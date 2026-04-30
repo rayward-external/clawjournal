@@ -22,11 +22,15 @@ INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
 
 # Schema version sentinels. Version 1 is the bundles→shares migration,
-# version 2 is the security refactor, and version 3 adds the
-# `sessions.session_key` bridge to `event_sessions.session_key`.
+# version 2 is the security refactor, version 3 adds the
+# `sessions.session_key` bridge to `event_sessions.session_key`, and
+# version 4 marks the workbench as widened-message-aware (parser path
+# now produces messages with optional `invocations` / `snippets` /
+# `extra` / `author` fields, all routed through redaction).
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
-WORKBENCH_SCHEMA_VERSION = SESSION_IDENTITY_SCHEMA_VERSION
+WIDENED_MESSAGE_SCHEMA_VERSION = 4
+WORKBENCH_SCHEMA_VERSION = WIDENED_MESSAGE_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
@@ -302,6 +306,7 @@ def open_index() -> sqlite3.Connection:
 
     _migrate_security_refactor(conn)
     _migrate_session_identity_bridge(conn)
+    _migrate_widened_message_model(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -414,6 +419,49 @@ def _migrate_session_identity_bridge(conn: sqlite3.Connection) -> None:
             "ON sessions(session_key) WHERE session_key IS NOT NULL"
         )
         conn.execute(f"PRAGMA user_version = {SESSION_IDENTITY_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_widened_message_model(conn: sqlite3.Connection) -> None:
+    """Mark this DB as widened-message-aware. Advances PRAGMA user_version 3 → 4.
+
+    Phase-2 C1. The widened message model lives in the per-session JSON
+    blob — message dicts gain optional ``invocations`` / ``snippets`` /
+    ``extra`` / ``author`` fields. Existing blobs remain valid because
+    every reader treats the new fields as optional (``msg.get("invocations", [])``).
+
+    The migration adds ``sessions.message_schema_version`` so future
+    backfills can identify legacy-shape rows without re-parsing each
+    blob. Existing rows are stamped with version 1 (legacy); rows
+    written by widened-aware code use version 2. The column is not
+    consulted by any current reader — it is a forward-compat marker.
+
+    Idempotent. Re-running on a v4 DB is a no-op.
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= WIDENED_MESSAGE_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        try:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN message_schema_version INTEGER DEFAULT 2"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+        # Backfill existing rows with version 1 (legacy shape). New
+        # inserts get the column default (2).
+        conn.execute(
+            "UPDATE sessions SET message_schema_version = 1 "
+            "WHERE message_schema_version IS NULL OR message_schema_version = 2"
+        )
+        conn.execute(f"PRAGMA user_version = {WIDENED_MESSAGE_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()

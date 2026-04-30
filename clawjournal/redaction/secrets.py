@@ -22,6 +22,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from ..findings import RawFinding, hash_entity
+from ..parsing.widened import iter_widened_text_locations
 
 REDACTED = "[REDACTED]"
 
@@ -632,6 +633,12 @@ def _collect_all_text(session: dict) -> list[tuple[str, str, int | None, str | N
                     flat = _flatten_to_strings(val)
                     for s in flat:
                         texts.append((s, f"tool_{tf}", msg_idx, tf))
+        # Widened message model (phase-2 C1): invocations / snippets /
+        # extra / author flow through the same scan as content.
+        # `extra` especially — invariant 8 in phase-2/01: do not
+        # short-circuit because the field looks like metadata.
+        for text, field_label in iter_widened_text_locations(msg):
+            texts.append((text, field_label, msg_idx, None))
 
     return texts
 
@@ -761,6 +768,45 @@ def _apply_to_value(value: Any, secret_map: dict[str, str]) -> tuple[Any, int]:
     return value, 0
 
 
+def _apply_widened_message_fields(msg: dict, secret_map: dict[str, str]) -> int:
+    """Redact secrets across the widened-message fields in place.
+
+    Mutates ``msg`` directly, replacing strings inside ``invocations``,
+    ``snippets``, ``extra`` (recursively) and the scalar ``author``.
+    Returns the number of replacements applied. Used by both
+    ``redact_session`` (legacy path) and ``apply_findings_to_blob``
+    (DB-backed path) so the two stay in sync.
+
+    Skipped silently when none of the widened fields are populated —
+    the cost on legacy-shape messages is one ``msg.get`` per field.
+    """
+    total = 0
+    if not isinstance(msg, dict) or not secret_map:
+        return total
+
+    author = msg.get("author")
+    if isinstance(author, str) and author:
+        msg["author"], n = _apply_redaction_set(author, secret_map)
+        total += n
+
+    invocations = msg.get("invocations")
+    if isinstance(invocations, list):
+        msg["invocations"], n = _apply_to_value(invocations, secret_map)
+        total += n
+
+    snippets = msg.get("snippets")
+    if isinstance(snippets, list):
+        msg["snippets"], n = _apply_to_value(snippets, secret_map)
+        total += n
+
+    extra = msg.get("extra")
+    if isinstance(extra, dict):
+        msg["extra"], n = _apply_to_value(extra, secret_map)
+        total += n
+
+    return total
+
+
 def redact_session(
     session: dict, custom_strings: list[str] | None = None,
     user_allowlist: list[dict] | None = None,
@@ -816,6 +862,10 @@ def redact_session(
                     if tool_use.get(tf):
                         tool_use[tf], n = _apply_to_value(tool_use[tf], secret_map)
                         pass_count += n
+            # Widened message model: redact across invocations /
+            # snippets / extra / author with the same secret_map.
+            n = _apply_widened_message_fields(msg, secret_map)
+            pass_count += n
 
         total += pass_count
 
@@ -889,6 +939,12 @@ def _iter_text_locations(
                                 "tool_dict",
                                 f"{tool_idx}:{branch}:{key}",
                             )
+        # Widened message model (phase-2 C1): yield strings from
+        # invocations / snippets / extra / author so the findings
+        # scan covers them. write_kind="widened" signals
+        # ``apply_findings_to_blob`` to use the recursive writeback.
+        for text, field_label in iter_widened_text_locations(msg):
+            yield text, field_label, msg_idx, None, "widened", field_label
 
 
 def _dedupe_overlapping_matches(matches: list[dict]) -> list[dict]:
@@ -1069,6 +1125,7 @@ def apply_findings_to_blob(
                         continue
                     tool_use[branch], n = _apply_to_value(val, secret_map)
                     pass_count += n
+            pass_count += _apply_widened_message_fields(msg, secret_map)
 
         total += pass_count
         if pass_count == 0 and pass_num > 0:

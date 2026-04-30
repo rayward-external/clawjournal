@@ -340,6 +340,8 @@ def _review_text_with_agent(session_id: str, message_index: int, field: str, tex
 
 def _collect_text_work_items(session: dict[str, Any]) -> list[tuple[str, int, str, str]]:
     """Extract all (session_id, message_index, field, text) tuples from a session."""
+    from ..parsing.widened import iter_widened_text_locations
+
     session_id = str(session.get("session_id") or "")
     messages = session.get("messages", [])
     if not isinstance(messages, list):
@@ -363,6 +365,11 @@ def _collect_text_work_items(session: dict[str, Any]) -> list[tuple[str, int, st
                             work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}.{key}", nested))
                 elif isinstance(value, str) and value.strip():
                     work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}", value))
+        # Widened message model (phase-2 C1): same redaction passes
+        # apply to invocations / snippets / extra / author.
+        for text, field_label in iter_widened_text_locations(msg):
+            if text.strip():
+                work_items.append((session_id, i, field_label, text))
     return work_items
 
 
@@ -533,6 +540,8 @@ def _scan_text_for_pii(session_id: str, message_index: int, field: str, text: st
 
 
 def review_session_pii(session: dict[str, Any]) -> list[PIIFinding]:
+    from ..parsing.widened import iter_widened_text_locations
+
     findings: list[PIIFinding] = []
     session_id = str(session.get("session_id") or "")
 
@@ -565,6 +574,9 @@ def review_session_pii(session: dict[str, Any]) -> list[PIIFinding]:
                 elif isinstance(value, str):
                     field = f"tool_uses[{tool_index}].{branch}"
                     findings.extend(_scan_text_for_pii(session_id, i, field, value))
+        # Widened message model (phase-2 C1).
+        for text, field_label in iter_widened_text_locations(msg):
+            findings.extend(_scan_text_for_pii(session_id, i, field_label, text))
     return merge_findings(findings)
 
 
