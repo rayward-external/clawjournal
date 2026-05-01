@@ -35,6 +35,8 @@ After install, your AI will give you a web address that looks like `http://local
 
 Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent conversations."* It'll walk you through configure, scan, and review in your browser.
 
+Your first scan may take a minute or two if you have lots of past sessions, and the workbench may show an empty list briefly while it indexes — that's normal. The page refreshes automatically as conversations are added.
+
 ---
 
 <details>
