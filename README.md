@@ -202,13 +202,18 @@ pipx install clawjournal        # or: pip install clawjournal
 
 The PyPI wheel ships the pre-built workbench (no Node.js needed) but is currently many versions behind the source — features documented in this README may be missing. Use this only when installing from source isn't an option. `pip show clawjournal` reports the wheel's version.
 
-**TruffleHog** is **not** required to install or use ClawJournal locally. It is required only for [Stage 6 Package & Share](#6-package--share) — every `bundle-export` and `share` runs an independent secrets scan on the redacted output, and exports are blocked if TruffleHog is missing or finds anything. Install it before your first share; you can defer it.
+**TruffleHog** is **not** required to install or use ClawJournal locally. It is only needed for [Stage 6 Package & Share](#6-package--share) — every `bundle-export` and `share` runs an independent secrets scan on the redacted output, and exports are blocked if TruffleHog is missing or finds anything. Your AI can install it for you when you reach Stage 6, or you can defer it entirely if you only plan to use ClawJournal locally.
+
+<details>
+<summary><b>Show TruffleHog install commands (your AI handles this for you)</b></summary>
 
 ```bash
 brew install trufflehog                                    # macOS
 curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux
 # Windows: download a release binary from https://github.com/trufflesecurity/trufflehog/releases
 ```
+
+</details>
 
 See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
 
@@ -278,7 +283,10 @@ clawjournal shortlist <session_id>                   # mark for deeper review
 
 </details>
 
-Optional hold-state controls — useful when you want to quarantine a session without blocking it (CLI only):
+Sometimes you want to set a conversation aside without blocking it permanently — for example, "this might be useful but I need to clear it with legal first." That's called a "hold." Just say to your AI: *"Put this session on hold pending legal review."* The agent will mark it. You can release it later, or set an embargo (auto-release at a specific date).
+
+<details>
+<summary><b>Show hold-state shell commands (CLI only — non-coders can ignore)</b></summary>
 
 ```bash
 clawjournal hold <id> --reason "pending legal review"
@@ -286,6 +294,8 @@ clawjournal release <id>
 clawjournal embargo <id> --until 2026-06-01
 clawjournal hold-history <id>
 ```
+
+</details>
 
 ### 5. Score
 
@@ -345,6 +355,13 @@ Upload is gated on hold-state: only sessions in `auto_redacted` or `released` ca
 
 ## Build the browser workbench
 
+If you followed the **Install in one step** section at the top of this README, the workbench is already built — you don't need this section.
+
+This section is only for developers who installed without the workbench (no `--with-frontend` flag) and want to add it later, or who want to do the frontend build by hand.
+
+<details>
+<summary><b>Show frontend-build shell commands</b></summary>
+
 `clawjournal serve` opens a local Vite app from `clawjournal/web/frontend/dist/`. The PyPI wheel ships this `dist/` pre-built; a source install needs a one-time build.
 
 The simplest way is to re-run the installer with the frontend flag:
@@ -363,6 +380,8 @@ npm run build
 ```
 
 Either path requires Node.js. Skip the build entirely if you're only using the CLI (`scan`, `inbox`, `search`, `bundle-export`, …).
+
+</details>
 
 <details>
 <summary><b>Python not installed?</b></summary>
