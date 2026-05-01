@@ -24,28 +24,60 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 
 ## Quickstart
 
-Inside any compatible coding agent (Claude Code, Codex, Cursor, Gemini CLI, OpenCode, [many more](https://github.com/nicepkg/skills)):
+Pick the block for your OS and run all the commands in it. The install script handles Python detection, venv creation, and editable install on macOS, Linux, WSL, and Windows.
+
+**macOS / Linux / WSL / Git Bash on Windows:**
 
 ```bash
-npx skills add kai-rayward/clawjournal
+git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
+cd ~/clawjournal
+./scripts/install.sh
 ```
 
-Then tell the agent: *"setup clawjournal"*. It clones the repo into `~/clawjournal`, installs ClawJournal in an isolated venv, scans your local sessions with default settings, and opens the workbench at `http://localhost:8384`. Nothing is uploaded.
+**Native Windows PowerShell:**
 
-Prefer the terminal? See Stage 1 in the flow below — every stage shows both skills and shell commands.
+```powershell
+git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
+Set-Location "$HOME\clawjournal"
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+The script prints `[ok] ClawJournal <version> installed.` on success. Pass `--with-frontend` (POSIX) or `-WithFrontend` (PowerShell) to also build the browser workbench (requires Node.js).
+
+**Verify** — you should see a JSON response with `"stage"` and `"stage_number"`:
+
+```bash
+~/.clawjournal-venv/bin/clawjournal status                              # POSIX
+```
+
+```powershell
+& "$HOME\.clawjournal-venv\Scripts\clawjournal.exe" status              # PowerShell
+```
+
+```json
+{ "stage": "configure", "stage_number": 2, "total_stages": 4, ... }
+```
+
+The CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows). Add the venv bin directory to your `PATH` to call it as plain `clawjournal`. The install is idempotent — re-run the script any time to upgrade against the latest `git pull`.
+
+> **Already inside a coding agent and want it to drive ClawJournal for you?** `npx skills add kai-rayward/clawjournal` adds three skills (Claude Code, Codex, Cursor, …); then say *"setup clawjournal"* — the wizard runs the same script above. Optional convenience, not a separate install path. See [Stage 1: Install](#1-install).
+>
+> **Can't clone? Behind a firewall?** `pipx install clawjournal` works as a fallback, but the PyPI wheel currently lags the source by many releases. See [Stage 1: Install](#1-install).
 
 ---
 
 ## End-to-end flow
 
-Six stages from a blank machine to a shared bundle. Each stage shows the skills-first way (inside your coding agent) and the shell-direct way.
+After install, six stages take you from indexing local sessions to optionally sharing a redacted bundle. Each stage shows the shell command (the canonical path) and the equivalent skill prompt (if you've done `npx skills add`).
+
+> **Heads up on `PATH`:** the shell snippets below use bare `clawjournal`. If you haven't added the venv bin to `PATH`, prefix every command with `~/.clawjournal-venv/bin/` (POSIX) or `$HOME\.clawjournal-venv\Scripts\` (Windows).
 
 ```
  Install ──► Configure ──► Scan ──► Triage ──► Score ──► Package & Share
     1            2           3          4          5              6
 ```
 
-**Three skills are installed by `npx skills add`:**
+**Optional skills layer** — `npx skills add kai-rayward/clawjournal` installs three skills into Claude Code / Codex / Cursor / Gemini CLI / OpenCode and similar agents:
 
 | Skill | Covers stages |
 |-------|---------------|
@@ -53,57 +85,29 @@ Six stages from a blank machine to a shared bundle. Each stage shows the skills-
 | **clawjournal** | 4 Triage · 6 Package & Share |
 | **clawjournal-score** | 5 Score |
 
-Day-to-day, prompts like *"triage my new sessions"*, *"score everything unscored"*, or *"package my approved sessions for export"* route to the right skill automatically.
+With skills installed, prompts like *"triage my new sessions"*, *"score everything unscored"*, or *"package my approved sessions for export"* route to the right skill. Skills are a convenience for agent-driven workflows — the shell commands below work the same without them.
 
 ### 1. Install
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
+If you followed [Quickstart](#quickstart) above, you're done — skip to Stage 2. Two alternative paths:
+
+**Skills install (guided wizard inside your coding agent):**
 
 ```bash
 npx skills add kai-rayward/clawjournal
 ```
 
-Adds the three ClawJournal skills to your agent. ClawJournal itself is installed when you run `setup clawjournal` (the wizard executes the same source-install path documented below).
+Then say *"setup clawjournal"* inside the agent. The `clawjournal-setup` wizard runs `scripts/install.sh` (or `install.ps1`) under the hood and walks through scan + workbench launch. The end state is identical to the Quickstart shell install.
 
-**Shell — install from source (recommended):**
-
-The GitHub source is the canonical version. The PyPI wheel currently lags behind, so features documented in this README may not be present in `pip install clawjournal`. The bundled installer script picks a Python 3.10+ interpreter, creates an isolated venv at `~/.clawjournal-venv`, and installs ClawJournal in editable mode. It's idempotent — re-run any time to upgrade against the latest checkout.
-
-macOS / Linux / WSL / Git Bash on Windows — clone, then run *one* of the install commands (`--with-frontend` requires Node.js):
-
-```bash
-git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
-cd ~/clawjournal
-
-./scripts/install.sh                  # CLI only
-# or
-./scripts/install.sh --with-frontend  # also build the browser workbench
-```
-
-Native Windows PowerShell — clone, then run *one* of the install commands:
-
-```powershell
-git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
-Set-Location "$HOME\clawjournal"
-
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1                 # CLI only
-# or
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend   # also build the browser workbench
-```
-
-After the script completes, either add the venv bin directory to your `PATH` or invoke the binary directly: `~/.clawjournal-venv/bin/clawjournal` on POSIX, or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` on Windows.
-
-The browser workbench (`clawjournal serve`) needs a one-time frontend build — pass the `--with-frontend` / `-WithFrontend` flag during install, or see [Build the browser workbench](#build-the-browser-workbench) below. Skip it if you'll only use the CLI.
-
-**Shell — install from PyPI (fallback, may be out of date):**
+**PyPI install (fallback, lags GitHub source):**
 
 ```bash
 pipx install clawjournal        # or: pip install clawjournal
 ```
 
-Faster, and the wheel ships the pre-built workbench (no Node.js needed). Use this only if installing from source isn't an option — `pip show clawjournal` will tell you the wheel's version, which currently lags the GitHub source by many releases.
+The PyPI wheel ships the pre-built workbench (no Node.js needed) but is currently many versions behind the source — features documented in this README may be missing. Use this only when installing from source isn't an option. `pip show clawjournal` reports the wheel's version.
 
-**TruffleHog (required for sharing):**
+**TruffleHog (required for sharing exports, regardless of install path):**
 
 ```bash
 brew install trufflehog      # macOS; Linux/Windows: see upstream installer
@@ -115,19 +119,7 @@ Every `bundle-export` and `share` runs an independent secrets scan on the redact
 
 Tell ClawJournal which agents' sessions to scan and what to exclude or redact.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
-
-For a first-time run with defaults (all sources, no exclusions), say:
-
-> *"setup clawjournal"*
-
-The skill installs ClawJournal from GitHub, runs a first scan, and opens the workbench. Later, to narrow scope or add redactions:
-
-> *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."*
-
-Subsequent scans pick up the new settings automatically.
-
-**Shell — in any bash/zsh terminal:**
+**Shell:**
 
 ```bash
 clawjournal config --source all                   # claude | codex | gemini | opencode | openclaw | kimi | custom | all
@@ -140,15 +132,17 @@ clawjournal config --confirm-projects             # lock in project selection
 
 `--exclude`, `--redact`, and `--redact-usernames` all append; they never overwrite. Safe to call repeatedly.
 
+**Skill prompt** (if you've done `npx skills add`):
+
+> *"setup clawjournal"* — first-time run with defaults (all sources, no exclusions). The skill runs install + scan; if ClawJournal is already installed it skips to scan.
+>
+> *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."* — narrow scope after the fact. Subsequent scans pick up new settings automatically.
+
 ### 3. Scan
 
 Reads your local session files into a SQLite DB and runs a per-session findings pipeline (secrets engine + PII engine). Findings are stored as hashed references — plaintext is never persisted.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
-
-Your agent runs scan as part of `setup clawjournal`. Re-scan any time with: *"scan my sessions again."*
-
-**Shell — in any bash/zsh terminal:**
+**Shell:**
 
 ```bash
 clawjournal scan
@@ -156,15 +150,13 @@ clawjournal scan
 
 The workbench daemon (`clawjournal serve`) also scans continuously in the background.
 
+**Skill prompt:** *"scan my sessions again"* (a first scan also runs as part of `setup clawjournal`).
+
 ### 4. Triage
 
 Approve sessions worth keeping, block the rest. Happens in the workbench (Sessions page) or the CLI.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
-
-> *"Open clawjournal and help me triage the unreviewed sessions."*
-
-**Shell — in any bash/zsh terminal:**
+**Shell:**
 
 ```bash
 clawjournal serve                                    # workbench UI — the primary review surface
@@ -175,6 +167,8 @@ clawjournal approve <session_id> --reason "clean"    # approve
 clawjournal block <session_id> --reason "private"    # block
 clawjournal shortlist <session_id>                   # mark for deeper review
 ```
+
+**Skill prompt:** *"Open clawjournal and help me triage the unreviewed sessions."*
 
 Optional hold-state controls — useful when you want to quarantine a session without blocking it (CLI only):
 
@@ -189,19 +183,15 @@ clawjournal hold-history <id>
 
 AI-assisted quality scoring on a 1–5 scale (1 = noise, 5 = excellent). Home-dir paths and usernames are anonymized before anything is sent to the judge.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
-
-> *"Score my unscored sessions."*
-
-This runs through the `clawjournal-score` skill and uses your current agent's automation CLI.
-
-**Shell — in any bash/zsh terminal:**
+**Shell:**
 
 ```bash
 clawjournal score --batch --auto-triage              # batch-score; auto-blocks noise (score 1) sessions
 clawjournal score-view <id>                          # show score details
 clawjournal set-score <id> --quality 4               # manual override
 ```
+
+**Skill prompt:** *"Score my unscored sessions."* (runs through the `clawjournal-score` skill, uses your current agent's automation CLI.)
 
 `--auto-triage` moves sessions with quality score 1 to `blocked`. Sessions scored 2–5 stay visible for you to decide.
 
@@ -211,17 +201,7 @@ By default scoring uses the current agent's automation CLI (e.g. `codex exec` in
 
 Bundle approved sessions into a redacted export on disk. Uploading that bundle is a separate, opt-in step.
 
-**Skills — in your coding agent (Claude Code, Codex, Cursor, …):**
-
-> *"Package my approved sessions and export them locally."*
->
-> *(optional)* *"Then share the bundle through the ingest service."*
-
-**Workbench — in your browser:**
-
-Open the workbench (`clawjournal serve`) and walk the Share page: **Queue → Redact → Review → Package → Done**. The Redact step layers AI-assisted PII detection on top of the scan-time findings.
-
-**Shell — in any bash/zsh terminal:**
+**Shell:**
 
 ```bash
 clawjournal bundle-create --status approved          # bundle all approved sessions
@@ -229,6 +209,13 @@ clawjournal bundle-list
 clawjournal bundle-view <bundle_id>                  # inspect before exporting
 clawjournal bundle-export <bundle_id>                # write sessions.jsonl + manifest.json to disk
 ```
+
+**Workbench:** open `clawjournal serve` and walk the Share page: **Queue → Redact → Review → Package → Done**. The Redact step layers AI-assisted PII detection on top of the scan-time findings.
+
+**Skill prompts:**
+> *"Package my approved sessions and export them locally."*
+>
+> *(optional)* *"Then share the bundle through the ingest service."*
 
 Optional upload:
 
