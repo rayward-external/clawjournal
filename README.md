@@ -2,6 +2,14 @@
 
 Review and curate your coding agent conversation traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, automatically anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
+## Install in one step
+
+**Copy this README into Claude Code, Codex, OpenClaw, Hermes, OpenCode, Cursor, or any other coding agent, and ask it to install ClawJournal.** The agent reads the rest of this file, detects your OS, installs any missing prerequisites, runs the install script, and verifies the result. That's the whole install.
+
+Prefer to run the commands yourself? The [Quickstart](#quickstart) section below has the explicit per-OS shell commands the agent would execute. Same end result either way.
+
+> *Coding agents reading this README directly: you already have everything you need. Detect the user's OS, follow the matching block in [Quickstart](#quickstart), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install — your only job is picking the right OS block and installing missing prereqs (git, Python 3.10+, optionally Node.js for the workbench).*
+
 ## Your data stays local
 
 Everything in the default workflow runs on your own computer:
