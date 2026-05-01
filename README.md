@@ -161,9 +161,9 @@ $env:Path = "$HOME\.clawjournal-venv\Scripts;" + $env:Path   # PowerShell
 
 ## End-to-end flow
 
-After install, six stages take you from indexing local sessions to optionally sharing a redacted bundle. Each stage shows the shell command (the canonical path) and the equivalent skill prompt (if you've done `npx skills add`).
+After install, six stages take you from indexing local sessions to (optionally) sharing a redacted bundle. **Non-coders: each stage starts with the natural-language prompt to give your AI assistant.** The shell commands the agent runs are tucked into expandable "Show shell commands" sections — you can ignore them.
 
-> **Heads up on `PATH`:** the shell snippets below use bare `clawjournal`. If you haven't added the venv bin to `PATH`, prefix every command with `~/.clawjournal-venv/bin/` (POSIX) or `$HOME\.clawjournal-venv\Scripts\` (Windows).
+> *Heads up for developers running commands by hand: the shell snippets use bare `clawjournal`. If you haven't added the venv bin to `PATH`, prefix every command with `~/.clawjournal-venv/bin/` (POSIX) or `$HOME\.clawjournal-venv\Scripts\` (Windows).*
 
 ```
  Install ──► Configure ──► Scan ──► Triage ──► Score ──► Package & Share
@@ -214,7 +214,16 @@ See [PRIVACY.md](PRIVACY.md) for the full gate semantics.
 
 Tell ClawJournal which agents' sessions to scan and what to exclude or redact.
 
-**Shell:**
+**Just say to your AI:**
+
+> *"Configure clawjournal — scan all sources with defaults, no exclusions."*
+>
+> Or, to narrow scope: *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."*
+
+The agent translates this into the right CLI calls. Subsequent scans pick up new settings automatically.
+
+<details>
+<summary><b>Show shell commands (what the agent runs)</b></summary>
 
 ```bash
 clawjournal config --source all                   # claude | codex | gemini | opencode | openclaw | kimi | custom | all
@@ -227,17 +236,16 @@ clawjournal config --confirm-projects             # lock in project selection
 
 `--exclude`, `--redact`, and `--redact-usernames` all append; they never overwrite. Safe to call repeatedly.
 
-**Skill prompt** (if you've done `npx skills add`):
-
-> *"setup clawjournal"* — first-time run with defaults (all sources, no exclusions). The skill runs install + scan; if ClawJournal is already installed it skips to scan.
->
-> *"Configure clawjournal to scan only claude and codex, exclude the `scratch` project, and always redact the string `acme-internal`."* — narrow scope after the fact. Subsequent scans pick up new settings automatically.
+</details>
 
 ### 3. Scan
 
-Reads your local session files into a SQLite DB and runs a per-session findings pipeline (secrets engine + PII engine). Findings are stored as hashed references — plaintext is never persisted.
+Reads your local session files into a private database on your computer. As it reads, ClawJournal automatically detects secrets and personal information so you can review them before sharing anything. Plaintext is never saved — only safe references.
 
-**Shell:**
+**Just say to your AI:** *"scan my coding-agent sessions"* (a first scan also runs automatically as part of *"setup clawjournal"*).
+
+<details>
+<summary><b>Show shell command</b></summary>
 
 ```bash
 clawjournal scan
@@ -245,13 +253,16 @@ clawjournal scan
 
 The workbench daemon (`clawjournal serve`) also scans continuously in the background.
 
-**Skill prompt:** *"scan my sessions again"* (a first scan also runs as part of `setup clawjournal`).
+</details>
 
 ### 4. Triage
 
-Approve sessions worth keeping, block the rest. Happens in the workbench (Sessions page) or the CLI.
+Mark which conversations you want to keep ("approve") and which to discard ("block"). The browser workbench at `localhost:8384` is the easiest place to do this — you'll see each conversation with a summary, and click Approve or Block.
 
-**Shell:**
+**Just say to your AI:** *"Open clawjournal and help me triage my unreviewed sessions."*
+
+<details>
+<summary><b>Show shell commands</b></summary>
 
 ```bash
 clawjournal serve                                    # workbench UI — the primary review surface
@@ -263,7 +274,7 @@ clawjournal block <session_id> --reason "private"    # block
 clawjournal shortlist <session_id>                   # mark for deeper review
 ```
 
-**Skill prompt:** *"Open clawjournal and help me triage the unreviewed sessions."*
+</details>
 
 Optional hold-state controls — useful when you want to quarantine a session without blocking it (CLI only):
 
@@ -276,9 +287,14 @@ clawjournal hold-history <id>
 
 ### 5. Score
 
-AI-assisted quality scoring on a 1–5 scale (1 = noise, 5 = excellent). Home-dir paths and usernames are anonymized before anything is sent to the judge.
+AI-assisted quality rating on a 1–5 scale (1 = noise, 5 = excellent). Personal info in your conversations is removed before anything is sent to the AI judge — your home folder paths and usernames are anonymized first.
 
-**Shell:**
+**Just say to your AI:** *"Score my unscored ClawJournal sessions and auto-block the noise."*
+
+The agent batches the scoring; sessions rated 1 get auto-blocked, sessions rated 2–5 stay visible for you to decide.
+
+<details>
+<summary><b>Show shell commands</b></summary>
 
 ```bash
 clawjournal score --batch --auto-triage              # batch-score; auto-blocks noise (score 1) sessions
@@ -286,41 +302,42 @@ clawjournal score-view <id>                          # show score details
 clawjournal set-score <id> --quality 4               # manual override
 ```
 
-**Skill prompt:** *"Score my unscored sessions."* (runs through the `clawjournal-score` skill, uses your current agent's automation CLI.)
-
-`--auto-triage` moves sessions with quality score 1 to `blocked`. Sessions scored 2–5 stay visible for you to decide.
-
 By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
+
+</details>
 
 ### 6. Package & Share
 
-Bundle approved sessions into a redacted export on disk. Uploading that bundle is a separate, opt-in step.
+Package the conversations you approved into a redacted file on your computer. Uploading anywhere is a separate, opt-in step — by default the file just sits on your disk.
 
-**Shell:**
+**Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
+
+The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed.
+
+To actually upload after packaging (optional, requires a one-time email verification):
+
+> *(optional)* *"Now share the bundle through the ClawJournal ingest service. My email is you@university.edu."*
+
+Uploads are gated: only conversations you approved and confirmed for sharing leave your machine.
+
+<details>
+<summary><b>Show shell commands</b></summary>
 
 ```bash
 clawjournal bundle-create --status approved          # bundle all approved sessions
 clawjournal bundle-list
 clawjournal bundle-view <bundle_id>                  # inspect before exporting
 clawjournal bundle-export <bundle_id>                # write sessions.jsonl + manifest.json to disk
-```
 
-**Workbench:** open `clawjournal serve` and walk the Share page: **Queue → Redact → Review → Package → Done**. The Redact step layers AI-assisted PII detection on top of the scan-time findings.
-
-**Skill prompts:**
-> *"Package my approved sessions and export them locally."*
->
-> *(optional)* *"Then share the bundle through the ingest service."*
-
-Optional upload:
-
-```bash
+# Optional upload:
 clawjournal verify-email you@university.edu          # one-time email verification
 clawjournal share --preview --status approved        # dry-run
 clawjournal bundle-share <bundle_id>                 # upload through the configured ingest service
 ```
 
 Upload is gated on hold-state: only sessions in `auto_redacted` or `released` can leave the machine.
+
+</details>
 
 ---
 
