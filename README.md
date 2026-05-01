@@ -27,18 +27,19 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 **Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Skip any line whose tool is already installed:
 
 ```bash
-# macOS (install Homebrew first if you don't have it):
+# macOS (install Homebrew first if you don't have it; second line puts brew on PATH for the current shell):
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv)"
 brew install git python              # workbench (optional): brew install node
 
 # Debian / Ubuntu (drop `sudo` if you're root in a container):
 sudo apt update && sudo apt install -y git curl python3-full python3-venv
 sudo apt install -y nodejs npm       # workbench (optional). 24.04+ ships Node 18; on older LTS use NodeSource: curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash - && sudo apt install -y nodejs
 
-# Windows (PowerShell, native package manager):
-winget install --id Git.Git -e
-winget install --id Python.Python.3.12 -e
-winget install --id OpenJS.NodeJS.LTS -e   # workbench (optional)
+# Windows (PowerShell, native package manager). The flags suppress interactive prompts that block autonomous installs:
+winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements --scope user
+winget install --id Python.Python.3.12 -e --accept-source-agreements --accept-package-agreements --scope user
+winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements --scope user   # workbench (optional)
 
 # Refresh PATH in the current PowerShell session (winget doesn't do this for you):
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
