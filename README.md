@@ -24,17 +24,21 @@ See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing pat
 
 ## Quickstart
 
-**Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Install per OS:
+**Prerequisites** — `git` + Python 3.10+ are required; Node.js 18+ is required only for the browser workbench (`--with-frontend`). Skip any line whose tool is already installed:
 
 ```bash
 # macOS:
-brew install git python              # Node (optional, for workbench): brew install node
+brew install git python              # workbench (optional): brew install node
 
-# Debian / Ubuntu (run on bare containers; safe to skip if already installed):
-sudo apt update && sudo apt install -y git python3-full python3-venv
-sudo apt install -y nodejs npm        # optional, for workbench (24.04+ is fine; older LTS may need NodeSource)
+# Debian / Ubuntu (drop `sudo` if you're root in a container):
+sudo apt update && sudo apt install -y git curl python3-full python3-venv
+sudo apt install -y nodejs npm       # workbench (optional). 24.04+ ships Node 18; on older LTS use NodeSource: curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo bash - && sudo apt install -y nodejs
 
-# Windows: install Git for Windows, Python 3.10+ from python.org, and (optionally) Node.js LTS from nodejs.org.
+# Windows (PowerShell, native package manager):
+winget install --id Git.Git -e
+winget install --id Python.Python.3.12 -e
+winget install --id OpenJS.NodeJS.LTS -e   # workbench (optional)
+# winget doesn't refresh the current shell's PATH; close this PowerShell window and open a new one before continuing.
 ```
 
 Then pick the block for your OS and run it. The install script handles Python detection, venv creation, and editable install. Run `./scripts/install.sh --help` for all options.
