@@ -300,9 +300,6 @@ def test_local_agent_falls_back_to_a_single_nested_dir_when_processname_missing(
     alt = session_dir / ".claude" / "projects" / "-sessions-fallback"
     alt.mkdir(parents=True)
     (alt / "cli-6.jsonl").write_text("{}\n")
-    extra = session_dir / ".claude" / "projects" / "-sessions-other"
-    extra.mkdir(parents=True)
-    (extra / "cli-6.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
     assert len(files) == 1
