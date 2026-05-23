@@ -448,6 +448,7 @@ _GITHUB_URL_PUBLIC_ORGS = frozenset({
     "pytorch", "tensorflow", "golang", "rust-lang", "python", "nodejs",
     "actions", "github", "cli", "docker", "kubernetes", "helm", "npm",
     "homebrew", "apache", "mozilla", "jetbrains", "gradle", "maven",
+    "rayward-external",
 })
 
 

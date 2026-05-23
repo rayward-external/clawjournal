@@ -277,6 +277,12 @@ def test_content_findings_skips_public_github_orgs():
     assert "npm" not in entity_texts
 
 
+def test_content_findings_skips_rayward_external_org():
+    findings = _content_findings_for_text("s1", 0, "content", "git clone https://github.com/rayward-external/clawjournal.git")
+    entity_texts = {f["entity_text"] for f in findings}
+    assert "rayward-external" not in entity_texts
+
+
 def test_content_findings_telegram_bot_token():
     findings = _content_findings_for_text("s1", 0, "content", "token is 8773626713:AAGaVClH6X8qr59wwbwoLpqVyu3ebOi5irw here")
     assert len(findings) == 1
