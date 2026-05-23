@@ -2591,6 +2591,39 @@ function DoneStep(p: DoneStepProps) {
         )}
 
         <div style={{
+          margin: '0 auto 22px',
+          display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap',
+        }}>
+          <button
+            onClick={p.onDownloadAgain}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8,
+              padding: '11px 20px', background: colors.white, color: colors.gray900,
+              border: `1px solid ${colors.gray300}`, borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            <Icon name="download" size={15} /> Download zip
+          </button>
+          <a
+            href="https://data.rayward.ai"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8,
+              padding: '11px 20px', background: colors.primary500, color: colors.white,
+              borderRadius: 8, fontSize: 14, fontWeight: 600,
+              textDecoration: 'none',
+            }}
+          >
+            Share with Rayward &rarr;
+          </a>
+        </div>
+        <div style={{ fontSize: 12, color: colors.gray500, marginBottom: 8 }}>
+          Upload your bundle at <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>data.rayward.ai</span> to contribute to research.
+        </div>
+
+        <div style={{
           margin: '20px auto', maxWidth: 480, textAlign: 'left' as const,
           padding: '14px 16px', background: colors.white,
           border: `1px solid ${colors.gray200}`, borderRadius: 8,
@@ -2633,10 +2666,6 @@ function DoneStep(p: DoneStepProps) {
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'center', gap: 10, color: colors.gray500, fontSize: 13 }}>
-          <button onClick={p.onDownloadAgain} style={{ ...btnGhost, color: colors.primary500, fontSize: 13, padding: '6px 10px' }}>
-            <Icon name="download" size={13} /> Download again
-          </button>
-          <span style={{ color: colors.gray300 }}>&middot;</span>
           <button onClick={p.onNew} style={{ ...btnGhost, color: colors.primary500, fontSize: 13, padding: '6px 10px' }}>
             Start a new bundle
           </button>
@@ -2648,7 +2677,7 @@ function DoneStep(p: DoneStepProps) {
           textAlign: 'left' as const, fontSize: 12.5, color: colors.gray600, lineHeight: 1.55,
         }}>
           <strong style={{ color: colors.gray900, fontWeight: 500 }}>What happens next.</strong>{' '}
-          If you choose to share this bundle with us, it will be used{' '}
+          If you choose to share, your bundle will be used{' '}
           <strong style={{ color: colors.gray900, fontWeight: 500 }}>only for model evaluation and model training</strong>.
           No advertising. No resale. No profile building.
           <div style={doneMiniRow}>
