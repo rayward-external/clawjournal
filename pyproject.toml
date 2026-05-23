@@ -29,8 +29,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kai-rayward/clawjournal"
-Issues = "https://github.com/kai-rayward/clawjournal/issues"
+Homepage = "https://github.com/rayward-external/clawjournal"
+Issues = "https://github.com/rayward-external/clawjournal/issues"
 
 [project.scripts]
 clawjournal = "clawjournal.cli:main"

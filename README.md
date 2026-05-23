@@ -10,7 +10,7 @@ If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, *
 
 **2.** Paste this message:
 
-> *Install ClawJournal from https://github.com/kai-rayward/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
+> *Install ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
 
 **3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
 
@@ -111,7 +111,7 @@ Then pick the block for your OS and run it. The install script handles Python de
 **macOS / Linux / WSL / Git Bash on Windows:**
 
 ```bash
-git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
+git clone https://github.com/rayward-external/clawjournal.git ~/clawjournal
 cd ~/clawjournal
 ./scripts/install.sh --with-frontend       # or: sh scripts/install.sh --with-frontend  (if the +x bit is missing)
 ```
@@ -119,7 +119,7 @@ cd ~/clawjournal
 **Native Windows PowerShell** — use `pwsh` (PowerShell 7+) if available, otherwise `powershell` (legacy 5.1) works the same:
 
 ```powershell
-git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
+git clone https://github.com/rayward-external/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
 pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
 # If `pwsh` is not installed: powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
@@ -153,7 +153,7 @@ export PATH="$HOME/.clawjournal-venv/bin:$PATH"          # POSIX (bash/zsh)
 $env:Path = "$HOME\.clawjournal-venv\Scripts;" + $env:Path   # PowerShell
 ```
 
-> **Already inside a coding agent and want it to drive ClawJournal for you?** `npx skills add kai-rayward/clawjournal` adds three skills (Claude Code, Codex, Cursor, …); then say *"setup clawjournal"* — the wizard runs the same script above. Optional convenience, not a separate install path. See [Stage 1: Install](#1-install).
+> **Already inside a coding agent and want it to drive ClawJournal for you?** `npx skills add rayward-external/clawjournal` adds three skills (Claude Code, Codex, Cursor, …); then say *"setup clawjournal"* — the wizard runs the same script above. Optional convenience, not a separate install path. See [Stage 1: Install](#1-install).
 >
 > **Can't clone? Behind a firewall?** `pipx install clawjournal` works as a fallback, but the PyPI wheel currently lags the source by many releases. See [Stage 1: Install](#1-install).
 
@@ -172,7 +172,7 @@ After install, six stages take you from indexing local sessions to (optionally) 
     1            2           3          4          5              6
 ```
 
-**Optional skills layer** — `npx skills add kai-rayward/clawjournal` installs three skills into Claude Code / Codex / Cursor / Gemini CLI / OpenCode and similar agents:
+**Optional skills layer** — `npx skills add rayward-external/clawjournal` installs three skills into Claude Code / Codex / Cursor / Gemini CLI / OpenCode and similar agents:
 
 | Skill | Covers stages |
 |-------|---------------|
@@ -189,7 +189,7 @@ The canonical install is the shell script in [Quickstart](#quickstart) above —
 **Skills install (guided wizard inside your coding agent):**
 
 ```bash
-npx skills add kai-rayward/clawjournal
+npx skills add rayward-external/clawjournal
 ```
 
 Then say *"setup clawjournal"* inside the agent. The `clawjournal-setup` wizard runs `scripts/install.sh` (or `install.ps1`) under the hood and walks through scan + workbench launch. The end state is identical to the Quickstart shell install.
@@ -411,7 +411,7 @@ ClawJournal requires Python 3.10+.
 <summary><b>Developing ClawJournal itself</b></summary>
 
 ```bash
-git clone https://github.com/kai-rayward/clawjournal.git
+git clone https://github.com/rayward-external/clawjournal.git
 cd clawjournal
 python3 -m venv .venv
 source .venv/bin/activate

@@ -41,7 +41,7 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot '..\pyproject.toml'))
         & git -C $target pull --ff-only --quiet
     } else {
         Write-Host "-> Cloning ClawJournal to $target"
-        & git clone --quiet https://github.com/kai-rayward/clawjournal.git $target
+        & git clone --quiet https://github.com/rayward-external/clawjournal.git $target
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     $RepoDir = $target

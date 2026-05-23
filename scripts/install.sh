@@ -50,7 +50,7 @@ if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/pyproject.toml" ]; then
     git -C "$TARGET" pull --ff-only --quiet || true
   else
     echo "-> Cloning ClawJournal to $TARGET"
-    git clone --quiet https://github.com/kai-rayward/clawjournal.git "$TARGET"
+    git clone --quiet https://github.com/rayward-external/clawjournal.git "$TARGET"
   fi
   REPO_DIR="$TARGET"
 fi

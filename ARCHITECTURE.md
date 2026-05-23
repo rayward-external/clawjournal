@@ -59,7 +59,7 @@ npm run build
 
 The repo keeps `skills/` as the single source of truth for user-facing skills.
 
-- `npx skills add kai-rayward/clawjournal` reads from the root `skills/` layout.
+- `npx skills add rayward-external/clawjournal` reads from the root `skills/` layout.
 - Claude plugin distribution uses a thin wrapper under `plugins/clawjournal/`.
 - `plugins/clawjournal/skills` is a symlink back to the root `skills/` directory so both channels share the same content.
 

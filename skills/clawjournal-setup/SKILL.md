@@ -31,7 +31,7 @@ First, ask: "Do you want the browser workbench? (Recommended — it's the primar
 if [ -d ~/clawjournal/.git ]; then
   git -C ~/clawjournal pull --ff-only
 else
-  git clone https://github.com/kai-rayward/clawjournal.git ~/clawjournal
+  git clone https://github.com/rayward-external/clawjournal.git ~/clawjournal
 fi
 
 # Pick ONE based on the user's answer above:
@@ -45,7 +45,7 @@ fi
 if (Test-Path "$HOME\clawjournal\.git") {
   git -C "$HOME\clawjournal" pull --ff-only
 } else {
-  git clone https://github.com/kai-rayward/clawjournal.git "$HOME\clawjournal"
+  git clone https://github.com/rayward-external/clawjournal.git "$HOME\clawjournal"
 }
 
 # Pick ONE based on the user's answer above:

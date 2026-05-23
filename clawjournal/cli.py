@@ -18,8 +18,8 @@ from .redaction.pii import apply_findings_to_session, load_findings, load_jsonl_
 from .scoring.scoring import SCORING_BACKEND_CHOICES
 from .redaction.secrets import _has_mixed_char_types, _shannon_entropy, redact_session
 
-REPO_URL = "https://github.com/kai-rayward/clawjournal"
-SKILL_URL = "https://raw.githubusercontent.com/kai-rayward/clawjournal/main/skills/clawjournal/SKILL.md"
+REPO_URL = "https://github.com/rayward-external/clawjournal"
+SKILL_URL = "https://raw.githubusercontent.com/rayward-external/clawjournal/main/skills/clawjournal/SKILL.md"
 
 REQUIRED_REVIEW_ATTESTATIONS: dict[str, str] = {
     "asked_full_name": "I asked the user for their full name and scanned for it.",
