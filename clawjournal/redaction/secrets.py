@@ -1155,7 +1155,9 @@ def apply_findings_to_blob(
 AI_TEXT_TOP_FIELD = "ai_learning_summary"
 AI_TEXT_DETAIL_FIELD = "ai_scoring_detail"
 AI_TEXT_DETAIL_STR_FIELDS: tuple[str, ...] = (
-    "reason",
+    # The judge writes "reasoning" (not "reason") into the detail blob —
+    # see ``scoring.score_session``'s detail_data construction.
+    "reasoning",
     "display_title",
     "summary",
     "ai_learning_summary",

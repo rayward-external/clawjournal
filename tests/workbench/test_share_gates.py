@@ -297,6 +297,117 @@ class TestExportManifestRedactions:
         assert not any(entry["type"] == "trufflehog_slack" for entry in log)
 
 
+class TestAiTextRedaction:
+    """The judge writes free-text fields (reasoning, summary, evidence
+    paraphrases, learning summary) into ``ai_scoring_detail`` and the
+    top-level ``ai_learning_summary`` column. These fields are exported
+    in the share bundle, so share-time redaction has to walk them with
+    the same engines that handle ``display_title`` / message content.
+
+    These tests pin the exact field names used by the rubric — they
+    caught a "reason" vs "reasoning" typo where the constants did not
+    match what the judge actually writes (see
+    ``scoring.score_session``'s detail_data construction)."""
+
+    def _session_with_judge_text(self, session_id, *, custom_marker="LAB-PROJECT-X"):
+        sess = _settled_session(session_id, content="harmless")
+        # Mirror the actual detail_data shape from scoring.score_session.
+        sess["ai_learning_summary"] = f"Top-level note about {custom_marker}."
+        sess["ai_scoring_detail"] = json.dumps({
+            "substance": 4,
+            "resolution": "resolved",
+            "reasoning": f"Judge cited {custom_marker} in its reasoning.",
+            "display_title": f"Fix {custom_marker} pipeline",
+            "summary": f"Walked through the {custom_marker} dataset and fixed it.",
+            "task_type": "data_analysis",
+            "session_tags": ["statistics"],
+            "privacy_flags": [],
+            "project_areas": [f"/Users/student/{custom_marker}/notebooks/"],
+            "ai_failure_value_score": 4,
+            "ai_recovery_labels": ["user_corrected_recovery"],
+            "ai_failure_attribution": "agent_caused",
+            "ai_failure_modes": ["wrong_assumption"],
+            "ai_failure_evidence": [
+                f"User: 'the {custom_marker} samples are paired'.",
+                f"Agent then revised the {custom_marker} test.",
+            ],
+            "ai_learning_summary": f"Embedded summary mentions {custom_marker} too.",
+        })
+        return sess
+
+    def test_apply_to_ai_text_walks_reasoning_field(self):
+        """Regression: the constants must reference the actual key written
+        by the judge. ``ai_scoring_detail.reasoning`` (not ``reason``) must
+        appear in the visited-label list."""
+        from clawjournal.workbench.index import _apply_to_ai_text
+
+        sess = self._session_with_judge_text("apply-1")
+        visited: list[str] = []
+        _apply_to_ai_text(sess, lambda text, label: (visited.append(label), text)[1])
+
+        assert "ai_learning_summary" in visited
+        assert "ai_scoring_detail.reasoning" in visited
+        assert "ai_scoring_detail.display_title" in visited
+        assert "ai_scoring_detail.summary" in visited
+        assert "ai_scoring_detail.ai_learning_summary" in visited
+        assert "ai_scoring_detail.ai_failure_evidence[0]" in visited
+        assert "ai_scoring_detail.ai_failure_evidence[1]" in visited
+        assert "ai_scoring_detail.project_areas[0]" in visited
+        # Sanity: at minimum the 8 fields we know are free-text in the
+        # actual rubric. Enum/numeric fields must not appear.
+        assert len(visited) >= 8
+        assert "ai_scoring_detail.task_type" not in visited
+        assert "ai_scoring_detail.session_tags" not in visited
+
+    def test_share_redactions_redact_custom_strings_from_reasoning(self, conn):
+        """End-to-end: a custom string visible only in ``detail.reasoning``
+        must be redacted by the custom-strings engine at share time. If
+        the constants typo regresses to ``reason``, this fails."""
+        marker = "FOO-LAB-PROJ"
+        sess = self._session_with_judge_text("redact-1", custom_marker=marker)
+        upsert_sessions(conn, [sess])
+        conn.commit()
+        redacted, _, _ = apply_share_redactions(
+            conn, sess, custom_strings=[marker],
+        )
+        detail = json.loads(redacted["ai_scoring_detail"])
+        assert marker not in detail["reasoning"]
+        assert marker not in detail["display_title"]
+        assert marker not in detail["summary"]
+        assert marker not in detail["ai_learning_summary"]
+        assert marker not in json.dumps(detail["ai_failure_evidence"])
+        assert marker not in json.dumps(detail["project_areas"])
+        assert marker not in redacted["ai_learning_summary"]
+        # Enum fields untouched.
+        assert detail["task_type"] == "data_analysis"
+        assert detail["ai_failure_attribution"] == "agent_caused"
+
+    def test_findings_to_blob_redacts_secret_paraphrased_into_reasoning(self, conn):
+        """Apply path: a secret detected in messages is replaced when it
+        appears (paraphrased) in ``detail.reasoning`` too."""
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+
+        secret = "AKIA0123456789ABCDEF"
+        sess = _settled_session("findings-1", content=f"key={secret}")
+        sess["ai_scoring_detail"] = json.dumps({
+            "reasoning": f"Agent verified the key {secret} works.",
+            "ai_failure_evidence": [f"User shared {secret} in chat."],
+        })
+        upsert_sessions(conn, [sess])
+        raw = scan_session_for_findings(sess)
+        write_findings_to_db(conn, "findings-1", raw, revision="v1:reasoning")
+        conn.commit()
+
+        redacted, n = apply_findings_to_blob(sess, conn, "findings-1")
+        detail = json.loads(redacted["ai_scoring_detail"])
+        assert secret not in detail["reasoning"]
+        assert secret not in detail["ai_failure_evidence"][0]
+        assert "[REDACTED_AWS_KEY]" in detail["reasoning"]
+        assert "[REDACTED_AWS_KEY]" in detail["ai_failure_evidence"][0]
+        # message-level redaction still happens
+        assert secret not in redacted["messages"][0]["content"]
+
+
 class TestTruffleHogGate:
     """The post-redaction TruffleHog scan is mandatory on every share
     export. These tests disable the test-suite-wide bypass and mock
