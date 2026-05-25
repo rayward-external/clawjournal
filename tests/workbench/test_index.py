@@ -21,6 +21,7 @@ from clawjournal.workbench.index import (
     link_subagent_hierarchy,
     open_index,
     query_sessions,
+    query_unscored_sessions,
     remove_policy,
     search_fts,
     update_session,
@@ -407,8 +408,39 @@ class TestGetSessionDetail:
         assert len(detail["messages"]) == 2
         assert detail["messages"][0]["role"] == "user"
 
+    def test_parses_failure_array_fields(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        update_session(
+            index_conn,
+            "sess-1",
+            ai_recovery_labels=json.dumps(["user_corrected_recovery"]),
+            ai_failure_modes=json.dumps(["wrong_assumption"]),
+        )
+
+        detail = get_session_detail(index_conn, "sess-1")
+
+        assert detail is not None
+        assert detail["ai_recovery_labels"] == ["user_corrected_recovery"]
+        assert detail["ai_failure_modes"] == ["wrong_assumption"]
+
     def test_not_found(self, index_conn):
         assert get_session_detail(index_conn, "nonexistent") is None
+
+
+class TestQueryUnscoredSessions:
+    def test_since_filters_old_unscored_sessions(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("old", start_time="2025-01-01T00:00:00+00:00"),
+            _make_session("recent", start_time="2026-05-24T00:00:00+00:00"),
+        ])
+
+        results = query_unscored_sessions(
+            index_conn,
+            source=["claude"],
+            since="2026-05-20T00:00:00+00:00",
+        )
+
+        assert [row["session_id"] for row in results] == ["recent"]
 
 
 class TestSearchFts:

@@ -267,6 +267,41 @@ def _extract_session_stats(session: dict) -> dict:
     }
 
 
+def _parse_json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, str)]
+    return []
+
+
+def _extract_failure_annotations(session: dict) -> dict:
+    """Extract session-level failure labels for each exported training turn."""
+    detail = session.get("ai_scoring_detail")
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except json.JSONDecodeError:
+            detail = {}
+    if not isinstance(detail, dict):
+        detail = {}
+
+    return {
+        "ai_quality_score": session.get("ai_quality_score"),
+        "ai_failure_value_score": session.get("ai_failure_value_score"),
+        "ai_recovery_labels": _parse_json_list(session.get("ai_recovery_labels")),
+        "ai_failure_attribution": session.get("ai_failure_attribution"),
+        "ai_failure_modes": _parse_json_list(session.get("ai_failure_modes")),
+        "ai_learning_summary": session.get("ai_learning_summary"),
+        "ai_failure_evidence": _parse_json_list(detail.get("ai_failure_evidence")),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -281,6 +316,7 @@ def convert_session(session: dict) -> list[dict]:
     model = session.get("model", "unknown")
     source = session.get("source", "unknown")
     session_stats = _extract_session_stats(session)
+    failure_annotations = _extract_failure_annotations(session)
 
     for turn_idx, turn in enumerate(turns):
         user_text = extract_user_text(turn["user_msg"].get("content") or "")
@@ -299,7 +335,10 @@ def convert_session(session: dict) -> list[dict]:
             "input": {"role": "user", "content": user_text},
             "output": output_seq,
             "session_stats": session_stats,
-            "metadata": {"timestamp": turn["user_msg"].get("timestamp")},
+            "metadata": {
+                "timestamp": turn["user_msg"].get("timestamp"),
+                "failure_annotations": failure_annotations,
+            },
         })
 
     return result

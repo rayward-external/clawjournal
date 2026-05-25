@@ -8,6 +8,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
 WORKBENCH_SCHEMA_VERSION = WIDENED_MESSAGE_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
 # onto a single coherent label set. Prevents the duplicate-meaning rows we
@@ -98,7 +100,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     share_id           TEXT REFERENCES shares(share_id),
     ai_quality_score   INTEGER,
     ai_score_reason    TEXT,
-    ai_display_title   TEXT
+    ai_display_title   TEXT,
+    ai_failure_value_score INTEGER,
+    ai_recovery_labels     TEXT,
+    ai_failure_attribution TEXT,
+    ai_failure_modes       TEXT,
+    ai_learning_summary    TEXT,
+    ai_scorer_backend      TEXT,
+    ai_scorer_model        TEXT,
+    ai_rubric_git_sha      TEXT,
+    ai_scored_at           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shares (
@@ -276,6 +287,15 @@ def open_index() -> sqlite3.Connection:
         ("subagent_session_ids", "TEXT"),
         ("ai_effort_estimate", "REAL"),   # replaces ai_episode_quality
         ("ai_summary", "TEXT"),           # replaces ai_quality_tier
+        ("ai_failure_value_score", "INTEGER"),
+        ("ai_recovery_labels", "TEXT"),
+        ("ai_failure_attribution", "TEXT"),
+        ("ai_failure_modes", "TEXT"),
+        ("ai_learning_summary", "TEXT"),
+        ("ai_scorer_backend", "TEXT"),
+        ("ai_scorer_model", "TEXT"),
+        ("ai_rubric_git_sha", "TEXT"),
+        ("ai_scored_at", "TEXT"),
         ("tool_counts", "TEXT"),
         ("user_interrupts", "INTEGER"),
         ("model_effort", "TEXT"),   # Codex-style reasoning effort ("medium"/"high"/"xhigh")
@@ -598,6 +618,15 @@ def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
             "ai_quality_score   INTEGER",
             "ai_score_reason    TEXT",
             "ai_display_title   TEXT",
+            "ai_failure_value_score INTEGER",
+            "ai_recovery_labels     TEXT",
+            "ai_failure_attribution TEXT",
+            "ai_failure_modes       TEXT",
+            "ai_learning_summary    TEXT",
+            "ai_scorer_backend      TEXT",
+            "ai_scorer_model        TEXT",
+            "ai_rubric_git_sha      TEXT",
+            "ai_scored_at           TEXT",
         ]
         known_names = {
             "session_id", "project", "source", "model", "start_time",
@@ -608,7 +637,10 @@ def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
             "review_status", "selection_reason", "reviewer_notes",
             "reviewed_at", "blob_path", "raw_source_path", "indexed_at",
             "updated_at", "share_id", "ai_quality_score", "ai_score_reason",
-            "ai_display_title",
+            "ai_display_title", "ai_failure_value_score", "ai_recovery_labels",
+            "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
+            "ai_scorer_backend", "ai_scorer_model", "ai_rubric_git_sha",
+            "ai_scored_at",
         }
         # Map column name -> declared type from the old table so we preserve
         # types for any columns not in the base schema.
@@ -1129,6 +1161,70 @@ def _build_deterministic_redaction_log(
     return log
 
 
+def _apply_to_ai_text(
+    session: dict[str, Any],
+    transform: Callable[[str, str], str],
+) -> None:
+    """Apply ``transform(text, field_label) -> text`` to every judge-generated free-text field.
+
+    The judge sees only anonymized message content, but its outputs
+    (summary, evidence paraphrases, learning summary) can still contain
+    project, lab, or dataset names. These fields end up in the export
+    bundle, so they must pass through the same share-time redaction
+    stack as ``display_title``.
+
+    ``field_label`` is a precise dotted path so callers that build
+    redaction-log entries can attribute hits — examples:
+    ``"ai_learning_summary"``, ``"ai_scoring_detail.reason"``,
+    ``"ai_scoring_detail.ai_failure_evidence[2]"``.
+
+    The walked field set is defined by the ``AI_TEXT_*`` constants in
+    ``clawjournal.redaction.secrets`` — that module is the single source
+    of truth so adding a judge-emitted field only requires updating one
+    list.
+    """
+    from ..redaction.secrets import (
+        AI_TEXT_DETAIL_FIELD,
+        AI_TEXT_DETAIL_LIST_FIELDS,
+        AI_TEXT_DETAIL_STR_FIELDS,
+        AI_TEXT_TOP_FIELD,
+    )
+
+    top_value = session.get(AI_TEXT_TOP_FIELD)
+    if isinstance(top_value, str) and top_value:
+        session[AI_TEXT_TOP_FIELD] = transform(top_value, AI_TEXT_TOP_FIELD)
+
+    raw = session.get(AI_TEXT_DETAIL_FIELD)
+    if not isinstance(raw, str) or not raw:
+        return
+    try:
+        detail = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(detail, dict):
+        return
+
+    for field in AI_TEXT_DETAIL_STR_FIELDS:
+        value = detail.get(field)
+        if isinstance(value, str) and value:
+            detail[field] = transform(value, f"{AI_TEXT_DETAIL_FIELD}.{field}")
+
+    for list_field in AI_TEXT_DETAIL_LIST_FIELDS:
+        items = detail.get(list_field)
+        if not isinstance(items, list):
+            continue
+        new_items: list[Any] = []
+        for idx, item in enumerate(items):
+            if isinstance(item, str) and item:
+                label = f"{AI_TEXT_DETAIL_FIELD}.{list_field}[{idx}]"
+                new_items.append(transform(item, label))
+            else:
+                new_items.append(item)
+        detail[list_field] = new_items
+
+    session[AI_TEXT_DETAIL_FIELD] = json.dumps(detail)
+
+
 def apply_share_redactions(
     conn: sqlite3.Connection,
     session: dict[str, Any],
@@ -1171,6 +1267,16 @@ def apply_share_redactions(
                             custom_strings,
                         )
                         custom_total += count
+
+        custom_ai_count = [0]
+
+        def _custom_transform(text: str, _label: str) -> str:
+            new_text, n = _redact_custom_strings_in_value(text, custom_strings)
+            custom_ai_count[0] += n
+            return new_text
+
+        _apply_to_ai_text(session, _custom_transform)
+        custom_total += custom_ai_count[0]
 
         total_redactions += custom_total
 
@@ -1217,6 +1323,21 @@ def apply_share_redactions(
                         domain_total += count
                         domain_log.extend(entries)
 
+        domain_ai_count = [0]
+
+        def _domain_transform(text: str, label: str) -> str:
+            new_text, n, entries = _redact_blocked_domains_in_value(
+                text,
+                domain_patterns,
+                field=label,
+            )
+            domain_ai_count[0] += n
+            domain_log.extend(entries)
+            return new_text
+
+        _apply_to_ai_text(session, _domain_transform)
+        domain_total += domain_ai_count[0]
+
         total_redactions += domain_total
         redaction_log.extend(domain_log)
 
@@ -1235,6 +1356,8 @@ def apply_share_redactions(
                         tool_use[tool_field],
                         anonymizer.text,
                     )
+
+    _apply_to_ai_text(session, lambda text, _label: anonymizer.text(text))
 
     session_id = str(session.get("session_id") or "")
     if not session_id:
@@ -1778,11 +1901,14 @@ def query_sessions(
     conn: sqlite3.Connection,
     *,
     status: str | None = None,
-    source: str | None = None,
+    source: str | list[str] | tuple[str, ...] | None = None,
     project: str | None = None,
     task_type: str | None = None,
+    recovery_label: str | None = None,
+    failure_attribution: str | None = None,
+    failure_mode: str | None = None,
     search_text: str | None = None,
-    sort: str = "start_time",
+    sort: str = "ai_failure_value_score",
     order: str = "desc",
     limit: int = 50,
     offset: int = 0,
@@ -1799,7 +1925,7 @@ def query_sessions(
         "project", "source", "model", "model_effort", "review_status", "task_type",
         "user_messages", "assistant_messages", "tool_uses",
         "input_tokens", "output_tokens", "duration_seconds",
-        "sensitivity_score", "ai_quality_score",
+        "sensitivity_score", "ai_quality_score", "ai_failure_value_score",
     }
     if sort not in allowed_sort_columns:
         sort = "start_time"
@@ -1824,27 +1950,52 @@ def query_sessions(
         where_clauses.append("s.review_status = ?")
         params.append(status)
     if source is not None:
-        where_clauses.append("s.source = ?")
-        params.append(source)
+        if isinstance(source, (list, tuple)):
+            values = [s for s in source if s]
+            if values:
+                where_clauses.append(f"s.source IN ({','.join('?' for _ in values)})")
+                params.extend(values)
+        else:
+            where_clauses.append("s.source = ?")
+            params.append(source)
     if project is not None:
         where_clauses.append("s.project = ?")
         params.append(project)
     if task_type is not None:
         where_clauses.append("COALESCE(s.ai_task_type, s.task_type) = ?")
         params.append(task_type)
+    if recovery_label is not None:
+        where_clauses.append(
+            "EXISTS (SELECT 1 FROM json_each(COALESCE(s.ai_recovery_labels, '[]')) WHERE value = ?)"
+        )
+        params.append(recovery_label)
+    if failure_attribution is not None:
+        where_clauses.append("s.ai_failure_attribution = ?")
+        params.append(failure_attribution)
+    if failure_mode is not None:
+        where_clauses.append(
+            "EXISTS (SELECT 1 FROM json_each(COALESCE(s.ai_failure_modes, '[]')) WHERE value = ?)"
+        )
+        params.append(failure_mode)
     if exclude_segmented_parents:
         where_clauses.append("s.review_status != 'segmented'")
 
     sql = base
     for clause in where_clauses:
         sql += f" AND {clause}"
-    # "Best first" should really mean "recent 5-star first, then lower
+    # Productivity sort should mean "recent 5-star first, then lower
     # scores, then unscored at the bottom" — a lone ``ORDER BY
     # ai_quality_score DESC`` puts NULLs at the TOP in SQLite (NULL >
     # any value when descending) AND shuffles old 5-star sessions over
     # new ones arbitrarily. The composite tiebreak fixes both:
     # non-NULL first, then score DESC, then newest within each score.
-    if sort == "ai_quality_score":
+    if sort == "ai_failure_value_score":
+        sql += (
+            " ORDER BY (s.ai_failure_value_score IS NULL), "
+            f"s.ai_failure_value_score {order.upper()}, "
+            "s.start_time DESC LIMIT ? OFFSET ?"
+        )
+    elif sort == "ai_quality_score":
         sql += (
             " ORDER BY (s.ai_quality_score IS NULL), "
             f"s.ai_quality_score {order.upper()}, "
@@ -1891,7 +2042,10 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, A
         result["messages"] = []
 
     # Parse JSON fields
-    for field in ("value_badges", "risk_badges", "files_touched", "commands_run"):
+    for field in (
+        "value_badges", "risk_badges", "files_touched", "commands_run",
+        "ai_recovery_labels", "ai_failure_modes",
+    ):
         val = result.get(field)
         if isinstance(val, str):
             try:
@@ -1919,6 +2073,15 @@ def update_session(
     ai_value_badges: str | None = None,
     ai_risk_badges: str | None = None,
     ai_display_title: str | None = None,
+    ai_failure_value_score: int | None = None,
+    ai_recovery_labels: str | None = None,
+    ai_failure_attribution: str | None = None,
+    ai_failure_modes: str | None = None,
+    ai_learning_summary: str | None = None,
+    ai_scorer_backend: str | None = None,
+    ai_scorer_model: str | None = None,
+    ai_rubric_git_sha: str | None = None,
+    ai_scored_at: str | None = None,
 ) -> bool:
     """Update review fields on a session.
 
@@ -1928,6 +2091,10 @@ def update_session(
     if ai_quality_score is not None:
         ai_quality_score = int(ai_quality_score)
         if not (1 <= ai_quality_score <= 5):
+            return False
+    if ai_failure_value_score is not None:
+        ai_failure_value_score = int(ai_failure_value_score)
+        if not (1 <= ai_failure_value_score <= 5):
             return False
 
     row = conn.execute(
@@ -1995,6 +2162,42 @@ def update_session(
     if ai_display_title is not None:
         updates.append("ai_display_title = ?")
         params.append(ai_display_title)
+
+    if ai_failure_value_score is not None:
+        updates.append("ai_failure_value_score = ?")
+        params.append(ai_failure_value_score)
+
+    if ai_recovery_labels is not None:
+        updates.append("ai_recovery_labels = ?")
+        params.append(ai_recovery_labels)
+
+    if ai_failure_attribution is not None:
+        updates.append("ai_failure_attribution = ?")
+        params.append(ai_failure_attribution)
+
+    if ai_failure_modes is not None:
+        updates.append("ai_failure_modes = ?")
+        params.append(ai_failure_modes)
+
+    if ai_learning_summary is not None:
+        updates.append("ai_learning_summary = ?")
+        params.append(ai_learning_summary)
+
+    if ai_scorer_backend is not None:
+        updates.append("ai_scorer_backend = ?")
+        params.append(ai_scorer_backend)
+
+    if ai_scorer_model is not None:
+        updates.append("ai_scorer_model = ?")
+        params.append(ai_scorer_model)
+
+    if ai_rubric_git_sha is not None:
+        updates.append("ai_rubric_git_sha = ?")
+        params.append(ai_rubric_git_sha)
+
+    if ai_scored_at is not None:
+        updates.append("ai_scored_at = ?")
+        params.append(ai_scored_at)
 
     if not updates:
         return True
@@ -2214,9 +2417,10 @@ def query_unscored_sessions(
     conn: sqlite3.Connection,
     *,
     limit: int = 50,
-    source: str | None = None,
+    source: str | list[str] | tuple[str, ...] | None = None,
+    since: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return sessions where ai_quality_score IS NULL.
+    """Return sessions missing either legacy quality or failure-value score.
 
     Returns a list of dicts with session_id, display_title, task_type,
     outcome_badge, project, and source.
@@ -2224,11 +2428,57 @@ def query_unscored_sessions(
     params: list[Any] = []
     sql = (
         "SELECT session_id, display_title, task_type, outcome_badge, project, source "
-        "FROM sessions WHERE ai_quality_score IS NULL"
+        "FROM sessions WHERE (ai_quality_score IS NULL OR ai_failure_value_score IS NULL)"
+    )
+    if since is not None:
+        sql += " AND start_time >= ?"
+        params.append(since)
+    if source is not None:
+        if isinstance(source, (list, tuple)):
+            values = [s for s in source if s]
+            if values:
+                sql += f" AND source IN ({','.join('?' for _ in values)})"
+                params.extend(values)
+        else:
+            sql += " AND source = ?"
+            params.append(source)
+    sql += " ORDER BY start_time DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def query_sessions_for_rescore(
+    conn: sqlite3.Connection,
+    *,
+    window_days: int = 7,
+    source: str | list[str] | tuple[str, ...] | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return sessions within a recent time window for rescoring.
+
+    Unlike :func:`query_unscored_sessions`, this returns sessions
+    *regardless* of whether they have an ``ai_failure_value_score`` —
+    the caller is explicitly rebuilding scores within a bounded window
+    (e.g. after a rubric change). Filters by ``start_time`` (rolling
+    window from ``now()``) and an optional source scope.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    params: list[Any] = [cutoff]
+    sql = (
+        "SELECT session_id, display_title, task_type, outcome_badge, project, source "
+        "FROM sessions WHERE start_time >= ?"
     )
     if source is not None:
-        sql += " AND source = ?"
-        params.append(source)
+        if isinstance(source, (list, tuple)):
+            values = [s for s in source if s]
+            if values:
+                sql += f" AND source IN ({','.join('?' for _ in values)})"
+                params.extend(values)
+        else:
+            sql += " AND source = ?"
+            params.append(source)
     sql += " ORDER BY start_time DESC LIMIT ?"
     params.append(limit)
 
@@ -2544,6 +2794,45 @@ def get_dashboard_analytics(
         f"SELECT COUNT(*) as cnt FROM sessions {unscored_where}",
         unscored_params,
     ).fetchone()["cnt"]
+
+    failure_scored_where, failure_scored_params = _build_start_time_where(
+        start=start, end=end, base_clauses=["ai_failure_value_score IS NOT NULL"],
+    )
+    rows = conn.execute(
+        "SELECT ai_failure_value_score as score, COUNT(*) as count FROM sessions "
+        f"{failure_scored_where} GROUP BY ai_failure_value_score ORDER BY ai_failure_value_score",
+        failure_scored_params,
+    ).fetchall()
+    result["by_failure_value_score"] = [dict(r) for r in rows]
+    result["high_value_failure_count"] = conn.execute(
+        f"SELECT COUNT(*) as cnt FROM sessions {failure_scored_where} "
+        "AND ai_failure_value_score >= 4",
+        failure_scored_params,
+    ).fetchone()["cnt"]
+
+    rows = conn.execute(
+        "SELECT ai_failure_attribution as attribution, COUNT(*) as count FROM sessions "
+        f"{failure_scored_where} AND ai_failure_attribution IS NOT NULL "
+        "AND ai_failure_attribution != '' GROUP BY ai_failure_attribution ORDER BY count DESC",
+        failure_scored_params,
+    ).fetchall()
+    result["by_failure_attribution"] = [dict(r) for r in rows]
+
+    rows = conn.execute(
+        "SELECT json_each.value as recovery_label, COUNT(*) as count "
+        f"FROM sessions, json_each(COALESCE(ai_recovery_labels, '[]')) {failure_scored_where} "
+        "GROUP BY json_each.value ORDER BY count DESC",
+        failure_scored_params,
+    ).fetchall()
+    result["by_recovery_label"] = [dict(r) for r in rows]
+
+    rows = conn.execute(
+        "SELECT json_each.value as failure_mode, COUNT(*) as count "
+        f"FROM sessions, json_each(COALESCE(ai_failure_modes, '[]')) {failure_scored_where} "
+        "GROUP BY json_each.value ORDER BY count DESC",
+        failure_scored_params,
+    ).fetchall()
+    result["by_failure_mode"] = [dict(r) for r in rows]
 
     # By agent (derived from source + client_origin + runtime_channel)
     rows = conn.execute(
@@ -3063,15 +3352,16 @@ def get_share_ready_stats(
 
     By default returns only `review_status='approved'` sessions; pass
     `include_unapproved=True` to widen the pool so the Preview UI can
-    offer non-approved sessions for selection (Package will auto-approve
-    them on the way through). Approved sessions are listed first; within
-    each tier, ordered by recency. The first 10 approved sessions become
-    the default recommendation.
+    offer non-approved sessions for explicit review. Approved high-value
+    failure traces are recommended first; unapproved high-value failures
+    remain visible but are never auto-approved by this API.
     """
     where_status = "" if include_unapproved else " WHERE review_status = 'approved'"
     rows = conn.execute(
         "SELECT session_id, project, model, source, display_title,"
-        " ai_quality_score, user_messages, assistant_messages, tool_uses,"
+        " ai_quality_score, ai_failure_value_score, ai_recovery_labels,"
+        " ai_failure_attribution, ai_failure_modes, ai_learning_summary,"
+        " user_messages, assistant_messages, tool_uses,"
         " input_tokens, output_tokens, outcome_badge, client_origin,"
         " runtime_channel, start_time, review_status"
         " FROM sessions"
@@ -3090,13 +3380,23 @@ def get_share_ready_stats(
         "   )"
         " )"
         " ORDER BY (review_status = 'approved') DESC,"
+        " (ai_failure_value_score IS NULL), ai_failure_value_score DESC,"
         " start_time DESC, ai_quality_score DESC"
     ).fetchall()
     cols = ["session_id", "project", "model", "source", "display_title",
-            "ai_quality_score", "user_messages", "assistant_messages",
-            "tool_uses", "input_tokens", "output_tokens", "outcome_badge",
-            "client_origin", "runtime_channel", "start_time", "review_status"]
+            "ai_quality_score", "ai_failure_value_score", "ai_recovery_labels",
+            "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
+            "user_messages", "assistant_messages", "tool_uses", "input_tokens",
+            "output_tokens", "outcome_badge", "client_origin", "runtime_channel",
+            "start_time", "review_status"]
     sessions = [dict(zip(cols, r)) for r in rows]
+    for session in sessions:
+        for field in ("ai_recovery_labels", "ai_failure_modes"):
+            if isinstance(session.get(field), str):
+                try:
+                    session[field] = json.loads(session[field])
+                except (json.JSONDecodeError, ValueError):
+                    session[field] = []
     if excluded_projects:
         sessions = [
             session for session in sessions
@@ -3110,12 +3410,12 @@ def get_share_ready_stats(
         if s.get("model"):
             models.add(s["model"])
     approved_sessions = [s for s in sessions if s.get("review_status") == "approved"]
+    has_failure_scores = any(s.get("ai_failure_value_score") is not None for s in sessions)
 
-    # Default recommendation: 5 five-star approved traces, prioritising the
-    # last 7 days but falling back to older 5-star traces if the recent
-    # window is thin. Never mix in <5-star — quality matters more than
-    # recency here. The sessions list is already sorted start_time DESC so
-    # iterating preserves recency within each tier.
+    # Default recommendation: approved high-value failure traces from in-scope
+    # sources. Recent rows dominate, with older approved high-value failures as
+    # backfill. Unapproved failures are shown to the user for review, not added
+    # to the package by default.
     recent_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
 
     def _is_recent(start_time: str | None) -> bool:
@@ -3129,85 +3429,54 @@ def get_share_ready_stats(
             ts = ts.replace(tzinfo=timezone.utc)
         return ts >= recent_cutoff
 
-    # Recommender tiers, in priority order:
-    #
-    #   1. Recent 5-star (<=7 days old) — approved or unreviewed,
-    #      newest first. Dominates the top slots so the user sees
-    #      recently-scored high-quality work, never week-old traces
-    #      just because they're approved.
-    #   2. Recent substantive unscored (<=2 days old, >=2 messages)
-    #      so today's real work can still surface when the scorer
-    #      hasn't caught up yet — but the 5-star tier has already
-    #      claimed the top of the list.
-    #   3. Older approved 5-star as final backfill.
-    #
-    # Sort locally by ``start_time DESC`` — the outer SELECT
-    # tier-sorts approved ahead of new for the list-view use case,
-    # but the recommender wants pure recency within a tier.
-    recent_cutoff_tight = datetime.now(timezone.utc) - timedelta(days=2)
-
-    def _is_very_recent(start_time: str | None) -> bool:
-        if not start_time:
-            return False
-        try:
-            ts = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts >= recent_cutoff_tight
-
     recent_sessions = sorted(
         (s for s in sessions if _is_recent(s.get("start_time"))),
-        key=lambda s: s.get("start_time") or "",
+        key=lambda s: (
+            s.get("ai_failure_value_score") or 0,
+            s.get("start_time") or "",
+        ),
         reverse=True,
     )
 
     recommended_pool: list[dict] = []
     seen_ids: set[str] = set()
 
-    # Tier 1: recent 5-star, newest first. No quality-<3 gate needed
-    # here since score==5 is the filter.
+    def _is_high_value_failure(session: dict[str, Any]) -> bool:
+        score = session.get("ai_failure_value_score")
+        if score is None and not has_failure_scores:
+            # Transitional fallback for pre-migration databases. Once any
+            # failure-value scores exist in the visible pool, recommendations
+            # are strictly failure-value based.
+            score = session.get("ai_quality_score")
+        return (
+            session.get("review_status") == "approved"
+            and session.get("source") in FAILURE_VALUE_SOURCE_SCOPE
+            and (score or 0) >= 4
+        )
+
+    # Tier 1: recent approved high-value failures.
     for session in recent_sessions:
         if len(recommended_pool) >= 5:
             break
         sid = session.get("session_id")
         if not sid or sid in seen_ids:
             continue
-        if session.get("ai_quality_score") != 5:
+        if not _is_high_value_failure(session):
             continue
         recommended_pool.append(session)
         seen_ids.add(sid)
 
-    # Tier 2: very-recent substantive unscored (last 2 days) so
-    # today's work surfaces even before `clawjournal score` runs.
-    # Explicitly-low-quality (1-2 stars) excluded.
+    # Tier 2: older approved high-value failures.
     if len(recommended_pool) < 5:
-        for session in recent_sessions:
-            if len(recommended_pool) >= 5:
-                break
-            sid = session.get("session_id")
-            if not sid or sid in seen_ids:
-                continue
-            if not _is_very_recent(session.get("start_time")):
-                continue
-            score = session.get("ai_quality_score")
-            if score is not None and score <= 2:
-                continue
-            user_msgs = session.get("user_messages") or 0
-            assistant_msgs = session.get("assistant_messages") or 0
-            if user_msgs < 2 and assistant_msgs < 2:
-                continue
-            recommended_pool.append(session)
-            seen_ids.add(sid)
-
-    five_star = [s for s in approved_sessions if s.get("ai_quality_score") == 5]
-    five_star_older = [s for s in five_star if not _is_recent(s.get("start_time"))]
-
-    # Tier 3: older approved 5-star backfill — only if we still
-    # haven't reached 5 after tiers 1 and 2.
-    if len(recommended_pool) < 5:
-        for session in five_star_older:
+        older_high_value = sorted(
+            (s for s in approved_sessions if not _is_recent(s.get("start_time")) and _is_high_value_failure(s)),
+            key=lambda s: (
+                s.get("ai_failure_value_score") or 0,
+                s.get("start_time") or "",
+            ),
+            reverse=True,
+        )
+        for session in older_high_value:
             if len(recommended_pool) >= 5:
                 break
             sid = session.get("session_id")
@@ -3281,7 +3550,9 @@ EXPORT_FIELDS = {
     "input_tokens", "output_tokens",
     "display_title", "messages",
     "outcome_badge", "value_badges", "risk_badges",
-    "ai_quality_score", "task_type",
+    "ai_quality_score", "ai_failure_value_score", "ai_recovery_labels",
+    "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
+    "ai_scoring_detail", "task_type",
     # NOTE: files_touched and commands_run are intentionally excluded from
     # exports — they contain unredacted file paths and shell commands that
     # could leak internal project structure or sensitive information.

@@ -959,16 +959,33 @@ def apply_findings_to_session(
     if not session_findings:
         return session, 0
 
-    for meta_field in ("project", "git_branch", "display_title"):
+    for meta_field in (
+        "project", "git_branch", "display_title",
+        "ai_learning_summary", "ai_score_reason", "ai_display_title",
+        "ai_summary",
+    ):
         value = session.get(meta_field)
         if isinstance(value, str):
             new_value, n = apply_findings_to_text(value, session_findings)
             session[meta_field] = new_value
             total += n
 
+    raw_detail = session.get("ai_scoring_detail")
+    if isinstance(raw_detail, str) and raw_detail:
+        try:
+            detail = json.loads(raw_detail)
+        except json.JSONDecodeError:
+            new_value, n = apply_findings_to_text(raw_detail, session_findings)
+            session["ai_scoring_detail"] = new_value
+            total += n
+        else:
+            redacted_detail, n = _apply_findings_to_value(detail, session_findings)
+            session["ai_scoring_detail"] = json.dumps(redacted_detail)
+            total += n
+
     messages = session.get("messages", [])
     if not isinstance(messages, list):
-        return session, 0
+        return session, total
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -995,3 +1012,28 @@ def apply_findings_to_session(
                     tool_use[branch] = new_value
                     total += n
     return session, total
+
+
+def _apply_findings_to_value(
+    value: Any,
+    findings: list[PIIFinding],
+) -> tuple[Any, int]:
+    if isinstance(value, str):
+        return apply_findings_to_text(value, findings)
+    if isinstance(value, list):
+        total = 0
+        out: list[Any] = []
+        for item in value:
+            redacted, n = _apply_findings_to_value(item, findings)
+            out.append(redacted)
+            total += n
+        return out, total
+    if isinstance(value, dict):
+        total = 0
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            redacted, n = _apply_findings_to_value(item, findings)
+            out[key] = redacted
+            total += n
+        return out, total
+    return value, 0

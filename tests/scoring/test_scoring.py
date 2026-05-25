@@ -66,6 +66,20 @@ def _tool_use(tool: str, inp: str = "", output: str = "", status: str = "success
     }
 
 
+def _failure_fields(**overrides) -> dict:
+    payload = {
+        "ai_quality_score": 4,
+        "ai_failure_value_score": 4,
+        "ai_recovery_labels": ["user_corrected_recovery"],
+        "ai_failure_attribution": "agent_caused",
+        "ai_failure_modes": ["wrong_assumption"],
+        "ai_failure_evidence": ["User corrected the assumption."],
+        "ai_learning_summary": "The trace shows a corrected agent assumption.",
+    }
+    payload.update(overrides)
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # get_message_text
 # ---------------------------------------------------------------------------
@@ -509,6 +523,7 @@ class TestBackendSelection:
             captured["codex_output_schema"] = kw.get("codex_output_schema")
             scoring = {
                 "substance": 4,
+                **_failure_fields(ai_quality_score=4),
                 "reasoning": "Good session",
                 "display_title": "Fix auth tests",
                 "summary": "Fixed auth tests.",
@@ -544,6 +559,7 @@ class TestBackendSelection:
             captured["session_payload"] = json.loads((cwd / "session.json").read_text())
             scoring = {
                 "substance": 4,
+                **_failure_fields(ai_quality_score=4),
                 "reasoning": "Good session",
                 "display_title": "Fix auth tests",
                 "summary": "Fixed auth tests.",
@@ -618,6 +634,7 @@ class TestBackendSelection:
 
         scoring = {
             "substance": 5,
+            **_failure_fields(ai_quality_score=5, ai_failure_value_score=5),
             "reasoning": "Excellent session",
             "display_title": "Add retry logic",
             "summary": "Added retry logic to the API client.",
@@ -681,6 +698,7 @@ class TestBackendSelection:
 
 _VALID_JUDGE = {
     "substance": 4,
+    **_failure_fields(ai_quality_score=4),
     "reasoning": "Good",
     "display_title": "Fix bug",
     "summary": "Fixed a bug in the auth module.",
@@ -712,6 +730,25 @@ class TestReadScoringOutput:
         )
         parsed = _read_scoring_output(result, "openclaw")
         assert parsed["substance"] == 4
+
+    def test_live_backend_output_requires_failure_fields(self, tmp_path):
+        legacy_payload = {
+            "substance": 4,
+            "reasoning": "Good",
+            "display_title": "Fix bug",
+            "summary": "Fixed a bug.",
+            "resolution": "resolved",
+            "effort_estimate": 0.4,
+            "task_type": "debugging",
+            "session_tags": [],
+            "privacy_flags": [],
+            "project_areas": [],
+        }
+        result = AgentResult(
+            stdout=json.dumps(legacy_payload), stderr="", returncode=0, cwd=tmp_path,
+        )
+        with pytest.raises(RuntimeError, match="failure-value fields"):
+            _read_scoring_output(result, "openclaw")
 
     def test_openclaw_empty_stdout_raises(self, tmp_path):
         result = AgentResult(stdout="", stderr="", returncode=0, cwd=tmp_path)

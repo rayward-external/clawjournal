@@ -79,6 +79,9 @@ export const api = {
       source?: string | null;
       project?: string | null;
       task_type?: string | null;
+      recovery_label?: string | null;
+      failure_attribution?: string | null;
+      failure_mode?: string | null;
       q?: string | null;
       sort?: string;
       order?: string;
@@ -101,7 +104,7 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`);
     },
 
-    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
+    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; ai_failure_value_score?: number; ai_recovery_labels?: string[]; ai_failure_attribution?: string; ai_failure_modes?: string[]; ai_learning_summary?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
       return request(`/sessions/${encodeURIComponent(id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -127,6 +130,11 @@ export const api = {
     score(id: string, body?: { backend?: string; model?: string }): Promise<{
       ok: boolean;
       ai_quality_score?: number;
+      ai_failure_value_score?: number;
+      ai_recovery_labels?: string[];
+      ai_failure_attribution?: string;
+      ai_failure_modes?: string[];
+      ai_learning_summary?: string;
       reason?: string;
       task_type?: string;
       outcome?: string;
@@ -160,7 +168,7 @@ export const api = {
     return request('/projects');
   },
 
-  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
+  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; ai_failure_value_score: number | null; ai_recovery_labels: string[]; ai_failure_attribution: string | null; ai_failure_modes: string[]; ai_learning_summary: string | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
     const q = opts?.includeUnapproved ? '?include_unapproved=1' : '';
     return request(`/share-ready${q}`);
   },

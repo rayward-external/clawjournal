@@ -28,6 +28,11 @@ export interface Session {
   reviewer_notes: string | null;
   reviewed_at: string | null;
   ai_quality_score: number | null;
+  ai_failure_value_score: number | null;
+  ai_recovery_labels: string[];
+  ai_failure_attribution: string | null;
+  ai_failure_modes: string[];
+  ai_learning_summary: string | null;
   ai_score_reason: string | null;
   ai_summary: string | null;
   ai_effort_estimate: number | null;
@@ -168,6 +173,10 @@ export interface SharePreviewSession {
   output_tokens: number;
   first_user_message: string;
   ai_quality_score: number | null;
+  ai_failure_value_score: number | null;
+  ai_failure_attribution: string | null;
+  ai_recovery_labels: string[];
+  ai_failure_modes: string[];
 }
 
 export interface SharePreview {
@@ -262,6 +271,11 @@ export interface DashboardData {
   by_agent: { agent: string; count: number }[];
   tokens_by_source: { source: string; input_tokens: number; output_tokens: number }[];
   by_quality_score: { score: number; count: number }[];
+  by_failure_value_score?: { score: number; count: number }[];
+  high_value_failure_count?: number;
+  by_failure_attribution?: { attribution: string; count: number }[];
+  by_recovery_label?: { recovery_label: string; count: number }[];
+  by_failure_mode?: { failure_mode: string; count: number }[];
   unscored_count: number;
   resolve_rate: number | null;
   resolve_rate_previous: number | null;
