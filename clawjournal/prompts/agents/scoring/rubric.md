@@ -84,6 +84,11 @@ Emit zero or more:
 
 Use an empty list for smooth success, trivial sessions, or control samples.
 
+`user_corrected_recovery` requires actual recovery — if the user corrected the
+agent and the agent still did not fix the failure, emit `unrecovered` instead.
+The two labels can coexist only across distinct failures: e.g. a session with
+one user-corrected fix and one separate unresolved bug emits both.
+
 ## Failure Attribution / `ai_failure_attribution`
 
 Emit one scalar for the most consequential failure:
@@ -93,6 +98,11 @@ Emit one scalar for the most consequential failure:
 - `preexisting_problem`
 - `user_redirect`
 - `unclear`
+
+If no failure is present (`ai_failure_value_score == 1` and `ai_recovery_labels`
+is empty), emit empty string `""` for attribution. Do not default to `unclear`
+in that case — `unclear` means a failure happened but cause cannot be assigned
+from the trace evidence.
 
 ## Failure Modes / `ai_failure_modes`
 
@@ -176,10 +186,13 @@ fact.
 `project_areas`: zero or more directory paths/modules, omitted for trivial
 sessions.
 
-`ai_failure_evidence`: zero or more short evidence snippets or paraphrases.
-Keep them short; they are stored in scoring detail, not query columns.
+`ai_failure_evidence`: up to 8 short evidence snippets or paraphrases, each
+under 220 characters. Items beyond the limits are silently dropped/truncated
+by the validator — don't waste tokens on long evidence. Stored inside the
+scoring detail JSON, not in a query column.
 
-`ai_learning_summary`: one concise sentence naming what the failure teaches.
+`ai_learning_summary`: one concise sentence (under 500 characters) naming
+what the failure teaches. Truncated by the validator past that length.
 
 ## Output Example
 
