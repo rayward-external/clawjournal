@@ -119,6 +119,10 @@ Emit every applicable mode:
 - `blocker_mishandled`: handled an env/deps/creds/data blocker poorly. The
   mishandling is the failure, not the blocker itself.
 
+Use an empty list when no failure is present (`ai_failure_value_score == 1`).
+Consistent with the empty-attribution and empty-recovery-labels rules for
+the no-failure case.
+
 `user_correction` and `self_recovery` are recovery labels, not failure modes.
 
 ## STEM-Specific Evidence
@@ -218,5 +222,30 @@ what the failure teaches. Truncated by the validator past that length.
   "session_tags": ["agent_failure", "user_correction", "statistics", "recovery"],
   "privacy_flags": [],
   "project_areas": []
+}
+```
+
+Smooth-success / no-failure example — note the empty failure fields and
+empty attribution string:
+
+```json
+{
+  "substance": 4,
+  "ai_quality_score": 4,
+  "resolution": "resolved",
+  "ai_failure_value_score": 1,
+  "ai_recovery_labels": [],
+  "ai_failure_attribution": "",
+  "ai_failure_modes": [],
+  "ai_failure_evidence": [],
+  "ai_learning_summary": "",
+  "reasoning": "Routine implementation; tests pass, no agent failure to capture.",
+  "display_title": "Add pagination to /users",
+  "summary": "Added pagination to the /users endpoint. Tests pass and the user confirmed.",
+  "effort_estimate": 0.35,
+  "task_type": "feature",
+  "session_tags": ["api", "backend"],
+  "privacy_flags": [],
+  "project_areas": ["routes/", "tests/"]
 }
 ```
