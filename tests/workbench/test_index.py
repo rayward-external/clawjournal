@@ -21,6 +21,7 @@ from clawjournal.workbench.index import (
     link_subagent_hierarchy,
     open_index,
     query_sessions,
+    query_sessions_for_rescore,
     query_unscored_sessions,
     remove_policy,
     search_fts,
@@ -441,6 +442,78 @@ class TestQueryUnscoredSessions:
         )
 
         assert [row["session_id"] for row in results] == ["recent"]
+
+    def test_skips_segmented_parents(self, index_conn):
+        """Segmented parent sessions are not directly scorable — their
+        per-segment children carry the content. The daemon scanner and
+        score --batch must skip them or they burn judge calls on the
+        umbrella row."""
+        upsert_sessions(index_conn, [
+            _make_session("plain-unscored"),
+            _make_session("parent-segmented"),
+        ])
+        update_session(index_conn, "parent-segmented", status="segmented")
+
+        results = query_unscored_sessions(index_conn, source=["claude"])
+        ids = [row["session_id"] for row in results]
+        assert "plain-unscored" in ids
+        assert "parent-segmented" not in ids
+
+
+class TestQuerySessionsForRescore:
+    def test_returns_sessions_regardless_of_existing_score(self, index_conn):
+        """`clawjournal rescore --window` must overwrite, so the query
+        returns scored sessions too — the difference from
+        `query_unscored_sessions`."""
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        upsert_sessions(index_conn, [
+            _make_session("scored", start_time=now_iso),
+            _make_session("unscored", start_time=now_iso),
+        ])
+        # Mark "scored" as already scored under both rubrics.
+        update_session(
+            index_conn, "scored",
+            ai_quality_score=4,
+            ai_failure_value_score=4,
+        )
+
+        results = query_sessions_for_rescore(
+            index_conn, window_days=7, source=["claude"],
+        )
+        ids = {row["session_id"] for row in results}
+        assert ids == {"scored", "unscored"}
+
+    def test_window_excludes_old_sessions(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("old", start_time="2025-01-01T00:00:00+00:00"),
+            _make_session("recent",
+                          start_time="2026-05-24T00:00:00+00:00"),
+        ])
+
+        results = query_sessions_for_rescore(
+            index_conn, window_days=7, source=["claude"],
+        )
+        # "recent" is from 2026-05-24; with a default current-time clock,
+        # only sessions inside ``now - 7 days`` qualify. The old session
+        # must never appear.
+        assert "old" not in {row["session_id"] for row in results}
+
+    def test_skips_segmented_parents(self, index_conn):
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        upsert_sessions(index_conn, [
+            _make_session("plain", start_time=now_iso),
+            _make_session("parent-segmented", start_time=now_iso),
+        ])
+        update_session(index_conn, "parent-segmented", status="segmented")
+
+        results = query_sessions_for_rescore(
+            index_conn, window_days=7, source=["claude"],
+        )
+        ids = {row["session_id"] for row in results}
+        assert "plain" in ids
+        assert "parent-segmented" not in ids
 
 
 class TestSearchFts:

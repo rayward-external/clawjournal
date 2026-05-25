@@ -2423,12 +2423,15 @@ def query_unscored_sessions(
     """Return sessions missing either legacy quality or failure-value score.
 
     Returns a list of dicts with session_id, display_title, task_type,
-    outcome_badge, project, and source.
+    outcome_badge, project, and source. Segmented parent sessions
+    (``review_status='segmented'``) are skipped — their scorable content
+    lives in the per-segment child rows, not the parent umbrella.
     """
     params: list[Any] = []
     sql = (
         "SELECT session_id, display_title, task_type, outcome_badge, project, source "
-        "FROM sessions WHERE (ai_quality_score IS NULL OR ai_failure_value_score IS NULL)"
+        "FROM sessions WHERE (ai_quality_score IS NULL OR ai_failure_value_score IS NULL) "
+        "AND review_status != 'segmented'"
     )
     if since is not None:
         sql += " AND start_time >= ?"
@@ -2462,13 +2465,15 @@ def query_sessions_for_rescore(
     *regardless* of whether they have an ``ai_failure_value_score`` —
     the caller is explicitly rebuilding scores within a bounded window
     (e.g. after a rubric change). Filters by ``start_time`` (rolling
-    window from ``now()``) and an optional source scope.
+    window from ``now()``) and an optional source scope. Segmented
+    parent sessions are skipped — the scorable content lives in their
+    per-segment child rows.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
     params: list[Any] = [cutoff]
     sql = (
         "SELECT session_id, display_title, task_type, outcome_badge, project, source "
-        "FROM sessions WHERE start_time >= ?"
+        "FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
     )
     if source is not None:
         if isinstance(source, (list, tuple)):

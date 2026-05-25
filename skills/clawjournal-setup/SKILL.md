@@ -89,15 +89,17 @@ If zero sessions found:
 
 ## 3. Score & Auto-Triage (optional but recommended)
 
-Ask: "Would you like me to auto-score your sessions? This uses AI to rate quality 1-5 and auto-approve high-quality traces."
+Ask: "Would you like me to auto-score your sessions? Each session gets two AI ratings: a productivity score (1-5, legacy) and a failure-value score (1-5, the new primary signal for finding teachable agent failures on real work)."
 
 If yes:
 
 ```bash
-~/.clawjournal-venv/bin/clawjournal score --batch --auto-triage
+~/.clawjournal-venv/bin/clawjournal score --batch --source failure-v1 --auto-triage
 ```
 
-Show summary: "N auto-approved (quality 4-5), M auto-blocked (1-2), K need review."
+`--source failure-v1` scopes to the supported sources (claude, codex, opencode, openclaw); auto-triage archives productivity-1 noise sessions.
+
+Show summary: "N sessions scored. Productivity distribution: ... Failure-value distribution: ... M auto-archived as productivity-1 noise."
 
 If no: skip to Step 4.
 
