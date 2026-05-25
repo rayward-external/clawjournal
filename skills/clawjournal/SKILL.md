@@ -74,12 +74,14 @@ Present the traces to the user as a numbered list showing title, source, badges,
 
 ```bash
 clawjournal scan
-clawjournal score --batch --auto-triage
+clawjournal score --batch --source failure-v1 --auto-triage
 ```
+
+`--source failure-v1` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: productivity (legacy) and failure-value (the new primary signal for finding teachable agent failures).
 
 Present summary:
 
-> Found 47 sessions. 23 auto-approved (quality 4-5), 8 auto-blocked (1-2), 16 need review.
+> Found 47 sessions. 23 scored. Productivity 4-5: 14, productivity 1-2: 8 (auto-archived). Failure-value 4-5: 9 (high-value failure traces — review first). 16 still need review.
 
 Ask:
 > How would you like to review?
@@ -108,10 +110,12 @@ Parse the JSON. Present up to 10 sessions at a time:
 
 > 23 approved sessions. Here are the first 10:
 >
-> 1. Fix auth bug (score 5) — Excellent debugging session with clear root cause analysis.
-> 2. Refactor DB layer (score 4) — Clean refactor with good test coverage.
-> 3. Add parser tests (score 4) — Solid test writing for edge cases.
+> 1. Fix auth bug (failure 5 · productivity 5) — Agent's first patch broke a different test; user corrected; agent recovered with the right fix.
+> 2. Refactor DB layer (failure 1 · productivity 4) — Clean refactor, no failure signal.
+> 3. Add parser tests (failure 4 · productivity 4) — Agent claimed coverage; tests didn't actually exercise the new branch until user pointed it out.
 > ...
+
+Failure value is shown first because it's the primary signal for this corpus — a high failure value means the trace teaches something about agent behavior (failures + recoveries), independent of whether the work succeeded.
 >
 > You can:
 > - Remove sessions: "remove 4"
@@ -267,9 +271,10 @@ clawjournal shortlist <id> [id ...]
 clawjournal search <query> [--json] [--limit 20]
 
 # Scoring
-clawjournal score --batch [--auto-triage] [--limit 20]
+clawjournal score --batch [--source failure-v1] [--auto-triage] [--limit 20]
+clawjournal rescore --window 7d [--source failure-v1] [--limit 200]
 clawjournal score-view <id>
-clawjournal set-score <id> <1-5> [--reason "..."]
+clawjournal set-score <id> <1-5> [--reason "..."]  # legacy productivity only
 
 # Share
 clawjournal share --status approved [--note "..."] [--preview] [--json]

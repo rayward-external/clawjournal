@@ -15,6 +15,11 @@ function scoreBadge(score: number | null): string {
   return '\u2605'.repeat(Math.min(score, 5));
 }
 
+function failureBadge(score: number | null): string {
+  if (score == null) return '\u2014';
+  return `${score} failure`;
+}
+
 function outcomeText(badge: string | null): string {
   if (!badge) return '';
   const b = badge.toLowerCase();
@@ -109,10 +114,13 @@ export function Inbox() {
   const [offset, setOffset] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedMessages, setExpandedMessages] = useState<Record<string, Array<{ role: string; content: string; tool_uses?: Array<{ tool: string }> }>>>({});
-  const [sort, setSort] = useState('ai_quality_score:desc');
+  const [sort, setSort] = useState('ai_failure_value_score:desc');
   const [showFilters, setShowFilters] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<string | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
+  const [recoveryFilter, setRecoveryFilter] = useState<string | null>(null);
+  const [attributionFilter, setAttributionFilter] = useState<string | null>(null);
+  const [modeFilter, setModeFilter] = useState<string | null>(null);
 
   // Agent-classified type filter (dynamic, not hardcoded)
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
@@ -153,6 +161,9 @@ export function Inbox() {
         source: sourceFilter,
         project: projectFilter,
         task_type: typeFilter,
+        recovery_label: recoveryFilter,
+        failure_attribution: attributionFilter,
+        failure_mode: modeFilter,
         sort: sortField,
         order: sortOrder,
         limit: PAGE_SIZE,
@@ -163,7 +174,7 @@ export function Inbox() {
       toast(e instanceof Error ? e.message : 'Failed to load sessions', 'error');
     }
     finally { setLoading(false); }
-  }, [sort, sourceFilter, projectFilter, typeFilter, toast]);
+  }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, toast]);
 
   useEffect(() => {
     setOffset(0);
@@ -171,7 +182,7 @@ export function Inbox() {
     setFocusIndex(-1);
     loadSessions(0, false);
     loadStats();
-  }, [sort, sourceFilter, projectFilter, typeFilter, loadSessions, loadStats]);
+  }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, loadSessions, loadStats]);
 
   // Keyboard navigation — uses refs to avoid stale closures
   useEffect(() => {
@@ -284,7 +295,8 @@ export function Inbox() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <select value={sort} onChange={e => setSort(e.target.value)} style={selectStyle}>
-            <option value="ai_quality_score:desc">Best first</option>
+            <option value="ai_failure_value_score:desc">Top failures</option>
+            <option value="ai_quality_score:desc">Highest productivity</option>
             <option value="start_time:desc">Newest first</option>
             <option value="start_time:asc">Oldest first</option>
           </select>
@@ -308,6 +320,43 @@ export function Inbox() {
             {Object.keys(stats.by_source).sort().map(src => (
               <option key={src} value={src}>{src} ({stats.by_source[src]})</option>
             ))}
+          </select>
+          <select
+            value={recoveryFilter || ''}
+            onChange={e => setRecoveryFilter(e.target.value || null)}
+            style={selectStyle}
+          >
+            <option value="">All recovery</option>
+            <option value="user_corrected_recovery">User-corrected</option>
+            <option value="self_recovered">Self-recovered</option>
+            <option value="unrecovered">Unrecovered</option>
+            <option value="blocked">Blocked</option>
+          </select>
+          <select
+            value={attributionFilter || ''}
+            onChange={e => setAttributionFilter(e.target.value || null)}
+            style={selectStyle}
+          >
+            <option value="">All attribution</option>
+            <option value="agent_caused">Agent-caused</option>
+            <option value="environment">Environment</option>
+            <option value="preexisting_problem">Preexisting</option>
+            <option value="user_redirect">User redirect</option>
+            <option value="unclear">Unclear</option>
+          </select>
+          <select
+            value={modeFilter || ''}
+            onChange={e => setModeFilter(e.target.value || null)}
+            style={selectStyle}
+          >
+            <option value="">All modes</option>
+            <option value="wrong_approach">Wrong approach</option>
+            <option value="wrong_assumption">Wrong assumption</option>
+            <option value="false_success">False success</option>
+            <option value="regression">Regression</option>
+            <option value="instruction_violation">Instruction violation</option>
+            <option value="excessive_work">Excessive work</option>
+            <option value="blocker_mishandled">Blocker mishandled</option>
           </select>
           <select
             value={projectFilter || ''}
@@ -446,12 +495,12 @@ export function Inbox() {
                 display: 'flex', alignItems: 'center', gap: '8px',
                 padding: '7px 10px', cursor: 'pointer',
               }} onClick={() => handleExpand(s.session_id)}>
-                {/* Score */}
+                {/* Failure + productivity scores */}
                 <div style={{
-                  fontSize: '13px', color: colors.yellow400, whiteSpace: 'nowrap', minWidth: '42px',
-                  letterSpacing: '-1px',
+                  fontSize: '12px', color: colors.red500, whiteSpace: 'nowrap', minWidth: '74px',
+                  fontWeight: 700,
                 }}>
-                  {scoreBadge(s.ai_quality_score)}
+                  {failureBadge(s.ai_failure_value_score)}
                 </div>
 
                 {/* Title + meta */}
@@ -493,6 +542,8 @@ export function Inbox() {
                     <span>
                       {s.project} &middot; {s.user_messages + s.assistant_messages} msgs
                       {s.outcome_label ? ` · ${outcomeText(s.outcome_label)}` : ''}
+                      {s.ai_quality_score != null ? ` · productivity ${s.ai_quality_score}/5` : ''}
+                      {s.ai_failure_attribution ? ` · ${s.ai_failure_attribution.replace(/_/g, ' ')}` : ''}
                     </span>
                   </div>
                 </div>

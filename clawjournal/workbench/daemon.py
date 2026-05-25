@@ -14,7 +14,7 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +35,7 @@ from .index import (
     apply_share_redactions,
     create_share,
     export_share_to_disk,
+    FAILURE_VALUE_SOURCE_SCOPE,
     get_effective_share_settings,
     get_share,
     get_shares,
@@ -112,6 +113,15 @@ def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: A
         ai_display_title=result.display_title or None,
         ai_effort_estimate=result.effort_estimate,
         ai_summary=result.summary or None,
+        ai_failure_value_score=getattr(result, "failure_value_score", None),
+        ai_recovery_labels=json.dumps(getattr(result, "recovery_labels", [])),
+        ai_failure_attribution=getattr(result, "failure_attribution", "") or None,
+        ai_failure_modes=json.dumps(getattr(result, "failure_modes", [])),
+        ai_learning_summary=getattr(result, "learning_summary", "") or None,
+        ai_scorer_backend=getattr(result, "scorer_backend", "") or None,
+        ai_scorer_model=getattr(result, "scorer_model", "") or None,
+        ai_rubric_git_sha=getattr(result, "rubric_git_sha", "") or None,
+        ai_scored_at=getattr(result, "scored_at", "") or None,
     )
 
 
@@ -231,7 +241,14 @@ class Scanner:
         try:
             conn = open_index()
             try:
-                sessions = query_unscored_sessions(conn, limit=limit, source=self.source_filter)
+                source_scope = self.source_filter or FAILURE_VALUE_SOURCE_SCOPE
+                recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                sessions = query_unscored_sessions(
+                    conn,
+                    limit=limit,
+                    source=source_scope,
+                    since=recent_cutoff,
+                )
                 if not sessions:
                     return 0
 
@@ -380,8 +397,11 @@ def _parse_json_fields(rows: list[dict]) -> None:
     falls back to heuristic values, then removes the ai_* keys from the dict.
     """
     for row in rows:
-        for field in ("value_badges", "risk_badges", "files_touched", "commands_run",
-                       "ai_value_badges", "ai_risk_badges"):
+        for field in (
+            "value_badges", "risk_badges", "files_touched", "commands_run",
+            "ai_value_badges", "ai_risk_badges", "ai_recovery_labels",
+            "ai_failure_modes",
+        ):
             if isinstance(row.get(field), str):
                 try:
                     row[field] = json.loads(row[field])
@@ -1133,6 +1153,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 source=params.get("source", [None])[0],
                 project=params.get("project", [None])[0],
                 task_type=params.get("task_type", [None])[0],
+                recovery_label=params.get("recovery_label", [None])[0],
+                failure_attribution=params.get("failure_attribution", [None])[0],
+                failure_mode=params.get("failure_mode", [None])[0],
                 search_text=params.get("q", [None])[0],
                 sort=params.get("sort", ["start_time"])[0],
                 order=params.get("order", ["desc"])[0],
@@ -1174,6 +1197,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 ai_outcome_badge=body.get("ai_outcome_badge"),
                 ai_value_badges=json.dumps(body["ai_value_badges"]) if isinstance(body.get("ai_value_badges"), list) else body.get("ai_value_badges"),
                 ai_risk_badges=json.dumps(body["ai_risk_badges"]) if isinstance(body.get("ai_risk_badges"), list) else body.get("ai_risk_badges"),
+                ai_failure_value_score=body.get("ai_failure_value_score"),
+                ai_recovery_labels=json.dumps(body["ai_recovery_labels"]) if isinstance(body.get("ai_recovery_labels"), list) else body.get("ai_recovery_labels"),
+                ai_failure_attribution=body.get("ai_failure_attribution"),
+                ai_failure_modes=json.dumps(body["ai_failure_modes"]) if isinstance(body.get("ai_failure_modes"), list) else body.get("ai_failure_modes"),
+                ai_learning_summary=body.get("ai_learning_summary"),
+                ai_scorer_backend=body.get("ai_scorer_backend"),
+                ai_scorer_model=body.get("ai_scorer_model"),
+                ai_rubric_git_sha=body.get("ai_rubric_git_sha"),
+                ai_scored_at=body.get("ai_scored_at"),
             )
             # Hold-state transitions are separate from review-status updates
             # — they pass through `set_hold_state` so the audit log and
@@ -1398,6 +1430,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             _json_response(self, {
                 "ok": True,
                 "ai_quality_score": result.quality,
+                "ai_failure_value_score": getattr(result, "failure_value_score", None),
+                "ai_recovery_labels": getattr(result, "recovery_labels", []),
+                "ai_failure_attribution": getattr(result, "failure_attribution", ""),
+                "ai_failure_modes": getattr(result, "failure_modes", []),
+                "ai_learning_summary": getattr(result, "learning_summary", ""),
                 "reason": result.reason,
                 "task_type": result.task_type,
                 "outcome": result.outcome_label,
@@ -1847,6 +1884,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         "output_tokens": output_tok,
                         "first_user_message": first_user_msg,
                         "ai_quality_score": session.get("ai_quality_score"),
+                        "ai_failure_value_score": session.get("ai_failure_value_score"),
+                        "ai_failure_attribution": session.get("ai_failure_attribution"),
+                        "ai_recovery_labels": session.get("ai_recovery_labels"),
+                        "ai_failure_modes": session.get("ai_failure_modes"),
                     })
 
             file_size = sessions_file.stat().st_size

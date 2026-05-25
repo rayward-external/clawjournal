@@ -75,10 +75,11 @@ export function FilterBar({ filters, onChange }: FilterBarProps) {
       >
         <option value="start_time:desc">Newest first</option>
         <option value="start_time:asc">Oldest first</option>
+        <option value="ai_failure_value_score:desc">Top failures</option>
         <option value="sensitivity_score:desc">Highest risk</option>
         <option value="input_tokens:desc">Most tokens</option>
         <option value="tool_uses:desc">Most tool use</option>
-        <option value="ai_quality_score:desc">Highest quality</option>
+        <option value="ai_quality_score:desc">Highest productivity</option>
       </select>
 
       <select

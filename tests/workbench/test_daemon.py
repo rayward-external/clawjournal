@@ -4,6 +4,7 @@ import json
 import time
 import urllib.error
 import zipfile
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from io import BytesIO
 from threading import Thread
@@ -492,13 +493,14 @@ class TestScanner:
         monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
 
         conn = open_index()
+        now = datetime.now(timezone.utc)
         upsert_sessions(conn, [{
             "session_id": "sess-1",
             "project": "test-project",
             "source": "claude",
             "model": "claude-sonnet-4",
-            "start_time": "2025-01-01T00:00:00+00:00",
-            "end_time": "2025-01-01T00:10:00+00:00",
+            "start_time": now.isoformat(),
+            "end_time": (now + timedelta(minutes=10)).isoformat(),
             "messages": [
                 {"role": "user", "content": "Fix it", "tool_uses": []},
                 {"role": "assistant", "content": "Done", "tool_uses": []},
@@ -523,6 +525,15 @@ class TestScanner:
                 display_title="Great trace",
                 effort_estimate=0.8,
                 summary="Useful fix",
+                failure_value_score=5,
+                recovery_labels=["user_corrected_recovery"],
+                failure_attribution="agent_caused",
+                failure_modes=["wrong_assumption"],
+                learning_summary="Useful failure trace",
+                scorer_backend="test",
+                scorer_model="test-model",
+                rubric_git_sha="test-sha",
+                scored_at=now.isoformat(),
             ),
         )
 
@@ -539,6 +550,44 @@ class TestScanner:
         assert row["ai_quality_score"] == 5
         assert row["ai_score_reason"] == "Strong trace"
         assert row["ai_summary"] == "Useful fix"
+
+    def test_score_unscored_once_skips_sessions_outside_recent_window(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        old = datetime.now(timezone.utc) - timedelta(days=30)
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "old-sess",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": old.isoformat(),
+            "end_time": (old + timedelta(minutes=10)).isoformat(),
+            "messages": [
+                {"role": "user", "content": "Fix it", "tool_uses": []},
+                {"role": "assistant", "content": "Done", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1, "assistant_messages": 1,
+                "tool_uses": 0, "input_tokens": 100, "output_tokens": 50,
+            },
+        }])
+        conn.close()
+
+        calls = {"count": 0}
+
+        def fake_score(*args, **kwargs):
+            calls["count"] += 1
+            raise AssertionError("old sessions should not be scored")
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=5) == 0
+        assert calls["count"] == 0
 
 
 class TestProjectsAPI:

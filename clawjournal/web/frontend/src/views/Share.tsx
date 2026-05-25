@@ -152,6 +152,11 @@ interface ReadySession {
   source: string;
   display_title: string;
   ai_quality_score: number | null;
+  ai_failure_value_score: number | null;
+  ai_recovery_labels: string[];
+  ai_failure_attribution: string | null;
+  ai_failure_modes: string[];
+  ai_learning_summary: string | null;
   user_messages: number;
   assistant_messages: number;
   tool_uses: number;
@@ -549,8 +554,8 @@ export function Share() {
       setShares(shareList);
       setScoringBackend(backend);
       if (!selectionInitialized && stats.sessions.length > 0) {
-        // Server recommendation is already 5-star approved traces from the
-        // last 7 days, capped at 5. Trust it and only filter out ids the
+        // Server recommendation is approved high-value failure traces, capped
+        // at 5. Trust it and only filter out ids the
         // client can't resolve (eg. excluded projects).
         const validIds = new Set(stats.sessions.map((s) => s.session_id));
         const recommended = (stats.recommended_session_ids || [])
@@ -937,15 +942,6 @@ export function Share() {
     };
 
     try {
-      // Auto-approve unapproved review_status sessions as before.
-      const needApproval = approvedList.filter((s) => s.review_status && s.review_status !== 'approved');
-      if (needApproval.length > 0) {
-        await Promise.all(
-          needApproval.map((s) =>
-            api.sessions.update(s.session_id, { status: 'approved' }).catch(() => undefined),
-          ),
-        );
-      }
       const ids = approvedList.map((s) => s.session_id);
       const { share_id } = await api.shares.create(ids, note || undefined);
       await api.shares.export(share_id);
@@ -1262,7 +1258,7 @@ function QueueStep(p: QueueStepProps) {
       && !(s.project || '').toLowerCase().includes(p.searchQuery.toLowerCase())) return false;
     if (p.sourceFilter && s.source !== p.sourceFilter) return false;
     if (p.projectFilter && s.project !== p.projectFilter) return false;
-    if (p.scoreFilter > 0 && (s.ai_quality_score == null || s.ai_quality_score < p.scoreFilter)) return false;
+    if (p.scoreFilter > 0 && (s.ai_failure_value_score == null || s.ai_failure_value_score < p.scoreFilter)) return false;
     if (dateCutoffMs && (!s.start_time || new Date(s.start_time).getTime() < dateCutoffMs)) return false;
     return true;
   });
@@ -1434,6 +1430,14 @@ function QueueStep(p: QueueStepProps) {
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span>{s.tool_uses} tools</span>
                       </>)}
+                      {s.ai_failure_value_score != null && (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span style={{ color: '#991b1b', fontWeight: 700 }}>{s.ai_failure_value_score} failure value</span>
+                      </>)}
+                      {s.ai_failure_attribution && (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span>{s.ai_failure_attribution.replace(/_/g, ' ')}</span>
+                      </>)}
                       {s.ai_quality_score != null ? (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span style={{ color: '#c08a1a', letterSpacing: -1 }}>{scoreBadge(s.ai_quality_score)}</span>
@@ -1523,10 +1527,10 @@ function QueueStep(p: QueueStepProps) {
                   )}
                   <select value={p.scoreFilter} onChange={e => p.setScoreFilter(Number(e.target.value))}
                     style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
-                    <option value={0}>Any score</option>
-                    <option value={3}>{'\u2605'.repeat(3)}+ (3+)</option>
-                    <option value={4}>{'\u2605'.repeat(4)}+ (4+)</option>
-                    <option value={5}>{'\u2605'.repeat(5)} (5)</option>
+                    <option value={0}>Any failure value</option>
+                    <option value={3}>3+ failure value</option>
+                    <option value={4}>4+ failure value</option>
+                    <option value={5}>5 failure value</option>
                   </select>
                   <select value={p.dateFilter} onChange={e => p.setDateFilter(e.target.value)}
                     style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>

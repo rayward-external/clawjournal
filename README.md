@@ -299,19 +299,19 @@ clawjournal hold-history <id>
 
 ### 5. Score
 
-AI-assisted quality rating on a 1–5 scale (1 = noise, 5 = excellent). Personal info in your conversations is removed before anything is sent to the AI judge — your home folder paths and usernames are anonymized first.
+AI-assisted scoring now records two labels in one pass: a legacy productivity score (`ai_quality_score`) and the primary failure-value score (`ai_failure_value_score`). Failure value prioritizes traces where a frontier coding agent made, recovered from, or failed to recover from a meaningful mistake on real work. Personal info in your conversations is removed before anything is sent to the AI judge — your home folder paths and usernames are anonymized first.
 
 **Just say to your AI:** *"Score my unscored ClawJournal sessions and auto-block the noise."*
 
-The agent batches the scoring; sessions rated 1 get auto-blocked, sessions rated 2–5 stay visible for you to decide.
+The agent batches the scoring over the v1 failure-source scope (`claude`, `codex`, `opencode`, `openclaw`). Productivity-1 sessions get auto-blocked when `--auto-triage` is set; high failure-value sessions stay visible for review and sharing.
 
 <details>
 <summary><b>Show shell commands</b></summary>
 
 ```bash
-clawjournal score --batch --auto-triage              # batch-score; auto-blocks noise (score 1) sessions
+clawjournal score --batch --source failure-v1 --auto-triage  # score failure-value scope; auto-block productivity-1 noise
 clawjournal score-view <id>                          # show score details
-clawjournal set-score <id> --quality 4               # manual override
+clawjournal set-score <id> --quality 4               # manual productivity override
 ```
 
 By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
@@ -451,7 +451,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal serve` | Open workbench UI at localhost:8384 |
 | `clawjournal config --source all` | Select source scope (required) |
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
-| `clawjournal score --batch --auto-triage` | AI-score sessions; auto-block noise (score 1) |
+| `clawjournal score --batch --source failure-v1 --auto-triage` | AI-score failure-value scope; auto-block productivity-1 noise |
 | `clawjournal bundle-create --status approved` | Bundle approved sessions |
 | `clawjournal bundle-export <bundle_id>` | Export bundle to disk as `sessions.jsonl` + `manifest.json` |
 
@@ -464,9 +464,9 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal approve <id> [id ...]` | Approve sessions |
 | `clawjournal block <id> [id ...]` | Block sessions |
 | `clawjournal shortlist <id> [id ...]` | Shortlist sessions |
-| `clawjournal score --batch --limit 20` | AI-score up to 20 sessions |
+| `clawjournal score --batch --source failure-v1 --limit 20` | AI-score up to 20 in-scope sessions |
 | `clawjournal score-view <id>` | View score details |
-| `clawjournal set-score <id> --quality <1-5>` | Manually set a quality score |
+| `clawjournal set-score <id> --quality <1-5>` | Manually set the legacy productivity score |
 
 ### Hold-state gate
 

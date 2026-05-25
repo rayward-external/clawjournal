@@ -100,6 +100,69 @@ def test_apply_findings_to_session_nested_tool_field():
     assert redacted["messages"][0]["tool_uses"][0]["input"]["command"] == "echo [REDACTED_NAME]"
 
 
+def test_apply_findings_to_session_redacts_scoring_text():
+    session = {
+        "session_id": "s1",
+        "ai_learning_summary": "Jane D corrected the paired-data assumption.",
+        "ai_scoring_detail": json.dumps({
+            "reasoning": "Jane D corrected the agent.",
+            "ai_failure_evidence": ["Jane D pointed out the samples were paired."],
+        }),
+        "messages": [],
+    }
+    findings = [
+        {
+            "session_id": "s1",
+            "message_index": -1,
+            "field": "ai_learning_summary",
+            "entity_text": "Jane D",
+            "entity_type": "person_name",
+            "replacement": "[REDACTED_NAME]",
+            "confidence": 0.99,
+        }
+    ]
+    redacted, count = apply_findings_to_session(session, findings)
+    detail = json.loads(redacted["ai_scoring_detail"])
+    assert count == 3
+    assert "Jane D" not in redacted["ai_learning_summary"]
+    assert "Jane D" not in detail["reasoning"]
+    assert "Jane D" not in detail["ai_failure_evidence"][0]
+
+
+def test_collect_text_work_items_includes_scoring_text():
+    session = {
+        "session_id": "s1",
+        "project": "Private Project",
+        "messages": [{"content": "regular text"}],
+        "ai_learning_summary": "Jane D corrected the assumption.",
+        "ai_scoring_detail": json.dumps({
+            "reasoning": "Acme Lab was mentioned.",
+            "ai_failure_evidence": ["Jane D supplied the constraint."],
+        }),
+    }
+    fields = {field for _sid, _idx, field, _text in _collect_text_work_items(session)}
+    assert "project" in fields
+    assert "ai_learning_summary" in fields
+    assert "ai_scoring_detail.reasoning" in fields
+    assert "ai_scoring_detail.ai_failure_evidence[0]" in fields
+
+
+def test_review_session_pii_scans_scoring_text():
+    session = {
+        "session_id": "s1",
+        "messages": [],
+        "ai_learning_summary": "The user at jane@example.com corrected the agent.",
+        "ai_scoring_detail": json.dumps({
+            "ai_failure_evidence": ["Path /Users/jane/private-lab/notes.md leaked."],
+        }),
+    }
+    findings = review_session_pii(session)
+    entity_texts = {f["entity_text"] for f in findings}
+
+    assert "jane@example.com" in entity_texts
+    assert "/Users/jane/private-lab/notes.md" in entity_texts
+
+
 def test_review_session_pii_detects_metadata_entities():
     session = {
         "session_id": "s1",

@@ -159,7 +159,7 @@ function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
   const p95Idx = Math.floor(durations.length * 0.95);
   const maxMinutes = Math.max(durations[p95Idx] || 60, 10);
 
-  // Y axis: quality score 1-5
+  // Y axis: productivity score 1-5
   const minScore = 1;
   const maxScore = 5;
 
@@ -200,7 +200,7 @@ function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
 
       {/* Axis labels */}
       <text x={SPAD.left + plotW / 2} y={SCATTER_H - 14} textAnchor="middle" fontSize={10} fill={colors.gray500}>Duration (minutes)</text>
-      <text x={12} y={SPAD.top + plotH / 2} textAnchor="middle" fontSize={10} fill={colors.gray500} transform={`rotate(-90, 12, ${SPAD.top + plotH / 2})`}>Score</text>
+      <text x={12} y={SPAD.top + plotH / 2} textAnchor="middle" fontSize={10} fill={colors.gray500} transform={`rotate(-90, 12, ${SPAD.top + plotH / 2})`}>Productivity</text>
     </svg>
   );
 }
@@ -506,18 +506,18 @@ export function Insights() {
             flex: 1, background: colors.blue50, border: `1px solid ${colors.blue100}`, borderRadius: 8,
             padding: '10px 14px',
           }}>
-            <div style={{ fontSize: 12, color: colors.blue700, fontWeight: 600 }}>Highest Quality</div>
+            <div style={{ fontSize: 12, color: colors.blue700, fontWeight: 600 }}>Highest Productivity</div>
             <div style={{ fontSize: 14, color: colors.blue600, marginTop: 2 }}>{stats.highest_quality_model}</div>
           </div>
         )}
       </div>
 
-      {/* Highlights — top 3 recent five-star sessions across different agents,
+      {/* Highlights — top 3 recent high-productivity sessions across different agents,
           matched to the tab's `days` window. */}
       {highlights && highlights.highlights.length > 0 && (
         <Section
           title="Highlights"
-          subtitle={`Top ${highlights.highlights.length} recent five-star sessions across agents`}
+          subtitle={`Top ${highlights.highlights.length} recent high-productivity sessions across agents`}
         >
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {highlights.highlights.map((item) => (
@@ -527,7 +527,7 @@ export function Insights() {
         </Section>
       )}
       {highlights && highlights.highlights.length === 0 && (
-        <Section title="Highlights" subtitle={`No 4+ star sessions in the last ${highlights.window_days} days`}>
+        <Section title="Highlights" subtitle={`No 4+ productivity sessions in the last ${highlights.window_days} days`}>
           <div style={{ fontSize: 12, color: colors.gray500, padding: 8 }}>
             Run <code style={{ background: colors.gray100, padding: '1px 5px', borderRadius: 3 }}>clawjournal score</code> on recent sessions to populate this panel.
           </div>

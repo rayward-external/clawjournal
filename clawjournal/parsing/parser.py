@@ -350,8 +350,10 @@ def discover_projects(source_filter: str | None = None) -> list[dict]:
     }
 
     normalized = (source_filter or "").strip().lower()
-    if normalized in ("", "auto", "all", "both"):
+    if normalized in ("", "auto", "all"):
         discovery_fns = discovery_by_source.values()
+    elif normalized == "both":
+        discovery_fns = (discovery_by_source[CLAUDE_SOURCE], discovery_by_source[CODEX_SOURCE])
     else:
         discover_fn = discovery_by_source.get(normalized)
         if discover_fn is None:

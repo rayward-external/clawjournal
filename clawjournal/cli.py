@@ -60,9 +60,11 @@ SETUP_TO_PUBLISH_STEPS = [
 
 EXPLICIT_SOURCE_CHOICES = {"claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
 SOURCE_CHOICES = ["auto", "claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all"]
-WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "openclaw", "cursor", "copilot", "aider"]
+WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "gemini", "kimi"]
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
+SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-v1", "all", "auto", "both"}
 
 
 def _mask_secret(s: str) -> str:
@@ -79,6 +81,34 @@ def _normalize_pii_provider(provider: str) -> str:
     if normalized in PII_PROVIDER_CHOICES:
         return normalized
     raise ValueError(f"Unsupported PII provider: {provider}")
+
+
+def _normalize_score_source_filter(raw: str | None) -> str | list[str] | None:
+    """Normalize `clawjournal score --source` for the failure-value rollout."""
+    if raw is None:
+        return list(FAILURE_VALUE_SOURCE_SCOPE)
+    value = raw.strip().lower()
+    if value in ("", "failure-v1"):
+        return list(FAILURE_VALUE_SOURCE_SCOPE)
+    if value == "both":
+        print(
+            "Warning: --source both is deprecated for scoring; use "
+            "--source failure-v1 or --source claude,codex,opencode,openclaw.",
+            file=sys.stderr,
+        )
+        return ["claude", "codex"]
+    if value in ("all", "auto"):
+        return None
+    sources = [part.strip().lower() for part in value.split(",") if part.strip()]
+    invalid = [source for source in sources if source not in SCORE_SOURCE_CHOICES]
+    if invalid:
+        allowed = ", ".join(sorted(SCORE_SOURCE_CHOICES))
+        print(
+            f"Unsupported --source value(s): {', '.join(invalid)}. Allowed: {allowed}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return sources or list(FAILURE_VALUE_SOURCE_SCOPE)
 
 
 def _parse_pii_provider_arg(value: str) -> str:
@@ -101,6 +131,8 @@ def _mask_config_for_display(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _source_label(source_filter: str) -> str:
     source_filter = _normalize_source_filter(source_filter)
+    if source_filter == "both":
+        return "Claude Code and Codex"
     if source_filter == "claude":
         return "Claude Code"
     if source_filter == "codex":
@@ -125,7 +157,7 @@ def _source_label(source_filter: str) -> str:
 
 
 def _normalize_source_filter(source_filter: str) -> str:
-    if source_filter in ("all", "both"):
+    if source_filter == "all":
         return "auto"
     return source_filter
 
@@ -159,6 +191,8 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
         return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists()
     if source_filter == "codex":
         return CODEX_DIR.exists()
+    if source_filter == "both":
+        return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CODEX_DIR.exists()
     if source_filter == "gemini":
         return GEMINI_DIR.exists()
     if source_filter == "opencode":
@@ -183,6 +217,8 @@ def _filter_projects_by_source(projects: list[dict], source_filter: str) -> list
     source_filter = _normalize_source_filter(source_filter)
     if source_filter == "auto":
         return projects
+    if source_filter == "both":
+        return [p for p in projects if p.get("source", "unknown") in ("claude", "codex")]
     return [p for p in projects if p.get("source", "unknown") == source_filter]
 
 
@@ -1875,6 +1911,10 @@ def _share_preview(sessions: list[dict], *, output_json: bool = False, limit: in
                 "source": s.get("source", ""),
                 "model": s.get("model"),
                 "ai_quality_score": s.get("ai_quality_score"),
+                "ai_failure_value_score": s.get("ai_failure_value_score"),
+                "ai_failure_attribution": s.get("ai_failure_attribution"),
+                "ai_recovery_labels": _parse_badges(s.get("ai_recovery_labels", [])),
+                "ai_failure_modes": _parse_badges(s.get("ai_failure_modes", [])),
                 "ai_score_reason": s.get("ai_score_reason"),
                 "outcome_badge": s.get("outcome_badge"),
                 "risk_badges": _parse_badges(s.get("risk_badges", [])),
@@ -1890,21 +1930,23 @@ def _share_preview(sessions: list[dict], *, output_json: bool = False, limit: in
         }
 
     print(f"{total} sessions ready to share. Showing top {min(limit, total)}:\n")
-    print(f"  {'#':>3}  {'Score':>5}  Title")
+    print(f"  {'#':>3}  {'Fail':>5}  {'Prod':>5}  Title")
     print(f"  {'':>3}  {'':>5}  Summary")
     print("  " + "-" * 70)
 
     for i, s in enumerate(sessions[:limit], 1):
         title = (s.get("display_title") or "")[:60]
         score = s.get("ai_quality_score")
+        failure_score = s.get("ai_failure_value_score")
         score_str = str(score) if score is not None else "-"
+        failure_str = str(failure_score) if failure_score is not None else "-"
         reason = s.get("ai_score_reason") or ""
         outcome = s.get("outcome_badge") or ""
 
         risk_badges = _parse_badges(s.get("risk_badges", []))
         risk_str = f" [{', '.join(risk_badges)}]" if risk_badges else ""
 
-        print(f"  {i:>3}    {score_str:>1}    {title}")
+        print(f"  {i:>3}    {failure_str:>1}      {score_str:>1}    {title}")
         if reason:
             summary = reason[:65]
             print(f"  {'':>3}  {'':>5}    {summary}{risk_str}")
@@ -2348,7 +2390,8 @@ def _run_score_batch(args) -> None:
     from .workbench.index import open_index, query_unscored_sessions
 
     conn = open_index()
-    sessions = query_unscored_sessions(conn, limit=args.limit, source=args.source)
+    source_filter = _normalize_score_source_filter(args.source)
+    sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter)
     conn.close()
 
     print(json.dumps(sessions, indent=2))
@@ -2529,11 +2572,25 @@ def _score_single_session(
         ai_display_title=result.display_title or None,
         ai_effort_estimate=result.effort_estimate,
         ai_summary=result.summary or None,
+        ai_failure_value_score=getattr(result, "failure_value_score", None),
+        ai_recovery_labels=json.dumps(getattr(result, "recovery_labels", [])),
+        ai_failure_attribution=getattr(result, "failure_attribution", "") or None,
+        ai_failure_modes=json.dumps(getattr(result, "failure_modes", [])),
+        ai_learning_summary=getattr(result, "learning_summary", "") or None,
+        ai_scorer_backend=getattr(result, "scorer_backend", "") or None,
+        ai_scorer_model=getattr(result, "scorer_model", "") or None,
+        ai_rubric_git_sha=getattr(result, "rubric_git_sha", "") or None,
+        ai_scored_at=getattr(result, "scored_at", "") or None,
     )
 
     return {
         "session_id": session_id,
         "ai_quality_score": result.quality,
+        "ai_failure_value_score": getattr(result, "failure_value_score", None),
+        "ai_recovery_labels": getattr(result, "recovery_labels", []),
+        "ai_failure_attribution": getattr(result, "failure_attribution", ""),
+        "ai_failure_modes": getattr(result, "failure_modes", []),
+        "ai_learning_summary": getattr(result, "learning_summary", ""),
         "reason": result.reason,
         "task_type": result.task_type,
         "resolution": result.outcome_label,
@@ -2556,10 +2613,11 @@ def _run_score(args) -> None:
     dry_run = args.dry_run
     batch = args.batch
     auto_triage = getattr(args, "auto_triage", False)
+    source_filter = _normalize_score_source_filter(args.source)
 
     if batch:
         # Batch mode: score unscored sessions
-        sessions = query_unscored_sessions(conn, limit=args.limit, source=args.source)
+        sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter)
         if not sessions:
             print(json.dumps({"message": "No unscored sessions found.", "scored": 0}))
             conn.close()
@@ -2573,7 +2631,13 @@ def _run_score(args) -> None:
             result = _score_single_session(conn, sid, model=model, backend=backend, dry_run=dry_run)
             results.append(result)
             if result.get("ai_quality_score"):
-                print(f"  -> {result['ai_quality_score']}/5: {result.get('reason', '')[:100]}", file=sys.stderr)
+                failure = result.get("ai_failure_value_score")
+                failure_suffix = f", failure {failure}/5" if failure is not None else ""
+                print(
+                    f"  -> quality {result['ai_quality_score']}/5{failure_suffix}: "
+                    f"{result.get('reason', '')[:100]}",
+                    file=sys.stderr,
+                )
             elif result.get("error"):
                 print(f"  -> Error: {result['error']}", file=sys.stderr)
             elif result.get("dry_run"):
@@ -2588,6 +2652,11 @@ def _run_score(args) -> None:
         }
         if scored:
             scores = [r["ai_quality_score"] for r in scored]
+            failure_scores = [
+                r["ai_failure_value_score"]
+                for r in scored
+                if r.get("ai_failure_value_score") is not None
+            ]
             summary["score_distribution"] = {
                 "excellent_5": sum(1 for q in scores if q == 5),
                 "good_4": sum(1 for q in scores if q == 4),
@@ -2595,6 +2664,14 @@ def _run_score(args) -> None:
                 "low_2": sum(1 for q in scores if q == 2),
                 "poor_1": sum(1 for q in scores if q == 1),
             }
+            if failure_scores:
+                summary["failure_value_distribution"] = {
+                    "high_5": sum(1 for q in failure_scores if q == 5),
+                    "valuable_4": sum(1 for q in failure_scores if q == 4),
+                    "some_signal_3": sum(1 for q in failure_scores if q == 3),
+                    "weak_2": sum(1 for q in failure_scores if q == 2),
+                    "none_1": sum(1 for q in failure_scores if q == 1),
+                }
 
         # Auto-triage: archive noise (substance=1), leave everything else visible
         if auto_triage and scored and not dry_run:
@@ -2627,6 +2704,109 @@ def _run_score(args) -> None:
         else:
             print(json.dumps({"results": results}, indent=2))
 
+    conn.close()
+
+
+def _parse_window_days(value: str) -> int:
+    """Parse a window string like ``7d`` / ``14`` / ``30d`` into integer days."""
+    if value is None:
+        raise argparse.ArgumentTypeError("--window value is required")
+    text = str(value).strip().lower()
+    if text.endswith("d"):
+        text = text[:-1]
+    try:
+        days = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --window value: {value!r}. Use e.g. '7d', '14d', '30d'."
+        ) from exc
+    if days <= 0 or days > 365:
+        raise argparse.ArgumentTypeError(
+            f"--window must be between 1 and 365 days (got {days})."
+        )
+    return days
+
+
+def _run_rescore(args) -> None:
+    """Rescore recent in-scope sessions, ignoring existing scores."""
+    from .workbench.index import open_index, query_sessions_for_rescore
+
+    conn = open_index()
+
+    model = args.model
+    backend = args.backend
+    dry_run = args.dry_run
+    window_days = args.window
+    source_filter = _normalize_score_source_filter(args.source)
+
+    sessions = query_sessions_for_rescore(
+        conn,
+        window_days=window_days,
+        source=source_filter,
+        limit=args.limit,
+    )
+    if not sessions:
+        print(json.dumps({
+            "message": f"No sessions in the last {window_days} days for the selected source scope.",
+            "scored": 0,
+        }))
+        conn.close()
+        return
+
+    label = "all sources" if source_filter is None else ",".join(source_filter)
+    print(
+        f"Rescoring {len(sessions)} session(s) from the last {window_days} days "
+        f"(source: {label})",
+        file=sys.stderr,
+    )
+
+    results = []
+    for i, s in enumerate(sessions, 1):
+        sid = s["session_id"]
+        title = s.get("display_title", sid)
+        print(
+            f"[{i}/{len(sessions)}] Rescoring: {_truncate(title, 60)} ({sid[:12]}...)",
+            file=sys.stderr,
+        )
+        result = _score_single_session(conn, sid, model=model, backend=backend, dry_run=dry_run)
+        results.append(result)
+        if result.get("ai_quality_score"):
+            failure = result.get("ai_failure_value_score")
+            failure_suffix = f", failure {failure}/5" if failure is not None else ""
+            print(
+                f"  -> quality {result['ai_quality_score']}/5{failure_suffix}: "
+                f"{result.get('reason', '')[:100]}",
+                file=sys.stderr,
+            )
+        elif result.get("error"):
+            print(f"  -> Error: {result['error']}", file=sys.stderr)
+        elif result.get("dry_run"):
+            print(f"  -> (dry run)", file=sys.stderr)
+
+    scored = [r for r in results if r.get("ok")]
+    errors = [r for r in results if r.get("error")]
+    summary = {
+        "rescored": len(scored),
+        "errors": len(errors),
+        "window_days": window_days,
+        "results": results,
+    }
+    if scored:
+        failure_scores = [
+            r["ai_failure_value_score"]
+            for r in scored
+            if r.get("ai_failure_value_score") is not None
+        ]
+        if failure_scores:
+            summary["failure_value_distribution"] = {
+                "high_5": sum(1 for q in failure_scores if q == 5),
+                "valuable_4": sum(1 for q in failure_scores if q == 4),
+                "some_signal_3": sum(1 for q in failure_scores if q == 3),
+                "weak_2": sum(1 for q in failure_scores if q == 2),
+                "none_1": sum(1 for q in failure_scores if q == 1),
+            }
+
+    print(json.dumps(summary, indent=2))
     conn.close()
 
 
@@ -3575,13 +3755,15 @@ def main() -> None:
 
     sb = sub.add_parser("score-batch", help="List unscored sessions for AI scoring")
     sb.add_argument("--limit", type=int, default=50)
-    sb.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None)
+    sb.add_argument("--source", default="failure-v1",
+                    help="Source scope: failure-v1, comma list, all/auto, or a single source")
 
     sc = sub.add_parser("score", help="Auto-score sessions via the current agent's automation CLI or an explicit backend")
     sc.add_argument("session_ids", nargs="*", help="Session IDs to score")
     sc.add_argument("--batch", action="store_true", help="Score all unscored sessions")
     sc.add_argument("--limit", type=int, default=10, help="Max sessions for batch mode (default: 10)")
-    sc.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None)
+    sc.add_argument("--source", default="failure-v1",
+                    help="Batch source scope: failure-v1, comma list, all/auto, or a single source")
     sc.add_argument("--backend", choices=SCORING_BACKEND_CHOICES, default="auto",
                     help="Scoring backend (default: auto = current agent's automation CLI)")
     sc.add_argument("--model", type=str, default=None,
@@ -3589,6 +3771,40 @@ def main() -> None:
     sc.add_argument("--dry-run", action="store_true", help="Show score-view without calling a scoring backend")
     sc.add_argument("--auto-triage", action="store_true",
                     help="After scoring, auto-archive 1/5 noise sessions")
+
+    rs = sub.add_parser(
+        "rescore",
+        help="Rescore recent in-scope sessions, ignoring existing scores",
+    )
+    rs.add_argument(
+        "--window",
+        type=_parse_window_days,
+        default="7d",
+        help="Rolling time window by start_time (e.g. 7d, 14d, 30d). Default: 7d",
+    )
+    rs.add_argument(
+        "--source",
+        default="failure-v1",
+        help="Source scope: failure-v1, comma list, all/auto, or a single source",
+    )
+    rs.add_argument("--limit", type=int, default=200, help="Max sessions to rescore (default: 200)")
+    rs.add_argument(
+        "--backend",
+        choices=SCORING_BACKEND_CHOICES,
+        default="auto",
+        help="Scoring backend (default: auto = current agent's automation CLI)",
+    )
+    rs.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Optional model override for the selected backend",
+    )
+    rs.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Skip the scoring backend; report which sessions would be rescored",
+    )
 
     # Bundle commands
     bc = sub.add_parser("bundle-create", help="Create a bundle from approved sessions")
@@ -3834,6 +4050,10 @@ def main() -> None:
 
     if command == "score":
         _run_score(args)
+        return
+
+    if command == "rescore":
+        _run_rescore(args)
         return
 
     if command == "bundle-create":

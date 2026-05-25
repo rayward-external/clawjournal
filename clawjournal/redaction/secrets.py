@@ -15,6 +15,7 @@ Two surfaces coexist:
    legacy path when every decision is open/accepted.
 """
 
+import json
 import math
 import re
 import sqlite3
@@ -1091,6 +1092,16 @@ def apply_findings_to_blob(
             secret_map.update(
                 pii_secret_map_from_text_decisions(text, decisions, user_allowlist)
             )
+        # Also include matches found inside judge-generated free-text fields
+        # — entities that survive in paraphrases need redaction even when
+        # the original message text has already been cleaned in a prior pass.
+        for ai_text in _iter_ai_text_strings(blob):
+            secret_map.update(
+                _secret_map_from_text_decisions(ai_text, decisions, user_allowlist)
+            )
+            secret_map.update(
+                pii_secret_map_from_text_decisions(ai_text, decisions, user_allowlist)
+            )
         secret_map.update(trufflehog_map)
         # Note on loop termination: once trufflehog_map is non-empty the
         # `not secret_map` guard never fires, so the pass loop now
@@ -1127,8 +1138,118 @@ def apply_findings_to_blob(
                     pass_count += n
             pass_count += _apply_widened_message_fields(msg, secret_map)
 
+        pass_count += _apply_redaction_set_to_ai_text(blob, secret_map)
+
         total += pass_count
         if pass_count == 0 and pass_num > 0:
             break
 
     return blob, total
+
+
+# Field names walked by AI-text redaction helpers. These constants are the
+# single source of truth — both _iter_ai_text_strings /
+# _apply_redaction_set_to_ai_text in this module and _apply_to_ai_text in
+# workbench/index.py consume them, so adding a new judge-emitted field only
+# requires extending these lists.
+AI_TEXT_TOP_FIELD = "ai_learning_summary"
+AI_TEXT_DETAIL_FIELD = "ai_scoring_detail"
+AI_TEXT_DETAIL_STR_FIELDS: tuple[str, ...] = (
+    # The judge writes "reasoning" (not "reason") into the detail blob —
+    # see ``scoring.score_session``'s detail_data construction.
+    "reasoning",
+    "display_title",
+    "summary",
+    "ai_learning_summary",
+)
+AI_TEXT_DETAIL_LIST_FIELDS: tuple[str, ...] = (
+    "ai_failure_evidence",
+    "project_areas",
+)
+
+
+def _iter_ai_text_strings(blob: dict) -> Iterable[str]:
+    """Yield every judge-generated free-text string in ``blob``.
+
+    Covers the top-level ``ai_learning_summary`` column plus the inner
+    str / list-of-str fields inside the JSON-encoded ``ai_scoring_detail``
+    blob, per the ``AI_TEXT_*`` constants above.
+    """
+    val = blob.get(AI_TEXT_TOP_FIELD)
+    if isinstance(val, str) and val:
+        yield val
+
+    raw = blob.get(AI_TEXT_DETAIL_FIELD)
+    if not isinstance(raw, str) or not raw:
+        return
+    try:
+        detail = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(detail, dict):
+        return
+
+    for field in AI_TEXT_DETAIL_STR_FIELDS:
+        value = detail.get(field)
+        if isinstance(value, str) and value:
+            yield value
+
+    for list_field in AI_TEXT_DETAIL_LIST_FIELDS:
+        items = detail.get(list_field)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, str) and item:
+                    yield item
+
+
+def _apply_redaction_set_to_ai_text(
+    blob: dict,
+    secret_map: dict[str, str],
+) -> int:
+    """Apply ``secret_map`` redactions to judge-generated free-text fields.
+
+    The judge sees only anonymized message content but can paraphrase or
+    quote secrets/PII back into its summary, evidence list, or learning
+    summary. Findings detected from message text are applied here so the
+    paraphrase is redacted too. Mirrors the AI-text walk in
+    ``index._apply_to_ai_text`` but applies the secret_map instead of a
+    free transform.
+    """
+    total = 0
+
+    val = blob.get(AI_TEXT_TOP_FIELD)
+    if isinstance(val, str) and val:
+        blob[AI_TEXT_TOP_FIELD], n = _apply_redaction_set(val, secret_map)
+        total += n
+
+    raw = blob.get(AI_TEXT_DETAIL_FIELD)
+    if not isinstance(raw, str) or not raw:
+        return total
+    try:
+        detail = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return total
+    if not isinstance(detail, dict):
+        return total
+
+    for field in AI_TEXT_DETAIL_STR_FIELDS:
+        value = detail.get(field)
+        if isinstance(value, str) and value:
+            detail[field], n = _apply_redaction_set(value, secret_map)
+            total += n
+
+    for list_field in AI_TEXT_DETAIL_LIST_FIELDS:
+        items = detail.get(list_field)
+        if isinstance(items, list):
+            new_items: list = []
+            for item in items:
+                if isinstance(item, str) and item:
+                    redacted, n = _apply_redaction_set(item, secret_map)
+                    total += n
+                    new_items.append(redacted)
+                else:
+                    new_items.append(item)
+            detail[list_field] = new_items
+
+    blob[AI_TEXT_DETAIL_FIELD] = json.dumps(detail)
+    return total

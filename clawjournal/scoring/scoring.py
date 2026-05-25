@@ -11,8 +11,11 @@ formatting, calling the judge, and storing results. Zero scoring logic.
 from __future__ import annotations
 
 import json
+import hashlib
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +73,15 @@ class ScoringResult:
     project_areas: list[str] = field(default_factory=list)  # directory paths touched
     taste_signals: list[dict] = field(default_factory=list)  # kept for backward compat
     detail_json: str = "{}"
+    failure_value_score: int | None = None
+    recovery_labels: list[str] = field(default_factory=list)
+    failure_attribution: str = ""
+    failure_modes: list[str] = field(default_factory=list)
+    learning_summary: str = ""
+    scorer_backend: str = ""
+    scorer_model: str = ""
+    rubric_git_sha: str = ""
+    scored_at: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +358,9 @@ def format_session_for_judge(
             lines.append(f" → {step.action_tool}({input_text})")
             result_text = _truncate(step.result_output, 300)
             lines.append(f" → {step.result_status}: {result_text}")
+            reflect_text = _truncate(step.reflect, 300) if step.reflect else ""
+            if reflect_text:
+                lines.append(f" → assistant reflection: {reflect_text}")
         lines.append("")
 
         lines.append("## User Response After Agent Work")
@@ -372,6 +387,9 @@ def format_session_for_judge(
                     lines.append(f" → {step.action_tool}({input_text})")
                     result_text = _truncate(step.result_output, 300)
                     lines.append(f" → {step.result_status}: {result_text}")
+                    reflect_text = _truncate(step.reflect, 300) if step.reflect else ""
+                    if reflect_text:
+                        lines.append(f" → assistant reflection: {reflect_text}")
                 lines.append("")
 
             if seg.user_response:
@@ -387,7 +405,7 @@ def format_session_for_judge(
             lines.append("")
 
     lines.append("## Respond with JSON:")
-    lines.append('{"substance": N, "reasoning": "...", "resolution": "resolved|partial|failed|abandoned|exploratory|trivial", "display_title": "...", "summary": "...", "effort_estimate": 0.0-1.0, "task_type": "...", "session_tags": [...], "privacy_flags": [...], "project_areas": [...]}')
+    lines.append('{"substance": N, "ai_quality_score": N, "ai_failure_value_score": N, "ai_recovery_labels": [...], "ai_failure_attribution": "...", "ai_failure_modes": [...], "ai_failure_evidence": [...], "ai_learning_summary": "...", "reasoning": "...", "resolution": "resolved|partial|failed|abandoned|exploratory|trivial", "display_title": "...", "summary": "...", "effort_estimate": 0.0-1.0, "task_type": "...", "session_tags": [...], "privacy_flags": [...], "project_areas": [...]}')
     return "\n".join(lines)
 
 
@@ -402,10 +420,12 @@ _RUBRIC_SEARCH_PATHS = [
 ]
 
 _FALLBACK_RUBRIC = """\
-Score this coding agent session for productivity (1-5). \
-5=major work (significant task), 4=solid, 3=light, 2=minimal, 1=noise. \
-Return JSON with substance, reasoning, display_title, summary, resolution, \
-effort_estimate, task_type, session_tags, privacy_flags, and project_areas fields."""
+Score this coding agent session for productivity and failure value. \
+Return JSON with substance, ai_quality_score, ai_failure_value_score, \
+ai_recovery_labels, ai_failure_attribution, ai_failure_modes, \
+ai_failure_evidence, ai_learning_summary, reasoning, display_title, summary, \
+resolution, effort_estimate, task_type, session_tags, privacy_flags, and \
+project_areas fields."""
 
 
 def _looks_like_rubric_redirect_stub(text: str) -> bool:
@@ -450,6 +470,53 @@ JUDGE_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "substance": {"type": "integer", "minimum": 1, "maximum": 5},
+        "ai_quality_score": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Legacy productivity/substance score, kept for compatibility.",
+        },
+        "ai_failure_value_score": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Value of this trace for understanding frontier-agent failure behavior.",
+        },
+        "ai_recovery_labels": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["self_recovered", "user_corrected_recovery", "unrecovered", "blocked"],
+            },
+        },
+        "ai_failure_attribution": {
+            "type": "string",
+            "enum": ["agent_caused", "environment", "preexisting_problem", "user_redirect", "unclear", ""],
+        },
+        "ai_failure_modes": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "wrong_approach",
+                    "wrong_assumption",
+                    "false_success",
+                    "regression",
+                    "instruction_violation",
+                    "excessive_work",
+                    "blocker_mishandled",
+                ],
+            },
+        },
+        "ai_failure_evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Short evidence snippets or paraphrases supporting the failure-value label.",
+        },
+        "ai_learning_summary": {
+            "type": "string",
+            "description": "One concise sentence naming the lesson this failure trace teaches.",
+        },
         "reasoning": {"type": "string"},
         "display_title": {
             "type": "string",
@@ -503,9 +570,13 @@ JUDGE_SCHEMA = {
             "description": "Zero or more directory paths that were the focus of work",
         },
     },
-    "required": ["substance", "reasoning", "display_title", "summary",
-                  "resolution", "effort_estimate", "task_type", "session_tags",
-                  "privacy_flags", "project_areas"],
+    "required": [
+        "substance", "ai_quality_score", "ai_failure_value_score",
+        "ai_recovery_labels", "ai_failure_attribution", "ai_failure_modes",
+        "ai_failure_evidence", "ai_learning_summary", "reasoning",
+        "display_title", "summary", "resolution", "effort_estimate",
+        "task_type", "session_tags", "privacy_flags", "project_areas",
+    ],
 }
 
 # Backward compat: old schema used "quality" key — _validate_judge_result handles both
@@ -647,6 +718,46 @@ def _write_agent_inputs(
     (tmp_path / "RUBRIC.md").write_text(rubric, encoding="utf-8")
 
 
+def _rubric_revision(rubric: str) -> str:
+    """Return the git commit for the active rubric, or a content hash fallback."""
+    rubric_path = PROMPTS_DIR / "scoring" / "rubric.md"
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        rubric_path_arg = str(rubric_path.relative_to(repo_root))
+    except ValueError:
+        rubric_path_arg = str(rubric_path)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "-n", "1", "--format=%H", "--", rubric_path_arg],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        proc = None
+    if proc and proc.returncode == 0:
+        sha = proc.stdout.strip()
+        if sha:
+            return sha
+    return "sha256:" + hashlib.sha256(rubric.encode("utf-8")).hexdigest()
+
+
+def _attach_scorer_metadata(
+    result: dict[str, Any],
+    *,
+    backend: str,
+    model: str | None,
+    rubric: str,
+) -> dict[str, Any]:
+    """Attach provenance fields after validation."""
+    result["_scorer_backend"] = backend
+    result["_scorer_model"] = model or ""
+    result["_rubric_git_sha"] = _rubric_revision(rubric)
+    result["_scored_at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
 def _extract_json_candidate_strings(value: Any) -> list[str]:
     """Collect string candidates that may contain a JSON judge result."""
     candidates: list[str] = []
@@ -679,15 +790,46 @@ def _looks_like_judge_result(d: dict) -> bool:
     """
     if not isinstance(d, dict) or "reasoning" not in d:
         return False
-    has_score = "substance" in d or "quality" in d
+    has_score = "substance" in d or "quality" in d or "ai_quality_score" in d
     has_classification = "task_type" in d or "display_title" in d
     return has_score and has_classification
 
 
-def _extract_judge_result_from_value(value: Any) -> dict[str, Any]:
+_REQUIRED_FAILURE_FIELDS = (
+    "ai_failure_value_score",
+    "ai_recovery_labels",
+    "ai_failure_attribution",
+    "ai_failure_modes",
+    "ai_failure_evidence",
+    "ai_learning_summary",
+)
+
+
+def _validate_backend_judge_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Validate a live backend result and require the failure-value schema."""
+    validated = _validate_judge_result(result)
+    missing = [field for field in _REQUIRED_FAILURE_FIELDS if field not in result]
+    if missing or validated["ai_failure_value_score"] is None:
+        details = ", ".join(missing or ["ai_failure_value_score"])
+        raise RuntimeError(
+            "Judge result missing required failure-value fields: "
+            f"{details}. Re-run with the current scoring rubric."
+        )
+    return validated
+
+
+def _extract_judge_result_from_value(
+    value: Any,
+    *,
+    require_failure_fields: bool = False,
+) -> dict[str, Any]:
     """Find and validate a judge result inside a backend response payload."""
     if isinstance(value, dict) and _looks_like_judge_result(value):
-        return _validate_judge_result(value)
+        return (
+            _validate_backend_judge_result(value)
+            if require_failure_fields
+            else _validate_judge_result(value)
+        )
 
     for candidate in _extract_json_candidate_strings(value):
         try:
@@ -695,7 +837,11 @@ def _extract_judge_result_from_value(value: Any) -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict) and _looks_like_judge_result(parsed):
-            return _validate_judge_result(parsed)
+            return (
+                _validate_backend_judge_result(parsed)
+                if require_failure_fields
+                else _validate_judge_result(parsed)
+            )
 
     raise RuntimeError("Backend response did not contain a valid JSON judge result")
 
@@ -711,7 +857,7 @@ def _read_scoring_output(result: AgentResult, backend: str) -> dict:
         except json.JSONDecodeError:
             raise RuntimeError("scoring.json is not valid JSON")
         if isinstance(parsed, dict):
-            return _validate_judge_result(parsed)
+            return _validate_backend_judge_result(parsed)
         raise RuntimeError("scoring.json does not contain a JSON object")
 
     # OpenClaw: parse from stdout
@@ -722,9 +868,9 @@ def _read_scoring_output(result: AgentResult, backend: str) -> dict:
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError:
-        return _extract_judge_result_from_value(stdout)
+        return _extract_judge_result_from_value(stdout, require_failure_fields=True)
 
-    return _extract_judge_result_from_value(payload)
+    return _extract_judge_result_from_value(payload, require_failure_fields=True)
 
 
 def call_judge(
@@ -781,7 +927,13 @@ def call_judge(
             openclaw_message=openclaw_msg,
         )
 
-        return _read_scoring_output(result, resolved)
+        parsed = _read_scoring_output(result, resolved)
+        return _attach_scorer_metadata(
+            parsed,
+            backend=resolved,
+            model=model,
+            rubric=rubric,
+        )
 
 
 def _normalize_snake_case(s: str) -> str:
@@ -798,6 +950,60 @@ def _validate_snake_list(raw: Any) -> list[str]:
         for v in raw
         if isinstance(v, str) and v.strip()
     ]
+
+
+def _validate_bounded_string_list(raw: Any, *, limit: int = 8, max_chars: int = 220) -> list[str]:
+    """Return a short list of clean strings for display-only judge fields."""
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = " ".join(item.split())
+        if not text:
+            continue
+        values.append(text[:max_chars])
+        if len(values) >= limit:
+            break
+    return values
+
+
+_VALID_RECOVERY_LABELS = {
+    "self_recovered",
+    "user_corrected_recovery",
+    "unrecovered",
+    "blocked",
+}
+
+_VALID_FAILURE_ATTRIBUTIONS = {
+    "agent_caused",
+    "environment",
+    "preexisting_problem",
+    "user_redirect",
+    "unclear",
+}
+
+_VALID_FAILURE_MODES = {
+    "wrong_approach",
+    "wrong_assumption",
+    "false_success",
+    "regression",
+    "instruction_violation",
+    "excessive_work",
+    "blocker_mishandled",
+}
+
+
+def _validate_enum_list(raw: Any, valid_values: set[str]) -> list[str]:
+    """Validate and normalize a judge-emitted enum list, preserving order."""
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in _validate_snake_list(raw):
+        if item in valid_values and item not in seen:
+            values.append(item)
+            seen.add(item)
+    return values
 
 
 _VALID_RESOLUTIONS = {"resolved", "partial", "failed", "abandoned", "exploratory", "trivial"}
@@ -820,10 +1026,46 @@ _LEGACY_RESOLUTION_MAP = {
 
 def _validate_judge_result(result: dict) -> dict:
     """Parse judge result safely. Handles both new (substance) and old (quality) schemas."""
-    # Support both new "substance" and old "quality" key
-    substance = result.get("substance") if "substance" in result else result.get("quality")
+    # Support the new explicit ai_quality_score, current "substance", and
+    # older "quality" key. Keep returning substance for existing callers.
+    if "ai_quality_score" in result:
+        substance = result.get("ai_quality_score")
+    elif "substance" in result:
+        substance = result.get("substance")
+    else:
+        substance = result.get("quality")
     if not isinstance(substance, int) or not (1 <= substance <= 5):
         substance = 3  # safety net: invalid defaults to middle
+
+    failure_value = result.get("ai_failure_value_score")
+    if isinstance(failure_value, int) and 1 <= failure_value <= 5:
+        failure_value_score = failure_value
+    else:
+        failure_value_score = None
+
+    recovery_labels = _validate_enum_list(
+        result.get("ai_recovery_labels", []),
+        _VALID_RECOVERY_LABELS,
+    )
+
+    failure_attribution = result.get("ai_failure_attribution", "")
+    if isinstance(failure_attribution, str):
+        failure_attribution = _normalize_snake_case(failure_attribution)
+    else:
+        failure_attribution = ""
+    if failure_attribution not in _VALID_FAILURE_ATTRIBUTIONS:
+        failure_attribution = ""
+
+    failure_modes = _validate_enum_list(
+        result.get("ai_failure_modes", []),
+        _VALID_FAILURE_MODES,
+    )
+    failure_evidence = _validate_bounded_string_list(result.get("ai_failure_evidence", []))
+
+    learning_summary = result.get("ai_learning_summary", "")
+    if not isinstance(learning_summary, str):
+        learning_summary = ""
+    learning_summary = " ".join(learning_summary.split())[:500]
 
     # Resolution (new) or fall back from old outcome_label. The judge
     # sometimes returns values outside _VALID_RESOLUTIONS (historically
@@ -884,6 +1126,13 @@ def _validate_judge_result(result: dict) -> dict:
 
     return {
         "substance": substance,
+        "ai_quality_score": substance,
+        "ai_failure_value_score": failure_value_score,
+        "ai_recovery_labels": recovery_labels,
+        "ai_failure_attribution": failure_attribution,
+        "ai_failure_modes": failure_modes,
+        "ai_failure_evidence": failure_evidence,
+        "ai_learning_summary": learning_summary,
         "reasoning": str(result.get("reasoning", "")),
         "display_title": display_title,
         "summary": summary,
@@ -893,6 +1142,10 @@ def _validate_judge_result(result: dict) -> dict:
         "session_tags": session_tags,
         "privacy_flags": privacy_flags,
         "project_areas": project_areas,
+        "_scorer_backend": result.get("_scorer_backend", ""),
+        "_scorer_model": result.get("_scorer_model", ""),
+        "_rubric_git_sha": result.get("_rubric_git_sha", ""),
+        "_scored_at": result.get("_scored_at", ""),
     }
 
 
@@ -968,7 +1221,11 @@ def score_session(
     detail = get_session_detail(conn, session_id)
     if not detail:
         return ScoringResult(
-            segments=[], quality=1, reason="Session not found",
+            segments=[],
+            quality=1,
+            reason="Session not found",
+            failure_value_score=1,
+            learning_summary="Session not found.",
         )
 
     messages = detail.get("messages", [])
@@ -1010,7 +1267,11 @@ def score_session(
     segments = segment_session(messages)
     if not segments:
         return ScoringResult(
-            segments=[], quality=1, reason="No scorable content",
+            segments=[],
+            quality=1,
+            reason="No scorable content",
+            failure_value_score=1,
+            learning_summary="No scorable content.",
         )
 
     metrics = compute_basic_metrics(segments, detail)
@@ -1018,7 +1279,11 @@ def score_session(
 
     if total_steps == 0:
         return ScoringResult(
-            segments=segments, quality=1, reason="No tool usage",
+            segments=segments,
+            quality=1,
+            reason="No tool usage",
+            failure_value_score=1,
+            learning_summary="No useful failure signal: no tool usage.",
         )
 
     # Judge: LLM scores holistically
@@ -1051,6 +1316,16 @@ def score_session(
         "session_tags": result["session_tags"],
         "privacy_flags": result["privacy_flags"],
         "project_areas": result.get("project_areas", []),
+        "ai_failure_value_score": result.get("ai_failure_value_score"),
+        "ai_recovery_labels": result.get("ai_recovery_labels", []),
+        "ai_failure_attribution": result.get("ai_failure_attribution", ""),
+        "ai_failure_modes": result.get("ai_failure_modes", []),
+        "ai_failure_evidence": result.get("ai_failure_evidence", []),
+        "ai_learning_summary": result.get("ai_learning_summary", ""),
+        "ai_scorer_backend": result.get("_scorer_backend", ""),
+        "ai_scorer_model": result.get("_scorer_model", ""),
+        "ai_rubric_git_sha": result.get("_rubric_git_sha", ""),
+        "ai_scored_at": result.get("_scored_at", ""),
     }
 
     return ScoringResult(
@@ -1066,4 +1341,13 @@ def score_session(
         effort_estimate=effort_estimate,
         project_areas=result.get("project_areas", []),
         detail_json=json.dumps(detail_data),
+        failure_value_score=result.get("ai_failure_value_score"),
+        recovery_labels=result.get("ai_recovery_labels", []),
+        failure_attribution=result.get("ai_failure_attribution", ""),
+        failure_modes=result.get("ai_failure_modes", []),
+        learning_summary=result.get("ai_learning_summary", ""),
+        scorer_backend=result.get("_scorer_backend", ""),
+        scorer_model=result.get("_scorer_model", ""),
+        rubric_git_sha=result.get("_rubric_git_sha", ""),
+        scored_at=result.get("_scored_at", ""),
     )

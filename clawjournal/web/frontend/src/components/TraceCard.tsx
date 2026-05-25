@@ -141,6 +141,22 @@ export function TraceCard({
               {session.ai_quality_score}
             </span>
           )}
+          {session.ai_failure_value_score != null && (
+            <span style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '2px 7px',
+              borderRadius: 9999,
+              fontSize: 11,
+              fontWeight: 700,
+              color: '#991b1b',
+              background: '#fee2e2',
+              flexShrink: 0,
+            }}>
+              {session.ai_failure_value_score} failure value
+            </span>
+          )}
           <span style={{ fontSize: 12, color: '#9ca3af', flexShrink: 0 }}>
             {formatTime(session.start_time)}
           </span>

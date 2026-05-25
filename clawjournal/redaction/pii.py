@@ -344,33 +344,72 @@ def _collect_text_work_items(session: dict[str, Any]) -> list[tuple[str, int, st
 
     session_id = str(session.get("session_id") or "")
     messages = session.get("messages", [])
-    if not isinstance(messages, list):
-        return []
     work_items: list[tuple[str, int, str, str]] = []
-    for i, msg in enumerate(messages):
-        if not isinstance(msg, dict):
-            continue
-        for field in ("content", "thinking"):
-            value = msg.get(field)
-            if isinstance(value, str) and value.strip():
-                work_items.append((session_id, i, field, value))
-        for tool_index, tool_use in enumerate(msg.get("tool_uses", [])):
-            if not isinstance(tool_use, dict):
+    if isinstance(messages, list):
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
                 continue
-            for branch in ("input", "output"):
-                value = tool_use.get(branch)
-                if isinstance(value, dict):
-                    for key, nested in value.items():
-                        if isinstance(nested, str) and nested.strip():
-                            work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}.{key}", nested))
-                elif isinstance(value, str) and value.strip():
-                    work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}", value))
-        # Widened message model (phase-2 C1): same redaction passes
-        # apply to invocations / snippets / extra / author.
-        for text, field_label in iter_widened_text_locations(msg):
-            if text.strip():
-                work_items.append((session_id, i, field_label, text))
+            for field in ("content", "thinking"):
+                value = msg.get(field)
+                if isinstance(value, str) and value.strip():
+                    work_items.append((session_id, i, field, value))
+            for tool_index, tool_use in enumerate(msg.get("tool_uses", [])):
+                if not isinstance(tool_use, dict):
+                    continue
+                for branch in ("input", "output"):
+                    value = tool_use.get(branch)
+                    if isinstance(value, dict):
+                        for key, nested in value.items():
+                            if isinstance(nested, str) and nested.strip():
+                                work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}.{key}", nested))
+                    elif isinstance(value, str) and value.strip():
+                        work_items.append((session_id, i, f"tool_uses[{tool_index}].{branch}", value))
+            # Widened message model (phase-2 C1): same redaction passes
+            # apply to invocations / snippets / extra / author.
+            for text, field_label in iter_widened_text_locations(msg):
+                if text.strip():
+                    work_items.append((session_id, i, field_label, text))
+    for field, text in _iter_session_level_text_locations(session):
+        if text.strip():
+            work_items.append((session_id, -1, field, text))
     return work_items
+
+
+def _iter_session_level_text_locations(session: dict[str, Any]) -> Iterable[tuple[str, str]]:
+    """Yield metadata and judge-generated text that can be exported."""
+    for field in (
+        "project",
+        "git_branch",
+        "display_title",
+        "ai_learning_summary",
+        "ai_score_reason",
+        "ai_display_title",
+        "ai_summary",
+    ):
+        value = session.get(field)
+        if isinstance(value, str) and value:
+            yield field, value
+
+    raw = session.get("ai_scoring_detail")
+    if not isinstance(raw, str) or not raw:
+        return
+    try:
+        detail = json.loads(raw)
+    except json.JSONDecodeError:
+        yield "ai_scoring_detail", raw
+        return
+    yield from _iter_json_text_locations("ai_scoring_detail", detail)
+
+
+def _iter_json_text_locations(prefix: str, value: Any) -> Iterable[tuple[str, str]]:
+    if isinstance(value, str):
+        yield prefix, value
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            yield from _iter_json_text_locations(f"{prefix}[{idx}]", item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_json_text_locations(f"{prefix}.{key}", item)
 
 
 def review_session_pii_with_agent(session: dict[str, Any], *, backend: str = "auto", ignore_errors: bool = False, rubric: str | None = None, max_workers: int = 4) -> list[PIIFinding]:
@@ -546,11 +585,10 @@ def review_session_pii(session: dict[str, Any]) -> list[PIIFinding]:
     findings: list[PIIFinding] = []
     session_id = str(session.get("session_id") or "")
 
-    # Scan top-level metadata fields for PII
-    for meta_field in ("project", "git_branch", "display_title"):
-        value = session.get(meta_field)
-        if isinstance(value, str) and value.strip():
-            findings.extend(_content_findings_for_text(session_id, -1, meta_field, value))
+    # Scan top-level metadata and judge-generated export fields for PII.
+    for field, value in _iter_session_level_text_locations(session):
+        if value.strip():
+            findings.extend(_scan_text_for_pii(session_id, -1, field, value))
 
     messages = session.get("messages", [])
     if not isinstance(messages, list):
