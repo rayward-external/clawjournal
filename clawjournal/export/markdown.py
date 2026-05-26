@@ -301,23 +301,15 @@ def _render_failure_analysis(session: dict[str, Any]) -> str:
     `ai_meta_labels`). Keeps the AI judge output queryable from exported
     bundles, not just from the live SQLite index.
     """
-    detail: dict[str, Any] = {}
-    raw_detail = session.get("ai_scoring_detail")
-    if isinstance(raw_detail, str) and raw_detail.strip():
-        try:
-            parsed = json.loads(raw_detail)
-            if isinstance(parsed, dict):
-                detail = parsed
-        except (json.JSONDecodeError, ValueError):
-            detail = {}
+    detail = _parse_detail_field(session.get("ai_scoring_detail"))
 
     score = session.get("ai_failure_value_score")
-    attribution = (session.get("ai_failure_attribution") or "").strip()
+    attribution = str(session.get("ai_failure_attribution") or "").strip()
     modes = _parse_list_field(session.get("ai_failure_modes"))
     recovery = _parse_list_field(session.get("ai_recovery_labels"))
     meta_labels = _parse_list_field(detail.get("ai_meta_labels"))
     evidence = _parse_list_field(detail.get("ai_failure_evidence"))
-    learning = (session.get("ai_learning_summary") or "").strip()
+    learning = str(session.get("ai_learning_summary") or "").strip()
 
     if not any([score is not None, attribution, modes, recovery, meta_labels, evidence, learning]):
         return ""
@@ -340,6 +332,19 @@ def _render_failure_analysis(session: dict[str, Any]) -> str:
         rows.extend(f"- {e}" for e in evidence)
     rows.append("")
     return "\n".join(rows)
+
+
+def _parse_detail_field(raw_detail: Any) -> dict[str, Any]:
+    if isinstance(raw_detail, dict):
+        return raw_detail
+    if isinstance(raw_detail, str) and raw_detail.strip():
+        try:
+            parsed = json.loads(raw_detail)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
 
 
 def _extract_text(msg: dict[str, Any]) -> str:

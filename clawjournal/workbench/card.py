@@ -109,18 +109,27 @@ def _summarize_failure(session: dict[str, Any]) -> dict[str, Any]:
     evidence + learning summary live in the trace note and the markdown
     export.
     """
-    modes_raw = session.get("ai_failure_modes")
-    if isinstance(modes_raw, str):
-        try:
-            modes_raw = json.loads(modes_raw)
-        except (json.JSONDecodeError, ValueError):
-            modes_raw = []
-    modes = [str(m).replace("_", " ") for m in modes_raw or [] if m]
+    modes = _parse_string_list(session.get("ai_failure_modes"))
     return {
         "score": session.get("ai_failure_value_score"),
         "attribution": session.get("ai_failure_attribution") or None,
         "modes": modes,
     }
+
+
+def _parse_string_list(value: Any) -> list[str]:
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item]
+
+
+def _display_failure_label(value: Any) -> str:
+    return str(value).replace("_", " ")
 
 
 def _short_model_name(model: str) -> str:
@@ -176,9 +185,9 @@ def _build_card_text(card: dict[str, Any], depth: str) -> str:
     if failure.get("score") is not None:
         failure_parts.append(f"Failure {failure['score']}/5")
     if failure.get("attribution"):
-        failure_parts.append(str(failure["attribution"]).replace("_", " "))
+        failure_parts.append(_display_failure_label(failure["attribution"]))
     if failure.get("modes"):
-        failure_parts.append(", ".join(failure["modes"]))
+        failure_parts.append(", ".join(_display_failure_label(m) for m in failure["modes"]))
     if failure_parts:
         lines.append(" \u00b7 ".join(failure_parts))
 

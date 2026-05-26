@@ -1,9 +1,12 @@
 """Tests for trace note rendering."""
 
+import json
+
 from clawjournal.workbench.trace_note import (
     SCHEMA_VERSION,
     _normalize_notes,
     extract_rendered_updated_at,
+    extract_trace_note_notes,
     render_trace_note,
 )
 
@@ -75,6 +78,38 @@ class TestRenderEmptySummary:
         # Both heading anchors still emitted
         assert text.count("## Summary") == 1
         assert text.count("## Notes") == 1
+
+
+class TestFailureAnalysis:
+    def test_renders_failure_analysis_from_columns_and_detail_dict(self):
+        session = _minimal_session(
+            ai_failure_value_score=4,
+            ai_failure_attribution="agent_caused",
+            ai_failure_modes=json.dumps(["reasoning_fabrication"]),
+            ai_recovery_labels=["user_corrected_recovery"],
+            ai_learning_summary="Verify the evidence before committing.",
+            ai_scoring_detail={
+                "ai_meta_labels": ["evaluation_measurement"],
+                "ai_failure_evidence": ["User corrected a fabricated API."],
+            },
+        )
+
+        text = render_trace_note(session, "keep this reviewer note")
+
+        assert "## Failure analysis" in text
+        assert "- **Failure value:** 4/5" in text
+        assert "- **Attribution:** agent_caused" in text
+        assert "- **Modes:** reasoning_fabrication" in text
+        assert "- **Recovery:** user_corrected_recovery" in text
+        assert "- **Meta labels:** evaluation_measurement" in text
+        assert "_Verify the evidence before committing._" in text
+        assert "- User corrected a fabricated API." in text
+        assert extract_trace_note_notes(text) == "keep this reviewer note"
+
+    def test_omits_failure_analysis_when_no_failure_fields(self):
+        text = render_trace_note(_minimal_session(), None)
+
+        assert "## Failure analysis" not in text
 
 
 class TestRenderIdempotent:

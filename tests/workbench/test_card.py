@@ -1,5 +1,7 @@
 """Tests for clawjournal.workbench.card — share card generation."""
 
+import json
+
 import pytest
 
 from clawjournal.workbench.card import (
@@ -175,6 +177,34 @@ class TestGenerateCard:
         assert card["score"] == 4
         assert card["outcome"] == "tests_passed"
         assert card["redaction_count"] == 7
+
+    def test_failure_card_preserves_structured_labels(self, sample_session):
+        sample_session.update({
+            "ai_failure_value_score": 4,
+            "ai_failure_attribution": "agent_caused",
+            "ai_failure_modes": json.dumps([
+                "reasoning_fabrication",
+                "verification_skipped",
+            ]),
+        })
+        result = generate_card(sample_session, "summary")
+
+        assert result["card"]["failure"] == {
+            "score": 4,
+            "attribution": "agent_caused",
+            "modes": ["reasoning_fabrication", "verification_skipped"],
+        }
+        assert (
+            "Failure 4/5 · agent caused · reasoning fabrication, verification skipped"
+            in result["card_text"]
+        )
+
+    def test_failure_card_ignores_malformed_mode_payload(self, sample_session):
+        sample_session["ai_failure_modes"] = '{"not": "a-list"}'
+
+        result = generate_card(sample_session, "summary")
+
+        assert result["card"]["failure"]["modes"] == []
 
     def test_card_text_not_empty(self, sample_session):
         result = generate_card(sample_session, "summary")

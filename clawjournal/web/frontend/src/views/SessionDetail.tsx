@@ -354,13 +354,13 @@ export default function SessionDetail() {
               }
             } catch { /* tolerate malformed scoring detail */ }
             const evidence = Array.isArray(scoringDetail.ai_failure_evidence)
-              ? (scoringDetail.ai_failure_evidence as string[])
+              ? scoringDetail.ai_failure_evidence.filter((item): item is string => typeof item === 'string')
               : [];
             const metaLabels = Array.isArray(scoringDetail.ai_meta_labels)
-              ? (scoringDetail.ai_meta_labels as string[])
+              ? scoringDetail.ai_meta_labels.filter((item): item is string => typeof item === 'string')
               : [];
-            const modes = session.ai_failure_modes ?? [];
-            const recovery = session.ai_recovery_labels ?? [];
+            const modes = Array.isArray(session.ai_failure_modes) ? session.ai_failure_modes : [];
+            const recovery = Array.isArray(session.ai_recovery_labels) ? session.ai_recovery_labels : [];
             const hasFailureBlock =
               session.ai_failure_value_score != null
               || modes.length > 0
@@ -706,4 +706,3 @@ function SummaryRow({ label, value, color }: { label: string; value: string; col
     </div>
   );
 }
-

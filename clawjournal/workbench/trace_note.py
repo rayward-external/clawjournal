@@ -307,23 +307,15 @@ def _render_failure_block(session: dict[str, Any]) -> str:
     JSON blob (`ai_failure_evidence`, `ai_meta_labels`). This is the canonical
     snapshot of judge output for later analysis — keep it round-trippable.
     """
-    detail: dict[str, Any] = {}
-    raw_detail = session.get("ai_scoring_detail")
-    if isinstance(raw_detail, str) and raw_detail.strip():
-        try:
-            parsed = json.loads(raw_detail)
-            if isinstance(parsed, dict):
-                detail = parsed
-        except (json.JSONDecodeError, ValueError):
-            detail = {}
+    detail = _parse_detail_field(session.get("ai_scoring_detail"))
 
     score = session.get("ai_failure_value_score")
-    attribution = (session.get("ai_failure_attribution") or "").strip()
+    attribution = str(session.get("ai_failure_attribution") or "").strip()
     modes = _parse_list(session.get("ai_failure_modes"))
     recovery = _parse_list(session.get("ai_recovery_labels"))
     meta_labels = _parse_list(detail.get("ai_meta_labels"))
     evidence = _parse_list(detail.get("ai_failure_evidence"))
-    learning = (session.get("ai_learning_summary") or "").strip()
+    learning = str(session.get("ai_learning_summary") or "").strip()
 
     has_any = (
         score is not None
@@ -354,6 +346,19 @@ def _render_failure_block(session: dict[str, Any]) -> str:
         parts.extend(["", "**Evidence:**"])
         parts.extend(f"- {e}" for e in evidence)
     return "\n".join(parts)
+
+
+def _parse_detail_field(raw_detail: Any) -> dict[str, Any]:
+    if isinstance(raw_detail, dict):
+        return raw_detail
+    if isinstance(raw_detail, str) and raw_detail.strip():
+        try:
+            parsed = json.loads(raw_detail)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
 
 
 def extract_trace_note_notes(text: str) -> str | None:
