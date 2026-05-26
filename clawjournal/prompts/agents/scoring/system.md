@@ -26,7 +26,8 @@ Write scoring.json with these fields:
 - ai_failure_value_score: integer 1-5 (value for understanding agent failure behavior)
 - ai_recovery_labels: array of recovery labels
 - ai_failure_attribution: scalar failure attribution
-- ai_failure_modes: array of failure-mode labels
+- ai_failure_modes: array of agent failure-mode labels (categories 1-12 from RUBRIC.md)
+- ai_meta_labels: array of evaluation/measurement labels (only `evaluation_measurement` today; usually empty)
 - ai_failure_evidence: array of short evidence snippets or paraphrases
 - ai_learning_summary: one concise lesson from the failure signal
 - reasoning: string (explanation)

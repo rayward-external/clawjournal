@@ -415,14 +415,14 @@ class TestGetSessionDetail:
             index_conn,
             "sess-1",
             ai_recovery_labels=json.dumps(["user_corrected_recovery"]),
-            ai_failure_modes=json.dumps(["wrong_assumption"]),
+            ai_failure_modes=json.dumps(["reasoning_fabrication"]),
         )
 
         detail = get_session_detail(index_conn, "sess-1")
 
         assert detail is not None
         assert detail["ai_recovery_labels"] == ["user_corrected_recovery"]
-        assert detail["ai_failure_modes"] == ["wrong_assumption"]
+        assert detail["ai_failure_modes"] == ["reasoning_fabrication"]
 
     def test_not_found(self, index_conn):
         assert get_session_detail(index_conn, "nonexistent") is None

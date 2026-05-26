@@ -72,7 +72,7 @@ def _failure_fields(**overrides) -> dict:
         "ai_failure_value_score": 4,
         "ai_recovery_labels": ["user_corrected_recovery"],
         "ai_failure_attribution": "agent_caused",
-        "ai_failure_modes": ["wrong_assumption"],
+        "ai_failure_modes": ["reasoning_fabrication"],
         "ai_failure_evidence": ["User corrected the assumption."],
         "ai_learning_summary": "The trace shows a corrected agent assumption.",
     }
