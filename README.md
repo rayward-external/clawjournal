@@ -127,6 +127,8 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
 
 The script prints `[ok] ClawJournal <version> installed.` on success. The default above includes `--with-frontend` / `-WithFrontend` which builds the browser workbench at `localhost:8384`. **If Node.js is not installed, the script warns and continues with a CLI-only install** — `clawjournal serve` will then 404; install Node and re-run the script with the flag to fix. Drop the flag entirely if you only need `scan`, `inbox`, `search`, and `bundle-export` (these don't need the workbench).
 
+**Stays current automatically.** Each invocation runs a silent, throttled background fast-forward from `rayward-external/clawjournal` (once per hour, capped on time, network-failure-safe). New code is picked up by the editable install on the next run — no manual upgrades. Skipped on dirty trees, local-only commits, diverged histories, or non-`main` branches. Opt out with `CLAWJOURNAL_NO_AUTO_UPDATE=1`, or run a synchronous update anytime with `clawjournal selfupdate` (`--check` to peek, `--force` to discard local changes on `main` only).
+
 **Verify** — you should see a JSON response with `"stage"` and `"stage_number"`:
 
 ```bash
@@ -141,7 +143,7 @@ The script prints `[ok] ClawJournal <version> installed.` on success. The defaul
 { "stage": "configure", "stage_number": 2, "total_stages": 4, ... }
 ```
 
-The CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows). The install is idempotent — re-run the script any time to upgrade against the latest `git pull`.
+The CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows). The install is idempotent — re-run the script any time to fast-forward to the latest source.
 
 **To call it as plain `clawjournal` instead of the full path** (current shell session; add to your shell profile to persist):
 
@@ -527,6 +529,8 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal list` | List all projects with exclusion status |
 | `clawjournal status` | Show current stage and next steps (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |
+| `clawjournal selfupdate` | Fast-forward to latest from `rayward-external/clawjournal` (sync) |
+| `clawjournal selfupdate --check` | Report whether updates are available without applying |
 | `clawjournal serve --remote` | Print SSH tunnel command for remote VM access |
 
 ### Export & sanitize (advanced)

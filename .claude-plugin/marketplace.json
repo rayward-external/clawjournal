@@ -4,8 +4,8 @@
   "version": "0.1.13",
   "description": "ClawJournal — review, curate, and share your coding agent conversation traces. 100% local. Scans sessions from Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline. Auto-redacts secrets and PII. Browser workbench for triage and export.",
   "owner": {
-    "name": "kai-rayward",
-    "url": "https://github.com/kai-rayward"
+    "name": "rayward-external",
+    "url": "https://github.com/rayward-external"
   },
   "plugins": [
     {
@@ -13,8 +13,8 @@
       "description": "ClawJournal agent skills: /clawjournal-setup (install + scan + launch workbench), /clawjournal (review, triage, and share traces), and /clawjournal-score (AI-assisted quality scoring).",
       "version": "0.1.13",
       "author": {
-        "name": "kai-rayward",
-        "url": "https://github.com/kai-rayward"
+        "name": "rayward-external",
+        "url": "https://github.com/rayward-external"
       },
       "source": "../plugins/clawjournal",
       "category": "productivity"

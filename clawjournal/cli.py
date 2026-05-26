@@ -3324,7 +3324,44 @@ def _run_note(args: argparse.Namespace) -> None:
     sys.exit(2)
 
 
+_AUTO_UPDATE_SKIP_FLAGS = frozenset({"-h", "--help", "--version"})
+
+
+def _should_auto_update(argv: list[str] | None = None) -> bool:
+    """Return False for commands where a pre-parse update changes semantics.
+
+    Suppresses in two cases:
+      - The user explicitly invoked `clawjournal selfupdate` — let
+        that command be the only updater for this invocation.
+      - The user invoked help/version (`-h`, `--help`, `--version`)
+        with no real subcommand — argparse prints and exits, so a
+        background fetch is wasted work that surprises the user.
+
+    Matching `"selfupdate"` anywhere in argv produced false positives
+    like `clawjournal export --output ./selfupdate`.
+    """
+    tokens = (sys.argv if argv is None else argv)[1:]
+    if not tokens:
+        return True
+    for token in tokens:
+        if token.startswith("-"):
+            continue
+        return token != "selfupdate"
+    # All tokens were flags — no subcommand. Skip when any are help/version.
+    return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
+
+
 def main() -> None:
+    # Fire the silent, throttled auto-update before any work. Returns
+    # immediately on opt-out, non-git installs, or throttle hits.
+    if _should_auto_update():
+        try:
+            from .selfupdate import maybe_self_update
+            maybe_self_update()
+        except Exception:
+            # Auto-update must never block the CLI. Swallow anything.
+            pass
+
     parser = argparse.ArgumentParser(description="ClawJournal — coding agent conversation exporter")
     sub = parser.add_subparsers(dest="command")
 
@@ -3353,6 +3390,14 @@ def main() -> None:
     us = sub.add_parser("update-skill", help="Install/update the clawjournal skill for a coding agent")
     us.add_argument("target", choices=["claude", "openclaw", "codex", "cline"],
                     help="Agent to install skill for")
+
+    su = sub.add_parser("selfupdate",
+                        help="Pull the latest clawjournal from the public repo (manual sync update)")
+    su.add_argument("--check", action="store_true",
+                    help="Report whether updates are available without applying them")
+    su.add_argument("--force", action="store_true",
+                    help="Discard local changes on main before applying a fast-forward update")
+    su.add_argument("--json", action="store_true", help="Output result as JSON")
 
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
@@ -4173,6 +4218,45 @@ def main() -> None:
 
     if command == "update-skill":
         update_skill(args.target)
+        return
+
+    if command == "selfupdate":
+        from .selfupdate import selfupdate_sync
+        result = selfupdate_sync(check_only=args.check, force=args.force)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            status = result.get("status")
+            if status == "not-a-checkout":
+                print("clawjournal is not installed from an editable git checkout — nothing to update.")
+            elif status == "up-to-date":
+                print(f"Already up to date ({str(result.get('head', ''))[:7]}).")
+            elif status == "behind":
+                print(
+                    f"Update available: {str(result.get('head', ''))[:7]} -> "
+                    f"{str(result.get('upstream', ''))[:7]}. Run `clawjournal selfupdate` to apply."
+                )
+            elif status == "updated":
+                print(
+                    f"Updated {str(result.get('head', ''))[:7]} -> "
+                    f"{str(result.get('upstream', ''))[:7]}."
+                )
+            elif status == "dirty":
+                print("Skipped: the checkout has local changes. Commit/stash or pass --force.")
+            elif isinstance(status, str) and status.startswith("branch-"):
+                print(f"Skipped: not on the main branch ({status[len('branch-'):]}). Check out main first.")
+            elif status == "ahead":
+                print("Skipped: local main has commits not present on origin/main. Update manually.")
+            elif status == "diverged":
+                print("Skipped: local main has diverged from origin/main. Update manually.")
+            elif status == "ancestry-failed":
+                print("Skipped: could not compare local main with origin/main.")
+            elif status == "fetch-failed":
+                print(f"Fetch failed: {result.get('stderr', '')}".rstrip())
+            elif status == "update-failed":
+                print(f"Update failed: {result.get('stderr', '')}".rstrip())
+            else:
+                print(f"selfupdate status: {status}")
         return
 
     if command == "list":

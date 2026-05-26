@@ -17,7 +17,7 @@ def test_claude_marketplace_points_to_plugin_wrapper():
     assert plugin["version"] == clawjournal.__version__
     assert plugin["source"] == "../plugins/clawjournal"
     assert plugin["category"] == "productivity"
-    assert plugin["author"]["name"] == "kai-rayward"
+    assert plugin["author"]["name"] == "rayward-external"
     assert plugin.get("description"), "plugin description must be present but can evolve freely"
 
 

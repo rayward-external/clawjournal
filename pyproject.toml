@@ -11,7 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 readme = "README.md"
 authors = [
-    {name = "kai-rayward"},
+    {name = "rayward-external"},
 ]
 keywords = ["claude-code", "codex", "gemini-cli", "opencode", "openclaw", "dataset", "conversations"]
 classifiers = [
