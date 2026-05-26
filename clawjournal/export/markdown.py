@@ -266,12 +266,80 @@ def render_session_summary(session: dict[str, Any]) -> str:
             parts.append(f"- *... and {len(files) - 10} more*")
         parts.append("")
 
+    # Failure analysis (AI judge output — modes, attribution, recovery, evidence)
+    failure_block = _render_failure_analysis(session)
+    if failure_block:
+        parts.append(failure_block)
+
     # Outcome
     resolution = session.get("ai_outcome_badge") or session.get("outcome_badge")
     if resolution:
         parts.append(f"## Outcome\n\n{resolution.replace('_', ' ').title()}\n")
 
     return "\n".join(parts)
+
+
+def _parse_list_field(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value if x]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if x]
+    return []
+
+
+def _render_failure_analysis(session: dict[str, Any]) -> str:
+    """Render the Failure Analysis section, or empty string if no failure data.
+
+    Pulls from columns (`ai_failure_modes`, `ai_failure_attribution`,
+    `ai_recovery_labels`, `ai_learning_summary`, `ai_failure_value_score`)
+    and from the `ai_scoring_detail` JSON blob (`ai_failure_evidence`,
+    `ai_meta_labels`). Keeps the AI judge output queryable from exported
+    bundles, not just from the live SQLite index.
+    """
+    detail: dict[str, Any] = {}
+    raw_detail = session.get("ai_scoring_detail")
+    if isinstance(raw_detail, str) and raw_detail.strip():
+        try:
+            parsed = json.loads(raw_detail)
+            if isinstance(parsed, dict):
+                detail = parsed
+        except (json.JSONDecodeError, ValueError):
+            detail = {}
+
+    score = session.get("ai_failure_value_score")
+    attribution = (session.get("ai_failure_attribution") or "").strip()
+    modes = _parse_list_field(session.get("ai_failure_modes"))
+    recovery = _parse_list_field(session.get("ai_recovery_labels"))
+    meta_labels = _parse_list_field(detail.get("ai_meta_labels"))
+    evidence = _parse_list_field(detail.get("ai_failure_evidence"))
+    learning = (session.get("ai_learning_summary") or "").strip()
+
+    if not any([score is not None, attribution, modes, recovery, meta_labels, evidence, learning]):
+        return ""
+
+    rows: list[str] = ["## Failure Analysis", ""]
+    if score is not None:
+        rows.append(f"- **Failure value:** {score}/5")
+    if attribution:
+        rows.append(f"- **Attribution:** {attribution}")
+    if modes:
+        rows.append(f"- **Modes:** {', '.join(modes)}")
+    if recovery:
+        rows.append(f"- **Recovery:** {', '.join(recovery)}")
+    if meta_labels:
+        rows.append(f"- **Meta labels:** {', '.join(meta_labels)}")
+    if learning:
+        rows.extend(["", f"_{learning}_"])
+    if evidence:
+        rows.extend(["", "**Evidence:**", ""])
+        rows.extend(f"- {e}" for e in evidence)
+    rows.append("")
+    return "\n".join(rows)
 
 
 def _extract_text(msg: dict[str, Any]) -> str:

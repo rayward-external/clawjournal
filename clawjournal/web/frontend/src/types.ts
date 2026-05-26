@@ -130,6 +130,7 @@ export interface HoldHistoryEntry {
 
 export interface SessionDetail extends Session {
   messages: Message[];
+  ai_scoring_detail?: string | null;
 }
 
 export interface Message {

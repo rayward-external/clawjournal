@@ -258,6 +258,7 @@ def render_trace_note(
 
     summary_body = (session.get("ai_summary") or "").strip()
     notes_body = _normalize_notes(reviewer_notes)
+    failure_block = _render_failure_block(session)
 
     lines = [
         f"<!-- clawjournal-trace-note v{SCHEMA_VERSION} -->",
@@ -278,12 +279,81 @@ def render_trace_note(
         "## Summary",
         "",
         summary_body,
-        "",
-        "## Notes",
-        "",
-        notes_body,
     ]
+    if failure_block:
+        lines.extend(["", "## Failure analysis", "", failure_block])
+    lines.extend(["", "## Notes", "", notes_body])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _parse_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value if x]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if x]
+    return []
+
+
+def _render_failure_block(session: dict[str, Any]) -> str:
+    """Render the failure-analysis section. Returns "" when no failure data.
+
+    Pulls from dedicated columns (`ai_failure_modes`, `ai_failure_attribution`,
+    `ai_recovery_labels`, `ai_learning_summary`) and from the `ai_scoring_detail`
+    JSON blob (`ai_failure_evidence`, `ai_meta_labels`). This is the canonical
+    snapshot of judge output for later analysis — keep it round-trippable.
+    """
+    detail: dict[str, Any] = {}
+    raw_detail = session.get("ai_scoring_detail")
+    if isinstance(raw_detail, str) and raw_detail.strip():
+        try:
+            parsed = json.loads(raw_detail)
+            if isinstance(parsed, dict):
+                detail = parsed
+        except (json.JSONDecodeError, ValueError):
+            detail = {}
+
+    score = session.get("ai_failure_value_score")
+    attribution = (session.get("ai_failure_attribution") or "").strip()
+    modes = _parse_list(session.get("ai_failure_modes"))
+    recovery = _parse_list(session.get("ai_recovery_labels"))
+    meta_labels = _parse_list(detail.get("ai_meta_labels"))
+    evidence = _parse_list(detail.get("ai_failure_evidence"))
+    learning = (session.get("ai_learning_summary") or "").strip()
+
+    has_any = (
+        score is not None
+        or attribution
+        or modes
+        or recovery
+        or meta_labels
+        or evidence
+        or learning
+    )
+    if not has_any:
+        return ""
+
+    parts: list[str] = []
+    if score is not None:
+        parts.append(f"- **Failure value:** {score}/5")
+    if attribution:
+        parts.append(f"- **Attribution:** {attribution}")
+    if modes:
+        parts.append(f"- **Modes:** {', '.join(modes)}")
+    if recovery:
+        parts.append(f"- **Recovery:** {', '.join(recovery)}")
+    if meta_labels:
+        parts.append(f"- **Meta labels:** {', '.join(meta_labels)}")
+    if learning:
+        parts.extend(["", f"_{learning}_"])
+    if evidence:
+        parts.extend(["", "**Evidence:**"])
+        parts.extend(f"- {e}" for e in evidence)
+    return "\n".join(parts)
 
 
 def extract_trace_note_notes(text: str) -> str | None:

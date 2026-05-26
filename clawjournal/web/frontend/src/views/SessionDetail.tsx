@@ -345,6 +345,83 @@ export default function SessionDetail() {
           )}
           {session.share_id && <MetaRow label="Share" value={session.share_id} mono />}
 
+          {/* Failure reasons (AI judge output) */}
+          {(() => {
+            let scoringDetail: Record<string, unknown> = {};
+            try {
+              if (session.ai_scoring_detail) {
+                scoringDetail = JSON.parse(session.ai_scoring_detail);
+              }
+            } catch { /* tolerate malformed scoring detail */ }
+            const evidence = Array.isArray(scoringDetail.ai_failure_evidence)
+              ? (scoringDetail.ai_failure_evidence as string[])
+              : [];
+            const metaLabels = Array.isArray(scoringDetail.ai_meta_labels)
+              ? (scoringDetail.ai_meta_labels as string[])
+              : [];
+            const modes = session.ai_failure_modes ?? [];
+            const recovery = session.ai_recovery_labels ?? [];
+            const hasFailureBlock =
+              session.ai_failure_value_score != null
+              || modes.length > 0
+              || metaLabels.length > 0
+              || evidence.length > 0
+              || (session.ai_failure_attribution && session.ai_failure_attribution.length > 0)
+              || (session.ai_learning_summary && session.ai_learning_summary.length > 0);
+            if (!hasFailureBlock) return null;
+            return (
+              <>
+                <div style={{ padding: '12px 0 4px', fontWeight: 700, fontSize: 12, color: colors.gray400 }}>
+                  FAILURE REASONS
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, padding: '2px 0 6px' }}>
+                  {session.ai_failure_value_score != null && (
+                    <span
+                      title="Failure value (1-5): how useful this trace is for understanding agent failure behavior"
+                      style={{
+                        display: 'inline-block', padding: '1px 8px', borderRadius: '9999px',
+                        fontSize: '12px', fontWeight: 600, lineHeight: '20px',
+                        background: '#fef2f2', color: '#b91c1c', whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Failure {session.ai_failure_value_score}/5
+                    </span>
+                  )}
+                  {session.ai_failure_attribution && (
+                    <BadgeChip kind="attribution" value={session.ai_failure_attribution} />
+                  )}
+                  {modes.map(m => <BadgeChip key={`mode-${m}`} kind="failure_mode" value={m} />)}
+                  {metaLabels.map(m => <BadgeChip key={`meta-${m}`} kind="meta_label" value={m} />)}
+                  {recovery.map(r => <BadgeChip key={`rec-${r}`} kind="recovery" value={r} />)}
+                </div>
+                {session.ai_learning_summary && (
+                  <div
+                    style={{
+                      padding: '4px 0 6px', fontSize: 12, fontStyle: 'italic',
+                      color: colors.gray700, lineHeight: 1.4,
+                    }}
+                  >
+                    “{session.ai_learning_summary}”
+                  </div>
+                )}
+                {evidence.length > 0 && (
+                  <>
+                    <div style={{ padding: '8px 0 2px', fontSize: 11, fontWeight: 600, color: colors.gray400 }}>
+                      EVIDENCE
+                    </div>
+                    <ul style={{ margin: 0, padding: '0 0 0 14px', lineHeight: 1.5 }}>
+                      {evidence.map((e, i) => (
+                        <li key={i} style={{ fontSize: 12, color: colors.gray700, marginBottom: 2 }}>
+                          {e}
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </>
+            );
+          })()}
+
           {/* Badges */}
           <div style={{ padding: '12px 0 4px', fontWeight: 700, fontSize: 12, color: colors.gray400 }}>
             BADGES

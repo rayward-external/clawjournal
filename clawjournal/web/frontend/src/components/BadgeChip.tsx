@@ -1,4 +1,4 @@
-type BadgeKind = 'outcome' | 'value' | 'risk' | 'status';
+type BadgeKind = 'outcome' | 'value' | 'risk' | 'status' | 'failure_mode' | 'meta_label' | 'recovery' | 'attribution';
 
 const COLORS: Record<BadgeKind, Record<string, { bg: string; fg: string }>> = {
   outcome: {
@@ -55,6 +55,23 @@ const COLORS: Record<BadgeKind, Record<string, { bg: string; fg: string }>> = {
     exported: { bg: '#e0f2fe', fg: '#075985' },
     shared: { bg: '#f3e8ff', fg: '#7e22ce' },
     uploaded: { bg: '#f3e8ff', fg: '#7e22ce' },
+  },
+  failure_mode: {},
+  meta_label: {
+    evaluation_measurement: { bg: '#f3e8ff', fg: '#7e22ce' },
+  },
+  recovery: {
+    self_recovered: { bg: '#dcfce7', fg: '#166534' },
+    user_corrected_recovery: { bg: '#e0f2fe', fg: '#075985' },
+    unrecovered: { bg: '#fee2e2', fg: '#991b1b' },
+    blocked: { bg: '#f3f4f6', fg: '#6b7280' },
+  },
+  attribution: {
+    agent_caused: { bg: '#fee2e2', fg: '#991b1b' },
+    environment: { bg: '#f3f4f6', fg: '#6b7280' },
+    preexisting_problem: { bg: '#fef3c7', fg: '#92400e' },
+    user_redirect: { bg: '#e0f2fe', fg: '#075985' },
+    unclear: { bg: '#f3f4f6', fg: '#6b7280' },
   },
 };
 
@@ -134,6 +151,31 @@ export const LABELS: Record<string, string> = {
   planning: 'Planning',
   incident: 'Incident',
   learning: 'Learning',
+  // Failure modes (categories 1-12)
+  task_framing: 'Task framing',
+  method_selection: 'Method selection',
+  context_handling: 'Context handling',
+  execution_error: 'Execution error',
+  reasoning_fabrication: 'Reasoning / fabrication',
+  revision_failure: 'Revision failure',
+  verification_skipped: 'Verification skipped',
+  deliverable_defect: 'Deliverable defect',
+  communication_error: 'Communication error',
+  collaboration_error: 'Collaboration error',
+  safety_security: 'Safety / security',
+  efficiency_waste: 'Efficiency / waste',
+  // Meta labels (category 13)
+  evaluation_measurement: 'Evaluation / measurement',
+  // Recovery
+  self_recovered: 'Self-recovered',
+  user_corrected_recovery: 'User-corrected',
+  unrecovered: 'Unrecovered',
+  // Attribution
+  agent_caused: 'Agent-caused',
+  environment: 'Environment',
+  preexisting_problem: 'Preexisting',
+  user_redirect: 'User redirect',
+  unclear: 'Unclear',
 };
 
 const DESCRIPTIONS: Record<string, string> = {
@@ -176,6 +218,30 @@ const DESCRIPTIONS: Record<string, string> = {
   planning: 'Designing an approach without implementing',
   incident: 'Responding to a production issue',
   learning: 'Understanding something new',
+  // Failure modes
+  task_framing: 'Misread the goal, scope, deliverable, or constraints',
+  method_selection: 'Wrong approach, tool, model, or order of steps',
+  context_handling: 'Failed to gather, read, or preserve needed context',
+  execution_error: 'Mechanical failure: bad tool call, code bug, env issue',
+  reasoning_fabrication: 'Hallucinated APIs/files, unsupported inference, wrong math',
+  revision_failure: "Had the signal to course-correct but didn't revise",
+  verification_skipped: 'Declared done without testing or sanity-checking',
+  deliverable_defect: 'Artifact missing, partial, malformed, or unauditable',
+  communication_error: 'Misleading summary, missing caveats, over/underclaiming',
+  collaboration_error: 'Mishandled human loop: when to ask, when to pause',
+  safety_security: 'Insecure code, destructive action, privacy leak, policy issue',
+  efficiency_waste: 'Disproportionate cost relative to value produced',
+  evaluation_measurement: 'Evaluation/measurement setup misjudges the agent',
+  // Recovery
+  self_recovered: 'Agent detected and fixed the mistake itself',
+  user_corrected_recovery: 'User supplied a correction; agent recovered',
+  unrecovered: 'Meaningful failure remains unresolved at the end',
+  // Attribution
+  agent_caused: 'Failure caused by the agent',
+  environment: 'Failure caused by tools, deps, or environment',
+  preexisting_problem: 'Pre-existing issue in the codebase or task',
+  user_redirect: 'User redirected away from the original task',
+  unclear: 'Failure happened but cause cannot be assigned',
 };
 
 /** Deterministic color from a string hash — ensures unknown LLM-generated badges get distinct colors. */
