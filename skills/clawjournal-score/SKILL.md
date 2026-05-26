@@ -60,7 +60,9 @@ Recovery labels: `self_recovered`, `user_corrected_recovery`, `unrecovered`, `bl
 
 Failure attribution: `agent_caused`, `environment`, `preexisting_problem`, `user_redirect`, `unclear`.
 
-Failure modes: `wrong_approach`, `wrong_assumption`, `false_success`, `regression`, `instruction_violation`, `excessive_work`, `blocker_mishandled`.
+Failure modes (`ai_failure_modes`): `task_framing`, `method_selection`, `context_handling`, `execution_error`, `reasoning_fabrication`, `revision_failure`, `verification_skipped`, `deliverable_defect`, `communication_error`, `collaboration_error`, `safety_security`, `efficiency_waste`.
+
+Meta labels (`ai_meta_labels`): `evaluation_measurement` only — emit when the evaluation/measurement setup itself misjudges the agent, not when the agent failed.
 
 ### Detailed rubric
 
@@ -68,7 +70,7 @@ See `RUBRIC.md` in this directory for the full scoring rubric with examples. In 
 - How to read user feedback signals and final user response
 - How to score failure value without punishing normal debugging
 - STEM/domain correction evidence
-- Seven failure modes and recovery labels
+- Twelve agent failure modes plus one meta label and recovery labels
 - Structured output fields
 
 ## Store the Score

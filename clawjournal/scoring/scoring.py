@@ -405,7 +405,7 @@ def format_session_for_judge(
             lines.append("")
 
     lines.append("## Respond with JSON:")
-    lines.append('{"substance": N, "ai_quality_score": N, "ai_failure_value_score": N, "ai_recovery_labels": [...], "ai_failure_attribution": "...", "ai_failure_modes": [...], "ai_failure_evidence": [...], "ai_learning_summary": "...", "reasoning": "...", "resolution": "resolved|partial|failed|abandoned|exploratory|trivial", "display_title": "...", "summary": "...", "effort_estimate": 0.0-1.0, "task_type": "...", "session_tags": [...], "privacy_flags": [...], "project_areas": [...]}')
+    lines.append('{"substance": N, "ai_quality_score": N, "ai_failure_value_score": N, "ai_recovery_labels": [...], "ai_failure_attribution": "...", "ai_failure_modes": [...], "ai_meta_labels": [...], "ai_failure_evidence": [...], "ai_learning_summary": "...", "reasoning": "...", "resolution": "resolved|partial|failed|abandoned|exploratory|trivial", "display_title": "...", "summary": "...", "effort_estimate": 0.0-1.0, "task_type": "...", "session_tags": [...], "privacy_flags": [...], "project_areas": [...]}')
     return "\n".join(lines)
 
 
@@ -422,7 +422,7 @@ _RUBRIC_SEARCH_PATHS = [
 _FALLBACK_RUBRIC = """\
 Score this coding agent session for productivity and failure value. \
 Return JSON with substance, ai_quality_score, ai_failure_value_score, \
-ai_recovery_labels, ai_failure_attribution, ai_failure_modes, \
+ai_recovery_labels, ai_failure_attribution, ai_failure_modes, ai_meta_labels, \
 ai_failure_evidence, ai_learning_summary, reasoning, display_title, summary, \
 resolution, effort_estimate, task_type, session_tags, privacy_flags, and \
 project_areas fields."""
@@ -498,15 +498,28 @@ JUDGE_SCHEMA = {
             "items": {
                 "type": "string",
                 "enum": [
-                    "wrong_approach",
-                    "wrong_assumption",
-                    "false_success",
-                    "regression",
-                    "instruction_violation",
-                    "excessive_work",
-                    "blocker_mishandled",
+                    "task_framing",
+                    "method_selection",
+                    "context_handling",
+                    "execution_error",
+                    "reasoning_fabrication",
+                    "revision_failure",
+                    "verification_skipped",
+                    "deliverable_defect",
+                    "communication_error",
+                    "collaboration_error",
+                    "safety_security",
+                    "efficiency_waste",
                 ],
             },
+        },
+        "ai_meta_labels": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": ["evaluation_measurement"],
+            },
+            "description": "Optional failures in the measurement system itself (not the agent). Usually empty.",
         },
         "ai_failure_evidence": {
             "type": "array",
@@ -985,13 +998,22 @@ _VALID_FAILURE_ATTRIBUTIONS = {
 }
 
 _VALID_FAILURE_MODES = {
-    "wrong_approach",
-    "wrong_assumption",
-    "false_success",
-    "regression",
-    "instruction_violation",
-    "excessive_work",
-    "blocker_mishandled",
+    "task_framing",
+    "method_selection",
+    "context_handling",
+    "execution_error",
+    "reasoning_fabrication",
+    "revision_failure",
+    "verification_skipped",
+    "deliverable_defect",
+    "communication_error",
+    "collaboration_error",
+    "safety_security",
+    "efficiency_waste",
+}
+
+_VALID_META_LABELS = {
+    "evaluation_measurement",
 }
 
 
@@ -1059,6 +1081,10 @@ def _validate_judge_result(result: dict) -> dict:
     failure_modes = _validate_enum_list(
         result.get("ai_failure_modes", []),
         _VALID_FAILURE_MODES,
+    )
+    meta_labels = _validate_enum_list(
+        result.get("ai_meta_labels", []),
+        _VALID_META_LABELS,
     )
     failure_evidence = _validate_bounded_string_list(result.get("ai_failure_evidence", []))
 
@@ -1131,6 +1157,7 @@ def _validate_judge_result(result: dict) -> dict:
         "ai_recovery_labels": recovery_labels,
         "ai_failure_attribution": failure_attribution,
         "ai_failure_modes": failure_modes,
+        "ai_meta_labels": meta_labels,
         "ai_failure_evidence": failure_evidence,
         "ai_learning_summary": learning_summary,
         "reasoning": str(result.get("reasoning", "")),
@@ -1320,6 +1347,7 @@ def score_session(
         "ai_recovery_labels": result.get("ai_recovery_labels", []),
         "ai_failure_attribution": result.get("ai_failure_attribution", ""),
         "ai_failure_modes": result.get("ai_failure_modes", []),
+        "ai_meta_labels": result.get("ai_meta_labels", []),
         "ai_failure_evidence": result.get("ai_failure_evidence", []),
         "ai_learning_summary": result.get("ai_learning_summary", ""),
         "ai_scorer_backend": result.get("_scorer_backend", ""),

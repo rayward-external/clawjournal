@@ -350,13 +350,18 @@ export function Inbox() {
             style={selectStyle}
           >
             <option value="">All modes</option>
-            <option value="wrong_approach">Wrong approach</option>
-            <option value="wrong_assumption">Wrong assumption</option>
-            <option value="false_success">False success</option>
-            <option value="regression">Regression</option>
-            <option value="instruction_violation">Instruction violation</option>
-            <option value="excessive_work">Excessive work</option>
-            <option value="blocker_mishandled">Blocker mishandled</option>
+            <option value="task_framing">Task framing</option>
+            <option value="method_selection">Method selection</option>
+            <option value="context_handling">Context handling</option>
+            <option value="execution_error">Execution error</option>
+            <option value="reasoning_fabrication">Reasoning / fabrication</option>
+            <option value="revision_failure">Revision failure</option>
+            <option value="verification_skipped">Verification skipped</option>
+            <option value="deliverable_defect">Deliverable defect</option>
+            <option value="communication_error">Communication error</option>
+            <option value="collaboration_error">Collaboration error</option>
+            <option value="safety_security">Safety / security</option>
+            <option value="efficiency_waste">Efficiency / waste</option>
           </select>
           <select
             value={projectFilter || ''}

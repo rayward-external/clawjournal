@@ -528,7 +528,7 @@ class TestScanner:
                 failure_value_score=5,
                 recovery_labels=["user_corrected_recovery"],
                 failure_attribution="agent_caused",
-                failure_modes=["wrong_assumption"],
+                failure_modes=["reasoning_fabrication"],
                 learning_summary="Useful failure trace",
                 scorer_backend="test",
                 scorer_model="test-model",

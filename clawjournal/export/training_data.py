@@ -297,6 +297,7 @@ def _extract_failure_annotations(session: dict) -> dict:
         "ai_recovery_labels": _parse_json_list(session.get("ai_recovery_labels")),
         "ai_failure_attribution": session.get("ai_failure_attribution"),
         "ai_failure_modes": _parse_json_list(session.get("ai_failure_modes")),
+        "ai_meta_labels": _parse_json_list(detail.get("ai_meta_labels")),
         "ai_learning_summary": session.get("ai_learning_summary"),
         "ai_failure_evidence": _parse_json_list(detail.get("ai_failure_evidence")),
     }
