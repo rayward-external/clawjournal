@@ -57,13 +57,28 @@ Current repo state:
   `ai_failure_evidence` and `ai_meta_labels` live inside `ai_scoring_detail`
   and are included in export/share payloads.
 - The scorer already emits both `ai_quality_score` and
-  `ai_failure_value_score`.
-- The workbench list and share flow already use failure value in important
-  places, but session detail, dashboard, insights, and some compact cards still
-  surface the legacy productivity score. Hiding productivity is remaining UI
-  work, not a completed state.
-- `set-score --quality` exists; a manual `--failure-value` override does not
-  exist yet.
+  `ai_failure_value_score`. The canonical rubric prompt
+  (`clawjournal/prompts/agents/scoring/rubric.md`) reflects the new semantics
+  (5/5 does not require `agent_caused`; 4-5 require evidence).
+- Scorer validation enforces the evidence cap at
+  `clawjournal/scoring/scoring.py:1090`: a failure-value score of 4 or 5 with
+  no `ai_failure_evidence` is downgraded to 3.
+- `set-score --failure-value` exists for manual failure-value overrides.
+- The workbench list (`TraceCard.tsx`), session detail score panel, share
+  recommendations, and recent highlights now use failure value as the primary
+  review score.
+- The legacy `ai_quality_score` is still visible on four UI surfaces that
+  need follow-up migration:
+  - `web/frontend/src/views/SessionDetail.tsx:582-587` renders
+    `Legacy productivity {score}/5` next to the failure-value panel.
+  - `web/frontend/src/views/Dashboard.tsx:230` computes
+    `totalProductivityScored` and renders a `by_quality_score` histogram
+    alongside `by_failure_value_score`.
+  - `web/frontend/src/views/Insights.tsx:169` falls back to
+    `ai_quality_score` when `ai_failure_value_score` is null, so quality
+    still drives ranking on legacy traces.
+  - `web/frontend/src/views/Share.tsx` (and the `api.ts` / `types.ts`
+    contracts) keep `ai_quality_score` in the share-ready payload.
 
 ## Score Semantics
 
@@ -89,7 +104,8 @@ Important implications:
   about the agent's handling of constraints, uncertainty, collaboration, or
   recovery.
 - Scores of `4` or `5` require at least one `ai_failure_evidence` snippet. If no
-  snippet can be quoted, fall back to `3`.
+  snippet can be quoted, fall back to `3`. The scorer validation path enforces
+  this cap after parsing judge output.
 - `5/5` does not require `agent_caused` attribution. A non-agent-caused trace
   can score `5/5` if the agent's behavior (recovery, uncertainty handling,
   collaboration, escalation) is itself the lesson. Treat `agent_caused` as a
@@ -184,12 +200,6 @@ separate timeline view. Fine to build, but keep it clearly marked as a second
 lens — don't let it leak into the dashboard default. The dashboard's job is
 "what should I review next," not "what did I do."
 
-### Open question
-
-- Should the dashboard scope to "all time" or "last 7 days" by default? A
-  7-day default makes the histogram and recent feed feel alive; all-time is
-  stable but may underweight recent regressions and starve low-volume users.
-
 ## CLI And Data Model Direction
 
 Keep the current columns and add behavior around them rather than renaming the
@@ -201,12 +211,14 @@ Near-term behavior:
   `ai_quality_score`.
 - `score-view` should lead with failure value and failure reasons.
 - `set-score --quality` should remain a legacy productivity override.
-- Add or consider a manual failure-value override, for example:
+- Use the manual failure-value override when human review needs to correct the
+  score:
   `set-score --failure-value 4`.
 - Auto-triage should not hide a trace solely because productivity is low if
-  failure value is high. Current `--auto-triage` only auto-blocks
-  productivity-1 sessions, so this needs a pass before changing the UI defaults
-  further.
+  failure value is high. `--auto-triage` should only auto-block productivity-1
+  sessions when failure value is below 4. Rationale: failure value 3 is
+  "usable signal" worth keeping reviewable; 4-5 is share-worthy. So 4 is the
+  cutoff between "could be reviewed later" and "definitely keep in the queue."
 
 Provenance remains important when changing score meaning:
 
@@ -260,22 +272,52 @@ Evidence and attribution rules:
    unless explicitly marked as evaluation data?
 3. Should we derive a `corpus_ready` state from failure value, evidence, hold
    state, and privacy gates?
-4. Should low-productivity/high-failure-value traces bypass productivity-based
-   auto-blocking? This becomes more important once the legacy score is hidden
-   from primary UI surfaces.
+4. Is "below 4" the right auto-triage cutoff? The current proposal keeps
+   productivity-1 + failure-value-3 traces reviewable; an alternative is
+   "below 3" (only auto-block productivity-1 + failure-value 1-2). Trade-off:
+   reviewer queue size vs. capturing 3/5 "usable but minor" signals.
+5. Should the dashboard scope to "all time" or "last 7 days" by default? A
+   7-day default makes the histogram and recent feed feel alive; all-time is
+   stable but may underweight recent regressions and starve low-volume users.
 
 ## Implementation Sketch
 
-The smallest useful remaining path is:
+### Already shipped
 
-1. Update the canonical scoring rubric so the live judge prompt matches these
-   semantics.
-2. Update Session Detail so `ai_failure_value_score` is the primary score panel.
-3. Hide the legacy productivity score from primary UI surfaces. Keep it in the
-   data model and CLI for backwards compatibility.
-4. Update CLI text and README language to stop treating "quality" as the main
-   score.
-5. Add manual override support for failure value.
-6. Review share recommendations, dashboard averages, and insights so they rank
-   by failure value where appropriate.
-7. Re-run frontend build if frontend files change.
+1. Canonical rubric prompt updated
+   (`clawjournal/prompts/agents/scoring/rubric.md`) — the failure-value
+   section, the 5/5 no-`agent_caused` rule, and the 4-5 evidence requirement
+   are all in the live judge prompt.
+2. Scorer validation enforces the evidence cap at
+   `clawjournal/scoring/scoring.py:1090`: a score of 4 or 5 with no
+   `ai_failure_evidence` is downgraded to 3.
+3. Session Detail leads with the failure-value panel; failure modes,
+   attribution, recovery, evidence, and learning summary surface directly
+   under it.
+4. Manual failure-value override: `set-score --failure-value <n>`.
+5. Workbench list (`TraceCard.tsx`), share recommendations, and recent
+   highlights rank by failure value.
+
+### Remaining
+
+1. **Hide the legacy productivity score from primary UI surfaces.** Four
+   concrete touch-points (see "Current repo state" above for exact line
+   refs):
+   - Remove or gate the `Legacy productivity {score}/5` badge in
+     `SessionDetail.tsx:582-587`.
+   - Drop or relabel the `by_quality_score` histogram in
+     `Dashboard.tsx:230` (and stop computing `totalProductivityScored` for
+     the primary surface).
+   - In `Insights.tsx:169`, stop falling back to `ai_quality_score` for
+     the primary score lens — render "no failure score yet" for legacy
+     traces instead.
+   - In `Share.tsx`, drop `ai_quality_score` from the share-ready UI;
+     keep it in the API contract (`api.ts` / `types.ts`) for backwards
+     compatibility.
+2. **Update CLI text and README language** so "quality" is no longer the
+   main score; lead with failure value in `score-view` output.
+3. **Auto-triage gate.** Implement the "below 4" rule so productivity-1
+   sessions with high failure value are not auto-blocked.
+4. **Re-run the frontend build** once the four UI surfaces above are
+   reworked — the CI smoke job verifies the built wheel ships
+   `clawjournal/web/frontend/dist/index.html`.
