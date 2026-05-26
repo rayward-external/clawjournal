@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -88,10 +89,16 @@ def _claim_throttle_slot(now: float) -> bool:
 
     Two-layer atomicity:
       1. ``O_CREAT|O_EXCL`` for the common "no lock yet" case.
-      2. For stale-lock reclaim, write our PID to a tmpfile and use
-         ``os.link`` to atomically move it into the lock path. Two
-         concurrent reclaimers will race on the link step — only one
-         gets a successful link, the other raises ``FileExistsError``.
+      2. For stale-lock reclaim, ``os.rename`` the stale lock to a
+         unique parked name. ``rename`` is atomic on POSIX: if two
+         threads race the same source path, only one rename succeeds;
+         the loser gets ENOENT. The winner then claims the now-empty
+         lock_path via ``O_EXCL``.
+
+    The earlier "unlink + link" sequence had a race window where two
+    racers could each take and re-take the lock in sequence — both
+    "won" because ``unlink`` is not atomic with respect to subsequent
+    ``link`` calls from other threads.
 
     The lock is only meant to exclude during the brief spawn window;
     the parent releases it as soon as ``Popen`` returns. The throttle
@@ -128,50 +135,47 @@ def _claim_throttle_slot(now: float) -> bool:
     if lock_age < 0 or lock_age < LOCK_STALE_SECONDS:
         return False
 
-    # Atomic reclaim: write a tmpfile in the same dir, then link it
-    # into place. `os.link` raises FileExistsError if the target now
-    # exists — so if two CLIs race the reclaim, only one wins.
-    tmp_path = lock_path.with_suffix(f".lock.tmp.{os.getpid()}.{int(now * 1e6)}")
+    # Atomic reclaim: rename the stale lock out of the way. Only one
+    # thread's rename can succeed (POSIX guarantee: rename moves the
+    # source inode and the source path then no longer exists for
+    # subsequent renames). The winner then claims the empty path.
+    parked = lock_path.with_suffix(
+        f".lock.stale.{os.getpid()}.{threading.get_ident()}.{int(now * 1e6)}"
+    )
     try:
-        fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except OSError as exc:
-        _debug(f"could not create reclaim tmpfile: {exc}")
+        os.rename(str(lock_path), str(parked))
+    except FileNotFoundError:
+        # Another reclaimer parked it first — we lost the race.
+        _debug("lost stale-reclaim race (rename source gone)")
         return False
+    except OSError as exc:
+        _debug(f"could not park stale lock: {exc}")
+        return False
+
+    # We won the parking race. Claim the lock atomically.
     try:
-        os.close(fd)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        claimed = True
+    except FileExistsError:
+        # A different thread snuck in via the fast path between our
+        # rename and our open. They hold the lock now.
+        _debug("lost stale-reclaim race (fast-path racer beat us)")
+        claimed = False
+    except OSError as exc:
+        _debug(f"could not claim reclaimed lock: {exc}")
+        claimed = False
+
+    # Discard the parked stale file — it's served its purpose.
+    try:
+        os.unlink(str(parked))
     except OSError:
         pass
 
-    # Remove the dead lock so link can succeed. Another racer may also
-    # be unlinking; we don't care which unlink wins because link is
-    # what actually claims ownership.
-    try:
-        os.unlink(lock_path)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        _debug(f"could not remove stale lock: {exc}")
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        return False
-
-    try:
-        os.link(str(tmp_path), str(lock_path))
-        return True
-    except FileExistsError:
-        # Another reclaimer won the race.
-        _debug("lost stale-reclaim race")
-        return False
-    except OSError as exc:
-        _debug(f"could not link reclaim tmpfile: {exc}")
-        return False
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    return claimed
 
 
 def _write_stamp(now: float) -> None:

@@ -376,7 +376,11 @@ def test_background_update_skips_local_ahead_commit(
 
 def _wire_remote(repo: Path, tmp_path: Path) -> Path:
     remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--quiet", "--bare", str(remote)], check=True)
+    # `-b main` is required: without it the bare remote's HEAD defaults
+    # to whatever the system's init.defaultBranch is (often `master`),
+    # which then causes downstream `git clone` to leave the work tree
+    # detached and breaks `git push origin main`.
+    subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(remote)], check=True)
     subprocess.run(
         ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
         check=True,
