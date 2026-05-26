@@ -1,12 +1,13 @@
 # Redefine AI Score
 
-Status: draft for iteration
+Status: implementation proposal
 Last updated: 2026-05-26
 
-Recent decisions:
+Target decisions:
 - 5/5 does not require `agent_caused`; gate on whether agent behavior is the lesson.
 - Scores of 4 or 5 require at least one `ai_failure_evidence` snippet.
-- Hide the legacy `ai_quality_score` in the UI; keep it in the data model and CLI.
+- Hide the legacy `ai_quality_score` from primary UI surfaces; keep it in the
+  data model, CLI, and exports for compatibility.
 
 ## Problem
 
@@ -36,18 +37,33 @@ Make the primary user-facing 1-5 score the failure-value score:
 Keep the existing productivity score as a secondary/legacy field. Do not reuse
 one field for both meanings.
 
-Current field split:
+Target field split:
 
 | Field | Meaning | Product role |
 | --- | --- | --- |
 | `ai_failure_value_score` | 1-5 value for failure-corpus review | Primary score |
-| `ai_quality_score` | 1-5 productivity/substance legacy score | Hidden in UI; kept in data model and CLI |
+| `ai_quality_score` | 1-5 productivity/substance legacy score | Hidden from primary UI surfaces; kept in data model, CLI, and exports |
 | `ai_failure_modes` | What kind of failure happened | Failure reason labels |
 | `ai_failure_attribution` | Dominant cause of the key failure | Failure reason context |
 | `ai_recovery_labels` | Whether and how recovery happened | Failure/recovery context |
-| `ai_failure_evidence` | Trace-backed evidence snippets | Label support |
+| `ai_failure_evidence` | Trace-backed evidence snippets | Label support in `ai_scoring_detail` and exports |
 | `ai_learning_summary` | One concise lesson from the trace | Human review summary |
-| `ai_meta_labels` | Evaluation/scoring artifacts | Meta-level caveats |
+| `ai_meta_labels` | Evaluation/scoring artifacts | Meta-level caveats in `ai_scoring_detail` and exports |
+
+Current repo state:
+
+- The schema already stores `ai_failure_value_score`, `ai_failure_modes`,
+  `ai_failure_attribution`, `ai_recovery_labels`, and `ai_learning_summary`.
+  `ai_failure_evidence` and `ai_meta_labels` live inside `ai_scoring_detail`
+  and are included in export/share payloads.
+- The scorer already emits both `ai_quality_score` and
+  `ai_failure_value_score`.
+- The workbench list and share flow already use failure value in important
+  places, but session detail, dashboard, insights, and some compact cards still
+  surface the legacy productivity score. Hiding productivity is remaining UI
+  work, not a completed state.
+- `set-score --quality` exists; a manual `--failure-value` override does not
+  exist yet.
 
 ## Score Semantics
 
@@ -59,7 +75,7 @@ The 1-5 scale should rank traces by corpus value, not by how badly the agent did
 | 2 | Weak signal | A possible failure exists, but it is routine, unclear, expected debugging, or low-value. |
 | 3 | Usable signal | There is a real failure signal, but it is minor, ambiguous, repeated, mostly environmental, or only partly attributable. |
 | 4 | Strong pattern | Meaningful agent failure or recovery pattern with clear evidence and a useful lesson. Worth review and likely share/export consideration. |
-| 5 | Canonical failure trace | Consequential, evidence-rich failure on real expert work. Strong lesson for evals, training data, product design, or agent behavior analysis. |
+| 5 | Canonical failure trace | Consequential, evidence-rich failure or recovery pattern on real expert work. Strong lesson for evals, training data, product design, or agent behavior analysis. |
 
 Important implications:
 
@@ -103,15 +119,16 @@ reason from:
 
 The product surface should make failure value the primary review lens.
 
-Recommended changes:
+Recommended UI changes:
 
 1. Rename the main score panel from "Productivity Score" to "Failure Value".
 2. Show `ai_failure_value_score` as the primary 1-5 score in session detail.
 3. Place failure modes, attribution, recovery labels, evidence, and learning
    summary directly under the failure score.
-4. Hide the legacy productivity score (`ai_quality_score`) in the UI. Keep it
-   in the data model and CLI/exports for backwards compatibility — showing two
-   1-5 scores with different meanings side-by-side confuses reviewers.
+4. Hide the legacy productivity score (`ai_quality_score`) from primary UI
+   surfaces. Keep it in the data model and CLI/exports for backwards
+   compatibility; showing two 1-5 scores with different meanings side-by-side
+   confuses reviewers.
 5. In list views, sort by failure value by default and label the sort as "Top
    failure value" or "Most valuable failures".
 6. In CLI output, lead with failure value:
@@ -187,7 +204,9 @@ Near-term behavior:
 - Add or consider a manual failure-value override, for example:
   `set-score --failure-value 4`.
 - Auto-triage should not hide a trace solely because productivity is low if
-  failure value is high.
+  failure value is high. Current `--auto-triage` only auto-blocks
+  productivity-1 sessions, so this needs a pass before changing the UI defaults
+  further.
 
 Provenance remains important when changing score meaning:
 
@@ -242,20 +261,21 @@ Evidence and attribution rules:
 3. Should we derive a `corpus_ready` state from failure value, evidence, hold
    state, and privacy gates?
 4. Should low-productivity/high-failure-value traces bypass productivity-based
-   auto-blocking? (Largely moot for the UI now that the legacy score is hidden,
-   but the underlying auto-triage logic may still need a pass.)
+   auto-blocking? This becomes more important once the legacy score is hidden
+   from primary UI surfaces.
 
 ## Implementation Sketch
 
-If we implement this direction, the smallest useful path is:
+The smallest useful remaining path is:
 
-1. Update Session Detail so `ai_failure_value_score` is the primary score panel.
-2. Hide the legacy productivity score in the UI. Keep it in the data model and
-   CLI for backwards compatibility.
-3. Update CLI text and README language to stop treating "quality" as the main
+1. Update the canonical scoring rubric so the live judge prompt matches these
+   semantics.
+2. Update Session Detail so `ai_failure_value_score` is the primary score panel.
+3. Hide the legacy productivity score from primary UI surfaces. Keep it in the
+   data model and CLI for backwards compatibility.
+4. Update CLI text and README language to stop treating "quality" as the main
    score.
-4. Add manual override support for failure value.
-5. Review share recommendations, dashboard averages, and insights so they rank
+5. Add manual override support for failure value.
+6. Review share recommendations, dashboard averages, and insights so they rank
    by failure value where appropriate.
-6. Re-run frontend build if frontend files change.
-
+7. Re-run frontend build if frontend files change.

@@ -40,11 +40,13 @@ clawjournal score --batch --limit 10
 ClawJournal now records two scores in one pass:
 
 - `ai_quality_score`: legacy productivity/substance score.
-- `ai_failure_value_score`: primary capture score for SOTA-agent failure behavior.
+- `ai_failure_value_score`: primary capture score for understanding
+  frontier-agent failure and recovery behavior.
 
 Failure value:
 
-**5 = Clear consequential failure** — Real expert work, strong evidence, useful lesson.
+**5 = Canonical high-value trace** — Consequential failure or recovery pattern
+on real expert work, where the agent behavior is the lesson.
 
 **4 = Meaningful failure/recovery** — Worth reviewing or turning into eval/training data.
 
@@ -63,6 +65,11 @@ Failure attribution: `agent_caused`, `environment`, `preexisting_problem`, `user
 Failure modes (`ai_failure_modes`): `task_framing`, `method_selection`, `context_handling`, `execution_error`, `reasoning_fabrication`, `revision_failure`, `verification_skipped`, `deliverable_defect`, `communication_error`, `collaboration_error`, `safety_security`, `efficiency_waste`.
 
 Meta labels (`ai_meta_labels`): `evaluation_measurement` only — emit when the evaluation/measurement setup itself misjudges the agent, not when the agent failed.
+
+Scores of 4 or 5 require at least one `ai_failure_evidence` snippet. A 5/5
+does not require `agent_caused`; non-agent-caused traces can be high value when
+the agent's recovery, uncertainty handling, escalation, or collaboration is the
+lesson.
 
 ### Detailed rubric
 

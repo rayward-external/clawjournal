@@ -50,8 +50,10 @@ Emit both `substance` and `ai_quality_score` with the same value.
 This is the primary score for failure-corpus capture. It answers: "how valuable
 is this trace for understanding and improving agent failure behavior?"
 
-5 = Clear, consequential SOTA-agent failure on real expert work, strong
-evidence, useful lesson.
+5 = Canonical high-value trace: consequential failure or recovery pattern on
+real expert work, where the agent's behavior is the lesson. Strong evidence
+and a reusable insight for evals, training, product design, or agent behavior
+analysis. Attribution may be agent-caused or non-agent-caused.
 4 = Meaningful failure or recovery pattern worth reviewing or turning into eval
 or training data.
 3 = Some failure signal, but ambiguous, minor, repeated, or mostly
@@ -61,8 +63,13 @@ environmental.
 or noise.
 
 A resolved session can be a 5 if it contains a valuable failure and recovery
-pattern. A failed session is not automatically valuable; it needs attributable,
-evidence-backed failure behavior.
+pattern. 5/5 does not require `agent_caused`; the teaching moment matters, not
+the source of the failure. A failed session is not automatically valuable; it
+needs attributable, evidence-backed failure behavior.
+
+Scores of 4 or 5 require at least one `ai_failure_evidence` snippet. If no
+snippet can be quoted or paraphrased from the trace, cap the failure-value score
+at 3.
 
 For multi-failure sessions, score by the highest single teaching moment, emit
 all applicable modes and recovery labels, and set attribution to the dominant
@@ -588,6 +595,8 @@ Before finalizing labels, confirm:
   agent's summary.
 - Each label is backed by concrete evidence (in `ai_failure_evidence`).
 - Your evidence quotes actually demonstrate the failure (not adjacent text).
+- If `ai_failure_value_score` is 4 or 5, `ai_failure_evidence` contains at
+  least one trace-backed snippet.
 - You did not infer a deep cause when the trace only supports a surface signal.
 - You considered whether an apparent failure is actually
   `evaluation_measurement` (eval artifact rather than agent behavior).
