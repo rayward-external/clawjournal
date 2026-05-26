@@ -318,6 +318,24 @@ Evidence and attribution rules:
    main score; lead with failure value in `score-view` output.
 3. **Auto-triage gate.** Implement the "below 4" rule so productivity-1
    sessions with high failure value are not auto-blocked.
-4. **Re-run the frontend build** once the four UI surfaces above are
-   reworked — the CI smoke job verifies the built wheel ships
+4. **Migrate "quality" copy in the Insights recommendations engine.** The
+   recommendation cards rendered on the Insights view still read "best
+   quality score", "Model quality vs cost trade-off", and "Highest quality:
+   …". Source:
+   - `clawjournal/scoring/insights.py:292` — `"{type} work has the best
+     quality score"` title.
+   - `clawjournal/scoring/insights.py:310` — `"Model quality vs cost
+     trade-off"` title.
+   - `clawjournal/scoring/insights.py:312` — `"Highest quality: {model}
+     ({avg_score:.1f}/5 avg, ...)"` body.
+   - `clawjournal/cli.py:1997` — matching CLI line `Highest quality:
+     {summary['highest_quality_model']}`.
+
+   Decide whether the recommendation should switch to failure-value
+   framing or to a neutral "score" framing, and whether the underlying
+   metric should still be `ai_quality_score` or move to
+   `ai_failure_value_score` (the recommendation logic likely needs the
+   same migration, not just the label).
+5. **Re-run the frontend build** once the UI surfaces above are reworked —
+   the CI smoke job verifies the built wheel ships
    `clawjournal/web/frontend/dist/index.html`.
