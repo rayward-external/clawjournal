@@ -34,6 +34,7 @@ WIDENED_MESSAGE_SCHEMA_VERSION = 4
 WORKBENCH_SCHEMA_VERSION = WIDENED_MESSAGE_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
+SHARE_RECOMMENDATION_LIMIT = 10
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
 # onto a single coherent label set. Prevents the duplicate-meaning rows we
@@ -3362,9 +3363,9 @@ def get_share_ready_stats(
 
     By default returns only `review_status='approved'` sessions; pass
     `include_unapproved=True` to widen the pool so the Preview UI can
-    offer non-approved sessions for explicit review. Approved high-value
-    failure traces are recommended first; unapproved high-value failures
-    remain visible but are never auto-approved by this API.
+    offer non-approved sessions for explicit review. Recommendations are
+    ranked by failure value first so the share wizard starts with the best
+    failure examples.
     """
     where_status = "" if include_unapproved else " WHERE review_status = 'approved'"
     rows = conn.execute(
@@ -3389,9 +3390,9 @@ def get_share_ready_stats(
         "     WHERE b.shared_at IS NOT NULL"
         "   )"
         " )"
-        " ORDER BY (review_status = 'approved') DESC,"
-        " (ai_failure_value_score IS NULL), ai_failure_value_score DESC,"
-        " start_time DESC, ai_quality_score DESC"
+        " ORDER BY (ai_failure_value_score IS NULL),"
+        " ai_failure_value_score DESC, start_time DESC,"
+        " (review_status = 'approved') DESC, ai_quality_score DESC"
     ).fetchall()
     cols = ["session_id", "project", "model", "source", "display_title",
             "ai_quality_score", "ai_failure_value_score", "ai_recovery_labels",
@@ -3419,76 +3420,26 @@ def get_share_ready_stats(
             projects.add(s["project"])
         if s.get("model"):
             models.add(s["model"])
-    approved_sessions = [s for s in sessions if s.get("review_status") == "approved"]
-    # Default recommendation: approved high-value failure traces from in-scope
-    # sources. Recent rows dominate, with older approved high-value failures as
-    # backfill. Unapproved failures are shown to the user for review, not added
-    # to the package by default.
-    recent_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-
-    def _is_recent(start_time: str | None) -> bool:
-        if not start_time:
-            return False
-        try:
-            ts = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts >= recent_cutoff
-
-    recent_sessions = sorted(
-        (s for s in sessions if _is_recent(s.get("start_time"))),
-        key=lambda s: (
-            s.get("ai_failure_value_score") or 0,
-            s.get("start_time") or "",
-        ),
-        reverse=True,
-    )
-
-    recommended_pool: list[dict] = []
+    recommended_pool: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
 
-    def _is_high_value_failure(session: dict[str, Any]) -> bool:
-        score = session.get("ai_failure_value_score")
-        return (
-            session.get("review_status") == "approved"
-            and session.get("source") in FAILURE_VALUE_SOURCE_SCOPE
-            and (score or 0) >= 4
-        )
-
-    # Tier 1: recent approved high-value failures.
-    for session in recent_sessions:
-        if len(recommended_pool) >= 5:
-            break
+    def _add_recommendation(session: dict[str, Any]) -> None:
         sid = session.get("session_id")
         if not sid or sid in seen_ids:
-            continue
-        if not _is_high_value_failure(session):
-            continue
+            return
         recommended_pool.append(session)
         seen_ids.add(sid)
 
-    # Tier 2: older approved high-value failures.
-    if len(recommended_pool) < 5:
-        older_high_value = sorted(
-            (s for s in approved_sessions if not _is_recent(s.get("start_time")) and _is_high_value_failure(s)),
-            key=lambda s: (
-                s.get("ai_failure_value_score") or 0,
-                s.get("start_time") or "",
-            ),
-            reverse=True,
-        )
-        for session in older_high_value:
-            if len(recommended_pool) >= 5:
-                break
-            sid = session.get("session_id")
-            if not sid or sid in seen_ids:
-                continue
-            recommended_pool.append(session)
-            seen_ids.add(sid)
+    for session in sessions:
+        if len(recommended_pool) >= SHARE_RECOMMENDATION_LIMIT:
+            break
+        if session.get("source") not in FAILURE_VALUE_SOURCE_SCOPE:
+            continue
+        if session.get("ai_failure_value_score") is None:
+            continue
+        _add_recommendation(session)
 
-    recommended_ids = [s["session_id"] for s in recommended_pool[:5]]
+    recommended_ids = [s["session_id"] for s in recommended_pool[:SHARE_RECOMMENDATION_LIMIT]]
 
     return {
         "count": len(sessions),

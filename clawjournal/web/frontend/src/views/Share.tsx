@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import type { Session, Share as ShareType, ToolUse } from '../types.ts';
 import { api } from '../api.ts';
 import { useToast } from '../components/Toast.tsx';
@@ -172,6 +172,24 @@ interface ShareReadyStats {
   models: string[];
   recommended_session_ids: string[];
   sessions: ReadySession[];
+}
+
+const DEFAULT_SHARE_QUEUE_SIZE = 10;
+
+function queueFromStats(stats: ShareReadyStats): string[] {
+  const validIds = new Set(stats.sessions.map((s) => s.session_id));
+  return (stats.recommended_session_ids || [])
+    .filter((id) => validIds.has(id))
+    .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
+}
+
+function completedKeysForStep(step: StepKey): Set<string> {
+  const idx = STEPS.findIndex((s) => s.key === step);
+  return new Set(STEPS.slice(0, Math.max(0, idx)).map((s) => s.key));
+}
+
+function parseStep(value: string | null): StepKey {
+  return STEPS.some((s) => s.key === value) ? value as StepKey : 'queue';
 }
 
 interface RedactedReviewMessage {
@@ -478,15 +496,17 @@ function StatusDot({ status }: { status: 'checking' | 'clear' | 'review' }) {
 
 export function Share() {
   const { toast } = useToast();
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const internalSearchRef = useRef<string | null>(null);
+  const skipNextUrlSyncRef = useRef(false);
 
   const [activeStep, setActiveStep] = useState<StepKey>(
-    () => (searchParams.get('step') as StepKey) || 'queue',
+    () => parseStep(searchParams.get('step')),
   );
   const [completedKeys, setCompletedKeys] = useState<Set<string>>(() => {
-    const step = (searchParams.get('step') as StepKey) || 'queue';
-    const idx = STEPS.findIndex((s) => s.key === step);
-    return new Set(STEPS.slice(0, Math.max(0, idx)).map((s) => s.key));
+    const step = parseStep(searchParams.get('step'));
+    return completedKeysForStep(step);
   });
 
   const [readyStats, setReadyStats] = useState<ShareReadyStats | null>(null);
@@ -550,13 +570,10 @@ export function Share() {
       setShares(shareList);
       setScoringBackend(backend);
       if (!selectionInitialized && stats.sessions.length > 0) {
-        // Server recommendation is approved high-value failure traces, capped
-        // at 5. Trust it and only filter out ids the
-        // client can't resolve (eg. excluded projects).
-        const validIds = new Set(stats.sessions.map((s) => s.session_id));
-        const recommended = (stats.recommended_session_ids || [])
-          .filter((id) => validIds.has(id))
-          .slice(0, 5);
+        // Server recommendation is an ordered, reviewable default package.
+        // Trust it and only filter out ids the client can't resolve
+        // (eg. excluded projects).
+        const recommended = queueFromStats(stats);
         setQueueOrder(recommended);
         setSelectionInitialized(true);
       }
@@ -578,6 +595,52 @@ export function Share() {
   // =================================================
 
   useEffect(() => {
+    if (selectionInitialized || !readyStats || searchParams.get('ids')) return;
+    setQueueOrder(queueFromStats(readyStats));
+    setSelectionInitialized(true);
+  }, [readyStats, searchParams, selectionInitialized]);
+
+  useEffect(() => {
+    const currentSearch = location.search.startsWith('?') ? location.search.slice(1) : location.search;
+    if (internalSearchRef.current === currentSearch) return;
+
+    internalSearchRef.current = currentSearch;
+    skipNextUrlSyncRef.current = true;
+
+    const idsParam = searchParams.get('ids');
+    const ids = idsParam ? idsParam.split(',').filter(Boolean) : null;
+    const step = parseStep(searchParams.get('step'));
+
+    setActiveStep(step);
+    setCompletedKeys(completedKeysForStep(step));
+    setNote(searchParams.get('note') || '');
+    setPackagedShareId(searchParams.get('share'));
+    setRedactedSessions({});
+    setApprovedIds(new Set());
+    setExpandedReviewIds(new Set());
+    setBundleInfo(null);
+    setPackageProgress(0);
+    setPackageLog('');
+    setPackagingFailed(null);
+
+    if (ids) {
+      setQueueOrder(ids);
+      setSelectionInitialized(true);
+      return;
+    }
+
+    const recommended = readyStats && readyStats.sessions.length > 0
+      ? queueFromStats(readyStats)
+      : [];
+    setQueueOrder(recommended);
+    setSelectionInitialized(!!readyStats);
+  }, [location.search, readyStats, searchParams]);
+
+  useEffect(() => {
+    if (skipNextUrlSyncRef.current) {
+      skipNextUrlSyncRef.current = false;
+      return;
+    }
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       if (activeStep === 'queue') next.delete('step'); else next.set('step', activeStep);
@@ -585,6 +648,7 @@ export function Share() {
       if (csv) next.set('ids', csv); else next.delete('ids');
       if (note) next.set('note', note); else next.delete('note');
       if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
+      internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
   }, [activeStep, queueOrder, note, packagedShareId, setSearchParams]);

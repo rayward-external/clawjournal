@@ -812,6 +812,89 @@ class TestShares:
         assert [s["session_id"] for s in stats["sessions"]] == ["failure", "legacy"]
         assert stats["recommended_session_ids"] == ["failure"]
 
+    def test_share_ready_fills_default_queue_with_lower_failure_value_scores(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        sessions = [
+            _make_session(
+                f"s{i}",
+                start_time=(now - timedelta(minutes=i)).isoformat(),
+                end_time=(now - timedelta(minutes=i - 10)).isoformat(),
+            )
+            for i in range(1, 13)
+        ]
+        upsert_sessions(index_conn, sessions)
+        scores = {
+            "s1": 5,
+            "s2": 4,
+            "s3": 3,
+            "s4": 2,
+            "s5": 1,
+            "s6": 1,
+            "s7": 1,
+            "s8": 1,
+            "s9": 1,
+            "s10": 1,
+            "s11": 1,
+            "s12": 1,
+        }
+        for sid, score in scores.items():
+            update_session(
+                index_conn,
+                sid,
+                status="approved",
+                ai_quality_score=5,
+                ai_failure_value_score=score,
+            )
+
+        stats = get_share_ready_stats(index_conn)
+
+        assert stats["recommended_session_ids"] == [
+            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10",
+        ]
+
+    def test_share_ready_widened_pool_ranks_best_failure_examples_first(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        upsert_sessions(index_conn, [
+            _make_session(
+                f"s{i}",
+                start_time=(now - timedelta(minutes=i)).isoformat(),
+                end_time=(now - timedelta(minutes=i - 10)).isoformat(),
+            )
+            for i in range(1, 12)
+        ])
+        for sid in ("s1", "s2"):
+            update_session(
+                index_conn,
+                sid,
+                status="approved",
+                ai_quality_score=5,
+                ai_failure_value_score=3,
+            )
+        for i in range(3, 6):
+            update_session(
+                index_conn,
+                f"s{i}",
+                status="new",
+                ai_quality_score=4,
+                ai_failure_value_score=4,
+            )
+        for i in range(6, 12):
+            update_session(
+                index_conn,
+                f"s{i}",
+                status="new",
+                ai_quality_score=4,
+                ai_failure_value_score=2,
+            )
+
+        stats = get_share_ready_stats(index_conn, include_unapproved=True)
+
+        assert stats["recommended_session_ids"] == [
+            "s3", "s4", "s5", "s1", "s2", "s6", "s7", "s8", "s9", "s10",
+        ]
+
     def test_share_ready_respects_excluded_project_rules(self, index_conn):
         from datetime import datetime, timedelta, timezone
         now = datetime.now(timezone.utc)
