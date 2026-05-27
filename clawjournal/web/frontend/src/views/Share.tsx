@@ -2595,7 +2595,6 @@ interface DoneStepProps {
 }
 
 function DoneStep(p: DoneStepProps) {
-  const [peek, setPeek] = useState(false);
   const [confettiPieces] = useState(() => {
     const palette = ['#b47d08', '#558745', '#5f7191', '#c4890a', '#a09a8f'];
     return Array.from({ length: 28 }, (_, i) => ({
@@ -2609,9 +2608,14 @@ function DoneStep(p: DoneStepProps) {
     }));
   });
 
-  const traces = p.bundle?.traces ?? 0;
   const hostedShareUrl = p.shareDestination?.configured ? p.shareDestination.share_page_url : null;
   const hostedShareLabel = hostedShareUrl ? formatShareDestination(hostedShareUrl) : null;
+  const zipFiles = [
+    { name: 'manifest.json', detail: 'metadata' },
+    { name: 'sessions.jsonl', detail: p.bundle ? `~${p.bundle.approxSize}` : 'redacted traces' },
+    { name: 'trufflehog.json', detail: 'secret scan' },
+    { name: 'trufflehog.post-pii.json', detail: 'final scan' },
+  ];
 
   return (
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
@@ -2749,31 +2753,13 @@ function DoneStep(p: DoneStepProps) {
             paddingBottom: 8, borderBottom: `1px solid ${colors.gray200}`,
           }}>
             <span>Inside the zip</span>
-            <button
-              onClick={() => setPeek(!peek)}
-              style={{
-                fontFamily: 'Inter, system-ui', color: colors.primary500,
-                fontSize: 11, letterSpacing: 0, textTransform: 'none' as const,
-                background: 'transparent', border: 'none', cursor: 'pointer',
-              }}
-            >
-              {peek ? 'Hide' : 'Show file list'}
-            </button>
           </div>
-          <div style={manifestRowStyle}><span>&rsaquo; manifest.json</span><span style={{ color: colors.gray900 }}>0.3 KB</span></div>
-          <div style={manifestRowStyle}><span>&rsaquo; redaction-audit.json</span><span style={{ color: colors.gray900 }}>2.1 KB</span></div>
-          {peek && traces > 0 && Array.from({ length: traces }).map((_, i) => (
-            <div key={i} style={manifestRowStyle}>
-              <span>&rsaquo; traces/t_{(i + 1).toString().padStart(3, '0')}.jsonl</span>
-              <span style={{ color: colors.gray900 }}>{(50 + i * 17) % 120 + 20} KB</span>
+          {zipFiles.map((entry) => (
+            <div key={entry.name} style={manifestRowStyle}>
+              <span style={manifestNameStyle}>&rsaquo; {entry.name}</span>
+              <span style={{ color: colors.gray900 }}>{entry.detail}</span>
             </div>
           ))}
-          {!peek && traces > 0 && (
-            <div style={manifestRowStyle}>
-              <span>&rsaquo; traces/ ({traces} files)</span>
-              <span style={{ color: colors.gray900 }}>~{p.bundle?.approxSize}</span>
-            </div>
-          )}
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'center', gap: 10, color: colors.gray500, fontSize: 13 }}>
@@ -2819,6 +2805,9 @@ const statValueStyle: React.CSSProperties = {
 };
 const manifestRowStyle: React.CSSProperties = {
   display: 'flex', justifyContent: 'space-between', gap: 10,
+};
+const manifestNameStyle: React.CSSProperties = {
+  minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis',
 };
 const doneMiniRow: React.CSSProperties = {
   display: 'flex', gap: 8, alignItems: 'center', marginTop: 6,

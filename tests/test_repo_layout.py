@@ -1,10 +1,21 @@
 import json
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
 import clawjournal
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_python_package_version_matches_runtime_version():
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+
+    assert pyproject["project"]["version"] == clawjournal.__version__
 
 
 def test_claude_marketplace_points_to_plugin_wrapper():
