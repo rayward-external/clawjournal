@@ -130,6 +130,7 @@ interface BucketCounts {
 }
 
 const emptyBuckets = (): BucketCounts => ({ tokens: 0, emails: 0, paths: 0, timestamps: 0, urls: 0, other: 0 });
+const SHARE_SHELL_WIDTH = '1120px';
 
 // ============================================================
 // Types
@@ -1038,7 +1039,7 @@ export function Share() {
   // =================================================
 
   if (loading) {
-    return <div style={{ padding: '24px', maxWidth: '720px', margin: '0 auto' }}>
+    return <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       <Spinner text="Loading share data..." />
     </div>;
   }
@@ -1266,7 +1267,7 @@ function QueueStep(p: QueueStepProps) {
   const historyShares = p.shares.filter(b => b.status === 'shared' || b.status === 'exported');
 
   return (
-    <div style={{ padding: '24px', maxWidth: '960px', margin: '0 auto' }}>
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
 
@@ -1277,9 +1278,10 @@ function QueueStep(p: QueueStepProps) {
             Build a redacted bundle of your traces to share for model evaluation and training.
           </p>
           <div style={{
-            padding: '60px 28px', textAlign: 'center',
+            minHeight: 280, padding: '60px 28px', textAlign: 'center',
             background: colors.gray50, border: `1px dashed ${colors.gray300}`,
             borderRadius: 12, color: colors.gray500,
+            display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
           }}>
             <div style={{
               width: 52, height: 52, borderRadius: 12, background: colors.white,
@@ -1333,9 +1335,10 @@ function QueueStep(p: QueueStepProps) {
             </>
           ) : (
             <div style={{
-              padding: '48px 28px', textAlign: 'center',
+              minHeight: 280, padding: '48px 28px', textAlign: 'center',
               background: colors.gray50, border: `1px dashed ${colors.gray300}`,
               borderRadius: 12, color: colors.gray500,
+              display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
             }}>
               <div style={{
                 width: 52, height: 52, borderRadius: 12, background: colors.white,
@@ -1736,7 +1739,7 @@ function RedactStep(p: RedactStepProps) {
   );
 
   return (
-    <div style={{ padding: '24px', maxWidth: '960px', margin: '0 auto' }}>
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
@@ -1955,7 +1958,7 @@ function ReviewStep(p: ReviewStepProps) {
   )).length;
 
   return (
-    <div style={{ padding: '24px', maxWidth: '960px', margin: '0 auto' }}>
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
@@ -2402,11 +2405,11 @@ function PackageStep(p: PackageStepProps) {
   }, [flying]);
 
   return (
-    <div style={{ padding: '24px', maxWidth: '720px', margin: '0 auto' }}>
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
       <div style={{
-        padding: '40px 24px 24px', maxWidth: 520, margin: '0 auto', textAlign: 'center',
+        padding: '56px 24px 24px', maxWidth: 680, margin: '0 auto', textAlign: 'center',
       }}>
         <div style={{ width: 180, height: 240, margin: '0 auto 24px', position: 'relative' }}>
           {flying.map((f) => (
@@ -2515,10 +2518,10 @@ function DoneStep(p: DoneStepProps) {
   const traces = p.bundle?.traces ?? 0;
 
   return (
-    <div style={{ padding: '24px', maxWidth: '720px', margin: '0 auto' }}>
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
-      <div style={{ position: 'relative', padding: '48px 24px 24px', maxWidth: 600, margin: '0 auto', textAlign: 'center' }}>
+      <div style={{ position: 'relative', padding: '56px 24px 24px', maxWidth: 680, margin: '0 auto', textAlign: 'center' }}>
         <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
           {confettiPieces.map((c) => (
             <span key={c.id} style={{

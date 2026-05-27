@@ -7,6 +7,8 @@ import { EmptyState } from '../components/Spinner.tsx';
 import { useToast } from '../components/Toast.tsx';
 import { colors } from '../theme.ts';
 
+const SEARCH_SHELL_WIDTH = 1120;
+
 export function Search() {
   const { toast } = useToast();
   const [query, setQuery] = useState('');
@@ -44,11 +46,16 @@ export function Search() {
   };
 
   return (
-    <div style={{ maxWidth: 960, margin: '0 auto', padding: '24px 16px' }}>
+    <div style={{ maxWidth: SEARCH_SHELL_WIDTH, margin: '0 auto', padding: '32px 24px 48px' }}>
       <h1 style={{ fontSize: 22, fontWeight: 700, margin: '0 0 4px 0', color: colors.gray900 }}>Search</h1>
       <p style={{ fontSize: 14, color: colors.gray500, margin: '0 0 16px 0' }}>Full-text search across all session content</p>
 
-      <div style={{ marginBottom: 20 }}>
+      <div style={{
+        marginBottom: 24,
+        padding: '18px',
+        borderRadius: 14,
+        background: colors.gray50,
+      }}>
         <input
           type="text"
           value={query}
@@ -63,6 +70,7 @@ export function Search() {
             outline: 'none',
             boxSizing: 'border-box',
             background: colors.white,
+            boxShadow: '0 1px 2px rgba(0,0,0,0.03)',
           }}
         />
       </div>
@@ -90,11 +98,18 @@ export function Search() {
       )}
 
       {!loading && !searched && (
-        <div style={{ textAlign: 'center', padding: '40px 20px' }}>
+        <div style={{
+          textAlign: 'center',
+          padding: '40px 20px',
+          minHeight: 280,
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+        }}>
           <div style={{ fontSize: 32, marginBottom: 12 }}>&#128269;</div>
           <h3 style={{ margin: '0 0 6px', fontSize: 16, fontWeight: 600, color: colors.gray500 }}>Search sessions</h3>
           <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray400 }}>Type to search, or try a suggested query:</p>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center', maxWidth: 600, margin: '0 auto' }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center', maxWidth: 720, margin: '0 auto' }}>
             {PRESET_SEARCHES.map(preset => (
               <button
                 key={preset.query}
