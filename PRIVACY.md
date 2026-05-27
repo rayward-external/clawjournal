@@ -92,7 +92,7 @@ Depending on how you export, bundle content can include user messages, assistant
 
 Uploading is a separate path from local export.
 
-- Hosted research submission uses a browser upload page when `CLAWJOURNAL_SHARE_URL` is configured in the workbench.
+- Hosted research submission uses Rayward's browser upload page by default. Self-hosters can override it with `CLAWJOURNAL_SHARE_URL`, and setting `CLAWJOURNAL_SHARE_URL=` disables the hosted button.
 - Advanced self-hosted ingest upload is disabled unless `CLAWJOURNAL_INGEST_URL` is configured.
 - The ingest and hosted-share URLs must use `https://`, except for `localhost` and `127.0.0.1` during local development.
 - Self-hosted ingest commands are `clawjournal bundle-share <bundle_id>` or `clawjournal share ...`.

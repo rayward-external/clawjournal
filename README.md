@@ -19,7 +19,7 @@ If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, *
 - **Permission prompts — lots of them.** Your AI will ask permission to run several commands. Expect 10–25 prompts before install finishes — more if your computer is fresh, fewer if it already has dev tools. **Click "Allow" each time.** This is normal. The tools the AI installs (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
 - **A separate password prompt on Mac.** macOS may ask for *your computer password* (the one you use to log in) when installing certain tools. This is your operating system asking, not the AI. Type your password and hit Enter — installing software almost always requires this.
 - **Silent waiting periods.** Some downloads and compiles take 30–90 seconds with no visible progress. **The AI isn't frozen — it's working.** Wait for it to come back. Total install time is usually 2–10 minutes depending on your network and what's already installed.
-- **A success message at the end:** `[ok] ClawJournal 0.1.13 installed.` (the version number may differ).
+- **A success message at the end:** `[ok] ClawJournal 0.1.15 installed.` (the version number may differ).
 
 ### Open the workbench
 
@@ -329,8 +329,7 @@ Package the conversations you approved into a redacted file on your computer. Up
 
 The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed. Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
 
-To actually upload after packaging (optional), use the hosted submission page if one is configured for this install. The Done screen shows **Submit to ClawJournal Research** when a destination is available; that page verifies email, shows consent, and asks for the downloaded zip.
-Set `CLAWJOURNAL_SHARE_URL` to the hosted `/share` page to enable that button in local workbench builds.
+To actually upload after packaging (optional), use the hosted Rayward submission page. The Done screen shows **Submit to ClawJournal Research** by default; that page verifies email, shows consent, and asks for the downloaded zip. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables the hosted button.
 
 > *(optional)* *"Open the ClawJournal Research submission page so I can upload the exported zip."*
 
@@ -346,7 +345,7 @@ clawjournal bundle-view <bundle_id>                  # inspect before exporting
 clawjournal bundle-export <bundle_id> --zip          # write an uploadable zip plus export folder
 
 # Optional hosted browser upload:
-python -m webbrowser "$CLAWJOURNAL_SHARE_URL"       # when configured
+python -m webbrowser "https://data.rayward.ai/share"  # packaged default
 
 # Advanced self-hosted ingest upload:
 clawjournal verify-email you@university.edu          # one-time email verification
