@@ -6,8 +6,16 @@ Last updated: 2026-05-26
 Target decisions:
 - 5/5 does not require `agent_caused`; gate on whether agent behavior is the lesson.
 - Scores of 4 or 5 require at least one `ai_failure_evidence` snippet.
-- Hide the legacy `ai_quality_score` from primary UI surfaces; keep it in the
-  data model, CLI, and exports for compatibility.
+- Show `ai_failure_value_score` as the primary score. Keep the legacy
+  productivity `ai_quality_score` visible as a secondary score and sortable
+  lens.
+- Default review sorting uses failure value. Productivity sort remains
+  available when the reviewer wants that lens.
+- `--auto-triage` only auto-blocks productivity-1 sessions when failure value
+  is 1-2. Failure value 3 stays reviewable.
+- Human 4-5 failure-value overrides require trace-backed evidence.
+- Legacy traces with productivity score but no failure-value score should be
+  rescored, not treated as fully scored.
 
 ## Problem
 
@@ -42,7 +50,7 @@ Target field split:
 | Field | Meaning | Product role |
 | --- | --- | --- |
 | `ai_failure_value_score` | 1-5 value for failure-corpus review | Primary score |
-| `ai_quality_score` | 1-5 productivity/substance legacy score | Hidden from primary UI surfaces; kept in data model, CLI, and exports |
+| `ai_quality_score` | 1-5 productivity/substance legacy score | Secondary score; visible and sortable but not the default lens |
 | `ai_failure_modes` | What kind of failure happened | Failure reason labels |
 | `ai_failure_attribution` | Dominant cause of the key failure | Failure reason context |
 | `ai_recovery_labels` | Whether and how recovery happened | Failure/recovery context |
@@ -64,19 +72,18 @@ Current repo state:
   `clawjournal/scoring/scoring.py:1090`: a failure-value score of 4 or 5 with
   no `ai_failure_evidence` is downgraded to 3.
 - `set-score --failure-value` exists for manual failure-value overrides.
+  Overrides to 4-5 require stored `ai_failure_evidence`.
 - The workbench list (`TraceCard.tsx`), session detail score panel, share
   recommendations, and recent highlights now use failure value as the primary
   review score.
-- The legacy `ai_quality_score` is still visible on four UI surfaces that
-  need follow-up migration:
+- The legacy `ai_quality_score` remains visible as a secondary lens:
   - `web/frontend/src/views/SessionDetail.tsx:582-587` renders
     `Legacy productivity {score}/5` next to the failure-value panel.
   - `web/frontend/src/views/Dashboard.tsx:230` computes
     `totalProductivityScored` and renders a `by_quality_score` histogram
-    alongside `by_failure_value_score`.
-  - `web/frontend/src/views/Insights.tsx:169` falls back to
-    `ai_quality_score` when `ai_failure_value_score` is null, so quality
-    still drives ranking on legacy traces.
+    alongside `by_failure_value_score` as broader analytics.
+  - `web/frontend/src/views/Insights.tsx` uses failure value for the primary
+    score lens; legacy productivity-only traces should be rescored.
   - `web/frontend/src/views/Share.tsx` (and the `api.ts` / `types.ts`
     contracts) keep `ai_quality_score` in the share-ready payload.
 
@@ -141,22 +148,25 @@ Recommended UI changes:
 2. Show `ai_failure_value_score` as the primary 1-5 score in session detail.
 3. Place failure modes, attribution, recovery labels, evidence, and learning
    summary directly under the failure score.
-4. Hide the legacy productivity score (`ai_quality_score`) from primary UI
-   surfaces. Keep it in the data model and CLI/exports for backwards
-   compatibility; showing two 1-5 scores with different meanings side-by-side
-   confuses reviewers.
+4. Keep the legacy productivity score (`ai_quality_score`) visible but
+   subordinate. It should read as a secondary analytics/review lens, not as the
+   main score.
 5. In list views, sort by failure value by default and label the sort as "Top
    failure value" or "Most valuable failures".
-6. In CLI output, lead with failure value:
+6. Keep productivity sort available for reviewers who need the older
+   productivity/substance lens.
+7. In CLI output, lead with failure value:
    `failure value 4/5; productivity 3/5`.
-7. Avoid presenting failure value as generic gold stars if that makes it feel
+8. Avoid presenting failure value as generic gold stars if that makes it feel
    like praise. Consider `FV 4/5`, a severity-style badge, or a compact numeric
    meter instead.
 
 ## Dashboard And List View
 
-The dashboard and list view are the primary review surfaces. Their job is
-triage — "what should I review next?" — not a leaderboard.
+The list view is the primary review queue. The dashboard is a broader
+analytics surface: it should still make failure value prominent, but it can
+also show productivity, model/source mix, cost, token, outcome, and activity
+context.
 
 Reframing first: under the new score, "best cases" and "failure cases" overlap.
 A canonical 5/5 trace *is* a best case (best for the corpus). There is no
@@ -165,15 +175,18 @@ counter, not a parallel ranked surface.
 
 ### Dashboard
 
-Four tiles, nothing more:
+Dashboard priorities:
 
 1. Failure-value distribution — small 1-5 histogram of recent traces.
 2. Top failure modes — top 5 by count.
 3. Top recovery patterns — top 5 by count.
-4. Recent 4-5s — the review inbox.
+4. Recent 4-5s — a review lane, not the only dashboard content.
+5. Secondary analytics — productivity distribution, outcomes, model/source
+   summaries, cost/tokens, activity, and similar operational context.
 
-Plus one ambient line at the top: `N sessions this week, M smooth successes`.
-Baseline activity, no ranked board.
+The dashboard should not make productivity the headline score, but keeping it
+visible is useful because it answers a different question: whether a trace was
+substantive/productive rather than whether it is valuable for failure analysis.
 
 ### List view
 
@@ -186,19 +199,19 @@ One default surface, sorted by failure value desc. Each row shows four things:
 
 Filters: failure value, failure mode, recovery label, outcome.
 
-Anything denser turns the list into a spreadsheet.
+Anything denser turns the review queue into a spreadsheet.
 
 ### What to resist
 
 Trying to make the list view serve every lens at once — recency, productivity,
-failure, outcome. Lock failure-value as the default lens and let timeline /
-outcome live as filters or alternate sorts, not parallel default surfaces. Two
-ranked boards always splits attention and never pays for the complexity.
+failure, outcome. Lock failure-value as the default lens and let timeline,
+productivity, and outcome live as filters or alternate sorts, not parallel
+default surfaces.
 
 Sharp tradeoff: a user who wants "what happened this week, all of it" needs a
 separate timeline view. Fine to build, but keep it clearly marked as a second
-lens — don't let it leak into the dashboard default. The dashboard's job is
-"what should I review next," not "what did I do."
+lens. The dashboard can answer "what happened this week" as analytics; the
+review list should answer "what should I inspect next."
 
 ## CLI And Data Model Direction
 
@@ -213,12 +226,15 @@ Near-term behavior:
 - `set-score --quality` should remain a legacy productivity override.
 - Use the manual failure-value override when human review needs to correct the
   score:
-  `set-score --failure-value 4`.
+  `set-score --failure-value 4 --failure-evidence "..."`.
 - Auto-triage should not hide a trace solely because productivity is low if
-  failure value is high. `--auto-triage` should only auto-block productivity-1
-  sessions when failure value is below 4. Rationale: failure value 3 is
-  "usable signal" worth keeping reviewable; 4-5 is share-worthy. So 4 is the
-  cutoff between "could be reviewed later" and "definitely keep in the queue."
+  failure value is at least usable. `--auto-triage` should only auto-block
+  productivity-1 sessions when failure value is 1-2. Rationale: failure value
+  3 is "usable signal" worth keeping reviewable; 4-5 is share-worthy. The
+  cutoff is between 2 and 3, not between 3 and 4.
+- Batch scoring should include legacy traces missing `ai_failure_value_score`,
+  even if they already have the old productivity score. Rescoring is the
+  migration path for legacy traces.
 
 Provenance remains important when changing score meaning:
 
@@ -272,11 +288,7 @@ Evidence and attribution rules:
    unless explicitly marked as evaluation data?
 3. Should we derive a `corpus_ready` state from failure value, evidence, hold
    state, and privacy gates?
-4. Is "below 4" the right auto-triage cutoff? The current proposal keeps
-   productivity-1 + failure-value-3 traces reviewable; an alternative is
-   "below 3" (only auto-block productivity-1 + failure-value 1-2). Trade-off:
-   reviewer queue size vs. capturing 3/5 "usable but minor" signals.
-5. Should the dashboard scope to "all time" or "last 7 days" by default? A
+4. Should the dashboard scope to "all time" or "last 7 days" by default? A
    7-day default makes the histogram and recent feed feel alive; all-time is
    stable but may underweight recent regressions and starve low-volume users.
 
@@ -294,48 +306,43 @@ Evidence and attribution rules:
 3. Session Detail leads with the failure-value panel; failure modes,
    attribution, recovery, evidence, and learning summary surface directly
    under it.
-4. Manual failure-value override: `set-score --failure-value <n>`.
+4. Manual failure-value override: `set-score --failure-value <n>`; 4-5
+   overrides require `--failure-evidence`.
 5. Workbench list (`TraceCard.tsx`), share recommendations, and recent
    highlights rank by failure value.
+6. Auto-triage only blocks productivity-1 sessions when failure value is 1-2.
+7. Legacy productivity-only traces are considered unscored for the new failure
+   lens and can be filled by `clawjournal score --batch`.
 
 ### Remaining
 
-1. **Hide the legacy productivity score from primary UI surfaces.** Four
-   concrete touch-points (see "Current repo state" above for exact line
-   refs):
-   - Remove or gate the `Legacy productivity {score}/5` badge in
-     `SessionDetail.tsx:582-587`.
-   - Drop or relabel the `by_quality_score` histogram in
-     `Dashboard.tsx:230` (and stop computing `totalProductivityScored` for
-     the primary surface).
-   - In `Insights.tsx:169`, stop falling back to `ai_quality_score` for
-     the primary score lens — render "no failure score yet" for legacy
-     traces instead.
-   - In `Share.tsx`, drop `ai_quality_score` from the share-ready UI;
-     keep it in the API contract (`api.ts` / `types.ts`) for backwards
-     compatibility.
-2. **Update CLI text and README language** so "quality" is no longer the
-   main score; lead with failure value in `score-view` output.
-3. **Auto-triage gate.** Implement the "below 4" rule so productivity-1
-   sessions with high failure value are not auto-blocked.
-4. **Migrate "quality" copy in the Insights recommendations engine.** The
-   recommendation cards rendered on the Insights view still read "best
-   quality score", "Model quality vs cost trade-off", and "Highest quality:
-   …". Source:
+1. **Keep productivity visibly secondary.** The session detail and dashboard
+   can show productivity, but the default list/review/share lens should
+   remain failure value.
+2. **Rename "quality" copy to "productivity" in the Insights recommendations
+   engine.** The recommendation cards still emit "best quality score",
+   "Model quality vs cost trade-off", and "Highest quality:". Touch-points:
    - `clawjournal/scoring/insights.py:292` — `"{type} work has the best
      quality score"` title.
    - `clawjournal/scoring/insights.py:310` — `"Model quality vs cost
      trade-off"` title.
    - `clawjournal/scoring/insights.py:312` — `"Highest quality: {model}
      ({avg_score:.1f}/5 avg, ...)"` body.
-   - `clawjournal/cli.py:1997` — matching CLI line `Highest quality:
-     {summary['highest_quality_model']}`.
+   - `clawjournal/cli.py:1997` — matching CLI line
+     `Highest quality: {summary['highest_quality_model']}`.
 
-   Decide whether the recommendation should switch to failure-value
-   framing or to a neutral "score" framing, and whether the underlying
-   metric should still be `ai_quality_score` or move to
-   `ai_failure_value_score` (the recommendation logic likely needs the
-   same migration, not just the label).
-5. **Re-run the frontend build** once the UI surfaces above are reworked —
+   The recommendation logic operates on `ai_quality_score` (productivity) and
+   that is fine — only the copy needs to switch from "quality" to
+   "productivity" so the term does not conflate with the failure-value
+   framing.
+3. **Remove the legacy-quality fallback in the Insights "Duration vs Failure
+   Value" scatter.** `clawjournal/web/frontend/src/views/Insights.tsx:169`
+   reads `const score = d.ai_failure_value_score ?? d.ai_quality_score`, so
+   legacy productivity-only traces get silently plotted on the failure-value
+   axis. Per Target decisions, legacy traces with no failure-value score
+   should be rescored, not coerced into the failure-value slot. Either omit
+   those traces from the scatter or render them with a visual treatment that
+   marks them as "rescore needed."
+4. **Re-run the frontend build** once the UI surfaces above are reworked —
    the CI smoke job verifies the built wheel ships
    `clawjournal/web/frontend/dist/index.html`.
