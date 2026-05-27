@@ -7,7 +7,7 @@ ClawJournal is designed to be usable without uploading anything.
 - `clawjournal scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` run locally.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
 - `bundle-export` writes files to disk. It does not contact a server.
-- If you never configure `CLAWJOURNAL_INGEST_URL` and never run `bundle-share` or `share`, nothing is uploaded.
+- If you never upload the zip in a hosted browser page, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share` / `share`, nothing is uploaded.
 
 ## Automatic redaction
 
@@ -72,7 +72,7 @@ brew install trufflehog
 # https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
 ```
 
-For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
+For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload. The AI-PII pass reviews sessions in a small bounded worker pool and falls back to deterministic PII rules when an AI backend errors or times out; the manifest records `redaction_summary.coverage.full` vs. `rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
 
 One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
 
@@ -92,10 +92,11 @@ Depending on how you export, bundle content can include user messages, assistant
 
 Uploading is a separate path from local export.
 
-- Uploading is disabled unless `CLAWJOURNAL_INGEST_URL` is configured.
-- The ingest URL must use `https://`, except for `localhost` and `127.0.0.1` during local development.
-- Upload commands are `clawjournal bundle-share <bundle_id>` or `clawjournal share ...`.
-- You can inspect what would be included with `clawjournal share --preview --status approved`.
+- Hosted research submission uses a browser upload page when `CLAWJOURNAL_SHARE_URL` is configured in the workbench.
+- Advanced self-hosted ingest upload is disabled unless `CLAWJOURNAL_INGEST_URL` is configured.
+- The ingest and hosted-share URLs must use `https://`, except for `localhost` and `127.0.0.1` during local development.
+- Self-hosted ingest commands are `clawjournal bundle-share <bundle_id>` or `clawjournal share ...`.
+- You can inspect what would be included in self-hosted ingest with `clawjournal share --preview --status approved`.
 
 ### Email verification
 

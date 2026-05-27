@@ -14,6 +14,7 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from http import HTTPStatus
@@ -88,7 +89,13 @@ AUTO_SCORE_BATCH_SIZE = 10
 
 _SHARE_MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 _SHARE_COOLDOWN_SECONDS = 10
+_UPLOAD_PII_DEFAULT_WORKERS = 3
+_UPLOAD_PII_MAX_WORKERS = 4
+_UPLOAD_PII_DEFAULT_TIMEOUT_SECONDS = 60
+_UPLOAD_PII_MIN_TIMEOUT_SECONDS = 10
+_UPLOAD_PII_MAX_TIMEOUT_SECONDS = 180
 _SHARE_INGEST_URL = os.environ.get("CLAWJOURNAL_INGEST_URL", "")
+_HOSTED_SHARE_URL = os.environ.get("CLAWJOURNAL_SHARE_URL", "").strip()
 _SHARE_GCS_BUCKET = os.environ.get("CLAWJOURNAL_GCS_BUCKET", "clawjournal-traces")
 _SHARE_GCS_PREFIX = os.environ.get("CLAWJOURNAL_GCS_PREFIX", "clawjournal")
 _SHARE_UPLOAD_TIMEOUT = 120
@@ -445,11 +452,27 @@ def _is_edu_email(email: str) -> bool:
 
 def _missing_ingest_url_error() -> str:
     return (
-        "Hosted sharing is not configured in this build. "
-        "Use `clawjournal bundle-export` to produce a local zip you can share "
-        "any way you like. Self-hosters can set CLAWJOURNAL_INGEST_URL to point "
-        "at their own ingest backend."
+        "CLI ingest upload is not configured in this build. "
+        "Use the workbench Download zip action or `clawjournal bundle-export` "
+        "to produce a local zip. Hosted research submissions use the configured "
+        "browser upload page; self-hosters can set CLAWJOURNAL_INGEST_URL to "
+        "point at their own ingest backend."
     )
+
+
+def _validated_hosted_share_url() -> tuple[str | None, str]:
+    """Return a configured hosted share URL, or a user-facing disabled reason."""
+    if not _HOSTED_SHARE_URL:
+        return None, "Hosted submission is not configured for this install."
+    parsed = urlparse(_HOSTED_SHARE_URL)
+    is_https = parsed.scheme == "https" and bool(parsed.netloc)
+    is_local_dev = (
+        parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1"}
+    )
+    if is_https or is_local_dev:
+        return _HOSTED_SHARE_URL, "Hosted submission is configured for browser zip upload."
+    return None, "CLAWJOURNAL_SHARE_URL must use HTTPS, or localhost for development."
 
 
 def _validate_ingest_url() -> None:
@@ -635,6 +658,299 @@ def _with_legacy_bundle_alias(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %d", name, raw, default)
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _upload_pii_worker_count(session_count: int) -> int:
+    if session_count <= 0:
+        return 0
+    requested = _bounded_int_env(
+        "CLAWJOURNAL_UPLOAD_PII_WORKERS",
+        _UPLOAD_PII_DEFAULT_WORKERS,
+        1,
+        _UPLOAD_PII_MAX_WORKERS,
+    )
+    return min(session_count, requested)
+
+
+def _upload_pii_timeout_seconds() -> int:
+    return _bounded_int_env(
+        "CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS",
+        _UPLOAD_PII_DEFAULT_TIMEOUT_SECONDS,
+        _UPLOAD_PII_MIN_TIMEOUT_SECONDS,
+        _UPLOAD_PII_MAX_TIMEOUT_SECONDS,
+    )
+
+
+def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
+    """Run upload-time PII review over a JSONL export, preserving row order."""
+    from ..redaction.pii import apply_findings_to_session, review_session_pii_hybrid
+
+    sessions: list[dict[str, Any]] = []
+    with open(sessions_file) as f:
+        for line in f:
+            if line.strip():
+                sessions.append(json.loads(line))
+
+    workers = _upload_pii_worker_count(len(sessions))
+    timeout_seconds = _upload_pii_timeout_seconds()
+    coverage = {"full": 0, "rules_only": 0}
+    if not sessions:
+        return {
+            "session_count": 0,
+            "finding_count": 0,
+            "replacement_count": 0,
+            "coverage": coverage,
+            "workers": 0,
+            "agent_timeout_seconds": timeout_seconds,
+        }
+
+    def redact_one(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
+        findings, cov = review_session_pii_hybrid(
+            session,
+            ignore_llm_errors=True,
+            return_coverage=True,
+            timeout_seconds=timeout_seconds,
+        )
+        replacement_count = 0
+        if findings:
+            session, replacement_count = apply_findings_to_session(session, findings)
+        coverage_bucket = cov if cov in coverage else "rules_only"
+        return index, session, len(findings), replacement_count, coverage_bucket
+
+    results: list[dict[str, Any] | None] = [None] * len(sessions)
+    finding_count = 0
+    replacement_count = 0
+
+    if workers <= 1:
+        for index, session in enumerate(sessions):
+            idx, redacted, findings, replacements, cov = redact_one(index, session)
+            results[idx] = redacted
+            finding_count += findings
+            replacement_count += replacements
+            coverage[cov] += 1
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(redact_one, index, session): index
+                for index, session in enumerate(sessions)
+            }
+            for future in as_completed(futures):
+                idx, redacted, findings, replacements, cov = future.result()
+                results[idx] = redacted
+                finding_count += findings
+                replacement_count += replacements
+                coverage[cov] += 1
+
+    with open(sessions_file, "w") as f:
+        for session in results:
+            if session is None:
+                raise RuntimeError("PII redaction did not produce all session rows")
+            f.write(json.dumps(session, default=str) + "\n")
+
+    return {
+        "session_count": len(sessions),
+        "finding_count": finding_count,
+        "replacement_count": replacement_count,
+        "coverage": coverage,
+        "workers": workers,
+        "agent_timeout_seconds": timeout_seconds,
+    }
+
+
+def finalize_share_export_for_upload(
+    export_dir: Path,
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Apply final local-only gates before an export becomes an upload zip.
+
+    `export_share_to_disk()` performs deterministic redaction and a first
+    TruffleHog scan. Hosted/browser upload needs the same extra local PII pass
+    that the legacy ingest path used, then a fresh TruffleHog scan over the
+    rewritten `sessions.jsonl`.
+    """
+    sessions_file = export_dir / "sessions.jsonl"
+    manifest_file = export_dir / "manifest.json"
+
+    if not sessions_file.exists():
+        return {"error": "Export failed — no sessions file.", "status": 500}, manifest
+
+    if manifest.get("blocked"):
+        return {
+            "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+            "block_reason": manifest.get("block_reason"),
+            "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+            "status": 422,
+        }, manifest
+
+    try:
+        pii_summary = _apply_upload_pii_redactions(sessions_file)
+        if pii_summary["finding_count"]:
+            logger.info(
+                "PII redaction applied: %d findings / %d replacements across %d sessions "
+                "(workers=%d, timeout=%ss)",
+                pii_summary["finding_count"],
+                pii_summary["replacement_count"],
+                pii_summary["session_count"],
+                pii_summary["workers"],
+                pii_summary["agent_timeout_seconds"],
+            )
+    except Exception as exc:
+        logger.warning("PII redaction pass failed: %s", exc)
+        return {
+            "error": "PII redaction failed — upload aborted. Try again or report this issue.",
+            "status": 500,
+        }, manifest
+
+    redaction_summary = manifest.setdefault("redaction_summary", {})
+    if isinstance(redaction_summary, dict):
+        redaction_summary["coverage"] = dict(pii_summary["coverage"])
+        redaction_summary["pii_review"] = {
+            "session_count": pii_summary["session_count"],
+            "finding_count": pii_summary["finding_count"],
+            "replacement_count": pii_summary["replacement_count"],
+            "workers": pii_summary["workers"],
+            "agent_timeout_seconds": pii_summary["agent_timeout_seconds"],
+        }
+
+    try:
+        from ..redaction import trufflehog as trufflehog_scanner
+
+        post_pii_report = trufflehog_scanner.scan_file(sessions_file)
+    except Exception as exc:
+        logger.warning("Post-PII TruffleHog scan failed: %s", exc)
+        return {
+            "error": "Post-redaction scan failed — upload aborted.",
+            "detail": str(exc),
+            "status": 500,
+        }, manifest
+
+    # `trufflehog.json` is the authoritative report shipped in the zip.
+    # `trufflehog.post-pii.json` is a compatibility/diagnostic marker that
+    # proves the final artifact passed the post-PII gate.
+    trufflehog_scanner.write_report(export_dir / "trufflehog.json", post_pii_report)
+    trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
+    if isinstance(redaction_summary, dict):
+        summary = post_pii_report.summary()
+        redaction_summary["trufflehog"] = summary
+        redaction_summary["trufflehog_post_pii"] = summary
+
+    if post_pii_report.blocking or post_pii_report.bypassed:
+        manifest["blocked"] = True
+        manifest["block_reason"] = (
+            post_pii_report.block_reason
+            or ("trufflehog-bypassed" if post_pii_report.bypassed else None)
+        )
+        manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
+        with open(manifest_file, "w") as f:
+            json.dump(manifest, f, indent=2, default=str)
+        if post_pii_report.bypassed:
+            return {
+                "error": (
+                    "Refusing to prepare upload zip: TruffleHog was bypassed via "
+                    "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable and retry."
+                ),
+                "block_reason": "trufflehog-bypassed",
+                "status": 422,
+            }, manifest
+        return {
+            "error": trufflehog_scanner.format_block_message(post_pii_report),
+            "block_reason": post_pii_report.block_reason,
+            "trufflehog_summary": post_pii_report.summary(),
+            "status": 422,
+        }, manifest
+
+    with open(manifest_file, "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    return None, manifest
+
+
+def _manifest_is_finalized_for_upload(manifest: dict[str, Any]) -> bool:
+    if manifest.get("blocked"):
+        return False
+    summary = manifest.get("redaction_summary")
+    if not isinstance(summary, dict):
+        return False
+    pii_review = summary.get("pii_review")
+    post_pii_scan = summary.get("trufflehog_post_pii")
+    if not isinstance(pii_review, dict) or not isinstance(post_pii_scan, dict):
+        return False
+    return (
+        post_pii_scan.get("findings") == 0
+        and post_pii_scan.get("bypassed") is False
+        and post_pii_scan.get("binary_missing") is False
+        and not post_pii_scan.get("scan_error")
+    )
+
+
+def _load_finalized_share_export(share_id: str) -> tuple[Path, dict[str, Any]] | None:
+    # Finalized exports are point-in-time artifacts: a later config change
+    # creates a new share/seal operation rather than mutating this cached zip.
+    export_dir = CONFIG_DIR / "shares" / share_id
+    manifest_file = export_dir / "manifest.json"
+    sessions_file = export_dir / "sessions.jsonl"
+    trufflehog_file = export_dir / "trufflehog.json"
+    post_pii_file = export_dir / "trufflehog.post-pii.json"
+    if not (
+        manifest_file.exists()
+        and sessions_file.exists()
+        and trufflehog_file.exists()
+        and post_pii_file.exists()
+    ):
+        return None
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if manifest.get("share_id") != share_id and manifest.get("bundle_id") != share_id:
+        return None
+    if not _manifest_is_finalized_for_upload(manifest):
+        return None
+    return export_dir, manifest
+
+
+def _prepare_share_export_for_upload(
+    conn: sqlite3.Connection,
+    share_id: str,
+    share: dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    reuse_finalized: bool = False,
+) -> tuple[Path | None, dict[str, Any], dict[str, Any] | None]:
+    if reuse_finalized:
+        cached = _load_finalized_share_export(share_id)
+        if cached is not None:
+            export_dir, manifest = cached
+            return export_dir, manifest, None
+
+    export_dir, manifest = export_share_to_disk(
+        conn,
+        share_id,
+        share,
+        custom_strings=settings["custom_strings"],
+        extra_usernames=settings["extra_usernames"],
+        excluded_projects=settings["excluded_projects"],
+        blocked_domains=settings["blocked_domains"],
+        allowlist_entries=settings["allowlist_entries"],
+    )
+    if export_dir is None:
+        return None, manifest, {"error": "Failed to prepare upload zip", "status": 500}
+
+    error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+    if error:
+        return export_dir, manifest, error
+    return export_dir, manifest, None
+
+
 def upload_share(
     conn: sqlite3.Connection,
     share_id: str,
@@ -697,115 +1013,12 @@ def upload_share(
     )
     if export_dir is None:
         return {"error": "Export failed.", "status": 500}
+    error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+    if error:
+        return error
+
     sessions_file = export_dir / "sessions.jsonl"
     manifest_file = export_dir / "manifest.json"
-
-    if not sessions_file.exists():
-        return {"error": "Export failed — no sessions file.", "status": 500}
-
-    # Pre-PII TruffleHog scan already ran inside export_share_to_disk —
-    # if that stage blocked, fail closed before we do any additional work.
-    if manifest.get("blocked"):
-        return {
-            "error": manifest.get("block_message") or "Share blocked by TruffleHog",
-            "block_reason": manifest.get("block_reason"),
-            "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
-            "status": 422,
-        }
-
-    # Mandatory PII redaction pass — applied to ALL sessions before upload.
-    # This catches names, orgs, usernames, etc. that regex-based secret
-    # redaction misses.  No session cap: every session gets reviewed.
-    coverage_full = 0
-    coverage_rules_only = 0
-    try:
-        from ..redaction.pii import apply_findings_to_session, review_session_pii_hybrid
-        import json as _json
-
-        redacted_lines: list[str] = []
-        pii_total = 0
-        with open(sessions_file) as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                session = _json.loads(line)
-                findings, cov = review_session_pii_hybrid(
-                    session, ignore_llm_errors=True, return_coverage=True,
-                )
-                if cov == "full":
-                    coverage_full += 1
-                else:
-                    coverage_rules_only += 1
-                if findings:
-                    session, _ = apply_findings_to_session(session, findings)
-                    pii_total += len(findings)
-                redacted_lines.append(_json.dumps(session, default=str))
-        with open(sessions_file, "w") as f:
-            for rline in redacted_lines:
-                f.write(rline + "\n")
-        if pii_total:
-            logger.info("PII redaction applied: %d findings across %d sessions", pii_total, len(redacted_lines))
-    except Exception as exc:
-        logger.warning("PII redaction pass failed: %s", exc)
-        return {"error": "PII redaction failed — upload aborted. Try again or report this issue.", "status": 500}
-
-    # Update manifest with PII coverage metadata
-    if manifest and isinstance(manifest.get("redaction_summary"), dict):
-        manifest["redaction_summary"]["coverage"] = {
-            "full": coverage_full,
-            "rules_only": coverage_rules_only,
-        }
-
-    # Post-PII TruffleHog re-scan: the PII pass rewrote sessions.jsonl,
-    # so the scan embedded in the manifest by export_share_to_disk is
-    # stale. Run the gate again on the file that's actually about to
-    # leave this machine.
-    try:
-        from ..redaction import trufflehog as trufflehog_scanner
-
-        post_pii_report = trufflehog_scanner.scan_file(sessions_file)
-    except Exception as exc:
-        logger.warning("Post-PII TruffleHog scan failed: %s", exc)
-        return {
-            "error": "Post-redaction scan failed — upload aborted.",
-            "detail": str(exc),
-            "status": 500,
-        }
-    trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
-    if manifest and isinstance(manifest.get("redaction_summary"), dict):
-        manifest["redaction_summary"]["trufflehog_post_pii"] = post_pii_report.summary()
-    if post_pii_report.blocking:
-        if manifest:
-            manifest["blocked"] = True
-            manifest["block_reason"] = post_pii_report.block_reason
-            manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
-            with open(manifest_file, "w") as f:
-                json.dump(manifest, f, indent=2, default=str)
-        return {
-            "error": trufflehog_scanner.format_block_message(post_pii_report),
-            "block_reason": post_pii_report.block_reason,
-            "trufflehog_summary": post_pii_report.summary(),
-            "status": 422,
-        }
-    # Bypass is allowed locally (bundle-export with CLAWJOURNAL_SKIP_
-    # TRUFFLEHOG=1 still writes files), but uploading an unscanned
-    # share to a remote endpoint should fail closed — the gate exists
-    # specifically to catch surviving secrets before they leave the
-    # machine.
-    if post_pii_report.bypassed:
-        return {
-            "error": (
-                "Refusing to upload: TruffleHog was bypassed via "
-                "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable and "
-                "retry, or use bundle-export for local-only output."
-            ),
-            "block_reason": "trufflehog-bypassed",
-            "status": 422,
-        }
-
-    if manifest and isinstance(manifest.get("redaction_summary"), dict):
-        with open(manifest_file, "w") as f:
-            json.dump(manifest, f, indent=2, default=str)
 
     file_size = sessions_file.stat().st_size
     if file_size > _SHARE_MAX_FILE_SIZE:
@@ -1028,6 +1241,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_projects()
         elif path == "/api/share-ready":
             self._handle_share_ready(params)
+        elif path == "/api/share-destination":
+            self._handle_share_destination()
         elif path == "/api/scoring/backend":
             self._handle_scoring_backend()
         elif path == "/api/bundles":
@@ -1090,6 +1305,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/bundles/") and path.endswith("/export"):
             share_id = path[len("/api/bundles/"):-len("/export")]
             self._handle_export_share(share_id)
+        elif path.startswith("/api/bundles/") and path.endswith("/seal"):
+            share_id = path[len("/api/bundles/"):-len("/seal")]
+            self._handle_seal_share(share_id)
         elif path.startswith("/api/bundles/") and path.endswith("/share"):
             share_id = path[len("/api/bundles/"):-len("/share")]
             self._handle_upload_share(share_id)
@@ -1098,6 +1316,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/shares/") and path.endswith("/export"):
             share_id = path[len("/api/shares/"):-len("/export")]
             self._handle_export_share(share_id)
+        elif path.startswith("/api/shares/") and path.endswith("/seal"):
+            share_id = path[len("/api/shares/"):-len("/seal")]
+            self._handle_seal_share(share_id)
         elif path.startswith("/api/shares/") and path.endswith("/share"):
             share_id = path[len("/api/shares/"):-len("/share")]
             self._handle_upload_share(share_id)
@@ -1747,6 +1968,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "display_name": display_names.get(backend, backend),
         })
 
+    def _handle_share_destination(self) -> None:
+        """Return the optional hosted browser-upload destination."""
+        share_url, message = _validated_hosted_share_url()
+        _json_response(self, {
+            "configured": bool(share_url),
+            "preferred_upload_flow": "browser_zip",
+            "cli_ingest_supported": False,
+            "share_page_url": share_url,
+            "message": message,
+        })
+
     def _handle_share_ready(self, params: dict[str, list[str]]) -> None:
         """Return stats for sessions ready to share.
 
@@ -1999,6 +2231,39 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _handle_seal_share(self, share_id: str) -> None:
+        """Finalize a share for browser upload without returning zip bytes."""
+        conn = open_index()
+        try:
+            share = get_share(conn, share_id)
+            if share is None:
+                _json_response(self, {"error": "Share not found"}, 404)
+                return
+
+            settings = get_effective_share_settings(conn, load_config())
+            export_dir, manifest, error = _prepare_share_export_for_upload(
+                conn,
+                share_id,
+                share,
+                settings,
+                reuse_finalized=True,
+            )
+            if error:
+                _json_response(self, error, int(error.get("status", 500)))
+                return
+            if export_dir is None:
+                _json_response(self, {"error": "Failed to prepare upload zip"}, 500)
+                return
+
+            _json_response(self, {
+                "ok": True,
+                "export_path": str(export_dir),
+                "session_count": len(manifest.get("sessions", [])),
+                "redaction_summary": manifest.get("redaction_summary", {}),
+            })
+        finally:
+            conn.close()
+
     def _handle_download_share(self, share_id: str) -> None:
         """Generate a zip of the share and serve it as a browser download."""
         conn = open_index()
@@ -2009,26 +2274,18 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
 
             settings = get_effective_share_settings(conn, load_config())
-            export_dir, _manifest = export_share_to_disk(
+            export_dir, _manifest, error = _prepare_share_export_for_upload(
                 conn,
                 share_id,
                 share,
-                custom_strings=settings["custom_strings"],
-                extra_usernames=settings["extra_usernames"],
-                excluded_projects=settings["excluded_projects"],
-                blocked_domains=settings["blocked_domains"],
-                allowlist_entries=settings["allowlist_entries"],
+                settings,
+                reuse_finalized=True,
             )
+            if error:
+                _json_response(self, error, int(error.get("status", 500)))
+                return
             if export_dir is None:
                 _json_response(self, {"error": "Failed to prepare download"}, 500)
-                return
-
-            if _manifest.get("blocked"):
-                _json_response(self, {
-                    "error": _manifest.get("block_message") or "Share blocked by TruffleHog",
-                    "block_reason": _manifest.get("block_reason"),
-                    "trufflehog_summary": _manifest.get("redaction_summary", {}).get("trufflehog"),
-                }, 422)
                 return
 
             sessions_content = (export_dir / "sessions.jsonl").read_bytes()
@@ -2036,6 +2293,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             trufflehog_path = export_dir / "trufflehog.json"
             trufflehog_content = (
                 trufflehog_path.read_bytes() if trufflehog_path.exists() else None
+            )
+            post_pii_path = export_dir / "trufflehog.post-pii.json"
+            post_pii_content = (
+                post_pii_path.read_bytes() if post_pii_path.exists() else None
             )
 
             # Create in-memory zip
@@ -2045,6 +2306,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 zf.writestr("manifest.json", manifest_content)
                 if trufflehog_content is not None:
                     zf.writestr("trufflehog.json", trufflehog_content)
+                if post_pii_content is not None:
+                    zf.writestr("trufflehog.post-pii.json", post_pii_content)
             zip_bytes = buf.getvalue()
 
             # Serve the zip

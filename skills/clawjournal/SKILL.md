@@ -146,15 +146,16 @@ If user adds a note, remember it for the `--note` flag.
 
 If user says "looks good" / "share" / "yes" — proceed to Step 4.
 
-**Step 4 — Share with confirmation**
+**Step 4 — Package with confirmation**
 
 Only after explicit user confirmation:
 
 ```bash
-clawjournal share --status approved --note "<user's comment>" --json
+clawjournal bundle-create --status approved --note "<user's comment>" --json
+clawjournal bundle-export <bundle_id> --zip --json
 ```
 
-Parse the JSON result. **Always report the redaction summary to the user** (see Communication Guidelines above).
+Parse the export result, use `zip_path` as the upload file, and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `CLAWJOURNAL_INGEST_URL`; use the workbench Done screen's "Submit to ClawJournal Research" button when it is available, then have the user upload the zip on that page. If the destination is not configured, tell the user the redacted zip is ready on their computer.
 
 ### Quick Share
 
@@ -277,15 +278,15 @@ clawjournal score-view <id>
 clawjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--reason "..."]
 clawjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only
 
-# Share
+# Advanced self-hosted ingest upload
 clawjournal share --status approved [--note "..."] [--preview] [--json]
 
 # Bundles
 clawjournal bundle-create [ids ...] [--status approved]
 clawjournal bundle-list
 clawjournal bundle-view <bundle_id>
-clawjournal bundle-export <bundle_id>
-clawjournal bundle-share <bundle_id>
+clawjournal bundle-export <bundle_id> [--zip]
+clawjournal bundle-share <bundle_id>  # self-hosted ingest only
 
 # Export (bulk)
 clawjournal status
@@ -307,4 +308,4 @@ clawjournal serve [--port 8384] [--no-browser] [--remote]
 - **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
 - **`clawjournal inbox --json`** is the preferred way for agents to read trace data.
 - **`clawjournal serve`** opens a browser automatically. Use `--no-browser` to suppress.
-- **Everything is 100% local** — nothing leaves the machine unless the user explicitly runs `share`.
+- **Everything is local by default** — nothing leaves the machine unless the user explicitly uploads the zip or uses a configured self-hosted ingest command.

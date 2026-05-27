@@ -173,6 +173,10 @@ export const api = {
     return request(`/share-ready${q}`);
   },
 
+  shareDestination(): Promise<{ configured: boolean; preferred_upload_flow: string; cli_ingest_supported: boolean; share_page_url: string | null; message?: string }> {
+    return request('/share-destination');
+  },
+
   quickShare(sessionIds: string[], note?: string): Promise<{
     ok: boolean; share_id: string;
     shared_at: string; session_count: number; bundle_hash: string;
@@ -211,6 +215,19 @@ export const api = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ output_path: outputPath }),
+      });
+    },
+
+    seal(id: string): Promise<{
+      ok: boolean;
+      export_path: string;
+      session_count: number;
+      redaction_summary: { total_redactions: number; by_type: Record<string, number> };
+    }> {
+      return request(`/shares/${encodeURIComponent(id)}/seal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
       });
     },
 
