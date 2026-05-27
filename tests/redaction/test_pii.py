@@ -321,6 +321,21 @@ def test_review_session_pii_hybrid_merges_rule_and_claude(monkeypatch):
     assert "Acme Labs" in entity_texts
 
 
+def test_review_session_pii_hybrid_passes_agent_timeout(monkeypatch):
+    session = {"session_id": "s1", "messages": [{"content": "Hello"}]}
+    captured = {}
+
+    def fake_agent(session, **kwargs):
+        captured["timeout_seconds"] = kwargs.get("timeout_seconds")
+        return []
+
+    monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_with_agent", fake_agent)
+    findings = review_session_pii_hybrid(session, timeout_seconds=37)
+
+    assert findings == []
+    assert captured["timeout_seconds"] == 37
+
+
 def test_content_findings_github_url():
     findings = _content_findings_for_text("s1", 0, "content", "See https://github.com/kai-rayward/clawjournal for details")
     entity_texts = {f["entity_text"] for f in findings}

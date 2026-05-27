@@ -412,7 +412,15 @@ def _iter_json_text_locations(prefix: str, value: Any) -> Iterable[tuple[str, st
             yield from _iter_json_text_locations(f"{prefix}.{key}", item)
 
 
-def review_session_pii_with_agent(session: dict[str, Any], *, backend: str = "auto", ignore_errors: bool = False, rubric: str | None = None, max_workers: int = 4) -> list[PIIFinding]:
+def review_session_pii_with_agent(
+    session: dict[str, Any],
+    *,
+    backend: str = "auto",
+    ignore_errors: bool = False,
+    rubric: str | None = None,
+    max_workers: int = 4,
+    timeout_seconds: int = 180,
+) -> list[PIIFinding]:
     """Review a session for PII using session-level batching (one agent call per batch)."""
     work_items = _collect_text_work_items(session)
     if not work_items:
@@ -427,7 +435,15 @@ def review_session_pii_with_agent(session: dict[str, Any], *, backend: str = "au
     if len(batches) == 1:
         # Single batch — no parallelism needed
         try:
-            findings.extend(_review_batch(session_id, batches[0], rubric=rubric, backend=backend))
+            findings.extend(
+                _review_batch(
+                    session_id,
+                    batches[0],
+                    rubric=rubric,
+                    backend=backend,
+                    timeout_seconds=timeout_seconds,
+                )
+            )
         except RuntimeError as exc:
             if not ignore_errors:
                 raise
@@ -435,7 +451,14 @@ def review_session_pii_with_agent(session: dict[str, Any], *, backend: str = "au
         # Multiple batches — run in parallel
         with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
             futures = {
-                pool.submit(_review_batch, session_id, batch, rubric=rubric, backend=backend): batch
+                pool.submit(
+                    _review_batch,
+                    session_id,
+                    batch,
+                    rubric=rubric,
+                    backend=backend,
+                    timeout_seconds=timeout_seconds,
+                ): batch
                 for batch in batches
             }
             for future in as_completed(futures):
@@ -457,6 +480,7 @@ def review_session_pii_hybrid(
     rubric: str | None = None,
     backend: str = "auto",
     return_coverage: bool = False,
+    timeout_seconds: int = 180,
 ) -> list[PIIFinding] | tuple[list[PIIFinding], str]:
     """Run hybrid PII detection (rule-based + AI agent).
 
@@ -468,7 +492,11 @@ def review_session_pii_hybrid(
     coverage = "full"
     try:
         agent_findings = review_session_pii_with_agent(
-            session, backend=backend, ignore_errors=False, rubric=rubric,
+            session,
+            backend=backend,
+            ignore_errors=False,
+            rubric=rubric,
+            timeout_seconds=timeout_seconds,
         )
     except Exception:
         if not ignore_llm_errors:

@@ -1,7 +1,9 @@
 """Tests for clawjournal.cli — CLI commands and helpers."""
 
 import json
+import shutil
 import sys
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -689,6 +691,21 @@ def bundle_index(tmp_path, monkeypatch):
     monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
     monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
 
+    from clawjournal.redaction import trufflehog
+    monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(
+        trufflehog,
+        "scan_file",
+        lambda path: trufflehog.TruffleHogReport(
+            scanned_path=str(path),
+            scanned_sha256="sha256:0",
+        ),
+    )
+    monkeypatch.setattr(
+        "clawjournal.redaction.pii.review_session_pii_hybrid",
+        lambda session, **kw: ([], "full") if kw.get("return_coverage") else [],
+    )
+
     from clawjournal.workbench.index import open_index, upsert_sessions
 
     conn = open_index()
@@ -824,6 +841,86 @@ class TestBundleExport:
         manifest = json.loads((Path(output["export_path"]) / "manifest.json").read_text())
         assert manifest["bundle_id"] == bundle_id
         assert manifest["share_id"] == bundle_id
+        assert "redaction_summary" in output
+
+    def test_export_zip_writes_uploadable_archive(self, bundle_index, capsys, monkeypatch):
+        from clawjournal.workbench.index import create_share, open_index
+        conn = open_index()
+        bundle_id = create_share(conn, ["sess-0", "sess-1"])
+        conn.close()
+
+        def fake_review(session, **kw):
+            assert kw.get("return_coverage") is True
+            if session["session_id"] != "sess-0":
+                return ([], "full")
+            return ([{
+                "session_id": "sess-0",
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Task 0",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+        from clawjournal.cli import _run_bundle_export
+        args = MagicMock(
+            share_id=bundle_id,
+            output=None,
+            json=True,
+            zip=True,
+            training_format=False,
+        )
+        _run_bundle_export(args)
+        output = json.loads(capsys.readouterr().out)
+
+        zip_path = Path(output["zip_path"])
+        assert zip_path.exists()
+        with zipfile.ZipFile(zip_path) as archive:
+            assert set(archive.namelist()) >= {
+                "manifest.json",
+                "sessions.jsonl",
+                "trufflehog.json",
+                "trufflehog.post-pii.json",
+            }
+            sessions_content = archive.read("sessions.jsonl").decode("utf-8")
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+
+        assert "Task 0" not in sessions_content
+        assert "[REDACTED_NAME]" in sessions_content
+        assert manifest["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert manifest["redaction_summary"]["coverage"] == {"full": 2, "rules_only": 0}
+
+    def test_export_zip_appends_suffix_to_output_directory(self, bundle_index, tmp_path, capsys):
+        from clawjournal.workbench.index import create_share, open_index
+        conn = open_index()
+        bundle_id = create_share(conn, ["sess-0"])
+        conn.close()
+
+        output_dir = Path("/tmp") / f"clawjournal-manual-export-{bundle_id}.zip"
+        from clawjournal.cli import _run_bundle_export
+        args = MagicMock(
+            share_id=bundle_id,
+            output=str(output_dir),
+            json=True,
+            zip=True,
+            training_format=False,
+        )
+        try:
+            _run_bundle_export(args)
+            output = json.loads(capsys.readouterr().out)
+
+            resolved_output_dir = output_dir.resolve()
+            assert Path(output["export_path"]) == resolved_output_dir
+            assert Path(output["zip_path"]) == resolved_output_dir.with_name(f"{resolved_output_dir.name}.zip")
+            assert Path(output["zip_path"]).is_file()
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+            output_dir.with_name(f"{output_dir.name}.zip").unlink(missing_ok=True)
 
     def test_export_redacts_custom_strings(self, tmp_path, monkeypatch, capsys):
         """Bundle export applies redact_strings from config."""

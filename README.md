@@ -327,11 +327,12 @@ Package the conversations you approved into a redacted file on your computer. Up
 
 **Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
-The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed.
+The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed. Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
 
-To actually upload after packaging (optional, requires a one-time email verification):
+To actually upload after packaging (optional), use the hosted submission page if one is configured for this install. The Done screen shows **Submit to ClawJournal Research** when a destination is available; that page verifies email, shows consent, and asks for the downloaded zip.
+Set `CLAWJOURNAL_SHARE_URL` to the hosted `/share` page to enable that button in local workbench builds.
 
-> *(optional)* *"Now share the bundle through the ClawJournal ingest service. My email is you@university.edu."*
+> *(optional)* *"Open the ClawJournal Research submission page so I can upload the exported zip."*
 
 Uploads are gated: only conversations you approved and confirmed for sharing leave your machine.
 
@@ -342,12 +343,15 @@ Uploads are gated: only conversations you approved and confirmed for sharing lea
 clawjournal bundle-create --status approved          # bundle all approved sessions
 clawjournal bundle-list
 clawjournal bundle-view <bundle_id>                  # inspect before exporting
-clawjournal bundle-export <bundle_id>                # write sessions.jsonl + manifest.json to disk
+clawjournal bundle-export <bundle_id> --zip          # write an uploadable zip plus export folder
 
-# Optional upload:
+# Optional hosted browser upload:
+python -m webbrowser "$CLAWJOURNAL_SHARE_URL"       # when configured
+
+# Advanced self-hosted ingest upload:
 clawjournal verify-email you@university.edu          # one-time email verification
 clawjournal share --preview --status approved        # dry-run
-clawjournal bundle-share <bundle_id>                 # upload through the configured ingest service
+clawjournal bundle-share <bundle_id>                 # self-hosted ingest upload
 ```
 
 Upload is gated on hold-state: only sessions in `auto_redacted` or `released` can leave the machine.
@@ -456,7 +460,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
 | `clawjournal score --batch --source failure-v1 --auto-triage` | AI-score failure-value scope; auto-block low-value productivity-1 noise |
 | `clawjournal bundle-create --status approved` | Bundle approved sessions |
-| `clawjournal bundle-export <bundle_id>` | Export bundle to disk as `sessions.jsonl` + `manifest.json` |
+| `clawjournal bundle-export <bundle_id> --zip` | Export bundle to disk and write an uploadable zip |
 
 ### Triage & review
 
@@ -500,8 +504,8 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal bundle-create --status approved` | Create bundle from all approved sessions |
 | `clawjournal bundle-list` | List bundles |
 | `clawjournal bundle-view <bundle_id>` | View bundle details |
-| `clawjournal bundle-export <bundle_id>` | Export bundle to disk |
-| `clawjournal bundle-share <bundle_id>` | Upload via configured ingest service |
+| `clawjournal bundle-export <bundle_id> --zip` | Export bundle and write an uploadable zip |
+| `clawjournal bundle-share <bundle_id>` | Advanced self-hosted ingest upload |
 
 ### Quick share
 
@@ -513,13 +517,13 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal card <id> --depth workflow` | Workflow-only card (safe for public channels) |
 | `clawjournal card <id> --depth full` | Full card with redacted content |
 
-### Optional upload
+### Advanced self-hosted ingest upload
 
 | Command | Description |
 |---------|-------------|
 | `clawjournal verify-email you@university.edu` | Verify a `.edu` email for upload authorization |
-| `clawjournal share --preview --status approved` | Preview what would be shared without uploading |
-| `clawjournal share --status approved` | Create a bundle and upload through the ingest service |
+| `clawjournal share --preview --status approved` | Preview what would be uploaded through ingest |
+| `clawjournal share --status approved` | Create a bundle and upload through the configured self-hosted ingest service |
 
 ### Configuration
 

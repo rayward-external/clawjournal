@@ -174,6 +174,24 @@ interface ShareReadyStats {
   sessions: ReadySession[];
 }
 
+interface ShareDestination {
+  configured: boolean;
+  preferred_upload_flow: string;
+  cli_ingest_supported: boolean;
+  share_page_url: string | null;
+  message?: string;
+}
+
+function formatShareDestination(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : '';
+    return `${parsed.hostname}${path}`;
+  } catch {
+    return url;
+  }
+}
+
 const DEFAULT_SHARE_QUEUE_SIZE = 10;
 
 function queueFromStats(stats: ShareReadyStats): string[] {
@@ -555,6 +573,7 @@ export function Share() {
   // Candidates (empty queue hint)
   const [candidates, setCandidates] = useState<Session[]>([]);
   const [scoringBackend, setScoringBackend] = useState<{ backend: string | null; display_name: string | null } | null>(null);
+  const [shareDestination, setShareDestination] = useState<ShareDestination | null>(null);
 
   // =================================================
   // Initial load
@@ -565,10 +584,12 @@ export function Share() {
       api.shareReady({ includeUnapproved: true }),
       api.shares.list(),
       api.scoringBackend().catch(() => ({ backend: null, display_name: null })),
-    ]).then(([stats, shareList, backend]) => {
+      api.shareDestination().catch(() => null),
+    ]).then(([stats, shareList, backend, destination]) => {
       setReadyStats(stats);
       setShares(shareList);
       setScoringBackend(backend);
+      setShareDestination(destination);
       if (!selectionInitialized && stats.sessions.length > 0) {
         // Server recommendation is an ordered, reviewable default package.
         // Trust it and only filter out ids the client can't resolve
@@ -979,8 +1000,8 @@ export function Share() {
       'Allocating bundle...',
       'Writing manifest.json...',
       ...approvedList.map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`),
-      'Writing redaction-audit.json...',
-      'Compressing...',
+      'Running final PII review...',
+      'Running final secret scan...',
       'Sealing bundle...',
     ];
 
@@ -1004,7 +1025,6 @@ export function Share() {
     try {
       const ids = approvedList.map((s) => s.session_id);
       const { share_id } = await api.shares.create(ids, note || undefined);
-      await api.shares.export(share_id);
 
       // Finish the animation cleanly before exposing the share id — the
       // `packageProgress >= 100 && packagedShareId` combination triggers the
@@ -1012,6 +1032,14 @@ export function Share() {
       const animRemaining = Math.max(0, duration - (Date.now() - animStart));
       await new Promise((r) => window.setTimeout(r, animRemaining));
       clearAllTimers();
+      setPackageProgress(98);
+      setPackageLog('Finalizing zip...');
+
+      // Seal performs the final local-only AI PII pass and post-PII
+      // TruffleHog gate without triggering a browser save. The Done button
+      // is the only action that downloads bytes.
+      await api.shares.seal(share_id);
+
       setPackageProgress(100);
       setPackageLog('Done.');
 
@@ -1038,9 +1066,6 @@ export function Share() {
       // success-path state update.
       setPackagedShareId(share_id);
 
-      // Best-effort browser download + refresh. None of these should block
-      // the step transition.
-      try { await api.shares.download(share_id); } catch { /* user can still click Download again */ }
       try { reload(); } catch { /* ignore */ }
       try { toast('Bundle ready', 'success'); } catch { /* ignore */ }
     } catch (err: unknown) {
@@ -1245,6 +1270,7 @@ export function Share() {
         onNew={() => { startFreshShare(); reload(); }}
         globalStyles={globalStyles}
         error={error}
+        shareDestination={shareDestination}
       />
     );
   }
@@ -2565,6 +2591,7 @@ interface DoneStepProps {
   onNew: () => void;
   globalStyles: React.ReactNode;
   error: string | null;
+  shareDestination: ShareDestination | null;
 }
 
 function DoneStep(p: DoneStepProps) {
@@ -2583,6 +2610,8 @@ function DoneStep(p: DoneStepProps) {
   });
 
   const traces = p.bundle?.traces ?? 0;
+  const hostedShareUrl = p.shareDestination?.configured ? p.shareDestination.share_page_url : null;
+  const hostedShareLabel = hostedShareUrl ? formatShareDestination(hostedShareUrl) : null;
 
   return (
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
@@ -2637,10 +2666,10 @@ function DoneStep(p: DoneStepProps) {
         </div>
 
         <h2 style={{ fontSize: 22, fontWeight: 500, letterSpacing: '-0.02em', margin: '0 0 8px', color: colors.gray900 }}>
-          Your bundle is saving to downloads
+          Your bundle is ready
         </h2>
         <p style={{ color: colors.gray500, margin: '0 0 24px', fontSize: 14 }}>
-          If your browser didn&rsquo;t catch the save, you can download the same zip again.
+          Download the finalized zip, then upload it through the hosted submission page.
         </p>
 
         {p.bundle && (
@@ -2679,22 +2708,30 @@ function DoneStep(p: DoneStepProps) {
           >
             <Icon name="download" size={15} /> Download zip
           </button>
-          <a
-            href="https://data.rayward.ai"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: 'inline-flex', alignItems: 'center', gap: 8,
-              padding: '11px 20px', background: colors.primary500, color: colors.white,
-              borderRadius: 8, fontSize: 14, fontWeight: 600,
-              textDecoration: 'none',
-            }}
-          >
-            Share with Rayward &rarr;
-          </a>
+          {hostedShareUrl && (
+            <a
+              href={hostedShareUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+                padding: '11px 20px', background: colors.primary500, color: colors.white,
+                borderRadius: 8, fontSize: 14, fontWeight: 600,
+                textDecoration: 'none',
+              }}
+            >
+              Submit to ClawJournal Research &rarr;
+            </a>
+          )}
         </div>
         <div style={{ fontSize: 12, color: colors.gray500, marginBottom: 8 }}>
-          Upload your bundle at <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>data.rayward.ai</span> to contribute to research.
+          {hostedShareLabel ? (
+            <>
+              Upload this zip at <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{hostedShareLabel}</span> to contribute to research.
+            </>
+          ) : (
+            <>Hosted submission is not configured for this install. The redacted zip stays on this computer.</>
+          )}
         </div>
 
         <div style={{

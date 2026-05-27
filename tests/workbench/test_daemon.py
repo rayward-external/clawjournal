@@ -7,13 +7,19 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from io import BytesIO
-from threading import Thread
+from threading import Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from clawjournal.workbench.daemon import Scanner, WorkbenchHandler, run_server, _SHARE_COOLDOWN_SECONDS
+from clawjournal.workbench.daemon import (
+    Scanner,
+    WorkbenchHandler,
+    run_server,
+    _SHARE_COOLDOWN_SECONDS,
+    _apply_upload_pii_redactions,
+)
 from clawjournal.workbench.index import open_index, upsert_sessions
 
 
@@ -26,6 +32,7 @@ def index_setup(tmp_path, monkeypatch):
     monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
     monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", tmp_path / "nonexistent_dist")
     monkeypatch.setattr("clawjournal.workbench.daemon._SHARE_INGEST_URL", "https://test-ingest.example.com")
+    monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "")
     monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
     # Mock PII review in share tests — no AI backend available in test env
     monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", lambda session, **kw: ([], "full") if kw.get("return_coverage") else [])
@@ -619,6 +626,58 @@ class TestProjectsAPI:
         assert data[0]["project"] == "test-project"
 
 
+class TestShareDestinationAPI:
+    def test_unconfigured_share_destination(self, server, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "")
+
+        status, data = _get(server, "/api/share-destination")
+
+        assert status == 200
+        assert data["configured"] is False
+        assert data["preferred_upload_flow"] == "browser_zip"
+        assert data["cli_ingest_supported"] is False
+        assert data["share_page_url"] is None
+
+    def test_configured_share_destination(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
+            "https://data.rayward.ai/share",
+        )
+
+        status, data = _get(server, "/api/share-destination")
+
+        assert status == 200
+        assert data["configured"] is True
+        assert data["preferred_upload_flow"] == "browser_zip"
+        assert data["cli_ingest_supported"] is False
+        assert data["share_page_url"] == "https://data.rayward.ai/share"
+
+    def test_invalid_share_destination_is_disabled(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
+            "data.rayward.ai/share",
+        )
+
+        status, data = _get(server, "/api/share-destination")
+
+        assert status == 200
+        assert data["configured"] is False
+        assert data["share_page_url"] is None
+        assert "HTTPS" in data["message"]
+
+    def test_prefix_lookalike_localhost_share_destination_is_disabled(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
+            "http://localhost.evil.test/share",
+        )
+
+        status, data = _get(server, "/api/share-destination")
+
+        assert status == 200
+        assert data["configured"] is False
+        assert data["share_page_url"] is None
+
+
 class TestSharesAPI:
     def test_create_and_list(self, server):
         status, data = _post(server, "/api/shares", {
@@ -1093,6 +1152,81 @@ def _mock_trufflehog_clean(monkeypatch):
     monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
 
 
+def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions = [
+        {
+            "session_id": f"s{i}",
+            "messages": [{"role": "user", "content": f"Alice{i} should be hidden"}],
+        }
+        for i in range(4)
+    ]
+    sessions_file.write_text(
+        "\n".join(json.dumps(session) for session in sessions) + "\n",
+        encoding="utf-8",
+    )
+
+    lock = Lock()
+    active = 0
+    max_active = 0
+
+    def fake_review(
+        session,
+        *,
+        ignore_llm_errors=True,
+        return_coverage=False,
+        timeout_seconds=180,
+        **_kw,
+    ):
+        nonlocal active, max_active
+        assert ignore_llm_errors is True
+        assert return_coverage is True
+        assert timeout_seconds == 23
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        sid = session["session_id"]
+        suffix = sid.removeprefix("s")
+        return ([{
+            "session_id": sid,
+            "message_index": 0,
+            "field": "content",
+            "entity_text": f"Alice{suffix}",
+            "entity_type": "person_name",
+            "confidence": 0.95,
+            "reason": "test name",
+            "replacement": "[REDACTED_NAME]",
+            "source": "test",
+        }], "full")
+
+    monkeypatch.setenv("CLAWJOURNAL_UPLOAD_PII_WORKERS", "4")
+    monkeypatch.setenv("CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS", "23")
+    monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+    summary = _apply_upload_pii_redactions(sessions_file)
+
+    assert summary["workers"] == 4
+    assert summary["agent_timeout_seconds"] == 23
+    assert summary["finding_count"] == 4
+    assert summary["replacement_count"] == 4
+    assert summary["coverage"] == {"full": 4, "rules_only": 0}
+    assert max_active > 1
+
+    redacted = [
+        json.loads(line)
+        for line in sessions_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [session["session_id"] for session in redacted] == ["s0", "s1", "s2", "s3"]
+    assert all(
+        session["messages"][0]["content"] == "[REDACTED_NAME] should be hidden"
+        for session in redacted
+    )
+
+
 class TestVerifyEmailAPI:
     def test_confirm_email_verification_persists_upload_token_and_expiry(self, monkeypatch):
         from clawjournal.workbench.daemon import confirm_email_verification
@@ -1455,10 +1589,138 @@ class TestShareAPI:
             assert "sessions.jsonl" in names
             assert "manifest.json" in names
             assert "trufflehog.json" in names
+            assert "trufflehog.post-pii.json" in names
             report = json.loads(archive.read("trufflehog.json").decode("utf-8"))
 
         assert report["summary"]["findings"] == 0
         assert report["summary"]["bypassed"] is False
+
+    def test_download_bundle_applies_final_ai_pii_redaction(self, server, monkeypatch):
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "download-ai-pii",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "Alice Example should not ship", "tool_uses": []},
+                {"role": "assistant", "content": "Done.", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1,
+                "assistant_messages": 1,
+                "tool_uses": 0,
+                "input_tokens": 100,
+                "output_tokens": 50,
+            },
+        }])
+        conn.close()
+
+        def fake_review(session, **kw):
+            assert kw.get("return_coverage") is True
+            return ([{
+                "session_id": session["session_id"],
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Alice Example",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test name",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["download-ai-pii"],
+            "note": "Download AI PII test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            sessions_content = archive.read("sessions.jsonl").decode("utf-8")
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+
+        assert "Alice Example" not in sessions_content
+        assert "[REDACTED_NAME]" in sessions_content
+        assert manifest["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert manifest["redaction_summary"]["coverage"] == {"full": 1, "rules_only": 0}
+
+    def test_seal_is_idempotent_and_download_reuses_export(self, server, monkeypatch):
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "seal-ai-pii",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "Alice Example should not ship", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1,
+                "assistant_messages": 0,
+                "tool_uses": 0,
+                "input_tokens": 100,
+                "output_tokens": 0,
+            },
+        }])
+        conn.close()
+
+        calls = 0
+
+        def fake_review(session, **kw):
+            nonlocal calls
+            calls += 1
+            assert kw.get("return_coverage") is True
+            return ([{
+                "session_id": session["session_id"],
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Alice Example",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test name",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["seal-ai-pii"],
+            "note": "Seal AI PII test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, data = _post(server, f"/api/shares/{share_id}/seal")
+        assert status == 200
+        assert data["ok"] is True
+        assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert calls == 1
+
+        status, data = _post(server, f"/api/shares/{share_id}/seal")
+        assert status == 200
+        assert data["ok"] is True
+        assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert calls == 1
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+        assert calls == 1
+
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            sessions_content = archive.read("sessions.jsonl").decode("utf-8")
+
+        assert "Alice Example" not in sessions_content
+        assert "[REDACTED_NAME]" in sessions_content
 
     def test_download_applies_configured_custom_redactions(self, server, monkeypatch):
         monkeypatch.setattr(

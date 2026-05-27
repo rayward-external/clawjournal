@@ -6,6 +6,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, cast
@@ -1483,6 +1484,21 @@ def _run_bundle_view(args) -> None:
         conn.close()
 
 
+def _write_bundle_zip(export_dir: Path) -> Path:
+    zip_path = export_dir.with_name(f"{export_dir.name}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in (
+            "sessions.jsonl",
+            "manifest.json",
+            "trufflehog.json",
+            "trufflehog.post-pii.json",
+        ):
+            path = export_dir / name
+            if path.exists():
+                zf.write(path, arcname=name)
+    return zip_path
+
+
 def _run_bundle_export(args) -> None:
     """Export a bundle to disk as JSONL + manifest."""
     from .workbench.index import (
@@ -1530,10 +1546,22 @@ def _run_bundle_export(args) -> None:
 
         session_count = len(manifest.get("sessions", []))
         files = ["sessions.jsonl", "manifest.json", "trufflehog.json"]
+        zip_path = None
+        if getattr(args, "zip", False) is True:
+            from .workbench.daemon import finalize_share_export_for_upload
+
+            error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+            if error:
+                if error.get("block_reason"):
+                    print(f"Share blocked: {error.get('block_reason')}")
+                print(error.get("error", "Failed to prepare upload zip."))
+                sys.exit(2 if int(error.get("status", 500)) == 422 else 1)
+            if (export_dir / "trufflehog.post-pii.json").exists():
+                files.append("trufflehog.post-pii.json")
 
         # Optional training-format conversion
         training_summary = None
-        if getattr(args, "training_format", False):
+        if getattr(args, "training_format", False) is True:
             from .export.training_data import convert_sessions_to_training
             sessions_path = export_dir / "sessions.jsonl"
             training_path = export_dir / "sessions.training.jsonl"
@@ -1541,17 +1569,28 @@ def _run_bundle_export(args) -> None:
             training_summary = convert_sessions_to_training(sessions, training_path)
             files.append("sessions.training.jsonl")
 
+        if getattr(args, "zip", False) is True:
+            zip_path = _write_bundle_zip(export_dir)
+
         if getattr(args, "json", False):
             result = {
                 "export_path": str(export_dir),
                 "session_count": session_count,
                 "files": files,
+                "redaction_summary": manifest.get("redaction_summary", {}),
             }
+            if zip_path:
+                result["zip_path"] = str(zip_path)
             if training_summary:
                 result["training"] = training_summary
             print(json.dumps(result, indent=2))
         else:
             print(f"Exported {session_count} sessions to {export_dir}/")
+            if zip_path:
+                print(f"Zip: {zip_path}")
+            redaction_summary = manifest.get("redaction_summary", {})
+            if redaction_summary:
+                print(f"Redactions: {redaction_summary.get('total_redactions', 0)} total")
             if training_summary:
                 print(f"Training format: {training_summary['turns']} turns → {export_dir}/sessions.training.jsonl")
     finally:
@@ -4004,9 +4043,10 @@ def main() -> None:
     be.add_argument("--output", "-o", type=str, default=None, help="Custom output directory")
     be.add_argument("--training-format", action="store_true",
                     help="Also produce a training-format JSONL (turn-based, cleaned)")
+    be.add_argument("--zip", action="store_true", help="Also write an uploadable zip")
     be.add_argument("--json", action="store_true", help="Output JSON")
 
-    bs = sub.add_parser("bundle-share", help="Share bundle via ingest service")
+    bs = sub.add_parser("bundle-share", help="Share bundle via self-hosted ingest service")
     bs.add_argument("share_id", help="Bundle ID (or prefix)")
     bs.add_argument("--force", action="store_true", help="Override duplicate check")
     bs.add_argument("--json", action="store_true", help="Output JSON")
