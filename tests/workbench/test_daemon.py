@@ -627,6 +627,11 @@ class TestProjectsAPI:
 
 
 class TestShareDestinationAPI:
+    def test_packaged_default_points_to_rayward_research(self):
+        from clawjournal.workbench.daemon import _HOSTED_SHARE_URL_DEFAULT
+
+        assert _HOSTED_SHARE_URL_DEFAULT == "https://data.rayward.ai/share"
+
     def test_unconfigured_share_destination(self, server, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "")
 
