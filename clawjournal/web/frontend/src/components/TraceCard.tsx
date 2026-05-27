@@ -49,12 +49,6 @@ interface TraceCardProps {
   quickActionMode?: 'full' | 'share';
 }
 
-function scoreStyle(score: number): { background: string; color: string } {
-  if (score >= 4) return { background: '#dcfce7', color: '#166534' };
-  if (score === 3) return { background: '#fef3c7', color: '#92400e' };
-  return { background: '#fee2e2', color: '#991b1b' };
-}
-
 export function TraceCard({
   session,
   selected = false,
@@ -125,22 +119,6 @@ export function TraceCard({
           <span style={{ fontWeight: 600, fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {session.display_title}
           </span>
-          {session.ai_quality_score != null && (
-            <span style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 22,
-              height: 22,
-              borderRadius: '50%',
-              fontSize: 12,
-              fontWeight: 700,
-              flexShrink: 0,
-              ...scoreStyle(session.ai_quality_score),
-            }}>
-              {session.ai_quality_score}
-            </span>
-          )}
           {session.ai_failure_value_score != null && (
             <span style={{
               display: 'inline-flex',
@@ -155,6 +133,25 @@ export function TraceCard({
               flexShrink: 0,
             }}>
               {session.ai_failure_value_score} failure value
+            </span>
+          )}
+          {session.ai_quality_score != null && (
+            <span
+              title="Legacy productivity score"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '2px 6px',
+                borderRadius: 9999,
+                fontSize: 11,
+                fontWeight: 600,
+                color: '#6b7280',
+                background: '#f3f4f6',
+                flexShrink: 0,
+              }}
+            >
+              P {session.ai_quality_score}/5
             </span>
           )}
           <span style={{ fontSize: 12, color: '#9ca3af', flexShrink: 0 }}>

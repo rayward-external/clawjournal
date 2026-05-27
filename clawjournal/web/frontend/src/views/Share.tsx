@@ -78,11 +78,6 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-function scoreBadge(score: number | null): string {
-  if (score == null) return '';
-  return '\u2605'.repeat(Math.min(score, 5));
-}
-
 function outcomeBadge(outcome: string | null): string {
   if (!outcome) return '';
   const b = outcome.toLowerCase();
@@ -1434,20 +1429,28 @@ function QueueStep(p: QueueStepProps) {
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span style={{ color: '#991b1b', fontWeight: 700 }}>{s.ai_failure_value_score} failure value</span>
                       </>)}
+                      {s.ai_quality_score != null && (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span
+                          style={{ color: colors.gray500 }}
+                          title="Legacy productivity score"
+                        >
+                          productivity {s.ai_quality_score}/5
+                        </span>
+                      </>)}
                       {s.ai_failure_attribution && (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span>{s.ai_failure_attribution.replace(/_/g, ' ')}</span>
                       </>)}
-                      {s.ai_quality_score != null ? (<>
-                        <span style={{ opacity: 0.5 }}>&middot;</span>
-                        <span style={{ color: '#c08a1a', letterSpacing: -1 }}>{scoreBadge(s.ai_quality_score)}</span>
-                      </>) : (<>
+                      {s.ai_failure_value_score == null && (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span
                           style={{ color: colors.gray500, fontStyle: 'italic' }}
-                          title="This session hasn't been scored yet. Click Preview → Score with AI, or run `clawjournal score` from a terminal."
+                          title={s.ai_quality_score == null
+                            ? "This session hasn't been scored yet. Click Preview → Score with AI, or run `clawjournal score` from a terminal."
+                            : "This legacy-scored session is missing failure value. Re-score it with AI before sharing."}
                         >
-                          unscored
+                          {s.ai_quality_score == null ? 'unscored' : 'failure value missing'}
                         </span>
                       </>)}
                       {s.outcome_badge && (<>

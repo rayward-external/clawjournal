@@ -50,22 +50,27 @@ Emit both `substance` and `ai_quality_score` with the same value.
 This is the primary score for failure-corpus capture. It answers: "how valuable
 is this trace for understanding and improving agent failure behavior?"
 
-5 = Canonical high-value trace: consequential failure or recovery pattern on
-real expert work, where the agent's behavior is the lesson. Strong evidence
-and a reusable insight for evals, training, product design, or agent behavior
+This is not a quality score, severity score, or user-satisfaction score. Rank
+the trace by the clearest trace-backed teaching moment.
+
+5 = Canonical failure trace: consequential, evidence-rich failure or recovery
+pattern on real expert work, where the agent's behavior is the lesson. Strong
+reusable insight for evals, training, product design, or agent behavior
 analysis. Attribution may be agent-caused or non-agent-caused.
-4 = Meaningful failure or recovery pattern worth reviewing or turning into eval
-or training data.
-3 = Some failure signal, but ambiguous, minor, repeated, or mostly
-environmental.
-2 = Weak signal: routine retry, expected debugging, or unclear attribution.
+4 = Strong pattern: meaningful trace-backed agent failure or recovery behavior
+worth reviewing and likely worth turning into eval or training data.
+3 = Usable signal: real failure signal, but minor, ambiguous, repeated, mostly
+environmental, or only partly attributable.
+2 = Weak signal: routine retry, expected debugging, unclear attribution, or
+little reusable lesson.
 1 = No useful failure signal: smooth success, trivial session, control sample,
 or noise.
 
 A resolved session can be a 5 if it contains a valuable failure and recovery
 pattern. 5/5 does not require `agent_caused`; the teaching moment matters, not
-the source of the failure. A failed session is not automatically valuable; it
-needs attributable, evidence-backed failure behavior.
+the source of the failure. A failed or blocked session is not automatically
+valuable; score by visible agent behavior, evidence clarity, consequence,
+recovery signal, and reusable lesson.
 
 Scores of 4 or 5 require at least one `ai_failure_evidence` snippet. If no
 snippet can be quoted or paraphrased from the trace, cap the failure-value score

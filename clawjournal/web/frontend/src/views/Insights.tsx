@@ -147,7 +147,8 @@ const RESOLUTION_COLORS: Record<string, string> = {
 };
 
 function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
-  if (data.length < 3) {
+  const scored = data.filter(d => d.ai_failure_value_score != null);
+  if (scored.length < 3) {
     return <div style={{ fontSize: 13, color: colors.gray400, padding: '12px 0' }}>Not enough scored sessions for scatter plot</div>;
   }
 
@@ -155,20 +156,21 @@ function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
   const plotH = SCATTER_H - SPAD.top - SPAD.bottom;
 
   // X axis: duration in minutes, capped at 95th percentile for legibility
-  const durations = data.map(d => (d.duration_seconds || 0) / 60).sort((a, b) => a - b);
+  const durations = scored.map(d => (d.duration_seconds || 0) / 60).sort((a, b) => a - b);
   const p95Idx = Math.floor(durations.length * 0.95);
   const maxMinutes = Math.max(durations[p95Idx] || 60, 10);
 
-  // Y axis: productivity score 1-5
+  // Y axis: failure-value score 1-5
   const minScore = 1;
   const maxScore = 5;
 
-  const dots = data.map(d => {
+  const dots = scored.map(d => {
     const mins = Math.min((d.duration_seconds || 0) / 60, maxMinutes);
     const x = SPAD.left + (mins / maxMinutes) * plotW;
-    const y = SPAD.top + plotH - ((d.ai_quality_score - minScore) / (maxScore - minScore)) * plotH;
+    const score = d.ai_failure_value_score ?? 1;
+    const y = SPAD.top + plotH - ((score - minScore) / (maxScore - minScore)) * plotH;
     const color = RESOLUTION_COLORS[d.resolution ?? ''] ?? colors.gray400;
-    return { x, y, color, d };
+    return { x, y, color, score, d };
   });
 
   return (
@@ -194,13 +196,13 @@ function ScatterPlot({ data }: { data: InsightsDurationVsScoreRow[] }) {
       {/* Dots */}
       {dots.map((dot, i) => (
         <circle key={i} cx={dot.x} cy={dot.y} r={4} fill={dot.color} opacity={0.6}>
-          <title>{Math.round(dot.d.duration_seconds / 60)}min, score {dot.d.ai_quality_score}, {dot.d.resolution ?? 'unknown'}{dot.d.cost ? `, ${formatCost(dot.d.cost)}` : ''}</title>
+          <title>{Math.round(dot.d.duration_seconds / 60)}min, failure value {dot.score}, {dot.d.resolution ?? 'unknown'}{dot.d.cost ? `, ${formatCost(dot.d.cost)}` : ''}</title>
         </circle>
       ))}
 
       {/* Axis labels */}
       <text x={SPAD.left + plotW / 2} y={SCATTER_H - 14} textAnchor="middle" fontSize={10} fill={colors.gray500}>Duration (minutes)</text>
-      <text x={12} y={SPAD.top + plotH / 2} textAnchor="middle" fontSize={10} fill={colors.gray500} transform={`rotate(-90, 12, ${SPAD.top + plotH / 2})`}>Productivity</text>
+      <text x={12} y={SPAD.top + plotH / 2} textAnchor="middle" fontSize={10} fill={colors.gray500} transform={`rotate(-90, 12, ${SPAD.top + plotH / 2})`}>Failure Value</text>
     </svg>
   );
 }
@@ -242,10 +244,10 @@ function labelFor(outcome: string): string {
 }
 
 function HighlightCard({ item }: { item: HighlightItem }) {
-  const scoreColor = item.ai_quality_score && item.ai_quality_score >= 5
-    ? colors.green500
-    : item.ai_quality_score && item.ai_quality_score >= 4
-    ? colors.blue400
+  const scoreColor = item.ai_failure_value_score && item.ai_failure_value_score >= 5
+    ? colors.red500
+    : item.ai_failure_value_score && item.ai_failure_value_score >= 4
+    ? colors.red400
     : colors.gray400;
 
   return (
@@ -275,12 +277,12 @@ function HighlightCard({ item }: { item: HighlightItem }) {
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, marginBottom: 6 }}>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {item.ai_quality_score != null && (
+          {item.ai_failure_value_score != null && (
             <span style={{
               fontSize: 11, fontWeight: 600, color: scoreColor,
               background: `${scoreColor}18`, padding: '2px 7px', borderRadius: 10,
             }}>
-              {item.ai_quality_score}/5
+              FV {item.ai_failure_value_score}/5
             </span>
           )}
           {item.outcome && (
@@ -401,7 +403,7 @@ export function Insights() {
       const [adv, ins, hl] = await Promise.all([
         api.advisor({ days }),
         api.insights({ start, end }),
-        api.highlights({ days, top: 3, min_quality: 4 }).catch(() => null),
+        api.highlights({ days, top: 3, min_failure_value: 4 }).catch(() => null),
       ]);
       setAdvisor(adv);
       setInsights(ins);
@@ -501,23 +503,14 @@ export function Insights() {
             <div style={{ fontSize: 14, color: colors.green500, marginTop: 2 }}>{stats.most_efficient_model}</div>
           </div>
         )}
-        {stats.highest_quality_model && (
-          <div style={{
-            flex: 1, background: colors.blue50, border: `1px solid ${colors.blue100}`, borderRadius: 8,
-            padding: '10px 14px',
-          }}>
-            <div style={{ fontSize: 12, color: colors.blue700, fontWeight: 600 }}>Highest Productivity</div>
-            <div style={{ fontSize: 14, color: colors.blue600, marginTop: 2 }}>{stats.highest_quality_model}</div>
-          </div>
-        )}
       </div>
 
-      {/* Highlights — top 3 recent high-productivity sessions across different agents,
+      {/* Highlights — top 3 recent high-failure-value sessions across different agents,
           matched to the tab's `days` window. */}
       {highlights && highlights.highlights.length > 0 && (
         <Section
           title="Highlights"
-          subtitle={`Top ${highlights.highlights.length} recent high-productivity sessions across agents`}
+          subtitle={`Top ${highlights.highlights.length} recent high-failure-value sessions across agents`}
         >
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {highlights.highlights.map((item) => (
@@ -527,7 +520,7 @@ export function Insights() {
         </Section>
       )}
       {highlights && highlights.highlights.length === 0 && (
-        <Section title="Highlights" subtitle={`No 4+ productivity sessions in the last ${highlights.window_days} days`}>
+        <Section title="Highlights" subtitle={`No 4+ failure-value sessions in the last ${highlights.window_days} days`}>
           <div style={{ fontSize: 12, color: colors.gray500, padding: 8 }}>
             Run <code style={{ background: colors.gray100, padding: '1px 5px', borderRadius: 3 }}>clawjournal score</code> on recent sessions to populate this panel.
           </div>
@@ -542,9 +535,9 @@ export function Insights() {
         </Section>
       )}
 
-      {/* Duration vs Quality scatter */}
+      {/* Duration vs Failure Value scatter */}
       {insights && insights.duration_vs_score && insights.duration_vs_score.length >= 3 && (
-        <Section title="Duration vs Quality" subtitle="Longer sessions aren't always better">
+        <Section title="Duration vs Failure Value" subtitle="Longer sessions are not automatically higher value">
           <ScatterPlot data={insights.duration_vs_score} />
           <ScatterLegend />
         </Section>

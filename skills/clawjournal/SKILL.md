@@ -77,11 +77,11 @@ clawjournal scan
 clawjournal score --batch --source failure-v1 --auto-triage
 ```
 
-`--source failure-v1` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: productivity (legacy) and failure-value (the new primary signal for finding teachable agent failures).
+`--source failure-v1` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: failure value (the primary signal for teachable agent failures) and productivity (legacy compatibility).
 
 Present summary:
 
-> Found 47 sessions. 23 scored. Productivity 4-5: 14, productivity 1-2: 8 (auto-archived). Failure-value 4-5: 9 (high-value failure traces — review first). 16 still need review.
+> Found 47 sessions. 23 scored. Failure-value 4-5: 9 (high-value failure traces — review first). Productivity-1 low-failure-value noise: 8 auto-archived. 16 still need review.
 
 Ask:
 > How would you like to review?
@@ -274,7 +274,8 @@ clawjournal search <query> [--json] [--limit 20]
 clawjournal score --batch [--source failure-v1] [--auto-triage] [--limit 20]
 clawjournal rescore --window 7d [--source failure-v1] [--limit 200]
 clawjournal score-view <id>
-clawjournal set-score <id> <1-5> [--reason "..."]  # legacy productivity only
+clawjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--reason "..."]
+clawjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only
 
 # Share
 clawjournal share --status approved [--note "..."] [--preview] [--json]

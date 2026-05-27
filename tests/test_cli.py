@@ -977,6 +977,34 @@ class TestWorkbenchSourceChoices:
         assert seen["source"] == "aider"
 
 
+class TestRecentOutput:
+    def test_recent_prints_failure_value_as_visible_score(self, monkeypatch, capsys):
+        from clawjournal.cli import _run_recent
+
+        conn = MagicMock()
+
+        def fake_query_sessions(conn, **kwargs):
+            if kwargs.get("sort") == "indexed_at":
+                return [{"indexed_at": "2999-01-01T00:00:00+00:00"}]
+            return [{
+                "session_id": "sess-1",
+                "display_title": "Investigate flaky parser",
+                "duration_seconds": 90,
+                "outcome_badge": "failed",
+                "ai_failure_value_score": 4,
+                "ai_quality_score": 1,
+            }]
+
+        monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: conn)
+        monkeypatch.setattr("clawjournal.workbench.index.query_sessions", fake_query_sessions)
+
+        _run_recent(MagicMock(source=None, since=None, limit=5, json=False))
+
+        out = capsys.readouterr().out
+        assert "FV 4/5" in out
+        assert "1/5" not in out
+
+
 class TestEventsCLI:
     def test_events_capabilities_outputs_json(self, capsys):
         with patch.object(sys, "argv", ["clawjournal", "events", "capabilities"]):
@@ -1517,6 +1545,160 @@ class TestVerifyEmail:
 
 
 class TestScore:
+    def test_set_score_can_override_failure_value(self, monkeypatch, capsys):
+        from clawjournal.cli import _run_set_score
+
+        conn = MagicMock()
+        calls = []
+
+        monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: conn)
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.get_session_detail",
+            lambda conn_arg, sid: {"ai_scoring_detail": "{}"},
+        )
+
+        def fake_update_session(conn_arg, session_id, **updates):
+            calls.append((conn_arg, session_id, updates))
+            return True
+
+        monkeypatch.setattr("clawjournal.workbench.index.update_session", fake_update_session)
+
+        args = MagicMock(
+            session_ids=["sess-1"],
+            quality=None,
+            failure_value=4,
+            failure_evidence=["Trace-backed failure evidence."],
+            reason="Trace-backed failure pattern.",
+        )
+        _run_set_score(args)
+
+        output = json.loads(capsys.readouterr().out)
+        assert output["failure_value"] == 4
+        assert output["failure_evidence"] == ["Trace-backed failure evidence."]
+        assert output["results"][0]["ai_failure_value_score"] == 4
+        assert len(calls) == 1
+        assert calls[0][0] is conn
+        assert calls[0][1] == "sess-1"
+        assert calls[0][2]["ai_failure_value_score"] == 4
+        assert calls[0][2]["ai_score_reason"] == "Trace-backed failure pattern."
+        assert json.loads(calls[0][2]["ai_scoring_detail"]) == {
+            "ai_failure_evidence": ["Trace-backed failure evidence."],
+        }
+        conn.close.assert_called_once()
+
+    def test_set_score_requires_evidence_for_high_failure_value(self, monkeypatch, capsys):
+        from clawjournal.cli import _run_set_score
+
+        conn = MagicMock()
+        monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: conn)
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.get_session_detail",
+            lambda conn_arg, sid: {"ai_scoring_detail": "{}"},
+        )
+
+        args = MagicMock(
+            session_ids=["sess-1"],
+            quality=None,
+            failure_value=4,
+            failure_evidence=[],
+            reason="Needs promotion.",
+        )
+
+        with pytest.raises(SystemExit):
+            _run_set_score(args)
+
+        output = json.loads(capsys.readouterr().out)
+        assert "require --failure-evidence" in output["error"]
+        assert output["session_ids"] == ["sess-1"]
+        conn.close.assert_called_once()
+
+    def test_set_score_requires_at_least_one_score(self, monkeypatch, capsys):
+        from clawjournal.cli import _run_set_score
+
+        args = MagicMock(
+            session_ids=["sess-1"],
+            quality=None,
+            failure_value=None,
+            failure_evidence=[],
+            reason=None,
+        )
+
+        with pytest.raises(SystemExit):
+            _run_set_score(args)
+
+        output = json.loads(capsys.readouterr().out)
+        assert "Provide --failure-value" in output["error"]
+
+    def test_score_view_prints_failure_value_first(self, monkeypatch, capsys):
+        from clawjournal.cli import _run_score_view
+
+        conn = MagicMock()
+        monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: conn)
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.get_session_detail",
+            lambda conn_arg, sid: {
+                "session_id": sid,
+                "source": "codex",
+                "model": "gpt-5",
+                "project": "demo",
+                "duration_seconds": 120,
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "user_messages": 1,
+                "assistant_messages": 1,
+                "task_type": "debugging",
+                "outcome_badge": "resolved",
+                "sensitivity_score": 0.0,
+                "value_badges": [],
+                "risk_badges": [],
+                "ai_failure_value_score": 4,
+                "ai_quality_score": 2,
+                "ai_failure_modes": ["reasoning_fabrication"],
+                "ai_recovery_labels": ["user_corrected_recovery"],
+                "ai_failure_attribution": "agent_caused",
+                "ai_learning_summary": "The user corrected a fabricated API call.",
+                "ai_scoring_detail": json.dumps({
+                    "ai_failure_evidence": ["User corrected the nonexistent call."],
+                }),
+                "messages": [],
+                "files_touched": [],
+                "commands_run": [],
+            },
+        )
+
+        _run_score_view(MagicMock(batch=False, session_ids=["sess-1"]))
+
+        output = capsys.readouterr().out
+        assert "Failure value: 4/5 | Productivity: 2/5" in output
+        assert "Failure modes: reasoning_fabrication" in output
+        assert "Evidence:" in output
+        assert "User corrected the nonexistent call." in output
+        conn.close.assert_called_once()
+
+    def test_auto_triage_only_blocks_low_failure_value_productivity_noise(self):
+        from clawjournal.cli import _is_auto_triage_noise
+
+        assert _is_auto_triage_noise({
+            "ai_quality_score": 1,
+            "ai_failure_value_score": 1,
+        })
+        assert _is_auto_triage_noise({
+            "ai_quality_score": 1,
+            "ai_failure_value_score": 2,
+        })
+        assert not _is_auto_triage_noise({
+            "ai_quality_score": 1,
+            "ai_failure_value_score": 3,
+        })
+        assert not _is_auto_triage_noise({
+            "ai_quality_score": 1,
+            "ai_failure_value_score": 4,
+        })
+        assert not _is_auto_triage_noise({
+            "ai_quality_score": 1,
+            "ai_failure_value_score": None,
+        })
+
     def test_score_single_session_returns_error_on_judge_failure(self, monkeypatch):
         from clawjournal.cli import _score_single_session
 

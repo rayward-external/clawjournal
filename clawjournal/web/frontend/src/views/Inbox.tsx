@@ -10,11 +10,6 @@ import { colors, selectStyle } from '../theme.ts';
 
 const PAGE_SIZE = 10;
 
-function scoreBadge(score: number | null): string {
-  if (score == null) return '\u2014';
-  return '\u2605'.repeat(Math.min(score, 5));
-}
-
 function failureBadge(score: number | null): string {
   if (score == null) return '\u2014';
   return `${score} failure`;
@@ -502,10 +497,17 @@ export function Inbox() {
               }} onClick={() => handleExpand(s.session_id)}>
                 {/* Failure + productivity scores */}
                 <div style={{
-                  fontSize: '12px', color: colors.red500, whiteSpace: 'nowrap', minWidth: '74px',
-                  fontWeight: 700,
+                  display: 'flex', flexDirection: 'column', gap: 1,
+                  fontSize: '12px', whiteSpace: 'nowrap', minWidth: '74px',
                 }}>
-                  {failureBadge(s.ai_failure_value_score)}
+                  <span style={{ color: colors.red500, fontWeight: 700 }}>
+                    {failureBadge(s.ai_failure_value_score)}
+                  </span>
+                  {s.ai_quality_score != null && (
+                    <span style={{ color: colors.gray400, fontSize: 11, fontWeight: 600 }}>
+                      P {s.ai_quality_score}/5
+                    </span>
+                  )}
                 </div>
 
                 {/* Title + meta */}
@@ -547,7 +549,6 @@ export function Inbox() {
                     <span>
                       {s.project} &middot; {s.user_messages + s.assistant_messages} msgs
                       {s.outcome_label ? ` · ${outcomeText(s.outcome_label)}` : ''}
-                      {s.ai_quality_score != null ? ` · productivity ${s.ai_quality_score}/5` : ''}
                       {s.ai_failure_attribution ? ` · ${s.ai_failure_attribution.replace(/_/g, ' ')}` : ''}
                     </span>
                   </div>

@@ -412,6 +412,27 @@ class TestSessionsAPI:
         status, detail = _get(server, "/api/sessions/sess-0")
         assert detail["review_status"] == "approved"
 
+    def test_update_session_requires_evidence_for_high_failure_value(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {"ai_failure_value_score": 4})
+
+        assert status == 400
+        assert "require evidence" in data["error"]
+
+    def test_update_session_stores_failure_evidence_for_high_failure_value(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {
+            "ai_failure_value_score": 4,
+            "ai_failure_evidence": ["The user corrected a fabricated API call."],
+        })
+        assert status == 200
+        assert data["ok"] is True
+
+        status, detail = _get(server, "/api/sessions/sess-0")
+        assert status == 200
+        assert detail["ai_failure_value_score"] == 4
+        assert json.loads(detail["ai_scoring_detail"]) == {
+            "ai_failure_evidence": ["The user corrected a fabricated API call."],
+        }
+
     def test_score_session_endpoint_updates_session(self, server, monkeypatch):
         monkeypatch.setattr(
             "clawjournal.scoring.scoring.score_session",

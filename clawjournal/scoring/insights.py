@@ -50,7 +50,7 @@ def collect_advisor_stats(
     # export path already filters them at `cli.py:479`; mirror that here.
     # Same-model traffic at different reasoning-effort tiers (e.g.
     # `gpt-5.4 @ high` vs `gpt-5.4 @ xhigh`) is split into separate rows
-    # so "Most efficient" and "Highest quality" picks a specific tier.
+    # so "Most efficient" and "Highest productivity" picks a specific tier.
     # Numerator matches the normalized `resolved` bucket in
     # workbench.index (AI `resolved` or heuristic `tests_passed`).
     # Dropping heuristic `completed` from the success set — it's the
@@ -289,9 +289,9 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
                 recommendations.append({
                     "type": "high_roi",
                     "priority": "low",
-                    "title": f"{best['type'].title()} work has the best quality score",
+                    "title": f"{best['type'].title()} work has the best productivity score",
                     "detail": (
-                        f"{best['type'].title()} sessions: {best['avg_score']:.1f}/5 avg score "
+                        f"{best['type'].title()} sessions: {best['avg_score']:.1f}/5 avg productivity "
                         f"at {format_cost(best['cost'])} total cost ({best['sessions']} sessions)."
                     ),
                 })
@@ -307,9 +307,9 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
                 recommendations.append({
                     "type": "model_comparison",
                     "priority": "low",
-                    "title": "Model quality vs cost trade-off",
+                    "title": "Model productivity vs cost trade-off",
                     "detail": (
-                        f"Highest quality: {best_quality['model']} ({best_quality['avg_score']:.1f}/5 avg, "
+                        f"Highest productivity: {best_quality['model']} ({best_quality['avg_score']:.1f}/5 avg, "
                         f"{format_cost(best_quality['cost'])} total). "
                         f"Most cost-effective: {cheapest['model']} "
                         f"({cheapest['avg_score']:.1f}/5 avg, "

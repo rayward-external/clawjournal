@@ -304,7 +304,7 @@ export interface InsightsFocusRow {
 export interface InsightsModelEffectivenessRow {
   model: string;
   sessions: number;
-  avg_score: number;
+  avg_failure_value_score: number;
   resolve_rate: number;
   avg_cost: number;
   total_cost: number;
@@ -332,6 +332,7 @@ export interface InsightsDurationVsScoreRow {
   session_id: string;
   duration_seconds: number;
   ai_quality_score: number;
+  ai_failure_value_score: number | null;
   resolution: string | null;
   cost: number | null;
 }
@@ -346,6 +347,7 @@ export interface HighlightItem {
   end_time: string | null;
   duration_seconds: number | null;
   ai_quality_score: number | null;
+  ai_failure_value_score: number | null;
   ai_effort_estimate: number | null;
   outcome: string | null;
   summary_teaser: string;
@@ -356,6 +358,7 @@ export interface HighlightsData {
   highlights: HighlightItem[];
   window_days: number;
   min_quality: number;
+  min_failure_value?: number;
   candidate_count: number;
 }
 

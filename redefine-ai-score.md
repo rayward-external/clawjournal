@@ -313,36 +313,19 @@ Evidence and attribution rules:
 6. Auto-triage only blocks productivity-1 sessions when failure value is 1-2.
 7. Legacy productivity-only traces are considered unscored for the new failure
    lens and can be filled by `clawjournal score --batch`.
+8. Productivity remains visible as a secondary lens in session detail, list
+   cards, share review rows, dashboard analytics, and productivity sort
+   options.
+9. Insights recommendation copy uses "productivity" when it is analyzing
+   `ai_quality_score`, and the duration scatter no longer falls back from
+   missing failure value to productivity.
 
 ### Remaining
 
-1. **Keep productivity visibly secondary.** The session detail and dashboard
-   can show productivity, but the default list/review/share lens should
-   remain failure value.
-2. **Rename "quality" copy to "productivity" in the Insights recommendations
-   engine.** The recommendation cards still emit "best quality score",
-   "Model quality vs cost trade-off", and "Highest quality:". Touch-points:
-   - `clawjournal/scoring/insights.py:292` — `"{type} work has the best
-     quality score"` title.
-   - `clawjournal/scoring/insights.py:310` — `"Model quality vs cost
-     trade-off"` title.
-   - `clawjournal/scoring/insights.py:312` — `"Highest quality: {model}
-     ({avg_score:.1f}/5 avg, ...)"` body.
-   - `clawjournal/cli.py:1997` — matching CLI line
-     `Highest quality: {summary['highest_quality_model']}`.
-
-   The recommendation logic operates on `ai_quality_score` (productivity) and
-   that is fine — only the copy needs to switch from "quality" to
-   "productivity" so the term does not conflate with the failure-value
-   framing.
-3. **Remove the legacy-quality fallback in the Insights "Duration vs Failure
-   Value" scatter.** `clawjournal/web/frontend/src/views/Insights.tsx:169`
-   reads `const score = d.ai_failure_value_score ?? d.ai_quality_score`, so
-   legacy productivity-only traces get silently plotted on the failure-value
-   axis. Per Target decisions, legacy traces with no failure-value score
-   should be rescored, not coerced into the failure-value slot. Either omit
-   those traces from the scatter or render them with a visual treatment that
-   marks them as "rescore needed."
-4. **Re-run the frontend build** once the UI surfaces above are reworked —
-   the CI smoke job verifies the built wheel ships
-   `clawjournal/web/frontend/dist/index.html`.
+1. **Choose the final visual language for failure value.** Current UI uses
+   compact `FV n/5` badges; keep or refine that after seeing real reviewer use.
+2. **Decide whether to derive `corpus_ready`.** It would likely combine
+   failure value, evidence, hold state, and privacy gates.
+3. **Choose the dashboard default window.** The current dashboard supports
+   multiple ranges, but the product default may still need tuning after more
+   scored traces exist.

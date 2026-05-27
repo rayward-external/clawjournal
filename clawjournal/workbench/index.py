@@ -2876,22 +2876,24 @@ def get_highlights(
     days: int = 7,
     top_n: int = 3,
     min_quality: int = 4,
+    min_failure_value: int | None = None,
 ) -> dict[str, Any]:
     """Pick a small curated set of 'worth a look' sessions for the dashboard.
 
     Selection recipe:
     1. Candidates have `end_time` within the last `days`, are fully scored
-       (`ai_quality_score IS NOT NULL`), and meet `ai_quality_score >= min_quality`.
-    2. Order by `ai_quality_score DESC, end_time DESC`.
+       (`ai_failure_value_score IS NOT NULL`), and meet the failure-value threshold.
+    2. Order by `ai_failure_value_score DESC, end_time DESC`.
     3. Diversify across `source` — prefer one from each distinct agent
        (claude / codex / openclaw / etc.) before taking a second from any.
     4. If fewer than `top_n` distinct sources have candidates, fill from the
        remaining sorted list.
 
     Each result carries enough metadata for the dashboard card plus a
-    one-line rationale string ("5-star · 3 days ago") so the UI doesn't
+    one-line rationale string ("FV 5/5 · 3 days ago") so the UI doesn't
     have to re-derive it.
     """
+    threshold = min_failure_value if min_failure_value is not None else min_quality
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     cutoff_iso = cutoff.isoformat()
 
@@ -2900,16 +2902,17 @@ def get_highlights(
         SELECT session_id, project, source, model,
                start_time, end_time, duration_seconds,
                display_title, ai_display_title, ai_summary,
-               ai_quality_score, ai_effort_estimate,
+               ai_quality_score, ai_failure_value_score,
+               ai_learning_summary, ai_effort_estimate,
                outcome_badge, ai_outcome_badge
         FROM sessions
         WHERE end_time IS NOT NULL
           AND end_time >= ?
-          AND ai_quality_score IS NOT NULL
-          AND ai_quality_score >= ?
-        ORDER BY ai_quality_score DESC, end_time DESC
+          AND ai_failure_value_score IS NOT NULL
+          AND ai_failure_value_score >= ?
+        ORDER BY ai_failure_value_score DESC, end_time DESC, ai_quality_score DESC
         """,
-        (cutoff_iso, min_quality),
+        (cutoff_iso, threshold),
     ).fetchall()
 
     candidates = [dict(r) for r in rows]
@@ -2938,7 +2941,7 @@ def get_highlights(
     now = datetime.now(timezone.utc)
 
     def _rationale(s: dict[str, Any]) -> str:
-        score = s.get("ai_quality_score")
+        score = s.get("ai_failure_value_score")
         end_time = s.get("end_time") or ""
         try:
             end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
@@ -2956,7 +2959,7 @@ def get_highlights(
                 when = f"{delta.days} days ago"
         except (ValueError, AttributeError):
             when = "recently"
-        score_label = f"{score}-star" if score else "scored"
+        score_label = f"FV {score}/5" if score else "failure-value scored"
         return f"{score_label} · {when}"
 
     def _truncate(text: str | None, limit: int = 200) -> str:
@@ -2981,9 +2984,10 @@ def get_highlights(
             "end_time": s.get("end_time"),
             "duration_seconds": s.get("duration_seconds"),
             "ai_quality_score": s.get("ai_quality_score"),
+            "ai_failure_value_score": s.get("ai_failure_value_score"),
             "ai_effort_estimate": s.get("ai_effort_estimate"),
             "outcome": outcome,
-            "summary_teaser": _truncate(s.get("ai_summary")),
+            "summary_teaser": _truncate(s.get("ai_learning_summary") or s.get("ai_summary")),
             "rationale": _rationale(s),
         })
 
@@ -2991,6 +2995,7 @@ def get_highlights(
         "highlights": highlights,
         "window_days": days,
         "min_quality": min_quality,
+        "min_failure_value": threshold,
         "candidate_count": len(candidates),
     }
 
@@ -3189,18 +3194,18 @@ def get_insights(
         focus.append(proj)
     result["focus"] = focus
 
-    # Productivity: duration vs score. Returns the normalized resolution
+    # Failure value: duration vs score. Returns the normalized resolution
     # (`resolved` / `failed` / `partial` / etc.) so the frontend scatter
     # plot only has to color-code one vocabulary. Before normalization,
     # heuristic badges like `tests_failed` / `build_failed` / `errored`
     # fell into the color map's default gray "Other" bucket instead of
     # red failures.
     rows = conn.execute(
-        f"SELECT session_id, duration_seconds, ai_quality_score, "
+        f"SELECT session_id, duration_seconds, ai_quality_score, ai_failure_value_score, "
         f"({_OUTCOME_NORMALIZE_SQL}) as resolution, "
         f"estimated_cost_usd as cost "
         f"FROM sessions {where} "
-        f"AND duration_seconds IS NOT NULL AND ai_quality_score IS NOT NULL "
+        f"AND duration_seconds IS NOT NULL AND ai_failure_value_score IS NOT NULL "
         f"ORDER BY start_time DESC LIMIT 200",
         params_base,
     ).fetchall()
@@ -3213,7 +3218,7 @@ def get_insights(
         f"SELECT CASE WHEN model_effort IS NOT NULL AND model_effort != '' "
         f"       THEN model || ' @ ' || model_effort ELSE model END as model, "
         f"COUNT(*) as sessions, "
-        f"AVG(ai_quality_score) as avg_score, "
+        f"AVG(ai_failure_value_score) as avg_failure_value_score, "
         f"SUM(CASE WHEN ({_OUTCOME_NORMALIZE_SQL}) = 'resolved' THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as resolve_rate, "
         f"AVG(estimated_cost_usd) as avg_cost, "
         f"SUM(estimated_cost_usd) as total_cost "
@@ -3222,7 +3227,7 @@ def get_insights(
         params_base,
     ).fetchall()
     result["model_effectiveness"] = [
-        {**dict(r), "avg_score": round(r["avg_score"] or 0, 1), "resolve_rate": round(r["resolve_rate"] or 0, 2), "avg_cost": round(r["avg_cost"] or 0, 4), "total_cost": round(r["total_cost"] or 0, 2)}
+        {**dict(r), "avg_failure_value_score": round(r["avg_failure_value_score"] or 0, 1), "resolve_rate": round(r["resolve_rate"] or 0, 2), "avg_cost": round(r["avg_cost"] or 0, 4), "total_cost": round(r["total_cost"] or 0, 2)}
         for r in rows
     ]
 
@@ -3415,8 +3420,6 @@ def get_share_ready_stats(
         if s.get("model"):
             models.add(s["model"])
     approved_sessions = [s for s in sessions if s.get("review_status") == "approved"]
-    has_failure_scores = any(s.get("ai_failure_value_score") is not None for s in sessions)
-
     # Default recommendation: approved high-value failure traces from in-scope
     # sources. Recent rows dominate, with older approved high-value failures as
     # backfill. Unapproved failures are shown to the user for review, not added
@@ -3448,11 +3451,6 @@ def get_share_ready_stats(
 
     def _is_high_value_failure(session: dict[str, Any]) -> bool:
         score = session.get("ai_failure_value_score")
-        if score is None and not has_failure_scores:
-            # Transitional fallback for pre-migration databases. Once any
-            # failure-value scores exist in the visible pool, recommendations
-            # are strictly failure-value based.
-            score = session.get("ai_quality_score")
         return (
             session.get("review_status") == "approved"
             and session.get("source") in FAILURE_VALUE_SOURCE_SCOPE

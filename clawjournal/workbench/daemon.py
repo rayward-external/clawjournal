@@ -25,6 +25,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
+from ..scoring.overrides import (
+    failure_evidence_from_detail,
+    merge_failure_evidence,
+    normalize_failure_evidence,
+    requires_failure_evidence,
+)
 from ..config import CONFIG_DIR, load_config, save_config
 from .findings_pipeline import (
     drain_findings_backfill,
@@ -1183,6 +1189,43 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         body = _read_body(self)
         conn = open_index()
         try:
+            if "ai_failure_value_score" in body or "ai_failure_evidence" in body:
+                detail = get_session_detail(conn, session_id)
+                if detail is None:
+                    _json_response(self, {"error": "Session not found"}, 404)
+                    return
+
+                failure_value = body.get("ai_failure_value_score")
+                if failure_value is not None:
+                    try:
+                        failure_value = int(failure_value)
+                    except (TypeError, ValueError):
+                        _json_response(self, {"error": "Invalid failure value"}, 400)
+                        return
+                    body["ai_failure_value_score"] = failure_value
+
+                provided_evidence = normalize_failure_evidence(
+                    body.get("ai_failure_evidence")
+                )
+                raw_detail = body.get(
+                    "ai_scoring_detail",
+                    detail.get("ai_scoring_detail"),
+                )
+                if requires_failure_evidence(failure_value):
+                    existing_evidence = failure_evidence_from_detail(raw_detail)
+                    if not provided_evidence and not existing_evidence:
+                        _json_response(
+                            self,
+                            {"error": "Failure-value 4-5 overrides require evidence."},
+                            400,
+                        )
+                        return
+                if provided_evidence:
+                    body["ai_scoring_detail"] = merge_failure_evidence(
+                        raw_detail,
+                        provided_evidence,
+                    )
+
             ok = update_session(
                 conn, session_id,
                 status=body.get("status"),
@@ -1492,11 +1535,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         days = _int_param("days", 7, 1, 90)
         top_n = _int_param("top", 3, 1, 12)
         min_quality = _int_param("min_quality", 4, 1, 5)
+        min_failure_value = _int_param("min_failure_value", min_quality, 1, 5)
 
         conn = open_index()
         try:
             data = get_highlights(
-                conn, days=days, top_n=top_n, min_quality=min_quality
+                conn,
+                days=days,
+                top_n=top_n,
+                min_quality=min_quality,
+                min_failure_value=min_failure_value,
             )
             _json_response(self, data)
         finally:

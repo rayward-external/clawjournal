@@ -64,6 +64,34 @@ function truncate(text: string, max: number): string {
   return text.slice(0, max) + '...';
 }
 
+function failureValueLabel(score: number): string {
+  return score === 5 ? 'Canonical'
+    : score === 4 ? 'Strong pattern'
+    : score === 3 ? 'Usable signal'
+    : score === 2 ? 'Weak signal'
+    : 'No signal';
+}
+
+function failureEvidenceText(detail: string | null | undefined): string {
+  if (!detail) return '';
+  try {
+    const parsed = JSON.parse(detail);
+    if (!Array.isArray(parsed.ai_failure_evidence)) return '';
+    return parsed.ai_failure_evidence
+      .filter((item: unknown): item is string => typeof item === 'string' && item.trim().length > 0)
+      .join('\n');
+  } catch {
+    return '';
+  }
+}
+
+function splitEvidence(text: string): string[] {
+  return text
+    .split('\n')
+    .map(item => item.trim())
+    .filter(Boolean);
+}
+
 /** Render text with [REDACTED] spans highlighted. */
 /* ------------------------------------------------------------------ */
 /*  Sub-components                                                    */
@@ -189,7 +217,8 @@ export default function SessionDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [userRating, setUserRating] = useState<number | null>(null);
+  const [failureValueOverride, setFailureValueOverride] = useState<number | null>(null);
+  const [failureValueEvidence, setFailureValueEvidence] = useState('');
   const [scoring, setScoring] = useState(false);
 
   // Refs for scroll targets
@@ -213,7 +242,8 @@ export default function SessionDetail() {
       .get(id)
       .then((data) => {
         setSession(data);
-        setUserRating(data.ai_quality_score);
+        setFailureValueOverride(data.ai_failure_value_score);
+        setFailureValueEvidence(failureEvidenceText(data.ai_scoring_detail));
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
@@ -539,28 +569,29 @@ export default function SessionDetail() {
           background: colors.white,
         }}
       >
-        <Section title="Productivity Score">
-          {(userRating ?? session.ai_quality_score) != null ? (() => {
-            const displayScore = userRating ?? session.ai_quality_score!;
+        <Section title="Failure Value">
+          {(failureValueOverride ?? session.ai_failure_value_score) != null ? (() => {
+            const displayScore = failureValueOverride ?? session.ai_failure_value_score!;
             return (
             <div>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 4 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
                 <span style={{
-                  fontSize: 22,
-                  letterSpacing: '-1px',
-                  color: colors.yellow400,
+                  fontSize: 24,
+                  fontWeight: 700,
+                  color: colors.red500,
                 }}>
-                  {'\u2605'.repeat(displayScore)}{'\u2606'.repeat(5 - displayScore)}
+                  FV {displayScore}/5
                 </span>
                 <span style={{ fontSize: 13, fontWeight: 600, color: colors.gray700 }}>
-                  {displayScore === 5 ? 'Major'
-                    : displayScore === 4 ? 'Solid'
-                    : displayScore === 3 ? 'Light'
-                    : displayScore === 2 ? 'Minimal'
-                    : 'Noise'}
+                  {failureValueLabel(displayScore)}
                 </span>
               </div>
-              {session.ai_summary && (
+              {session.ai_learning_summary && (
+                <div style={{ fontSize: 12, color: colors.gray700, lineHeight: 1.5, marginBottom: 6 }}>
+                  {session.ai_learning_summary}
+                </div>
+              )}
+              {session.ai_summary && !session.ai_learning_summary && (
                 <div style={{ fontSize: 12, color: colors.gray700, lineHeight: 1.5, marginBottom: 6 }}>
                   {session.ai_summary}
                 </div>
@@ -570,10 +601,15 @@ export default function SessionDetail() {
                   {session.ai_score_reason}
                 </div>
               )}
+              {session.ai_quality_score != null && (
+                <div style={{ fontSize: 11, color: colors.gray400, lineHeight: 1.4, marginBottom: 8 }}>
+                  Legacy productivity {session.ai_quality_score}/5
+                </div>
+              )}
             </div>
             );
           })() : (
-            <div style={{ fontSize: 12, color: colors.gray400, marginBottom: 8 }}>Not scored yet</div>
+            <div style={{ fontSize: 12, color: colors.gray400, marginBottom: 8 }}>Failure value not scored yet</div>
           )}
 
           <button
@@ -585,7 +621,8 @@ export default function SessionDetail() {
                 await api.sessions.score(id);
                 const fresh = await api.sessions.get(id);
                 setSession(fresh);
-                setUserRating(fresh.ai_quality_score);
+                setFailureValueOverride(fresh.ai_failure_value_score);
+                setFailureValueEvidence(failureEvidenceText(fresh.ai_scoring_detail));
                 toast('Scored', 'success');
               } catch (e) {
                 toast(e instanceof Error ? e.message : 'Scoring failed', 'error');
@@ -606,38 +643,70 @@ export default function SessionDetail() {
               cursor: scoring ? 'wait' : 'pointer',
             }}
           >
-            {scoring ? 'Scoring…' : (session.ai_quality_score ? 'Re-score with AI' : 'Score with AI')}
+            {scoring ? 'Scoring…' : (session.ai_failure_value_score ? 'Re-score with AI' : 'Score with AI')}
           </button>
 
-          <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray700, marginBottom: 4 }}>Override rating</div>
-          <div style={{ display: 'flex', gap: 2, marginBottom: 4 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray700, marginBottom: 4 }}>Override failure value</div>
+          <textarea
+            value={failureValueEvidence}
+            onChange={e => setFailureValueEvidence(e.target.value)}
+            placeholder="Evidence for 4-5 overrides"
+            rows={3}
+            style={{
+              width: '100%',
+              boxSizing: 'border-box',
+              resize: 'vertical',
+              border: `1px solid ${colors.gray200}`,
+              borderRadius: 4,
+              padding: '6px 8px',
+              marginBottom: 6,
+              fontSize: 12,
+              lineHeight: 1.4,
+              color: colors.gray700,
+            }}
+          />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4, marginBottom: 4 }}>
             {[1, 2, 3, 4, 5].map((n) => {
-              const currentScore = userRating ?? session.ai_quality_score ?? 0;
+              const currentScore = failureValueOverride ?? session.ai_failure_value_score ?? 0;
+              const active = n === currentScore;
               return (
                 <button
                   key={n}
                   onClick={async () => {
-                    setUserRating(n);
+                    const evidence = splitEvidence(failureValueEvidence);
+                    if (n >= 4 && evidence.length === 0) {
+                      toast('Evidence is required for failure value 4-5', 'error');
+                      return;
+                    }
                     if (id) {
                       try {
-                        await api.sessions.update(id, { ai_quality_score: n });
-                        toast(`Rating set to ${n}`, 'success');
+                        await api.sessions.update(id, {
+                          ai_failure_value_score: n,
+                          ...(evidence.length > 0 ? { ai_failure_evidence: evidence } : {}),
+                        });
+                        const fresh = await api.sessions.get(id);
+                        setSession(fresh);
+                        setFailureValueOverride(n);
+                        setFailureValueEvidence(failureEvidenceText(fresh.ai_scoring_detail));
+                        toast(`Failure value set to ${n}`, 'success');
                       } catch (e) {
-                        toast(e instanceof Error ? e.message : 'Failed to save rating', 'error');
+                        toast(e instanceof Error ? e.message : 'Failed to save failure value', 'error');
                       }
                     }
                   }}
                   style={{
-                    padding: '4px 2px',
-                    border: 'none',
-                    background: 'transparent',
-                    color: n <= currentScore ? colors.yellow400 : colors.gray300,
-                    fontSize: 20,
+                    padding: '5px 0',
+                    border: `1px solid ${active ? colors.red500 : colors.gray200}`,
+                    background: active ? colors.red500 : colors.white,
+                    color: active ? colors.white : colors.gray700,
+                    borderRadius: 4,
+                    fontSize: 12,
+                    fontWeight: 700,
                     cursor: 'pointer',
                     lineHeight: 1,
                   }}
                 >
-                  {n <= currentScore ? '\u2605' : '\u2606'}
+                  {n}
                 </button>
               );
             })}

@@ -104,7 +104,7 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`);
     },
 
-    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; ai_failure_value_score?: number; ai_recovery_labels?: string[]; ai_failure_attribution?: string; ai_failure_modes?: string[]; ai_learning_summary?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
+    update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; ai_failure_value_score?: number; ai_failure_evidence?: string[]; ai_recovery_labels?: string[]; ai_failure_attribution?: string; ai_failure_modes?: string[]; ai_learning_summary?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
       return request(`/sessions/${encodeURIComponent(id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -160,7 +160,7 @@ export const api = {
     return request(`/dashboard${qs(params)}`);
   },
 
-  highlights(params: { days?: number; top?: number; min_quality?: number } = {}): Promise<HighlightsData> {
+  highlights(params: { days?: number; top?: number; min_quality?: number; min_failure_value?: number } = {}): Promise<HighlightsData> {
     return request(`/dashboard/highlights${qs(params)}`);
   },
 

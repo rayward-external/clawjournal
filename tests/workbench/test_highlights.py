@@ -29,6 +29,7 @@ def _insert(
     source="claude",
     project="proj-1",
     quality=5,
+    failure_value=None,
     ended_hours_ago=24,
     duration=1000,
     title=None,
@@ -57,11 +58,15 @@ def _insert(
         ),
     )
     conn.commit()
-    if quality is not None:
+    if quality is not None or failure_value is not None:
+        if failure_value is None:
+            failure_value = quality
         update_session(
             conn, session_id,
             ai_quality_score=quality,
+            ai_failure_value_score=failure_value,
             ai_summary=summary or f"Summary for {session_id}",
+            ai_learning_summary=summary or f"Summary for {session_id}",
             ai_outcome_badge="resolved",
             ai_effort_estimate=0.5,
         )
@@ -155,16 +160,16 @@ class TestSourceDiversification:
         assert {h["source"] for h in data["highlights"]} == {"claude"}
 
 
-class TestQualityTieBreaker:
-    def test_higher_quality_beats_more_recent_at_same_source(self, index_conn):
-        _insert(index_conn, session_id="solid", quality=4, ended_hours_ago=1)
-        _insert(index_conn, session_id="major", quality=5, ended_hours_ago=24)
+class TestFailureValueTieBreaker:
+    def test_higher_failure_value_beats_more_recent_at_same_source(self, index_conn):
+        _insert(index_conn, session_id="solid", quality=5, failure_value=4, ended_hours_ago=1)
+        _insert(index_conn, session_id="canonical", quality=3, failure_value=5, ended_hours_ago=24)
 
         data = get_highlights(index_conn, days=7, top_n=3, min_quality=4)
 
         ids = [h["session_id"] for h in data["highlights"]]
-        # Both are from the same source; quality tier wins.
-        assert ids == ["major", "solid"]
+        # Both are from the same source; failure-value tier wins.
+        assert ids == ["canonical", "solid"]
 
 
 class TestMetadataFields:
@@ -182,9 +187,10 @@ class TestMetadataFields:
         assert card["project"] == "proj-1"
         assert card["source"] == "claude"
         assert card["ai_quality_score"] == 5
+        assert card["ai_failure_value_score"] == 5
         assert card["outcome"] == "resolved"
         assert "rationale" in card
-        assert card["rationale"].startswith("5-star")
+        assert card["rationale"].startswith("FV 5/5")
 
     def test_summary_teaser_truncates(self, index_conn):
         long_summary = "word " * 200  # far more than 200 chars
@@ -217,13 +223,14 @@ class TestEndpointResponseShape:
         data = get_highlights(index_conn, days=7, top_n=3, min_quality=4)
 
         assert set(data.keys()) == {
-            "highlights", "window_days", "min_quality", "candidate_count"
+            "highlights", "window_days", "min_quality", "min_failure_value", "candidate_count"
         }
         assert data["window_days"] == 7
         assert data["min_quality"] == 4
+        assert data["min_failure_value"] == 4
 
     def test_unscored_sessions_excluded(self, index_conn):
-        # Session with NULL ai_quality_score (not yet scored) must not appear
+        # Session with NULL ai_failure_value_score (not yet scored) must not appear
         # even if end_time is in range.
         _insert(index_conn, session_id="unscored", quality=None, ended_hours_ago=1)
         _insert(index_conn, session_id="scored", quality=5, ended_hours_ago=2)
@@ -232,3 +239,12 @@ class TestEndpointResponseShape:
 
         ids = [h["session_id"] for h in data["highlights"]]
         assert ids == ["scored"]
+
+    def test_high_quality_low_failure_value_excluded(self, index_conn):
+        _insert(index_conn, session_id="productive", quality=5, failure_value=2, ended_hours_ago=1)
+        _insert(index_conn, session_id="failure", quality=3, failure_value=4, ended_hours_ago=2)
+
+        data = get_highlights(index_conn, days=7, top_n=3, min_quality=4)
+
+        ids = [h["session_id"] for h in data["highlights"]]
+        assert ids == ["failure"]

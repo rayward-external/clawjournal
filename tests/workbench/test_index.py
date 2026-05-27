@@ -735,7 +735,7 @@ class TestShares:
         assert share["session_count"] == 0
 
     def test_share_history_and_share_ready_recommendations(self, index_conn):
-        # Recommendations require 5-star quality in the last 7 days. Use
+        # Recommendations require high failure value in the last 7 days. Use
         # `datetime.now()` so the window is always satisfied; the existing
         # in-memory DB has no clock dependency otherwise.
         from datetime import datetime, timedelta, timezone
@@ -758,7 +758,12 @@ class TestShares:
             ),
         ])
         for sid in ("s1", "s2", "s3"):
-            update_session(index_conn, sid, status="approved", ai_quality_score=5)
+            update_session(
+                index_conn, sid,
+                status="approved",
+                ai_quality_score=5,
+                ai_failure_value_score=5,
+            )
 
         shared_share_id = create_share(index_conn, ["s1"])
         index_conn.execute(
@@ -776,8 +781,36 @@ class TestShares:
 
         stats = get_share_ready_stats(index_conn)
         assert [s["session_id"] for s in stats["sessions"]] == ["s3", "s2"]
-        # Recommendation is the same ordered list (recent 5-star, capped 5).
+        # Recommendation is the same ordered list (recent high failure value, capped 5).
         assert stats["recommended_session_ids"] == ["s3", "s2"]
+
+    def test_share_ready_does_not_recommend_legacy_productivity_only_scores(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        upsert_sessions(index_conn, [
+            _make_session(
+                "legacy",
+                start_time=(now - timedelta(days=1)).isoformat(),
+                end_time=(now - timedelta(days=1, minutes=-10)).isoformat(),
+            ),
+            _make_session(
+                "failure",
+                start_time=now.isoformat(),
+                end_time=(now + timedelta(minutes=10)).isoformat(),
+            ),
+        ])
+        update_session(index_conn, "legacy", status="approved", ai_quality_score=5)
+        update_session(
+            index_conn, "failure",
+            status="approved",
+            ai_quality_score=3,
+            ai_failure_value_score=4,
+        )
+
+        stats = get_share_ready_stats(index_conn)
+
+        assert [s["session_id"] for s in stats["sessions"]] == ["failure", "legacy"]
+        assert stats["recommended_session_ids"] == ["failure"]
 
     def test_share_ready_respects_excluded_project_rules(self, index_conn):
         from datetime import datetime, timedelta, timezone
@@ -792,8 +825,18 @@ class TestShares:
                 start_time=(now - timedelta(days=1)).isoformat(),
             ),
         ])
-        update_session(index_conn, "private", status="approved", ai_quality_score=5)
-        update_session(index_conn, "public", status="approved", ai_quality_score=5)
+        update_session(
+            index_conn, "private",
+            status="approved",
+            ai_quality_score=5,
+            ai_failure_value_score=5,
+        )
+        update_session(
+            index_conn, "public",
+            status="approved",
+            ai_quality_score=5,
+            ai_failure_value_score=5,
+        )
         add_policy(index_conn, "exclude_project", "private-repo")
 
         settings = get_effective_share_settings(index_conn, {"excluded_projects": []})

@@ -1087,6 +1087,8 @@ def _validate_judge_result(result: dict) -> dict:
         _VALID_META_LABELS,
     )
     failure_evidence = _validate_bounded_string_list(result.get("ai_failure_evidence", []))
+    if failure_value_score is not None and failure_value_score >= 4 and not failure_evidence:
+        failure_value_score = 3
 
     learning_summary = result.get("ai_learning_summary", "")
     if not isinstance(learning_summary, str):

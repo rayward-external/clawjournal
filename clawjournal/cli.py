@@ -1244,6 +1244,7 @@ def _run_inbox(
                 "outcome_badge": s.get("outcome_badge"),
                 "value_badges": value_badges,
                 "risk_badges": risk_badges,
+                "ai_failure_value_score": s.get("ai_failure_value_score"),
                 "ai_quality_score": s.get("ai_quality_score"),
                 "ai_score_reason": s.get("ai_score_reason"),
                 "review_status": s.get("review_status", "new"),
@@ -1993,7 +1994,7 @@ def _run_insights(args) -> None:
         if summary.get("most_efficient_model"):
             print(f"  Most efficient: {summary['most_efficient_model']}")
         if summary.get("highest_quality_model"):
-            print(f"  Highest quality: {summary['highest_quality_model']}")
+            print(f"  Highest productivity: {summary['highest_quality_model']}")
         savings = summary.get("potential_savings_usd", 0)
         if savings > 0:
             print(f"  Potential savings: {format_cost(savings)}/period")
@@ -2136,6 +2137,7 @@ def _extract_tool_uses(msg: dict) -> list[dict]:
 
 def _run_score_view(args) -> None:
     """Show condensed session view for AI scoring."""
+    from .scoring.overrides import failure_evidence_from_detail
     from .workbench.index import get_session_detail, open_index, query_sessions
 
     conn = open_index()
@@ -2269,11 +2271,48 @@ def _run_score_view(args) -> None:
 
         value_str = ", ".join(value_badges) if value_badges else "(none)"
         risk_str = ", ".join(risk_badges) if risk_badges else "(none)"
+        failure_score = detail.get("ai_failure_value_score")
+        quality_score = detail.get("ai_quality_score")
+        failure_modes = detail.get("ai_failure_modes", [])
+        if isinstance(failure_modes, str):
+            try:
+                failure_modes = json.loads(failure_modes)
+            except (json.JSONDecodeError, ValueError):
+                failure_modes = []
+        recovery_labels = detail.get("ai_recovery_labels", [])
+        if isinstance(recovery_labels, str):
+            try:
+                recovery_labels = json.loads(recovery_labels)
+            except (json.JSONDecodeError, ValueError):
+                recovery_labels = []
+        failure_attribution = detail.get("ai_failure_attribution")
+        learning_summary = detail.get("ai_learning_summary")
+        score_reason = detail.get("ai_score_reason")
+        failure_evidence = failure_evidence_from_detail(
+            detail.get("ai_scoring_detail")
+        )
 
         print(f"Session: {sid}")
         print(f"Source: {source} | Model: {model} | Project: {project}")
         print(f"Duration: {duration} | Tokens: {input_tok} in / {output_tok} out | Messages: {user_msgs} user / {asst_msgs} asst")
         print(f"Task type: {task_type} | Outcome: {outcome}")
+        failure_display = f"{failure_score}/5" if failure_score else "(unscored)"
+        productivity_display = f"{quality_score}/5" if quality_score else "(unscored)"
+        print(f"Failure value: {failure_display} | Productivity: {productivity_display}")
+        if failure_attribution:
+            print(f"Attribution: {failure_attribution}")
+        if failure_modes:
+            print(f"Failure modes: {', '.join(failure_modes)}")
+        if recovery_labels:
+            print(f"Recovery: {', '.join(recovery_labels)}")
+        if learning_summary:
+            print(f"Lesson: {learning_summary}")
+        elif score_reason:
+            print(f"Reason: {score_reason}")
+        if failure_evidence:
+            print("Evidence:")
+            for snippet in failure_evidence[:3]:
+                print(f"- {_truncate(snippet, 160)}")
         print(f"Value: {value_str} | Risk: {risk_str} | Sensitivity: {sensitivity}")
         print()
 
@@ -2354,35 +2393,97 @@ def _run_score_view(args) -> None:
 
 
 def _run_set_score(args) -> None:
-    """Record AI quality score for one or more sessions."""
-    from .workbench.index import open_index, update_session
+    """Record manual score overrides for one or more sessions."""
+    from .scoring.overrides import (
+        failure_evidence_from_detail,
+        merge_failure_evidence,
+        normalize_failure_evidence,
+        requires_failure_evidence,
+    )
+    from .workbench.index import get_session_detail, open_index, update_session
 
     session_ids = args.session_ids
     quality = args.quality
+    failure_value = args.failure_value
     reason = args.reason
+    failure_evidence = normalize_failure_evidence(
+        getattr(args, "failure_evidence", None)
+    )
 
     if not session_ids:
         print(json.dumps({"error": "No session IDs provided."}))
         sys.exit(1)
+    if quality is None and failure_value is None:
+        print(json.dumps({"error": "Provide --failure-value, --quality, or both."}))
+        sys.exit(1)
+    if failure_evidence and failure_value is None:
+        print(json.dumps({"error": "Provide --failure-value with --failure-evidence."}))
+        sys.exit(1)
 
     conn = open_index()
+    details: dict[str, dict[str, Any] | None] = {}
+    if requires_failure_evidence(failure_value):
+        missing_evidence: list[str] = []
+        for sid in session_ids:
+            detail = get_session_detail(conn, sid)
+            details[sid] = detail
+            if detail is None:
+                continue
+            existing_evidence = failure_evidence_from_detail(
+                detail.get("ai_scoring_detail")
+            )
+            if not failure_evidence and not existing_evidence:
+                missing_evidence.append(sid)
+        if missing_evidence:
+            conn.close()
+            print(json.dumps({
+                "error": "Failure-value 4-5 overrides require --failure-evidence.",
+                "session_ids": missing_evidence,
+            }))
+            sys.exit(1)
+
     results = []
     for sid in session_ids:
+        detail = details.get(sid)
+        if failure_evidence and sid not in details:
+            detail = get_session_detail(conn, sid)
+        updates: dict[str, Any] = {}
+        result: dict[str, Any] = {"session_id": sid}
+        if quality is not None:
+            updates["ai_quality_score"] = quality
+            result["ai_quality_score"] = quality
+        if failure_value is not None:
+            updates["ai_failure_value_score"] = failure_value
+            result["ai_failure_value_score"] = failure_value
+        if reason is not None:
+            updates["ai_score_reason"] = reason
+        if failure_evidence:
+            updates["ai_scoring_detail"] = merge_failure_evidence(
+                detail.get("ai_scoring_detail") if detail else None,
+                failure_evidence,
+            )
+            result["ai_failure_evidence"] = failure_evidence
         ok = update_session(
             conn, sid,
-            ai_quality_score=quality,
-            ai_score_reason=reason,
+            **updates,
         )
-        results.append({"session_id": sid, "ai_quality_score": quality, "ok": ok})
+        result["ok"] = ok
+        results.append(result)
     conn.close()
 
     success = sum(1 for r in results if r["ok"])
-    print(json.dumps({
+    payload: dict[str, Any] = {
         "action": "set-score",
         "updated": success,
-        "quality": quality,
         "results": results,
-    }, indent=2))
+    }
+    if failure_value is not None:
+        payload["failure_value"] = failure_value
+    if failure_evidence:
+        payload["failure_evidence"] = failure_evidence
+    if quality is not None:
+        payload["quality"] = quality
+    print(json.dumps(payload, indent=2))
 
 
 def _run_score_batch(args) -> None:
@@ -2602,6 +2703,16 @@ def _score_single_session(
     }
 
 
+def _is_auto_triage_noise(result: dict[str, Any]) -> bool:
+    """Return True when auto-triage should block a scored noise session."""
+    failure_value = result.get("ai_failure_value_score")
+    return (
+        result.get("ai_quality_score") == 1
+        and isinstance(failure_value, int)
+        and failure_value <= 2
+    )
+
+
 def _run_score(args) -> None:
     """Score sessions using the current agent's automation CLI or an explicit backend."""
     from .workbench.index import open_index, query_unscored_sessions, update_session
@@ -2632,9 +2743,9 @@ def _run_score(args) -> None:
             results.append(result)
             if result.get("ai_quality_score"):
                 failure = result.get("ai_failure_value_score")
-                failure_suffix = f", failure {failure}/5" if failure is not None else ""
+                failure_prefix = f"failure {failure}/5; " if failure is not None else ""
                 print(
-                    f"  -> quality {result['ai_quality_score']}/5{failure_suffix}: "
+                    f"  -> {failure_prefix}productivity {result['ai_quality_score']}/5: "
                     f"{result.get('reason', '')[:100]}",
                     file=sys.stderr,
                 )
@@ -2673,15 +2784,28 @@ def _run_score(args) -> None:
                     "none_1": sum(1 for q in failure_scores if q == 1),
                 }
 
-        # Auto-triage: archive noise (substance=1), leave everything else visible
+        # Auto-triage: archive productivity noise, but keep high failure-value
+        # traces visible even when the legacy productivity score is low.
         if auto_triage and scored and not dry_run:
-            noise_ids = [r["session_id"] for r in scored if r["ai_quality_score"] == 1]
+            noise_ids = [
+                r["session_id"]
+                for r in scored
+                if _is_auto_triage_noise(r)
+            ]
             triage = {"archived": 0, "visible": 0}
             if noise_ids:
                 for sid in noise_ids:
-                    update_session(conn, sid, status="blocked", reason="Auto-triage: noise session (productivity 1)")
+                    update_session(
+                        conn, sid,
+                        status="blocked",
+                        reason="Auto-triage: noise session (productivity 1, failure value 1-2)",
+                    )
                 triage["archived"] = len(noise_ids)
-                print(f"  Auto-archived {len(noise_ids)} noise sessions (productivity 1)", file=sys.stderr)
+                print(
+                    f"  Auto-archived {len(noise_ids)} noise sessions "
+                    "(productivity 1, failure value 1-2)",
+                    file=sys.stderr,
+                )
             triage["visible"] = len(scored) - len(noise_ids)
             summary["auto_triage"] = triage
 
@@ -2772,9 +2896,9 @@ def _run_rescore(args) -> None:
         results.append(result)
         if result.get("ai_quality_score"):
             failure = result.get("ai_failure_value_score")
-            failure_suffix = f", failure {failure}/5" if failure is not None else ""
+            failure_prefix = f"failure {failure}/5; " if failure is not None else ""
             print(
-                f"  -> quality {result['ai_quality_score']}/5{failure_suffix}: "
+                f"  -> {failure_prefix}productivity {result['ai_quality_score']}/5: "
                 f"{result.get('reason', '')[:100]}",
                 file=sys.stderr,
             )
@@ -3018,6 +3142,7 @@ def _run_recent(args: argparse.Namespace) -> None:
                 "source": s.get("source", ""),
                 "model": s.get("model"),
                 "duration_seconds": s.get("duration_seconds"),
+                "ai_failure_value_score": s.get("ai_failure_value_score"),
                 "ai_quality_score": s.get("ai_quality_score"),
                 "outcome_badge": s.get("outcome_badge"),
                 "start_time": s.get("start_time"),
@@ -3048,8 +3173,8 @@ def _run_recent(args: argparse.Namespace) -> None:
             dur_str = f"{dur // 60} min" if dur >= 60 else f"{dur}s"
         else:
             dur_str = ""
-        score = s.get("ai_quality_score")
-        score_str = f" · {score}/5" if score else ""
+        failure_score = s.get("ai_failure_value_score")
+        score_str = f" · FV {failure_score}/5" if failure_score else ""
         outcome = s.get("outcome_badge") or ""
         sid = s.get("session_id", "")
 
@@ -3793,9 +3918,16 @@ def main() -> None:
     sv.add_argument("--offset", type=int, default=0, help="Offset for batch")
     sv.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None)
 
-    ss = sub.add_parser("set-score", help="Record AI quality score for sessions")
+    ss = sub.add_parser("set-score", help="Record manual AI score overrides for sessions")
     ss.add_argument("session_ids", nargs="+", help="Session IDs")
-    ss.add_argument("--quality", type=int, required=True, choices=range(1, 6), help="Quality 1-5")
+    ss.add_argument("--failure-value", type=int, choices=range(1, 6), help="Failure value 1-5")
+    ss.add_argument(
+        "--failure-evidence",
+        action="append",
+        default=[],
+        help="Trace-backed evidence for manual failure-value 4-5 overrides; repeat for multiple snippets",
+    )
+    ss.add_argument("--quality", type=int, choices=range(1, 6), help="Legacy productivity quality 1-5")
     ss.add_argument("--reason", type=str, default=None, help="Reason for the score")
 
     sb = sub.add_parser("score-batch", help="List unscored sessions for AI scoring")

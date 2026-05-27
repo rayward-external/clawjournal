@@ -20,6 +20,8 @@ clawjournal score --batch --source failure-v1 --limit 20
 ```
 
 For hands-on scoring of a specific session, continue below.
+With `--auto-triage`, only productivity-1 sessions with failure value 1-2 are
+auto-blocked; failure value 3+ stays reviewable.
 
 ## Session Data
 
@@ -82,9 +84,11 @@ See `RUBRIC.md` in this directory for the full scoring rubric with examples. In 
 
 ## Store the Score
 
-Manual score setting only updates the legacy productivity score. Prefer
-`clawjournal score` for failure-value annotations.
+Manual score setting can override failure value directly. Keep `--quality` for
+legacy productivity compatibility only. Failure-value overrides to 4-5 require
+trace-backed evidence.
 
 ```bash
-clawjournal set-score <session-id> --quality <score> --reason "<1-2 sentence explanation>"
+clawjournal set-score <session-id> --failure-value <score> --failure-evidence "<trace-backed snippet>" --reason "<1-2 sentence explanation>"
+clawjournal set-score <session-id> --quality <score> --reason "<legacy productivity note>"
 ```

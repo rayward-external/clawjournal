@@ -305,15 +305,16 @@ AI-assisted scoring now records two labels in one pass: a legacy productivity sc
 
 **Just say to your AI:** *"Score my unscored ClawJournal sessions and auto-block the noise."*
 
-The agent batches the scoring over the v1 failure-source scope (`claude`, `codex`, `opencode`, `openclaw`). Productivity-1 sessions get auto-blocked when `--auto-triage` is set; high failure-value sessions stay visible for review and sharing.
+The agent batches the scoring over the v1 failure-source scope (`claude`, `codex`, `opencode`, `openclaw`). Productivity-1 sessions get auto-blocked when `--auto-triage` is set only if failure value is 1-2; failure value 3+ stays visible for review and sharing.
 
 <details>
 <summary><b>Show shell commands</b></summary>
 
 ```bash
-clawjournal score --batch --source failure-v1 --auto-triage  # score failure-value scope; auto-block productivity-1 noise
+clawjournal score --batch --source failure-v1 --auto-triage  # score failure-value scope; auto-block low-value productivity-1 noise
 clawjournal score-view <id>                          # show score details
-clawjournal set-score <id> --quality 4               # manual productivity override
+clawjournal set-score <id> --failure-value 4 --failure-evidence "User corrected a fabricated API call"
+clawjournal set-score <id> --quality 4               # legacy productivity override
 ```
 
 By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
@@ -453,7 +454,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal serve` | Open workbench UI at localhost:8384 |
 | `clawjournal config --source all` | Select source scope (required) |
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
-| `clawjournal score --batch --source failure-v1 --auto-triage` | AI-score failure-value scope; auto-block productivity-1 noise |
+| `clawjournal score --batch --source failure-v1 --auto-triage` | AI-score failure-value scope; auto-block low-value productivity-1 noise |
 | `clawjournal bundle-create --status approved` | Bundle approved sessions |
 | `clawjournal bundle-export <bundle_id>` | Export bundle to disk as `sessions.jsonl` + `manifest.json` |
 
@@ -468,6 +469,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal shortlist <id> [id ...]` | Shortlist sessions |
 | `clawjournal score --batch --source failure-v1 --limit 20` | AI-score up to 20 in-scope sessions |
 | `clawjournal score-view <id>` | View score details |
+| `clawjournal set-score <id> --failure-value <1-5>` | Manually set the failure-value score; 4-5 requires `--failure-evidence` |
 | `clawjournal set-score <id> --quality <1-5>` | Manually set the legacy productivity score |
 
 ### Hold-state gate

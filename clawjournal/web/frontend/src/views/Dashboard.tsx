@@ -103,8 +103,9 @@ interface TriageStats {
   by_status: Record<string, number>;
 }
 
-const SCORE_COLORS = ['', colors.red400, colors.yellow400, colors.gray400, colors.blue400, colors.green400];
-const SCORE_LABELS = ['', 'Noise', 'Minimal', 'Light', 'Solid', 'Major'];
+const SCORE_COLORS = ['', colors.gray400, colors.yellow400, colors.blue400, colors.red400, colors.red500];
+const SCORE_LABELS = ['', 'No signal', 'Weak signal', 'Usable signal', 'Strong pattern', 'Canonical'];
+const PRODUCTIVITY_COLORS = ['', colors.red400, colors.yellow400, colors.gray400, colors.blue400, colors.green400];
 
 // Keep as many trailing dash-segments as fit in the label column; full id stays in the hover title.
 // Path separators and dashes-inside-folder-names look identical here, so we err on the side of
@@ -205,7 +206,7 @@ export function Dashboard() {
 
   if (!data) return null;
 
-  const { summary, weekly_activity, by_outcome_label, by_value_label, by_risk_level, by_task_type, by_model, by_agent, tokens_by_source, by_quality_score, unscored_count, resolve_rate, resolve_rate_previous, read_edit_ratio, top_tools, avg_interrupts } = data;
+  const { summary, weekly_activity, by_outcome_label, by_value_label, by_risk_level, by_task_type, by_model, by_agent, tokens_by_source, by_quality_score, by_failure_value_score = [], resolve_rate, resolve_rate_previous, read_edit_ratio, top_tools, avg_interrupts } = data;
 
   // Sort outcomes by count descending
   const sortedOutcomes = [...by_outcome_label].sort((a, b) => b.count - a.count);
@@ -227,12 +228,20 @@ export function Dashboard() {
   const approved = triage?.by_status['approved'] ?? 0;
   const skipped = triage?.by_status['blocked'] ?? 0;
 
-  // Quality score stats
-  const totalScored = by_quality_score.reduce((s, q) => s + q.count, 0);
-  const qualityMax = Math.max(...by_quality_score.map(q => q.count), 0);
-  const avgScore = totalScored > 0
-    ? (by_quality_score.reduce((s, q) => s + q.score * q.count, 0) / totalScored).toFixed(1)
+  const totalProductivityScored = by_quality_score.reduce((s, q) => s + q.count, 0);
+  const productivityMax = Math.max(...by_quality_score.map(q => q.count), 0);
+  const avgProductivity = totalProductivityScored > 0
+    ? (by_quality_score.reduce((s, q) => s + q.score * q.count, 0) / totalProductivityScored).toFixed(1)
     : null;
+  const productivityUnscored = Math.max(0, summary.total_sessions - totalProductivityScored);
+
+  // Failure-value score stats
+  const totalFailureScored = by_failure_value_score.reduce((s, q) => s + q.count, 0);
+  const failureMax = Math.max(...by_failure_value_score.map(q => q.count), 0);
+  const avgFailureValue = totalFailureScored > 0
+    ? (by_failure_value_score.reduce((s, q) => s + q.score * q.count, 0) / totalFailureScored).toFixed(1)
+    : null;
+  const failureUnscored = Math.max(0, summary.total_sessions - totalFailureScored);
 
   return (
     <div style={{ padding: '16px 20px', maxWidth: 1200 }}>
@@ -244,7 +253,7 @@ export function Dashboard() {
         <StatCard label="Sessions" value={formatNumber(summary.total_sessions)} sub={`${approved} approved`} />
         <StatCard label="Tokens" value={formatNumber(summary.total_tokens)} sub={`${tokens_by_source.length} sources`} />
         <StatCard label="API Equivalent" value={formatCost(summary.total_cost)} sub={`${summary.unique_projects} projects`} color={colors.emerald400} />
-        <StatCard label="Avg Productivity" value={avgScore ?? '--'} sub={totalScored > 0 ? `${totalScored} scored` : 'none scored'} color={avgScore && parseFloat(avgScore) >= 4 ? colors.green500 : avgScore ? colors.yellow400 : colors.gray400} />
+        <StatCard label="Avg Failure Value" value={avgFailureValue ?? '--'} sub={totalFailureScored > 0 ? `${totalFailureScored} scored` : 'none scored'} color={avgFailureValue && parseFloat(avgFailureValue) >= 4 ? colors.red500 : avgFailureValue ? colors.yellow400 : colors.gray400} />
         {resolve_rate != null && (() => {
           const pct = Math.round(resolve_rate * 100);
           const trend = resolve_rate_previous != null
@@ -254,7 +263,7 @@ export function Dashboard() {
             : null;
           const arrow = trend === 'up' ? ' \u2191' : trend === 'down' ? ' \u2193' : trend === 'stable' ? ' \u2192' : '';
           const trendColor = trend === 'up' ? colors.green500 : trend === 'down' ? colors.red400 : colors.gray500;
-          return <StatCard label="Resolve Rate" value={`${pct}%${arrow}`} sub={totalScored > 0 ? `${totalScored} scored` : 'not scored'} color={trendColor} />;
+          return <StatCard label="Resolve Rate" value={`${pct}%${arrow}`} sub={totalProductivityScored > 0 ? `${totalProductivityScored} scored` : 'not scored'} color={trendColor} />;
         })()}
       </div>
 
@@ -383,30 +392,34 @@ export function Dashboard() {
       {/* Model effectiveness */}
       {insights && insights.model_effectiveness.length > 0 && (
         <div style={{ marginBottom: 12 }}>
-          <Section title="Model Effectiveness" subtitle="Quality and cost comparison across models">
+          <Section title="Model Effectiveness" subtitle="Failure value and cost comparison across models">
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ borderBottom: `1px solid ${colors.gray200}`, color: colors.gray500, fontSize: 12 }}>
                     <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 600 }}>Model</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Sessions</th>
-                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Avg Score</th>
+                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Avg FV</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Resolve Rate</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }} title="Average API cost per session (total cost ÷ sessions)">Avg Cost / Session</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Total API Cost</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {insights.model_effectiveness.slice(0, 10).map(m => (
-                    <tr key={m.model} style={{ borderBottom: `1px solid ${colors.gray100}` }}>
-                      <td style={{ padding: '6px 8px', color: colors.gray700, fontWeight: 500 }}>{shortModel(m.model)}</td>
-                      <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray600 }}>{m.sessions}</td>
-                      <td style={{ padding: '6px 8px', textAlign: 'right', color: (m.avg_score ?? 0) >= 4 ? colors.green500 : (m.avg_score ?? 0) >= 3 ? colors.yellow400 : colors.red400, fontWeight: 600 }}>{(m.avg_score ?? 0).toFixed(1)}</td>
-                      <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray600 }}>{((m.resolve_rate ?? 0) * 100).toFixed(0)}%</td>
-                      <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray600 }}>{formatCost(m.avg_cost)}</td>
-                      <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray700, fontWeight: 500 }}>{formatCost(m.total_cost)}</td>
-                    </tr>
-                  ))}
+                  {insights.model_effectiveness.slice(0, 10).map(m => {
+                    const avgFailure = m.avg_failure_value_score ?? 0;
+                    const failureColor = avgFailure >= 4 ? colors.red500 : avgFailure >= 3 ? colors.yellow400 : colors.gray500;
+                    return (
+                      <tr key={m.model} style={{ borderBottom: `1px solid ${colors.gray100}` }}>
+                        <td style={{ padding: '6px 8px', color: colors.gray700, fontWeight: 500 }}>{shortModel(m.model)}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray600 }}>{m.sessions}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: failureColor, fontWeight: 600 }}>{avgFailure > 0 ? avgFailure.toFixed(1) : '--'}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray600 }}>{((m.resolve_rate ?? 0) * 100).toFixed(0)}%</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray600 }}>{formatCost(m.avg_cost)}</td>
+                        <td style={{ padding: '6px 8px', textAlign: 'right', color: colors.gray700, fontWeight: 500 }}>{formatCost(m.total_cost)}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -457,7 +470,7 @@ export function Dashboard() {
         </div>
       )}
 
-      {/* Row 1: Activity + Quality Score + Models */}
+      {/* Row 1: Activity + Failure Value + Models */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
         {/* Weekly activity */}
         <Section title="Activity" subtitle="Sessions per week">
@@ -469,19 +482,19 @@ export function Dashboard() {
           )}
         </Section>
 
-        {/* Quality score distribution */}
-        <Section title="Productivity Score" subtitle={totalScored > 0 ? `${totalScored} scored, ${unscored_count} pending` : 'No sessions scored yet'}>
-          {totalScored > 0 ? (
+        {/* Failure-value score distribution */}
+        <Section title="Failure Value" subtitle={totalFailureScored > 0 ? `${totalFailureScored} scored, ${failureUnscored} pending` : 'No sessions scored yet'}>
+          {totalFailureScored > 0 ? (
             <>
               {[5, 4, 3, 2, 1].map(score => {
-                const entry = by_quality_score.find(q => q.score === score);
+                const entry = by_failure_value_score.find(q => q.score === score);
                 const count = entry?.count ?? 0;
-                const pct = qualityMax > 0 ? (count / qualityMax) * 100 : 0;
-                const pctTotal = totalScored > 0 ? ((count / totalScored) * 100).toFixed(0) : '0';
+                const pct = failureMax > 0 ? (count / failureMax) * 100 : 0;
+                const pctTotal = totalFailureScored > 0 ? ((count / totalFailureScored) * 100).toFixed(0) : '0';
                 return (
                   <div key={score} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
                     <div style={{ width: 80, fontSize: 13, color: colors.gray700, flexShrink: 0 }}>
-                      <span style={{ color: SCORE_COLORS[score], fontWeight: 600 }}>{'★'.repeat(score)}{'☆'.repeat(5 - score)}</span>
+                      <span style={{ color: SCORE_COLORS[score], fontWeight: 700 }}>FV {score}</span>
                     </div>
                     <div style={{ flex: 1, background: colors.gray100, borderRadius: 3, height: 16 }}>
                       <div style={{
@@ -499,8 +512,8 @@ export function Dashboard() {
                 );
               })}
               <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, fontSize: 12, color: colors.gray400, borderTop: `1px solid ${colors.gray100}`, paddingTop: 6 }}>
-                <span>Avg: <strong style={{ color: colors.gray700 }}>{avgScore}</strong>/5</span>
-                <span>{SCORE_LABELS[Math.round(parseFloat(avgScore!))]}</span>
+                <span>Avg: <strong style={{ color: colors.gray700 }}>{avgFailureValue}</strong>/5</span>
+                <span>{SCORE_LABELS[Math.round(parseFloat(avgFailureValue!))]}</span>
               </div>
             </>
           ) : (
@@ -541,6 +554,44 @@ export function Dashboard() {
             ))}
           </Section>
         )}
+
+        {/* Legacy productivity distribution */}
+        <Section title="Productivity" subtitle={totalProductivityScored > 0 ? `${totalProductivityScored} scored, ${productivityUnscored} pending` : 'No productivity scores yet'}>
+          {totalProductivityScored > 0 ? (
+            <>
+              {[5, 4, 3, 2, 1].map(score => {
+                const entry = by_quality_score.find(q => q.score === score);
+                const count = entry?.count ?? 0;
+                const pct = productivityMax > 0 ? (count / productivityMax) * 100 : 0;
+                const pctTotal = totalProductivityScored > 0 ? ((count / totalProductivityScored) * 100).toFixed(0) : '0';
+                return (
+                  <div key={score} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
+                    <div style={{ width: 54, fontSize: 13, color: colors.gray700, flexShrink: 0 }}>
+                      <span style={{ color: PRODUCTIVITY_COLORS[score], fontWeight: 700 }}>P {score}</span>
+                    </div>
+                    <div style={{ flex: 1, background: colors.gray100, borderRadius: 3, height: 14 }}>
+                      <div style={{
+                        width: `${pct}%`, background: PRODUCTIVITY_COLORS[score], borderRadius: 3, height: 14,
+                        minWidth: count > 0 ? 2 : 0, transition: 'width 0.3s ease',
+                      }} />
+                    </div>
+                    <div style={{ width: 56, fontSize: 12, color: colors.gray500, textAlign: 'right', flexShrink: 0 }}>
+                      {count} <span style={{ color: colors.gray400, fontSize: 11 }}>({pctTotal}%)</span>
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, fontSize: 12, color: colors.gray400, borderTop: `1px solid ${colors.gray100}`, paddingTop: 6 }}>
+                <span>Avg: <strong style={{ color: colors.gray700 }}>{avgProductivity}</strong>/5</span>
+                <span>secondary lens</span>
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: 13, color: colors.gray400, padding: '16px 0', textAlign: 'center' }}>
+              Run <code style={{ background: colors.gray100, padding: '2px 6px', borderRadius: 3 }}>clawjournal score</code> to score sessions
+            </div>
+          )}
+        </Section>
 
         {/* Tokens by source */}
         {tokenSources.length > 0 && (

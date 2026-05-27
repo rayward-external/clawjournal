@@ -465,6 +465,50 @@ class TestValidateJudgeResultBackwardCompat:
         assert validated["summary"] == "Added a feature."
         assert validated["effort_estimate"] == 0.7
 
+    def test_high_failure_value_without_evidence_is_capped(self):
+        result = {
+            "substance": 4,
+            **_failure_fields(
+                ai_quality_score=4,
+                ai_failure_value_score=5,
+                ai_failure_evidence=[],
+            ),
+            "reasoning": "High value, but no concrete evidence was returned.",
+            "display_title": "Review failed session",
+            "summary": "Reviewed a failed session.",
+            "resolution": "failed",
+            "task_type": "review",
+            "session_tags": [],
+            "privacy_flags": [],
+            "project_areas": [],
+        }
+
+        validated = _validate_judge_result(result)
+
+        assert validated["ai_failure_value_score"] == 3
+
+    def test_high_failure_value_with_evidence_is_preserved(self):
+        result = {
+            "substance": 4,
+            **_failure_fields(
+                ai_quality_score=4,
+                ai_failure_value_score=5,
+                ai_failure_evidence=["User corrected the agent's unsupported claim."],
+            ),
+            "reasoning": "Evidence-backed high-value failure.",
+            "display_title": "Review failed session",
+            "summary": "Reviewed a failed session.",
+            "resolution": "failed",
+            "task_type": "review",
+            "session_tags": [],
+            "privacy_flags": [],
+            "project_areas": [],
+        }
+
+        validated = _validate_judge_result(result)
+
+        assert validated["ai_failure_value_score"] == 5
+
 
 # ---------------------------------------------------------------------------
 # Backend selection
