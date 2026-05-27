@@ -95,7 +95,11 @@ _UPLOAD_PII_DEFAULT_TIMEOUT_SECONDS = 60
 _UPLOAD_PII_MIN_TIMEOUT_SECONDS = 10
 _UPLOAD_PII_MAX_TIMEOUT_SECONDS = 180
 _SHARE_INGEST_URL = os.environ.get("CLAWJOURNAL_INGEST_URL", "")
-_HOSTED_SHARE_URL = os.environ.get("CLAWJOURNAL_SHARE_URL", "").strip()
+# The hosted research submission page. Self-hosters can override via the
+# CLAWJOURNAL_SHARE_URL env var; explicitly setting it to an empty value
+# disables the workbench's "Submit to ClawJournal Research" button.
+_HOSTED_SHARE_URL_DEFAULT = "https://data.rayward.ai/share"
+_HOSTED_SHARE_URL = os.environ.get("CLAWJOURNAL_SHARE_URL", _HOSTED_SHARE_URL_DEFAULT).strip()
 _SHARE_GCS_BUCKET = os.environ.get("CLAWJOURNAL_GCS_BUCKET", "clawjournal-traces")
 _SHARE_GCS_PREFIX = os.environ.get("CLAWJOURNAL_GCS_PREFIX", "clawjournal")
 _SHARE_UPLOAD_TIMEOUT = 120
