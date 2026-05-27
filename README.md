@@ -19,7 +19,7 @@ If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, *
 - **Permission prompts — lots of them.** Your AI will ask permission to run several commands. Expect 10–25 prompts before install finishes — more if your computer is fresh, fewer if it already has dev tools. **Click "Allow" each time.** This is normal. The tools the AI installs (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
 - **A separate password prompt on Mac.** macOS may ask for *your computer password* (the one you use to log in) when installing certain tools. This is your operating system asking, not the AI. Type your password and hit Enter — installing software almost always requires this.
 - **Silent waiting periods.** Some downloads and compiles take 30–90 seconds with no visible progress. **The AI isn't frozen — it's working.** Wait for it to come back. Total install time is usually 2–10 minutes depending on your network and what's already installed.
-- **A success message at the end:** `[ok] ClawJournal 0.1.14 installed.` (the version number may differ).
+- **A success message at the end:** `[ok] ClawJournal 0.1.15 installed.` (the version number may differ).
 
 ### Open the workbench
 

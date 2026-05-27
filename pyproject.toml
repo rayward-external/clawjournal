@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawjournal"
-version = "0.1.14"
+version = "0.1.15"
 description = "Review, score, and curate your coding agent conversation traces locally"
 requires-python = ">=3.10"
 license = "Apache-2.0"
