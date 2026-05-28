@@ -17,6 +17,7 @@ from clawjournal.cli import (
     _format_token_count,
     _has_session_sources,
     _merge_config_list,
+    _normalize_score_source_filter,
     _parse_csv_arg,
     _scan_for_text_occurrences,
     _scan_high_entropy_strings,
@@ -1899,13 +1900,54 @@ class TestScore:
         assert result["session_id"] == "sess-1"
         assert "Judge failed: backend auth failed" in result["error"]
 
-    def test_score_help_includes_default_limit_10(self, capsys, monkeypatch):
+    def test_score_help_includes_default_limit_20(self, capsys, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["clawjournal", "score", "--help"])
         with pytest.raises(SystemExit) as excinfo:
             main()
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
-        assert "Max sessions for batch mode (default: 10)" in out
+        assert "Max sessions for batch mode (default: 20)" in out
+        assert "failure-corpus" in out
+
+    def test_failure_corpus_alias_matches_legacy_failure_v1(self):
+        assert _normalize_score_source_filter("failure-corpus") == _normalize_score_source_filter("failure-v1")
+
+    def test_score_batch_window_filters_recent_sessions(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        from clawjournal.cli import _run_score_batch
+        from clawjournal.workbench.index import open_index, upsert_sessions
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [
+            {
+                "session_id": "old-sess",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "start_time": (now - timedelta(days=30)).isoformat(),
+                "messages": [{"role": "user", "content": "Old"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            },
+            {
+                "session_id": "recent-sess",
+                "project": "test-project",
+                "source": "codex",
+                "model": "gpt-5",
+                "start_time": (now - timedelta(days=1)).isoformat(),
+                "messages": [{"role": "user", "content": "Recent"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            },
+        ])
+        conn.close()
+
+        _run_score_batch(MagicMock(limit=50, source="failure-corpus", window=7))
+
+        output = json.loads(capsys.readouterr().out)
+        assert [row["session_id"] for row in output] == ["recent-sess"]
 
     def test_share_preview_json(self, bundle_index, capsys):
         """share --preview --json outputs session list as JSON."""

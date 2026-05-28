@@ -873,7 +873,7 @@ def _read_scoring_output(result: AgentResult, backend: str) -> dict:
             return _validate_backend_judge_result(parsed)
         raise RuntimeError("scoring.json does not contain a JSON object")
 
-    # OpenClaw: parse from stdout
+    # OpenClaw / Hermes: parse from stdout
     stdout = result.stdout.strip()
     if not stdout:
         raise RuntimeError(f"{backend} did not produce scoring output")
@@ -910,10 +910,11 @@ def call_judge(
             rubric=rubric,
         )
 
-        # Build OpenClaw-specific message with absolute paths
-        openclaw_msg = None
-        if resolved == "openclaw":
-            openclaw_msg = (
+        # Build backend-specific messages for agents that do not consume
+        # Claude-style system prompts or Codex structured-output files.
+        file_based_msg = None
+        if resolved in ("openclaw", "hermes"):
+            file_based_msg = (
                 "Score the coding agent session using the files below.\n\n"
                 f"Read these absolute paths:\n"
                 f"- {tmp_path / 'judge_input.md'}\n"
@@ -924,8 +925,13 @@ def call_judge(
                 "Do not wrap it in markdown fences."
             )
 
-        # Codex uses structured output; give it a matching prompt
-        task_prompt = _SCORE_TASK_PROMPT_CODEX if resolved == "codex" else _SCORE_TASK_PROMPT
+        # Codex uses structured output; Hermes/OpenClaw get absolute paths.
+        if resolved == "codex":
+            task_prompt = _SCORE_TASK_PROMPT_CODEX
+        elif resolved == "hermes" and file_based_msg is not None:
+            task_prompt = file_based_msg
+        else:
+            task_prompt = _SCORE_TASK_PROMPT
 
         result = run_default_agent_task(
             backend=resolved,
@@ -937,7 +943,7 @@ def call_judge(
             codex_sandbox="read-only",
             codex_output_schema=JUDGE_SCHEMA,
             codex_output_file="scoring.json",
-            openclaw_message=openclaw_msg,
+            openclaw_message=file_based_msg if resolved == "openclaw" else None,
         )
 
         parsed = _read_scoring_output(result, resolved)

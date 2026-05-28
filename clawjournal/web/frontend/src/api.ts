@@ -242,8 +242,22 @@ export const api = {
     });
   },
 
-  scoringBackend(): Promise<{ backend: string | null; display_name: string | null }> {
+  scoringBackend(): Promise<{ backend: string | null; display_name: string | null; confirmed?: boolean; needs_confirmation?: boolean }> {
     return request('/scoring/backend');
+  },
+
+  scoringWarmup(body?: { confirm_backend?: boolean; backend?: string | null }): Promise<{
+    status: 'started' | 'already_running' | 'needs_confirmation' | 'disabled';
+    backend?: string | null;
+    display_name?: string | null;
+    reason?: string;
+    limit?: number;
+  }> {
+    return request('/scoring/warmup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    });
   },
 
   shares: {

@@ -15,7 +15,7 @@ import uuid
 import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +26,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .. import __version__
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
+from ..scoring.backends import (
+    SUPPORTED_BACKENDS,
+    detect_available_backend,
+    require_backend_command,
+)
 from ..scoring.overrides import (
     failure_evidence_from_detail,
     merge_failure_evidence,
@@ -86,7 +91,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
-AUTO_SCORE_BATCH_SIZE = 10
+AUTO_SCORE_BATCH_SIZE = 20
+SCORING_DISPLAY_NAMES = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "hermes": "Hermes Agent",
+    "openclaw": "OpenClaw",
+}
 
 _SHARE_MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 _SHARE_COOLDOWN_SECONDS = 10
@@ -143,6 +154,83 @@ def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: A
         ai_rubric_git_sha=getattr(result, "rubric_git_sha", "") or None,
         ai_scored_at=getattr(result, "scored_at", "") or None,
     )
+
+
+def _env_scoring_backend() -> str | None:
+    backend = os.environ.get("CLAWJOURNAL_SCORER_BACKEND", "").strip().lower()
+    return backend if backend in SUPPORTED_BACKENDS else None
+
+
+def _confirmed_scoring_backend() -> str | None:
+    env_backend = _env_scoring_backend()
+    if env_backend:
+        return env_backend
+    config = load_config()
+    backend = str(config.get("scorer_backend") or "").strip().lower()
+    if backend in SUPPORTED_BACKENDS:
+        return backend
+    return None
+
+
+def _suggest_scoring_backend() -> str | None:
+    return detect_available_backend()
+
+
+def _save_confirmed_scoring_backend(backend: str) -> None:
+    config = load_config()
+    config["scorer_backend"] = backend
+    config["scorer_backend_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+    save_config(config)
+
+
+def _scoring_backend_payload(backend: str | None) -> dict[str, Any]:
+    return {
+        "backend": backend,
+        "display_name": SCORING_DISPLAY_NAMES.get(backend or "", backend),
+    }
+
+
+def trigger_scoring_warmup(
+    scanner: "Scanner | None",
+    *,
+    confirm_backend: bool = False,
+    requested_backend: str | None = None,
+    limit: int = AUTO_SCORE_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Start the share-readiness scoring warmup if it is allowed."""
+    if scanner is None:
+        return {"status": "disabled", "reason": "Background scanner is not running."}
+
+    backend = _confirmed_scoring_backend()
+    suggested = (requested_backend or "").strip().lower() or None
+    if suggested is not None and suggested not in SUPPORTED_BACKENDS:
+        return {"status": "disabled", "reason": f"Unsupported scoring backend: {suggested}"}
+
+    if backend is None:
+        backend = suggested or _suggest_scoring_backend()
+        if backend is None:
+            return {
+                "status": "disabled",
+                "reason": "No supported scoring backend CLI was detected.",
+            }
+        try:
+            require_backend_command(backend)
+        except RuntimeError as exc:
+            return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
+        if not confirm_backend and _env_scoring_backend() is None:
+            return {
+                "status": "needs_confirmation",
+                "reason": "Confirm the detected AI scoring backend before background scoring starts.",
+                **_scoring_backend_payload(backend),
+            }
+        _save_confirmed_scoring_backend(backend)
+
+    try:
+        require_backend_command(backend)
+    except RuntimeError as exc:
+        return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
+
+    return scanner.trigger_auto_score(limit=limit, backend=backend)
 
 
 def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
@@ -249,8 +337,14 @@ class Scanner:
         finally:
             conn.close()
 
-    def score_unscored_once(self, *, limit: int = AUTO_SCORE_BATCH_SIZE) -> int:
-        """Score a recent batch of unscored traces using the current agent."""
+    def score_unscored_once(
+        self,
+        *,
+        limit: int = AUTO_SCORE_BATCH_SIZE,
+        since: str | None = None,
+        backend: str = "auto",
+    ) -> int:
+        """Score the latest failure-corpus traces using the selected backend."""
         if self._auto_score_disabled_reason:
             return 0
         if not self._score_lock.acquire(blocking=False):
@@ -261,13 +355,11 @@ class Scanner:
         try:
             conn = open_index()
             try:
-                source_scope = self.source_filter or FAILURE_VALUE_SOURCE_SCOPE
-                recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
                 sessions = query_unscored_sessions(
                     conn,
                     limit=limit,
-                    source=source_scope,
-                    since=recent_cutoff,
+                    source=FAILURE_VALUE_SOURCE_SCOPE,
+                    since=since,
                 )
                 if not sessions:
                     return 0
@@ -276,7 +368,7 @@ class Scanner:
                 for s in sessions:
                     sid = s["session_id"]
                     try:
-                        result = score_session(conn, sid, backend="auto")
+                        result = score_session(conn, sid, backend=backend)
                     except RuntimeError as exc:
                         message = str(exc)
                         if (
@@ -303,27 +395,34 @@ class Scanner:
         finally:
             self._score_lock.release()
 
-    def trigger_auto_score(self, *, limit: int = AUTO_SCORE_BATCH_SIZE) -> None:
-        """Start background scoring for recent unscored sessions if idle."""
+    def trigger_auto_score(
+        self,
+        *,
+        limit: int = AUTO_SCORE_BATCH_SIZE,
+        since: str | None = None,
+        backend: str = "auto",
+    ) -> dict[str, Any]:
+        """Start background scoring for the latest failure-corpus sessions if idle."""
         if self._auto_score_disabled_reason:
-            return
+            return {"status": "disabled", "reason": self._auto_score_disabled_reason}
         if self._score_thread and self._score_thread.is_alive():
-            return
+            return {"status": "already_running"}
 
         def _run() -> None:
-            scored = self.score_unscored_once(limit=limit)
+            scored = self.score_unscored_once(limit=limit, since=since, backend=backend)
             self.last_scored_count = scored
             if scored > 0:
                 logger.info("Auto-scored %d recent sessions", scored)
 
         self._score_thread = threading.Thread(target=_run, daemon=True)
         self._score_thread.start()
+        return {"status": "started", "limit": limit, "backend": backend}
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
                 results = self.scan_once()
-                self.trigger_auto_score()
+                trigger_scoring_warmup(self)
                 total_new = sum(results.values())
                 if total_new > 0 or self.last_linked_count > 0:
                     logger.info(
@@ -1822,6 +1921,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_add_allowlist()
         elif path == "/api/findings/allowlist":
             self._handle_add_findings_allowlist()
+        elif path == "/api/scoring/warmup":
+            self._handle_scoring_warmup()
         elif path == "/api/scan":
             force = parse_qs(parsed.query).get("force", [""])[0] in ("1", "true")
             self._handle_trigger_scan(force=force)
@@ -2448,17 +2549,24 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_scoring_backend(self) -> None:
         """Return the default AI scoring backend detected for this daemon."""
-        from ..scoring.backends import resolve_backend
-        display_names = {"claude": "Claude Code", "codex": "Codex", "openclaw": "OpenClaw"}
-        try:
-            backend = resolve_backend(backend="auto")
-        except RuntimeError:
-            _json_response(self, {"backend": None, "display_name": None})
-            return
+        backend = _confirmed_scoring_backend()
+        suggested = None if backend else _suggest_scoring_backend()
         _json_response(self, {
-            "backend": backend,
-            "display_name": display_names.get(backend, backend),
+            **_scoring_backend_payload(backend or suggested),
+            "confirmed": backend is not None,
+            "needs_confirmation": backend is None and suggested is not None,
         })
+
+    def _handle_scoring_warmup(self) -> None:
+        """Start background scoring for share-ready recommendations."""
+        body = _read_body(self) or {}
+        scanner = getattr(self.server, "_scanner", None)
+        payload = trigger_scoring_warmup(
+            scanner,
+            confirm_backend=bool(body.get("confirm_backend") or body.get("confirm")),
+            requested_backend=body.get("backend"),
+        )
+        _json_response(self, payload)
 
     def _handle_share_destination(self) -> None:
         """Return the optional hosted research-submission destination."""
@@ -3032,8 +3140,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         scanner = getattr(self.server, "_scanner", None)
         if scanner:
             results = scanner.scan_once()
-            scanner.trigger_auto_score()
+            warmup = trigger_scoring_warmup(scanner)
             payload: dict[str, Any] = {"ok": True, "new_sessions": results}
+            payload["scoring_warmup"] = warmup
             if force:
                 from ..config import load_config as _load_config
                 from .findings_pipeline import run_findings_pipeline
@@ -3298,7 +3407,7 @@ def run_server(
     def _initial_scan() -> None:
         logger.info("Running initial scan...")
         results = scanner.scan_once()
-        scanner.trigger_auto_score()
+        trigger_scoring_warmup(scanner)
         total = sum(results.values())
         logger.info(
             "Initial scan complete: %d sessions indexed, %d subagent relationships linked",

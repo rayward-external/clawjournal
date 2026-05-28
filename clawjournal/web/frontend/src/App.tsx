@@ -117,6 +117,29 @@ function Sidebar() {
 }
 
 export default function App() {
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const warmup = await api.scoringWarmup();
+        if (
+          !cancelled
+          && warmup.status === 'needs_confirmation'
+          && warmup.backend
+          && window.confirm(`Use ${warmup.display_name ?? warmup.backend} to score recent failure-corpus traces in the background?`)
+        ) {
+          await api.scoringWarmup({ confirm_backend: true, backend: warmup.backend });
+        }
+      } catch {
+        // Background scoring is opportunistic; the workbench stays usable.
+      }
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
   return (
     <BrowserRouter>
       <ToastProvider>

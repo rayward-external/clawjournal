@@ -13,12 +13,14 @@ from clawjournal.scoring.backends import (
     SUPPORTED_BACKENDS,
     _build_claude_cmd,
     _build_codex_cmd,
+    _build_hermes_cmd,
     _build_openclaw_cmd,
     _classify_process_command,
     _detect_current_agent_from_env,
     _detect_current_agent_from_process_tree,
     _get_process_field,
     check_backend_runtime,
+    detect_available_backend,
     format_codex_runtime_error,
     require_backend_command,
     resolve_backend,
@@ -29,10 +31,10 @@ from clawjournal.scoring.backends import (
 
 class TestConstants:
     def test_backend_choices_include_auto(self):
-        assert BACKEND_CHOICES == ("auto", "claude", "codex", "openclaw")
+        assert BACKEND_CHOICES == ("auto", "claude", "codex", "hermes", "openclaw")
 
     def test_supported_backends(self):
-        assert set(SUPPORTED_BACKENDS) == {"claude", "codex", "openclaw"}
+        assert set(SUPPORTED_BACKENDS) == {"claude", "codex", "hermes", "openclaw"}
 
 
 class TestDetection:
@@ -44,6 +46,9 @@ class TestDetection:
 
     def test_detect_from_env_openclaw(self):
         assert _detect_current_agent_from_env({"OPENCLAW_STATE_DIR": "/tmp"}) == "openclaw"
+
+    def test_detect_from_env_hermes(self):
+        assert _detect_current_agent_from_env({"HERMES_HOME": "/tmp/hermes"}) == "hermes"
 
     def test_detect_from_env_empty(self):
         assert _detect_current_agent_from_env({}) is None
@@ -59,6 +64,9 @@ class TestDetection:
     def test_classify_process_command_openclaw(self):
         assert _classify_process_command("openclaw", "") == "openclaw"
 
+    def test_classify_process_command_hermes(self):
+        assert _classify_process_command("hermes", "") == "hermes"
+
     def test_classify_process_command_unknown(self):
         assert _classify_process_command("bash", "/bin/bash") is None
 
@@ -67,6 +75,7 @@ class TestResolveBackend:
     def test_explicit_backend(self):
         assert resolve_backend("codex", {}) == "codex"
         assert resolve_backend("claude", {}) == "claude"
+        assert resolve_backend("hermes", {}) == "hermes"
         assert resolve_backend("openclaw", {}) == "openclaw"
 
     def test_explicit_unsupported_raises(self):
@@ -84,7 +93,8 @@ class TestResolveBackend:
 
     def test_auto_detects_from_env(self):
         env = {"CODEX_THREAD_ID": "thread-123"}
-        assert resolve_backend("auto", env) == "codex"
+        with patch("clawjournal.scoring.backends.shutil.which", return_value="/usr/bin/codex"):
+            assert resolve_backend("auto", env) == "codex"
 
 
 class TestErrorFormatting:
@@ -128,10 +138,26 @@ class TestRequireBackendCommand:
             require_backend_command("codex")
 
 
-class TestResolveBackendAutoNoAgent:
-    def test_raises_when_no_agent(self, monkeypatch):
+class TestResolveBackendAutoFallback:
+    def test_falls_back_when_detected_agent_cli_is_missing(self, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.scoring.backends.shutil.which",
+            lambda cmd: "/usr/bin/claude" if cmd == "claude" else None,
+        )
+        assert resolve_backend("auto", {"CODEX_THREAD_ID": "thread-123"}) == "claude"
+
+    def test_uses_installed_backend_when_no_agent(self, monkeypatch):
         monkeypatch.setattr("clawjournal.scoring.backends._detect_current_agent_from_process_tree", lambda **kw: None)
-        with pytest.raises(RuntimeError, match="Could not detect the current agent"):
+        monkeypatch.setattr(
+            "clawjournal.scoring.backends.shutil.which",
+            lambda cmd: "/usr/bin/hermes" if cmd == "hermes" else None,
+        )
+        assert resolve_backend("auto", {}) == "hermes"
+
+    def test_raises_when_no_agent_or_installed_backend(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.scoring.backends._detect_current_agent_from_process_tree", lambda **kw: None)
+        monkeypatch.setattr("clawjournal.scoring.backends.shutil.which", lambda cmd: None)
+        with pytest.raises(RuntimeError, match="Could not detect a supported scoring backend"):
             resolve_backend("auto", {})
 
 
@@ -259,6 +285,17 @@ class TestBuildOpenclawCmd:
             "--json",
             "--timeout", "60",
         ]
+
+
+class TestBuildHermesCmd:
+    def test_basic(self):
+        assert _build_hermes_cmd("hermes", message="score this", model=None) == [
+            "hermes", "-z", "score this",
+        ]
+
+    def test_with_model(self):
+        cmd = _build_hermes_cmd("hermes", message="score this", model="nous/hermes")
+        assert cmd == ["hermes", "-z", "score this", "--model", "nous/hermes"]
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +523,39 @@ class TestRunDefaultAgentTaskOpenclaw:
         )
         idx = captured_cmd.index("--message")
         assert captured_cmd[idx + 1] == "fallback prompt"
+
+
+class TestRunDefaultAgentTaskHermes:
+    def test_success(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        _stub_subprocess(monkeypatch, stdout='{"quality": 4}')
+        result = run_default_agent_task(
+            backend="hermes", cwd=tmp_path, task_prompt="score",
+        )
+        assert result.stdout == '{"quality": 4}'
+        assert result.returncode == 0
+
+    def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        _stub_subprocess(monkeypatch, returncode=1, stderr="error: failed")
+        with pytest.raises(RuntimeError, match="hermes exited 1"):
+            run_default_agent_task(
+                backend="hermes", cwd=tmp_path, task_prompt="score",
+            )
+
+    def test_model_override_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="hermes", cwd=tmp_path, task_prompt="score", model="nous/hermes",
+        )
+        assert captured_cmd == ["hermes", "-z", "score", "--model", "nous/hermes"]
 
 
 class TestRunDefaultAgentTaskUnsupportedBackend:

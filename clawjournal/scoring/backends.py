@@ -18,21 +18,25 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-SUPPORTED_BACKENDS = ("claude", "codex", "openclaw")
+SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
+AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
 BACKEND_COMMANDS: dict[str, str] = {
     "claude": "claude",
     "codex": "codex",
+    "hermes": "hermes",
     "openclaw": "openclaw",
 }
 BACKEND_ENV_MARKERS: dict[str, tuple[str, ...]] = {
     "claude": ("CLAUDECODE", "CLAUDE_CODE", "CLAUDECODE_SESSION_ID", "CLAUDE_PROJECT_DIR"),
     "codex": ("CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI"),
+    "hermes": ("HERMES_HOME", "HERMES_CONFIG_PATH", "HERMES_SESSION_ID"),
     "openclaw": ("OPENCLAW_HOME", "OPENCLAW_STATE_DIR", "OPENCLAW_CONFIG_PATH"),
 }
 BACKEND_COMMAND_ALIASES: dict[str, tuple[str, ...]] = {
     "claude": ("claude",),
     "codex": ("codex",),
+    "hermes": ("hermes",),
     "openclaw": ("openclaw",),
 }
 
@@ -103,10 +107,23 @@ def detect_current_agent(env: dict[str, str] | None = None) -> str | None:
     return _detect_current_agent_from_env(env) or _detect_current_agent_from_process_tree()
 
 
+def detect_available_backend(env: dict[str, str] | None = None) -> str | None:
+    """Detect a usable backend, falling back to installed CLIs."""
+    detected = detect_current_agent(env)
+    if detected and shutil.which(BACKEND_COMMANDS[detected]) is not None:
+        return detected
+    for backend in AUTO_BACKEND_FALLBACK_ORDER:
+        command = BACKEND_COMMANDS[backend]
+        if shutil.which(command) is not None:
+            return backend
+    return None
+
+
 def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) -> str:
     """Resolve 'auto' backend selection to a concrete backend name.
 
-    Priority: explicit value > CLAWJOURNAL_SCORER_BACKEND env > auto-detect.
+    Priority: explicit value > CLAWJOURNAL_SCORER_BACKEND env >
+    current-agent detection > installed CLI fallback.
     """
     env = os.environ if env is None else env
     requested = (backend or "auto").strip().lower()
@@ -124,13 +141,13 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
             )
         return override
 
-    detected = detect_current_agent(env)
+    detected = detect_available_backend(env)
     if detected:
         return detected
 
     raise RuntimeError(
-        "Could not detect the current agent. "
-        "Run clawjournal from a supported agent CLI, set CLAWJOURNAL_SCORER_BACKEND, "
+        "Could not detect a supported scoring backend. "
+        "Install a supported agent CLI, set CLAWJOURNAL_SCORER_BACKEND, "
         "or pass --backend explicitly."
     )
 
@@ -308,6 +325,19 @@ def _build_openclaw_cmd(
     ]
 
 
+def _build_hermes_cmd(
+    command: str,
+    *,
+    message: str,
+    model: str | None,
+) -> list[str]:
+    """Build a Hermes scripted one-shot invocation."""
+    cmd = [command, "-z", message]
+    if model:
+        cmd += ["--model", model]
+    return cmd
+
+
 def run_default_agent_task(
     *,
     backend: str = "auto",
@@ -330,12 +360,13 @@ def run_default_agent_task(
     parsing.
 
     Args:
-        backend: "auto", "claude", "codex", or "openclaw".
+        backend: "auto", "claude", "codex", "hermes", or "openclaw".
         cwd: Working directory for the subprocess.
         system_prompt_file: Path to system prompt (used by Claude's
             ``--system-prompt-file``; ignored by other backends).
         task_prompt: The task instruction. Delivered via stdin (Claude),
-            positional arg (Codex), or ``--message`` (OpenClaw).
+            positional arg (Codex), scripted one-shot (Hermes), or
+            ``--message`` (OpenClaw).
         model: Optional model override for Claude/Codex.
         timeout_seconds: Subprocess timeout.
         codex_sandbox: Codex sandbox mode ("read-only" or None for
@@ -461,6 +492,30 @@ def run_default_agent_task(
         if proc.returncode != 0:
             summary = summarize_process_error(proc.stderr, proc.stdout)
             raise RuntimeError(f"openclaw exited {proc.returncode}: {summary}")
+
+        return AgentResult(
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            returncode=proc.returncode,
+            cwd=cwd,
+        )
+
+    if resolved == "hermes":
+        cmd = _build_hermes_cmd(command, message=task_prompt, model=model)
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds + 10,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Timed out waiting for hermes ({timeout_seconds}s)")
+
+        if proc.returncode != 0:
+            summary = summarize_process_error(proc.stderr, proc.stdout)
+            raise RuntimeError(f"hermes exited {proc.returncode}: {summary}")
 
         return AgentResult(
             stdout=proc.stdout or "",
