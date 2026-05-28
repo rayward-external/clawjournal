@@ -163,6 +163,7 @@ export interface Share {
   hosted_receipt_id?: string | null;
   hosted_status?: string | null;
   hosted_submission_url?: string | null;
+  zip_size_bytes?: number | null;
   sessions?: Session[];
 }
 

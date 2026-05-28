@@ -1354,9 +1354,8 @@ def submit_share_to_hosted(
     force: bool = False,
 ) -> dict[str, Any]:
     """Submit a finalized share zip to the hosted research API."""
-    # Consent + token gates run first so any in-process caller (CLI, tests)
-    # gets a precise rejection before we hit the DB or the network. The HTTP
-    # handler already checks for missing keys; this is defense-in-depth.
+    # The HTTP handler already checks for missing keys; these checks keep
+    # in-process callers from submitting without the exact displayed terms.
     if not accept_terms or not ownership_certification:
         return {
             "error": "You must accept the terms and certify ownership before submitting.",
@@ -1365,24 +1364,9 @@ def submit_share_to_hosted(
     if not consent_version or not retention_policy_version:
         return {"error": "Consent and retention versions are required.", "status": 400}
 
-    try:
-        _verified_email, upload_token = _ensure_hosted_upload_token()
-    except RuntimeError as exc:
-        return {"error": str(exc), "status": 403}
-
     share = get_share(conn, share_id)
     if share is None:
         return {"error": "Share not found", "status": 404}
-
-    from .index import release_gate_blockers
-    session_ids = [s["session_id"] for s in share.get("sessions") or []]
-    blockers = release_gate_blockers(conn, session_ids)
-    if blockers:
-        return {
-            "error": "Share contains sessions that are not released",
-            "blockers": blockers,
-            "status": 409,
-        }
 
     # `force` is only meaningful when the share has already been submitted;
     # for hosted research it surfaces a clearer "cannot overwrite" message.
@@ -1413,6 +1397,21 @@ def submit_share_to_hosted(
             "shared_at": prior_shared_at,
             "status": 409,
         }
+
+    from .index import release_gate_blockers
+    session_ids = [s["session_id"] for s in share.get("sessions") or []]
+    blockers = release_gate_blockers(conn, session_ids)
+    if blockers:
+        return {
+            "error": "Share contains sessions that are not released",
+            "blockers": blockers,
+            "status": 409,
+        }
+
+    try:
+        _verified_email, upload_token = _ensure_hosted_upload_token()
+    except RuntimeError as exc:
+        return {"error": str(exc), "status": 403}
 
     try:
         capabilities = _fetch_hosted_share_capabilities()
@@ -2595,6 +2594,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             if share is None:
                 _json_response(self, {"error": "Share not found"}, 404)
                 return
+            cached = _load_finalized_share_export(share_id)
+            if cached is not None:
+                export_dir, _manifest = cached
+                try:
+                    share["zip_size_bytes"] = len(_build_share_zip(export_dir))
+                except OSError:
+                    pass
             share.pop("gcs_uri", None)
             _with_legacy_bundle_alias(share)
             _json_response(self, share)

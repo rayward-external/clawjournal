@@ -1530,6 +1530,7 @@ class TestShareAPI:
         status, detail = _get(server, f"/api/shares/{share_id}")
         assert status == 200
         assert detail["hosted_receipt_id"] == "rcpt-test-123"
+        assert detail["zip_size_bytes"] > 0
         assert "gcs_uri" not in detail
 
         status, share_list = _get(server, "/api/shares")
@@ -1594,6 +1595,33 @@ class TestShareAPI:
         assert "cannot be overwritten" in data["error"]
         assert data["receipt_id"] == "rcpt-test-123"
 
+    def test_duplicate_receipt_returned_even_without_valid_token(self, server, monkeypatch):
+        """Receipt hydration/retry should not require a still-valid upload token."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        conn = open_index()
+        conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ?, "
+            "hosted_receipt_id = ?, hosted_status = ? WHERE share_id = ?",
+            (
+                "2026-01-01T00:00:00+00:00",
+                "rcpt-existing-123",
+                "received",
+                share_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 409
+        assert data["receipt_id"] == "rcpt-existing-123"
+        assert data["hosted_status"] == "received"
+        assert "already submitted" in data["error"]
+
     def test_force_on_fresh_share_submits(self, server, monkeypatch):
         """`force: true` on a never-submitted share submits normally (force is ignored)."""
         WorkbenchHandler._last_share_time = 0.0
@@ -1624,9 +1652,9 @@ class TestShareAPI:
         conn.commit()
         conn.close()
 
-        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
-        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
-            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 409
         assert "self-hosted ingest" in data["error"]

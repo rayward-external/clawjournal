@@ -762,7 +762,7 @@ export function Share() {
         setBundleInfo((current) => current || {
           traces: share.session_count,
           created: share.created_at ? formatDate(share.created_at) : '',
-          approxSize: 'ready',
+          approxSize: share.zip_size_bytes ? formatBytes(share.zip_size_bytes) : 'ready',
         });
       }
     }).catch(() => { });
@@ -3029,7 +3029,7 @@ function DoneStep(p: DoneStepProps) {
             </div>
             <div>
               <div style={statLabelStyle}>File size</div>
-              <div style={statValueStyle}>~{p.bundle.approxSize}</div>
+              <div style={statValueStyle}>{p.bundle.approxSize}</div>
             </div>
             <div>
               <div style={statLabelStyle}>Created</div>
