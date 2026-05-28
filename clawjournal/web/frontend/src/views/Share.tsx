@@ -96,6 +96,11 @@ function outcomeBadge(outcome: string | null): string {
 }
 
 const formatTokens = (t: number) => t >= 1_000_000 ? `${(t / 1_000_000).toFixed(1)}M` : `${(t / 1000).toFixed(0)}k`;
+const formatBytes = (bytes: number) => {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${bytes} B`;
+};
 
 // Matches SessionDetail's formula: input + output (cache tokens excluded).
 const sessionTotalTokens = (s: { input_tokens?: number; output_tokens?: number }) =>
@@ -131,13 +136,14 @@ const SHARE_SHELL_WIDTH = '1120px';
 // Types
 // ============================================================
 
-type StepKey = 'queue' | 'redact' | 'review' | 'package' | 'done';
+type StepKey = 'queue' | 'redact' | 'review' | 'package' | 'submit' | 'done';
 
 const STEPS = [
   { key: 'queue', label: 'Queue' },
   { key: 'redact', label: 'Redact' },
   { key: 'review', label: 'Review' },
   { key: 'package', label: 'Package' },
+  { key: 'submit', label: 'Submit' },
   { key: 'done', label: 'Done' },
 ];
 
@@ -176,10 +182,25 @@ interface ShareReadyStats {
 
 interface ShareDestination {
   configured: boolean;
+  daemon_upload_supported: boolean;
+  submissions_open: boolean;
   preferred_upload_flow: string;
   cli_ingest_supported: boolean;
   share_page_url: string | null;
+  submit_page_url?: string | null;
+  maximum_bundle_size?: number | null;
+  accepted_manifest_schema_versions?: string[];
+  support_contact?: string | null;
   message?: string;
+}
+
+interface HostedConsent {
+  consent_text: string;
+  retention_text: string;
+  consent_version: string;
+  retention_policy_version: string;
+  support_contact?: string;
+  [key: string]: unknown;
 }
 
 function formatShareDestination(url: string): string {
@@ -569,6 +590,9 @@ export function Share() {
 
   // Done state
   const [bundleInfo, setBundleInfo] = useState<{ traces: number; created: string; approxSize: string } | null>(null);
+  const [receiptId, setReceiptId] = useState<string | null>(null);
+  const [hostedStatus, setHostedStatus] = useState<string | null>(null);
+  const [supportContact, setSupportContact] = useState<string | null>(null);
 
   // Candidates (empty queue hint)
   const [candidates, setCandidates] = useState<Session[]>([]);
@@ -590,6 +614,7 @@ export function Share() {
       setShares(shareList);
       setScoringBackend(backend);
       setShareDestination(destination);
+      setSupportContact(destination?.support_contact || null);
       if (!selectionInitialized && stats.sessions.length > 0) {
         // Server recommendation is an ordered, reviewable default package.
         // Trust it and only filter out ids the client can't resolve
@@ -640,6 +665,9 @@ export function Share() {
     setApprovedIds(new Set());
     setExpandedReviewIds(new Set());
     setBundleInfo(null);
+    setReceiptId(null);
+    setHostedStatus(null);
+    setSupportContact(null);
     setPackageProgress(0);
     setPackageLog('');
     setPackagingFailed(null);
@@ -721,6 +749,25 @@ export function Share() {
     [queueOrder, sessionById],
   );
 
+  useEffect(() => {
+    if (!packagedShareId) return;
+    api.shares.get(packagedShareId).then((share) => {
+      if (share.hosted_receipt_id) {
+        setReceiptId(share.hosted_receipt_id);
+        setCompletedKeys((prev) => new Set([...prev, 'submit']));
+        setActiveStep((step) => step === 'submit' ? 'done' : step);
+      }
+      if (share.hosted_status) setHostedStatus(share.hosted_status);
+      if (share.session_count) {
+        setBundleInfo((current) => current || {
+          traces: share.session_count,
+          created: share.created_at ? formatDate(share.created_at) : '',
+          approxSize: 'ready',
+        });
+      }
+    }).catch(() => { });
+  }, [packagedShareId]);
+
   // =================================================
   // Queue actions
   // =================================================
@@ -755,6 +802,9 @@ export function Share() {
     setApprovedIds(new Set());
     setExpandedReviewIds(new Set());
     setBundleInfo(null);
+    setReceiptId(null);
+    setHostedStatus(null);
+    setSupportContact(null);
     setPackageProgress(0);
     setPackageLog('');
     setPackagingFailed(null);
@@ -1038,7 +1088,7 @@ export function Share() {
       // Seal performs the final local-only AI PII pass and post-PII
       // TruffleHog gate without triggering a browser save. The Done button
       // is the only action that downloads bytes.
-      await api.shares.seal(share_id);
+      const sealed = await api.shares.seal(share_id);
 
       setPackageProgress(100);
       setPackageLog('Done.');
@@ -1047,17 +1097,18 @@ export function Share() {
       // source of RangeError in some Intl configs).
       const totalTokens = approvedList.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
       const approxMB = Math.max(0.1, (totalTokens * 0.3) / (1024 * 1024));
+      const sizeLabel = sealed.zip_size_bytes ? formatBytes(sealed.zip_size_bytes) : (approxMB >= 1 ? `${approxMB.toFixed(1)} MB` : `${(approxMB * 1024).toFixed(0)} KB`);
       try {
         setBundleInfo({
           traces: approvedList.length,
           created: new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
-          approxSize: approxMB >= 1 ? `${approxMB.toFixed(1)} MB` : `${(approxMB * 1024).toFixed(0)} KB`,
+          approxSize: sizeLabel,
         });
       } catch {
         setBundleInfo({
           traces: approvedList.length,
           created: new Date().toISOString().slice(11, 16),
-          approxSize: approxMB >= 1 ? `${approxMB.toFixed(1)} MB` : `${(approxMB * 1024).toFixed(0)} KB`,
+          approxSize: sizeLabel,
         });
       }
 
@@ -1100,9 +1151,10 @@ export function Share() {
   useEffect(() => {
     if (activeStep === 'package' && packagedShareId && packageProgress >= 100 && !packagingFailed) {
       setCompletedKeys((prev) => new Set([...prev, 'package']));
-      setActiveStep('done');
+      const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
+      setActiveStep(canSubmit ? 'submit' : 'done');
     }
-  }, [activeStep, packagedShareId, packageProgress, packagingFailed]);
+  }, [activeStep, packagedShareId, packageProgress, packagingFailed, shareDestination]);
 
   // =================================================
   // Step 5: Done actions
@@ -1116,6 +1168,15 @@ export function Share() {
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : 'Download failed', 'error');
     }
+  };
+
+  const handleSubmitComplete = (receipt: string, status?: string | null, support?: string | null) => {
+    setReceiptId(receipt);
+    setHostedStatus(status || null);
+    if (support) setSupportContact(support);
+    setCompletedKeys((prev) => new Set([...prev, 'submit']));
+    setActiveStep('done');
+    try { reload(); } catch { /* ignore */ }
   };
 
   // =================================================
@@ -1259,13 +1320,35 @@ export function Share() {
   }
 
   // =====================================================
-  // STEP 5: DONE
+  // STEP 5: SUBMIT
+  // =====================================================
+  if (activeStep === 'submit') {
+    return (
+      <SubmitStep
+        stepperHeader={stepperHeader}
+        shareId={packagedShareId}
+        bundle={bundleInfo}
+        shareDestination={shareDestination}
+        onSubmitted={handleSubmitComplete}
+        onDownloadZip={handleDownloadZip}
+        onBack={() => setActiveStep('package')}
+        globalStyles={globalStyles}
+        toast={toast}
+      />
+    );
+  }
+
+  // =====================================================
+  // STEP 6: DONE
   // =====================================================
   if (activeStep === 'done') {
     return (
       <DoneStep
         stepperHeader={stepperHeader}
         bundle={bundleInfo}
+        receiptId={receiptId}
+        hostedStatus={hostedStatus}
+        supportContact={supportContact || shareDestination?.support_contact || null}
         onDownloadAgain={handleDownloadZip}
         onNew={() => { startFreshShare(); reload(); }}
         globalStyles={globalStyles}
@@ -2581,12 +2664,265 @@ function PackageStep(p: PackageStepProps) {
 }
 
 // ============================================================
-// Step 5: Done component
+// Step 5: Submit component
+// ============================================================
+
+interface SubmitStepProps {
+  stepperHeader: React.ReactNode;
+  shareId: string | null;
+  bundle: { traces: number; created: string; approxSize: string } | null;
+  shareDestination: ShareDestination | null;
+  onSubmitted: (receiptId: string, status?: string | null, supportContact?: string | null) => void;
+  onDownloadZip: () => void;
+  onBack: () => void;
+  globalStyles: React.ReactNode;
+  toast: (message: string, type?: 'success' | 'error' | 'info') => void;
+}
+
+function SubmitStep(p: SubmitStepProps) {
+  const [consent, setConsent] = useState<HostedConsent | null>(null);
+  const [loadingConsent, setLoadingConsent] = useState(true);
+  const [tokenValid, setTokenValid] = useState(false);
+  const [verifiedEmail, setVerifiedEmail] = useState<string | null>(null);
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
+  const [email, setEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [devCode, setDevCode] = useState<string | null>(null);
+  const [acceptTerms, setAcceptTerms] = useState(false);
+  const [ownership, setOwnership] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadSubmitState = useCallback(async () => {
+    setLoadingConsent(true);
+    try {
+      const [consentData, status] = await Promise.all([
+        api.share.consent(),
+        api.share.uploadStatus(),
+      ]);
+      setConsent(consentData);
+      setTokenValid(!!status.token_valid);
+      setVerifiedEmail(status.verified_email);
+      setPendingEmail(status.pending_email);
+      setEmail(status.pending_email || status.verified_email || '');
+      setError(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not load hosted submission state');
+    } finally {
+      setLoadingConsent(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSubmitState();
+  }, [loadSubmitState]);
+
+  const sendCode = async () => {
+    if (!email.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.share.verifyEmail(email.trim());
+      setPendingEmail(result.email);
+      setDevCode(result.dev_code || null);
+      p.toast('Verification code sent', 'success');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not send verification code');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const verifyCode = async () => {
+    if (!code.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.share.verifyConfirm(code.trim());
+      setTokenValid(true);
+      setVerifiedEmail(result.verified_email);
+      setPendingEmail(null);
+      setDevCode(null);
+      p.toast('Email verified', 'success');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not verify code');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submit = async () => {
+    if (!p.shareId || !consent) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.shares.upload(p.shareId, {
+        accept_terms: acceptTerms,
+        ownership_certification: ownership,
+        consent_version: consent.consent_version,
+        retention_policy_version: consent.retention_policy_version,
+      });
+      p.toast('Submitted', 'success');
+      p.onSubmitted(result.receipt_id, result.hosted_status || null, consent.support_contact || p.shareDestination?.support_contact || null);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Submission failed';
+      setError(msg);
+      if (/consent|retention|version|terms/i.test(msg)) {
+        setAcceptTerms(false);
+        setOwnership(false);
+        void loadSubmitState();
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disabled = busy || loadingConsent || !p.shareId || !tokenValid || !acceptTerms || !ownership || !consent;
+  const supportContact = consent?.support_contact || p.shareDestination?.support_contact || null;
+
+  return (
+    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
+      {p.globalStyles}
+      {p.stepperHeader}
+      <div style={{ maxWidth: 760, margin: '0 auto', padding: '32px 0 0' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, alignItems: 'flex-start', marginBottom: 18, flexWrap: 'wrap' }}>
+          <div>
+            <h2 style={{ fontSize: 20, fontWeight: 500, margin: '0 0 6px', color: colors.gray900 }}>
+              Submit to ClawJournal Research
+            </h2>
+            <div style={{ color: colors.gray500, fontSize: 13 }}>
+              {p.bundle ? `${p.bundle.traces} trace${p.bundle.traces === 1 ? '' : 's'} · ${p.bundle.approxSize}` : 'Finalized bundle'}
+            </div>
+          </div>
+          <button onClick={p.onDownloadZip} style={btnSecondary}>
+            <Icon name="download" size={14} /> Download zip instead
+          </button>
+        </div>
+
+        {error && (
+          <div style={{
+            marginBottom: 14, padding: '10px 12px',
+            background: colors.red50, border: `1px solid ${colors.red200}`,
+            color: colors.red500, borderRadius: 8, fontSize: 13,
+          }}>
+            {error}
+          </div>
+        )}
+
+        <div style={{
+          display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))',
+          gap: 18, alignItems: 'start',
+        }}>
+          <div style={{ background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 8, overflow: 'hidden' }}>
+            <div style={{ padding: '12px 14px', borderBottom: `1px solid ${colors.gray200}`, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Icon name="shield" size={15} />
+              <span style={{ fontSize: 13, fontWeight: 600, color: colors.gray900 }}>Consent and retention</span>
+            </div>
+            <div style={{ maxHeight: 320, overflow: 'auto', padding: 14, color: colors.gray700, fontSize: 13.5, lineHeight: 1.6 }}>
+              {loadingConsent ? (
+                <Spinner text="Loading terms..." />
+              ) : consent ? (
+                <>
+                  <p style={{ margin: '0 0 12px' }}>{consent.consent_text}</p>
+                  <p style={{ margin: 0 }}>{consent.retention_text}</p>
+                  <div style={{ marginTop: 14, display: 'flex', gap: 8, flexWrap: 'wrap', color: colors.gray500, fontSize: 11.5, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                    <span>{consent.consent_version}</span>
+                    <span>{consent.retention_policy_version}</span>
+                  </div>
+                </>
+              ) : (
+                <span>Terms are unavailable.</span>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gap: 12 }}>
+            <div style={{ background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 8, padding: 14 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray900, marginBottom: 10 }}>Verified email</div>
+              {tokenValid ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: colors.green500, fontSize: 13 }}>
+                  <Icon name="check" size={14} /> {verifiedEmail}
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <input
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="name@university.edu"
+                    style={{ padding: '9px 10px', border: `1px solid ${colors.gray300}`, borderRadius: 8, fontSize: 13 }}
+                  />
+                  <button onClick={sendCode} disabled={busy || !email.trim()} style={{ ...btnPrimary, justifyContent: 'center', opacity: busy || !email.trim() ? 0.5 : 1 }}>
+                    Send code
+                  </button>
+                  {(pendingEmail || devCode) && (
+                    <>
+                      <input
+                        value={code}
+                        onChange={(e) => setCode(e.target.value)}
+                        placeholder="Verification code"
+                        style={{ padding: '9px 10px', border: `1px solid ${colors.gray300}`, borderRadius: 8, fontSize: 13 }}
+                      />
+                      {devCode && (
+                        <div style={{ fontSize: 12, color: colors.gray500, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>
+                          {devCode}
+                        </div>
+                      )}
+                      <button onClick={verifyCode} disabled={busy || !code.trim()} style={{ ...btnSecondary, justifyContent: 'center', opacity: busy || !code.trim() ? 0.5 : 1 }}>
+                        Verify
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div style={{ background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 8, padding: 14, display: 'grid', gap: 10 }}>
+              <CheckboxRow checked={acceptTerms} onChange={setAcceptTerms}>
+                I accept the displayed consent and data-use terms.
+              </CheckboxRow>
+              <CheckboxRow checked={ownership} onChange={setOwnership}>
+                I certify this bundle is mine to submit and contains no third-party confidential material.
+              </CheckboxRow>
+              <button onClick={submit} disabled={disabled} style={{ ...btnPrimary, justifyContent: 'center', opacity: disabled ? 0.45 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}>
+                <Icon name="check" size={14} /> Submit to ClawJournal Research
+              </button>
+              {supportContact && (
+                <div style={{ fontSize: 11.5, color: colors.gray500, textAlign: 'center' }}>
+                  Support: {supportContact}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CheckboxRow({ checked, onChange, children }: { checked: boolean; onChange: (checked: boolean) => void; children: React.ReactNode }) {
+  return (
+    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 9, fontSize: 12.5, color: colors.gray700, lineHeight: 1.4, cursor: 'pointer' }}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ marginTop: 2, width: 15, height: 15, accentColor: colors.gray900, flexShrink: 0 }}
+      />
+      <span>{children}</span>
+    </label>
+  );
+}
+
+// ============================================================
+// Step 6: Done component
 // ============================================================
 
 interface DoneStepProps {
   stepperHeader: React.ReactNode;
   bundle: { traces: number; created: string; approxSize: string } | null;
+  receiptId: string | null;
+  hostedStatus: string | null;
+  supportContact: string | null;
   onDownloadAgain: () => void;
   onNew: () => void;
   globalStyles: React.ReactNode;
@@ -2610,6 +2946,7 @@ function DoneStep(p: DoneStepProps) {
 
   const hostedShareUrl = p.shareDestination?.configured ? p.shareDestination.share_page_url : null;
   const hostedShareLabel = hostedShareUrl ? formatShareDestination(hostedShareUrl) : null;
+  const submitted = !!p.receiptId;
   const zipFiles = [
     { name: 'manifest.json', detail: 'metadata' },
     { name: 'sessions.jsonl', detail: p.bundle ? `~${p.bundle.approxSize}` : 'redacted traces' },
@@ -2666,14 +3003,14 @@ function DoneStep(p: DoneStepProps) {
           marginBottom: 18,
         }}>
           <span style={{ width: 6, height: 6, borderRadius: '50%', background: colors.green500 }} />
-          local &middot; redacted &middot; not uploaded
+          {submitted ? 'submitted · redacted · receipt saved' : 'local · redacted · not uploaded'}
         </div>
 
         <h2 style={{ fontSize: 22, fontWeight: 500, letterSpacing: '-0.02em', margin: '0 0 8px', color: colors.gray900 }}>
-          Your bundle is ready
+          {submitted ? 'Submitted' : 'Your bundle is ready'}
         </h2>
         <p style={{ color: colors.gray500, margin: '0 0 24px', fontSize: 14 }}>
-          Download the finalized zip, then upload it through the hosted submission page.
+          {submitted ? `Receipt ${p.receiptId}` : 'Download the finalized zip, then upload it through the hosted submission page.'}
         </p>
 
         {p.bundle && (
@@ -2712,7 +3049,7 @@ function DoneStep(p: DoneStepProps) {
           >
             <Icon name="download" size={15} /> Download zip
           </button>
-          {hostedShareUrl && (
+          {hostedShareUrl && !submitted && (
             <a
               href={hostedShareUrl}
               target="_blank"
@@ -2729,7 +3066,12 @@ function DoneStep(p: DoneStepProps) {
           )}
         </div>
         <div style={{ fontSize: 12, color: colors.gray500, marginBottom: 8 }}>
-          {hostedShareLabel ? (
+          {submitted ? (
+            <>
+              {p.hostedStatus ? `Status: ${p.hostedStatus}. ` : null}
+              {p.supportContact ? `For deletion or withdrawal, contact ${p.supportContact} with the receipt ID.` : null}
+            </>
+          ) : hostedShareLabel ? (
             <>
               Upload this zip at <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{hostedShareLabel}</span> to contribute to research.
             </>

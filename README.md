@@ -61,7 +61,7 @@ Everything in the default workflow runs on your own computer:
 - The review UI opens on `localhost:8384` in your own browser — no account, no cloud service.
 - `scan` auto-runs a secrets + PII findings pipeline per session. Findings are stored as hashed references in your local SQLite DB — plaintext is never persisted.
 - `bundle-export` writes redacted files to your disk. It does not upload them.
-- Uploading is a separate, opt-in flow. If you never configure an ingest endpoint and never run a share command, nothing is sent anywhere.
+- Uploading is a separate, opt-in flow. If you never use the workbench Submit step and never run `bundle-share` against a configured self-hosted ingest endpoint, nothing is sent anywhere.
 
 ## If you decide to share
 
@@ -69,7 +69,7 @@ Sharing is fully opt-in and separate from local review. When you do choose to ex
 
 The AI-assisted PII review uses the same backend as `score` — your current coding agent's automation CLI (e.g. `codex exec`, the Claude CLI). Home-dir paths and usernames are anonymized locally before anything is sent to the agent; if your agent routes to a cloud provider, that's where the PII review happens. Override with `--backend` to keep the call on a local model.
 
-See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing paths (local file vs. self-configured upload).
+See [PRIVACY.md](PRIVACY.md) for the full redaction list and the sharing paths (local file, hosted research submission, or self-configured ingest upload).
 
 ---
 
@@ -327,11 +327,11 @@ Package the conversations you approved into a redacted file on your computer. Up
 
 **Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
-The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed. Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
+The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Submit → Done**. The Redact step uses AI to catch any personal info the automatic scan missed. Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
 
-To actually upload after packaging (optional), use the hosted Rayward submission page. The Done screen shows **Submit to ClawJournal Research** by default; that page verifies email, shows consent, and asks for the downloaded zip. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables the hosted button.
+To actually upload after packaging (optional), use the workbench **Submit** step. It verifies email, shows consent, sends the finalized zip to the hosted service, and stores the returned receipt locally. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables hosted submission and leaves download-only packaging.
 
-> *(optional)* *"Open the ClawJournal Research submission page so I can upload the exported zip."*
+> *(optional)* *"Submit this bundle to ClawJournal Research."*
 
 Uploads are gated: only conversations you approved and confirmed for sharing leave your machine.
 
@@ -344,11 +344,10 @@ clawjournal bundle-list
 clawjournal bundle-view <bundle_id>                  # inspect before exporting
 clawjournal bundle-export <bundle_id> --zip          # write an uploadable zip plus export folder
 
-# Optional hosted browser upload:
-python -m webbrowser "https://data.rayward.ai/share"  # packaged default
+# Optional hosted research submission:
+# use the workbench Share tab's Submit step
 
 # Advanced self-hosted ingest upload:
-clawjournal verify-email you@university.edu          # one-time email verification
 clawjournal share --preview --status approved        # dry-run
 clawjournal bundle-share <bundle_id>                 # self-hosted ingest upload
 ```
@@ -520,9 +519,10 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 
 | Command | Description |
 |---------|-------------|
-| `clawjournal verify-email you@university.edu` | Verify a `.edu` email for upload authorization |
-| `clawjournal share --preview --status approved` | Preview what would be uploaded through ingest |
-| `clawjournal share --status approved` | Create a bundle and upload through the configured self-hosted ingest service |
+| `clawjournal verify-email you@university.edu` | Verify an academic email for hosted workbench submission |
+| `clawjournal share --preview --status approved` | Preview what would be packaged |
+| `clawjournal share --status approved` | Package locally and print the workbench Submit URL |
+| `clawjournal bundle-share <bundle_id>` | Upload through an explicitly configured self-hosted ingest service |
 
 ### Configuration
 

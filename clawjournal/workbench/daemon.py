@@ -104,6 +104,8 @@ _SHARE_GCS_BUCKET = os.environ.get("CLAWJOURNAL_GCS_BUCKET", "clawjournal-traces
 _SHARE_GCS_PREFIX = os.environ.get("CLAWJOURNAL_GCS_PREFIX", "clawjournal")
 _SHARE_UPLOAD_TIMEOUT = 120
 _share_rate_lock = threading.Lock()
+_HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
+_hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 
 # Sources supported in the workbench (scientist-facing subset)
 WORKBENCH_SOURCES = {
@@ -449,9 +451,56 @@ def _parse_json_fields(rows: list[dict]) -> None:
 
 
 
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def _email_domain_allowed(
+    email: str,
+    capabilities: dict[str, Any] | None = None,
+) -> bool:
+    normalized = _normalize_email(email)
+    if "@" not in normalized:
+        return False
+    domain = normalized.rsplit("@", 1)[1]
+    policy = (capabilities or {}).get("supported_institution_email_policy")
+    suffixes = _HOSTED_EMAIL_SUFFIXES_DEFAULT
+    if isinstance(policy, dict) and isinstance(policy.get("domain_suffixes"), list):
+        suffixes = tuple(str(item).lower() for item in policy["domain_suffixes"] if item)
+    for suffix in suffixes:
+        normalized_suffix = suffix.strip().lower()
+        if not normalized_suffix:
+            continue
+        bare_suffix = normalized_suffix[1:] if normalized_suffix.startswith(".") else normalized_suffix
+        if domain == bare_suffix or domain.endswith(f".{bare_suffix}"):
+            return True
+    return False
+
+
+def _expiry_timestamp(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _expiry_is_valid(value: Any, *, grace_seconds: int = 60) -> bool:
+    timestamp = _expiry_timestamp(value)
+    return timestamp is not None and time.time() < (timestamp - grace_seconds)
+
+
 def _is_edu_email(email: str) -> bool:
-    """Check if an email address has a .edu domain."""
-    return bool(email and email.strip().lower().endswith(".edu"))
+    """Check if an email address matches the hosted academic-email policy."""
+    return _email_domain_allowed(email)
 
 
 def _missing_ingest_url_error() -> str:
@@ -459,7 +508,7 @@ def _missing_ingest_url_error() -> str:
         "CLI ingest upload is not configured in this build. "
         "Use the workbench Download zip action or `clawjournal bundle-export` "
         "to produce a local zip. Hosted research submissions use the configured "
-        "browser upload page; self-hosters can set CLAWJOURNAL_INGEST_URL to "
+        "workbench Submit step; self-hosters can set CLAWJOURNAL_INGEST_URL to "
         "point at their own ingest backend."
     )
 
@@ -479,6 +528,60 @@ def _validated_hosted_share_url() -> tuple[str | None, str]:
     return None, "CLAWJOURNAL_SHARE_URL must use HTTPS, or localhost for development."
 
 
+def _hosted_api_base() -> str:
+    share_url, message = _validated_hosted_share_url()
+    if not share_url:
+        raise RuntimeError(message)
+    parsed = urlparse(share_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _json_request(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    data = None
+    headers = {"User-Agent": f"clawjournal/{__version__}"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+    if not body:
+        return {}
+    parsed = json.loads(body.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("Hosted service returned an invalid response.")
+    return parsed
+
+
+def _fetch_hosted_share_capabilities(*, force: bool = False) -> dict[str, Any]:
+    """Fetch and daemon-cache the hosted submission capability document."""
+    global _hosted_capabilities_cache
+    now = time.time()
+    api_base = _hosted_api_base()
+    if not force and _hosted_capabilities_cache is not None:
+        cached_base, expires_at, cached = _hosted_capabilities_cache
+        if cached_base == api_base and now < expires_at:
+            return dict(cached)
+
+    capabilities = _json_request(
+        f"{api_base}/.well-known/clawjournal-share.json",
+        timeout=15,
+    )
+    cache_seconds = capabilities.get("cache_seconds", 300)
+    try:
+        ttl = max(0, min(86400, int(cache_seconds)))
+    except (TypeError, ValueError):
+        ttl = 300
+    _hosted_capabilities_cache = (api_base, now + ttl, dict(capabilities))
+    return capabilities
+
+
 def _validate_ingest_url() -> None:
     """Verify the ingest URL is configured and uses HTTPS."""
     if not _SHARE_INGEST_URL:
@@ -492,12 +595,12 @@ def _validate_ingest_url() -> None:
         )
 
 
-def _ensure_verified_email_credentials() -> tuple[str, str]:
+def _ensure_hosted_upload_token() -> tuple[str, str]:
     """Ensure the user has a valid, non-expired upload token.
 
     Returns (verified_email, upload_token).
     """
-    _validate_ingest_url()
+    _hosted_api_base()
 
     config = load_config()
     verified_email = (config.get("verified_email") or "").strip().lower()
@@ -506,26 +609,42 @@ def _ensure_verified_email_credentials() -> tuple[str, str]:
 
     if verified_email and upload_token:
         # Check expiry with 60-second grace period
-        if isinstance(expires_at, (int, float)) and time.time() < (expires_at - 60):
+        if _expiry_is_valid(expires_at):
             return verified_email, upload_token
         raise RuntimeError(
             "Upload token has expired. "
-            "Run `clawjournal verify-email <your-email@university.edu>` to get a fresh token."
+            "Verify your academic email again before submitting."
         )
     if verified_email:
         raise RuntimeError(
             "Email verification needs to be refreshed before sharing data. "
-            "Run `clawjournal verify-email <your-email@university.edu>` again."
+            "Verify your academic email again before submitting."
         )
     raise RuntimeError(
         "Email verification required before sharing data. "
-        "Run `clawjournal verify-email <your-email@university.edu>` to verify your .edu email."
+        "Verify your academic email before submitting."
     )
+
+
+def _ensure_self_hosted_upload_credentials() -> tuple[str, str]:
+    """Ensure the legacy self-hosted ingest service has a token to send."""
+    _validate_ingest_url()
+    config = load_config()
+    verified_email = (config.get("verified_email") or "").strip().lower()
+    upload_token = (config.get("verified_email_token") or "").strip()
+    expires_at = config.get("verified_email_token_expires_at", 0)
+    if verified_email and upload_token:
+        if _expiry_is_valid(expires_at):
+            return verified_email, upload_token
+        raise RuntimeError("Upload token has expired. Verify your email again before sharing.")
+    if verified_email:
+        raise RuntimeError("Email verification needs to be refreshed before sharing data.")
+    raise RuntimeError("Email verification required before sharing data.")
 
 
 def ensure_share_upload_ready() -> None:
     """Fail fast if the current environment cannot upload shared data."""
-    _ensure_verified_email_credentials()
+    _ensure_hosted_upload_token()
 
 
 def _clear_stored_upload_token() -> None:
@@ -551,71 +670,116 @@ def _http_error_message(exc: urllib.error.HTTPError) -> str:
     return body or str(exc)
 
 
+class HostedServiceError(ValueError):
+    """User-facing hosted API error with the originating HTTP status."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+def _hosted_user_status(status: int) -> int:
+    return status if status in (400, 401, 403, 409, 413, 429) else 502
+
+
 def request_email_verification(email: str) -> dict:
-    """Send a verification request to the ingest service for a .edu email.
+    """Send a verification request to the hosted submission service.
 
     Returns the response dict from the server (contains status info).
     """
-    _validate_ingest_url()
-    if not _is_edu_email(email):
-        raise ValueError("Only .edu email addresses are accepted for data sharing.")
+    normalized = _normalize_email(email)
+    capabilities = _fetch_hosted_share_capabilities()
+    if not _email_domain_allowed(normalized, capabilities):
+        raise ValueError("Enter a valid academic email address.")
 
-    url = f"{_SHARE_INGEST_URL}/verify-email"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps({"email": email.strip().lower()}).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": f"clawjournal/{__version__}",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
+        result = _json_request(
+            f"{_hosted_api_base()}/api/verify-email",
+            method="POST",
+            payload={"email": normalized},
+            timeout=30,
+        )
     except urllib.error.HTTPError as exc:
-        raise ValueError(_http_error_message(exc)) from exc
+        raise HostedServiceError(_http_error_message(exc), exc.code) from exc
+
+    verification_id = result.get("verification_id")
+    if not isinstance(verification_id, str) or not verification_id:
+        raise ValueError("Verification service did not return a verification id.")
+    config = load_config()
+    config["pending_verification_id"] = verification_id
+    config["pending_verification_email"] = normalized
+    config["pending_verification_expires_at"] = result.get("expires_at")
+    save_config(config)
+    return result
+
+
+def confirm_pending_email_verification(code: str) -> dict:
+    """Confirm the pending hosted email verification and persist its token."""
+    config = load_config()
+    verification_id = (config.get("pending_verification_id") or "").strip()
+    pending_email = (config.get("pending_verification_email") or "").strip().lower()
+    if not verification_id or not pending_email:
+        raise ValueError("No pending email verification. Request a new verification code first.")
+
+    try:
+        result = _json_request(
+            f"{_hosted_api_base()}/api/verify-email/confirm",
+            method="POST",
+            payload={"verification_id": verification_id, "code": code.strip()},
+            timeout=30,
+        )
+    except urllib.error.HTTPError as exc:
+        raise HostedServiceError(_http_error_message(exc), exc.code) from exc
+
+    upload_token = result.get("upload_token")
+    if not isinstance(upload_token, str) or not upload_token:
+        raise ValueError("Verification succeeded but no upload token was returned.")
+    expires_at = result.get("upload_token_expires_at", 0)
+    config = load_config()
+    config["verified_email"] = pending_email
+    config["verified_email_token"] = upload_token
+    config["verified_email_token_expires_at"] = expires_at
+    for key in (
+        "pending_verification_id",
+        "pending_verification_email",
+        "pending_verification_expires_at",
+    ):
+        config.pop(key, None)
+    save_config(config)
+
+    return result
 
 
 def confirm_email_verification(email: str, code: str) -> dict:
-    """Confirm email verification with the code received via email.
+    """CLI-compatible wrapper around pending hosted verification."""
+    normalized = _normalize_email(email)
+    config = load_config()
+    pending_email = (config.get("pending_verification_email") or "").strip().lower()
+    if pending_email and normalized != pending_email:
+        raise ValueError(
+            f"Verification code was requested for {pending_email}; request a new code for {normalized}."
+        )
+    return confirm_pending_email_verification(code)
 
-    On success, stores the verified email in config and returns the response.
-    """
-    _validate_ingest_url()
-    url = f"{_SHARE_INGEST_URL}/verify-confirm"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps({
-            "email": email.strip().lower(),
-            "code": code.strip(),
-        }).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": f"clawjournal/{__version__}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        raise ValueError(_http_error_message(exc)) from exc
 
-    if result.get("verified"):
-        upload_token = result.get("upload_token")
-        if not isinstance(upload_token, str) or not upload_token:
-            raise ValueError(
-                "Verification succeeded but the ingest service did not return an upload token."
-            )
-        expires_at = result.get("upload_token_expires_at", 0)
-        config = load_config()
-        config["verified_email"] = email.strip().lower()
-        config["verified_email_token"] = upload_token
-        config["verified_email_token_expires_at"] = expires_at
-        save_config(config)
+def hosted_upload_status() -> dict[str, Any]:
+    config = load_config()
+    verified_email = (config.get("verified_email") or "").strip().lower() or None
+    upload_token = (config.get("verified_email_token") or "").strip()
+    expires_at = config.get("verified_email_token_expires_at")
+    token_valid = False
+    if upload_token:
+        token_valid = _expiry_is_valid(expires_at)
+    return {
+        "verified_email": verified_email,
+        "token_valid": token_valid,
+        "expires_at": expires_at,
+        "pending_email": (config.get("pending_verification_email") or "").strip().lower() or None,
+    }
 
-    return result
+
+def fetch_hosted_consent() -> dict[str, Any]:
+    return _json_request(f"{_hosted_api_base()}/api/consent", timeout=30)
 
 
 def _build_multipart_body(
@@ -653,6 +817,39 @@ def _build_multipart_body(
     body = b"".join(parts)
     content_type = f"multipart/form-data; boundary={boundary}"
     return body, content_type
+
+
+def _build_share_zip(export_dir: Path) -> bytes:
+    """Build the finalized share zip expected by hosted submission."""
+    required = ["sessions.jsonl", "manifest.json", "trufflehog.post-pii.json"]
+    missing = [name for name in required if not (export_dir / name).exists()]
+    if missing:
+        raise FileNotFoundError(f"Finalized share is missing {', '.join(missing)}")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in ("sessions.jsonl", "manifest.json", "trufflehog.json", "trufflehog.post-pii.json"):
+            path = export_dir / name
+            if path.exists():
+                zf.writestr(name, path.read_bytes())
+    return buf.getvalue()
+
+
+def _jsonl_row_count(path: Path) -> int:
+    count = 0
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _body_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _with_legacy_bundle_alias(payload: dict[str, Any]) -> dict[str, Any]:
@@ -955,7 +1152,7 @@ def _prepare_share_export_for_upload(
     return export_dir, manifest, None
 
 
-def upload_share(
+def upload_share_to_self_hosted_ingest(
     conn: sqlite3.Connection,
     share_id: str,
     *,
@@ -966,7 +1163,7 @@ def upload_share(
     blocked_domains: list[str] | None = None,
     allowlist_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Upload a share to the GCS ingest service.
+    """Upload a share to the legacy self-hosted ingest service.
 
     Returns a result dict with keys: ok, shared_at, session_count,
     bundle_hash, redaction_summary.  On error, returns: error (str) and
@@ -975,7 +1172,7 @@ def upload_share(
     """
     # Require verified upload credentials before uploading.
     try:
-        verified_email, verified_email_token = _ensure_verified_email_credentials()
+        verified_email, verified_email_token = _ensure_self_hosted_upload_credentials()
     except RuntimeError as e:
         return {"error": str(e), "status": 403}
 
@@ -1117,6 +1314,209 @@ def upload_share(
     }
 
 
+def _hosted_error_message(exc: urllib.error.HTTPError) -> str:
+    body = exc.read().decode("utf-8", errors="replace")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        if data.get("error"):
+            return str(data["error"])
+        detail = data.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, list) and detail:
+            messages = [
+                str(item.get("msg"))
+                for item in detail
+                if isinstance(item, dict) and item.get("msg")
+            ]
+            if messages:
+                return "; ".join(messages)
+    return body or "Hosted submission failed."
+
+
+def _hosted_http_error_result(exc: urllib.error.HTTPError) -> dict[str, Any]:
+    message = _hosted_error_message(exc)
+    if exc.code in (401, 403):
+        _clear_stored_upload_token()
+    if exc.code in (400, 401, 403, 409, 413, 429):
+        return {"error": message, "status": exc.code}
+    return {"error": message, "status": 502}
+
+
+def submit_share_to_hosted(
+    conn: sqlite3.Connection,
+    share_id: str,
+    *,
+    accept_terms: bool,
+    ownership_certification: bool,
+    consent_version: str,
+    retention_policy_version: str,
+    settings: dict[str, Any],
+    force: bool = False,
+) -> dict[str, Any]:
+    """Submit a finalized share zip to the hosted research API."""
+    share = get_share(conn, share_id)
+    if share is None:
+        return {"error": "Share not found", "status": 404}
+    if share.get("hosted_receipt_id") or share.get("shared_at"):
+        return {
+            "error": "Share already submitted",
+            "receipt_id": share.get("hosted_receipt_id"),
+            "hosted_status": share.get("hosted_status"),
+            "shared_at": share.get("shared_at"),
+            "status": 409,
+        }
+    if force:
+        return {
+            "error": "Hosted submissions cannot be overwritten. Create a new share to submit again.",
+            "status": 409,
+        }
+    if not accept_terms or not ownership_certification:
+        return {
+            "error": "You must accept the terms and certify ownership before submitting.",
+            "status": 400,
+        }
+    if not consent_version or not retention_policy_version:
+        return {"error": "Consent and retention versions are required.", "status": 400}
+
+    try:
+        _verified_email, upload_token = _ensure_hosted_upload_token()
+    except RuntimeError as exc:
+        return {"error": str(exc), "status": 403}
+
+    from .index import release_gate_blockers
+    session_ids = [s["session_id"] for s in share.get("sessions") or []]
+    blockers = release_gate_blockers(conn, session_ids)
+    if blockers:
+        return {
+            "error": "Share contains sessions that are not released",
+            "blockers": blockers,
+            "status": 409,
+        }
+
+    try:
+        capabilities = _fetch_hosted_share_capabilities()
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+        return {"error": f"Could not reach hosted submission service: {exc}", "status": 502}
+    if capabilities.get("submissions_open") is False:
+        return {
+            "error": "Hosted submissions are currently closed.",
+            "support_contact": capabilities.get("contact_email"),
+            "status": 403,
+        }
+
+    export_dir, manifest, error = _prepare_share_export_for_upload(
+        conn,
+        share_id,
+        share,
+        settings,
+        reuse_finalized=True,
+    )
+    if error:
+        return error
+    if export_dir is None:
+        return {"error": "Failed to prepare upload zip", "status": 500}
+
+    try:
+        zip_bytes = _build_share_zip(export_dir)
+    except OSError as exc:
+        return {"error": f"Failed to build upload zip: {exc}", "status": 500}
+
+    max_bundle_size = capabilities.get("maximum_bundle_size", 52_428_800)
+    try:
+        max_bundle_size_int = int(max_bundle_size)
+    except (TypeError, ValueError):
+        max_bundle_size_int = 52_428_800
+    if len(zip_bytes) > max_bundle_size_int:
+        return {
+            "error": (
+                f"Upload zip is {len(zip_bytes) / (1024 * 1024):.1f} MB, "
+                f"which exceeds the hosted limit of {max_bundle_size_int / (1024 * 1024):.1f} MB."
+            ),
+            "status": 413,
+        }
+
+    sessions_file = export_dir / "sessions.jsonl"
+    sha = hashlib.sha256()
+    with open(sessions_file, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha.update(chunk)
+    bundle_hash = sha.hexdigest()
+
+    upload_body, content_type = _build_multipart_body(
+        fields={
+            "upload_token": upload_token,
+            "consent_version": consent_version,
+            "retention_policy_version": retention_policy_version,
+            "accept_terms": "true" if accept_terms else "false",
+            "ownership_certification": "true" if ownership_certification else "false",
+        },
+        files={
+            "bundle": (
+                f"clawjournal-share-{share_id[:8]}.zip",
+                zip_bytes,
+                "application/zip",
+            ),
+        },
+    )
+    req = urllib.request.Request(
+        f"{_hosted_api_base()}/api/submissions",
+        data=upload_body,
+        headers={
+            "Content-Type": content_type,
+            "User-Agent": f"clawjournal/{__version__}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=_SHARE_UPLOAD_TIMEOUT) as resp:
+            hosted_result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return _hosted_http_error_result(exc)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return {"error": "Could not reach hosted submission service. Please try again.", "status": 502}
+
+    receipt_id = hosted_result.get("receipt_id")
+    if not isinstance(receipt_id, str) or not receipt_id:
+        return {"error": "Hosted submission succeeded but no receipt was returned.", "status": 502}
+
+    hosted_status = hosted_result.get("status")
+    hosted_submission_url = hosted_result.get("submission_url")
+    shared_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE shares SET status = 'shared', shared_at = ?, bundle_hash = ?, "
+        "hosted_receipt_id = ?, hosted_status = ?, hosted_submission_url = ? "
+        "WHERE share_id = ?",
+        (
+            shared_at,
+            bundle_hash,
+            receipt_id,
+            str(hosted_status) if hosted_status is not None else None,
+            str(hosted_submission_url) if hosted_submission_url is not None else None,
+            share_id,
+        ),
+    )
+    conn.commit()
+
+    _clear_stored_upload_token()
+    redaction_summary = manifest.get("redaction_summary", {}) if manifest else {}
+    return {
+        "ok": True,
+        "receipt_id": receipt_id,
+        "hosted_status": hosted_status,
+        "hosted_submission_url": hosted_submission_url,
+        "shared_at": shared_at,
+        "session_count": _jsonl_row_count(sessions_file),
+        "bundle_hash": bundle_hash,
+        "zip_size_bytes": len(zip_bytes),
+        "redaction_summary": redaction_summary,
+    }
+
+
 class WorkbenchHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the workbench API + static files.
 
@@ -1247,6 +1647,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_ready(params)
         elif path == "/api/share-destination":
             self._handle_share_destination()
+        elif path == "/api/share/consent":
+            self._handle_share_consent()
+        elif path == "/api/share/upload-status":
+            self._handle_share_upload_status()
         elif path == "/api/scoring/backend":
             self._handle_scoring_backend()
         elif path == "/api/bundles":
@@ -1304,6 +1708,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_update_session(session_id)
         elif path == "/api/quick-share":
             self._handle_quick_share()
+        elif path == "/api/share/verify-email":
+            self._handle_share_verify_email()
+        elif path == "/api/share/verify-confirm":
+            self._handle_share_verify_confirm()
         elif path == "/api/bundles":
             self._handle_create_share()
         elif path.startswith("/api/bundles/") and path.endswith("/export"):
@@ -1973,15 +2381,106 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_share_destination(self) -> None:
-        """Return the optional hosted browser-upload destination."""
+        """Return the optional hosted research-submission destination."""
         share_url, message = _validated_hosted_share_url()
-        _json_response(self, {
+        payload: dict[str, Any] = {
             "configured": bool(share_url),
+            "daemon_upload_supported": False,
+            "submissions_open": False,
             "preferred_upload_flow": "browser_zip",
             "cli_ingest_supported": False,
             "share_page_url": share_url,
+            "submit_page_url": share_url,
+            "maximum_bundle_size": None,
+            "accepted_manifest_schema_versions": [],
+            "support_contact": None,
             "message": message,
+        }
+        if not share_url:
+            _json_response(self, payload)
+            return
+        try:
+            capabilities = _fetch_hosted_share_capabilities()
+        except Exception as exc:
+            payload["message"] = f"Hosted submission is configured, but capabilities could not be loaded: {exc}"
+            _json_response(self, payload)
+            return
+
+        submissions_open = bool(capabilities.get("submissions_open"))
+        payload.update({
+            "preferred_upload_flow": capabilities.get("preferred_upload_flow", "browser_zip"),
+            "cli_ingest_supported": bool(capabilities.get("cli_ingest_supported")),
+            "share_page_url": capabilities.get("share_page_url") or share_url,
+            "submit_page_url": capabilities.get("submit_page_url") or capabilities.get("share_page_url") or share_url,
+            "daemon_upload_supported": True,
+            "submissions_open": submissions_open,
+            "maximum_bundle_size": capabilities.get("maximum_bundle_size"),
+            "accepted_manifest_schema_versions": capabilities.get("accepted_manifest_schema_versions", []),
+            "support_contact": capabilities.get("contact_email") or capabilities.get("support_contact"),
+            "message": "Hosted research submissions are open." if submissions_open else "Hosted research submissions are currently closed.",
         })
+        _json_response(self, payload)
+
+    def _handle_share_consent(self) -> None:
+        try:
+            _json_response(self, fetch_hosted_consent())
+        except urllib.error.HTTPError as exc:
+            _json_response(self, {"error": _hosted_error_message(exc)}, exc.code)
+        except Exception as exc:
+            _json_response(self, {"error": f"Could not load hosted consent text: {exc}"}, 502)
+
+    def _handle_share_verify_email(self) -> None:
+        body = _read_body(self)
+        email = body.get("email")
+        if not isinstance(email, str) or not email.strip():
+            _json_response(self, {"error": "email required"}, 400)
+            return
+        try:
+            result = request_email_verification(email)
+        except HostedServiceError as exc:
+            _json_response(self, {"error": str(exc)}, _hosted_user_status(exc.status))
+            return
+        except ValueError as exc:
+            _json_response(self, {"error": str(exc)}, 400)
+            return
+        except (OSError, RuntimeError, urllib.error.URLError) as exc:
+            _json_response(self, {"error": str(exc)}, 502)
+            return
+        response = {
+            "ok": True,
+            "email": _normalize_email(email),
+            "expires_at": result.get("expires_at"),
+        }
+        if result.get("dev_code"):
+            response["dev_code"] = result["dev_code"]
+        _json_response(self, response)
+
+    def _handle_share_verify_confirm(self) -> None:
+        body = _read_body(self)
+        code = body.get("code")
+        if not isinstance(code, str) or not code.strip():
+            _json_response(self, {"error": "code required"}, 400)
+            return
+        try:
+            result = confirm_pending_email_verification(code)
+        except HostedServiceError as exc:
+            _json_response(self, {"error": str(exc)}, _hosted_user_status(exc.status))
+            return
+        except ValueError as exc:
+            _json_response(self, {"error": str(exc)}, 400)
+            return
+        except (OSError, RuntimeError, urllib.error.URLError) as exc:
+            _json_response(self, {"error": str(exc)}, 502)
+            return
+        status = hosted_upload_status()
+        _json_response(self, {
+            "verified": True,
+            "verified_email": status["verified_email"],
+            "expires_at": result.get("upload_token_expires_at"),
+        })
+
+    def _handle_share_upload_status(self) -> None:
+        _json_response(self, hosted_upload_status())
 
     def _handle_share_ready(self, params: dict[str, list[str]]) -> None:
         """Return stats for sessions ready to share.
@@ -2004,7 +2503,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _handle_quick_share(self) -> None:
-        """Combined create + share in one call."""
+        """Create and package a share; hosted submission needs consent first."""
         with _share_rate_lock:
             now = time.time()
             elapsed = now - WorkbenchHandler._last_share_time
@@ -2027,25 +2526,35 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         try:
             settings = get_effective_share_settings(conn, load_config())
             share_id = create_share(conn, session_ids, note=note)
-            result = upload_share(
+            share = get_share(conn, share_id)
+            if share is None:
+                _json_response(self, {"error": "Share not found"}, 404)
+                return
+            export_dir, manifest, error = _prepare_share_export_for_upload(
                 conn,
                 share_id,
-                force=True,
-                custom_strings=settings["custom_strings"],
-                extra_usernames=settings["extra_usernames"],
-                excluded_projects=settings["excluded_projects"],
-                blocked_domains=settings["blocked_domains"],
-                allowlist_entries=settings["allowlist_entries"],
+                share,
+                settings,
+                reuse_finalized=True,
             )
-            result["share_id"] = share_id
-            result["bundle_id"] = share_id
-            if result.get("ok"):
-                with _share_rate_lock:
-                    WorkbenchHandler._last_share_time = time.time()
-                _json_response(self, result)
-            else:
-                status_code = result.pop("status", 500)
-                _json_response(self, result, status_code)
+            if error:
+                status_code = int(error.get("status", 500))
+                _json_response(self, error, status_code)
+                return
+            if export_dir is None:
+                _json_response(self, {"error": "Failed to prepare upload zip"}, 500)
+                return
+            with _share_rate_lock:
+                WorkbenchHandler._last_share_time = time.time()
+            _json_response(self, {
+                "ok": True,
+                "share_id": share_id,
+                "bundle_id": share_id,
+                "next_step": "submit",
+                "export_path": str(export_dir),
+                "session_count": len(manifest.get("sessions", [])),
+                "redaction_summary": manifest.get("redaction_summary", {}),
+            })
         except Exception as exc:
             logger.exception("Quick share failed")
             _json_response(self, {"error": str(exc)}, 500)
@@ -2258,11 +2767,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             if export_dir is None:
                 _json_response(self, {"error": "Failed to prepare upload zip"}, 500)
                 return
+            try:
+                zip_size_bytes = len(_build_share_zip(export_dir))
+            except OSError:
+                zip_size_bytes = None
 
             _json_response(self, {
                 "ok": True,
                 "export_path": str(export_dir),
                 "session_count": len(manifest.get("sessions", [])),
+                "zip_size_bytes": zip_size_bytes,
                 "redaction_summary": manifest.get("redaction_summary", {}),
             })
         finally:
@@ -2292,27 +2806,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "Failed to prepare download"}, 500)
                 return
 
-            sessions_content = (export_dir / "sessions.jsonl").read_bytes()
-            manifest_content = (export_dir / "manifest.json").read_bytes()
-            trufflehog_path = export_dir / "trufflehog.json"
-            trufflehog_content = (
-                trufflehog_path.read_bytes() if trufflehog_path.exists() else None
-            )
-            post_pii_path = export_dir / "trufflehog.post-pii.json"
-            post_pii_content = (
-                post_pii_path.read_bytes() if post_pii_path.exists() else None
-            )
-
-            # Create in-memory zip
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("sessions.jsonl", sessions_content)
-                zf.writestr("manifest.json", manifest_content)
-                if trufflehog_content is not None:
-                    zf.writestr("trufflehog.json", trufflehog_content)
-                if post_pii_content is not None:
-                    zf.writestr("trufflehog.post-pii.json", post_pii_content)
-            zip_bytes = buf.getvalue()
+            zip_bytes = _build_share_zip(export_dir)
 
             # Serve the zip
             date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -2330,7 +2824,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def _handle_upload_share(self, share_id: str) -> None:
-        """Upload a share to the hosted ingest service."""
+        """Submit a share to hosted research after consent."""
         with _share_rate_lock:
             now = time.time()
             elapsed = now - WorkbenchHandler._last_share_time
@@ -2341,20 +2835,36 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
 
         body = _read_body(self)
-        force = body.get("force", False)
+        force = _body_bool(body.get("force", False))
+        required = [
+            "accept_terms",
+            "ownership_certification",
+            "consent_version",
+            "retention_policy_version",
+        ]
+        missing = [key for key in required if key not in body]
+        if missing:
+            _json_response(self, {
+                "error": (
+                    "Hosted submission requires consent fields. "
+                    "Use the Share tab Submit step and review the current terms."
+                ),
+                "missing": missing,
+            }, 400)
+            return
 
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
-            result = upload_share(
+            result = submit_share_to_hosted(
                 conn,
                 share_id,
                 force=force,
-                custom_strings=settings["custom_strings"],
-                extra_usernames=settings["extra_usernames"],
-                excluded_projects=settings["excluded_projects"],
-                blocked_domains=settings["blocked_domains"],
-                allowlist_entries=settings["allowlist_entries"],
+                settings=settings,
+                accept_terms=_body_bool(body.get("accept_terms")),
+                ownership_certification=_body_bool(body.get("ownership_certification")),
+                consent_version=str(body.get("consent_version") or ""),
+                retention_policy_version=str(body.get("retention_policy_version") or ""),
             )
             if result.get("ok"):
                 with _share_rate_lock:

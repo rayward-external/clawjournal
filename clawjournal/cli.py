@@ -1692,6 +1692,7 @@ def _print_share_pii_warning(output_json: bool = False) -> dict[str, Any]:
 def _run_verify_email(args) -> None:
     """Handle the verify-email CLI command."""
     from .workbench.daemon import (
+        _expiry_is_valid,
         _is_edu_email,
         confirm_email_verification,
         request_email_verification,
@@ -1703,9 +1704,8 @@ def _run_verify_email(args) -> None:
 
     if not args.email and not args.code:
         if existing and existing_token:
-            import time as _time
             expires_at = config.get("verified_email_token_expires_at", 0)
-            expired = not isinstance(expires_at, (int, float)) or _time.time() >= expires_at
+            expired = not _expiry_is_valid(expires_at, grace_seconds=0)
             status = "expired" if expired else "verified"
             info: dict = {"verified_email": existing, "status": status}
             if expired:
@@ -1716,13 +1716,13 @@ def _run_verify_email(args) -> None:
         elif existing:
             print(json.dumps({
                 "error": "No active upload token. Re-verify your email before sharing.",
-                "hint": "Run `clawjournal verify-email <your-email@university.edu>` again.",
+                "hint": "Run `clawjournal verify-email <your-email@academic-domain>` again.",
             }, indent=2))
             sys.exit(1)
         else:
             print(json.dumps({
-                "error": "No verified email. Usage: clawjournal verify-email <your-email@university.edu>",
-                "hint": "Only .edu email addresses are accepted.",
+                "error": "No verified email. Usage: clawjournal verify-email <your-email@academic-domain>",
+                "hint": "Academic email addresses are accepted.",
             }, indent=2))
             sys.exit(1)
         return
@@ -1734,8 +1734,8 @@ def _run_verify_email(args) -> None:
 
     if not _is_edu_email(email):
         print(json.dumps({
-            "error": f"'{email}' is not a .edu email address.",
-            "hint": "Only .edu email addresses are accepted for data sharing.",
+            "error": f"'{email}' is not an accepted academic email address.",
+            "hint": "Use an academic email address, or contact support if you are an explicit collaborator.",
         }, indent=2))
         sys.exit(1)
 
@@ -1743,43 +1743,39 @@ def _run_verify_email(args) -> None:
         # Step 2: Confirm with verification code
         try:
             result = confirm_email_verification(email, args.code)
-        except (OSError, ValueError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             print(json.dumps({"error": f"Verification failed: {e}"}, indent=2))
             sys.exit(1)
 
-        if result.get("verified"):
-            expires_at = result.get("upload_token_expires_at", 0)
-            print(json.dumps({
-                "verified_email": email.strip().lower(),
-                "status": "verified",
-                "message": "Email verified! Upload token valid for one upload within 1 hour.",
-                "upload_token_expires_at": expires_at,
-            }, indent=2))
-        else:
-            print(json.dumps({
-                "error": result.get("error", "Verification failed."),
-                "hint": "Check the code and try again, or request a new code.",
-            }, indent=2))
-            sys.exit(1)
+        expires_at = result.get("upload_token_expires_at", 0)
+        print(json.dumps({
+            "verified_email": email.strip().lower(),
+            "status": "verified",
+            "message": "Email verified. Submit from the workbench Share tab to review consent terms.",
+            "upload_token_expires_at": expires_at,
+        }, indent=2))
     else:
         # Step 1: Request verification
         try:
-            request_email_verification(email)
-        except (OSError, ValueError) as e:
+            result = request_email_verification(email)
+        except (OSError, RuntimeError, ValueError) as e:
             print(json.dumps({"error": f"Request failed: {e}"}, indent=2))
             sys.exit(1)
 
-        print(json.dumps({
+        payload = {
             "status": "verification_sent",
             "email": email.strip().lower(),
-            "message": "If the ingest service is configured correctly, you will receive a verification code by email.",
+            "message": "You will receive a verification code by email.",
             "next_command": f"clawjournal verify-email {email} --code <CODE>",
-        }, indent=2))
+        }
+        if result.get("dev_code"):
+            payload["dev_code"] = result["dev_code"]
+        print(json.dumps(payload, indent=2))
 
 
 def _run_bundle_share(args) -> None:
-    """Share a bundle via the ingest service."""
-    from .workbench.daemon import ensure_share_upload_ready, upload_share
+    """Share a bundle via the explicit self-hosted ingest service."""
+    from .workbench.daemon import upload_share_to_self_hosted_ingest
     from .workbench.index import get_effective_share_settings, open_index
 
     config = load_config()
@@ -1792,10 +1788,8 @@ def _run_bundle_share(args) -> None:
             print(f"Bundle not found: {args.share_id}")
             sys.exit(1)
 
-        ensure_share_upload_ready()
-
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        result = upload_share(
+        result = upload_share_to_self_hosted_ingest(
             conn,
             share_id,
             force=args.force,
@@ -1830,10 +1824,11 @@ def _run_bundle_share(args) -> None:
 
 
 def _run_share(args) -> None:
-    """One-step: create bundle + export + share. With --preview, show bundle contents."""
-    from .workbench.daemon import ensure_share_upload_ready
+    """Create and package a share. Hosted submission happens in the workbench."""
     from .workbench.index import (
+        create_share,
         get_effective_share_settings,
+        get_share,
         open_index,
         query_sessions,
         session_matches_excluded_projects,
@@ -1882,36 +1877,51 @@ def _run_share(args) -> None:
                 _share_preview(session_rows, output_json=False)
             return
 
-        ensure_share_upload_ready()
-
-        # PII redaction is now mandatory inside upload_share() itself
-        from .workbench.daemon import upload_share
-        from .workbench.index import create_share
+        from .workbench.daemon import _prepare_share_export_for_upload
 
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
         share_id = create_share(conn, session_ids, note=args.note)
-        result = upload_share(
+        share = get_share(conn, share_id)
+        if share is None:
+            print("Share failed: newly created share could not be loaded.")
+            sys.exit(1)
+        export_dir, manifest, error = _prepare_share_export_for_upload(
             conn,
             share_id,
-            force=args.force,
-            custom_strings=settings["custom_strings"],
-            extra_usernames=settings["extra_usernames"],
-            excluded_projects=settings["excluded_projects"],
-            blocked_domains=settings["blocked_domains"],
-            allowlist_entries=settings["allowlist_entries"],
+            share,
+            settings,
+            reuse_finalized=True,
         )
+        if error:
+            print(error.get("error", "Share failed."))
+            sys.exit(1)
+        if export_dir is None:
+            print("Share failed: could not prepare bundle.")
+            sys.exit(1)
+
+        port = config.get("daemon_port") or 8384
+        workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit"
+        result = {
+            "ok": True,
+            "share_id": share_id,
+            "bundle_id": share_id,
+            "export_path": str(export_dir),
+            "session_count": len(manifest.get("sessions", [])),
+            "next_step": "submit_in_workbench",
+            "workbench_url": workbench_url,
+            "redaction_summary": manifest.get("redaction_summary", {}),
+        }
         if result.get("ok"):
             if getattr(args, "json", False):
-                result["share_id"] = share_id
-                result["bundle_id"] = share_id
                 result["pii_status"] = pii_status
                 result.pop("status", None)
                 result.pop("gcs_uri", None)
                 print(json.dumps(result, indent=2))
             else:
                 count = result.get("session_count", len(session_ids))
-                print(f"Shared {count} sessions.")
-                print(f"Bundle {share_id[:8]} uploaded successfully.")
+                print(f"Packaged {count} sessions.")
+                print(f"Bundle {share_id[:8]} is ready for hosted submission in the workbench.")
+                print(f"Next step: open {workbench_url} and review the Submit step.")
                 redaction_summary = result.get("redaction_summary")
                 if redaction_summary is not None:
                     print(f"Privacy: {_format_redaction_summary(redaction_summary)}")
@@ -1965,7 +1975,7 @@ def _share_preview(sessions: list[dict], *, output_json: bool = False, limit: in
             "total": total,
             "upload_auth": {
                 "required": True,
-                "note": "Upload sends the bundle separately from your verified .edu email authentication data.",
+                "note": "Hosted submission uses your verified academic email and a short-lived upload token.",
             },
         }
 
@@ -1995,7 +2005,7 @@ def _share_preview(sessions: list[dict], *, output_json: bool = False, limit: in
 
     if total > limit:
         print(f"\n  ... and {total - limit} more sessions.")
-    print("\nNote: upload authentication is separate from this preview and uses your verified .edu email plus a short-lived upload token.")
+    print("\nNote: hosted submission uses your verified academic email plus a short-lived upload token.")
     return None
 
 
@@ -4062,8 +4072,8 @@ def main() -> None:
                     help="Show the trace bundle contents that would be shared without uploading")
     sh.add_argument("--json", action="store_true", help="Output JSON")
 
-    ve = sub.add_parser("verify-email", help="Verify a .edu email address for a short-lived upload token")
-    ve.add_argument("email", nargs="?", help="Your .edu email address")
+    ve = sub.add_parser("verify-email", help="Verify an academic email address for a short-lived upload token")
+    ve.add_argument("email", nargs="?", help="Your academic email address")
     ve.add_argument("--code", type=str, default=None, help="Verification code from email")
 
     # PII review/apply commands

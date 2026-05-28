@@ -4,6 +4,7 @@ import json
 import shutil
 import sys
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1567,25 +1568,28 @@ class TestShareHelpers:
 
 class TestShare:
     def test_share_approved(self, bundle_index, capsys, monkeypatch):
-        """share --status approved creates bundle + exports + shares."""
+        """share --status approved packages locally and points to the workbench submit step."""
         from clawjournal.cli import _run_share
 
-        def mock_upload_share(conn, bundle_id, **kwargs):
-            return {"ok": True, "session_count": 3, "bundle_hash": "abc123",
-                    "shared_at": "2026-01-01",
-                    "redaction_summary": {"total_redactions": 2, "by_type": {"jwt": 1, "email": 1}}}
-
-        # _run_share imports upload_share from clawjournal.workbench.daemon at call time
-        monkeypatch.setattr("clawjournal.workbench.daemon.ensure_share_upload_ready", lambda: None)
-        monkeypatch.setattr("clawjournal.workbench.daemon.upload_share", mock_upload_share)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._prepare_share_export_for_upload",
+            lambda conn, share_id, share, settings, reuse_finalized=False: (
+                Path("/tmp/clawjournal-share"),
+                {
+                    "sessions": [{}, {}, {}],
+                    "redaction_summary": {"total_redactions": 2, "by_type": {"jwt": 1, "email": 1}},
+                },
+                None,
+            ),
+        )
         monkeypatch.setattr("clawjournal.cli._collect_pii_findings", lambda *args, **kwargs: [])
 
         args = MagicMock(session_ids=[], status="approved", note="test",
                          force=False, json=False, preview=False)
         _run_share(args)
         out = capsys.readouterr().out
-        assert "Shared 3 sessions" in out
-        assert "uploaded successfully" in out
+        assert "Packaged 3 sessions" in out
+        assert "ready for hosted submission in the workbench" in out
         assert "Privacy:" in out
         assert "2 redactions applied" in out
 
@@ -1602,16 +1606,13 @@ class TestShare:
         """share --json restores the legacy bundle_id alias."""
         from clawjournal.cli import _run_share
 
-        monkeypatch.setattr("clawjournal.workbench.daemon.ensure_share_upload_ready", lambda: None)
         monkeypatch.setattr(
-            "clawjournal.workbench.daemon.upload_share",
-            lambda conn, share_id, **kwargs: {
-                "ok": True,
-                "session_count": 3,
-                "bundle_hash": "abc123",
-                "shared_at": "2026-01-01",
-                "redaction_summary": {"total_redactions": 0, "by_type": {}},
-            },
+            "clawjournal.workbench.daemon._prepare_share_export_for_upload",
+            lambda conn, share_id, share, settings, reuse_finalized=False: (
+                Path("/tmp/clawjournal-share"),
+                {"sessions": [{}, {}, {}], "redaction_summary": {"total_redactions": 0, "by_type": {}}},
+                None,
+            ),
         )
 
         args = MagicMock(session_ids=[], status="approved", note="test",
@@ -1620,6 +1621,7 @@ class TestShare:
         output = json.loads(capsys.readouterr().out)
         assert output["share_id"]
         assert output["bundle_id"] == output["share_id"]
+        assert output["next_step"] == "submit_in_workbench"
 
 
 class TestVerifyEmail:
@@ -1630,6 +1632,20 @@ class TestVerifyEmail:
             main()
         payload = json.loads(capsys.readouterr().out)
         assert "No active upload token" in payload["error"]
+
+    def test_verify_email_status_accepts_iso_expiry(self, monkeypatch, capsys):
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {
+            "verified_email": "test@university.edu",
+            "verified_email_token": "token",
+            "verified_email_token_expires_at": expires_at,
+        })
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email"])
+
+        main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "verified"
 
     def test_verify_email_request_outputs_next_command(self, monkeypatch, capsys):
         monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})

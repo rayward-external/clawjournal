@@ -12,6 +12,7 @@ import sqlite3
 import pytest
 
 from clawjournal.workbench.index import (
+    HOSTED_SUBMISSION_SCHEMA_VERSION,
     SESSION_IDENTITY_SCHEMA_VERSION,
     WIDENED_MESSAGE_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
@@ -34,12 +35,13 @@ def _columns(conn, table):
 
 class TestFreshInstall:
     def test_workbench_version_advances_to_widened(self, fresh_db):
-        assert WORKBENCH_SCHEMA_VERSION == WIDENED_MESSAGE_SCHEMA_VERSION
+        assert WORKBENCH_SCHEMA_VERSION == HOSTED_SUBMISSION_SCHEMA_VERSION
+        assert HOSTED_SUBMISSION_SCHEMA_VERSION > WIDENED_MESSAGE_SCHEMA_VERSION
         assert WIDENED_MESSAGE_SCHEMA_VERSION > SESSION_IDENTITY_SCHEMA_VERSION
         conn = open_index()
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version == WIDENED_MESSAGE_SCHEMA_VERSION
+            assert version == WORKBENCH_SCHEMA_VERSION
         finally:
             conn.close()
 
@@ -69,7 +71,7 @@ class TestUpgradeFromV3:
         conn.close()
 
     def test_upgrade_adds_column_and_backfills_legacy(self, fresh_db):
-        # Step 1: fresh install lands at v4 with the column.
+        # Step 1: fresh install lands at the current version with the column.
         conn = open_index()
         conn.execute(
             "INSERT INTO sessions (session_id, project, source, indexed_at) "
@@ -92,13 +94,13 @@ class TestUpgradeFromV3:
             ).fetchone()
             assert row[0] == 1
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version == WIDENED_MESSAGE_SCHEMA_VERSION
+            assert version == WORKBENCH_SCHEMA_VERSION
         finally:
             conn.close()
 
     def test_upgrade_is_idempotent(self, fresh_db):
-        # Open twice from a fresh DB — second open is a no-op for the
-        # widened-message migration since user_version already == 4.
+        # Open twice from a fresh DB — second open is a no-op for all
+        # gated migrations since user_version is already current.
         conn = open_index()
         conn.execute(
             "INSERT INTO sessions (session_id, project, source, indexed_at) "
@@ -117,7 +119,7 @@ class TestUpgradeFromV3:
             msv_after = conn.execute(
                 "SELECT message_schema_version FROM sessions WHERE session_id='s1'"
             ).fetchone()[0]
-            assert version_after == version_before == WIDENED_MESSAGE_SCHEMA_VERSION
+            assert version_after == version_before == WORKBENCH_SCHEMA_VERSION
             # A second open must not flip a widened row back to legacy.
             assert msv_after == msv_before == 2
         finally:

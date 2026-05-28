@@ -71,7 +71,8 @@ Supported public path:
 
 Optional self-hosted path:
 
-- `clawjournal share` can upload to an ingest backend only when `CLAWJOURNAL_INGEST_URL` is explicitly configured.
+- Hosted research submission happens from the local workbench Submit step after email verification and consent.
+- `clawjournal bundle-share` can upload to a self-hosted ingest backend only when `CLAWJOURNAL_INGEST_URL` is explicitly configured.
 
 The default configuration is local-first and does not require any hosted backend.
 
