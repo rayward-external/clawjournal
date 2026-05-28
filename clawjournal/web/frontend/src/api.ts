@@ -22,11 +22,13 @@ import type {
 
 const BASE = '/api';
 
-class ApiError extends Error {
+export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  body: Record<string, unknown>;
+  constructor(status: number, message: string, body: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -58,7 +60,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+    throw new ApiError(res.status, body.error || `HTTP ${res.status}`, body);
   }
   return res.json();
 }
@@ -173,13 +175,64 @@ export const api = {
     return request(`/share-ready${q}`);
   },
 
-  shareDestination(): Promise<{ configured: boolean; preferred_upload_flow: string; cli_ingest_supported: boolean; share_page_url: string | null; message?: string }> {
+  shareDestination(): Promise<{
+    configured: boolean;
+    daemon_upload_supported: boolean;
+    submissions_open: boolean;
+    preferred_upload_flow: string;
+    cli_ingest_supported: boolean;
+    share_page_url: string | null;
+    submit_page_url?: string | null;
+    maximum_bundle_size?: number | null;
+    accepted_manifest_schema_versions?: string[];
+    supported_institution_email_policy?: { domain_suffixes?: string[] } | null;
+    support_contact?: string | null;
+    message?: string;
+  }> {
     return request('/share-destination');
   },
 
+  share: {
+    consent(): Promise<{
+      consent_text: string;
+      retention_text: string;
+      consent_version: string;
+      retention_policy_version: string;
+      support_contact?: string;
+      [key: string]: unknown;
+    }> {
+      return request('/share/consent');
+    },
+
+    verifyEmail(email: string): Promise<{ ok: boolean; email: string; expires_at?: string; dev_code?: string }> {
+      return request('/share/verify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+    },
+
+    verifyConfirm(code: string): Promise<{ verified: boolean; verified_email: string; expires_at?: string | number }> {
+      return request('/share/verify-confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+    },
+
+    uploadStatus(): Promise<{
+      verified_email: string | null;
+      token_valid: boolean;
+      expires_at: string | number | null;
+      pending_email: string | null;
+    }> {
+      return request('/share/upload-status');
+    },
+  },
+
   quickShare(sessionIds: string[], note?: string): Promise<{
-    ok: boolean; share_id: string;
-    shared_at: string; session_count: number; bundle_hash: string;
+    ok: boolean; share_id: string; next_step: 'submit';
+    export_path: string; session_count: number; zip_size_bytes?: number | null;
     redaction_summary: { total_redactions: number; by_type: Record<string, number> };
   }> {
     return request('/quick-share', {
@@ -222,6 +275,7 @@ export const api = {
       ok: boolean;
       export_path: string;
       session_count: number;
+      zip_size_bytes?: number | null;
       redaction_summary: { total_redactions: number; by_type: Record<string, number> };
     }> {
       return request(`/shares/${encodeURIComponent(id)}/seal`, {
@@ -248,7 +302,7 @@ export const api = {
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+        throw new ApiError(res.status, body.error || `HTTP ${res.status}`, body);
       }
       const disposition = res.headers.get('Content-Disposition') || '';
       const match = /filename="?([^";]+)"?/.exec(disposition);
@@ -264,15 +318,21 @@ export const api = {
       URL.revokeObjectURL(url);
     },
 
-    upload(id: string, force?: boolean): Promise<{
-      ok: boolean; shared_at: string;
+    upload(id: string, body: {
+      accept_terms: boolean;
+      ownership_certification: boolean;
+      consent_version: string;
+      retention_policy_version: string;
+    }): Promise<{
+      ok: boolean; shared_at: string; receipt_id: string; hosted_status?: string | null;
       session_count: number; bundle_hash: string;
+      zip_size_bytes?: number;
       redaction_summary: { total_redactions: number; by_type: Record<string, number> };
     }> {
       return request(`/shares/${encodeURIComponent(id)}/upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(force ? { force: true } : {}),
+        body: JSON.stringify(body),
       });
     },
   },

@@ -282,6 +282,45 @@ class TestApplyFindingsToBlob:
         assert result == legacy_blob
         assert count == legacy_count
 
+    def test_tool_server_id_redacts_without_findings_rows(self, conn):
+        raw = "407e1111222233334444555566660ea2c7fa"
+        blob = {
+            "session_id": "sess-server-id",
+            "project": "demo",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": "2025-01-01T00:00:00+00:00",
+            "end_time": "2025-01-01T00:10:00+00:00",
+            "git_branch": "main",
+            "display_title": "preview test",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "thinking": "",
+                "tool_uses": [{
+                    "tool": "mcp__Claude_Preview__preview_eval",
+                    "input": {"serverId": raw, "expression": "location.href = '/login/'"},
+                    "output": {"text": f'{{"serverId": "{raw}", "port": 8000}}'},
+                }],
+            }],
+            "stats": {
+                "user_messages": 0, "assistant_messages": 1, "tool_uses": 1,
+                "input_tokens": 1, "output_tokens": 1,
+            },
+        }
+
+        result, count = apply_findings_to_blob(copy.deepcopy(blob), conn, "sess-server-id")
+
+        dumped = str(result)
+        assert raw not in dumped
+        assert count == 2
+        assert result["messages"][0]["tool_uses"][0]["input"]["serverId"] == (
+            "[REDACTED_TOOL_SERVER_ID]"
+        )
+        assert "[REDACTED_TOOL_SERVER_ID]" in (
+            result["messages"][0]["tool_uses"][0]["output"]["text"]
+        )
+
     def test_multi_pass_catches_cascaded_reveals(self, conn):
         """Redaction equivalence holds for sessions where a secret hides
         inside another. Here we just confirm apply terminates and produces

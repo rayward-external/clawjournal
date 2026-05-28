@@ -648,14 +648,59 @@ class TestShareDestinationAPI:
             "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
             "https://data.rayward.ai/share",
         )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
 
-        status, data = _get(server, "/api/share-destination")
+        # `_handle_share_destination` fetches hosted capabilities; without a
+        # mock this test would hit the real `data.rayward.ai`. Simulate an
+        # unreachable hosted service so the handler degrades to its
+        # "configured but capabilities unavailable" branch.
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("hosted unreachable"),
+        ):
+            status, data = _get(server, "/api/share-destination")
 
         assert status == 200
         assert data["configured"] is True
+        assert data["daemon_upload_supported"] is False
         assert data["preferred_upload_flow"] == "browser_zip"
         assert data["cli_ingest_supported"] is False
         assert data["share_page_url"] == "https://data.rayward.ai/share"
+        assert "capabilities could not be loaded" in (data.get("message") or "")
+
+    def test_configured_share_destination_uses_hosted_capabilities(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
+            "https://hosted.example.test/share",
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        capabilities = {
+            "submissions_open": False,
+            "preferred_upload_flow": "daemon_zip",
+            "cli_ingest_supported": False,
+            "share_page_url": "https://hosted.example.test/share",
+            "submit_page_url": "https://hosted.example.test/submit",
+            "maximum_bundle_size": 12345,
+            "accepted_manifest_schema_versions": ["1.0.0", "1.1.0"],
+            "contact_email": "support@example.test",
+            "cache_seconds": 0,
+        }
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(capabilities=capabilities),
+        ):
+            status, data = _get(server, "/api/share-destination")
+
+        assert status == 200
+        assert data["configured"] is True
+        assert data["daemon_upload_supported"] is True
+        assert data["submissions_open"] is False
+        assert data["preferred_upload_flow"] == "daemon_zip"
+        assert data["submit_page_url"] == "https://hosted.example.test/submit"
+        assert data["maximum_bundle_size"] == 12345
+        assert data["accepted_manifest_schema_versions"] == ["1.0.0", "1.1.0"]
+        assert data["support_contact"] == "support@example.test"
 
     def test_invalid_share_destination_is_disabled(self, server, monkeypatch):
         monkeypatch.setattr(
@@ -1103,22 +1148,57 @@ class TestRunServerPortFallback:
         mock_open.assert_called_once_with("http://localhost:9999/")
 
 
-def _mock_urlopen_factory(upload_response=None, upload_error=None, upload_assert=None):
-    """Create a mock urlopen that handles /upload calls."""
-    upload_resp = upload_response or {"ok": True}
+def _mock_urlopen_factory(upload_response=None, upload_error=None, upload_assert=None, capabilities=None):
+    """Create a mock urlopen that handles the hosted research API."""
+    upload_resp = upload_response or {"receipt_id": "rcpt-test-123", "status": "received"}
+    cap_resp = capabilities or {
+        "submissions_open": True,
+        "preferred_upload_flow": "browser_zip",
+        "cli_ingest_supported": False,
+        "share_page_url": "https://hosted.example.test/share",
+        "submit_page_url": "https://hosted.example.test/share",
+        "maximum_bundle_size": 52_428_800,
+        "accepted_manifest_schema_versions": ["1.0.0"],
+        "supported_institution_email_policy": {"domain_suffixes": [".edu", "rayward.ai"]},
+        "contact_email": "contact@example.test",
+        "cache_seconds": 0,
+    }
+
+    def _resp(payload):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps(payload).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
 
     def mock_urlopen(req, **kwargs):
         url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "/upload" in url:
+        if "/.well-known/clawjournal-share.json" in url:
+            return _resp(cap_resp)
+        if "/api/consent" in url:
+            return _resp({
+                "consent_text": "Consent text",
+                "retention_text": "Retention text",
+                "consent_version": "consent-v1",
+                "retention_policy_version": "retention-v1",
+                "support_contact": "contact@example.test",
+            })
+        if "/api/verify-email/confirm" in url:
+            return _resp({
+                "upload_token": "upload-token-123",
+                "upload_token_expires_at": int(time.time()) + 3600,
+            })
+        if "/api/verify-email" in url:
+            return _resp({
+                "verification_id": "verify-123",
+                "expires_at": "2026-01-01T00:00:00+00:00",
+            })
+        if "/api/submissions" in url:
             if upload_assert is not None:
                 upload_assert(req)
             if upload_error:
                 raise upload_error
-            resp = MagicMock()
-            resp.read.return_value = json.dumps(upload_resp).encode()
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            return resp
+            return _resp(upload_resp)
         raise ValueError(f"Unexpected URL: {url}")
 
     return mock_urlopen
@@ -1233,50 +1313,128 @@ def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
 
 
 class TestVerifyEmailAPI:
+    def test_request_email_verification_stores_pending_id(self, monkeypatch):
+        from clawjournal.workbench.daemon import request_email_verification
+
+        saved = {}
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            result = request_email_verification("Test@University.edu")
+
+        assert result["verification_id"] == "verify-123"
+        assert saved["pending_verification_id"] == "verify-123"
+        assert saved["pending_verification_email"] == "test@university.edu"
+
     def test_confirm_email_verification_persists_upload_token_and_expiry(self, monkeypatch):
         from clawjournal.workbench.daemon import confirm_email_verification
 
         saved = {}
 
-        monkeypatch.setattr("clawjournal.workbench.daemon._SHARE_INGEST_URL", "https://test-ingest.example.com")
-        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {
+            "pending_verification_id": "verify-123",
+            "pending_verification_email": "test@university.edu",
+        })
         monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
 
-        def mock_urlopen(req, **kwargs):
-            resp = MagicMock()
-            resp.read.return_value = json.dumps({
-                "verified": True,
-                "upload_token": "upload-token-123",
-                "upload_token_expires_at": 1700000000,
-            }).encode()
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            return resp
-
-        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
             result = confirm_email_verification("Test@University.edu", "123456")
 
-        assert result["verified"] is True
+        assert result["upload_token"] == "upload-token-123"
         assert saved["verified_email"] == "test@university.edu"
         assert saved["verified_email_token"] == "upload-token-123"
-        assert saved["verified_email_token_expires_at"] == 1700000000
+        assert "pending_verification_id" not in saved
+
+    def test_verify_endpoints_do_not_return_upload_token(self, server, monkeypatch):
+        state = {}
+
+        def load_state():
+            return dict(state)
+
+        def save_state(updated):
+            state.clear()
+            state.update(updated)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", load_state)
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", save_state)
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, "/api/share/verify-email", {"email": "Test@University.edu"})
+            assert status == 200
+            assert data["ok"] is True
+            assert data["email"] == "test@university.edu"
+            assert "upload_token" not in data
+            assert state["pending_verification_id"] == "verify-123"
+
+            status, data = _post(server, "/api/share/verify-confirm", {"code": "123456"})
+
+        assert status == 200
+        assert data["verified"] is True
+        assert data["verified_email"] == "test@university.edu"
+        assert "upload_token" not in json.dumps(data)
+        assert state["verified_email_token"] == "upload-token-123"
+        assert "pending_verification_id" not in state
+
+    def test_verify_email_network_failure_returns_502(self, server, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("connection refused"),
+        ):
+            status, data = _post(server, "/api/share/verify-email", {"email": "test@university.edu"})
+
+        assert status == 502
+        assert "connection refused" in data["error"]
+
+    def test_verify_email_preserves_hosted_rate_limit_status(self, server, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        error_resp = BytesIO(json.dumps({"error": "Too many verification attempts"}).encode())
+        http_error = urllib.error.HTTPError(
+            url="https://hosted.example.test/api/verify-email",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},
+            fp=error_resp,  # type: ignore[arg-type]
+        )
+
+        def fail_verify(req, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "/.well-known/clawjournal-share.json" in url:
+                return _mock_urlopen_factory()(req, **kwargs)
+            raise http_error
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=fail_verify):
+            status, data = _post(server, "/api/share/verify-email", {"email": "test@university.edu"})
+
+        assert status == 429
+        assert data["error"] == "Too many verification attempts"
 
 
 class TestShareAPI:
-    """Tests for the share-to-GCS HTTP upload flow."""
+    """Tests for the hosted research submission flow."""
 
     @pytest.fixture(autouse=True)
-    def _trufflehog_clean_for_uploads(self, monkeypatch):
+    def _trufflehog_clean_for_uploads(self, monkeypatch, index_setup):
         """The upload path refuses bypassed TruffleHog scans by design.
         All share-API tests want the clean-upload scenario, so install
         a no-op mock here rather than repeating it in every test."""
         _mock_trufflehog_clean(monkeypatch)
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
 
     def _create_and_export_share(self, port):
         """Helper: create a share and export it, return share_id.
 
         Releases the underlying sessions (`hold_state='released'`) so
-        the centralized upload gate in `upload_share` lets the share
+        the centralized upload gate in `submit_share_to_hosted` lets the share
         through. Hosted upload requires released sessions since the
         security refactor.
         """
@@ -1299,6 +1457,14 @@ class TestShareAPI:
         assert status == 200
         assert data["ok"] is True
         return share_id
+
+    def _consent_body(self):
+        return {
+            "accept_terms": True,
+            "ownership_certification": True,
+            "consent_version": "consent-v1",
+            "retention_policy_version": "retention-v1",
+        }
 
     def test_upload_refuses_when_trufflehog_bypassed(self, server, monkeypatch):
         """CLAWJOURNAL_SKIP_TRUFFLEHOG is a dev/CI escape hatch for
@@ -1328,7 +1494,7 @@ class TestShareAPI:
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 422, data
         assert data.get("block_reason") == "trufflehog-bypassed"
@@ -1341,16 +1507,37 @@ class TestShareAPI:
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 200
         assert data["ok"] is True
         assert "gcs_uri" not in data
+        assert data["receipt_id"] == "rcpt-test-123"
         assert "shared_at" in data
         assert data["bundle_hash"]
         assert "redaction_summary" in data
         assert isinstance(data["redaction_summary"]["total_redactions"], int)
         assert isinstance(data["redaction_summary"]["by_type"], dict)
+        conn = open_index()
+        row = conn.execute(
+            "SELECT hosted_receipt_id, gcs_uri FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        conn.close()
+        assert row["hosted_receipt_id"] == "rcpt-test-123"
+        assert row["gcs_uri"] is None
+
+        status, detail = _get(server, f"/api/shares/{share_id}")
+        assert status == 200
+        assert detail["hosted_receipt_id"] == "rcpt-test-123"
+        assert detail["zip_size_bytes"] > 0
+        assert "gcs_uri" not in detail
+
+        status, share_list = _get(server, "/api/shares")
+        assert status == 200
+        listed = next(share for share in share_list if share["share_id"] == share_id)
+        assert listed["hosted_receipt_id"] == "rcpt-test-123"
+        assert "gcs_uri" not in listed
 
     def test_share_success_clears_cached_upload_token(self, server, monkeypatch):
         """Successful upload should clear the cached single-use token."""
@@ -1363,7 +1550,7 @@ class TestShareAPI:
         monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: saved.update(updated))
 
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 200
         assert data["ok"] is True
@@ -1377,34 +1564,102 @@ class TestShareAPI:
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 200
 
-        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 429
         assert "Rate limited" in data["error"]
 
     def test_share_duplicate_prevention(self, server, monkeypatch):
-        """Already-shared bundle → 409 (unless force=true)."""
+        """Already-submitted bundle → 409; force surfaces a clearer message."""
         WorkbenchHandler._last_share_time = 0.0
         share_id = self._create_and_export_share(server)
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         mock_urlopen = _mock_urlopen_factory()
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, _ = _post(server, f"/api/shares/{share_id}/upload")
+            status, _ = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 200
 
         WorkbenchHandler._last_share_time = 0.0
-        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 409
-        assert "already uploaded" in data["error"]
+        assert "already submitted" in data["error"]
+        assert data["receipt_id"] == "rcpt-test-123"
 
         WorkbenchHandler._last_share_time = 0.0
-        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            status, data = _post(server, f"/api/shares/{share_id}/upload", {"force": True})
-        assert status == 200
+        body = {**self._consent_body(), "force": True}
+        status, data = _post(server, f"/api/shares/{share_id}/upload", body)
+        assert status == 409
+        assert "cannot be overwritten" in data["error"]
+        assert data["receipt_id"] == "rcpt-test-123"
+
+    def test_duplicate_receipt_returned_even_without_valid_token(self, server, monkeypatch):
+        """Receipt hydration/retry should not require a still-valid upload token."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        conn = open_index()
+        conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ?, "
+            "hosted_receipt_id = ?, hosted_status = ? WHERE share_id = ?",
+            (
+                "2026-01-01T00:00:00+00:00",
+                "rcpt-existing-123",
+                "received",
+                share_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 409
+        assert data["receipt_id"] == "rcpt-existing-123"
+        assert data["hosted_status"] == "received"
+        assert "already submitted" in data["error"]
+
+    def test_force_on_fresh_share_submits(self, server, monkeypatch):
+        """`force: true` on a never-submitted share submits normally (force is ignored)."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        body = {**self._consent_body(), "force": True}
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", body)
+
+        assert status == 200, data
         assert data["ok"] is True
+        assert data["receipt_id"] == "rcpt-test-123"
+
+    def test_self_hosted_ingest_share_rejects_hosted_submit(self, server, monkeypatch):
+        """A share previously uploaded via self-hosted ingest cannot be re-submitted to hosted research."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        # Simulate a legacy self-hosted upload: shared_at is set but
+        # there's no hosted_receipt_id.
+        conn = open_index()
+        conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ?, "
+            "hosted_receipt_id = NULL WHERE share_id = ?",
+            ("2026-01-01T00:00:00+00:00", share_id),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 409
+        assert "self-hosted ingest" in data["error"]
+        assert data.get("shared_at") == "2026-01-01T00:00:00+00:00"
+        assert "receipt_id" not in data
 
     def test_share_http_error(self, server, monkeypatch):
         """HTTP error from ingest → daemon returns 502."""
@@ -1413,36 +1668,34 @@ class TestShareAPI:
 
         error_resp = BytesIO(json.dumps({"error": "Internal server error"}).encode())
         http_error = urllib.error.HTTPError(
-            url="http://test/upload", code=500, msg="Internal Server Error",
+            url="http://test/api/submissions", code=500, msg="Internal Server Error",
             hdrs={}, fp=error_resp,  # type: ignore[arg-type]
         )
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 502
         assert "error" in data
 
-    def test_share_cf_409_treated_as_success(self, server, monkeypatch):
-        """Cloud Function 409 (already in GCS) → daemon treats as success."""
+    def test_hosted_409_is_returned_as_conflict(self, server, monkeypatch):
+        """Hosted conflicts are not treated as GCS idempotency successes."""
         WorkbenchHandler._last_share_time = 0.0
         share_id = self._create_and_export_share(server)
 
-        error_resp = BytesIO(json.dumps({"error": "Share already uploaded"}).encode())
+        error_resp = BytesIO(json.dumps({"error": "Duplicate submission"}).encode())
         http_error = urllib.error.HTTPError(
-            url="http://test/upload", code=409, msg="Conflict",
+            url="http://test/api/submissions", code=409, msg="Conflict",
             hdrs={}, fp=error_resp,  # type: ignore[arg-type]
         )
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
-        assert status == 200
-        assert data["ok"] is True
-        assert "gcs_uri" not in data
-        assert data["shared_at"]
+        assert status == 409
+        assert data["error"] == "Duplicate submission"
 
     def test_share_network_failure(self, server, monkeypatch):
         """Network failure → daemon returns 502 with friendly message."""
@@ -1451,10 +1704,10 @@ class TestShareAPI:
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=urllib.error.URLError("Connection refused"))):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 502
-        assert "Could not reach upload service" in data["error"]
+        assert "Could not reach hosted submission service" in data["error"]
 
     def test_share_verification_error_passthrough(self, server, monkeypatch):
         """Verification failures from the ingest service should remain 403."""
@@ -1463,13 +1716,13 @@ class TestShareAPI:
 
         error_resp = BytesIO(json.dumps({"error": "Invalid or expired upload token"}).encode())
         http_error = urllib.error.HTTPError(
-            url="http://test/upload", code=403, msg="Forbidden",
+            url="http://test/api/submissions", code=403, msg="Forbidden",
             hdrs={}, fp=error_resp,  # type: ignore[arg-type]
         )
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 403
         assert data["error"] == "Invalid or expired upload token"
@@ -1483,14 +1736,14 @@ class TestShareAPI:
 
         error_resp = BytesIO(json.dumps({"error": "Invalid or expired upload token"}).encode())
         http_error = urllib.error.HTTPError(
-            url="http://test/upload", code=403, msg="Forbidden",
+            url="http://test/api/submissions", code=403, msg="Forbidden",
             hdrs={}, fp=error_resp,  # type: ignore[arg-type]
         )
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: config)
         monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: saved.update(updated))
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory(upload_error=http_error)):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 403
         assert data["error"] == "Invalid or expired upload token"
@@ -1506,7 +1759,7 @@ class TestShareAPI:
             "verified_email": "test@university.edu",
         })
 
-        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 403
         assert "needs to be refreshed" in data["error"]
 
@@ -1519,7 +1772,7 @@ class TestShareAPI:
             verified_email_token_expires_at=int(time.time()) - 100,
         ))
 
-        status, data = _post(server, f"/api/shares/{share_id}/upload")
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 403
         assert "expired" in data["error"].lower()
 
@@ -1534,6 +1787,10 @@ class TestShareAPI:
             body = req.data.decode("utf-8", errors="replace")
             assert 'name="upload_token"' in body
             assert "test-upload-token" in body
+            assert 'name="bundle"; filename="' in body
+            assert 'name="consent_version"' in body
+            assert "consent-v1" in body
+            assert 'name="ownership_certification"' in body
             # These must NOT be sent as form fields
             assert 'name="verified_email"' not in body
             assert 'name="device_id"' not in body
@@ -1542,10 +1799,153 @@ class TestShareAPI:
             "clawjournal.workbench.daemon.urllib.request.urlopen",
             side_effect=_mock_urlopen_factory(upload_assert=assert_upload_fields),
         ):
-            status, data = _post(server, f"/api/shares/{share_id}/upload")
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 200
         assert data["ok"] is True
+
+    def test_share_upload_submits_hosted_zip_with_validator_fields(self, server, monkeypatch):
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        def assert_zip(req):
+            body = req.data
+            assert b'name="sessions"' not in body
+            marker = b"PK\x03\x04"
+            start = body.index(marker)
+            end = body.rfind(b"\r\n--")
+            with zipfile.ZipFile(BytesIO(body[start:end])) as archive:
+                names = set(archive.namelist())
+                assert {"manifest.json", "sessions.jsonl", "trufflehog.post-pii.json"}.issubset(names)
+                manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+                summary = manifest["redaction_summary"]
+                assert isinstance(summary["pii_review"]["finding_count"], int)
+                post = summary["trufflehog_post_pii"]
+                assert post["findings"] == 0
+                assert post["bypassed"] is False
+                assert post["binary_missing"] is False
+                assert not post.get("scan_error")
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_assert=assert_zip),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 200
+        assert data["receipt_id"] == "rcpt-test-123"
+
+    def test_share_upload_requires_consent_body(self, server, monkeypatch):
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload")
+
+        assert status == 400
+        assert "requires consent fields" in data["error"]
+
+    def test_share_upload_rejects_oversize_zip_before_network(self, server, monkeypatch):
+        """The daemon refuses oversize zips locally so we never hit the hosted limit."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+
+        tiny_capabilities = {
+            "submissions_open": True,
+            "preferred_upload_flow": "browser_zip",
+            "cli_ingest_supported": False,
+            "share_page_url": "https://hosted.example.test/share",
+            "submit_page_url": "https://hosted.example.test/share",
+            "maximum_bundle_size": 16,  # bytes — guaranteed to be smaller than any real share zip
+            "accepted_manifest_schema_versions": ["1.0.0"],
+            "supported_institution_email_policy": {"domain_suffixes": [".edu", "rayward.ai"]},
+            "contact_email": "contact@example.test",
+            "cache_seconds": 0,
+        }
+
+        submissions_called = {"count": 0}
+
+        def upload_assert(_req):
+            submissions_called["count"] += 1
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(capabilities=tiny_capabilities, upload_assert=upload_assert),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 413, data
+        assert "exceeds the hosted limit" in data["error"]
+        assert submissions_called["count"] == 0  # never reached /api/submissions
+
+    def test_share_upload_surfaces_stale_consent_rejection(self, server, monkeypatch):
+        """Hosted 400 with consent-version error is forwarded verbatim so the UI can refresh."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        stale_resp = BytesIO(json.dumps({
+            "error": "consent_version 'consent-v1' is stale; current is 'consent-v2'.",
+        }).encode())
+        stale_error = urllib.error.HTTPError(
+            url="http://test/api/submissions", code=400, msg="Bad Request",
+            hdrs={}, fp=stale_resp,  # type: ignore[arg-type]
+        )
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_error=stale_error),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 400, data
+        assert "consent_version" in data["error"]
+        assert "stale" in data["error"]
+        # Stale-consent must not leave the share marked shared in the local DB.
+        conn = open_index()
+        row = conn.execute(
+            "SELECT status, hosted_receipt_id FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        conn.close()
+        assert row["status"] != "shared"
+        assert row["hosted_receipt_id"] is None
+
+    def test_legacy_share_alias_requires_consent_body(self, server, monkeypatch):
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        status, data = _post(server, f"/api/shares/{share_id}/share")
+
+        assert status == 400
+        assert "requires consent fields" in data["error"]
+
+    def test_quick_share_packages_only(self, server):
+        WorkbenchHandler._last_share_time = 0.0
+
+        status, data = _post(server, "/api/quick-share", {
+            "session_ids": ["sess-0", "sess-1"],
+            "note": "Quick package",
+        })
+
+        assert status == 200
+        assert data["ok"] is True
+        assert data["next_step"] == "submit"
+        assert data["share_id"] == data["bundle_id"]
+        assert "shared_at" not in data
+        conn = open_index()
+        row = conn.execute(
+            "SELECT status, shared_at, hosted_receipt_id FROM shares WHERE share_id = ?",
+            (data["share_id"],),
+        ).fetchone()
+        conn.close()
+        assert row["status"] == "exported"
+        assert row["shared_at"] is None
+        assert row["hosted_receipt_id"] is None
 
     def test_download_preserves_shared_status(self, server):
         """Downloading an already-shared archive must not downgrade it to exported."""

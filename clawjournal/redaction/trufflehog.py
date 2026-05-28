@@ -611,7 +611,14 @@ def _iter_session_text_fields(session: dict):
 
 
 def _serialize_session_for_scan(session: dict) -> str:
-    return "\n\n".join(text for text, *_ in _iter_session_text_fields(session))
+    field_payload = "\n\n".join(text for text, *_ in _iter_session_text_fields(session))
+    try:
+        json_payload = json.dumps(session, default=str, sort_keys=True)
+    except (TypeError, ValueError):
+        json_payload = ""
+    if field_payload and json_payload:
+        return f"{field_payload}\n\n{json_payload}"
+    return field_payload or json_payload
 
 
 def scan_session_for_trufflehog_findings(

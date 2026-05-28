@@ -31,7 +31,8 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
-WORKBENCH_SCHEMA_VERSION = WIDENED_MESSAGE_SCHEMA_VERSION
+HOSTED_SUBMISSION_SCHEMA_VERSION = 5
+WORKBENCH_SCHEMA_VERSION = HOSTED_SUBMISSION_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
 SHARE_RECOMMENDATION_LIMIT = 10
@@ -123,7 +124,10 @@ CREATE TABLE IF NOT EXISTS shares (
     bundle_hash     TEXT,
     manifest        TEXT,
     shared_at       TEXT,
-    gcs_uri         TEXT
+    gcs_uri         TEXT,
+    hosted_receipt_id TEXT,
+    hosted_status     TEXT,
+    hosted_submission_url TEXT
 );
 
 CREATE TABLE IF NOT EXISTS share_sessions (
@@ -328,6 +332,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_security_refactor(conn)
     _migrate_session_identity_bridge(conn)
     _migrate_widened_message_model(conn)
+    _migrate_hosted_submission_receipts(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -483,6 +488,32 @@ def _migrate_widened_message_model(conn: sqlite3.Connection) -> None:
             "WHERE message_schema_version IS NULL OR message_schema_version = 2"
         )
         conn.execute(f"PRAGMA user_version = {WIDENED_MESSAGE_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_hosted_submission_receipts(conn: sqlite3.Connection) -> None:
+    """Add hosted research submission receipt fields. Advances v4 -> v5."""
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= HOSTED_SUBMISSION_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for col, col_type in [
+            ("hosted_receipt_id", "TEXT"),
+            ("hosted_status", "TEXT"),
+            ("hosted_submission_url", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE shares ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+        conn.execute(f"PRAGMA user_version = {HOSTED_SUBMISSION_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -3513,6 +3544,59 @@ EXPORT_FIELDS = {
 }
 
 
+def build_trufflehog_blocked_sessions(
+    manifest: dict[str, Any],
+    report: Any,
+) -> list[dict[str, Any]]:
+    """Map TruffleHog JSONL line findings back to exported sessions.
+
+    ``sessions.jsonl`` is one line per exported session. If every finding has
+    a valid line number, the UI can offer an explicit "remove these traces and
+    retry" recovery path. If any finding cannot be mapped, return an empty
+    list so callers keep the existing hard block.
+    """
+    findings = list(getattr(report, "findings", []) or [])
+    if not findings:
+        return []
+
+    sessions = manifest.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return []
+
+    blocked_by_id: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        line = getattr(finding, "line", None)
+        if not isinstance(line, int) or line < 1 or line > len(sessions):
+            return []
+
+        session = sessions[line - 1]
+        if not isinstance(session, dict):
+            return []
+        session_id = session.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return []
+
+        entry = blocked_by_id.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "project": session.get("project"),
+                "source": session.get("source"),
+                "model": session.get("model"),
+                "line": line,
+                "findings": [],
+            },
+        )
+        entry["findings"].append({
+            "line": line,
+            "detector": getattr(finding, "detector", None),
+            "status": getattr(finding, "status", None),
+            "masked": getattr(finding, "masked", None),
+        })
+
+    return sorted(blocked_by_id.values(), key=lambda item: item["line"])
+
+
 def export_share_to_disk(
     conn: sqlite3.Connection,
     share_id: str,
@@ -3615,6 +3699,9 @@ def export_share_to_disk(
         manifest["blocked"] = True
         manifest["block_reason"] = trufflehog_report.block_reason
         manifest["block_message"] = trufflehog_scanner.format_block_message(trufflehog_report)
+        blocked_sessions = build_trufflehog_blocked_sessions(manifest, trufflehog_report)
+        if blocked_sessions:
+            manifest["blocked_sessions"] = blocked_sessions
         with open(export_dir / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2, default=str)
         # Record the block on the share row so the UI can surface it,

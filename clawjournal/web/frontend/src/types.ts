@@ -160,6 +160,10 @@ export interface Share {
   manifest: Record<string, unknown> | null;
   shared_at: string | null;
   gcs_uri?: string | null;
+  hosted_receipt_id?: string | null;
+  hosted_status?: string | null;
+  hosted_submission_url?: string | null;
+  zip_size_bytes?: number | null;
   sessions?: Session[];
 }
 

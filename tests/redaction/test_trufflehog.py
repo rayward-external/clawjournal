@@ -486,6 +486,49 @@ class TestApplyPathIntegration:
         finally:
             conn.close()
 
+    def test_json_serialization_context_matches_are_redacted(self, tmp_path, monkeypatch):
+        from clawjournal.findings import reset_salt_cache
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+        from clawjournal.workbench.index import open_index
+
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+        reset_salt_cache()
+
+        raw = "407e111122223333444455556666c7fa"
+
+        def fake_scan(text):
+            if '"serverId":' in text and raw in text:
+                return [{"raw": raw, "detector": "NpmToken", "status": "unverified"}]
+            return []
+
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", fake_scan)
+
+        conn = open_index()
+        try:
+            blob = {
+                "session_id": "sess-json-context",
+                "display_title": "t",
+                "project": "p",
+                "git_branch": "",
+                "messages": [{
+                    "content": "tool server started",
+                    "thinking": "",
+                    "tool_uses": [{"input": {"serverId": raw}}],
+                }],
+            }
+            redacted, n = apply_findings_to_blob(blob, conn, "sess-json-context")
+            assert n == 1
+            assert (
+                redacted["messages"][0]["tool_uses"][0]["input"]["serverId"]
+                == "[REDACTED_NPMTOKEN]"
+            )
+        finally:
+            conn.close()
+
     def test_ignored_hash_is_not_redacted(self, tmp_path, monkeypatch):
         import sqlite3
         from clawjournal.findings import hash_entity, reset_salt_cache

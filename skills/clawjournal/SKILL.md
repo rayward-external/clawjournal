@@ -155,7 +155,7 @@ clawjournal bundle-create --status approved --note "<user's comment>" --json
 clawjournal bundle-export <bundle_id> --zip --json
 ```
 
-Parse the export result, use `zip_path` as the upload file, and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `CLAWJOURNAL_INGEST_URL`; use the workbench Done screen's "Submit to ClawJournal Research" button when it is available, then have the user upload the zip on that page. If the destination is not configured, tell the user the redacted zip is ready on their computer.
+Parse the export result and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `CLAWJOURNAL_INGEST_URL`; use the workbench Share tab's Submit step so email verification, consent, and receipt handling happen in the UI. If the destination is not configured, tell the user the redacted zip is ready on their computer.
 
 ### Quick Share
 
@@ -279,7 +279,7 @@ clawjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--r
 clawjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only
 
 # Advanced self-hosted ingest upload
-clawjournal share --status approved [--note "..."] [--preview] [--json]
+clawjournal share --status approved [--note "..."] [--preview] [--json]  # package locally; hosted submit is workbench-only
 
 # Bundles
 clawjournal bundle-create [ids ...] [--status approved]
@@ -308,4 +308,4 @@ clawjournal serve [--port 8384] [--no-browser] [--remote]
 - **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
 - **`clawjournal inbox --json`** is the preferred way for agents to read trace data.
 - **`clawjournal serve`** opens a browser automatically. Use `--no-browser` to suppress.
-- **Everything is local by default** — nothing leaves the machine unless the user explicitly uploads the zip or uses a configured self-hosted ingest command.
+- **Everything is local by default** — nothing leaves the machine unless the user explicitly submits from the workbench or uses a configured self-hosted ingest command.
