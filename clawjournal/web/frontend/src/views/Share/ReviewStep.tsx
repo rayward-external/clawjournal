@@ -12,6 +12,7 @@ export interface ReviewStepProps {
   redactedSessions: Record<string, RedactedSessionData>;
   approvedIds: Set<string>;
   expandedIds: Set<string>;
+  aiPiiEnabled: boolean;
   onToggleExpand: (id: string) => void;
   onApprove: (id: string) => void;
   onApproveAllClean: () => void;
@@ -53,7 +54,7 @@ export function ReviewStep(p: ReviewStepProps) {
         &mdash; so you know exactly what&rsquo;s in the zip.
       </p>
 
-      <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} />
+      <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
 
       {/* Bulk progress bar */}
       <div style={{
@@ -99,6 +100,7 @@ export function ReviewStep(p: ReviewStepProps) {
             data={p.redactedSessions[s.session_id]}
             approved={p.approvedIds.has(s.session_id)}
             expanded={p.expandedIds.has(s.session_id)}
+            aiPiiEnabled={p.aiPiiEnabled}
             onToggle={() => p.onToggleExpand(s.session_id)}
             onApprove={() => p.onApprove(s.session_id)}
             onRemove={() => p.onRemove(s.session_id)}
@@ -137,18 +139,19 @@ export function ReviewStep(p: ReviewStepProps) {
           </div>
         </div>
       </div>
-      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} />}
+      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} aiPiiEnabled={p.aiPiiEnabled} />}
     </div>
   );
 }
 
 function ReviewRow({
-  session, data, approved, expanded, onToggle, onApprove, onRemove, onRetryAi,
+  session, data, approved, expanded, aiPiiEnabled, onToggle, onApprove, onRemove, onRetryAi,
 }: {
   session: ReadySession;
   data: RedactedSessionData | undefined;
   approved: boolean;
   expanded: boolean;
+  aiPiiEnabled: boolean;
   onToggle: () => void;
   onApprove: () => void;
   onRemove: () => void;
@@ -160,10 +163,11 @@ function ReviewRow({
   const totalItems = categories.reduce((s, c) => s + c.count, 0);
   const borderColor = approved ? colors.green200 : status === 'review' ? colors.yellow200 : colors.gray200;
   const aiUnavailable = data?.aiCoverage === 'rules_only';
+  const aiDisabled = data?.aiCoverage === 'disabled' || !aiPiiEnabled;
 
   // Meta label under the title — no raw finding counts, just a neutral phrase.
   const metaPhrase: string | null = status === 'review'
-    ? (aiUnavailable ? 'needs review · rules-only' : 'needs review')
+    ? (aiDisabled ? 'needs review · rules-only' : aiUnavailable ? 'needs review · AI unavailable' : 'needs review')
     : null;
 
   return (
@@ -251,7 +255,7 @@ function ReviewRow({
               : <>Here&rsquo;s the redacted trace. Scan it &mdash; if anything looks off, <strong style={{ color: colors.gray900 }}>remove it</strong>. Otherwise include it in the bundle.</>}
           </p>
 
-          {aiUnavailable && (
+          {(aiUnavailable || aiDisabled) && (
             <div style={{
               display: 'flex', alignItems: 'center', gap: 10,
               padding: '10px 12px', marginBottom: 14,
@@ -260,9 +264,11 @@ function ReviewRow({
             }}>
               <Icon name="alert" size={14} />
               <span style={{ color: colors.gray600, marginRight: 'auto' }}>
-                AI review was unavailable &mdash; only deterministic + policy rules ran on this trace.
+                {aiDisabled
+                  ? 'AI review is off for this bundle — only deterministic + policy rules ran on this trace.'
+                  : 'AI review was unavailable — only deterministic + policy rules ran on this trace.'}
               </span>
-              {!approved && (
+              {!approved && aiUnavailable && (
                 <button
                   onClick={onRetryAi}
                   style={{
@@ -290,7 +296,8 @@ function ReviewRow({
                 {categories.length === 0 ? (
                   <div style={{ fontSize: 12.5, color: colors.gray500 }}>
                     Nothing matched the deterministic rules.
-                    {aiUnavailable && <div style={{ marginTop: 4 }}>AI review unavailable.</div>}
+                    {aiDisabled && <div style={{ marginTop: 4 }}>AI review off.</div>}
+                    {aiUnavailable && !aiDisabled && <div style={{ marginTop: 4 }}>AI review unavailable.</div>}
                   </div>
                 ) : (
                   <>

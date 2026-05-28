@@ -34,6 +34,7 @@ class ClawJournalConfig(TypedDict, total=False):
     pending_verification_id: str | None
     pending_verification_email: str | None
     pending_verification_expires_at: str | int | None
+    ai_pii_review_enabled: bool
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {

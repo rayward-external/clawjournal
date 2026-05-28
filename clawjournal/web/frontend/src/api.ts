@@ -230,7 +230,7 @@ export const api = {
     },
   },
 
-  quickShare(sessionIds: string[], note?: string): Promise<{
+  quickShare(sessionIds: string[], note?: string, opts?: { aiPii?: boolean }): Promise<{
     ok: boolean; share_id: string; next_step: 'submit';
     export_path: string; session_count: number; zip_size_bytes?: number | null;
     redaction_summary: { total_redactions: number; by_type: Record<string, number> };
@@ -238,7 +238,7 @@ export const api = {
     return request('/quick-share', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_ids: sessionIds, note }),
+      body: JSON.stringify({ session_ids: sessionIds, note, ai_pii: opts?.aiPii }),
     });
   },
 
@@ -271,7 +271,7 @@ export const api = {
       });
     },
 
-    seal(id: string): Promise<{
+    seal(id: string, opts?: { aiPii?: boolean }): Promise<{
       ok: boolean;
       export_path: string;
       session_count: number;
@@ -281,7 +281,7 @@ export const api = {
       return request(`/shares/${encodeURIComponent(id)}/seal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ ai_pii: opts?.aiPii }),
       });
     },
 
@@ -293,11 +293,12 @@ export const api = {
       return `${BASE}/shares/${encodeURIComponent(id)}/download`;
     },
 
-    async download(id: string): Promise<void> {
+    async download(id: string, opts?: { aiPii?: boolean }): Promise<void> {
       // `window.open` can't attach the Bearer auth header the daemon
       // requires, so fetch the zip through the same auth'd path as every
       // other API call and hand the browser a blob URL to save.
-      const res = await fetch(`${BASE}/shares/${encodeURIComponent(id)}/download`, {
+      const q = opts && typeof opts.aiPii === 'boolean' ? qs({ ai_pii: opts.aiPii ? 1 : 0 }) : '';
+      const res = await fetch(`${BASE}/shares/${encodeURIComponent(id)}/download${q}`, {
         headers: authHeader(),
       });
       if (!res.ok) {
@@ -323,6 +324,7 @@ export const api = {
       ownership_certification: boolean;
       consent_version: string;
       retention_policy_version: string;
+      ai_pii?: boolean;
     }): Promise<{
       ok: boolean; shared_at: string; receipt_id: string; hosted_status?: string | null;
       session_count: number; bundle_hash: string;

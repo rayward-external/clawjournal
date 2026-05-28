@@ -116,7 +116,7 @@ export interface RedactedSessionData {
   loading: boolean;
   redactionCount?: number;
   aiPiiFindings?: AiPiiFindingLocal[];
-  aiCoverage?: 'full' | 'rules_only';
+  aiCoverage?: 'full' | 'rules_only' | 'disabled';
   buckets?: BucketCounts;
   trufflehogHits?: number;
 }

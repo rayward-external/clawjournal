@@ -126,7 +126,7 @@ export function parseStep(value: string | null): StepKey {
 
 export function classify(d: RedactedSessionData | undefined): 'checking' | 'clear' | 'review' {
   if (!d || d.loading) return 'checking';
-  if (d.aiCoverage === 'rules_only') return 'review';
+  if (d.aiCoverage === 'rules_only' || d.aiCoverage === 'disabled') return 'review';
   const lowConf = (d.aiPiiFindings || []).some(f => f.confidence < CONFIDENCE_THRESHOLD);
   if (lowConf) return 'review';
   return 'clear';

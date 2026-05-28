@@ -367,6 +367,7 @@ def configure(
     redact: list[str] | None = None,
     redact_usernames: list[str] | None = None,
     confirm_projects: bool = False,
+    ai_pii_review: bool | None = None,
 ):
     """Set config values non-interactively. Lists are MERGED (append), not replaced."""
     config = load_config()
@@ -390,6 +391,8 @@ def configure(
         _merge_config_list(config, "redact_usernames", redact_usernames)
     if confirm_projects:
         config["projects_confirmed"] = True
+    if ai_pii_review is not None:
+        config["ai_pii_review_enabled"] = ai_pii_review
     save_config(config)
     print(f"Config saved to {CONFIG_FILE}")
     print(json.dumps(_mask_config_for_display(config), indent=2))
@@ -1510,6 +1513,16 @@ def _run_bundle_export(args) -> None:
 
     config = load_config()
 
+    # AI-PII review only runs inside the uploadable-zip finalize pass, so the
+    # flag is a no-op for a plain on-disk export. Warn instead of silently
+    # ignoring it.
+    if getattr(args, "ai_pii_review", False) is True and getattr(args, "zip", False) is not True:
+        print(
+            "Note: --ai-pii-review only applies when building the uploadable zip; "
+            "pass --zip to enable it.",
+            file=sys.stderr,
+        )
+
     conn = open_index()
     try:
         settings = get_effective_share_settings(conn, config)
@@ -1550,7 +1563,11 @@ def _run_bundle_export(args) -> None:
         if getattr(args, "zip", False) is True:
             from .workbench.daemon import finalize_share_export_for_upload
 
-            error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+            error, manifest = finalize_share_export_for_upload(
+                export_dir,
+                manifest,
+                ai_pii=getattr(args, "ai_pii_review", False) is True,
+            )
             if error:
                 if error.get("block_reason"):
                     print(f"Share blocked: {error.get('block_reason')}")
@@ -1814,6 +1831,7 @@ def _run_bundle_share(args) -> None:
             excluded_projects=settings["excluded_projects"],
             blocked_domains=settings["blocked_domains"],
             allowlist_entries=settings["allowlist_entries"],
+            ai_pii_review_enabled=getattr(args, "ai_pii_review", False) is True,
         )
         if result.get("ok"):
             if getattr(args, "json", False):
@@ -1901,12 +1919,19 @@ def _run_share(args) -> None:
         if share is None:
             print("Share failed: newly created share could not be loaded.")
             sys.exit(1)
+        # The explicit --ai-pii-review flag forces AI review on; otherwise fall
+        # back to the persisted config default (clawjournal config --ai-pii-review).
+        ai_pii_review = (
+            getattr(args, "ai_pii_review", False) is True
+            or bool(settings.get("ai_pii_review_enabled", False))
+        )
         export_dir, manifest, error = _prepare_share_export_for_upload(
             conn,
             share_id,
             share,
             settings,
             reuse_finalized=True,
+            ai_pii_review_enabled=ai_pii_review,
         )
         if error:
             print(error.get("error", "Share failed."))
@@ -1916,7 +1941,8 @@ def _run_share(args) -> None:
             sys.exit(1)
 
         port = config.get("daemon_port") or 8384
-        workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit"
+        ai_pii_param = "&ai_pii=1" if ai_pii_review else ""
+        workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit{ai_pii_param}"
         daemon_running = _daemon_port_is_open(port)
         result = {
             "ok": True,
@@ -3604,6 +3630,9 @@ def main() -> None:
                      help="Comma-separated usernames to anonymize (GitHub handles, Discord names)")
     cfg.add_argument("--confirm-projects", action="store_true",
                      help="Mark project selection as confirmed (include all)")
+    cfg.add_argument("--ai-pii-review", action=argparse.BooleanOptionalAction, default=None,
+                     help="Default AI-assisted PII review on (--ai-pii-review) or off "
+                          "(--no-ai-pii-review) for the workbench/CLI share flow")
 
     events_parser = sub.add_parser("events", help="Execution recorder commands")
     events_sub = events_parser.add_subparsers(dest="events_command", required=True)
@@ -4074,11 +4103,15 @@ def main() -> None:
     be.add_argument("--training-format", action="store_true",
                     help="Also produce a training-format JSONL (turn-based, cleaned)")
     be.add_argument("--zip", action="store_true", help="Also write an uploadable zip")
+    be.add_argument("--ai-pii-review", action="store_true",
+                    help="Requires --zip: opt in to AI-assisted PII review before writing the uploadable zip")
     be.add_argument("--json", action="store_true", help="Output JSON")
 
     bs = sub.add_parser("bundle-share", help="Share bundle via self-hosted ingest service")
     bs.add_argument("share_id", help="Bundle ID (or prefix)")
     bs.add_argument("--force", action="store_true", help="Override duplicate check")
+    bs.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review before upload")
     bs.add_argument("--json", action="store_true", help="Output JSON")
 
     # Share command (one-step: create + export + share)
@@ -4090,6 +4123,8 @@ def main() -> None:
     sh.add_argument("--force", action="store_true", help="Override duplicate check")
     sh.add_argument("--preview", action="store_true",
                     help="Show the trace bundle contents that would be shared without uploading")
+    sh.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review while packaging")
     sh.add_argument("--json", action="store_true", help="Output JSON")
 
     ve = sub.add_parser("verify-email", help="Verify an academic email address for a short-lived upload token")
@@ -4486,6 +4521,7 @@ def _parse_csv_arg(value: str | None) -> list[str] | None:
 
 def _handle_config(args) -> None:
     """Handle the config subcommand."""
+    ai_pii_review = getattr(args, "ai_pii_review", None)
     has_changes = (
         args.repo
         or args.source
@@ -4493,6 +4529,7 @@ def _handle_config(args) -> None:
         or args.redact
         or args.redact_usernames
         or args.confirm_projects
+        or ai_pii_review is not None
     )
     if not has_changes:
         print(json.dumps(_mask_config_for_display(load_config()), indent=2))
@@ -4504,6 +4541,7 @@ def _handle_config(args) -> None:
         redact=_parse_csv_arg(args.redact),
         redact_usernames=_parse_csv_arg(args.redact_usernames),
         confirm_projects=args.confirm_projects or bool(args.exclude),
+        ai_pii_review=ai_pii_review,
     )
 
 

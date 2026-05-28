@@ -323,6 +323,28 @@ class TestConfigure:
         configure(source="codex")
         assert saved["source"] == "codex"
 
+    def test_sets_ai_pii_review_flag(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(ai_pii_review=True)
+        assert saved["ai_pii_review_enabled"] is True
+
+        configure(ai_pii_review=False)
+        assert saved["ai_pii_review_enabled"] is False
+
+    def test_ai_pii_review_unset_leaves_config_untouched(self, tmp_config, monkeypatch, capsys):
+        # The tri-state default (None) must not write the key when the flag is omitted.
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(source="codex")
+        assert "ai_pii_review_enabled" not in saved
+
 
 # --- list_projects ---
 
@@ -874,6 +896,7 @@ class TestBundleExport:
             output=None,
             json=True,
             zip=True,
+            ai_pii_review=True,
             training_format=False,
         )
         _run_bundle_export(args)
@@ -895,6 +918,28 @@ class TestBundleExport:
         assert "[REDACTED_NAME]" in sessions_content
         assert manifest["redaction_summary"]["pii_review"]["finding_count"] == 1
         assert manifest["redaction_summary"]["coverage"] == {"full": 2, "rules_only": 0}
+
+    def test_export_ai_pii_review_without_zip_warns(self, bundle_index, capsys, monkeypatch):
+        """--ai-pii-review is a no-op without --zip; the CLI must say so rather
+        than silently ignore it."""
+        from clawjournal.workbench.index import create_share, open_index
+        conn = open_index()
+        bundle_id = create_share(conn, ["sess-0", "sess-1"])
+        conn.close()
+
+        def fail_hybrid(*_a, **_k):
+            raise AssertionError("AI PII review must not run without --zip")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fail_hybrid)
+
+        from clawjournal.cli import _run_bundle_export
+        args = MagicMock(
+            share_id=bundle_id, output=None, json=True,
+            zip=False, ai_pii_review=True, training_format=False,
+        )
+        _run_bundle_export(args)
+        captured = capsys.readouterr()
+        assert "--ai-pii-review only applies when building the uploadable zip" in captured.err
 
     def test_export_zip_appends_suffix_to_output_directory(self, bundle_index, tmp_path, capsys):
         from clawjournal.workbench.index import create_share, open_index
@@ -1573,7 +1618,7 @@ class TestShare:
 
         monkeypatch.setattr(
             "clawjournal.workbench.daemon._prepare_share_export_for_upload",
-            lambda conn, share_id, share, settings, reuse_finalized=False: (
+            lambda conn, share_id, share, settings, reuse_finalized=False, **_kw: (
                 Path("/tmp/clawjournal-share"),
                 {
                     "sessions": [{}, {}, {}],
@@ -1608,7 +1653,7 @@ class TestShare:
 
         monkeypatch.setattr(
             "clawjournal.workbench.daemon._prepare_share_export_for_upload",
-            lambda conn, share_id, share, settings, reuse_finalized=False: (
+            lambda conn, share_id, share, settings, reuse_finalized=False, **_kw: (
                 Path("/tmp/clawjournal-share"),
                 {"sessions": [{}, {}, {}], "redaction_summary": {"total_redactions": 0, "by_type": {}}},
                 None,
@@ -1622,6 +1667,36 @@ class TestShare:
         assert output["share_id"]
         assert output["bundle_id"] == output["share_id"]
         assert output["next_step"] == "submit_in_workbench"
+
+    def test_share_honors_config_ai_pii_default(self, bundle_index, capsys, monkeypatch):
+        """With no --ai-pii-review flag, the persisted config default opts in."""
+        from clawjournal.cli import _run_share
+
+        # bundle_index points cli.load_config at {}; opt in via the config default.
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"ai_pii_review_enabled": True})
+
+        captured = {}
+
+        def _stub(conn, share_id, share, settings, reuse_finalized=False, **kw):
+            captured.update(kw)
+            return (
+                Path("/tmp/clawjournal-share"),
+                {"sessions": [{}], "redaction_summary": {"total_redactions": 0, "by_type": {}}},
+                None,
+            )
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._prepare_share_export_for_upload", _stub)
+
+        # No ai_pii_review on the namespace → the flag is absent.
+        args = MagicMock(session_ids=[], status="approved", note="test",
+                         force=False, json=True, preview=False)
+        del args.ai_pii_review
+        _run_share(args)
+
+        assert captured.get("ai_pii_review_enabled") is True
+        output = json.loads(capsys.readouterr().out)
+        assert output["workbench_url"].endswith("&ai_pii=1")
 
 
 class TestVerifyEmail:

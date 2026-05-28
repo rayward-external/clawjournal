@@ -244,7 +244,7 @@ export interface RedactionReport {
   redaction_count: number;
   redaction_log: RedactionLogEntry[];
   ai_pii_findings?: AiPiiFinding[];
-  ai_coverage?: 'full' | 'rules_only';
+  ai_coverage?: 'full' | 'rules_only' | 'disabled';
   redacted_session: SessionDetail;
 }
 

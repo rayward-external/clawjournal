@@ -65,9 +65,9 @@ Everything in the default workflow runs on your own computer:
 
 ## If you decide to share
 
-Sharing is fully opt-in and separate from local review. When you do choose to export or upload, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and similar) on top of the scan-time findings, and the workbench Share flow adds an AI-assisted PII review on top of that.
+Sharing is fully opt-in and separate from local review. When you do choose to export or upload, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and similar) on top of the scan-time findings. The workbench Share flow can also add AI-assisted PII review when you opt in for a bundle.
 
-The AI-assisted PII review uses the same backend as `score` — your current coding agent's automation CLI (e.g. `codex exec`, the Claude CLI). Home-dir paths and usernames are anonymized locally before anything is sent to the agent; if your agent routes to a cloud provider, that's where the PII review happens. Override with `--backend` to keep the call on a local model.
+The optional AI-assisted PII review uses the same backend as `score` — your current coding agent's automation CLI (e.g. `codex exec`, the Claude CLI). Home-dir paths and usernames are anonymized locally before anything is sent to the agent; if your agent routes to a cloud provider, that's where the PII review happens.
 
 See [PRIVACY.md](PRIVACY.md) for the full redaction list and the sharing paths (local file, hosted research submission, or self-configured ingest upload).
 
@@ -327,7 +327,7 @@ Package the conversations you approved into a redacted file on your computer. Up
 
 **Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
-The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Submit → Done**. The Redact step uses AI to catch any personal info the automatic scan missed. Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
+The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Submit → Done**. The Redact step always uses deterministic and policy rules; you can opt in to AI review to catch contextual personal info the automatic scan missed. When enabled, upload-time AI review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
 
 To actually upload after packaging (optional), use the workbench **Submit** step. It verifies email, shows consent, sends the finalized zip to the hosted service, and stores the returned receipt locally. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables hosted submission and leaves download-only packaging.
 
@@ -522,6 +522,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal verify-email you@university.edu` | Verify an academic email for hosted workbench submission |
 | `clawjournal share --preview --status approved` | Preview what would be packaged |
 | `clawjournal share --status approved` | Package locally and print the workbench Submit URL |
+| `clawjournal share --status approved --ai-pii-review` | Package with optional AI-assisted PII review |
 | `clawjournal bundle-share <bundle_id>` | Upload through an explicitly configured self-hosted ingest service |
 
 ### Configuration
@@ -531,6 +532,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal config --exclude "a,b"` | Add excluded projects (appends) |
 | `clawjournal config --redact "str1,str2"` | Add strings to always redact (appends) |
 | `clawjournal config --redact-usernames "u1,u2"` | Add usernames to anonymize (appends) |
+| `clawjournal config --ai-pii-review` / `--no-ai-pii-review` | Set the default AI-assisted PII review on/off for the share flow |
 | `clawjournal list` | List all projects with exclusion status |
 | `clawjournal status` | Show current stage and next steps (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |
@@ -606,7 +608,7 @@ Each line in the exported JSONL is one session:
 
 - **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
 - **Source and project confirmation are required** — the CLI blocks export until both are set.
-- **`scan` already redacts.** Secrets and PII findings are computed and stored as hashed references at scan time. For additional LLM-PII review, use the workbench Share page. The legacy `--pii-review` / `--pii-apply` CLI path still works for sanitizing already-exported files.
+- **`scan` already redacts.** Secrets and PII findings are computed and stored as hashed references at scan time. For additional LLM-PII review, opt in on the workbench Share page. The legacy `--pii-review` / `--pii-apply` CLI path still works for sanitizing already-exported files.
 - **Hold-state gates uploads.** Sessions in `pending_review` or active `embargoed` cannot be shared; `auto_redacted` (default) and `released` can.
 - **Large exports take time** — 500+ sessions may take 1–3 minutes.
 - **Virtual environment recommended** — modern Linux (and some macOS setups) block system-wide pip installs. Use a venv to avoid issues.

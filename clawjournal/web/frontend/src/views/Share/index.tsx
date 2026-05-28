@@ -64,6 +64,7 @@ export function Share() {
   const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
 
   const [note, setNote] = useState(() => searchParams.get('note') || '');
+  const [aiPiiEnabled, setAiPiiEnabled] = useState(() => searchParams.get('ai_pii') === '1');
   const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
   const [showAddTraces, setShowAddTraces] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
@@ -164,6 +165,7 @@ export function Share() {
     setActiveStep(step);
     setCompletedKeys(completedKeysForStep(step));
     setNote(searchParams.get('note') || '');
+    setAiPiiEnabled(searchParams.get('ai_pii') === '1');
     setPackagedShareId(searchParams.get('share'));
     setRedactedSessions({});
     setApprovedIds(new Set());
@@ -201,11 +203,12 @@ export function Share() {
       const csv = queueOrder.join(',');
       if (csv) next.set('ids', csv); else next.delete('ids');
       if (note) next.set('note', note); else next.delete('note');
+      if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
       if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, note, packagedShareId, setSearchParams]);
+  }, [activeStep, queueOrder, note, aiPiiEnabled, packagedShareId, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {
@@ -257,6 +260,10 @@ export function Share() {
   useEffect(() => {
     if (!packagedShareId) return;
     api.shares.get(packagedShareId).then((share) => {
+      const piiReview = (share.manifest?.redaction_summary as { pii_review?: { ai_enabled?: unknown } } | undefined)?.pii_review;
+      if (!searchParams.get('ai_pii') && typeof piiReview?.ai_enabled === 'boolean') {
+        setAiPiiEnabled(piiReview.ai_enabled);
+      }
       if (share.hosted_receipt_id) {
         setReceiptId(share.hosted_receipt_id);
         setCompletedKeys((prev) => new Set([...prev, 'submit']));
@@ -271,7 +278,7 @@ export function Share() {
         });
       }
     }).catch(() => { });
-  }, [packagedShareId]);
+  }, [packagedShareId, searchParams]);
 
   // =================================================
   // Queue actions
@@ -283,6 +290,27 @@ export function Share() {
 
   const addToQueue = (id: string) => {
     setQueueOrder((prev) => prev.includes(id) ? prev : [...prev, id]);
+  };
+
+  const updateAiPiiEnabled = (enabled: boolean) => {
+    setAiPiiEnabled(enabled);
+    setRedactedSessions({});
+    setApprovedIds(new Set());
+    setExpandedReviewIds(new Set());
+    setPackagedShareId(null);
+    setPackageProgress(0);
+    setPackageLog('');
+    setPackagingFailed(null);
+    setBlockedPackageSessions([]);
+    setBundleInfo(null);
+    // Toggling AI-PII invalidates the packaged bundle and every step after the
+    // queue, so collapse the stepper and clear any prior submit/receipt state.
+    // Otherwise a completed Submit/Done entry stays clickable with a now-null
+    // share id, stranding the user in a dead-end step.
+    setCompletedKeys(completedKeysForStep('queue'));
+    setReceiptId(null);
+    setHostedStatus(null);
+    setSupportContact(null);
   };
 
   const reorderQueue = (fromId: string, overId: string) => {
@@ -303,6 +331,7 @@ export function Share() {
     setCompletedKeys(new Set());
     setPackagedShareId(null);
     setNote('');
+    setAiPiiEnabled(false);
     setRedactedSessions({});
     setApprovedIds(new Set());
     setExpandedReviewIds(new Set());
@@ -359,7 +388,7 @@ export function Share() {
       let lastErr: unknown = null;
       for (let attempt = 0; attempt <= REDACTION_RETRIES; attempt++) {
         try {
-          return await api.sessions.redactionReport(sessionId, { aiPii: true });
+          return await api.sessions.redactionReport(sessionId, { aiPii: aiPiiEnabled });
         } catch (e) {
           lastErr = e;
           if (attempt < REDACTION_RETRIES) {
@@ -394,7 +423,7 @@ export function Share() {
             messages: msgs, loading: false,
             redactionCount: report.redaction_count,
             aiPiiFindings: report.ai_pii_findings || [],
-            aiCoverage: report.ai_coverage || 'rules_only',
+            aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
             buckets,
             trufflehogHits,
           },
@@ -406,7 +435,7 @@ export function Share() {
             messages: [{ role: 'system', content: '(unable to load redacted content)' }],
             loading: false,
             redactionCount: 0,
-            aiCoverage: 'rules_only',
+            aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
             buckets: emptyBuckets(),
           },
         }));
@@ -418,7 +447,7 @@ export function Share() {
       await Promise.all(batch.map(processOne));
     }
     redactionStartedRef.current = false;
-  }, [queuedSessions, redactedSessions]);
+  }, [queuedSessions, redactedSessions, aiPiiEnabled]);
 
   const handleStartRedaction = () => {
     setCompletedKeys((prev) => new Set([...prev, 'queue']));
@@ -557,7 +586,7 @@ export function Share() {
       'Allocating bundle...',
       'Writing manifest.json...',
       ...approvedList.map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`),
-      'Running final PII review...',
+      aiPiiEnabled ? 'Running final AI PII review...' : 'Running final rules-only PII review...',
       'Running final secret scan...',
       'Sealing bundle...',
     ];
@@ -592,10 +621,10 @@ export function Share() {
       setPackageProgress(98);
       setPackageLog('Finalizing zip...');
 
-      // Seal performs the final local-only AI PII pass and post-PII
-      // TruffleHog gate without triggering a browser save. The Done button
-      // is the only action that downloads bytes.
-      const sealed = await api.shares.seal(share_id);
+      // Seal performs the final local-only PII pass and post-PII TruffleHog
+      // gate without triggering a browser save. The Done button is the only
+      // action that downloads bytes.
+      const sealed = await api.shares.seal(share_id, { aiPii: aiPiiEnabled });
 
       setPackageProgress(100);
       setPackageLog('Done.');
@@ -636,7 +665,7 @@ export function Share() {
     } finally {
       packagingStartedRef.current = false;
     }
-  }, [queuedSessions, approvedIds, note, toast]);
+  }, [queuedSessions, approvedIds, note, toast, aiPiiEnabled]);
 
   const handleStartPackage = () => {
     if (queuedSessions.length === 0) return;
@@ -698,7 +727,7 @@ export function Share() {
   const handleDownloadZip = async () => {
     if (!packagedShareId) return;
     try {
-      await api.shares.download(packagedShareId);
+      await api.shares.download(packagedShareId, { aiPii: aiPiiEnabled });
       toast('Download started', 'success');
     } catch (err: unknown) {
       toast(err instanceof Error ? err.message : 'Download failed', 'error');
@@ -748,6 +777,8 @@ export function Share() {
         queuedSessions={queuedSessions}
         note={note}
         setNote={setNote}
+        aiPiiEnabled={aiPiiEnabled}
+        setAiPiiEnabled={updateAiPiiEnabled}
         onRemove={removeFromQueue}
         onAdd={addToQueue}
         onReorder={reorderQueue}
@@ -786,6 +817,7 @@ export function Share() {
         queuedSessions={queuedSessions}
         redactedSessions={redactedSessions}
         allDone={redactAllDone}
+        aiPiiEnabled={aiPiiEnabled}
         onBack={() => setActiveStep('queue')}
         onContinue={goToReview}
         globalStyles={globalStyles}
@@ -806,6 +838,7 @@ export function Share() {
         redactedSessions={redactedSessions}
         approvedIds={approvedIds}
         expandedIds={expandedReviewIds}
+        aiPiiEnabled={aiPiiEnabled}
         onToggleExpand={toggleReviewExpand}
         onApprove={approveTrace}
         onApproveAllClean={approveAllClean}
@@ -851,6 +884,7 @@ export function Share() {
         shareId={packagedShareId}
         bundle={bundleInfo}
         shareDestination={shareDestination}
+        aiPiiEnabled={aiPiiEnabled}
         onSubmitted={handleSubmitComplete}
         onDownloadZip={handleDownloadZip}
         globalStyles={globalStyles}
