@@ -24,9 +24,11 @@ const BASE = '/api';
 
 class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  body: Record<string, unknown>;
+  constructor(status: number, message: string, body: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -58,7 +60,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+    throw new ApiError(res.status, body.error || `HTTP ${res.status}`, body);
   }
   return res.json();
 }
@@ -183,6 +185,7 @@ export const api = {
     submit_page_url?: string | null;
     maximum_bundle_size?: number | null;
     accepted_manifest_schema_versions?: string[];
+    supported_institution_email_policy?: { domain_suffixes?: string[] } | null;
     support_contact?: string | null;
     message?: string;
   }> {
@@ -299,7 +302,7 @@ export const api = {
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
+        throw new ApiError(res.status, body.error || `HTTP ${res.status}`, body);
       }
       const disposition = res.headers.get('Content-Disposition') || '';
       const match = /filename="?([^";]+)"?/.exec(disposition);

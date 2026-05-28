@@ -15,6 +15,33 @@ import { colors } from '../theme.ts';
 // Helpers
 // ============================================================
 
+interface BlockedShareFinding {
+  line?: number | null;
+  detector?: string | null;
+  status?: string | null;
+  masked?: string | null;
+}
+
+interface BlockedShareSession {
+  session_id: string;
+  project?: string | null;
+  source?: string | null;
+  model?: string | null;
+  line?: number | null;
+  findings?: BlockedShareFinding[];
+}
+
+function blockedSessionsFromError(err: unknown): BlockedShareSession[] {
+  const body = (err as { body?: { blocked_sessions?: unknown } } | null)?.body;
+  const raw = body?.blocked_sessions;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item): item is BlockedShareSession => (
+    !!item
+    && typeof item === 'object'
+    && typeof (item as { session_id?: unknown }).session_id === 'string'
+  ));
+}
+
 function hexAlpha(hex: string, alpha: number): string {
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
@@ -587,6 +614,7 @@ export function Share() {
   const [packageProgress, setPackageProgress] = useState(0);
   const [packageLog, setPackageLog] = useState('');
   const [packagingFailed, setPackagingFailed] = useState<string | null>(null);
+  const [blockedPackageSessions, setBlockedPackageSessions] = useState<BlockedShareSession[]>([]);
 
   // Done state
   const [bundleInfo, setBundleInfo] = useState<{ traces: number; created: string; approxSize: string } | null>(null);
@@ -671,6 +699,7 @@ export function Share() {
     setPackageProgress(0);
     setPackageLog('');
     setPackagingFailed(null);
+    setBlockedPackageSessions([]);
 
     if (ids) {
       setQueueOrder(ids);
@@ -808,6 +837,7 @@ export function Share() {
     setPackageProgress(0);
     setPackageLog('');
     setPackagingFailed(null);
+    setBlockedPackageSessions([]);
     setActiveStep('queue');
   }, []);
 
@@ -1041,6 +1071,7 @@ export function Share() {
     if (packagingStartedRef.current) return;
     packagingStartedRef.current = true;
     setPackagingFailed(null);
+    setBlockedPackageSessions([]);
     setPackageProgress(0);
     setPackageLog('Allocating bundle...');
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact', 'review']));
@@ -1122,6 +1153,7 @@ export function Share() {
     } catch (err: unknown) {
       clearAllTimers();
       const msg = err instanceof Error ? err.message : 'Package failed';
+      setBlockedPackageSessions(blockedSessionsFromError(err));
       setError(msg);
       setPackagingFailed(msg);
       setPackageLog(`Failed: ${msg}`);
@@ -1137,6 +1169,34 @@ export function Share() {
     setActiveStep('package');
     void runPackage();
   };
+
+  const removeBlockedAndRetry = useCallback(() => {
+    if (blockedPackageSessions.length === 0) return;
+    const blockedIds = new Set(blockedPackageSessions.map((s) => s.session_id));
+    const remainingApproved = queuedSessions.filter((s) => (
+      approvedIds.has(s.session_id) && !blockedIds.has(s.session_id)
+    ));
+
+    setQueueOrder((prev) => prev.filter((id) => !blockedIds.has(id)));
+    setApprovedIds((prev) => {
+      const next = new Set(prev);
+      blockedIds.forEach((id) => next.delete(id));
+      return next;
+    });
+    setBlockedPackageSessions([]);
+    setPackageProgress(0);
+    setPackagedShareId(null);
+
+    if (remainingApproved.length === 0) {
+      setPackagingFailed('All approved traces were blocked by the final secret scan.');
+      setPackageLog('No approved traces remain.');
+      setActiveStep('review');
+      return;
+    }
+
+    setPackagingFailed(null);
+    setPackageLog('Removed blocked traces. Retrying...');
+  }, [approvedIds, blockedPackageSessions, queuedSessions]);
 
   // kick off packaging when the step becomes active (eg. back-forward)
   useEffect(() => {
@@ -1312,7 +1372,9 @@ export function Share() {
         progress={packageProgress}
         log={packageLog}
         failed={packagingFailed}
+        blockedSessions={blockedPackageSessions}
         onRetry={runPackage}
+        onRemoveBlockedAndRetry={removeBlockedAndRetry}
         onBack={() => setActiveStep('review')}
         globalStyles={globalStyles}
       />
@@ -2550,7 +2612,9 @@ interface PackageStepProps {
   progress: number;
   log: string;
   failed: string | null;
+  blockedSessions: BlockedShareSession[];
   onRetry: () => void;
+  onRemoveBlockedAndRetry: () => void;
   onBack: () => void;
   globalStyles: React.ReactNode;
 }
@@ -2558,6 +2622,11 @@ interface PackageStepProps {
 function PackageStep(p: PackageStepProps) {
   const [flying, setFlying] = useState<{ id: string; title: string }[]>([]);
   const [thump, setThump] = useState(0);
+  const blockedRows = useMemo(() => p.blockedSessions.map((blocked) => ({
+    blocked,
+    session: p.approvedList.find((s) => s.session_id === blocked.session_id),
+  })), [p.approvedList, p.blockedSessions]);
+  const blockedCount = blockedRows.length;
 
   // animate trace labels flying in over the course of progress
   useEffect(() => {
@@ -2626,10 +2695,12 @@ function PackageStep(p: PackageStepProps) {
           </div>
         </div>
         <h2 style={{ fontSize: 20, fontWeight: 500, letterSpacing: '-0.01em', margin: '0 0 6px', color: colors.gray900 }}>
-          {p.failed ? 'Packaging failed' : 'Packaging your bundle'}
+          {p.failed && blockedCount > 0 ? 'Packaging blocked' : p.failed ? 'Packaging failed' : 'Packaging your bundle'}
         </h2>
         <p style={{ color: colors.gray500, fontSize: 13.5, margin: '0 0 20px' }}>
-          {p.failed
+          {p.failed && blockedCount > 0
+            ? `${blockedCount} trace${blockedCount === 1 ? '' : 's'} triggered the final secret scan.`
+            : p.failed
             ? p.failed
             : <>Compressing {p.approvedCount} approved trace{p.approvedCount === 1 ? '' : 's'} into a single redacted zip.</>}
         </p>
@@ -2651,12 +2722,50 @@ function PackageStep(p: PackageStepProps) {
           {p.log}
         </div>
         {p.failed && (
-          <div style={{ marginTop: 20, display: 'flex', gap: 10, justifyContent: 'center' }}>
-            <button onClick={p.onBack} style={btnSecondary}>Back to review</button>
-            <button onClick={p.onRetry} style={btnPrimary}>
-              <Icon name="retry" size={13} /> Retry
-            </button>
-          </div>
+          <>
+            {blockedCount > 0 && (
+              <div style={{
+                margin: '20px auto 0', maxWidth: 560, textAlign: 'left',
+                border: `1px solid ${colors.yellow200}`, background: colors.yellow50,
+                borderRadius: 6, padding: '12px 14px',
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray900, marginBottom: 8 }}>
+                  Blocked trace{blockedCount === 1 ? '' : 's'}
+                </div>
+                <div style={{ display: 'grid', gap: 8 }}>
+                  {blockedRows.map(({ blocked, session }) => {
+                    const firstFinding = blocked.findings?.[0];
+                    return (
+                      <div key={blocked.session_id} style={{
+                        display: 'grid', gap: 3, paddingBottom: 8,
+                        borderBottom: `1px solid ${colors.yellow200}`,
+                      }}>
+                        <div style={{ fontSize: 12.5, fontWeight: 500, color: colors.gray900 }}>
+                          {session?.display_title || blocked.project || blocked.session_id}
+                        </div>
+                        <div style={{ fontSize: 11.5, color: colors.gray500 }}>
+                          {session?.project || blocked.project || 'Unknown project'}
+                          {firstFinding?.detector ? ` · ${firstFinding.detector}` : ''}
+                          {firstFinding?.masked ? ` · ${firstFinding.masked}` : ''}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            <div style={{ marginTop: 20, display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap' }}>
+              <button onClick={p.onBack} style={btnSecondary}>Back to review</button>
+              {blockedCount > 0 && (
+                <button onClick={p.onRemoveBlockedAndRetry} style={btnPrimary}>
+                  Remove and retry
+                </button>
+              )}
+              <button onClick={p.onRetry} style={blockedCount > 0 ? btnSecondary : btnPrimary}>
+                <Icon name="retry" size={13} /> Retry
+              </button>
+            </div>
+          </>
         )}
       </div>
     </div>

@@ -40,6 +40,7 @@ from .findings_pipeline import (
 from .index import (
     add_policy,
     apply_share_redactions,
+    build_trufflehog_blocked_sessions,
     create_share,
     export_share_to_disk,
     FAILURE_VALUE_SOURCE_SCOPE,
@@ -989,6 +990,7 @@ def finalize_share_export_for_upload(
         return {
             "error": manifest.get("block_message") or "Share blocked by TruffleHog",
             "block_reason": manifest.get("block_reason"),
+            "blocked_sessions": manifest.get("blocked_sessions", []),
             "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
             "status": 422,
         }, manifest
@@ -1052,6 +1054,9 @@ def finalize_share_export_for_upload(
             or ("trufflehog-bypassed" if post_pii_report.bypassed else None)
         )
         manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
+        blocked_sessions = build_trufflehog_blocked_sessions(manifest, post_pii_report)
+        if blocked_sessions:
+            manifest["blocked_sessions"] = blocked_sessions
         with open(manifest_file, "w") as f:
             json.dump(manifest, f, indent=2, default=str)
         if post_pii_report.bypassed:
@@ -1066,6 +1071,7 @@ def finalize_share_export_for_upload(
         return {
             "error": trufflehog_scanner.format_block_message(post_pii_report),
             "block_reason": post_pii_report.block_reason,
+            "blocked_sessions": manifest.get("blocked_sessions", []),
             "trufflehog_summary": post_pii_report.summary(),
             "status": 422,
         }, manifest
@@ -2755,6 +2761,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "error": manifest.get("block_message") or "Share blocked by TruffleHog",
                     "block_reason": manifest.get("block_reason"),
                     "export_path": str(export_dir),
+                    "blocked_sessions": manifest.get("blocked_sessions", []),
                     "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
                 }, 422)
                 return

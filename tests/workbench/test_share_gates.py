@@ -479,6 +479,7 @@ class TestTruffleHogGate:
         assert manifest["blocked"] is True
         assert manifest["block_reason"] == "trufflehog-findings"
         assert "ghp_a***4567" in manifest["block_message"]
+        assert manifest.get("blocked_sessions") is None
         # Status must not advance — the share is not clean.
         post_status_row = conn.execute(
             "SELECT status FROM shares WHERE share_id = ?", (share_id,)
@@ -490,6 +491,46 @@ class TestTruffleHogGate:
         # Manifest-on-disk matches the returned manifest (blocked=true).
         disk = json.loads((export_dir / "manifest.json").read_text())
         assert disk["blocked"] is True
+
+    def test_findings_block_maps_jsonl_line_to_session(self, conn, monkeypatch):
+        from clawjournal.redaction import trufflehog as trufflehog_scanner
+        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+
+        def fake_scan(path):
+            return trufflehog_scanner.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+                findings=[
+                    trufflehog_scanner.TruffleHogFinding(
+                        detector="NpmToken", status="unverified",
+                        line=1, masked="407e***c7fa",
+                        raw_sha256="sha256:x",
+                    )
+                ],
+                unverified=1,
+                top_detectors=["NpmToken"],
+            )
+
+        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
+        share_id, share = self._share(conn)
+
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert export_dir is not None
+        blocked = manifest["blocked_sessions"]
+        assert blocked == [{
+            "session_id": "sess-1",
+            "project": "demo",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "line": 1,
+            "findings": [{
+                "line": 1,
+                "detector": "NpmToken",
+                "status": "unverified",
+                "masked": "407e***c7fa",
+            }],
+        }]
 
     def test_missing_binary_blocks_with_install_hint(self, conn, monkeypatch):
         from clawjournal.redaction import trufflehog as trufflehog_scanner
