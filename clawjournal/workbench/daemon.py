@@ -2415,6 +2415,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "submit_page_url": share_url,
             "maximum_bundle_size": None,
             "accepted_manifest_schema_versions": [],
+            "supported_institution_email_policy": None,
             "support_contact": None,
             "message": message,
         }
@@ -2429,6 +2430,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
 
         submissions_open = bool(capabilities.get("submissions_open"))
+        email_policy = capabilities.get("supported_institution_email_policy")
+        if not isinstance(email_policy, dict):
+            email_policy = None
         payload.update({
             "preferred_upload_flow": capabilities.get("preferred_upload_flow", "browser_zip"),
             "cli_ingest_supported": bool(capabilities.get("cli_ingest_supported")),
@@ -2438,6 +2442,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "submissions_open": submissions_open,
             "maximum_bundle_size": capabilities.get("maximum_bundle_size"),
             "accepted_manifest_schema_versions": capabilities.get("accepted_manifest_schema_versions", []),
+            "supported_institution_email_policy": email_policy,
             "support_contact": capabilities.get("contact_email") or capabilities.get("support_contact"),
             "message": "Hosted research submissions are open." if submissions_open else "Hosted research submissions are currently closed.",
         })

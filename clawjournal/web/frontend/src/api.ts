@@ -22,7 +22,7 @@ import type {
 
 const BASE = '/api';
 
-class ApiError extends Error {
+export class ApiError extends Error {
   status: number;
   body: Record<string, unknown>;
   constructor(status: number, message: string, body: Record<string, unknown> = {}) {

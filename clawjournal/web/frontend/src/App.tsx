@@ -3,7 +3,7 @@ import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-do
 import { Inbox } from './views/Inbox.tsx';
 import { Search } from './views/Search.tsx';
 import SessionDetail from './views/SessionDetail.tsx';
-import { Share } from './views/Share.tsx';
+import { Share } from './views/Share/index.tsx';
 import { Policies } from './views/Policies.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Insights } from './views/Insights.tsx';
