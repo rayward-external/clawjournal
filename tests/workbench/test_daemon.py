@@ -648,14 +648,25 @@ class TestShareDestinationAPI:
             "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
             "https://data.rayward.ai/share",
         )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
 
-        status, data = _get(server, "/api/share-destination")
+        # `_handle_share_destination` fetches hosted capabilities; without a
+        # mock this test would hit the real `data.rayward.ai`. Simulate an
+        # unreachable hosted service so the handler degrades to its
+        # "configured but capabilities unavailable" branch.
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("hosted unreachable"),
+        ):
+            status, data = _get(server, "/api/share-destination")
 
         assert status == 200
         assert data["configured"] is True
+        assert data["daemon_upload_supported"] is False
         assert data["preferred_upload_flow"] == "browser_zip"
         assert data["cli_ingest_supported"] is False
         assert data["share_page_url"] == "https://data.rayward.ai/share"
+        assert "capabilities could not be loaded" in (data.get("message") or "")
 
     def test_configured_share_destination_uses_hosted_capabilities(self, server, monkeypatch):
         monkeypatch.setattr(

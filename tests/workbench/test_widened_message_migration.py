@@ -140,3 +140,78 @@ class TestUpgradeFromV3:
             assert row[0] == 2
         finally:
             conn.close()
+
+
+class TestUpgradeFromV4:
+    """The v4 → v5 migration adds `shares.hosted_receipt_id` and friends.
+
+    These tests start from a fresh v5 DB, roll it back to v4 by surgically
+    removing the new columns, then re-open via ``open_index`` to confirm
+    the migration re-adds them and advances ``PRAGMA user_version``.
+    """
+
+    def _downgrade_to_v4(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA foreign_keys=OFF")
+        for col in ("hosted_receipt_id", "hosted_status", "hosted_submission_url"):
+            conn.execute(f"ALTER TABLE shares DROP COLUMN {col}")
+        conn.execute(f"PRAGMA user_version = {WIDENED_MESSAGE_SCHEMA_VERSION}")
+        conn.commit()
+        conn.close()
+
+    def test_fresh_install_has_hosted_submission_columns(self, fresh_db):
+        conn = open_index()
+        try:
+            cols = _columns(conn, "shares")
+            assert {"hosted_receipt_id", "hosted_status", "hosted_submission_url"}.issubset(cols)
+        finally:
+            conn.close()
+
+    def test_upgrade_adds_hosted_submission_columns(self, fresh_db):
+        # Land at v5, insert a pre-existing share, then roll back to v4.
+        conn = open_index()
+        conn.execute(
+            "INSERT INTO shares (share_id, created_at, status) "
+            "VALUES ('share-legacy', '2026-01-01T00:00:00+00:00', 'exported')"
+        )
+        conn.commit()
+        conn.close()
+
+        self._downgrade_to_v4(fresh_db)
+
+        with sqlite3.connect(str(fresh_db)) as raw:
+            cols_before = _columns(raw, "shares")
+            assert "hosted_receipt_id" not in cols_before
+            version_before = raw.execute("PRAGMA user_version").fetchone()[0]
+            assert version_before == WIDENED_MESSAGE_SCHEMA_VERSION
+
+        conn = open_index()
+        try:
+            cols_after = _columns(conn, "shares")
+            assert {"hosted_receipt_id", "hosted_status", "hosted_submission_url"}.issubset(cols_after)
+            version_after = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version_after == HOSTED_SUBMISSION_SCHEMA_VERSION
+            # Pre-existing rows keep their data; the new columns default to NULL.
+            row = conn.execute(
+                "SELECT hosted_receipt_id, hosted_status, hosted_submission_url "
+                "FROM shares WHERE share_id = 'share-legacy'"
+            ).fetchone()
+            assert tuple(row) == (None, None, None)
+        finally:
+            conn.close()
+
+    def test_upgrade_is_idempotent(self, fresh_db):
+        # Open twice from a fresh DB — second open is a no-op for the
+        # hosted-submission migration since user_version already == v5.
+        conn = open_index()
+        version_before = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+
+        conn = open_index()
+        try:
+            version_after = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version_after == version_before == HOSTED_SUBMISSION_SCHEMA_VERSION
+            cols = _columns(conn, "shares")
+            assert {"hosted_receipt_id", "hosted_status", "hosted_submission_url"}.issubset(cols)
+        finally:
+            conn.close()
