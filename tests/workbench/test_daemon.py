@@ -1560,7 +1560,7 @@ class TestShareAPI:
         assert "Rate limited" in data["error"]
 
     def test_share_duplicate_prevention(self, server, monkeypatch):
-        """Already-submitted bundle → 409; force does not overwrite hosted receipts."""
+        """Already-submitted bundle → 409; force surfaces a clearer message."""
         WorkbenchHandler._last_share_time = 0.0
         share_id = self._create_and_export_share(server)
 
@@ -1580,8 +1580,47 @@ class TestShareAPI:
         body = {**self._consent_body(), "force": True}
         status, data = _post(server, f"/api/shares/{share_id}/upload", body)
         assert status == 409
-        assert "already submitted" in data["error"]
+        assert "cannot be overwritten" in data["error"]
         assert data["receipt_id"] == "rcpt-test-123"
+
+    def test_force_on_fresh_share_submits(self, server, monkeypatch):
+        """`force: true` on a never-submitted share submits normally (force is ignored)."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        body = {**self._consent_body(), "force": True}
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", body)
+
+        assert status == 200, data
+        assert data["ok"] is True
+        assert data["receipt_id"] == "rcpt-test-123"
+
+    def test_self_hosted_ingest_share_rejects_hosted_submit(self, server, monkeypatch):
+        """A share previously uploaded via self-hosted ingest cannot be re-submitted to hosted research."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        # Simulate a legacy self-hosted upload: shared_at is set but
+        # there's no hosted_receipt_id.
+        conn = open_index()
+        conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ?, "
+            "hosted_receipt_id = NULL WHERE share_id = ?",
+            ("2026-01-01T00:00:00+00:00", share_id),
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 409
+        assert "self-hosted ingest" in data["error"]
+        assert data.get("shared_at") == "2026-01-01T00:00:00+00:00"
+        assert "receipt_id" not in data
 
     def test_share_http_error(self, server, monkeypatch):
         """HTTP error from ingest → daemon returns 502."""
@@ -1767,6 +1806,74 @@ class TestShareAPI:
 
         assert status == 400
         assert "requires consent fields" in data["error"]
+
+    def test_share_upload_rejects_oversize_zip_before_network(self, server, monkeypatch):
+        """The daemon refuses oversize zips locally so we never hit the hosted limit."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+
+        tiny_capabilities = {
+            "submissions_open": True,
+            "preferred_upload_flow": "browser_zip",
+            "cli_ingest_supported": False,
+            "share_page_url": "https://hosted.example.test/share",
+            "submit_page_url": "https://hosted.example.test/share",
+            "maximum_bundle_size": 16,  # bytes — guaranteed to be smaller than any real share zip
+            "accepted_manifest_schema_versions": ["1.0.0"],
+            "supported_institution_email_policy": {"domain_suffixes": [".edu", "rayward.ai"]},
+            "contact_email": "contact@example.test",
+            "cache_seconds": 0,
+        }
+
+        submissions_called = {"count": 0}
+
+        def upload_assert(_req):
+            submissions_called["count"] += 1
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(capabilities=tiny_capabilities, upload_assert=upload_assert),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 413, data
+        assert "exceeds the hosted limit" in data["error"]
+        assert submissions_called["count"] == 0  # never reached /api/submissions
+
+    def test_share_upload_surfaces_stale_consent_rejection(self, server, monkeypatch):
+        """Hosted 400 with consent-version error is forwarded verbatim so the UI can refresh."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        stale_resp = BytesIO(json.dumps({
+            "error": "consent_version 'consent-v1' is stale; current is 'consent-v2'.",
+        }).encode())
+        stale_error = urllib.error.HTTPError(
+            url="http://test/api/submissions", code=400, msg="Bad Request",
+            hdrs={}, fp=stale_resp,  # type: ignore[arg-type]
+        )
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_error=stale_error),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 400, data
+        assert "consent_version" in data["error"]
+        assert "stale" in data["error"]
+        # Stale-consent must not leave the share marked shared in the local DB.
+        conn = open_index()
+        row = conn.execute(
+            "SELECT status, hosted_receipt_id FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        conn.close()
+        assert row["status"] != "shared"
+        assert row["hosted_receipt_id"] is None
 
     def test_legacy_share_alias_requires_consent_body(self, server, monkeypatch):
         WorkbenchHandler._last_share_time = 0.0

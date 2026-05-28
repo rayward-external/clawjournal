@@ -837,7 +837,7 @@ def _build_share_zip(export_dir: Path) -> bytes:
 
 def _jsonl_row_count(path: Path) -> int:
     count = 0
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 count += 1
@@ -897,7 +897,7 @@ def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
     from ..redaction.pii import apply_findings_to_session, review_session_pii_hybrid
 
     sessions: list[dict[str, Any]] = []
-    with open(sessions_file) as f:
+    with open(sessions_file, encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 sessions.append(json.loads(line))
@@ -952,7 +952,7 @@ def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
                 replacement_count += replacements
                 coverage[cov] += 1
 
-    with open(sessions_file, "w") as f:
+    with open(sessions_file, "w", encoding="utf-8") as f:
         for session in results:
             if session is None:
                 raise RuntimeError("PII redaction did not produce all session rows")
@@ -1287,11 +1287,7 @@ def upload_share_to_self_hosted_ingest(
         return {"error": "Could not reach upload service. Please try again.", "status": 502}
 
     # Count sessions
-    session_count = 0
-    with open(sessions_file) as f:
-        for line in f:
-            if line.strip():
-                session_count += 1
+    session_count = _jsonl_row_count(sessions_file)
 
     gcs_uri = gcs_uri_from_server or f"gs://{_SHARE_GCS_BUCKET}/{_SHARE_GCS_PREFIX}/{share_id}/sessions.jsonl"
     shared_at = datetime.now(timezone.utc).isoformat()
@@ -1358,22 +1354,9 @@ def submit_share_to_hosted(
     force: bool = False,
 ) -> dict[str, Any]:
     """Submit a finalized share zip to the hosted research API."""
-    share = get_share(conn, share_id)
-    if share is None:
-        return {"error": "Share not found", "status": 404}
-    if share.get("hosted_receipt_id") or share.get("shared_at"):
-        return {
-            "error": "Share already submitted",
-            "receipt_id": share.get("hosted_receipt_id"),
-            "hosted_status": share.get("hosted_status"),
-            "shared_at": share.get("shared_at"),
-            "status": 409,
-        }
-    if force:
-        return {
-            "error": "Hosted submissions cannot be overwritten. Create a new share to submit again.",
-            "status": 409,
-        }
+    # Consent + token gates run first so any in-process caller (CLI, tests)
+    # gets a precise rejection before we hit the DB or the network. The HTTP
+    # handler already checks for missing keys; this is defense-in-depth.
     if not accept_terms or not ownership_certification:
         return {
             "error": "You must accept the terms and certify ownership before submitting.",
@@ -1387,6 +1370,10 @@ def submit_share_to_hosted(
     except RuntimeError as exc:
         return {"error": str(exc), "status": 403}
 
+    share = get_share(conn, share_id)
+    if share is None:
+        return {"error": "Share not found", "status": 404}
+
     from .index import release_gate_blockers
     session_ids = [s["session_id"] for s in share.get("sessions") or []]
     blockers = release_gate_blockers(conn, session_ids)
@@ -1394,6 +1381,36 @@ def submit_share_to_hosted(
         return {
             "error": "Share contains sessions that are not released",
             "blockers": blockers,
+            "status": 409,
+        }
+
+    # `force` is only meaningful when the share has already been submitted;
+    # for hosted research it surfaces a clearer "cannot overwrite" message.
+    # On a fresh share, `force` is ignored so defensive clients can pass it
+    # without failing the submission.
+    hosted_receipt_id = share.get("hosted_receipt_id")
+    prior_shared_at = share.get("shared_at")
+    if hosted_receipt_id:
+        return {
+            "error": (
+                "Hosted submissions cannot be overwritten. Create a new share to submit again."
+                if force
+                else "Share already submitted"
+            ),
+            "receipt_id": hosted_receipt_id,
+            "hosted_status": share.get("hosted_status"),
+            "shared_at": prior_shared_at,
+            "status": 409,
+        }
+    if prior_shared_at:
+        # Legacy self-hosted ingest upload; hosted research won't accept a
+        # re-submit. Differentiating the message lets the user know why.
+        return {
+            "error": (
+                "This share was uploaded via self-hosted ingest. "
+                "Create a new share to submit it to hosted research."
+            ),
+            "shared_at": prior_shared_at,
             "status": 409,
         }
 
@@ -2638,7 +2655,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             previews = []
             total_tokens = 0
             total_messages = 0
-            with open(sessions_file) as f:
+            with open(sessions_file, encoding="utf-8") as f:
                 for line in f:
                     if not line.strip():
                         continue

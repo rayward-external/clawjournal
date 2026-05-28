@@ -2947,9 +2947,13 @@ function DoneStep(p: DoneStepProps) {
   const hostedShareUrl = p.shareDestination?.configured ? p.shareDestination.share_page_url : null;
   const hostedShareLabel = hostedShareUrl ? formatShareDestination(hostedShareUrl) : null;
   const submitted = !!p.receiptId;
+  // `bundle.approxSize` is the whole zip's compressed size (from the seal
+  // response); it doesn't belong on the sessions.jsonl row, which the user
+  // would read as "this JSONL is that big". Keep the row generic — the zip
+  // size already shows in the stats grid as "File size".
   const zipFiles = [
     { name: 'manifest.json', detail: 'metadata' },
-    { name: 'sessions.jsonl', detail: p.bundle ? `~${p.bundle.approxSize}` : 'redacted traces' },
+    { name: 'sessions.jsonl', detail: p.bundle ? `${p.bundle.traces} redacted traces` : 'redacted traces' },
     { name: 'trufflehog.json', detail: 'secret scan' },
     { name: 'trufflehog.post-pii.json', detail: 'final scan' },
   ];

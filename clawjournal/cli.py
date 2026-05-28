@@ -1625,6 +1625,22 @@ _REDACTION_TYPE_LABELS: dict[str, str] = {
 }
 
 
+def _daemon_port_is_open(port: int) -> bool:
+    """Return True if the local workbench daemon appears to be listening.
+
+    The check is intentionally cheap — a short-timeout TCP connect on
+    127.0.0.1:<port>. False negatives (timeouts, ECONNREFUSED) are fine; we
+    use the result only to nudge the user toward `clawjournal serve`.
+    """
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
 def _format_redaction_summary(redaction_summary: dict) -> str:
     """Format a redaction summary dict into a human-readable string."""
     total = redaction_summary.get("total_redactions", 0)
@@ -1901,6 +1917,7 @@ def _run_share(args) -> None:
 
         port = config.get("daemon_port") or 8384
         workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit"
+        daemon_running = _daemon_port_is_open(port)
         result = {
             "ok": True,
             "share_id": share_id,
@@ -1909,6 +1926,7 @@ def _run_share(args) -> None:
             "session_count": len(manifest.get("sessions", [])),
             "next_step": "submit_in_workbench",
             "workbench_url": workbench_url,
+            "daemon_running": daemon_running,
             "redaction_summary": manifest.get("redaction_summary", {}),
         }
         if result.get("ok"):
@@ -1922,6 +1940,8 @@ def _run_share(args) -> None:
                 print(f"Packaged {count} sessions.")
                 print(f"Bundle {share_id[:8]} is ready for hosted submission in the workbench.")
                 print(f"Next step: open {workbench_url} and review the Submit step.")
+                if not daemon_running:
+                    print(f"Start `clawjournal serve` first so the workbench is reachable on port {port}.")
                 redaction_summary = result.get("redaction_summary")
                 if redaction_summary is not None:
                     print(f"Privacy: {_format_redaction_summary(redaction_summary)}")
