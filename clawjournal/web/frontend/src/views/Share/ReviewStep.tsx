@@ -265,8 +265,8 @@ function ReviewRow({
               <Icon name="alert" size={14} />
               <span style={{ color: colors.gray600, marginRight: 'auto' }}>
                 {aiDisabled
-                  ? 'AI review is off for this bundle - only deterministic + policy rules ran on this trace.'
-                  : 'AI review was unavailable - only deterministic + policy rules ran on this trace.'}
+                  ? 'AI review is off for this bundle — only deterministic + policy rules ran on this trace.'
+                  : 'AI review was unavailable — only deterministic + policy rules ran on this trace.'}
               </span>
               {!approved && aiUnavailable && (
                 <button

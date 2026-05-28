@@ -303,6 +303,14 @@ export function Share() {
     setPackagingFailed(null);
     setBlockedPackageSessions([]);
     setBundleInfo(null);
+    // Toggling AI-PII invalidates the packaged bundle and every step after the
+    // queue, so collapse the stepper and clear any prior submit/receipt state.
+    // Otherwise a completed Submit/Done entry stays clickable with a now-null
+    // share id, stranding the user in a dead-end step.
+    setCompletedKeys(completedKeysForStep('queue'));
+    setReceiptId(null);
+    setHostedStatus(null);
+    setSupportContact(null);
   };
 
   const reorderQueue = (fromId: string, overId: string) => {

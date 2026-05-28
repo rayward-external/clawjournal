@@ -1864,6 +1864,123 @@ class TestShareAPI:
         assert status == 200
         assert data["receipt_id"] == "rcpt-test-123"
 
+    def _seed_released_session(self, session_id, content):
+        """Upsert a single session containing `content` and release it so the
+        hosted upload gate (release_gate_blockers) lets the share through."""
+        from clawjournal.workbench.index import open_index, set_hold_state, upsert_sessions
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": session_id,
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": content, "tool_uses": []}],
+                "stats": {
+                    "user_messages": 1, "assistant_messages": 0,
+                    "tool_uses": 0, "input_tokens": 100, "output_tokens": 0,
+                },
+            }])
+            set_hold_state(conn, session_id, "released", changed_by="user", reason="test")
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _manifest_from_upload(req):
+        """Extract manifest.json from the multipart upload request body."""
+        body = req.data
+        start = body.index(b"PK\x03\x04")
+        end = body.rfind(b"\r\n--")
+        with zipfile.ZipFile(BytesIO(body[start:end])) as archive:
+            return json.loads(archive.read("manifest.json").decode("utf-8"))
+
+    def test_share_upload_runs_ai_pii_when_opted_in(self, server, monkeypatch):
+        """ai_pii=true in the upload body must run the AI hybrid pass and mark
+        the uploaded manifest ai_enabled=true (the highest-stakes share path)."""
+        WorkbenchHandler._last_share_time = 0.0
+        self._seed_released_session("upload-ai-on", "Alice Example should not ship")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        calls = 0
+
+        def fake_review(session, **kw):
+            nonlocal calls
+            calls += 1
+            assert kw.get("return_coverage") is True
+            return ([{
+                "session_id": session["session_id"],
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Alice Example",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test name",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["upload-ai-on"], "note": "Upload AI on test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        captured = {}
+
+        def assert_zip(req):
+            captured["manifest"] = self._manifest_from_upload(req)
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_assert=assert_zip),
+        ):
+            status, data = _post(
+                server, f"/api/shares/{share_id}/upload",
+                {**self._consent_body(), "ai_pii": True},
+            )
+
+        assert status == 200, data
+        assert calls >= 1  # the AI hybrid pass actually ran
+        summary = captured["manifest"]["redaction_summary"]
+        assert summary["pii_review"]["ai_enabled"] is True
+        assert summary["pii_review"]["finding_count"] == 1
+
+    def test_share_upload_leaves_ai_pii_off_by_default(self, server, monkeypatch):
+        """Omitting ai_pii must NOT run the AI hybrid pass; the uploaded manifest
+        records ai_enabled=false (deterministic rules still run + gate)."""
+        WorkbenchHandler._last_share_time = 0.0
+        self._seed_released_session("upload-ai-off", "Alice Example stays for default")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        def fail_review(*_args, **_kwargs):
+            raise AssertionError("AI PII review must be opt-in on the upload path")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fail_review)
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["upload-ai-off"], "note": "Upload AI off test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        captured = {}
+
+        def assert_zip(req):
+            captured["manifest"] = self._manifest_from_upload(req)
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_assert=assert_zip),
+        ):
+            status, data = _post(
+                server, f"/api/shares/{share_id}/upload", self._consent_body(),
+            )
+
+        assert status == 200, data
+        assert captured["manifest"]["redaction_summary"]["pii_review"]["ai_enabled"] is False
+
     def test_share_upload_requires_consent_body(self, server, monkeypatch):
         WorkbenchHandler._last_share_time = 0.0
         share_id = self._create_and_export_share(server)
@@ -2257,6 +2374,57 @@ class TestShareAPI:
         assert data["redaction_summary"]["pii_review"]["ai_enabled"] is True
         assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
         assert calls == 1
+
+    def test_seal_with_no_override_uses_config_default(self, server, monkeypatch):
+        """When the request omits ai_pii, the persisted config default
+        (ai_pii_review_enabled) decides whether the AI pass runs."""
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "seal-config-default",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "Alice Example config default", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1, "assistant_messages": 0,
+                "tool_uses": 0, "input_tokens": 100, "output_tokens": 0,
+            },
+        }])
+        conn.close()
+
+        def fake_review(session, **kw):
+            return ([{
+                "session_id": session["session_id"],
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Alice Example",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test name",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+        # Persisted config opts AI review on; the seal request omits ai_pii.
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"ai_pii_review_enabled": True},
+        )
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["seal-config-default"],
+            "note": "Seal config default test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, data = _post(server, f"/api/shares/{share_id}/seal")
+        assert status == 200
+        assert data["redaction_summary"]["pii_review"]["ai_enabled"] is True
+        assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
 
     def test_download_applies_configured_custom_redactions(self, server, monkeypatch):
         monkeypatch.setattr(

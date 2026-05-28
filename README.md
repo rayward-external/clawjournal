@@ -532,6 +532,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal config --exclude "a,b"` | Add excluded projects (appends) |
 | `clawjournal config --redact "str1,str2"` | Add strings to always redact (appends) |
 | `clawjournal config --redact-usernames "u1,u2"` | Add usernames to anonymize (appends) |
+| `clawjournal config --ai-pii-review` / `--no-ai-pii-review` | Set the default AI-assisted PII review on/off for the share flow |
 | `clawjournal list` | List all projects with exclusion status |
 | `clawjournal status` | Show current stage and next steps (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |

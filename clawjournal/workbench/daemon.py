@@ -1174,6 +1174,12 @@ def _prepare_share_export_for_upload(
         else ai_pii_review_enabled
     )
     if reuse_finalized:
+        # Pass the RAW override (not effective_ai_pii) on purpose: a finalized
+        # export is a point-in-time artifact. With an explicit ai_pii override
+        # the cache is only reused when its recorded ai_enabled matches; with no
+        # override (None) we reuse whatever was sealed (history re-download),
+        # rather than letting a later config-default flip rebuild the artifact.
+        # A cache miss still finalizes with effective_ai_pii below.
         cached = _load_finalized_share_export(share_id, ai_pii=ai_pii_review_enabled)
         if cached is not None:
             export_dir, manifest = cached
