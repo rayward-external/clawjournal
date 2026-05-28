@@ -408,6 +408,7 @@ class TestSessionsAPI:
         assert "MySecretName" not in redacted
         assert "PartnerDev" not in redacted
         assert "foo.internal" not in redacted
+        assert data["ai_coverage"] == "disabled"
         assert any(entry["type"] == "blocked_domain" for entry in data["redaction_log"])
 
     def test_update_session_status(self, server):
@@ -1291,10 +1292,11 @@ def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS", "23")
     monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
 
-    summary = _apply_upload_pii_redactions(sessions_file)
+    summary = _apply_upload_pii_redactions(sessions_file, ai_pii=True)
 
     assert summary["workers"] == 4
     assert summary["agent_timeout_seconds"] == 23
+    assert summary["ai_enabled"] is True
     assert summary["finding_count"] == 4
     assert summary["replacement_count"] == 4
     assert summary["coverage"] == {"full": 4, "rules_only": 0}
@@ -1310,6 +1312,32 @@ def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
         session["messages"][0]["content"] == "[REDACTED_NAME] should be hidden"
         for session in redacted
     )
+
+
+def test_upload_pii_redaction_defaults_to_rules_only(tmp_path, monkeypatch):
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions_file.write_text(
+        json.dumps({
+            "session_id": "rules-only",
+            "messages": [{"role": "user", "content": "Email alice@example.com"}],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    def fail_hybrid(*_args, **_kwargs):
+        raise AssertionError("AI PII review should be opt-in")
+
+    monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fail_hybrid)
+
+    summary = _apply_upload_pii_redactions(sessions_file)
+
+    assert summary["ai_enabled"] is False
+    assert summary["workers"] == 0
+    assert summary["agent_timeout_seconds"] == 0
+    assert summary["finding_count"] == 1
+    assert summary["replacement_count"] == 1
+    assert summary["coverage"] == {"full": 0, "rules_only": 1}
+    assert "alice@example.com" not in sessions_file.read_text(encoding="utf-8")
 
 
 class TestVerifyEmailAPI:
@@ -2000,7 +2028,7 @@ class TestShareAPI:
         assert report["summary"]["findings"] == 0
         assert report["summary"]["bypassed"] is False
 
-    def test_download_bundle_applies_final_ai_pii_redaction(self, server, monkeypatch):
+    def test_download_bundle_applies_final_ai_pii_redaction_when_opted_in(self, server, monkeypatch):
         conn = open_index()
         upsert_sessions(conn, [{
             "session_id": "download-ai-pii",
@@ -2044,7 +2072,7 @@ class TestShareAPI:
         assert status == 201
         share_id = data["share_id"]
 
-        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download?ai_pii=1")
         assert status == 200
         assert content_type == "application/zip"
 
@@ -2054,8 +2082,53 @@ class TestShareAPI:
 
         assert "Alice Example" not in sessions_content
         assert "[REDACTED_NAME]" in sessions_content
+        assert manifest["redaction_summary"]["pii_review"]["ai_enabled"] is True
         assert manifest["redaction_summary"]["pii_review"]["finding_count"] == 1
         assert manifest["redaction_summary"]["coverage"] == {"full": 1, "rules_only": 0}
+
+    def test_download_bundle_leaves_ai_pii_off_by_default(self, server, monkeypatch):
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "download-ai-off",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "Alice Example should remain without AI", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1,
+                "assistant_messages": 0,
+                "tool_uses": 0,
+                "input_tokens": 100,
+                "output_tokens": 0,
+            },
+        }])
+        conn.close()
+
+        def fail_review(*_args, **_kwargs):
+            raise AssertionError("AI PII review should be opt-in")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fail_review)
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["download-ai-off"],
+            "note": "Download AI off test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        assert content_type == "application/zip"
+
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            sessions_content = archive.read("sessions.jsonl").decode("utf-8")
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+
+        assert "Alice Example" in sessions_content
+        assert manifest["redaction_summary"]["pii_review"]["ai_enabled"] is False
+        assert manifest["redaction_summary"]["coverage"] == {"full": 0, "rules_only": 1}
 
     def test_seal_is_idempotent_and_download_reuses_export(self, server, monkeypatch):
         conn = open_index()
@@ -2104,13 +2177,14 @@ class TestShareAPI:
         assert status == 201
         share_id = data["share_id"]
 
-        status, data = _post(server, f"/api/shares/{share_id}/seal")
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
         assert status == 200
         assert data["ok"] is True
+        assert data["redaction_summary"]["pii_review"]["ai_enabled"] is True
         assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
         assert calls == 1
 
-        status, data = _post(server, f"/api/shares/{share_id}/seal")
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
         assert status == 200
         assert data["ok"] is True
         assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
@@ -2126,6 +2200,63 @@ class TestShareAPI:
 
         assert "Alice Example" not in sessions_content
         assert "[REDACTED_NAME]" in sessions_content
+
+    def test_seal_rebuilds_when_ai_pii_choice_changes(self, server, monkeypatch):
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "seal-mode-change",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "Alice Example mode switch", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1,
+                "assistant_messages": 0,
+                "tool_uses": 0,
+                "input_tokens": 100,
+                "output_tokens": 0,
+            },
+        }])
+        conn.close()
+
+        calls = 0
+
+        def fake_review(session, **kw):
+            nonlocal calls
+            calls += 1
+            return ([{
+                "session_id": session["session_id"],
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Alice Example",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test name",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["seal-mode-change"],
+            "note": "Seal mode change test",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": False})
+        assert status == 200
+        assert data["redaction_summary"]["pii_review"]["ai_enabled"] is False
+        assert calls == 0
+
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
+        assert status == 200
+        assert data["redaction_summary"]["pii_review"]["ai_enabled"] is True
+        assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert calls == 1
 
     def test_download_applies_configured_custom_redactions(self, server, monkeypatch):
         monkeypatch.setattr(

@@ -11,6 +11,7 @@ export interface SubmitStepProps {
   shareId: string | null;
   bundle: { traces: number; created: string; approxSize: string } | null;
   shareDestination: ShareDestination | null;
+  aiPiiEnabled: boolean;
   onSubmitted: (receiptId: string, status?: string | null, supportContact?: string | null) => void;
   onDownloadZip: () => void;
   globalStyles: React.ReactNode;
@@ -99,6 +100,7 @@ export function SubmitStep(p: SubmitStepProps) {
         ownership_certification: ownership,
         consent_version: consent.consent_version,
         retention_policy_version: consent.retention_policy_version,
+        ai_pii: p.aiPiiEnabled,
       });
       p.toast('Submitted', 'success');
       p.onSubmitted(result.receipt_id, result.hosted_status || null, consent.support_contact || p.shareDestination?.support_contact || null);

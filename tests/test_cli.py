@@ -874,6 +874,7 @@ class TestBundleExport:
             output=None,
             json=True,
             zip=True,
+            ai_pii_review=True,
             training_format=False,
         )
         _run_bundle_export(args)
@@ -1573,7 +1574,7 @@ class TestShare:
 
         monkeypatch.setattr(
             "clawjournal.workbench.daemon._prepare_share_export_for_upload",
-            lambda conn, share_id, share, settings, reuse_finalized=False: (
+            lambda conn, share_id, share, settings, reuse_finalized=False, **_kw: (
                 Path("/tmp/clawjournal-share"),
                 {
                     "sessions": [{}, {}, {}],
@@ -1608,7 +1609,7 @@ class TestShare:
 
         monkeypatch.setattr(
             "clawjournal.workbench.daemon._prepare_share_export_for_upload",
-            lambda conn, share_id, share, settings, reuse_finalized=False: (
+            lambda conn, share_id, share, settings, reuse_finalized=False, **_kw: (
                 Path("/tmp/clawjournal-share"),
                 {"sessions": [{}, {}, {}], "redaction_summary": {"total_redactions": 0, "by_type": {}}},
                 None,

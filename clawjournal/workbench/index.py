@@ -964,6 +964,7 @@ def get_effective_share_settings(
         "allowlist_entries": allowlist_entries,
         "excluded_projects": _dedupe_strings(excluded_projects),
         "blocked_domains": _dedupe_strings(blocked_domains),
+        "ai_pii_review_enabled": bool(resolved.get("ai_pii_review_enabled", False)),
     }
 
 

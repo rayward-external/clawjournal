@@ -9,6 +9,7 @@ export interface RedactStepProps {
   queuedSessions: ReadySession[];
   redactedSessions: Record<string, RedactedSessionData>;
   allDone: boolean;
+  aiPiiEnabled: boolean;
   onBack: () => void;
   onContinue: () => void;
   globalStyles: React.ReactNode;
@@ -38,7 +39,13 @@ export function RedactStep(p: RedactStepProps) {
   const overallPct = p.queuedSessions.length === 0 ? 0 : Math.round((doneCount / p.queuedSessions.length) * 100);
 
   // progress bar helper for category rows
-  const categoryRow = (label: string, count: number, max: number, color: string = colors.primary500) => (
+  const categoryRow = (
+    label: string,
+    count: number,
+    max: number,
+    color: string = colors.primary500,
+    unit: string = 'removed',
+  ) => (
     <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 13, marginBottom: 8 }}>
       <span style={{ color: colors.gray700, flex: 1 }}>{label}</span>
       <div style={{ flex: 2, maxWidth: 200, height: 6, background: colors.gray100, borderRadius: 3, overflow: 'hidden' }}>
@@ -51,7 +58,7 @@ export function RedactStep(p: RedactStepProps) {
         color: colors.gray500, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: 12, fontVariantNumeric: 'tabular-nums', minWidth: 80, textAlign: 'right' as const,
       }}>
-        {count} removed
+        {count} {unit}
       </span>
     </div>
   );
@@ -71,7 +78,7 @@ export function RedactStep(p: RedactStepProps) {
         Watch it happen &mdash; nothing is hidden.
       </p>
 
-      <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} />
+      <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
 
       <div style={{
         display: 'grid', gridTemplateColumns: '1fr auto', gap: 16,
@@ -82,7 +89,9 @@ export function RedactStep(p: RedactStepProps) {
             Scrubbing {p.queuedSessions.length} trace{p.queuedSessions.length === 1 ? '' : 's'}
           </div>
           <div style={{ fontSize: 13, color: colors.gray500 }}>
-            Deterministic rules &rarr; Policy rules &rarr; AI review. All on-device.
+            {p.aiPiiEnabled
+              ? 'Deterministic rules \u2192 Policy rules \u2192 AI review. All on-device.'
+              : 'Deterministic rules \u2192 Policy rules. AI review is off for this bundle.'}
           </div>
         </div>
         <div style={{
@@ -107,7 +116,13 @@ export function RedactStep(p: RedactStepProps) {
         {categoryRow('File paths & usernames', totals.paths, Math.max(totals.paths, 8))}
         {categoryRow('Timestamps coarsened', totals.timestamps, Math.max(totals.timestamps, 20))}
         {categoryRow('URLs', totals.urls, Math.max(totals.urls, 4), colors.blue500)}
-        {categoryRow('AI-flagged for your review', totals.flagged, Math.max(totals.flagged, 2), colors.yellow400)}
+        {categoryRow(
+          p.aiPiiEnabled ? 'AI-flagged for your review' : 'Needs your manual review',
+          totals.flagged,
+          Math.max(totals.flagged, 2),
+          colors.yellow400,
+          p.aiPiiEnabled ? 'flagged' : 'to review',
+        )}
       </div>
 
       <div style={{
@@ -233,7 +248,7 @@ export function RedactStep(p: RedactStepProps) {
           </div>
         </div>
       </div>
-      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} />}
+      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} aiPiiEnabled={p.aiPiiEnabled} />}
     </div>
   );
 }

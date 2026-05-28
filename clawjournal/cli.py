@@ -1550,7 +1550,11 @@ def _run_bundle_export(args) -> None:
         if getattr(args, "zip", False) is True:
             from .workbench.daemon import finalize_share_export_for_upload
 
-            error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+            error, manifest = finalize_share_export_for_upload(
+                export_dir,
+                manifest,
+                ai_pii=getattr(args, "ai_pii_review", False) is True,
+            )
             if error:
                 if error.get("block_reason"):
                     print(f"Share blocked: {error.get('block_reason')}")
@@ -1814,6 +1818,7 @@ def _run_bundle_share(args) -> None:
             excluded_projects=settings["excluded_projects"],
             blocked_domains=settings["blocked_domains"],
             allowlist_entries=settings["allowlist_entries"],
+            ai_pii_review_enabled=getattr(args, "ai_pii_review", False) is True,
         )
         if result.get("ok"):
             if getattr(args, "json", False):
@@ -1907,6 +1912,7 @@ def _run_share(args) -> None:
             share,
             settings,
             reuse_finalized=True,
+            ai_pii_review_enabled=getattr(args, "ai_pii_review", False) is True,
         )
         if error:
             print(error.get("error", "Share failed."))
@@ -1916,7 +1922,8 @@ def _run_share(args) -> None:
             sys.exit(1)
 
         port = config.get("daemon_port") or 8384
-        workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit"
+        ai_pii_param = "&ai_pii=1" if getattr(args, "ai_pii_review", False) is True else ""
+        workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit{ai_pii_param}"
         daemon_running = _daemon_port_is_open(port)
         result = {
             "ok": True,
@@ -4074,11 +4081,15 @@ def main() -> None:
     be.add_argument("--training-format", action="store_true",
                     help="Also produce a training-format JSONL (turn-based, cleaned)")
     be.add_argument("--zip", action="store_true", help="Also write an uploadable zip")
+    be.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review before writing the uploadable zip")
     be.add_argument("--json", action="store_true", help="Output JSON")
 
     bs = sub.add_parser("bundle-share", help="Share bundle via self-hosted ingest service")
     bs.add_argument("share_id", help="Bundle ID (or prefix)")
     bs.add_argument("--force", action="store_true", help="Override duplicate check")
+    bs.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review before upload")
     bs.add_argument("--json", action="store_true", help="Output JSON")
 
     # Share command (one-step: create + export + share)
@@ -4090,6 +4101,8 @@ def main() -> None:
     sh.add_argument("--force", action="store_true", help="Override duplicate check")
     sh.add_argument("--preview", action="store_true",
                     help="Show the trace bundle contents that would be shared without uploading")
+    sh.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review while packaging")
     sh.add_argument("--json", action="store_true", help="Output JSON")
 
     ve = sub.add_parser("verify-email", help="Verify an academic email address for a short-lived upload token")

@@ -96,7 +96,7 @@ function TrustChip({ icon, title, subtitle }: { icon: string; title: string; sub
   );
 }
 
-export function UsageDisclosure({ onLearnMore }: { onLearnMore?: () => void }) {
+export function UsageDisclosure({ onLearnMore, aiPiiEnabled = false }: { onLearnMore?: () => void; aiPiiEnabled?: boolean }) {
   return (
     <div style={{
       display: 'flex', alignItems: 'stretch', gap: 8,
@@ -105,7 +105,11 @@ export function UsageDisclosure({ onLearnMore }: { onLearnMore?: () => void }) {
       borderRadius: 10, flexWrap: 'wrap',
     }}>
       <TrustChip icon="shield" title="Local only" subtitle="Redaction runs on your device" />
-      <TrustChip icon="sparkle" title="Rules + AI redact" subtitle="Deterministic rules, then AI" />
+      <TrustChip
+        icon="sparkle"
+        title={aiPiiEnabled ? 'Rules + AI redact' : 'Rules-only redact'}
+        subtitle={aiPiiEnabled ? 'Deterministic rules, then AI' : 'AI review is off for this bundle'}
+      />
       <TrustChip icon="chart" title="Eval & training only" subtitle="No ads, no resale, no profiling" />
       {onLearnMore && (
         <button
@@ -124,7 +128,7 @@ export function UsageDisclosure({ onLearnMore }: { onLearnMore?: () => void }) {
   );
 }
 
-export function HelpModal({ onClose }: { onClose: () => void }) {
+export function HelpModal({ onClose, aiPiiEnabled = false }: { onClose: () => void; aiPiiEnabled?: boolean }) {
   const stages = [
     {
       num: 1,
@@ -141,16 +145,20 @@ export function HelpModal({ onClose }: { onClose: () => void }) {
     {
       num: 3,
       name: 'AI-assisted review',
-      sub: 'First line of judgement',
-      desc: 'Names, orgs, private project names, and contextual identifiers are flagged. If AI is unavailable, the trace falls back to rules-only and you’ll see a labeled reason.',
+      sub: aiPiiEnabled ? 'Opted in' : 'Off unless you opt in',
+      desc: aiPiiEnabled
+        ? 'Names, orgs, private project names, and contextual identifiers are flagged. If AI is unavailable, the trace falls back to rules-only and you’ll see a labeled reason.'
+        : 'The bundle uses deterministic and policy rules only. You can opt in before redaction if you want AI to flag contextual identifiers.',
       accent: colors.primary500,
       accentBg: colors.primary100,
     },
     {
       num: 4,
       name: 'Your review',
-      sub: 'Only when flagged',
-      desc: 'Only traces the AI wasn’t confident about reach you. Everything else clears automatically.',
+      sub: aiPiiEnabled ? 'Only when flagged' : 'Required when AI is off',
+      desc: aiPiiEnabled
+        ? 'Only traces the AI wasn’t confident about reach you. Everything else clears automatically.'
+        : 'Review each rules-only preview before packaging so the final zip contains only traces you inspected.',
       accent: colors.yellow400,
       accentBg: colors.yellow100,
     },

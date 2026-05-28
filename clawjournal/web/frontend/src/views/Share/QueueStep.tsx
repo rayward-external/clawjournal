@@ -8,7 +8,7 @@ import { TraceCard } from '../../components/TraceCard.tsx';
 import type { ReadySession, ShareReadyStats } from './types.ts';
 import { autoDescription, formatDate, formatTokens, outcomeBadge, sessionTotalTokens } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
-import { HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
+import { CheckboxRow, HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
 
 export interface QueueStepProps {
   stepperHeader: React.ReactNode;
@@ -20,6 +20,8 @@ export interface QueueStepProps {
   queuedSessions: ReadySession[];
   note: string;
   setNote: (s: string) => void;
+  aiPiiEnabled: boolean;
+  setAiPiiEnabled: (enabled: boolean) => void;
   onRemove: (id: string) => void;
   onAdd: (id: string) => void;
   onReorder: (fromId: string, overId: string) => void;
@@ -177,7 +179,7 @@ export function QueueStep(p: QueueStepProps) {
           <h1 style={{ margin: '0 0 12px', fontSize: 22, fontWeight: 600, color: colors.gray900 }}>
             What would you like to share?
           </h1>
-          <UsageDisclosure onLearnMore={p.onHelp} />
+          <UsageDisclosure onLearnMore={p.onHelp} aiPiiEnabled={p.aiPiiEnabled} />
 
           {/* Bundle summary */}
           <div style={{
@@ -417,6 +419,19 @@ export function QueueStep(p: QueueStepProps) {
             />
           </div>
 
+          <div style={{
+            marginBottom: 18, padding: '10px 12px',
+            background: colors.white, border: `1px solid ${colors.gray200}`,
+            borderRadius: 8,
+          }}>
+            <CheckboxRow checked={p.aiPiiEnabled} onChange={p.setAiPiiEnabled}>
+              Use AI-assisted PII review for this bundle
+              <span style={{ display: 'block', marginTop: 2, color: colors.gray500 }}>
+                Sends already-redacted trace text to your configured AI backend to flag contextual identifiers.
+              </span>
+            </CheckboxRow>
+          </div>
+
           {/* Footer */}
           <div style={{
             position: 'sticky', bottom: 0, marginTop: 8, paddingTop: 14,
@@ -434,6 +449,7 @@ export function QueueStep(p: QueueStepProps) {
                 </div>
                 <div style={{ fontSize: 11.5, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
                   Next: we&rsquo;ll redact secrets and identifiers on your device
+                  {p.aiPiiEnabled ? ' with AI review enabled' : ' with AI review off'}
                 </div>
               </div>
               <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
@@ -497,7 +513,7 @@ export function QueueStep(p: QueueStepProps) {
         sessionId={p.drawerSessionId}
         onClose={() => p.setDrawerSessionId(null)}
       />
-      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} />}
+      {p.showHelp && <HelpModal onClose={() => p.setShowHelp(false)} aiPiiEnabled={p.aiPiiEnabled} />}
     </div>
   );
 }

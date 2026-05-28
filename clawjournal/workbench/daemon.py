@@ -853,6 +853,12 @@ def _body_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return _body_bool(value)
+
+
 def _with_legacy_bundle_alias(payload: dict[str, Any]) -> dict[str, Any]:
     """Expose bundle_id as a compatibility alias for share_id."""
     if "share_id" in payload and "bundle_id" not in payload:
@@ -893,9 +899,17 @@ def _upload_pii_timeout_seconds() -> int:
     )
 
 
-def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
+def _apply_upload_pii_redactions(
+    sessions_file: Path,
+    *,
+    ai_pii: bool = False,
+) -> dict[str, Any]:
     """Run upload-time PII review over a JSONL export, preserving row order."""
-    from ..redaction.pii import apply_findings_to_session, review_session_pii_hybrid
+    from ..redaction.pii import (
+        apply_findings_to_session,
+        review_session_pii,
+        review_session_pii_hybrid,
+    )
 
     sessions: list[dict[str, Any]] = []
     with open(sessions_file, encoding="utf-8") as f:
@@ -903,8 +917,8 @@ def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
             if line.strip():
                 sessions.append(json.loads(line))
 
-    workers = _upload_pii_worker_count(len(sessions))
-    timeout_seconds = _upload_pii_timeout_seconds()
+    workers = _upload_pii_worker_count(len(sessions)) if ai_pii else 0
+    timeout_seconds = _upload_pii_timeout_seconds() if ai_pii else 0
     coverage = {"full": 0, "rules_only": 0}
     if not sessions:
         return {
@@ -914,15 +928,20 @@ def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
             "coverage": coverage,
             "workers": 0,
             "agent_timeout_seconds": timeout_seconds,
+            "ai_enabled": ai_pii,
         }
 
     def redact_one(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
-        findings, cov = review_session_pii_hybrid(
-            session,
-            ignore_llm_errors=True,
-            return_coverage=True,
-            timeout_seconds=timeout_seconds,
-        )
+        if ai_pii:
+            findings, cov = review_session_pii_hybrid(
+                session,
+                ignore_llm_errors=True,
+                return_coverage=True,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            findings = review_session_pii(session)
+            cov = "rules_only"
         replacement_count = 0
         if findings:
             session, replacement_count = apply_findings_to_session(session, findings)
@@ -966,12 +985,15 @@ def _apply_upload_pii_redactions(sessions_file: Path) -> dict[str, Any]:
         "coverage": coverage,
         "workers": workers,
         "agent_timeout_seconds": timeout_seconds,
+        "ai_enabled": ai_pii,
     }
 
 
 def finalize_share_export_for_upload(
     export_dir: Path,
     manifest: dict[str, Any],
+    *,
+    ai_pii: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Apply final local-only gates before an export becomes an upload zip.
 
@@ -996,14 +1018,15 @@ def finalize_share_export_for_upload(
         }, manifest
 
     try:
-        pii_summary = _apply_upload_pii_redactions(sessions_file)
+        pii_summary = _apply_upload_pii_redactions(sessions_file, ai_pii=ai_pii)
         if pii_summary["finding_count"]:
             logger.info(
                 "PII redaction applied: %d findings / %d replacements across %d sessions "
-                "(workers=%d, timeout=%ss)",
+                "(ai=%s, workers=%d, timeout=%ss)",
                 pii_summary["finding_count"],
                 pii_summary["replacement_count"],
                 pii_summary["session_count"],
+                "on" if ai_pii else "off",
                 pii_summary["workers"],
                 pii_summary["agent_timeout_seconds"],
             )
@@ -1023,6 +1046,7 @@ def finalize_share_export_for_upload(
             "replacement_count": pii_summary["replacement_count"],
             "workers": pii_summary["workers"],
             "agent_timeout_seconds": pii_summary["agent_timeout_seconds"],
+            "ai_enabled": pii_summary["ai_enabled"],
         }
 
     try:
@@ -1081,7 +1105,11 @@ def finalize_share_export_for_upload(
     return None, manifest
 
 
-def _manifest_is_finalized_for_upload(manifest: dict[str, Any]) -> bool:
+def _manifest_is_finalized_for_upload(
+    manifest: dict[str, Any],
+    *,
+    ai_pii: bool | None = None,
+) -> bool:
     if manifest.get("blocked"):
         return False
     summary = manifest.get("redaction_summary")
@@ -1091,6 +1119,8 @@ def _manifest_is_finalized_for_upload(manifest: dict[str, Any]) -> bool:
     post_pii_scan = summary.get("trufflehog_post_pii")
     if not isinstance(pii_review, dict) or not isinstance(post_pii_scan, dict):
         return False
+    if ai_pii is not None and pii_review.get("ai_enabled") is not ai_pii:
+        return False
     return (
         post_pii_scan.get("findings") == 0
         and post_pii_scan.get("bypassed") is False
@@ -1099,7 +1129,11 @@ def _manifest_is_finalized_for_upload(manifest: dict[str, Any]) -> bool:
     )
 
 
-def _load_finalized_share_export(share_id: str) -> tuple[Path, dict[str, Any]] | None:
+def _load_finalized_share_export(
+    share_id: str,
+    *,
+    ai_pii: bool | None = None,
+) -> tuple[Path, dict[str, Any]] | None:
     # Finalized exports are point-in-time artifacts: a later config change
     # creates a new share/seal operation rather than mutating this cached zip.
     export_dir = CONFIG_DIR / "shares" / share_id
@@ -1120,7 +1154,7 @@ def _load_finalized_share_export(share_id: str) -> tuple[Path, dict[str, Any]] |
         return None
     if manifest.get("share_id") != share_id and manifest.get("bundle_id") != share_id:
         return None
-    if not _manifest_is_finalized_for_upload(manifest):
+    if not _manifest_is_finalized_for_upload(manifest, ai_pii=ai_pii):
         return None
     return export_dir, manifest
 
@@ -1132,9 +1166,15 @@ def _prepare_share_export_for_upload(
     settings: dict[str, Any],
     *,
     reuse_finalized: bool = False,
+    ai_pii_review_enabled: bool | None = None,
 ) -> tuple[Path | None, dict[str, Any], dict[str, Any] | None]:
+    effective_ai_pii = (
+        bool(settings.get("ai_pii_review_enabled", False))
+        if ai_pii_review_enabled is None
+        else ai_pii_review_enabled
+    )
     if reuse_finalized:
-        cached = _load_finalized_share_export(share_id)
+        cached = _load_finalized_share_export(share_id, ai_pii=ai_pii_review_enabled)
         if cached is not None:
             export_dir, manifest = cached
             return export_dir, manifest, None
@@ -1152,7 +1192,11 @@ def _prepare_share_export_for_upload(
     if export_dir is None:
         return None, manifest, {"error": "Failed to prepare upload zip", "status": 500}
 
-    error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+    error, manifest = finalize_share_export_for_upload(
+        export_dir,
+        manifest,
+        ai_pii=effective_ai_pii,
+    )
     if error:
         return export_dir, manifest, error
     return export_dir, manifest, None
@@ -1168,6 +1212,7 @@ def upload_share_to_self_hosted_ingest(
     excluded_projects: list[str] | None = None,
     blocked_domains: list[str] | None = None,
     allowlist_entries: list[dict[str, Any]] | None = None,
+    ai_pii_review_enabled: bool = False,
 ) -> dict[str, Any]:
     """Upload a share to the legacy self-hosted ingest service.
 
@@ -1220,7 +1265,11 @@ def upload_share_to_self_hosted_ingest(
     )
     if export_dir is None:
         return {"error": "Export failed.", "status": 500}
-    error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+    error, manifest = finalize_share_export_for_upload(
+        export_dir,
+        manifest,
+        ai_pii=ai_pii_review_enabled,
+    )
     if error:
         return error
 
@@ -1357,6 +1406,7 @@ def submit_share_to_hosted(
     consent_version: str,
     retention_policy_version: str,
     settings: dict[str, Any],
+    ai_pii_review_enabled: bool | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     """Submit a finalized share zip to the hosted research API."""
@@ -1436,6 +1486,7 @@ def submit_share_to_hosted(
         share,
         settings,
         reuse_finalized=True,
+        ai_pii_review_enabled=ai_pii_review_enabled,
     )
     if error:
         return error
@@ -1682,7 +1733,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_preview_share(share_id)
         elif path.startswith("/api/bundles/") and path.endswith("/download"):
             share_id = path[len("/api/bundles/"):-len("/download")]
-            self._handle_download_share(share_id)
+            self._handle_download_share(share_id, params)
         elif path.startswith("/api/bundles/"):
             share_id = path[len("/api/bundles/"):]
             self._handle_get_share(share_id)
@@ -1693,7 +1744,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_preview_share(share_id)
         elif path.startswith("/api/shares/") and path.endswith("/download"):
             share_id = path[len("/api/shares/"):-len("/download")]
-            self._handle_download_share(share_id)
+            self._handle_download_share(share_id, params)
         elif path.startswith("/api/shares/"):
             share_id = path[len("/api/shares/"):]
             self._handle_get_share(share_id)
@@ -2266,9 +2317,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_redaction_report(self, session_id: str, *, ai_pii: bool = False) -> None:
         """Return redacted session WITH the full redaction log for review.
 
-        When *ai_pii* is True, also runs AI-based PII detection (hybrid:
-        rule-based + LLM agent) and applies the findings on top of the
-        regex-based secret redaction.
+        When *ai_pii* is True, also runs agent-based PII detection and
+        applies the findings on top of the deterministic share redaction.
         """
         conn = open_index()
         try:
@@ -2286,11 +2336,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 blocked_domains=settings["blocked_domains"],
             )
 
-            # AI-based PII detection (hybrid: rule-based + LLM agent)
+            # Agent-based PII detection is opt-in for the preview. The
+            # deterministic findings-backed pass above always runs.
             ai_pii_count = 0
             ai_pii_findings: list[dict] = []
-            ai_coverage = "rules_only"
+            ai_coverage = "disabled"
             if ai_pii:
+                ai_coverage = "rules_only"
                 try:
                     from ..redaction.pii import review_session_pii_with_agent, apply_findings_to_session
                     # Use AI-only detection (skip redundant rule-based PII scan
@@ -2552,6 +2604,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
+            ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
             share_id = create_share(conn, session_ids, note=note)
             share = get_share(conn, share_id)
             if share is None:
@@ -2563,6 +2616,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 share,
                 settings,
                 reuse_finalized=True,
+                ai_pii_review_enabled=ai_pii_override,
             )
             if error:
                 status_code = int(error.get("status", 500))
@@ -2607,7 +2661,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
             cached = _load_finalized_share_export(share_id)
             if cached is not None:
-                export_dir, _manifest = cached
+                export_dir, finalized_manifest = cached
+                share["manifest"] = finalized_manifest
                 try:
                     share["zip_size_bytes"] = len(_build_share_zip(export_dir))
                 except OSError:
@@ -2781,6 +2836,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_seal_share(self, share_id: str) -> None:
         """Finalize a share for browser upload without returning zip bytes."""
+        body = _read_body(self)
+        ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
         conn = open_index()
         try:
             share = get_share(conn, share_id)
@@ -2795,6 +2852,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 share,
                 settings,
                 reuse_finalized=True,
+                ai_pii_review_enabled=ai_pii_override,
             )
             if error:
                 _json_response(self, error, int(error.get("status", 500)))
@@ -2817,8 +2875,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _handle_download_share(self, share_id: str) -> None:
+    def _handle_download_share(
+        self,
+        share_id: str,
+        params: dict[str, list[str]] | None = None,
+    ) -> None:
         """Generate a zip of the share and serve it as a browser download."""
+        ai_pii_override = None
+        if params and "ai_pii" in params:
+            ai_pii_override = _body_bool(params.get("ai_pii", [""])[0])
         conn = open_index()
         try:
             share = get_share(conn, share_id)
@@ -2833,6 +2898,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 share,
                 settings,
                 reuse_finalized=True,
+                ai_pii_review_enabled=ai_pii_override,
             )
             if error:
                 _json_response(self, error, int(error.get("status", 500)))
@@ -2871,6 +2937,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         body = _read_body(self)
         force = _body_bool(body.get("force", False))
+        ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
         required = [
             "accept_terms",
             "ownership_certification",
@@ -2896,6 +2963,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 share_id,
                 force=force,
                 settings=settings,
+                ai_pii_review_enabled=ai_pii_override,
                 accept_terms=_body_bool(body.get("accept_terms")),
                 ownership_certification=_body_bool(body.get("ownership_certification")),
                 consent_version=str(body.get("consent_version") or ""),
