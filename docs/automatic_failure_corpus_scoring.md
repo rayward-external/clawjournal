@@ -40,9 +40,22 @@ If the user has not confirmed a backend before, warmup returns
 `needs_confirmation`. The frontend asks once, then stores the confirmed backend
 in `~/.clawjournal/config.json`.
 
+The background warmup never auto-confirms a backend — it only starts after an
+explicit confirmation. Users who never open the workbench (CLI-only) can confirm
+the headless equivalent so the daemon's background scoring can run:
+
+```bash
+clawjournal config --scorer-backend codex   # confirm; persists to config.json
+clawjournal config --scorer-backend none    # clear the confirmation
+```
+
+`CLAWJOURNAL_SCORER_BACKEND` is also honored and takes precedence over the
+stored confirmation.
+
 Hermes Agent (`https://github.com/NousResearch/hermes-agent`) is supported as a
 scoring backend only. ClawJournal invokes Hermes' scripted one-shot CLI mode and
-parses JSON from stdout.
+parses JSON from stdout. Stdout parsing tolerates markdown fences or surrounding
+prose by falling back to the outermost `{...}` span.
 
 ## Manual Commands
 

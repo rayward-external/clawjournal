@@ -820,6 +820,18 @@ class TestReadScoringOutput:
         parsed = _read_scoring_output(result, "hermes")
         assert parsed["substance"] == 4
 
+    def test_stdout_json_in_markdown_fences_is_parsed(self, tmp_path):
+        fenced = "```json\n" + json.dumps(_VALID_JUDGE) + "\n```"
+        result = AgentResult(stdout=fenced, stderr="", returncode=0, cwd=tmp_path)
+        parsed = _read_scoring_output(result, "hermes")
+        assert parsed["substance"] == 4
+
+    def test_stdout_json_with_surrounding_prose_is_parsed(self, tmp_path):
+        noisy = "Here is the score:\n" + json.dumps(_VALID_JUDGE) + "\nDone."
+        result = AgentResult(stdout=noisy, stderr="", returncode=0, cwd=tmp_path)
+        parsed = _read_scoring_output(result, "openclaw")
+        assert parsed["substance"] == 4
+
     def test_live_backend_output_requires_failure_fields(self, tmp_path):
         legacy_payload = {
             "substance": 4,

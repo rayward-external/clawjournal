@@ -13,10 +13,10 @@ If no session ID was provided, suggest the automated approach first:
 
 ```bash
 # Score in-scope failure-value traces automatically (recommended)
-clawjournal score --batch --source failure-v1 --auto-triage --limit 20
+clawjournal score --batch --source failure-corpus --auto-triage --limit 20
 
 # Or without auto-triage:
-clawjournal score --batch --source failure-v1 --limit 20
+clawjournal score --batch --source failure-corpus --limit 20
 ```
 
 For hands-on scoring of a specific session, continue below.

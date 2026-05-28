@@ -74,10 +74,10 @@ Present the traces to the user as a numbered list showing title, source, badges,
 
 ```bash
 clawjournal scan
-clawjournal score --batch --source failure-v1 --auto-triage
+clawjournal score --batch --source failure-corpus --auto-triage
 ```
 
-`--source failure-v1` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: failure value (the primary signal for teachable agent failures) and productivity (legacy compatibility).
+`--source failure-corpus` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: failure value (the primary signal for teachable agent failures) and productivity (legacy compatibility).
 
 Present summary:
 
@@ -272,8 +272,8 @@ clawjournal shortlist <id> [id ...]
 clawjournal search <query> [--json] [--limit 20]
 
 # Scoring
-clawjournal score --batch [--source failure-v1] [--auto-triage] [--limit 20]
-clawjournal rescore --window 7d [--source failure-v1] [--limit 200]
+clawjournal score --batch [--source failure-corpus] [--auto-triage] [--limit 20]
+clawjournal rescore --window 7d [--source failure-corpus] [--limit 200]
 clawjournal score-view <id>
 clawjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--reason "..."]
 clawjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only

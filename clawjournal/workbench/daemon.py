@@ -355,6 +355,11 @@ class Scanner:
         try:
             conn = open_index()
             try:
+                # Warmup deliberately scores the latest `limit` unscored
+                # failure-corpus traces ordered by start_time DESC with no
+                # age cap (`since` is None for the background path). The
+                # `limit` bounds cost; callers that want a rolling window
+                # (CLI `--window`) pass `since` explicitly.
                 sessions = query_unscored_sessions(
                     conn,
                     limit=limit,

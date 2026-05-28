@@ -312,12 +312,15 @@ The agent batches the scoring over the `failure-corpus` source scope (`claude`, 
 
 ```bash
 clawjournal score --batch --source failure-corpus --auto-triage  # score failure-value scope; auto-block low-value productivity-1 noise
+clawjournal score --batch --source failure-corpus --window 7d     # restrict to traces from the last N days
 clawjournal score-view <id>                          # show score details
 clawjournal set-score <id> --failure-value 4 --failure-evidence "User corrected a fabricated API call"
 clawjournal set-score <id> --quality 4               # legacy productivity override
 ```
 
-By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
+By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Supported backends are `claude`, `codex`, `hermes`, and `openclaw`; use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
+
+The browser workbench also keeps share-ready traces warm: on app load it offers to score the latest unscored `failure-corpus` traces in the background. It scores only after you confirm a backend once; the choice is persisted to `~/.clawjournal/config.json`. If you never open the workbench, confirm a backend headlessly with `clawjournal config --scorer-backend <claude|codex|hermes|openclaw>` (use `--scorer-backend none` to clear it).
 
 </details>
 
@@ -456,6 +459,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal serve` | Open workbench UI at localhost:8384 |
 | `clawjournal config --source all` | Select source scope (required) |
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
+| `clawjournal config --scorer-backend codex` | Confirm the AI scoring backend used for background workbench scoring (`none` clears it) |
 | `clawjournal score --batch --source failure-corpus --auto-triage` | AI-score failure-value scope; auto-block low-value productivity-1 noise |
 | `clawjournal bundle-create --status approved` | Bundle approved sessions |
 | `clawjournal bundle-export <bundle_id> --zip` | Export bundle to disk and write an uploadable zip |
@@ -470,6 +474,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal block <id> [id ...]` | Block sessions |
 | `clawjournal shortlist <id> [id ...]` | Shortlist sessions |
 | `clawjournal score --batch --source failure-corpus --limit 20` | AI-score up to 20 in-scope sessions |
+| `clawjournal score --batch --source failure-corpus --window 7d` | AI-score only in-scope sessions from the last N days |
 | `clawjournal score-view <id>` | View score details |
 | `clawjournal set-score <id> --failure-value <1-5>` | Manually set the failure-value score; 4-5 requires `--failure-evidence` |
 | `clawjournal set-score <id> --quality <1-5>` | Manually set the legacy productivity score |

@@ -778,6 +778,15 @@ def _extract_json_candidate_strings(value: Any) -> list[str]:
         text = value.strip()
         if text:
             candidates.append(text)
+            # Stdout-only backends (OpenClaw / Hermes) may wrap the JSON in
+            # markdown fences or surround it with prose despite instructions
+            # not to. Fall back to the outermost {...} span so the parse
+            # survives that.
+            start, end = text.find("{"), text.rfind("}")
+            if 0 <= start < end:
+                span = text[start:end + 1]
+                if span != text:
+                    candidates.append(span)
     elif isinstance(value, dict):
         priority_keys = (
             "text", "message", "result", "reply", "output", "content",
