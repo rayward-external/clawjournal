@@ -429,6 +429,15 @@ def maybe_self_update(*, now: float | None = None) -> str:
     if not _claim_throttle_slot(when):
         return "throttled"
 
+    # A racer can pass the pre-lock freshness check, wait while another
+    # thread claims a stale lock, and then acquire the lock after that
+    # winner releases it. Re-check under the lock so only one contender
+    # can spawn for a freshly written stamp.
+    post_claim_when = time.time() if now is None else now
+    if _throttle_fresh(post_claim_when):
+        _release_lock()
+        return "throttled"
+
     _write_stamp(when)
     spawned = _spawn_background_update(repo)
     # Release the lock — the stamp's fresh mtime is what gates the next
