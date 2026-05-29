@@ -27,6 +27,7 @@ from .. import __version__
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
 from ..scoring.backends import (
+    PERMANENT_BACKEND_FAILURE_MARKERS,
     SUPPORTED_BACKENDS,
     detect_available_backend,
     require_backend_command,
@@ -376,11 +377,7 @@ class Scanner:
                         result = score_session(conn, sid, backend=backend)
                     except RuntimeError as exc:
                         message = str(exc)
-                        if (
-                            "Could not detect the current agent" in message
-                            or "CLI not found" in message
-                            or "Unsupported CLAWJOURNAL_SCORER_BACKEND" in message
-                        ):
+                        if any(marker in message for marker in PERMANENT_BACKEND_FAILURE_MARKERS):
                             self._auto_score_disabled_reason = message
                             logger.info("Automatic scoring disabled: %s", message)
                             break

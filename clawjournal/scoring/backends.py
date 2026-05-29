@@ -21,6 +21,21 @@ logger = logging.getLogger(__name__)
 SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
 AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
+
+# Prefix of the RuntimeError raised by resolve_backend() when no usable backend
+# can be found. Kept as a constant so callers (e.g. the daemon's auto-score
+# circuit breaker) can recognise the condition without duplicating the wording.
+NO_BACKEND_DETECTED_ERROR = "Could not detect a supported scoring backend"
+
+# Substrings of RuntimeError messages that mean "no scoring backend is usable" —
+# a permanent condition that should stop the daemon's auto-score loop rather than
+# be retried on every scan tick. Keep aligned with resolve_backend() and
+# require_backend_command() below.
+PERMANENT_BACKEND_FAILURE_MARKERS = (
+    NO_BACKEND_DETECTED_ERROR,
+    "CLI not found",
+    "Unsupported CLAWJOURNAL_SCORER_BACKEND",
+)
 BACKEND_COMMANDS: dict[str, str] = {
     "claude": "claude",
     "codex": "codex",
@@ -146,7 +161,7 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
         return detected
 
     raise RuntimeError(
-        "Could not detect a supported scoring backend. "
+        f"{NO_BACKEND_DETECTED_ERROR}. "
         "Install a supported agent CLI, set CLAWJOURNAL_SCORER_BACKEND, "
         "or pass --backend explicitly."
     )

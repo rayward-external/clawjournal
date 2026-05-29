@@ -602,6 +602,43 @@ class TestScanner:
         assert row["ai_score_reason"] == "Strong trace"
         assert row["ai_summary"] == "Useful fix"
 
+    def test_score_unscored_once_disables_on_no_backend_error(self, tmp_path, monkeypatch):
+        """A 'no usable backend' RuntimeError must trip the circuit breaker so the
+        scan loop stops retrying. Guards against the disable sentinel drifting away
+        from resolve_backend's message."""
+        from clawjournal.scoring.backends import NO_BACKEND_DETECTED_ERROR
+
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "sess-nb",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": now.isoformat(),
+            "messages": [{"role": "user", "content": "Fix it", "tool_uses": []}],
+            "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+        }])
+        conn.close()
+
+        def boom(conn, session_id, model=None, backend="auto"):
+            raise RuntimeError(
+                f"{NO_BACKEND_DETECTED_ERROR}. Install a supported agent CLI, "
+                "set CLAWJOURNAL_SCORER_BACKEND, or pass --backend explicitly."
+            )
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", boom)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=5) == 0
+        assert scanner._auto_score_disabled_reason is not None
+        assert NO_BACKEND_DETECTED_ERROR in scanner._auto_score_disabled_reason
+
     def test_score_unscored_once_respects_since_window(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
         monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
