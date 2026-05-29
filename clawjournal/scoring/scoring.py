@@ -586,8 +586,8 @@ JUDGE_SCHEMA = {
     "required": [
         "substance", "ai_quality_score", "ai_failure_value_score",
         "ai_recovery_labels", "ai_failure_attribution", "ai_failure_modes",
-        "ai_failure_evidence", "ai_learning_summary", "reasoning",
-        "display_title", "summary", "resolution", "effort_estimate",
+        "ai_meta_labels", "ai_failure_evidence", "ai_learning_summary",
+        "reasoning", "display_title", "summary", "resolution", "effort_estimate",
         "task_type", "session_tags", "privacy_flags", "project_areas",
     ],
 }

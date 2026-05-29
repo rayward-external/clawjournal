@@ -645,6 +645,7 @@ class TestBackendSelection:
     def test_codex_judge_schema_forbids_additional_properties(self):
         assert JUDGE_SCHEMA["type"] == "object"
         assert JUDGE_SCHEMA["additionalProperties"] is False
+        assert set(JUDGE_SCHEMA["required"]) == set(JUDGE_SCHEMA["properties"])
 
     def test_check_backend_runtime_codex_is_non_blocking(self):
         env = {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}
