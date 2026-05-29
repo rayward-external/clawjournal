@@ -586,8 +586,8 @@ JUDGE_SCHEMA = {
     "required": [
         "substance", "ai_quality_score", "ai_failure_value_score",
         "ai_recovery_labels", "ai_failure_attribution", "ai_failure_modes",
-        "ai_failure_evidence", "ai_learning_summary", "reasoning",
-        "display_title", "summary", "resolution", "effort_estimate",
+        "ai_meta_labels", "ai_failure_evidence", "ai_learning_summary",
+        "reasoning", "display_title", "summary", "resolution", "effort_estimate",
         "task_type", "session_tags", "privacy_flags", "project_areas",
     ],
 }
@@ -778,6 +778,15 @@ def _extract_json_candidate_strings(value: Any) -> list[str]:
         text = value.strip()
         if text:
             candidates.append(text)
+            # Stdout-only backends (OpenClaw / Hermes) may wrap the JSON in
+            # markdown fences or surround it with prose despite instructions
+            # not to. Fall back to the outermost {...} span so the parse
+            # survives that.
+            start, end = text.find("{"), text.rfind("}")
+            if 0 <= start < end:
+                span = text[start:end + 1]
+                if span != text:
+                    candidates.append(span)
     elif isinstance(value, dict):
         priority_keys = (
             "text", "message", "result", "reply", "output", "content",
@@ -873,7 +882,7 @@ def _read_scoring_output(result: AgentResult, backend: str) -> dict:
             return _validate_backend_judge_result(parsed)
         raise RuntimeError("scoring.json does not contain a JSON object")
 
-    # OpenClaw: parse from stdout
+    # OpenClaw / Hermes: parse from stdout
     stdout = result.stdout.strip()
     if not stdout:
         raise RuntimeError(f"{backend} did not produce scoring output")
@@ -910,10 +919,11 @@ def call_judge(
             rubric=rubric,
         )
 
-        # Build OpenClaw-specific message with absolute paths
-        openclaw_msg = None
-        if resolved == "openclaw":
-            openclaw_msg = (
+        # Build backend-specific messages for agents that do not consume
+        # Claude-style system prompts or Codex structured-output files.
+        file_based_msg = None
+        if resolved in ("openclaw", "hermes"):
+            file_based_msg = (
                 "Score the coding agent session using the files below.\n\n"
                 f"Read these absolute paths:\n"
                 f"- {tmp_path / 'judge_input.md'}\n"
@@ -924,8 +934,13 @@ def call_judge(
                 "Do not wrap it in markdown fences."
             )
 
-        # Codex uses structured output; give it a matching prompt
-        task_prompt = _SCORE_TASK_PROMPT_CODEX if resolved == "codex" else _SCORE_TASK_PROMPT
+        # Codex uses structured output; Hermes/OpenClaw get absolute paths.
+        if resolved == "codex":
+            task_prompt = _SCORE_TASK_PROMPT_CODEX
+        elif resolved == "hermes" and file_based_msg is not None:
+            task_prompt = file_based_msg
+        else:
+            task_prompt = _SCORE_TASK_PROMPT
 
         result = run_default_agent_task(
             backend=resolved,
@@ -937,7 +952,7 @@ def call_judge(
             codex_sandbox="read-only",
             codex_output_schema=JUDGE_SCHEMA,
             codex_output_file="scoring.json",
-            openclaw_message=openclaw_msg,
+            openclaw_message=file_based_msg if resolved == "openclaw" else None,
         )
 
         parsed = _read_scoring_output(result, resolved)

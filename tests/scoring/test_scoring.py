@@ -517,7 +517,7 @@ class TestValidateJudgeResultBackwardCompat:
 
 class TestBackendSelection:
     def test_backend_choices_include_auto(self):
-        assert SCORING_BACKEND_CHOICES == ("auto", "claude", "codex", "openclaw")
+        assert SCORING_BACKEND_CHOICES == ("auto", "claude", "codex", "hermes", "openclaw")
 
     def test_detect_current_agent_from_env_codex(self):
         env = {"CODEX_THREAD_ID": "thread-123"}
@@ -551,7 +551,8 @@ class TestBackendSelection:
 
     def test_resolve_backend_raises_without_current_agent(self, monkeypatch):
         monkeypatch.setattr("clawjournal.scoring.backends._detect_current_agent_from_process_tree", lambda **kw: None)
-        with pytest.raises(RuntimeError, match="Could not detect the current agent"):
+        monkeypatch.setattr("clawjournal.scoring.backends.shutil.which", lambda cmd: None)
+        with pytest.raises(RuntimeError, match="Could not detect a supported scoring backend"):
             resolve_backend("auto", {})
 
     def test_call_judge_dispatches_to_codex(self, monkeypatch):
@@ -644,6 +645,7 @@ class TestBackendSelection:
     def test_codex_judge_schema_forbids_additional_properties(self):
         assert JUDGE_SCHEMA["type"] == "object"
         assert JUDGE_SCHEMA["additionalProperties"] is False
+        assert set(JUDGE_SCHEMA["required"]) == set(JUDGE_SCHEMA["properties"])
 
     def test_check_backend_runtime_codex_is_non_blocking(self):
         env = {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}
@@ -709,6 +711,43 @@ class TestBackendSelection:
         assert captured["openclaw_message"] is not None
         assert "absolute paths" in captured["openclaw_message"].lower()
 
+    def test_call_judge_dispatches_to_hermes_and_reads_stdout_json(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.scoring.scoring.load_scoring_rubric", lambda: "rubric")
+
+        scoring = {
+            "substance": 5,
+            **_failure_fields(ai_quality_score=5, ai_failure_value_score=5),
+            "reasoning": "Excellent failure trace",
+            "display_title": "Recover broken migration",
+            "summary": "Recovered a broken migration after tool failures.",
+            "resolution": "resolved",
+            "effort_estimate": 0.6,
+            "task_type": "debugging",
+            "session_tags": ["backend"],
+            "privacy_flags": [],
+            "project_areas": ["db/"],
+        }
+        captured = {}
+
+        def fake_run(*, backend, task_prompt=None, openclaw_message=None, **kw):
+            captured["backend"] = backend
+            captured["task_prompt"] = task_prompt
+            captured["openclaw_message"] = openclaw_message
+            return AgentResult(stdout=json.dumps(scoring), stderr="", returncode=0, cwd=kw["cwd"])
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.run_default_agent_task", fake_run)
+        result = call_judge(
+            "prompt",
+            session_data={"messages": []},
+            metadata={"total_steps": 1},
+            backend="hermes",
+        )
+        assert result["substance"] == 5
+        assert result["task_type"] == "debugging"
+        assert captured["backend"] == "hermes"
+        assert captured["openclaw_message"] is None
+        assert "absolute paths" in captured["task_prompt"].lower()
+
     def test_extract_judge_result_from_nested_openclaw_json(self):
         payload = {
             "reply": {
@@ -772,6 +811,25 @@ class TestReadScoringOutput:
         result = AgentResult(
             stdout=json.dumps(_VALID_JUDGE), stderr="", returncode=0, cwd=tmp_path,
         )
+        parsed = _read_scoring_output(result, "openclaw")
+        assert parsed["substance"] == 4
+
+    def test_hermes_reads_from_stdout(self, tmp_path):
+        result = AgentResult(
+            stdout=json.dumps(_VALID_JUDGE), stderr="", returncode=0, cwd=tmp_path,
+        )
+        parsed = _read_scoring_output(result, "hermes")
+        assert parsed["substance"] == 4
+
+    def test_stdout_json_in_markdown_fences_is_parsed(self, tmp_path):
+        fenced = "```json\n" + json.dumps(_VALID_JUDGE) + "\n```"
+        result = AgentResult(stdout=fenced, stderr="", returncode=0, cwd=tmp_path)
+        parsed = _read_scoring_output(result, "hermes")
+        assert parsed["substance"] == 4
+
+    def test_stdout_json_with_surrounding_prose_is_parsed(self, tmp_path):
+        noisy = "Here is the score:\n" + json.dumps(_VALID_JUDGE) + "\nDone."
+        result = AgentResult(stdout=noisy, stderr="", returncode=0, cwd=tmp_path)
         parsed = _read_scoring_output(result, "openclaw")
         assert parsed["substance"] == 4
 

@@ -94,10 +94,10 @@ Ask: "Would you like me to auto-score your sessions? Each session gets two AI ra
 If yes:
 
 ```bash
-~/.clawjournal-venv/bin/clawjournal score --batch --source failure-v1 --auto-triage
+~/.clawjournal-venv/bin/clawjournal score --batch --source failure-corpus --auto-triage
 ```
 
-`--source failure-v1` scopes to the supported sources (claude, codex, opencode, openclaw); auto-triage archives productivity-1 sessions only when failure value is 1-2.
+`--source failure-corpus` scopes to the supported sources (claude, codex, opencode, openclaw); auto-triage archives productivity-1 sessions only when failure value is 1-2.
 
 Show summary: "N sessions scored. Failure-value distribution: ... M productivity-1 low-failure-value sessions auto-archived as noise."
 

@@ -116,7 +116,44 @@ function Sidebar() {
   );
 }
 
+const SCORING_WARMUP_DECLINED_KEY = 'cj.scoringWarmupDeclined';
+
 export default function App() {
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const warmup = await api.scoringWarmup();
+        if (cancelled || warmup.status !== 'needs_confirmation' || !warmup.backend) {
+          return;
+        }
+        // Ask at most once. There is no server-side "declined" flag, so a
+        // browser that has already said no must remember it locally —
+        // otherwise this blocking dialog re-fires on every reload.
+        if (localStorage.getItem(SCORING_WARMUP_DECLINED_KEY)) {
+          return;
+        }
+        const accepted = window.confirm(
+          `Use ${warmup.display_name ?? warmup.backend} to score recent failure-corpus traces in the background?`,
+        );
+        if (cancelled) {
+          return;
+        }
+        if (accepted) {
+          await api.scoringWarmup({ confirm_backend: true, backend: warmup.backend });
+        } else {
+          localStorage.setItem(SCORING_WARMUP_DECLINED_KEY, '1');
+        }
+      } catch {
+        // Background scoring is opportunistic; the workbench stays usable.
+      }
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
   return (
     <BrowserRouter>
       <ToastProvider>

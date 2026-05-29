@@ -7,7 +7,7 @@ import sys
 import urllib.error
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, cast
 
@@ -65,7 +65,7 @@ WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "opencode", "openclaw", "cursor",
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
-SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-v1", "all", "auto", "both"}
+SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-corpus", "failure-v1", "all", "auto", "both"}
 
 
 def _mask_secret(s: str) -> str:
@@ -89,12 +89,12 @@ def _normalize_score_source_filter(raw: str | None) -> str | list[str] | None:
     if raw is None:
         return list(FAILURE_VALUE_SOURCE_SCOPE)
     value = raw.strip().lower()
-    if value in ("", "failure-v1"):
+    if value in ("", "failure-corpus", "failure-v1"):
         return list(FAILURE_VALUE_SOURCE_SCOPE)
     if value == "both":
         print(
             "Warning: --source both is deprecated for scoring; use "
-            "--source failure-v1 or --source claude,codex,opencode,openclaw.",
+            "--source failure-corpus or --source claude,codex,opencode,openclaw.",
             file=sys.stderr,
         )
         return ["claude", "codex"]
@@ -363,6 +363,7 @@ def _merge_config_list(config: ClawJournalConfig, key: str, new_values: list[str
 def configure(
     repo: str | None = None,
     source: str | None = None,
+    scorer_backend: str | None = None,
     exclude: list[str] | None = None,
     redact: list[str] | None = None,
     redact_usernames: list[str] | None = None,
@@ -375,6 +376,13 @@ def configure(
         config["repo"] = repo
     if source is not None:
         config["source"] = source
+    if scorer_backend is not None:
+        if scorer_backend == "none":
+            config.pop("scorer_backend", None)
+            config.pop("scorer_backend_confirmed_at", None)
+        else:
+            config["scorer_backend"] = scorer_backend
+            config["scorer_backend_confirmed_at"] = datetime.now(timezone.utc).isoformat()
     if exclude is not None:
         if config.get("excluded_projects"):
             config["excluded_projects"] = normalize_excluded_project_names(
@@ -2587,7 +2595,13 @@ def _run_score_batch(args) -> None:
 
     conn = open_index()
     source_filter = _normalize_score_source_filter(args.source)
-    sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter)
+    window_days = getattr(args, "window", None)
+    since = (
+        (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+        if window_days is not None
+        else None
+    )
+    sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter, since=since)
     conn.close()
 
     print(json.dumps(sessions, indent=2))
@@ -2820,10 +2834,16 @@ def _run_score(args) -> None:
     batch = args.batch
     auto_triage = getattr(args, "auto_triage", False)
     source_filter = _normalize_score_source_filter(args.source)
+    window_days = getattr(args, "window", None)
+    since = (
+        (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+        if window_days is not None
+        else None
+    )
 
     if batch:
         # Batch mode: score unscored sessions
-        sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter)
+        sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter, since=since)
         if not sessions:
             print(json.dumps({"message": "No unscored sessions found.", "scored": 0}))
             conn.close()
@@ -3623,6 +3643,8 @@ def main() -> None:
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
                      help="Set export source scope explicitly: claude, codex, gemini, or all")
+    cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
+                     help="Confirm the AI scoring backend for automatic workbench scoring")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
     cfg.add_argument("--redact", type=str,
                      help="Comma-separated strings to always redact (API keys, usernames, domains)")
@@ -4030,15 +4052,19 @@ def main() -> None:
 
     sb = sub.add_parser("score-batch", help="List unscored sessions for AI scoring")
     sb.add_argument("--limit", type=int, default=50)
-    sb.add_argument("--source", default="failure-v1",
-                    help="Source scope: failure-v1, comma list, all/auto, or a single source")
+    sb.add_argument("--source", default="failure-corpus",
+                    help="Source scope: failure-corpus, comma list, all/auto, or a single source")
+    sb.add_argument("--window", type=_parse_window_days, default=None,
+                    help="Only include unscored sessions from the last Nd days (e.g. 7d)")
 
     sc = sub.add_parser("score", help="Auto-score sessions via the current agent's automation CLI or an explicit backend")
     sc.add_argument("session_ids", nargs="*", help="Session IDs to score")
     sc.add_argument("--batch", action="store_true", help="Score all unscored sessions")
-    sc.add_argument("--limit", type=int, default=10, help="Max sessions for batch mode (default: 10)")
-    sc.add_argument("--source", default="failure-v1",
-                    help="Batch source scope: failure-v1, comma list, all/auto, or a single source")
+    sc.add_argument("--limit", type=int, default=20, help="Max sessions for batch mode (default: 20)")
+    sc.add_argument("--source", default="failure-corpus",
+                    help="Batch source scope: failure-corpus, comma list, all/auto, or a single source")
+    sc.add_argument("--window", type=_parse_window_days, default=None,
+                    help="Only score unscored sessions from the last Nd days (e.g. 7d)")
     sc.add_argument("--backend", choices=SCORING_BACKEND_CHOICES, default="auto",
                     help="Scoring backend (default: auto = current agent's automation CLI)")
     sc.add_argument("--model", type=str, default=None,
@@ -4059,8 +4085,8 @@ def main() -> None:
     )
     rs.add_argument(
         "--source",
-        default="failure-v1",
-        help="Source scope: failure-v1, comma list, all/auto, or a single source",
+        default="failure-corpus",
+        help="Source scope: failure-corpus, comma list, all/auto, or a single source",
     )
     rs.add_argument("--limit", type=int, default=200, help="Max sessions to rescore (default: 200)")
     rs.add_argument(
@@ -4525,6 +4551,7 @@ def _handle_config(args) -> None:
     has_changes = (
         args.repo
         or args.source
+        or args.scorer_backend
         or args.exclude
         or args.redact
         or args.redact_usernames
@@ -4537,6 +4564,7 @@ def _handle_config(args) -> None:
     configure(
         repo=args.repo,
         source=args.source,
+        scorer_backend=args.scorer_backend,
         exclude=_parse_csv_arg(args.exclude),
         redact=_parse_csv_arg(args.redact),
         redact_usernames=_parse_csv_arg(args.redact_usernames),

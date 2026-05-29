@@ -19,6 +19,7 @@ from clawjournal.workbench.daemon import (
     run_server,
     _SHARE_COOLDOWN_SECONDS,
     _apply_upload_pii_redactions,
+    trigger_scoring_warmup,
 )
 from clawjournal.workbench.index import open_index, upsert_sessions
 
@@ -71,6 +72,27 @@ def server(index_setup):
     thread = Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     yield port
+    srv.shutdown()
+
+
+@pytest.fixture
+def server_with_scanner(index_setup):
+    """Start a test HTTP server with a controllable background scanner."""
+    from http.server import ThreadingHTTPServer
+
+    scanner = SimpleNamespace(calls=[], status="started")
+
+    def trigger_auto_score(**kwargs):
+        scanner.calls.append(kwargs)
+        return {"status": scanner.status, **kwargs}
+
+    scanner.trigger_auto_score = trigger_auto_score
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
+    srv._scanner = scanner
+    port = srv.server_address[1]
+    thread = Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield port, scanner
     srv.shutdown()
 
 
@@ -580,7 +602,44 @@ class TestScanner:
         assert row["ai_score_reason"] == "Strong trace"
         assert row["ai_summary"] == "Useful fix"
 
-    def test_score_unscored_once_skips_sessions_outside_recent_window(self, tmp_path, monkeypatch):
+    def test_score_unscored_once_disables_on_no_backend_error(self, tmp_path, monkeypatch):
+        """A 'no usable backend' RuntimeError must trip the circuit breaker so the
+        scan loop stops retrying. Guards against the disable sentinel drifting away
+        from resolve_backend's message."""
+        from clawjournal.scoring.backends import NO_BACKEND_DETECTED_ERROR
+
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "sess-nb",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": now.isoformat(),
+            "messages": [{"role": "user", "content": "Fix it", "tool_uses": []}],
+            "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+        }])
+        conn.close()
+
+        def boom(conn, session_id, model=None, backend="auto"):
+            raise RuntimeError(
+                f"{NO_BACKEND_DETECTED_ERROR}. Install a supported agent CLI, "
+                "set CLAWJOURNAL_SCORER_BACKEND, or pass --backend explicitly."
+            )
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", boom)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=5) == 0
+        assert scanner._auto_score_disabled_reason is not None
+        assert NO_BACKEND_DETECTED_ERROR in scanner._auto_score_disabled_reason
+
+    def test_score_unscored_once_respects_since_window(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
         monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
         monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
@@ -615,8 +674,138 @@ class TestScanner:
         monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
 
         scanner = Scanner(source_filter="claude")
-        assert scanner.score_unscored_once(limit=5) == 0
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        assert scanner.score_unscored_once(limit=5, since=since) == 0
         assert calls["count"] == 0
+
+    def test_score_unscored_once_uses_failure_corpus_even_with_scan_filter(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [
+            {
+                "session_id": "cursor-sess",
+                "project": "test-project",
+                "source": "cursor",
+                "model": "cursor",
+                "start_time": now.isoformat(),
+                "messages": [{"role": "user", "content": "Cursor task"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            },
+            {
+                "session_id": "codex-sess",
+                "project": "test-project",
+                "source": "codex",
+                "model": "gpt-5",
+                "start_time": (now - timedelta(minutes=1)).isoformat(),
+                "messages": [{"role": "user", "content": "Codex task"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            },
+        ])
+        conn.close()
+
+        scored_ids = []
+
+        def fake_score(conn, session_id, model=None, backend="auto"):
+            scored_ids.append(session_id)
+            return SimpleNamespace(
+                quality=4,
+                reason="Good trace",
+                detail_json='{"substance": 4}',
+                task_type="debugging",
+                outcome_label="resolved",
+                value_labels=[],
+                risk_level=[],
+                display_title="Good trace",
+                effort_estimate=0.5,
+                summary="Useful trace",
+                failure_value_score=4,
+                recovery_labels=[],
+                failure_attribution="agent_caused",
+                failure_modes=[],
+                learning_summary="Useful failure trace",
+                scorer_backend="test",
+                scorer_model="test-model",
+                rubric_git_sha="test-sha",
+                scored_at=now.isoformat(),
+            )
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner(source_filter="cursor")
+        assert scanner.score_unscored_once(limit=5) == 1
+        assert scored_ids == ["codex-sess"]
+
+
+class TestScoringWarmupAPI:
+    def test_endpoint_returns_disabled_without_scanner(self, server):
+        status, data = _post(server, "/api/scoring/warmup")
+
+        assert status == 200
+        assert data["status"] == "disabled"
+
+    def test_endpoint_requires_confirmation_for_detected_backend(self, server_with_scanner, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.detect_available_backend", lambda: "codex")
+        monkeypatch.setattr("clawjournal.workbench.daemon.require_backend_command", lambda backend: backend)
+        port, scanner = server_with_scanner
+
+        status, data = _post(port, "/api/scoring/warmup")
+
+        assert status == 200
+        assert data["status"] == "needs_confirmation"
+        assert data["backend"] == "codex"
+        assert scanner.calls == []
+
+    def test_endpoint_starts_after_confirmation_and_persists_backend(self, server_with_scanner, monkeypatch):
+        config: dict[str, object] = {}
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: dict(config))
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda cfg: config.update(cfg))
+        monkeypatch.setattr("clawjournal.workbench.daemon.detect_available_backend", lambda: "codex")
+        monkeypatch.setattr("clawjournal.workbench.daemon.require_backend_command", lambda backend: backend)
+        port, scanner = server_with_scanner
+
+        status, data = _post(
+            port,
+            "/api/scoring/warmup",
+            {"confirm_backend": True, "backend": "codex"},
+        )
+
+        assert status == 200
+        assert data["status"] == "started"
+        assert data["backend"] == "codex"
+        assert data["limit"] == 20
+        assert scanner.calls == [{"limit": 20, "backend": "codex"}]
+        assert config["scorer_backend"] == "codex"
+        assert "scorer_backend_confirmed_at" in config
+
+    def test_endpoint_reports_already_running_from_scanner(self, server_with_scanner, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"scorer_backend": "codex"},
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.require_backend_command", lambda backend: backend)
+        port, scanner = server_with_scanner
+        scanner.status = "already_running"
+
+        status, data = _post(port, "/api/scoring/warmup")
+
+        assert status == 200
+        assert data["status"] == "already_running"
+        assert scanner.calls == [{"limit": 20, "backend": "codex"}]
+
+    def test_helper_disables_when_no_backend_detected(self, monkeypatch):
+        scanner = SimpleNamespace(trigger_auto_score=lambda **kw: {"status": "started"})
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.detect_available_backend", lambda: None)
+
+        result = trigger_scoring_warmup(scanner)
+
+        assert result["status"] == "disabled"
 
 
 class TestProjectsAPI:
