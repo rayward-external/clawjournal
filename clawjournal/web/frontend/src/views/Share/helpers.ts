@@ -110,8 +110,13 @@ export function formatShareDestination(url: string): string {
 
 export function queueFromStats(stats: ShareReadyStats): string[] {
   const validIds = new Set(stats.sessions.map((s) => s.session_id));
-  return (stats.recommended_session_ids || [])
+  const recommended = (stats.recommended_session_ids || [])
     .filter((id) => validIds.has(id))
+    .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
+  if (recommended.length > 0) return recommended;
+  return stats.sessions
+    .map((s) => s.session_id)
+    .filter(Boolean)
     .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
 }
 

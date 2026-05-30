@@ -4492,37 +4492,37 @@ def main() -> None:
         if args.json:
             print(json.dumps(result, indent=2))
         else:
-            status = result.get("status")
-            if status == "not-a-checkout":
+            selfupdate_status = result.get("status")
+            if selfupdate_status == "not-a-checkout":
                 print("clawjournal is not installed from an editable git checkout — nothing to update.")
-            elif status == "up-to-date":
+            elif selfupdate_status == "up-to-date":
                 print(f"Already up to date ({str(result.get('head', ''))[:7]}).")
-            elif status == "behind":
+            elif selfupdate_status == "behind":
                 print(
                     f"Update available: {str(result.get('head', ''))[:7]} -> "
                     f"{str(result.get('upstream', ''))[:7]}. Run `clawjournal selfupdate` to apply."
                 )
-            elif status == "updated":
+            elif selfupdate_status == "updated":
                 print(
                     f"Updated {str(result.get('head', ''))[:7]} -> "
                     f"{str(result.get('upstream', ''))[:7]}."
                 )
-            elif status == "dirty":
+            elif selfupdate_status == "dirty":
                 print("Skipped: the checkout has local changes. Commit/stash or pass --force.")
-            elif isinstance(status, str) and status.startswith("branch-"):
-                print(f"Skipped: not on the main branch ({status[len('branch-'):]}). Check out main first.")
-            elif status == "ahead":
+            elif isinstance(selfupdate_status, str) and selfupdate_status.startswith("branch-"):
+                print(f"Skipped: not on the main branch ({selfupdate_status[len('branch-'):]}). Check out main first.")
+            elif selfupdate_status == "ahead":
                 print("Skipped: local main has commits not present on origin/main. Update manually.")
-            elif status == "diverged":
+            elif selfupdate_status == "diverged":
                 print("Skipped: local main has diverged from origin/main. Update manually.")
-            elif status == "ancestry-failed":
+            elif selfupdate_status == "ancestry-failed":
                 print("Skipped: could not compare local main with origin/main.")
-            elif status == "fetch-failed":
+            elif selfupdate_status == "fetch-failed":
                 print(f"Fetch failed: {result.get('stderr', '')}".rstrip())
-            elif status == "update-failed":
+            elif selfupdate_status == "update-failed":
                 print(f"Update failed: {result.get('stderr', '')}".rstrip())
             else:
-                print(f"selfupdate status: {status}")
+                print(f"selfupdate status: {selfupdate_status}")
         return
 
     if command == "list":
