@@ -34,6 +34,10 @@ export function DoneStep(p: DoneStepProps) {
   const hostedShareUrl = p.shareDestination?.configured ? p.shareDestination.share_page_url : null;
   const hostedShareLabel = hostedShareUrl ? formatShareDestination(hostedShareUrl) : null;
   const submitted = !!p.receiptId;
+  // The flow routes here (instead of Submit) when hosted submissions are
+  // closed. Surface that explicitly so a participant doesn't think the
+  // missing Submit button means their workbench is broken.
+  const submissionsClosed = !!p.shareDestination?.configured && !p.shareDestination?.submissions_open;
   // `bundle.approxSize` is the whole zip's compressed size (from the seal
   // response); it doesn't belong on the sessions.jsonl row, which the user
   // would read as "this JSONL is that big". Keep the row generic — the zip
@@ -103,6 +107,17 @@ export function DoneStep(p: DoneStepProps) {
         <p style={{ color: colors.gray500, margin: '0 0 24px', fontSize: 14 }}>
           {submitted ? `Receipt ${p.receiptId}` : 'Download the finalized zip, then upload it through the hosted submission page.'}
         </p>
+
+        {!submitted && submissionsClosed && (
+          <div style={{
+            margin: '0 auto 22px', maxWidth: 520, padding: '12px 14px',
+            background: colors.yellow50, border: `1px solid ${colors.yellow200}`,
+            borderRadius: 8, fontSize: 13, color: colors.yellow700, textAlign: 'left' as const,
+          }}>
+            {p.shareDestination?.message
+              || 'Hosted research submissions are currently closed, so there is no Submit step right now — this is expected, not a problem. Download the zip below and upload it once submissions reopen.'}
+          </div>
+        )}
 
         {p.bundle && (
           <div style={{
