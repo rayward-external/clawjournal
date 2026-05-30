@@ -19,6 +19,7 @@ from clawjournal.workbench.daemon import (
     run_server,
     _SHARE_COOLDOWN_SECONDS,
     _apply_upload_pii_redactions,
+    _missing_ingest_url_error,
     trigger_scoring_warmup,
 )
 from clawjournal.workbench.index import open_index, upsert_sessions
@@ -817,6 +818,13 @@ class TestProjectsAPI:
 
 
 class TestShareDestinationAPI:
+    def test_missing_ingest_url_error_points_to_workbench_submit(self):
+        message = _missing_ingest_url_error()
+
+        assert "Share tab's Submit step" in message
+        assert "bundle-export <bundle_id> --zip" in message
+        assert "CLAWJOURNAL_INGEST_URL" in message
+
     def test_packaged_default_points_to_rayward_research(self):
         from clawjournal.workbench.daemon import _HOSTED_SHARE_URL_DEFAULT
 

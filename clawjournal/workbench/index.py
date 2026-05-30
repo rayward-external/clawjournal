@@ -3682,10 +3682,10 @@ def export_share_to_disk(
                     clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
                     f.write(json.dumps(clean, default=str) + "\n")
                     manifest["sessions"].append({
-                        "session_id": s["session_id"],
-                        "project": s.get("project"),
-                        "source": s.get("source"),
-                        "model": s.get("model"),
+                        "session_id": clean.get("session_id") or s["session_id"],
+                        "project": clean.get("project"),
+                        "source": clean.get("source"),
+                        "model": clean.get("model"),
                         # Aggregated counts per §Bundle manifest provenance —
                         # no hashes, plaintext, or offsets.
                         "redactions": build_session_redactions_summary(

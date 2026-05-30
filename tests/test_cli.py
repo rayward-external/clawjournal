@@ -432,6 +432,13 @@ class TestListProjects:
         assert len(data) == 1
         assert data[0]["name"] == "codex:proj2"
 
+    def test_main_status_dispatch_is_not_shadowed(self, monkeypatch):
+        called = []
+        monkeypatch.setattr("clawjournal.cli.status", lambda: called.append(True))
+        monkeypatch.setattr("sys.argv", ["clawjournal", "status"])
+        main()
+        assert called == [True]
+
 
 class TestWorkflowGateMessages:
     @staticmethod
@@ -981,7 +988,7 @@ class TestBundleExport:
         sessions = [
             {
                 "session_id": "redact-test",
-                "project": "test-project",
+                "project": "MySecretName-project",
                 "source": "claude",
                 "model": "claude-sonnet-4",
                 "messages": [
@@ -1012,6 +1019,9 @@ class TestBundleExport:
         content = sessions_file.read_text()
         assert "MySecretName" not in content, "Custom redact_string was not redacted"
         assert "sk-ant-api03" not in content, "API key was not redacted"
+
+        manifest_content = (Path(output["export_path"]) / "manifest.json").read_text()
+        assert "MySecretName" not in manifest_content, "manifest metadata was not redacted"
 
     def test_export_applies_policy_rules(self, tmp_path, monkeypatch, capsys):
         """Bundle export applies workbench policy rules in addition to config."""
