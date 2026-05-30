@@ -2,24 +2,24 @@
 
 Review and curate your coding agent conversation traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, automatically anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
-## Install in one step (no coding required)
+## Install or refresh in one step (no coding required)
 
-If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Hermes**, **Gemini CLI**, or similar — you can install ClawJournal without writing any code or running any commands yourself.
+If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Hermes**, **Gemini CLI**, or similar — you can install or refresh ClawJournal without writing any code or running any commands yourself. Use the same prompt for a first-time install, or before a submission window if you installed days or weeks ago.
 
 **1.** Open your AI assistant.
 
 **2.** Paste this message:
 
-> *Install ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
+> *Install or refresh ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow the instructions for my operating system. If ClawJournal is already installed, update it from the public GitHub repo and rebuild the browser workbench. Install any missing prerequisites. Verify it works at the end.*
 
-**3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
+**3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, rebuild the workbench when needed, and tell you when it's done.
 
 ### What to expect
 
 - **Permission prompts — lots of them.** Your AI will ask permission to run several commands. Expect 10–25 prompts before install finishes — more if your computer is fresh, fewer if it already has dev tools. **Click "Allow" each time.** This is normal. The tools the AI installs (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
 - **A separate password prompt on Mac.** macOS may ask for *your computer password* (the one you use to log in) when installing certain tools. This is your operating system asking, not the AI. Type your password and hit Enter — installing software almost always requires this.
 - **Silent waiting periods.** Some downloads and compiles take 30–90 seconds with no visible progress. **The AI isn't frozen — it's working.** Wait for it to come back. Total install time is usually 2–10 minutes depending on your network and what's already installed.
-- **A success message at the end:** `[ok] ClawJournal 0.1.15 installed.` (the version number may differ).
+- **A success message at the end:** `[ok] ClawJournal 0.1.15 installed.` (the version number may differ). On a refresh, the AI should also confirm that `clawjournal status` works and that `clawjournal bundle-export --help` shows the `--zip` option.
 
 ### Open the workbench
 
@@ -42,7 +42,7 @@ Your first scan may take a minute or two if you have lots of past sessions, and 
 <details>
 <summary><b>For AI agents reading this README directly</b> (humans following the 3 steps above can skip this)</summary>
 
-Detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+Detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status` and `clawjournal bundle-export --help`. If a checkout already exists, fetch/update it from `rayward-external/clawjournal` first and rerun the installer with `--with-frontend` so the built workbench assets match the current source. The install script handles Python detection, venv creation, dependency install, and frontend build. You have everything you need; proceed.
 
 </details>
 
