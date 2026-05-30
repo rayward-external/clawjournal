@@ -47,6 +47,11 @@ export function QueueStep(p: QueueStepProps) {
   const [dragId, setDragId] = useState<string | null>(null);
 
   const allSessions = p.readyStats?.sessions || [];
+  // `total_approved` counts every approved session; `allSessions` only holds the
+  // ones actually eligible to share. When approved > 0 but eligible == 0, the
+  // sessions exist but are all held/embargoed/excluded/already-shared — say so
+  // instead of telling the user to "approve traces" they already approved.
+  const totalApproved = p.readyStats?.total_approved ?? 0;
   const totalTokens = p.queuedSessions.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
   const uniqueProjects = [...new Set(p.queuedSessions.map(s => s.project).filter(Boolean))];
 
@@ -107,9 +112,18 @@ export function QueueStep(p: QueueStepProps) {
             <h3 style={{ color: colors.gray900, fontWeight: 500, margin: '0 0 6px', fontSize: 16 }}>
               No traces ready to share
             </h3>
-            <p style={{ margin: '0 auto 20px', maxWidth: '38ch', fontSize: 13 }}>
-              Approve traces in Sessions to build a bundle.
-            </p>
+            {totalApproved > 0 ? (
+              <p style={{ margin: '0 auto 20px', maxWidth: '46ch', fontSize: 13 }}>
+                You have {totalApproved} approved session{totalApproved === 1 ? '' : 's'}, but none are eligible to
+                share right now — they may be on hold, under an active embargo, in an excluded project, or already
+                shared. Release a hold or check your excluded projects (<code>clawjournal config --exclude</code>),
+                then come back.
+              </p>
+            ) : (
+              <p style={{ margin: '0 auto 20px', maxWidth: '38ch', fontSize: 13 }}>
+                Approve traces in Sessions to build a bundle.
+              </p>
+            )}
             <Link to="/" style={{ ...btnPrimary, textDecoration: 'none' }}>Go to Sessions</Link>
           </div>
         </>

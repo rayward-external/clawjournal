@@ -141,10 +141,21 @@ Or add the venv to your PATH:
 EOF
 
 # 6) Soft hints for optional runtime deps.
-if [ ! -f "$REPO_DIR/clawjournal/web/frontend/dist/index.html" ]; then
+FE_DIST_HTML="$REPO_DIR/clawjournal/web/frontend/dist/index.html"
+FE_SRC_DIR="$REPO_DIR/clawjournal/web/frontend/src"
+if [ ! -f "$FE_DIST_HTML" ]; then
   cat <<EOF
 
 [i] Browser workbench not built. To enable 'clawjournal serve':
+    ./scripts/install.sh --with-frontend       (requires Node.js)
+EOF
+elif [ -d "$FE_SRC_DIR" ] && [ -n "$(find "$FE_SRC_DIR" -type f -newer "$FE_DIST_HTML" 2>/dev/null | head -n 1)" ]; then
+  # Source is newer than the built assets — a sync without a rebuild leaves
+  # 'clawjournal serve' showing a stale workbench (e.g. an empty Share queue).
+  cat <<EOF
+
+[i] The browser workbench build looks out of date (its source is newer than
+    the built assets). 'clawjournal serve' may show an old UI until you rebuild:
     ./scripts/install.sh --with-frontend       (requires Node.js)
 EOF
 fi
