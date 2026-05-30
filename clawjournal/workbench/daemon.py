@@ -608,10 +608,10 @@ def _is_edu_email(email: str) -> bool:
 def _missing_ingest_url_error() -> str:
     return (
         "CLI ingest upload is not configured in this build. "
-        "Use the workbench Download zip action or "
-        "`clawjournal bundle-export <bundle_id> --zip` to produce a local zip. "
-        "Hosted research submissions use the configured "
-        "workbench Submit step; self-hosters can set CLAWJOURNAL_INGEST_URL to "
+        "Use the workbench Share tab's Submit step when hosted submissions are "
+        "open, or use Download zip / "
+        "`clawjournal bundle-export <bundle_id> --zip` for manual browser upload. "
+        "Self-hosters can set CLAWJOURNAL_INGEST_URL to "
         "point at their own ingest backend."
     )
 
