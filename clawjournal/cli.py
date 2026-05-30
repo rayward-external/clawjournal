@@ -1734,6 +1734,7 @@ def _run_verify_email(args) -> None:
     """Handle the verify-email CLI command."""
     from .workbench.daemon import (
         _expiry_is_valid,
+        _hosted_is_local_dev,
         _is_edu_email,
         confirm_email_verification,
         request_email_verification,
@@ -1809,7 +1810,9 @@ def _run_verify_email(args) -> None:
             "message": "You will receive a verification code by email.",
             "next_command": f"clawjournal verify-email {email} --code <CODE>",
         }
-        if result.get("dev_code"):
+        # `dev_code` is a local-development convenience; only surface it when the
+        # hosted service is a local/dev deployment, never against production.
+        if result.get("dev_code") and _hosted_is_local_dev():
             payload["dev_code"] = result["dev_code"]
         print(json.dumps(payload, indent=2))
 

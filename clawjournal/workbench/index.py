@@ -3406,7 +3406,7 @@ def get_share_ready_stats(
         " ai_failure_attribution, ai_failure_modes, ai_learning_summary,"
         " user_messages, assistant_messages, tool_uses,"
         " input_tokens, output_tokens, outcome_badge, client_origin,"
-        " runtime_channel, start_time, review_status"
+        " runtime_channel, start_time, review_status, hold_state, embargo_until"
         " FROM sessions"
         f"{where_status}"
         f"{' AND' if where_status else ' WHERE'} session_id NOT IN ("
@@ -3431,7 +3431,7 @@ def get_share_ready_stats(
             "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
             "user_messages", "assistant_messages", "tool_uses", "input_tokens",
             "output_tokens", "outcome_badge", "client_origin", "runtime_channel",
-            "start_time", "review_status"]
+            "start_time", "review_status", "hold_state", "embargo_until"]
     sessions = [dict(zip(cols, r)) for r in rows]
     for session in sessions:
         for field in ("ai_recovery_labels", "ai_failure_modes"):
@@ -3440,6 +3440,22 @@ def get_share_ready_stats(
                     session[field] = json.loads(session[field])
                 except (json.JSONDecodeError, ValueError):
                     session[field] = []
+    # Only offer sessions that are actually shareable: drop explicit holds
+    # (`pending_review`, active `embargoed`) so the student cannot pick a
+    # session that the submit-time release gate would later reject. Auto-expired
+    # embargoes pass through via `effective_hold_state`. The two helper columns
+    # are consumed here and removed so the response shape is unchanged.
+    # NOTE: this runs before the recommendation pool and the projects/models
+    # sets are computed below, so all of those are derived from the shareable
+    # subset only (a project whose sessions are all held won't be offered).
+    shareable_sessions: list[dict[str, Any]] = []
+    for session in sessions:
+        effective = effective_hold_state(
+            session.pop("hold_state", None), session.pop("embargo_until", None)
+        )
+        if effective in SHAREABLE_HOLD_STATES:
+            shareable_sessions.append(session)
+    sessions = shareable_sessions
     if excluded_projects:
         sessions = [
             session for session in sessions

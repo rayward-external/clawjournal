@@ -158,6 +158,26 @@ Tell the user:
 - "Score sessions with `/clawjournal-score`"
 - "Everything stays 100% local until you explicitly choose to share"
 
+## Before sharing: source scope + project confirmation
+
+Sharing/exporting is gated until two one-time confirmations are set — this
+prevents accidentally contributing traces from a source or project the user
+didn't intend. Local review and scoring do **not** need these; only the first
+share does. The workbench Share flow and `clawjournal` export both block until
+both are in place:
+
+- **Source scope** — explicitly choose which agents' traces are in scope:
+  ```bash
+  ~/.clawjournal-venv/bin/clawjournal config --source <claude|codex|gemini|all>
+  ```
+- **Project confirmation** — confirm the projects whose traces may be shared:
+  ```bash
+  ~/.clawjournal-venv/bin/clawjournal config --confirm-projects
+  ```
+
+It's fine to defer this until the user is ready to contribute — if they try to
+share first, ClawJournal prints the exact command to run.
+
 ## Troubleshooting
 
 **clawjournal command not found after install:** Use `~/.clawjournal-venv/bin/clawjournal` directly, or add the venv bin directory to your shell PATH.

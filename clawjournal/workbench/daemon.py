@@ -638,6 +638,21 @@ def _hosted_api_base() -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _hosted_is_local_dev() -> bool:
+    """True when the hosted submission API points at a local/dev host.
+
+    Used to gate developer-only fields (e.g. ``dev_code``) so they are never
+    forwarded to the browser when talking to a production deployment, even if a
+    misconfigured server were to return them.
+    """
+    try:
+        parsed = urlparse(_hosted_api_base())
+    except RuntimeError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"} or parsed.scheme == "http"
+
+
 def _json_request(
     url: str,
     *,
@@ -790,7 +805,15 @@ def request_email_verification(email: str) -> dict:
     Returns the response dict from the server (contains status info).
     """
     normalized = _normalize_email(email)
-    capabilities = _fetch_hosted_share_capabilities()
+    try:
+        capabilities = _fetch_hosted_share_capabilities()
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError):
+        # The capabilities doc is only a best-effort source for the institution
+        # email policy. If it is momentarily unreachable, fall back to the
+        # built-in default suffixes rather than blocking the student from
+        # requesting a code; a genuine outage still surfaces on the verify-email
+        # POST below.
+        capabilities = None
     if not _email_domain_allowed(normalized, capabilities):
         raise ValueError("Enter a valid academic email address.")
 
@@ -808,6 +831,17 @@ def request_email_verification(email: str) -> dict:
     if not isinstance(verification_id, str) or not verification_id:
         raise ValueError("Verification service did not return a verification id.")
     config = load_config()
+    prior_verified = (config.get("verified_email") or "").strip().lower()
+    if prior_verified and prior_verified != normalized:
+        # Switching identities: drop the previously verified email's upload
+        # token so a later submit cannot upload under the old identity while
+        # the UI shows the new email being verified.
+        for key in (
+            "verified_email",
+            "verified_email_token",
+            "verified_email_token_expires_at",
+        ):
+            config.pop(key, None)
     config["pending_verification_id"] = verification_id
     config["pending_verification_email"] = normalized
     config["pending_verification_expires_at"] = result.get("expires_at")
@@ -1206,6 +1240,42 @@ def finalize_share_export_for_upload(
     return None, manifest
 
 
+def _redaction_settings_fingerprint(settings: dict[str, Any]) -> str:
+    """Stable hash of the redaction inputs that shape an exported bundle.
+
+    A finalized export is a point-in-time artifact, but it must only be reused
+    while these inputs are unchanged. Editing the allowlist, custom redaction
+    strings/usernames, excluded projects, or blocked domains must force a
+    rebuild so a later seal/submit/download can never ship content redacted
+    under stale settings. `ai_pii` is intentionally excluded — it is gated
+    separately by ``_manifest_is_finalized_for_upload``.
+
+    Order-independent: each list is normalized (handles str and dict entries)
+    and sorted, so config/policy ordering differences do not change the hash.
+
+    MAINTENANCE: these keys must stay in sync with the redaction-affecting
+    inputs produced by ``get_effective_share_settings`` (index.py). If a new
+    redaction input is added there, add it here too — otherwise a change to it
+    would not invalidate the cache and a stale-redacted bundle could be reused.
+    """
+
+    def _norm(values: Any) -> list[str]:
+        return sorted(
+            json.dumps(item, sort_keys=True, default=str) for item in (values or [])
+        )
+
+    payload = {
+        "custom_strings": _norm(settings.get("custom_strings")),
+        "extra_usernames": _norm(settings.get("extra_usernames")),
+        "excluded_projects": _norm(settings.get("excluded_projects")),
+        "blocked_domains": _norm(settings.get("blocked_domains")),
+        "allowlist_entries": _norm(settings.get("allowlist_entries")),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def _manifest_is_finalized_for_upload(
     manifest: dict[str, Any],
     *,
@@ -1234,6 +1304,7 @@ def _load_finalized_share_export(
     share_id: str,
     *,
     ai_pii: bool | None = None,
+    expected_fingerprint: str | None = None,
 ) -> tuple[Path, dict[str, Any]] | None:
     # Finalized exports are point-in-time artifacts: a later config change
     # creates a new share/seal operation rather than mutating this cached zip.
@@ -1257,6 +1328,15 @@ def _load_finalized_share_export(
         return None
     if not _manifest_is_finalized_for_upload(manifest, ai_pii=ai_pii):
         return None
+    if (
+        expected_fingerprint is not None
+        and manifest.get("redaction_settings_fingerprint") != expected_fingerprint
+    ):
+        # Redaction settings (allowlist / custom strings / excluded projects /
+        # blocked domains) changed since this export was sealed. Force a
+        # rebuild rather than reuse a stale-redacted artifact. Exports sealed
+        # before this field existed have no fingerprint and so also rebuild once.
+        return None
     return export_dir, manifest
 
 
@@ -1274,14 +1354,21 @@ def _prepare_share_export_for_upload(
         if ai_pii_review_enabled is None
         else ai_pii_review_enabled
     )
+    settings_fingerprint = _redaction_settings_fingerprint(settings)
     if reuse_finalized:
         # Pass the RAW override (not effective_ai_pii) on purpose: a finalized
         # export is a point-in-time artifact. With an explicit ai_pii override
         # the cache is only reused when its recorded ai_enabled matches; with no
         # override (None) we reuse whatever was sealed (history re-download),
         # rather than letting a later config-default flip rebuild the artifact.
+        # The fingerprint additionally forces a rebuild when the redaction
+        # settings changed since seal, so we never reuse stale-redacted bytes.
         # A cache miss still finalizes with effective_ai_pii below.
-        cached = _load_finalized_share_export(share_id, ai_pii=ai_pii_review_enabled)
+        cached = _load_finalized_share_export(
+            share_id,
+            ai_pii=ai_pii_review_enabled,
+            expected_fingerprint=settings_fingerprint,
+        )
         if cached is not None:
             export_dir, manifest = cached
             return export_dir, manifest, None
@@ -1298,6 +1385,12 @@ def _prepare_share_export_for_upload(
     )
     if export_dir is None:
         return None, manifest, {"error": "Failed to prepare upload zip", "status": 500}
+
+    # Stamp the redaction-settings fingerprint so a later reuse can detect when
+    # the allowlist / custom redactions changed and rebuild instead of shipping
+    # stale bytes. Set before finalize so it is persisted to manifest.json.
+    if isinstance(manifest, dict):
+        manifest["redaction_settings_fingerprint"] = settings_fingerprint
 
     error, manifest = finalize_share_export_for_upload(
         export_dir,
@@ -1652,12 +1745,33 @@ def submit_share_to_hosted(
         method="POST",
     )
 
+    ambiguous_timeout_error = {
+        "error": (
+            "Your bundle was uploaded but the server did not confirm before the "
+            "connection timed out. It may already have been received — check for a "
+            "confirmation email before retrying, since re-submitting could create a "
+            "duplicate."
+        ),
+        "ambiguous": True,
+        "status": 504,
+    }
     try:
         with urllib.request.urlopen(req, timeout=_SHARE_UPLOAD_TIMEOUT) as resp:
             hosted_result = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return _hosted_http_error_result(exc)
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except TimeoutError:
+        # The bundle bytes were already sent; a timeout means we never learned
+        # whether the server accepted it. Do NOT clear the token or mark the
+        # share shared, and warn against a blind retry that could duplicate a
+        # submission that actually landed.
+        return dict(ambiguous_timeout_error)
+    except (urllib.error.URLError, OSError) as exc:
+        # A URLError may wrap a timeout raised while writing the request body.
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            return dict(ambiguous_timeout_error)
+        # Connection refused / DNS failure: the request never reached the
+        # server, so an immediate retry is safe.
         return {"error": "Could not reach hosted submission service. Please try again.", "status": 502}
 
     receipt_id = hosted_result.get("receipt_id")
@@ -2646,7 +2760,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "email": _normalize_email(email),
             "expires_at": result.get("expires_at"),
         }
-        if result.get("dev_code"):
+        # `dev_code` is a local-development convenience only. Never forward it to
+        # the browser when pointed at a production hosted deployment, even if the
+        # server returns it.
+        if result.get("dev_code") and _hosted_is_local_dev():
             response["dev_code"] = result["dev_code"]
         _json_response(self, response)
 
@@ -2721,6 +2838,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         try:
             settings = get_effective_share_settings(conn, load_config())
             ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
+            # Fail fast on hold-state BEFORE creating the share row: quick-share
+            # leads straight to submit, so there is no point creating/packaging a
+            # share for sessions the release gate would later block — and a gate
+            # placed after create_share would orphan the draft share on rejection.
+            # submit_share_to_hosted re-checks this at upload time.
+            from .index import release_gate_blockers
+            blockers = release_gate_blockers(conn, session_ids)
+            if blockers:
+                _json_response(self, {
+                    "error": "Some selected sessions are on hold and cannot be shared.",
+                    "blockers": blockers,
+                }, 409)
+                return
             share_id = create_share(conn, session_ids, note=note)
             share = get_share(conn, share_id)
             if share is None:
@@ -3042,15 +3172,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_upload_share(self, share_id: str) -> None:
         """Submit a share to hosted research after consent."""
-        with _share_rate_lock:
-            now = time.time()
-            elapsed = now - WorkbenchHandler._last_share_time
-            if elapsed < _SHARE_COOLDOWN_SECONDS:
-                _json_response(self, {
-                    "error": f"Rate limited. Try again in {int(_SHARE_COOLDOWN_SECONDS - elapsed)}s.",
-                }, 429)
-                return
-
+        # Validate the request BEFORE the rate-limit gate so a malformed request
+        # (missing consent fields) doesn't consume the 10s cooldown — only a real
+        # submission attempt should start it.
         body = _read_body(self)
         force = _body_bool(body.get("force", False))
         ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
@@ -3070,6 +3194,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "missing": missing,
             }, 400)
             return
+
+        with _share_rate_lock:
+            now = time.time()
+            elapsed = now - WorkbenchHandler._last_share_time
+            if elapsed < _SHARE_COOLDOWN_SECONDS:
+                _json_response(self, {
+                    "error": f"Rate limited. Try again in {int(_SHARE_COOLDOWN_SECONDS - elapsed)}s.",
+                }, 429)
+                return
+            # Mark in-flight atomically (like _handle_quick_share) so a second
+            # tab / double-click cannot also pass this check and reach the
+            # hosted POST concurrently, and so a failed attempt still starts the
+            # cooldown instead of allowing an immediate retry loop.
+            WorkbenchHandler._last_share_time = now
 
         conn = open_index()
         try:

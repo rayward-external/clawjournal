@@ -1732,6 +1732,32 @@ class TestVerifyEmail:
         assert payload["status"] == "verification_sent"
         assert payload["next_command"] == "clawjournal verify-email test@university.edu --code <CODE>"
 
+    def test_verify_email_request_suppresses_dev_code_on_prod(self, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon._is_edu_email", lambda email: True)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.request_email_verification",
+            lambda email: {"status": "ok", "dev_code": "424242"},
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_is_local_dev", lambda: False)
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email", "test@university.edu"])
+        main()
+        payload = json.loads(capsys.readouterr().out)
+        assert "dev_code" not in payload
+
+    def test_verify_email_request_surfaces_dev_code_on_local(self, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon._is_edu_email", lambda email: True)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.request_email_verification",
+            lambda email: {"status": "ok", "dev_code": "424242"},
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_is_local_dev", lambda: True)
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email", "test@university.edu"])
+        main()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dev_code"] == "424242"
+
 
 class TestScore:
     def test_set_score_can_override_failure_value(self, monkeypatch, capsys):

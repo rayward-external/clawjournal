@@ -720,6 +720,27 @@ export function Share() {
     }
   }, [activeStep, packagedShareId, packageProgress, packagingFailed, shareDestination]);
 
+  // Reload/deep-link robustness: a page reload or bookmark can land directly on
+  // Submit. If hosted submission isn't available (disabled, closed, or the
+  // destination failed to load) and the share hasn't already been submitted,
+  // fall back to the download-only Done view instead of stranding the user on a
+  // Submit step they can't complete. Gated on `loading` so we wait for the
+  // initial destination fetch (a still-null destination after load means
+  // not-submittable). Mirrors the package→done branch above.
+  useEffect(() => {
+    if (activeStep !== 'submit' || receiptId || loading) return;
+    const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
+    if (!canSubmit) setActiveStep('done');
+  }, [activeStep, shareDestination, receiptId, loading]);
+
+  // A Submit deep-link with no packaged share has nothing to act on; send the
+  // user back to the start rather than rendering a dead-end Submit bound to a
+  // null share id. In the normal flow `packagedShareId` is always set before we
+  // advance to Submit, so this only fires on a stale/partial deep-link.
+  useEffect(() => {
+    if (activeStep === 'submit' && !packagedShareId) setActiveStep('queue');
+  }, [activeStep, packagedShareId]);
+
   // =================================================
   // Step 5: Done actions
   // =================================================

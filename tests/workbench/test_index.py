@@ -25,6 +25,7 @@ from clawjournal.workbench.index import (
     query_unscored_sessions,
     remove_policy,
     search_fts,
+    set_hold_state,
     update_session,
     upsert_sessions,
 )
@@ -811,6 +812,53 @@ class TestShares:
 
         assert [s["session_id"] for s in stats["sessions"]] == ["failure", "legacy"]
         assert stats["recommended_session_ids"] == ["failure"]
+
+    def test_share_ready_excludes_held_sessions(self, index_conn):
+        """The queue must offer only shareable sessions: explicit holds
+        (pending_review, active embargo) are dropped, but an auto-expired
+        embargo passes through (treated as released)."""
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        upsert_sessions(index_conn, [
+            _make_session(
+                sid,
+                start_time=now.isoformat(),
+                end_time=(now + timedelta(minutes=10)).isoformat(),
+            )
+            for sid in ("ok", "held", "emb-active", "emb-expired")
+        ])
+        for sid in ("ok", "held", "emb-active", "emb-expired"):
+            update_session(
+                index_conn, sid,
+                status="approved", ai_quality_score=5, ai_failure_value_score=5,
+            )
+        set_hold_state(index_conn, "held", "pending_review", changed_by="user", reason="test")
+        set_hold_state(
+            index_conn, "emb-active", "embargoed", changed_by="user", reason="test",
+            embargo_until=(now + timedelta(days=30)).isoformat(),
+        )
+        # An expired embargo can't be set via set_hold_state (it requires a
+        # future date), so write it directly to exercise the expiry path.
+        index_conn.execute(
+            "UPDATE sessions SET hold_state = 'embargoed', embargo_until = ? "
+            "WHERE session_id = ?",
+            ((now - timedelta(days=1)).isoformat(), "emb-expired"),
+        )
+        index_conn.commit()
+
+        stats = get_share_ready_stats(index_conn)
+        ids = {s["session_id"] for s in stats["sessions"]}
+        assert "held" not in ids          # explicit pending_review hold
+        assert "emb-active" not in ids     # active embargo
+        assert "ok" in ids                 # default auto_redacted is shareable
+        assert "emb-expired" in ids        # expired embargo treated as released
+        assert "held" not in stats["recommended_session_ids"]
+        assert "emb-active" not in stats["recommended_session_ids"]
+        # The internal hold-state columns must not leak into the response shape.
+        assert all(
+            "hold_state" not in s and "embargo_until" not in s
+            for s in stats["sessions"]
+        )
 
     def test_share_ready_fills_default_queue_with_lower_failure_value_scores(self, index_conn):
         from datetime import datetime, timedelta, timezone

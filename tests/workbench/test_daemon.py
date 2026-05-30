@@ -1427,6 +1427,41 @@ def _mock_trufflehog_clean(monkeypatch):
     monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
 
 
+def test_redaction_settings_fingerprint_covers_all_inputs():
+    """Every redaction-affecting input changes the fingerprint; ai_pii does not;
+    and list order within a field does not — guards against a typo dropping a
+    field from the hash or making it order-sensitive."""
+    from clawjournal.workbench.daemon import _redaction_settings_fingerprint
+
+    base = {
+        "custom_strings": ["a"],
+        "extra_usernames": ["u"],
+        "excluded_projects": ["/p"],
+        "blocked_domains": ["x.com"],
+        "allowlist_entries": [{"value": "v"}],
+    }
+    base_fp = _redaction_settings_fingerprint(base)
+
+    for key, changed in [
+        ("custom_strings", ["a", "b"]),
+        ("extra_usernames", ["u", "w"]),
+        ("excluded_projects", ["/p", "/q"]),
+        ("blocked_domains", ["x.com", "y.com"]),
+        ("allowlist_entries", [{"value": "v2"}]),
+    ]:
+        assert _redaction_settings_fingerprint({**base, key: changed}) != base_fp, \
+            f"changing {key} must invalidate the fingerprint"
+
+    # ai_pii is intentionally NOT part of the fingerprint (gated separately).
+    assert _redaction_settings_fingerprint({**base, "ai_pii_review_enabled": True}) == base_fp
+
+    # Order within a list field does not change the hash.
+    assert (
+        _redaction_settings_fingerprint({**base, "custom_strings": ["b", "a", "c"]})
+        == _redaction_settings_fingerprint({**base, "custom_strings": ["c", "a", "b"]})
+    )
+
+
 def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
     sessions_file = tmp_path / "sessions.jsonl"
     sessions = [
@@ -1634,6 +1669,113 @@ class TestVerifyEmailAPI:
         assert status == 429
         assert data["error"] == "Too many verification attempts"
 
+    def test_request_verification_falls_back_when_capabilities_unavailable(self, monkeypatch):
+        """A momentarily unreachable capabilities doc must not block requesting a
+        code: domain validation falls back to the built-in default suffixes and
+        the verify-email POST still proceeds."""
+        from clawjournal.workbench.daemon import request_email_verification
+
+        saved = {}
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
+
+        def mock_urlopen(req, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "/.well-known/clawjournal-share.json" in url:
+                raise urllib.error.URLError("capabilities down")
+            if "/api/verify-email" in url:
+                resp = MagicMock()
+                resp.read.return_value = json.dumps({
+                    "verification_id": "verify-123",
+                    "expires_at": "2026-01-01T00:00:00+00:00",
+                }).encode()
+                resp.__enter__ = lambda s: s
+                resp.__exit__ = MagicMock(return_value=False)
+                return resp
+            raise ValueError(f"Unexpected URL: {url}")
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = request_email_verification("test@university.edu")
+
+        assert result["verification_id"] == "verify-123"
+        assert saved["pending_verification_id"] == "verify-123"
+
+    def test_request_verification_still_rejects_bad_domain_when_capabilities_down(self, monkeypatch):
+        """The capabilities fallback must not weaken domain validation: a
+        non-academic address is still rejected using the default suffixes."""
+        from clawjournal.workbench.daemon import request_email_verification
+
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        def mock_urlopen(req, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "/.well-known/clawjournal-share.json" in url:
+                raise urllib.error.URLError("capabilities down")
+            raise AssertionError("verify-email POST should not be reached for a rejected domain")
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+            with pytest.raises(ValueError):
+                request_email_verification("someone@gmail.com")
+
+    def test_request_verification_clears_stale_token_on_email_switch(self, monkeypatch):
+        """Requesting a code for a different email must drop the previously
+        verified email's upload token, so a later submit cannot upload under
+        the old identity while the UI shows the new email."""
+        from clawjournal.workbench.daemon import request_email_verification
+
+        state = {
+            "verified_email": "old@university.edu",
+            "verified_email_token": "old-token",
+            "verified_email_token_expires_at": int(time.time()) + 3600,
+        }
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: dict(state))
+
+        def save_state(updated):
+            state.clear()
+            state.update(updated)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", save_state)
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            request_email_verification("new@university.edu")
+
+        assert "verified_email" not in state
+        assert "verified_email_token" not in state
+        assert "verified_email_token_expires_at" not in state
+        assert state["pending_verification_email"] == "new@university.edu"
+
+    def test_request_verification_keeps_token_when_same_email(self, monkeypatch):
+        """Re-verifying the SAME email keeps the existing token until the new
+        one is confirmed (a token refresh, not an identity switch)."""
+        from clawjournal.workbench.daemon import request_email_verification
+
+        state = {
+            "verified_email": "same@university.edu",
+            "verified_email_token": "keep-token",
+            "verified_email_token_expires_at": int(time.time()) + 3600,
+        }
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: dict(state))
+
+        def save_state(updated):
+            state.clear()
+            state.update(updated)
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", save_state)
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            request_email_verification("Same@University.edu")
+
+        assert state["verified_email_token"] == "keep-token"
+        assert state["pending_verification_email"] == "same@university.edu"
+
 
 class TestShareAPI:
     """Tests for the hosted research submission flow."""
@@ -1787,6 +1929,193 @@ class TestShareAPI:
         status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
         assert status == 429
         assert "Rate limited" in data["error"]
+
+    def test_share_upload_timeout_is_ambiguous_and_preserves_state(self, server, monkeypatch):
+        """A timeout after the bundle bytes were sent is ambiguous: the server
+        may have accepted it. Don't clear the token or mark the share shared,
+        and warn against a duplicate-causing blind retry."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        saved = {}
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: saved.update(updated))
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_error=TimeoutError("timed out")),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 504, data
+        assert data.get("ambiguous") is True
+        assert "duplicate" in data["error"].lower()
+        # Token not cleared (single-use; the submission may actually have landed).
+        assert saved == {}
+        conn = open_index()
+        row = conn.execute(
+            "SELECT status, hosted_receipt_id FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        conn.close()
+        assert row["status"] != "shared"
+        assert row["hosted_receipt_id"] is None
+
+    def test_share_upload_connection_refused_is_safe_retry(self, server, monkeypatch):
+        """A pre-send connection failure never reached the server, so it stays a
+        plain 502 'try again' without the ambiguous-duplicate warning."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_error=urllib.error.URLError("connection refused")),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 502, data
+        assert not data.get("ambiguous")
+        assert "try again" in data["error"].lower()
+
+    def test_share_upload_urlerror_wrapping_timeout_is_ambiguous(self, server, monkeypatch):
+        """A URLError whose reason is a timeout (a timeout raised while writing
+        the request body) is treated like a bare TimeoutError: ambiguous 504,
+        not a safe-retry 502 — exercises the wrapped-timeout branch."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_error=urllib.error.URLError(TimeoutError("timed out"))),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+
+        assert status == 504, data
+        assert data.get("ambiguous") is True
+        assert "duplicate" in data["error"].lower()
+
+    def test_failed_submit_still_starts_cooldown(self, server, monkeypatch):
+        """A failed submit marks in-flight, so an immediate retry is rate-limited
+        — previously the cooldown only advanced on success, leaving a retry-loop
+        / concurrent-submit window open."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_error=TimeoutError("timed out")),
+        ):
+            status, _ = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+        assert status == 504
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+        assert status == 429
+        assert "Rate limited" in data["error"]
+
+    def test_missing_consent_does_not_consume_cooldown(self, server, monkeypatch):
+        """A malformed upload (missing consent fields) is rejected 400 BEFORE the
+        rate-limit gate, so it must not start the cooldown — a corrected submit
+        immediately afterwards proceeds rather than getting a 429."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+
+        status, data = _post(server, f"/api/shares/{share_id}/upload", {})
+        assert status == 400
+        assert "missing" in data
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(),
+        ):
+            status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
+        assert status == 200, data
+        assert data["ok"] is True
+
+    def _verify_email_mock_with_dev_code(self, dev_code):
+        """A urlopen mock that returns ``dev_code`` from /api/verify-email."""
+        base = _mock_urlopen_factory()
+
+        def mock_urlopen(req, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "/api/verify-email" in url and "/confirm" not in url:
+                resp = MagicMock()
+                resp.read.return_value = json.dumps({
+                    "verification_id": "verify-123",
+                    "expires_at": "2026-01-01T00:00:00+00:00",
+                    "dev_code": dev_code,
+                }).encode()
+                resp.__enter__ = lambda s: s
+                resp.__exit__ = MagicMock(return_value=False)
+                return resp
+            return base(req, **kwargs)
+
+        return mock_urlopen
+
+    def test_verify_email_suppresses_dev_code_on_prod_url(self, server, monkeypatch):
+        """dev_code must never reach the browser against a production hosted URL,
+        even if the server returns it."""
+        # The class autouse fixture points _HOSTED_SHARE_URL at a prod-like https URL.
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: None)
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=self._verify_email_mock_with_dev_code("000000"),
+        ):
+            status, data = _post(server, "/api/share/verify-email", {"email": "test@university.edu"})
+
+        assert status == 200
+        assert "dev_code" not in data
+
+    def test_verify_email_surfaces_dev_code_on_local_url(self, server, monkeypatch):
+        """On a localhost (dev) hosted URL, dev_code is surfaced for convenience."""
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "http://localhost:8799/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda updated: None)
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=self._verify_email_mock_with_dev_code("424242"),
+        ):
+            status, data = _post(server, "/api/share/verify-email", {"email": "test@university.edu"})
+
+        assert status == 200
+        assert data.get("dev_code") == "424242"
+
+    def test_quick_share_blocks_held_session(self, server, monkeypatch):
+        """quick-share leads straight to submit, so it must fail fast (409) when
+        a selected session is on hold instead of packaging an unsubmittable
+        bundle."""
+        from clawjournal.workbench.index import open_index, set_hold_state, upsert_sessions
+
+        WorkbenchHandler._last_share_time = 0.0
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": "qs-held",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "held content", "tool_uses": []}],
+                "stats": {
+                    "user_messages": 1, "assistant_messages": 0,
+                    "tool_uses": 0, "input_tokens": 100, "output_tokens": 0,
+                },
+            }])
+            set_hold_state(conn, "qs-held", "pending_review", changed_by="user", reason="test")
+        finally:
+            conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        status, data = _post(server, "/api/quick-share", {"session_ids": ["qs-held"]})
+
+        assert status == 409, data
+        assert data["blockers"][0]["session_id"] == "qs-held"
+        assert data["blockers"][0]["hold_state"] == "pending_review"
 
     def test_share_duplicate_prevention(self, server, monkeypatch):
         """Already-submitted bundle → 409; force surfaces a clearer message."""
@@ -2563,6 +2892,95 @@ class TestShareAPI:
         assert data["redaction_summary"]["pii_review"]["ai_enabled"] is True
         assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
         assert calls == 1
+
+    def test_seal_rebuilds_when_redaction_settings_change(self, server, monkeypatch):
+        """Editing the redaction settings (custom strings / allowlist / etc.)
+        must invalidate the finalized-export cache so a later seal/submit/
+        download never ships content redacted under the stale settings."""
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "seal-settings-change",
+            "project": "test-project",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "Codename SHIPWRECK and Alice Example", "tool_uses": []},
+            ],
+            "stats": {
+                "user_messages": 1, "assistant_messages": 0,
+                "tool_uses": 0, "input_tokens": 100, "output_tokens": 0,
+            },
+        }])
+        conn.close()
+
+        calls = 0
+
+        def fake_review(session, **kw):
+            nonlocal calls
+            calls += 1
+            return ([{
+                "session_id": session["session_id"],
+                "message_index": 0,
+                "field": "content",
+                "entity_text": "Alice Example",
+                "entity_type": "person_name",
+                "confidence": 0.95,
+                "reason": "test name",
+                "replacement": "[REDACTED_NAME]",
+                "source": "test",
+            }], "full")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
+
+        cfg: dict = {}
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: dict(cfg))
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["seal-settings-change"],
+            "note": "settings change",
+        })
+        assert status == 201
+        share_id = data["share_id"]
+
+        # First seal: no custom redaction strings configured.
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
+        assert status == 200
+        assert calls == 1
+
+        # Re-seal with identical settings reuses the cache (no rebuild).
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
+        assert status == 200
+        assert calls == 1
+
+        # Prove the cached export is genuinely stale once the setting changes:
+        # before adding the custom string, the downloaded zip still contains the
+        # raw 'SHIPWRECK' (it isn't a redaction target yet), and the download
+        # reuses the cache (no rebuild). This makes the rebuild assertion below
+        # a real content change, not just a call-count artifact.
+        status, _ct, before = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        with zipfile.ZipFile(BytesIO(before)) as archive:
+            before_content = archive.read("sessions.jsonl").decode("utf-8")
+        assert "SHIPWRECK" in before_content
+        assert calls == 1
+
+        # Add a custom redaction string → settings fingerprint changes.
+        cfg["redact_strings"] = ["SHIPWRECK"]
+
+        status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
+        assert status == 200
+        # Cache invalidated by the settings change → the export was rebuilt.
+        assert calls == 2
+
+        # The newly added custom string is now redacted in the downloaded zip.
+        status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
+        assert status == 200
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            sessions_content = archive.read("sessions.jsonl").decode("utf-8")
+        assert "SHIPWRECK" not in sessions_content
+        assert "[REDACTED_NAME]" in sessions_content
+        # The download reused the freshly rebuilt artifact (no extra AI pass).
+        assert calls == 2
 
     def test_seal_with_no_override_uses_config_default(self, server, monkeypatch):
         """When the request omits ai_pii, the persisted config default
