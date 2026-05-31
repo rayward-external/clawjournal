@@ -129,6 +129,13 @@ class TestExport:
     def test_export_not_found_404(self, api):
         assert _post(api, "/api/benchmarks/nope/export", {"kind": "authoring_md"})[0] == 404
 
+    def test_export_non_ready_409(self, api):
+        conn = open_index()
+        bid = store.insert_generating(conn, window_start="2026-05-24T00:00:00+00:00",
+                                      window_end="2026-05-31T00:00:00+00:00")
+        conn.close()
+        assert _post(api, f"/api/benchmarks/{bid}/export", {"kind": "authoring_md"})[0] == 409
+
 
 class TestGenerate:
     def _seed_failure(self):

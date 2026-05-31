@@ -58,6 +58,7 @@ def _generate(args) -> None:
                 window_days=args.window,
                 cap=args.cap,
                 backend=args.backend,
+                model=getattr(args, "model", None),
                 progress=lambda msg: print(f"… {msg}", file=sys.stderr),
             )
         except (ValueError, RuntimeError) as exc:
@@ -119,6 +120,8 @@ def _export(args) -> None:
         got = _resolve(conn, args.export)
         if got is None:
             _fail("benchmark not found", id=args.export)
+        if got.get("status") != "ready":
+            _fail(f"benchmark is {got.get('status')!r}, not ready to export", id=got.get("benchmark_id"))
         content = render.render(got, kind)
         # Best-effort local PII scan as a recorded receipt (full deterministic
         # export redaction lands in the privacy-guard phase).

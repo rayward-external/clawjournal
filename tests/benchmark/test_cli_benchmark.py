@@ -111,6 +111,12 @@ class TestExport:
         with pytest.raises(SystemExit):
             cli_benchmark.run_benchmark(_args(export="nope"))
 
+    def test_non_ready_exits(self, index_conn):
+        store.insert_generating(index_conn, window_start="2026-05-24T00:00:00+00:00",
+                                window_end="2026-05-31T00:00:00+00:00")
+        with pytest.raises(SystemExit):
+            cli_benchmark.run_benchmark(_args(export="2026-W22"))
+
 
 class TestArgparseWiring:
     def test_main_routes_benchmark_list(self, index_conn, monkeypatch, capsys):

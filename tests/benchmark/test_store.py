@@ -152,6 +152,20 @@ class TestExportsAndCascade:
             index_conn.commit()
 
 
+class TestReconcile:
+    def test_reconcile_stale_generating(self, index_conn):
+        bid = store.insert_generating(
+            index_conn, window_start="2026-05-24T00:00:00+00:00",
+            window_end="2026-05-31T00:00:00+00:00")
+        # a ready run must be untouched
+        ready = store.save_benchmark(index_conn, _benchmark())
+        n = store.reconcile_stale_generating(index_conn)
+        assert n == 1
+        failed = store.get_benchmark(index_conn, bid)
+        assert failed["status"] == "failed" and "interrupted" in failed["error"]
+        assert store.get_benchmark(index_conn, ready)["status"] == "ready"
+
+
 class TestTieBreak:
     def test_latest_and_trend_deterministic_on_tied_generated_at(self, index_conn):
         # three same-week regenerations share generated_at; rowid breaks the tie

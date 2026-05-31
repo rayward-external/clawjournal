@@ -567,6 +567,12 @@ def _run_benchmark_generation(benchmark_id: str, week_slice) -> None:
             store.finalize_benchmark(conn, benchmark_id, benchmark)
         except Exception as exc:
             logger.warning("benchmark generation failed for %s: %s", benchmark_id, exc)
+            # Discard any partial writes from a half-applied finalize before the
+            # failed-status commit, so we don't persist orphan/inconsistent rows.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             store.update_status(conn, benchmark_id, status="failed", error=str(exc))
     finally:
         conn.close()
@@ -2574,8 +2580,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     conn, window_start=sl.window_start, window_end=sl.window_end)
             finally:
                 conn.close()
-            threading.Thread(
-                target=_run_benchmark_generation, args=(bid, sl), daemon=True).start()
+            try:
+                threading.Thread(
+                    target=_run_benchmark_generation, args=(bid, sl), daemon=True).start()
+            except Exception as exc:
+                # Thread didn't start, so the worker won't run (and won't release
+                # the lock or finalize the row) — mark it failed here and bail.
+                conn2 = open_index()
+                try:
+                    store.update_status(conn2, bid, status="failed",
+                                        error=f"failed to start worker: {exc}")
+                finally:
+                    conn2.close()
+                _json_response(self, {"error": "could not start generation"}, 500)
+                return
             released = True  # the worker owns the lock now
             _json_response(self, {"status": "generating", "benchmark_id": bid}, 202)
         finally:
@@ -2598,6 +2616,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             got = store.get_benchmark(conn, benchmark_id)
             if got is None:
                 _json_response(self, {"error": "benchmark not found"}, 404)
+                return
+            if got.get("status") != "ready":
+                _json_response(self, {"error": f"benchmark is {got.get('status')!r}, not ready to export"}, 409)
                 return
             content = render.render(got, kind)
             pii_hits = len(bm.find_pii(content))
@@ -3759,6 +3780,20 @@ def run_server(
         logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
 
     threading.Thread(target=_initial_scan, daemon=True).start()
+
+    # Reconcile benchmark rows orphaned in 'generating' by a previous crash/restart
+    # (the only normal exit from 'generating' is the in-process worker).
+    try:
+        from ..benchmark import store as _bstore
+        _bconn = open_index()
+        try:
+            n = _bstore.reconcile_stale_generating(_bconn)
+            if n:
+                logger.info("Reconciled %d stale 'generating' benchmark row(s) -> failed", n)
+        finally:
+            _bconn.close()
+    except Exception:
+        logger.warning("benchmark stale-row reconcile skipped", exc_info=True)
 
     try:
         server.serve_forever()

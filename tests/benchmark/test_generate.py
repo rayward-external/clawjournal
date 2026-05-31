@@ -8,6 +8,7 @@ import pytest
 
 from clawjournal.benchmark import schema as bm
 from clawjournal.benchmark.generate import (
+    AgentBackendCaller,
     _blob_extract,
     _extract_json_object,
     _read_agent_output,
@@ -290,3 +291,31 @@ class TestBlobExtract:
         out = _blob_extract(str(p), NO_ANON, max_chars=1000)
         assert "MSG0000" in out and "MSG0079" in out and "…" in out
         assert len(out) <= 1010
+
+
+class TestDefaultModel:
+    def test_claude_defaults_to_sonnet(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.benchmark.generate.resolve_backend", lambda b: "claude")
+        assert AgentBackendCaller(backend="auto").model == "sonnet"
+
+    def test_codex_keeps_cli_default(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.benchmark.generate.resolve_backend", lambda b: "codex")
+        assert AgentBackendCaller(backend="auto").model is None
+
+    def test_explicit_model_overrides_default(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.benchmark.generate.resolve_backend", lambda b: "claude")
+        assert AgentBackendCaller(backend="auto", model="opus").model == "opus"
+
+
+class TestProgressMessages:
+    def test_incremental_human_messages(self, index_conn):
+        for sid in ("s1", "s2", "s3"):
+            _ins(index_conn, sid)
+        msgs: list[str] = []
+        generate_benchmark(index_conn, caller=FakeCaller(), anonymizer=NO_ANON, now=NOW,
+                           max_workers=2, progress=msgs.append)
+        blob = " | ".join(msgs)
+        assert "Reading your recent failures (" in blob   # incremental count
+        assert "Grouping failures into themes" in blob
+        assert "Writing & reviewing benchmark tasks (" in blob
+        assert "Finalizing" in blob and "Done —" in blob

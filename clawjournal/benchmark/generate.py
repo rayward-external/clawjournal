@@ -41,7 +41,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_WORKERS = 4
 BLOB_EXTRACT_MAX_CHARS = 8000
-STAGES = ("deepread", "architect", "design", "critique")
+
+# Generation makes ~40+ calls; default each backend to a fast, inexpensive model
+# (still through the CLI/subscription — no raw API). Only claude exposes a stable
+# alias; codex model slugs vary, so leave it at the CLI default (override with
+# `--model`). `None` means "the CLI's default model".
+_DEFAULT_GEN_MODEL: dict[str, str] = {"claude": "sonnet"}
 
 ProgressFn = Callable[[str], None]
 
@@ -139,6 +144,9 @@ class AgentBackendCaller:
 
     def __post_init__(self) -> None:
         self.resolved = resolve_backend(self.backend)
+        # Fall back to the per-backend fast default unless the caller named a model.
+        if self.model is None:
+            self.model = _DEFAULT_GEN_MODEL.get(self.resolved)
 
     def __call__(self, *, stage: str, system_prompt: str, task_prompt: str) -> dict[str, Any]:
         import tempfile
@@ -303,12 +311,27 @@ def _map(fn: Callable[[Any], Any], items: list[Any], max_workers: int) -> list[A
         return list(pool.map(fn, items))
 
 
+def _map_progress(fn, items, max_workers, *, label, note):
+    """Like :func:`_map` but emits ``label (k/total)`` from the MAIN thread after
+    each parallel chunk — so the UI bar advances smoothly and no DB write ever
+    happens off the worker thread (the per-item fns run in the pool; progress does
+    not)."""
+    total = len(items)
+    step = max(1, max_workers)
+    out: list[Any] = []
+    for i in range(0, total, step):
+        out.extend(_map(fn, items[i:i + step], max_workers))
+        note(f"{label} ({min(i + step, total)}/{total})")
+    return out
+
+
 def generate_benchmark(
     conn,
     *,
     window_days: int = DEFAULT_WINDOW_DAYS,
     cap: int = DEFAULT_DEEPREAD_CAP,
     backend: str = "auto",
+    model: str | None = None,
     caller: BackendCaller | None = None,
     anonymizer: Anonymizer | None = None,
     now: datetime | None = None,
@@ -322,7 +345,7 @@ def generate_benchmark(
     agent; tests pass a fake. ``week_slice`` lets a caller pass a pre-selected
     slice (else :func:`select_week_failures` is run).
     """
-    call = caller or AgentBackendCaller(backend=backend)
+    call = caller or AgentBackendCaller(backend=backend, model=model)
     anon = anonymizer if anonymizer is not None else Anonymizer(enabled=True)
     resolved = getattr(call, "resolved", None) or resolve_backend(backend)
 
@@ -336,7 +359,7 @@ def generate_benchmark(
         raise ValueError("no failure-signal sessions in the selected window")
 
     # 1. Deep-read (bounded parallel) -> seeds.
-    note(f"deep-reading {len(sl.candidates)} sessions")
+    note(f"Reading your recent failures (0/{len(sl.candidates)})")
     extracts = {c.session_id: _blob_extract(c.blob_path, anon) for c in sl.candidates}
 
     def _deepread(c: FailureCandidate) -> dict[str, Any] | None:
@@ -350,12 +373,13 @@ def generate_benchmark(
         seed["source"] = c.source
         return seed
 
-    seeds = [s for s in _map(_deepread, list(sl.candidates), max_workers) if s]
+    seeds = [s for s in _map_progress(_deepread, list(sl.candidates), max_workers,
+                                      label="Reading your recent failures", note=note) if s]
     if not seeds:
         raise ValueError("deep-read produced no seeds")
 
     # 2. Architect / cluster (single call) -> themes + stubs.
-    note("clustering into themes")
+    note("Grouping failures into themes…")
     try:
         arch = call(stage="architect", system_prompt=_SYSTEM, task_prompt=_architect_prompt(seeds))
     except Exception as exc:  # distinct from the empty-week control-flow ValueErrors
@@ -376,7 +400,7 @@ def generate_benchmark(
         raise ValueError("architect produced no task stubs")
 
     # 3 + 4. Design then critique each stub (bounded parallel, per-item chain).
-    note(f"designing + critiquing {len(stubs)} tasks")
+    note(f"Writing & reviewing benchmark tasks (0/{len(stubs)})")
 
     def _build(stub: dict[str, Any]) -> bm.BenchmarkTask | None:
         sid = stub.get("id") or "S?"
@@ -430,10 +454,12 @@ def generate_benchmark(
             return None
         return task
 
-    tasks = [t for t in _map(_build, stubs, max_workers) if t]
+    tasks = [t for t in _map_progress(_build, stubs, max_workers,
+                                      label="Writing & reviewing benchmark tasks", note=note) if t]
     if not tasks:
         raise ValueError("no tasks survived design/critique/validation")
 
+    note("Finalizing…")
     benchmark = bm.Benchmark(
         window_start=sl.window_start,
         window_end=sl.window_end,
@@ -446,5 +472,5 @@ def generate_benchmark(
         tasks=tasks,
     )
     bm.validate_or_raise(benchmark)
-    note(f"done: {len(tasks)} tasks, {len(themes)} themes")
+    note(f"Done — {len(tasks)} tasks across {len(themes)} themes")
     return benchmark

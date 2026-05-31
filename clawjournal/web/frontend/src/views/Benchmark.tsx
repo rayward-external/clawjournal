@@ -67,13 +67,17 @@ function Chip({ children, fg, bg }: { children: React.ReactNode; fg: string; bg:
 /*  Generation progress — slow run, keep it visibly alive             */
 /* ------------------------------------------------------------------ */
 
+// Maps the backend's human stage prose (clawjournal/benchmark/generate.py note()
+// calls) to a percent, parsing "(k/total)" for smooth within-stage movement.
 function stagePercent(stage: string): number {
   const s = (stage || '').toLowerCase();
-  if (s.includes('done')) return 100;
-  if (s.includes('design') || s.includes('critiqu')) return 80;
-  if (s.includes('cluster')) return 52;
-  if (s.includes('deep-read')) return 28;
-  return 10;
+  const m = s.match(/\((\d+)\s*\/\s*(\d+)\)/);
+  const frac = m && Number(m[2]) > 0 ? Number(m[1]) / Number(m[2]) : 0;
+  if (s.includes('finaliz') || s.includes('done')) return 100;
+  if (s.includes('writing') || s.includes('review') || s.includes('design') || s.includes('critiqu')) return 55 + frac * 35; // 55→90
+  if (s.includes('group') || s.includes('cluster')) return 50;
+  if (s.includes('reading') || s.includes('deep-read')) return 10 + frac * 35; // 10→45
+  return 8;
 }
 
 function GeneratingBanner({ stage, elapsedMs }: { stage: string; elapsedMs: number }) {
@@ -338,17 +342,21 @@ export function Benchmark() {
       if (!res.benchmark_id) { toast(res.error || 'Could not start generation', 'error'); return; }
       setGenStart(Date.now());
       setGenerating({ id: res.benchmark_id, stage: 'starting…' });
+      let fails = 0;
+      const stop = () => { if (pollRef.current) window.clearInterval(pollRef.current); setGenerating(null); setGenStart(null); };
       pollRef.current = window.setInterval(async () => {
         try {
           const st = await api.benchmarks.status(res.benchmark_id!);
+          fails = 0;
           if (st.status === 'generating') { setGenerating({ id: res.benchmark_id!, stage: st.stage || 'working…' }); return; }
-          if (pollRef.current) window.clearInterval(pollRef.current);
-          setGenerating(null);
-          setGenStart(null);
+          stop();
           if (st.status === 'failed') toast(`Generation failed: ${st.error || 'unknown'}`, 'error');
           else toast('Benchmark ready', 'success');
           load();
-        } catch { /* keep polling */ }
+        } catch {
+          // Tolerate transient blips, but don't spin forever on a persistent error.
+          if (++fails >= 5) { stop(); toast('Lost contact with the generation — check the workbench daemon.', 'error'); }
+        }
       }, 2000);
     } catch (e) {
       const msg = e instanceof ApiError ? (e.status === 409 ? 'A generation is already running' : e.message) : 'Could not start generation';
@@ -393,7 +401,9 @@ export function Benchmark() {
   const themes = current.themes || [];
   const tasks = current.tasks || [];
   const shown = themeFilter ? tasks.filter(t => t.theme === themeFilter) : tasks;
-  const active = tasks.find(t => t.id === selectedTask) || shown[0] || null;
+  // Resolve against the FILTERED list so the detail pane never shows a task the
+  // left rail isn't displaying (theme filter would otherwise desync the panes).
+  const active = shown.find(t => t.id === selectedTask) || shown[0] || null;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -470,7 +480,7 @@ export function Benchmark() {
             </div>
             {/* right pane: task detail */}
             <div style={{ flex: 1, overflow: 'auto', ...cardStyle }}>
-              {active ? <TaskDetail task={active} /> : <div style={{ padding: 24, color: colors.gray400 }}>No tasks.</div>}
+              {active ? <TaskDetail key={active.id} task={active} /> : <div style={{ padding: 24, color: colors.gray400 }}>No tasks.</div>}
             </div>
           </div>
         )}
@@ -521,6 +531,8 @@ function Header(props: {
   exportOpen?: boolean; setExportOpen?: (v: boolean) => void; onExport?: (k: string) => void;
 }) {
   const { current, stale, list, generating, onRegenerate, onSelectWeek, exportOpen, setExportOpen, onExport } = props;
+  // Only offer ready runs — a generating/failed row would load as a blank benchmark.
+  const readyRuns = (list || []).filter(b => b.status === 'ready');
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
       <div>
@@ -533,9 +545,9 @@ function Header(props: {
       </div>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         {stale && <Chip fg={colors.yellow700} bg={colors.yellow50}>{'>'}7 days old</Chip>}
-        {list && list.length > 1 && onSelectWeek && (
+        {readyRuns.length > 1 && onSelectWeek && (
           <select value={current?.benchmark_id} onChange={e => onSelectWeek(e.target.value)} style={selectStyle}>
-            {list.map(b => <option key={b.benchmark_id} value={b.benchmark_id}>{b.benchmark_id} ({shortDate(b.window_end)})</option>)}
+            {readyRuns.map(b => <option key={b.benchmark_id} value={b.benchmark_id}>{b.benchmark_id} ({shortDate(b.window_end)})</option>)}
           </select>
         )}
         <button style={generating ? { ...btnPrimary, opacity: 0.7, cursor: 'default' } : btnPrimary} onClick={onRegenerate} disabled={!!generating}>

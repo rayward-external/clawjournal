@@ -3990,6 +3990,7 @@ def main() -> None:
     bench_p.add_argument("--window", type=int, default=7, help="Coverage window in days (default 7)")
     bench_p.add_argument("--cap", type=int, default=15, help="Max sessions to deep-read (cost bound)")
     bench_p.add_argument("--backend", default="auto", help="Scoring backend (auto|claude|codex|...)")
+    bench_p.add_argument("--model", help="Model override for generation (default: a fast model per backend — sonnet for Claude)")
     bench_p.add_argument("--list", action="store_true", help="List stored benchmarks")
     bench_p.add_argument("--show", metavar="ID", help="Render a stored benchmark as markdown (ID or 'latest')")
     bench_p.add_argument("--export", metavar="ID", help="Export a benchmark to a local file (ID or 'latest')")

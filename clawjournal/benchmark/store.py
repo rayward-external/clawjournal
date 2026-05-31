@@ -259,6 +259,23 @@ def delete_benchmark(conn: sqlite3.Connection, benchmark_id: str) -> None:
     conn.commit()
 
 
+def reconcile_stale_generating(conn: sqlite3.Connection) -> int:
+    """Mark any rows stuck in ``generating`` as ``failed``.
+
+    The only normal transition out of ``generating`` is the in-process worker, so
+    a daemon kill/crash/restart mid-flight would otherwise orphan the row forever.
+    Run once at daemon startup (single-concurrency + a fresh lock make it
+    race-free). Returns the number of rows reconciled.
+    """
+    cur = conn.execute(
+        "UPDATE benchmarks SET status = 'failed', stage = NULL, "
+        "error = 'interrupted (daemon restarted during generation)' "
+        "WHERE status = 'generating'"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
