@@ -25,3 +25,8 @@ node_modules/
 
 # PII review artifacts
 *.pii_findings.json
+
+# Generated dashboards/screenshots — contain real session data, never commit
+*_dashboard.html
+/search-page*.png
+/share-page*.png

@@ -37,6 +37,19 @@ Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent 
 
 Your first scan may take a minute or two if you have lots of past sessions, and the workbench may show an empty list briefly while it indexes — that's normal. The page refreshes automatically as conversations are added.
 
+### Tour the workbench
+
+The workbench has five tabs. Two of them do the real work:
+
+- **Sessions** — *where you review.* Each trace shows a summary; click **Approve** to keep it or **Block** to discard it. New traces land here after every scan.
+- **Share** — *where you build a bundle to export.* A separate workflow from Sessions.
+
+The other three are read-only views: **Dashboard** (overview of what's been scanned), **Insights** (patterns across your traces), and **Search** (find a trace by keyword).
+
+**Going from review to share:** review in **Sessions**, then open the **Share** tab. Share doesn't auto-pull everything you approved — it starts with a short list of recommended traces, and if nothing's queued it lets you pick what to add right there (a search picker, or a few suggested traces). So even on a brand-new install with nothing approved, you're never stuck: open **Share** and pick what to include.
+
+**"Do I need more setup?"** No. Once install finishes and your first scan fills the **Sessions** tab, you're ready — there's no extra account, key, or service to configure. Reviewing in **Sessions** and packaging in **Share** are the only two steps left.
+
 ---
 
 <details>
@@ -323,11 +336,18 @@ By default scoring uses the current agent's automation CLI (e.g. `codex exec` in
 
 ### 6. Package & Share
 
-Package the conversations you approved into a redacted file on your computer. Uploading anywhere is a separate, opt-in step — by default the file just sits on your disk.
+Package a set of traces into a redacted file on your computer. Uploading anywhere is a separate, opt-in step — by default the file just sits on your disk.
 
-**Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
+This happens on the **Share** tab, which has its own five-step flow: **Queue → Redact → Review → Package → Done**.
 
-The agent walks you through the Share page in the browser workbench: **Queue → Redact → Review → Package → Done**. The Redact step uses AI to catch any personal info the automatic scan missed. Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.
+**Step 1 (Queue) is where new users most often get stuck, so here's how it works:**
+
+- If you have high-scoring approved traces, the queue **fills itself** with the ones the workbench recommends — start right away.
+- If the queue is **empty** — normal on a fresh install, even right after you approve a few traces — Share lets you pick what to add right there: a search picker (by project, source, date, or score), or a short list of suggested traces. Add *any* trace, approved or not. Approving in **Sessions** just gives the queue a head start; it's never required to share.
+
+From there the agent walks you through the rest: **Redact** uses AI to catch any personal info the automatic scan missed, **Review** lets you eyeball each redacted trace, and **Package** writes the file. (Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.)
+
+**Just say to your AI:** *"Open the ClawJournal Share page and help me build a bundle to export. If the queue is empty, pick the sessions to include."*
 
 To actually upload after packaging (optional), use the hosted Rayward submission page. The Done screen shows **Submit to ClawJournal Research** by default; that page verifies email, shows consent, and asks for the downloaded zip. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables the hosted button.
 

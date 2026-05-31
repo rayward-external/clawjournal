@@ -727,6 +727,17 @@ export function Share() {
 
   const removeFromQueue = (id: string) => {
     setQueueOrder((prev) => prev.filter((x) => x !== id));
+    // Removing the last trace returns to the empty-queue picker, which renders
+    // with the current filters. Clear them so it doesn't open on a stale
+    // "No sessions match your filters" state.
+    if (queueOrder.filter((x) => x !== id).length === 0) {
+      setShowAddTraces(false);
+      setSearchQuery('');
+      setSourceFilter('');
+      setProjectFilter('');
+      setScoreFilter(0);
+      setDateFilter('');
+    }
   };
 
   const addToQueue = (id: string) => {
@@ -758,6 +769,14 @@ export function Share() {
     setPackageProgress(0);
     setPackageLog('');
     setPackagingFailed(null);
+    // Reset the add-traces picker too, so a fresh share doesn't reopen with a
+    // stale toggle/filter state (e.g. "No sessions match your filters").
+    setShowAddTraces(false);
+    setSearchQuery('');
+    setSourceFilter('');
+    setProjectFilter('');
+    setScoreFilter(0);
+    setDateFilter('');
     setActiveStep('queue');
   }, []);
 
@@ -1351,6 +1370,95 @@ function QueueStep(p: QueueStepProps) {
 
   const historyShares = p.shares.filter(b => b.status === 'shared' || b.status === 'exported');
 
+  // Shared add-traces picker. Rendered both from the empty-queue state (so the
+  // first trace can be added) and from the populated bundle view. Keeping it in
+  // one place ensures the "Add traces" button works regardless of queue state.
+  const renderAddTracesPicker = () => (
+    <div style={{
+      marginTop: 10, padding: 12,
+      background: colors.gray50, border: `1px solid ${colors.gray200}`, borderRadius: 8,
+    }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
+        <input
+          type="text"
+          value={p.searchQuery}
+          onChange={e => p.setSearchQuery(e.target.value)}
+          placeholder="Search by title or project..."
+          aria-label="Search traces by title or project"
+          style={{
+            flex: 1, minWidth: 200, padding: '6px 10px', fontSize: 13,
+            border: `1px solid ${colors.gray300}`, borderRadius: 6,
+            outline: 'none', background: colors.white,
+          }}
+        />
+        {sources.length > 1 && (
+          <select value={p.sourceFilter} onChange={e => p.setSourceFilter(e.target.value)} aria-label="Filter by source"
+            style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
+            <option value="">All sources</option>
+            {sources.map(src => <option key={src} value={src}>{src}</option>)}
+          </select>
+        )}
+        {projects.length > 1 && (
+          <select value={p.projectFilter} onChange={e => p.setProjectFilter(e.target.value)} aria-label="Filter by project"
+            style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white, maxWidth: 180 }}>
+            <option value="">All projects</option>
+            {projects.map(pr => <option key={pr} value={pr}>{pr}</option>)}
+          </select>
+        )}
+        <select value={p.scoreFilter} onChange={e => p.setScoreFilter(Number(e.target.value))} aria-label="Filter by failure value"
+          style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
+          <option value={0}>Any failure value</option>
+          <option value={3}>3+ failure value</option>
+          <option value={4}>4+ failure value</option>
+          <option value={5}>5 failure value</option>
+        </select>
+        <select value={p.dateFilter} onChange={e => p.setDateFilter(e.target.value)} aria-label="Filter by date"
+          style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
+          <option value="">Any date</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+          <option value="90d">Last 90 days</option>
+        </select>
+      </div>
+      <div style={{ maxHeight: '36vh', overflowY: 'auto', border: `1px solid ${colors.gray200}`, borderRadius: 6, background: colors.white }}>
+        {available.length === 0 ? (
+          <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
+            {allSessions.length === p.queuedSessions.length ? 'All available traces are already in the queue.' : 'No sessions match your filters.'}
+          </div>
+        ) : available.map((s, i) => (
+          <div key={s.session_id} style={{
+            display: 'grid', gridTemplateColumns: '1fr auto', gap: 10,
+            alignItems: 'center', padding: '8px 12px',
+            borderBottom: i < available.length - 1 ? `1px solid ${colors.gray100}` : 'none',
+          }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{
+                fontSize: 13, color: colors.gray900, fontWeight: 500,
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+              }}>
+                {s.display_title || 'Untitled'}
+              </div>
+              <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <SourceBadge s={s} />
+                <span>{s.project}</span>
+                <span style={{ opacity: 0.5 }}>&middot;</span>
+                <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
+                {s.review_status && s.review_status !== 'approved' && (<>
+                  <span style={{ opacity: 0.5 }}>&middot;</span>
+                  <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
+                </>)}
+              </div>
+            </div>
+            <button onClick={() => p.onAdd(s.session_id)} style={btnSecondary}>
+              <Icon name="plus" size={12} />
+              Add
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
   return (
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
@@ -1419,29 +1527,18 @@ function QueueStep(p: QueueStepProps) {
               </div>
             </>
           ) : (
-            <div style={{
-              minHeight: 280, padding: '48px 28px', textAlign: 'center',
-              background: colors.gray50, border: `1px dashed ${colors.gray300}`,
-              borderRadius: 12, color: colors.gray500,
-              display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center',
-            }}>
-              <div style={{
-                width: 52, height: 52, borderRadius: 12, background: colors.white,
-                display: 'grid', placeItems: 'center', margin: '0 auto 16px',
-                color: colors.gray400, border: `1px solid ${colors.gray200}`,
-              }}>
-                <Icon name="inbox" size={24} />
+            // Empty queue, but shareable sessions exist: don't make the user infer
+            // the next action. Show the picker directly instead of a dead-end card.
+            <div>
+              <div style={{ marginBottom: 10 }}>
+                <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 600, color: colors.gray900 }}>
+                  Build your bundle
+                </h3>
+                <p style={{ margin: 0, fontSize: 13, color: colors.gray500, maxWidth: '60ch' }}>
+                  Nothing is preselected. Pick the traces you want to share below &mdash; approved or not. You&rsquo;ll redact and review each one in the next steps.
+                </p>
               </div>
-              <h3 style={{ color: colors.gray900, fontWeight: 500, margin: '0 0 6px', fontSize: 16 }}>
-                Your queue is empty
-              </h3>
-              <p style={{ margin: '0 auto 18px', maxWidth: '40ch', fontSize: 13 }}>
-                Add traces to build a bundle. The recommended set is based on your recent work.
-              </p>
-              <button onClick={() => p.setShowAddTraces(true)} style={btnPrimary}>
-                <Icon name="plus" size={13} />
-                Add traces
-              </button>
+              {renderAddTracesPicker()}
             </div>
           )}
         </>
@@ -1590,90 +1687,7 @@ function QueueStep(p: QueueStepProps) {
               )}
             </button>
 
-            {p.showAddTraces && (
-              <div style={{
-                marginTop: 10, padding: 12,
-                background: colors.gray50, border: `1px solid ${colors.gray200}`, borderRadius: 8,
-              }}>
-                <div style={{ display: 'flex', gap: 8, marginBottom: 10, flexWrap: 'wrap' }}>
-                  <input
-                    type="text"
-                    value={p.searchQuery}
-                    onChange={e => p.setSearchQuery(e.target.value)}
-                    placeholder="Search by title or project..."
-                    style={{
-                      flex: 1, minWidth: 200, padding: '6px 10px', fontSize: 13,
-                      border: `1px solid ${colors.gray300}`, borderRadius: 6,
-                      outline: 'none', background: colors.white,
-                    }}
-                  />
-                  {sources.length > 1 && (
-                    <select value={p.sourceFilter} onChange={e => p.setSourceFilter(e.target.value)}
-                      style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
-                      <option value="">All sources</option>
-                      {sources.map(src => <option key={src} value={src}>{src}</option>)}
-                    </select>
-                  )}
-                  {projects.length > 1 && (
-                    <select value={p.projectFilter} onChange={e => p.setProjectFilter(e.target.value)}
-                      style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white, maxWidth: 180 }}>
-                      <option value="">All projects</option>
-                      {projects.map(pr => <option key={pr} value={pr}>{pr}</option>)}
-                    </select>
-                  )}
-                  <select value={p.scoreFilter} onChange={e => p.setScoreFilter(Number(e.target.value))}
-                    style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
-                    <option value={0}>Any failure value</option>
-                    <option value={3}>3+ failure value</option>
-                    <option value={4}>4+ failure value</option>
-                    <option value={5}>5 failure value</option>
-                  </select>
-                  <select value={p.dateFilter} onChange={e => p.setDateFilter(e.target.value)}
-                    style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
-                    <option value="">Any date</option>
-                    <option value="7d">Last 7 days</option>
-                    <option value="30d">Last 30 days</option>
-                    <option value="90d">Last 90 days</option>
-                  </select>
-                </div>
-                <div style={{ maxHeight: '36vh', overflowY: 'auto', border: `1px solid ${colors.gray200}`, borderRadius: 6, background: colors.white }}>
-                  {available.length === 0 ? (
-                    <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
-                      {allSessions.length === p.queuedSessions.length ? 'All available traces are already in the queue.' : 'No sessions match your filters.'}
-                    </div>
-                  ) : available.map((s, i) => (
-                    <div key={s.session_id} style={{
-                      display: 'grid', gridTemplateColumns: '1fr auto', gap: 10,
-                      alignItems: 'center', padding: '8px 12px',
-                      borderBottom: i < available.length - 1 ? `1px solid ${colors.gray100}` : 'none',
-                    }}>
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{
-                          fontSize: 13, color: colors.gray900, fontWeight: 500,
-                          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                        }}>
-                          {s.display_title || 'Untitled'}
-                        </div>
-                        <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
-                          <SourceBadge s={s} />
-                          <span>{s.project}</span>
-                          <span style={{ opacity: 0.5 }}>&middot;</span>
-                          <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
-                          {s.review_status && s.review_status !== 'approved' && (<>
-                            <span style={{ opacity: 0.5 }}>&middot;</span>
-                            <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
-                          </>)}
-                        </div>
-                      </div>
-                      <button onClick={() => p.onAdd(s.session_id)} style={btnSecondary}>
-                        <Icon name="plus" size={12} />
-                        Add
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+            {p.showAddTraces && renderAddTracesPicker()}
           </div>
 
           {/* Note */}
