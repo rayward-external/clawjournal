@@ -394,6 +394,7 @@ export function Insights() {
   const [insights, setInsights] = useState<InsightsData | null>(null);
   const [highlights, setHighlights] = useState<HighlightsData | null>(null);
   const [days, setDays] = useState(7);
+  const [showDetails, setShowDetails] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -474,6 +475,49 @@ export function Insights() {
         )}
       </div>
 
+      {/* HERO: actionable recommendations first */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 10px' }}>
+        <h2 style={{ fontSize: 14, fontWeight: 700, color: colors.gray800, margin: 0, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Recommendations</h2>
+        {recommendations.length > 0 && (
+          <span style={{ fontSize: 12, fontWeight: 700, color: colors.white, background: colors.primary500, borderRadius: 10, padding: '1px 8px' }}>{recommendations.length}</span>
+        )}
+      </div>
+      {recommendations.length > 0 ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 18 }}>
+          {recommendations.map((rec, i) => (
+            <div key={i} style={{
+              border: `1px solid ${colors.gray200}`,
+              borderLeft: `4px solid ${PRIORITY_COLORS[rec.priority] || colors.gray400}`,
+              borderRadius: 8, padding: '12px 16px',
+              background: PRIORITY_BG[rec.priority] || colors.white,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', color: PRIORITY_COLORS[rec.priority] || colors.gray500 }}>{rec.priority}</span>
+                <span style={{ fontSize: 14, fontWeight: 600, color: colors.gray800 }}>{rec.title}</span>
+              </div>
+              <div style={{ fontSize: 13, color: colors.gray600, lineHeight: 1.5 }}>{rec.detail}</div>
+              {rec.estimated_savings_usd != null && rec.estimated_savings_usd > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600, color: colors.green500 }}>Est. savings: {formatCost(rec.estimated_savings_usd)}/period</div>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ border: `1px solid ${colors.gray200}`, borderRadius: 8, padding: '20px', textAlign: 'center', color: colors.gray400, fontSize: 13, marginBottom: 18 }}>
+          No specific optimization suggestions for this period. Your usage looks efficient.
+        </div>
+      )}
+
+      {/* Passive analytics, collapsed by default */}
+      <button onClick={() => setShowDetails(v => !v)} style={{
+        display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
+        background: colors.gray50, border: `1px solid ${colors.gray200}`, borderRadius: 8,
+        padding: '10px 14px', cursor: 'pointer', fontSize: 13, fontWeight: 600, color: colors.gray700, marginBottom: 12,
+      }}>
+        <span style={{ color: colors.gray400 }}>{showDetails ? '▾' : '▸'}</span> Analytics &amp; trends — cost, efficiency, highlights, trends
+      </button>
+      {showDetails && (<>
+
       {/* Summary stats */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
         {[
@@ -543,43 +587,7 @@ export function Insights() {
         </Section>
       )}
 
-      {/* Recommendations */}
-      <h2 style={{ fontSize: 14, fontWeight: 700, color: colors.gray700, margin: '0 0 10px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-        Recommendations
-      </h2>
-      {recommendations.length > 0 ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {recommendations.map((rec, i) => (
-            <div key={i} style={{
-              border: `1px solid ${colors.gray200}`,
-              borderLeft: `4px solid ${PRIORITY_COLORS[rec.priority] || colors.gray400}`,
-              borderRadius: 8, padding: '12px 16px',
-              background: PRIORITY_BG[rec.priority] || colors.white,
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                <span style={{
-                  fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
-                  color: PRIORITY_COLORS[rec.priority] || colors.gray500,
-                }}>{rec.priority}</span>
-                <span style={{ fontSize: 14, fontWeight: 600, color: colors.gray800 }}>{rec.title}</span>
-              </div>
-              <div style={{ fontSize: 13, color: colors.gray600, lineHeight: 1.5 }}>{rec.detail}</div>
-              {rec.estimated_savings_usd != null && rec.estimated_savings_usd > 0 && (
-                <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600, color: colors.green500 }}>
-                  Est. savings: {formatCost(rec.estimated_savings_usd)}/period
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div style={{
-          border: `1px solid ${colors.gray200}`, borderRadius: 8, padding: '20px',
-          textAlign: 'center', color: colors.gray400, fontSize: 13,
-        }}>
-          No specific optimization suggestions for this period. Your usage looks efficient.
-        </div>
-      )}
+      </>)}
 
       {/* Footer */}
       <div style={{ marginTop: 16, fontSize: 11, color: colors.gray400, textAlign: 'right' }}>

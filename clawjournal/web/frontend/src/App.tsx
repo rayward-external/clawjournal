@@ -15,33 +15,33 @@ import { api } from './api.ts';
 interface SidebarCounts {
   toReview: number;
   approved: number;
+  recommendations: number;
 }
 
 function Sidebar() {
-  const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0 });
+  const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0, recommendations: 0 });
 
   useEffect(() => {
-    api.stats()
-      .then(s => setCounts({
+    const loadStats = () => api.stats()
+      .then(s => setCounts(c => ({
+        ...c,
         toReview: (s.by_status['new'] ?? 0) + (s.by_status['shortlisted'] ?? 0),
         approved: s.by_status['approved'] ?? 0,
-      }))
+      })))
       .catch(() => {});
-    // Refresh counts periodically
-    const iv = setInterval(() => {
-      api.stats()
-        .then(s => setCounts({
-          toReview: (s.by_status['new'] ?? 0) + (s.by_status['shortlisted'] ?? 0),
-          approved: s.by_status['approved'] ?? 0,
-        }))
-        .catch(() => {});
-    }, 30_000);
+    // The advisor's recommendation count nudges the Insights tab — fetched once
+    // (it changes slowly), while the cheap session stats refresh periodically.
+    api.advisor({ days: 7 })
+      .then(a => setCounts(c => ({ ...c, recommendations: a.recommendations.length })))
+      .catch(() => {});
+    loadStats();
+    const iv = setInterval(loadStats, 30_000);
     return () => clearInterval(iv);
   }, []);
 
   const NAV_ITEMS = [
     { to: '/dashboard', label: 'Dashboard', badge: null },
-    { to: '/insights', label: 'Insights', badge: null },
+    { to: '/insights', label: 'Insights', badge: counts.recommendations > 0 ? counts.recommendations : null },
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
     { to: '/benchmark', label: 'Benchmark', badge: null },
