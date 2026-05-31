@@ -39,19 +39,6 @@ Ask your AI: *"Open ClawJournal and help me set it up to review my coding-agent 
 
 Your first scan may take a minute or two if you have lots of past sessions, and the workbench may show an empty list briefly while it indexes — that's normal. The page refreshes automatically as conversations are added.
 
-### Tour the workbench
-
-The workbench has five tabs. Two of them do the real work:
-
-- **Sessions** — *where you review.* Each trace shows a summary; click **Approve** to keep it or **Block** to discard it. New traces land here after every scan.
-- **Share** — *where you build a bundle to export.* A separate workflow from Sessions.
-
-The other three are read-only views: **Dashboard** (overview of what's been scanned), **Insights** (patterns across your traces), and **Search** (find a trace by keyword).
-
-**Going from review to share:** review in **Sessions**, then open the **Share** tab. Share doesn't auto-pull everything you approved — it starts with a short list of recommended traces, and if nothing's queued it lets you pick what to add right there (a search picker, or a few suggested traces). So even on a brand-new install with nothing approved, you're never stuck: open **Share** and pick what to include.
-
-**"Do I need more setup?"** No. Once install finishes and your first scan fills the **Sessions** tab, you're ready — there's no extra account, key, or service to configure. Reviewing in **Sessions** and packaging in **Share** are the only two steps left.
-
 ---
 
 <details>
@@ -343,9 +330,7 @@ The browser workbench also keeps share-ready traces warm: on app load it offers 
 
 Packaging is **100% local** — it writes a redacted ZIP to your own computer. Uploading is a **separate, opt-in step**. By default the ZIP just sits on your disk.
 
-This happens on the **Share** tab, which starts with the **Queue** step. If recommended traces are available, the queue fills itself; if nothing is preselected but shareable traces exist, Share opens a picker so you can add approved or unapproved traces before redaction and review.
-
-**Just say to your AI:** *"Open the ClawJournal Share page and help me build a bundle to export. If the queue is empty, pick the sessions to include."*
+**Just say to your AI:** *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
 Then follow the path below. **Rayward / STEM Data Program participants: use the workbench (Step B).**
 
@@ -381,7 +366,7 @@ cd ~/clawjournal
 
 #### If the Share queue is empty (after refreshing)
 
-If shareable traces exist but none are recommended, the Queue step opens a picker directly. Add any trace you want to include — approved or not — then review the redacted version before packaging.
+The queue only lists sessions that are cleared to leave your machine. If shareable traces exist but none are recommended, the Queue step opens a picker so you can add sessions before review.
 
 If the picker is empty or you see **No traces ready to share**:
 
