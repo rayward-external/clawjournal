@@ -522,6 +522,57 @@ def _read_body(handler: BaseHTTPRequestHandler) -> dict:
     return json.loads(raw)
 
 
+# Serializes benchmark generation: the deep pipeline is minutes-long and
+# expensive, so only one runs at a time (the row's `generating` status is the
+# durable state; this lock just rejects concurrent kicks).
+_BENCHMARK_GEN_LOCK = threading.Lock()
+_BENCHMARK_STALE_DAYS = 7
+
+
+def _benchmark_is_stale(benchmark: dict | None, *, days: int = _BENCHMARK_STALE_DAYS) -> bool:
+    """True when there's no benchmark, or the latest one is older than ``days``."""
+    if not benchmark or not benchmark.get("generated_at"):
+        return True
+    try:
+        gen = datetime.fromisoformat(str(benchmark["generated_at"]).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if gen.tzinfo is None:
+        gen = gen.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - gen).total_seconds() > days * 86400
+
+
+def _run_benchmark_generation(benchmark_id: str, week_slice) -> None:
+    """Background worker: run the deep pipeline against a pre-selected slice and
+    finalize (or mark failed) the placeholder row. Always releases the gen lock.
+
+    The same ``week_slice`` used to insert the placeholder is passed through, so
+    the finalized window matches the placeholder (``finalize_benchmark`` rejects
+    a window mismatch).
+    """
+    from ..benchmark import store
+    from ..benchmark.generate import generate_benchmark
+
+    conn = open_index()
+    try:
+        def progress(msg: str) -> None:
+            try:
+                store.update_status(conn, benchmark_id, stage=msg)
+            except Exception:  # progress is best-effort
+                pass
+
+        try:
+            benchmark = generate_benchmark(
+                conn, week_slice=week_slice, backend="auto", progress=progress)
+            store.finalize_benchmark(conn, benchmark_id, benchmark)
+        except Exception as exc:
+            logger.warning("benchmark generation failed for %s: %s", benchmark_id, exc)
+            store.update_status(conn, benchmark_id, status="failed", error=str(exc))
+    finally:
+        conn.close()
+        _BENCHMARK_GEN_LOCK.release()
+
+
 def _parse_json_fields(rows: list[dict]) -> None:
     """Parse JSON string fields in session rows into Python objects.
 
@@ -1987,6 +2038,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_allowlist()
         elif path == "/api/findings/allowlist":
             self._handle_list_findings_allowlist()
+        elif path == "/api/benchmarks":
+            self._handle_benchmarks_list()
+        elif path == "/api/benchmarks/latest":
+            self._handle_benchmark_latest()
+        elif path == "/api/benchmarks/trend":
+            self._handle_benchmark_trend()
+        elif path.startswith("/api/benchmarks/") and path.endswith("/status"):
+            self._handle_benchmark_status(path[len("/api/benchmarks/"):-len("/status")])
+        elif path.startswith("/api/benchmarks/"):
+            self._handle_benchmark_get(path[len("/api/benchmarks/"):])
         elif path.startswith("/timeline/"):
             if self._handle_session_timeline(path):
                 return
@@ -2054,6 +2115,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path == "/api/scan":
             force = parse_qs(parsed.query).get("force", [""])[0] in ("1", "true")
             self._handle_trigger_scan(force=force)
+        elif path == "/api/benchmarks/generate":
+            self._handle_benchmark_generate()
+        elif path.startswith("/api/benchmarks/") and path.endswith("/export"):
+            self._handle_benchmark_export(path[len("/api/benchmarks/"):-len("/export")])
         else:
             _json_response(self, {"error": "Not found"}, 404)
 
@@ -2423,6 +2488,130 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "task_type": result.task_type,
                 "outcome": result.outcome_label,
                 "summary": result.summary,
+            })
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Personalized benchmark API
+    # ------------------------------------------------------------------
+    def _handle_benchmarks_list(self) -> None:
+        from ..benchmark import store
+        conn = open_index()
+        try:
+            _json_response(self, {"benchmarks": store.list_benchmarks(conn)})
+        finally:
+            conn.close()
+
+    def _handle_benchmark_latest(self) -> None:
+        from ..benchmark import store
+        conn = open_index()
+        try:
+            latest = store.get_latest_benchmark(conn)
+            _json_response(self, {"benchmark": latest, "stale": _benchmark_is_stale(latest)})
+        finally:
+            conn.close()
+
+    def _handle_benchmark_trend(self) -> None:
+        from ..benchmark import store
+        conn = open_index()
+        try:
+            _json_response(self, store.get_theme_trend(conn))
+        finally:
+            conn.close()
+
+    def _handle_benchmark_get(self, benchmark_id: str) -> None:
+        from ..benchmark import store
+        conn = open_index()
+        try:
+            got = store.get_benchmark(conn, benchmark_id)
+            if got is None:
+                _json_response(self, {"error": "benchmark not found"}, 404)
+                return
+            _json_response(self, got)
+        finally:
+            conn.close()
+
+    def _handle_benchmark_status(self, benchmark_id: str) -> None:
+        from ..benchmark import store
+        conn = open_index()
+        try:
+            got = store.get_benchmark(conn, benchmark_id)
+            if got is None:
+                _json_response(self, {"error": "benchmark not found"}, 404)
+                return
+            _json_response(self, {
+                "benchmark_id": benchmark_id,
+                "status": got.get("status"),
+                "stage": got.get("stage"),
+                "error": got.get("error"),
+            })
+        finally:
+            conn.close()
+
+    def _handle_benchmark_generate(self) -> None:
+        from ..benchmark import store
+        from ..benchmark.select import select_week_failures
+
+        body = _read_body(self) or {}
+        window = int(body.get("window_days", 7))
+        cap = int(body.get("cap", 15))
+
+        if not _BENCHMARK_GEN_LOCK.acquire(blocking=False):
+            _json_response(self, {"status": "busy",
+                                  "error": "a benchmark generation is already running"}, 409)
+            return
+        released = False
+        try:
+            conn = open_index()
+            try:
+                sl = select_week_failures(conn, window_days=window, cap=cap)
+                if not sl.candidates:
+                    _json_response(
+                        self, {"error": "no failure-signal sessions in the selected window"}, 400)
+                    return
+                bid = store.insert_generating(
+                    conn, window_start=sl.window_start, window_end=sl.window_end)
+            finally:
+                conn.close()
+            threading.Thread(
+                target=_run_benchmark_generation, args=(bid, sl), daemon=True).start()
+            released = True  # the worker owns the lock now
+            _json_response(self, {"status": "generating", "benchmark_id": bid}, 202)
+        finally:
+            if not released:
+                _BENCHMARK_GEN_LOCK.release()
+
+    def _handle_benchmark_export(self, benchmark_id: str) -> None:
+        from ..benchmark import render, store
+        from ..benchmark import schema as bm
+        from ..benchmark.render import EXPORT_KINDS
+
+        body = _read_body(self) or {}
+        kind = body.get("kind", "authoring_md")
+        if kind not in EXPORT_KINDS:
+            _json_response(self, {"error": f"unknown export kind {kind!r}",
+                                  "kinds": list(EXPORT_KINDS)}, 400)
+            return
+        conn = open_index()
+        try:
+            got = store.get_benchmark(conn, benchmark_id)
+            if got is None:
+                _json_response(self, {"error": "benchmark not found"}, 404)
+                return
+            content = render.render(got, kind)
+            pii_hits = len(bm.find_pii(content))
+            ext = "json" if kind.endswith("json") else "md"
+            out_dir = CONFIG_DIR / "benchmark_exports"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{benchmark_id}-{kind}.{ext}"
+            out_path.write_text(content, encoding="utf-8")
+            summary = {"kind": kind, "pii_scan_hits": pii_hits, "deterministic_redaction": "deferred"}
+            store.record_export(
+                conn, benchmark_id, kind=kind, path=str(out_path), redaction_summary=summary)
+            _json_response(self, {
+                "benchmark_id": benchmark_id, "kind": kind, "path": str(out_path),
+                "pii_scan_hits": pii_hits, "content": content,
             })
         finally:
             conn.close()

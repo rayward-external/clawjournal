@@ -207,6 +207,61 @@ CREATE TABLE IF NOT EXISTS session_hold_history (
     reason         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_hold_history_session ON session_hold_history(session_id, changed_at);
+
+-- Personalized weekly benchmark tables. Net-new tables ship in SCHEMA_SQL as
+-- idempotent CREATE TABLE IF NOT EXISTS (benchmarks before its FK referents);
+-- open_index() runs executescript(SCHEMA_SQL) on every open, so existing DBs
+-- gain them on next open. No user_version bump or _migrate_* is needed — those
+-- are reserved for ALTER/rename/backfill on existing tables. Add a
+-- BENCHMARK_SCHEMA_VERSION sentinel + _migrate_ only if a future column
+-- ALTER/backfill is required.
+CREATE TABLE IF NOT EXISTS benchmarks (
+    benchmark_id        TEXT PRIMARY KEY,
+    window_start        TEXT NOT NULL,
+    window_end          TEXT NOT NULL,
+    generated_at        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'ready',
+    stage               TEXT,
+    backend             TEXT,
+    rubric_git_sha      TEXT,
+    n_tasks             INTEGER,
+    total_points        INTEGER,
+    source_count        INTEGER,
+    dropped_for_cost    INTEGER,
+    ready_count         INTEGER,
+    needs_staging_count INTEGER,
+    payload_json        TEXT NOT NULL,
+    error               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_benchmarks_generated ON benchmarks(generated_at DESC);
+
+CREATE TABLE IF NOT EXISTS benchmark_tasks (
+    task_id                   TEXT PRIMARY KEY,
+    benchmark_id              TEXT NOT NULL REFERENCES benchmarks(benchmark_id) ON DELETE CASCADE,
+    title                     TEXT,
+    theme                     TEXT,
+    domains_json              TEXT,
+    source_agents_json        TEXT,
+    difficulty                TEXT,
+    points                    INTEGER,
+    grading                   TEXT,
+    readiness                 TEXT,
+    leakage_risk              TEXT,
+    privacy_risk              TEXT,
+    grounded_session_ids_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_tasks_run ON benchmark_tasks(benchmark_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_tasks_readiness ON benchmark_tasks(benchmark_id, readiness);
+
+CREATE TABLE IF NOT EXISTS benchmark_exports (
+    export_id              TEXT PRIMARY KEY,
+    benchmark_id           TEXT NOT NULL REFERENCES benchmarks(benchmark_id) ON DELETE CASCADE,
+    kind                   TEXT NOT NULL,
+    path                   TEXT,
+    created_at             TEXT NOT NULL,
+    redaction_summary_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_exports_run ON benchmark_exports(benchmark_id);
 """
 
 FTS_SCHEMA_SQL = """

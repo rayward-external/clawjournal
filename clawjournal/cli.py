@@ -3984,6 +3984,21 @@ def main() -> None:
     hh_p = sub.add_parser("hold-history", help="Print the full hold-state timeline for a session")
     hh_p.add_argument("session_id")
 
+    # Personalized weekly benchmark
+    bench_p = sub.add_parser(
+        "benchmark", help="Generate / view / export a personalized weekly benchmark from your traces")
+    bench_p.add_argument("--window", type=int, default=7, help="Coverage window in days (default 7)")
+    bench_p.add_argument("--cap", type=int, default=15, help="Max sessions to deep-read (cost bound)")
+    bench_p.add_argument("--backend", default="auto", help="Scoring backend (auto|claude|codex|...)")
+    bench_p.add_argument("--list", action="store_true", help="List stored benchmarks")
+    bench_p.add_argument("--show", metavar="ID", help="Render a stored benchmark as markdown (ID or 'latest')")
+    bench_p.add_argument("--export", metavar="ID", help="Export a benchmark to a local file (ID or 'latest')")
+    bench_p.add_argument(
+        "--kind", default="authoring_md",
+        help="Export kind: authoring_md | agent_packet_md | grader_packet_md | agent_packet_json | grader_packet_json")
+    bench_p.add_argument("--output", help="Output file path for --export")
+    bench_p.add_argument("--json", action="store_true", help="Machine-readable output for --list")
+
     # Findings review
     fnd_p = sub.add_parser("findings", help="List or decide findings for a session")
     fnd_p.add_argument("session_id")
@@ -4325,6 +4340,11 @@ def main() -> None:
     if command == "hold-history":
         from .cli_security import run_hold_history
         run_hold_history(args)
+        return
+
+    if command == "benchmark":
+        from .cli_benchmark import run_benchmark
+        run_benchmark(args)
         return
 
     if command == "findings":
