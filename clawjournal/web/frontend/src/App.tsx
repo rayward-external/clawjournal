@@ -7,6 +7,7 @@ import { Share } from './views/Share/index.tsx';
 import { Policies } from './views/Policies.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Insights } from './views/Insights.tsx';
+import { Benchmark } from './views/Benchmark.tsx';
 import { ToastProvider } from './components/Toast.tsx';
 import { colors, fontFamily } from './theme.ts';
 import { api } from './api.ts';
@@ -43,6 +44,7 @@ function Sidebar() {
     { to: '/insights', label: 'Insights', badge: null },
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
+    { to: '/benchmark', label: 'Benchmark', badge: null },
     { to: '/share', label: 'Share', badge: null },
   ];
 
@@ -174,6 +176,7 @@ export default function App() {
               <Route path="/session/:id" element={<SessionDetail />} />
               <Route path="/bundles" element={<Navigate to="/share" replace />} />
               <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
+              <Route path="/benchmark" element={<Benchmark />} />
               <Route path="/share" element={<Share />} />
               <Route path="/share/rules" element={<Policies />} />
             </Routes>

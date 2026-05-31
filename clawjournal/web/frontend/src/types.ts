@@ -398,3 +398,85 @@ export interface AdvisorData {
     potential_savings_usd: number;
   };
 }
+
+/* ---------- Personalized benchmark ---------- */
+
+export interface BenchmarkTaskCritique {
+  discriminating: boolean;
+  gameable: boolean;
+  leakage: boolean;
+  measurable: boolean;
+  verdict: string;
+  notes: string;
+  staging_notes: string;
+}
+
+export interface BenchmarkTask {
+  id: string;
+  title: string;
+  theme: string;
+  scenario: string;
+  seed_inputs: string;
+  the_trap: string;
+  ideal_trajectory: string[];
+  pass_criteria: string[];
+  fail_signals: string[];
+  grading: string;
+  difficulty: string;
+  points: number;
+  domains: string[];
+  source_agents: string[];
+  grounded_session_ids: string[];
+  readiness: string;
+  leakage_risk: string;
+  privacy_risk: string;
+  critique: BenchmarkTaskCritique;
+}
+
+export interface BenchmarkTheme {
+  name: string;
+  taxonomy: string[];
+  frequency: number;
+  evidence_session_ids: string[];
+  lesson: string;
+}
+
+export interface Benchmark {
+  benchmark_id: string;
+  window_start: string;
+  window_end: string;
+  generated_at: string;
+  status: string;
+  stage: string | null;
+  error: string | null;
+  backend: string;
+  n_tasks: number;
+  total_points: number;
+  ready_count: number;
+  needs_staging_count: number;
+  source_count: number;
+  dropped_for_cost: number;
+  themes: BenchmarkTheme[];
+  tasks: BenchmarkTask[];
+}
+
+export interface BenchmarkSummary {
+  benchmark_id: string;
+  window_start: string;
+  window_end: string;
+  generated_at: string;
+  status: string;
+  backend: string | null;
+  n_tasks: number | null;
+  total_points: number | null;
+  source_count: number | null;
+  dropped_for_cost: number | null;
+  ready_count: number | null;
+  needs_staging_count: number | null;
+  error: string | null;
+}
+
+export interface BenchmarkTrend {
+  runs: { benchmark_id: string; window_end: string }[];
+  themes: Record<string, number[]>;
+}

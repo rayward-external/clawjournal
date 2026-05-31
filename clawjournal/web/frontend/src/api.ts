@@ -18,6 +18,9 @@ import type {
   FindingsAllowlistEntry,
   HoldHistoryEntry,
   HoldState,
+  Benchmark,
+  BenchmarkSummary,
+  BenchmarkTrend,
 } from './types.ts';
 
 const BASE = '/api';
@@ -436,6 +439,38 @@ export const api = {
       remove(id: string): Promise<{ removed: boolean; reverted: number; reassigned: number }> {
         return request(`/findings/allowlist/${encodeURIComponent(id)}`, { method: 'DELETE' });
       },
+    },
+  },
+
+  benchmarks: {
+    list(): Promise<{ benchmarks: BenchmarkSummary[] }> {
+      return request('/benchmarks');
+    },
+    latest(): Promise<{ benchmark: Benchmark | null; stale: boolean }> {
+      return request('/benchmarks/latest');
+    },
+    get(id: string): Promise<Benchmark> {
+      return request(`/benchmarks/${encodeURIComponent(id)}`);
+    },
+    trend(): Promise<BenchmarkTrend> {
+      return request('/benchmarks/trend');
+    },
+    status(id: string): Promise<{ benchmark_id: string; status: string; stage: string | null; error: string | null }> {
+      return request(`/benchmarks/${encodeURIComponent(id)}/status`);
+    },
+    generate(body: { window_days?: number; cap?: number } = {}): Promise<{ status: string; benchmark_id?: string; error?: string }> {
+      return request('/benchmarks/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+    export(id: string, kind: string): Promise<{ benchmark_id: string; kind: string; path: string; pii_scan_hits: number; content: string }> {
+      return request(`/benchmarks/${encodeURIComponent(id)}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
     },
   },
 };
