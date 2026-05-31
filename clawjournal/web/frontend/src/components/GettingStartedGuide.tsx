@@ -8,13 +8,12 @@ interface GettingStartedGuideProps {
 }
 
 export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuideProps) {
-  const approved = stats.by_status['approved'] ?? 0;
   const toReview = (stats.by_status['new'] ?? 0) + (stats.by_status['shortlisted'] ?? 0);
   const steps = [
-    { label: 'Review', detail: toReview > 0 ? `${toReview} waiting` : 'Scan the list' },
-    { label: 'Approve', detail: approved > 0 ? `${approved} approved` : 'Pick traces' },
-    { label: 'Redact', detail: 'Local preview' },
-    { label: 'Share', detail: 'Submit or zip' },
+    { label: 'Review', detail: toReview > 0 ? `${toReview} waiting` : 'Scan sessions' },
+    { label: 'Pick', detail: 'In Share' },
+    { label: 'Redact', detail: 'Local review' },
+    { label: 'Package', detail: 'Submit or zip' },
   ];
 
   return (
@@ -34,7 +33,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
           New here? Turn your sessions into shareable traces.
         </div>
         <div style={{ fontSize: 12, color: colors.gray600, lineHeight: 1.45 }}>
-          Triage your sessions here, then Share redacts and lets you review locally. Nothing leaves your machine until you approve it.
+          Inspect captured sessions here, then open Share to pick traces, redact, and review locally. Nothing leaves your machine until you approve sharing.
         </div>
       </div>
 
@@ -87,7 +86,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
       </div>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'flex-end', marginLeft: 'auto' }}>
-        <Link to="/share" style={{
+        <Link to="/share" onClick={onDismiss} style={{
           display: 'inline-flex',
           alignItems: 'center',
           padding: '7px 12px',
