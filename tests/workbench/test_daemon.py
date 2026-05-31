@@ -551,8 +551,10 @@ class TestScanner:
             "project": "test-project",
             "source": "claude",
             "model": "claude-sonnet-4",
-            "start_time": now.isoformat(),
-            "end_time": (now + timedelta(minutes=10)).isoformat(),
+            # Settled session (last activity well before the settle window),
+            # so the auto-scorer grades it rather than deferring it as in-flight.
+            "start_time": (now - timedelta(minutes=20)).isoformat(),
+            "end_time": (now - timedelta(minutes=10)).isoformat(),
             "messages": [
                 {"role": "user", "content": "Fix it", "tool_uses": []},
                 {"role": "assistant", "content": "Done", "tool_uses": []},

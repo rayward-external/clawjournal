@@ -2446,25 +2446,84 @@ def effective_hold_state(
     return "released" if parsed <= current else state
 
 
+# Seconds ``end_time`` must advance past ``ai_scored_at`` before an
+# already-scored session counts as "grew after it was scored" and is
+# re-selected. Small margin avoids re-scoring on a near-simultaneous
+# score/finish.
+RESCORE_GROWTH_MARGIN_SECONDS = 60
+
+_UNSCORED_RETURN_KEYS = (
+    "session_id", "display_title", "task_type", "outcome_badge", "project", "source",
+)
+
+
+def _parse_score_ts(ts: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp (accepting a trailing ``Z``) to aware UTC."""
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def query_unscored_sessions(
     conn: sqlite3.Connection,
     *,
     limit: int = 50,
     source: str | list[str] | tuple[str, ...] | None = None,
     since: str | None = None,
+    include_stale_scored: bool = False,
+    settle_seconds: int = 0,
+    growth_margin_seconds: int = RESCORE_GROWTH_MARGIN_SECONDS,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Return sessions missing either legacy quality or failure-value score.
+    """Return sessions that need (re)scoring.
 
-    Returns a list of dicts with session_id, display_title, task_type,
+    By default, returns sessions missing either legacy quality or failure-value
+    score — a list of dicts with session_id, display_title, task_type,
     outcome_badge, project, and source. Segmented parent sessions
-    (``review_status='segmented'``) are skipped — their scorable content
-    lives in the per-segment child rows, not the parent umbrella.
+    (``review_status='segmented'``) are skipped — their scorable content lives
+    in the per-segment child rows, not the parent umbrella.
+
+    Two opt-in behaviors support the background scanner, which would otherwise
+    grade a session once (often mid-flight) and never revisit it:
+
+    - ``include_stale_scored``: also return *already-scored* sessions whose
+      ``end_time`` advanced more than ``growth_margin_seconds`` past
+      ``ai_scored_at`` — i.e. they kept going after they were graded. Re-scoring
+      reads the current blob, so the stale early grade is corrected; once a
+      session is scored after it finishes, ``ai_scored_at >= end_time`` and it
+      drops out of this selection.
+    - ``settle_seconds``: skip sessions whose last activity (``end_time``) is
+      within ``settle_seconds`` of ``now`` — they are likely still in-flight, so
+      scoring now would just produce another premature grade (and, on the
+      re-score path, churn every scan cycle).
+
+    With both opt-ins off (the default) the behavior and return shape are
+    unchanged from the original contract.
     """
+    extended = include_stale_scored or settle_seconds > 0
     params: list[Any] = []
+    score_missing = "(ai_quality_score IS NULL OR ai_failure_value_score IS NULL)"
+    if include_stale_scored:
+        # Coarse pre-filter; the precise margin check happens in Python because
+        # ``end_time`` (``…Z``) and ``ai_scored_at`` (``…+00:00``) use different
+        # UTC spellings. Lexicographic ``>`` is safe as a *pre*-filter since a
+        # truly grown session differs in the minute/second portion.
+        where = (
+            f"({score_missing} OR (ai_scored_at IS NOT NULL "
+            "AND end_time IS NOT NULL AND end_time > ai_scored_at))"
+        )
+    else:
+        where = score_missing
     sql = (
-        "SELECT session_id, display_title, task_type, outcome_badge, project, source "
-        "FROM sessions WHERE (ai_quality_score IS NULL OR ai_failure_value_score IS NULL) "
-        "AND review_status != 'segmented'"
+        "SELECT session_id, display_title, task_type, outcome_badge, project, source, "
+        "end_time, ai_scored_at, ai_quality_score, ai_failure_value_score "
+        f"FROM sessions WHERE {where} AND review_status != 'segmented'"
     )
     if since is not None:
         sql += " AND start_time >= ?"
@@ -2479,10 +2538,38 @@ def query_unscored_sessions(
             sql += " AND source = ?"
             params.append(source)
     sql += " ORDER BY start_time DESC LIMIT ?"
-    params.append(limit)
+    # Over-fetch when we will refine in Python so we can still return `limit`
+    # rows after dropping non-stale / unsettled candidates.
+    params.append(max(limit * 5, 200) if extended else limit)
 
     rows = conn.execute(sql, params).fetchall()
-    return [dict(row) for row in rows]
+    if not extended:
+        return [{k: row[k] for k in _UNSCORED_RETURN_KEYS} for row in rows]
+
+    clock = now or datetime.now(timezone.utc)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        never_scored = row["ai_quality_score"] is None or row["ai_failure_value_score"] is None
+        end_dt = _parse_score_ts(row["end_time"])
+        scored_dt = _parse_score_ts(row["ai_scored_at"])
+        grew = (
+            include_stale_scored
+            and scored_dt is not None
+            and end_dt is not None
+            and (end_dt - scored_dt).total_seconds() > growth_margin_seconds
+        )
+        if not (never_scored or grew):
+            continue
+        if (
+            settle_seconds
+            and end_dt is not None
+            and (clock - end_dt).total_seconds() < settle_seconds
+        ):
+            continue
+        out.append({k: row[k] for k in _UNSCORED_RETURN_KEYS})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def query_sessions_for_rescore(

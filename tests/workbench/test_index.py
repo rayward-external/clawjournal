@@ -460,6 +460,79 @@ class TestQueryUnscoredSessions:
         assert "plain-unscored" in ids
         assert "parent-segmented" not in ids
 
+    def test_rescore_on_growth_reselects_stale_scored(self, index_conn):
+        """Regression for the S16 bug: a session scored mid-flight (its
+        ``end_time`` advanced past ``ai_scored_at``) must be re-selected when
+        ``include_stale_scored=True`` so the stale early grade is corrected —
+        but stay hidden by default."""
+        from datetime import datetime, timezone
+        upsert_sessions(index_conn, [
+            _make_session(
+                "grew",
+                start_time="2026-05-24T00:00:00+00:00",
+                end_time="2026-05-24T00:18:00+00:00",
+            ),
+        ])
+        # Graded 16 minutes before the session's final activity.
+        update_session(
+            index_conn, "grew",
+            ai_quality_score=2,
+            ai_failure_value_score=2,
+            ai_scored_at="2026-05-24T00:02:00+00:00",
+        )
+        now = datetime(2026, 5, 25, tzinfo=timezone.utc)
+        # Default contract: already-scored, so not returned.
+        assert query_unscored_sessions(index_conn, source=["claude"], now=now) == []
+        # Opt-in: returned for re-scoring.
+        ids = [r["session_id"] for r in query_unscored_sessions(
+            index_conn, source=["claude"], include_stale_scored=True, now=now)]
+        assert ids == ["grew"]
+
+    def test_rescore_skips_session_scored_after_it_finished(self, index_conn):
+        """A session graded *after* its last activity is not stale and must not
+        be re-selected (no churn on correctly-scored rows)."""
+        from datetime import datetime, timezone
+        upsert_sessions(index_conn, [
+            _make_session(
+                "done",
+                start_time="2026-05-24T00:00:00+00:00",
+                end_time="2026-05-24T00:18:00+00:00",
+            ),
+        ])
+        update_session(
+            index_conn, "done",
+            ai_quality_score=5, ai_failure_value_score=4,
+            ai_scored_at="2026-05-24T00:20:00+00:00",  # after end_time
+        )
+        now = datetime(2026, 5, 25, tzinfo=timezone.utc)
+        assert query_unscored_sessions(
+            index_conn, source=["claude"], include_stale_scored=True, now=now) == []
+
+    def test_settle_seconds_defers_in_flight_session(self, index_conn):
+        """An unscored session whose last activity is within the settle window
+        is deferred (likely still running) so it isn't graded prematurely."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+        upsert_sessions(index_conn, [
+            _make_session(
+                "active",
+                start_time=(now - timedelta(minutes=2)).isoformat(),
+                end_time=(now - timedelta(seconds=30)).isoformat(),  # 30s ago
+            ),
+            _make_session(
+                "settled",
+                start_time=(now - timedelta(minutes=20)).isoformat(),
+                end_time=(now - timedelta(minutes=10)).isoformat(),  # 10m ago
+            ),
+        ])
+        ids = [r["session_id"] for r in query_unscored_sessions(
+            index_conn, source=["claude"], settle_seconds=180, now=now)]
+        assert ids == ["settled"]
+        # With no settle window, both are immediately scorable.
+        ids_all = {r["session_id"] for r in query_unscored_sessions(
+            index_conn, source=["claude"], now=now)}
+        assert ids_all == {"active", "settled"}
+
 
 class TestQuerySessionsForRescore:
     def test_returns_sessions_regardless_of_existing_score(self, index_conn):
