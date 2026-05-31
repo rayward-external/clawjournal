@@ -64,6 +64,45 @@ function Chip({ children, fg, bg }: { children: React.ReactNode; fg: string; bg:
 }
 
 /* ------------------------------------------------------------------ */
+/*  Generation progress — slow run, keep it visibly alive             */
+/* ------------------------------------------------------------------ */
+
+function stagePercent(stage: string): number {
+  const s = (stage || '').toLowerCase();
+  if (s.includes('done')) return 100;
+  if (s.includes('design') || s.includes('critiqu')) return 80;
+  if (s.includes('cluster')) return 52;
+  if (s.includes('deep-read')) return 28;
+  return 10;
+}
+
+function GeneratingBanner({ stage, elapsedMs }: { stage: string; elapsedMs: number }) {
+  const pct = stagePercent(stage);
+  const secs = Math.floor(elapsedMs / 1000);
+  const elapsed = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return (
+    <div style={{ ...cardStyle, padding: 16, marginTop: 16, background: colors.primary50, borderColor: colors.primary200 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: colors.primary700, animation: 'bench-pulse 1.8s ease-in-out infinite' }}>
+          ⟳ Generating benchmark — {stage || 'starting…'}
+        </span>
+        <span style={{ fontSize: 12, color: colors.gray500 }}>{elapsed} elapsed</span>
+      </div>
+      <div style={{ height: 8, background: colors.primary100, borderRadius: 6, overflow: 'hidden' }}>
+        <div style={{
+          width: `${pct}%`, height: '100%', borderRadius: 6, transition: 'width 0.6s ease',
+          backgroundImage: `linear-gradient(90deg, ${colors.primary400}, ${colors.primary200}, ${colors.primary400})`,
+          backgroundSize: '200% 100%', animation: 'bench-shimmer 1.4s linear infinite',
+        }} />
+      </div>
+      <div style={{ fontSize: 12, color: colors.gray500, marginTop: 8 }}>
+        Runs the deep pipeline against your last 7 days of failures (~40+ model calls). A few minutes is normal — you can leave this tab and come back; it keeps running.
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Task detail — agent packet vs grader packet                       */
 /* ------------------------------------------------------------------ */
 
@@ -243,8 +282,18 @@ export function Benchmark() {
   const [themeFilter, setThemeFilter] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<string | null>(null);
   const [generating, setGenerating] = useState<{ id: string; stage: string } | null>(null);
+  const [genStart, setGenStart] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   const [exportOpen, setExportOpen] = useState(false);
   const pollRef = useRef<number | null>(null);
+
+  // Tick a 1s clock while generating so the banner shows live elapsed time.
+  useEffect(() => {
+    if (!generating) return;
+    setNow(Date.now());
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [generating]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -287,6 +336,7 @@ export function Benchmark() {
     try {
       const res = await api.benchmarks.generate({});
       if (!res.benchmark_id) { toast(res.error || 'Could not start generation', 'error'); return; }
+      setGenStart(Date.now());
       setGenerating({ id: res.benchmark_id, stage: 'starting…' });
       pollRef.current = window.setInterval(async () => {
         try {
@@ -294,6 +344,7 @@ export function Benchmark() {
           if (st.status === 'generating') { setGenerating({ id: res.benchmark_id!, stage: st.stage || 'working…' }); return; }
           if (pollRef.current) window.clearInterval(pollRef.current);
           setGenerating(null);
+          setGenStart(null);
           if (st.status === 'failed') toast(`Generation failed: ${st.error || 'unknown'}`, 'error');
           else toast('Benchmark ready', 'success');
           load();
@@ -324,13 +375,17 @@ export function Benchmark() {
     return (
       <div style={{ padding: 40 }}>
         <Header generating={generating} onRegenerate={regenerate} />
-        <div style={{ marginTop: 24 }}>
-          <EmptyState
-            title="No benchmark yet"
-            description="Generate a personalized benchmark from your last 7 days of agent failures. It runs the deep pipeline against your own traces — a few minutes, and stored locally."
-            action={<button style={btnPrimary} onClick={regenerate} disabled={!!generating}>{generating ? 'Generating…' : 'Generate benchmark'}</button>}
-          />
-        </div>
+        {generating ? (
+          <GeneratingBanner stage={generating.stage} elapsedMs={genStart ? now - genStart : 0} />
+        ) : (
+          <div style={{ marginTop: 24 }}>
+            <EmptyState
+              title="No benchmark yet"
+              description="Generate a personalized benchmark from your last 7 days of agent failures. It runs the deep pipeline against your own traces — a few minutes, and stored locally."
+              action={<button style={btnPrimary} onClick={regenerate} disabled={!!generating}>Generate benchmark</button>}
+            />
+          </div>
+        )}
       </div>
     );
   }
@@ -357,6 +412,7 @@ export function Benchmark() {
           <span style={{ color: colors.yellow700 }}>{current.needs_staging_count} need staging</span>
           <span>{current.source_count} sessions deep-read{current.dropped_for_cost ? `, ${current.dropped_for_cost} dropped for cost` : ''}</span>
         </div>
+        {generating && <GeneratingBanner stage={generating.stage} elapsedMs={genStart ? now - genStart : 0} />}
         {/* tabs */}
         <div style={{ display: 'flex', gap: 4, marginTop: 16, borderBottom: `1px solid ${colors.gray200}` }}>
           {(['tasks', 'themes', 'trend'] as const).map(t => (
@@ -482,8 +538,8 @@ function Header(props: {
             {list.map(b => <option key={b.benchmark_id} value={b.benchmark_id}>{b.benchmark_id} ({shortDate(b.window_end)})</option>)}
           </select>
         )}
-        <button style={btnPrimary} onClick={onRegenerate} disabled={!!generating}>
-          {generating ? `⟳ ${generating.stage}` : '⟳ Regenerate (last 7d)'}
+        <button style={generating ? { ...btnPrimary, opacity: 0.7, cursor: 'default' } : btnPrimary} onClick={onRegenerate} disabled={!!generating}>
+          {generating ? '⟳ Generating…' : '⟳ Regenerate (last 7d)'}
         </button>
         {current && onExport && setExportOpen && (
           <div style={{ position: 'relative' }}>

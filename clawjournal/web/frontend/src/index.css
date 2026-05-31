@@ -12,3 +12,13 @@ body {
 #root {
   height: 100vh;
 }
+
+/* Benchmark generation progress — a sliding sheen so a slow run still looks alive. */
+@keyframes bench-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: 0 0; }
+}
+@keyframes bench-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
