@@ -112,9 +112,9 @@ function ShareWorkflowGuide({
   const approved = stats.by_status['approved'] ?? 0;
   const toReview = (stats.by_status['new'] ?? 0) + (stats.by_status['shortlisted'] ?? 0);
   const steps = [
-    { label: 'Review', detail: toReview > 0 ? `${toReview} waiting` : 'Scan the list' },
-    { label: 'Select', detail: approved > 0 ? `${approved} approved` : 'Pick traces' },
-    { label: 'Redact', detail: 'Local preview' },
+    { label: 'Review', detail: toReview > 0 ? `${toReview} waiting` : 'Inspect traces' },
+    { label: 'Select', detail: approved > 0 ? `${approved} approved` : 'Choose traces' },
+    { label: 'Redact', detail: 'Before upload' },
     { label: 'Package', detail: 'Submit or zip' },
   ];
 
@@ -132,10 +132,10 @@ function ShareWorkflowGuide({
     }}>
       <div style={{ minWidth: 220, flex: '1 1 240px' }}>
         <div style={{ fontSize: 13.5, fontWeight: 700, color: colors.gray900, marginBottom: 2 }}>
-          Ready to share a trace?
+          Start with your local traces
         </div>
         <div style={{ fontSize: 12, color: colors.gray600, lineHeight: 1.45 }}>
-          Share walks you through local redaction, review, then submit or download.
+          Review traces here. Share redacts and reviews them locally before anything leaves your machine.
         </div>
       </div>
 
@@ -176,7 +176,7 @@ function ShareWorkflowGuide({
               {idx + 1}
             </span>
             <span style={{ minWidth: 0 }}>
-              <span style={{ display: 'block', fontSize: 12, fontWeight: 650, color: colors.gray800, whiteSpace: 'nowrap' }}>
+              <span style={{ display: 'block', fontSize: 12, fontWeight: 600, color: colors.gray800, whiteSpace: 'nowrap' }}>
                 {step.label}
               </span>
               <span style={{ display: 'block', fontSize: 11, color: colors.gray500, lineHeight: 1.25 }}>
@@ -196,7 +196,7 @@ function ShareWorkflowGuide({
           color: colors.white,
           borderRadius: 6,
           fontSize: 12.5,
-          fontWeight: 650,
+          fontWeight: 600,
           textDecoration: 'none',
           whiteSpace: 'nowrap',
         }}>
@@ -205,6 +205,7 @@ function ShareWorkflowGuide({
         <button
           type="button"
           onClick={onDismiss}
+          aria-label="Dismiss"
           title="Dismiss"
           style={{
             width: 28,
@@ -220,7 +221,7 @@ function ShareWorkflowGuide({
             lineHeight: 1,
           }}
         >
-          x
+          &times;
         </button>
       </div>
     </div>
@@ -444,7 +445,7 @@ export function Inbox() {
         </div>
       </div>
 
-      {showShareGuide && stats.total > 0 && !typeFilter && (
+      {showShareGuide && stats.total > 0 && sessions.length > 0 && !typeFilter && (
         <ShareWorkflowGuide stats={stats} onDismiss={dismissShareGuide} />
       )}
 
