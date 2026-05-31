@@ -73,6 +73,21 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
 #   returns ``unverified`` for those, so they are never real leaks.
 EXCLUDED_DETECTORS: tuple[str, ...] = ("refiner",)
 
+# Detectors whose UNVERIFIED findings are dropped as structural false
+# positives, while their verified/unknown findings still block. This is
+# narrower than EXCLUDED_DETECTORS (which disables a detector entirely,
+# reserved for detectors that never catch real leaks): the detector stays
+# active, so a real, live secret it confirms still blocks the share.
+#
+# - ``Azure`` is TruffleHog's legacy generic Azure detector (type 3). Its
+#   broad pattern, fed through the PLAIN and BASE64 decoders, matches ordinary
+#   agent-session terminal content — ``127.0.0.1:5432`` connection lines, file
+#   paths like ``scripts/foo.sh``, ANSI color codes (``\x1b[0m``) — and
+#   Azure-API verification returns unverified for all of them. The specific
+#   Azure detectors (AzureStorage, AzureSAS, AzureBatch, …) stay active and
+#   still catch real Azure keys by type.
+NOISY_UNVERIFIED_DETECTORS: frozenset[str] = frozenset({"Azure"})
+
 INSTALL_HINT = (
     "TruffleHog is required to export shares but was not found on PATH.\n"
     "Install it with:\n"
@@ -416,6 +431,14 @@ def scan_file(path: Path) -> TruffleHogReport:
             continue
         finding = _parse_finding(parsed)
         if finding is None:
+            continue
+        # Drop structural false positives from broad detectors before they can
+        # block the gate (see NOISY_UNVERIFIED_DETECTORS). Only unverified
+        # findings are dropped; verified/unknown ones still block.
+        if (
+            finding.status == "unverified"
+            and finding.detector in NOISY_UNVERIFIED_DETECTORS
+        ):
             continue
         key = (finding.detector, finding.status, finding.line, finding.raw_sha256)
         if key in seen_keys:
