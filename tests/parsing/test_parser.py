@@ -114,6 +114,56 @@ class TestBuildProjectName:
         assert result == "claude:my-cool-project"
 
 
+class TestReadProjectCwd:
+    def test_reads_cwd_from_session_jsonl(self, tmp_path):
+        from clawjournal.parsing.parser import _read_project_cwd
+        d = tmp_path / "proj"
+        d.mkdir()
+        (d / "s.jsonl").write_text(
+            '{"type":"user","cwd":"/Users/x/Rayward/Codes/llm-gateway-infra"}\n'
+        )
+        assert _read_project_cwd(d) == "/Users/x/Rayward/Codes/llm-gateway-infra"
+
+    def test_returns_none_when_no_cwd(self, tmp_path):
+        from clawjournal.parsing.parser import _read_project_cwd
+        d = tmp_path / "proj"
+        d.mkdir()
+        (d / "s.jsonl").write_text('{"type":"user","message":{"content":"hi"}}\n')
+        assert _read_project_cwd(d) is None
+
+    def test_returns_none_for_empty_dir(self, tmp_path):
+        from clawjournal.parsing.parser import _read_project_cwd
+        d = tmp_path / "empty"
+        d.mkdir()
+        assert _read_project_cwd(d) is None
+
+    def test_reads_cwd_from_nested_subagent_file(self, tmp_path):
+        """Subagent-only projects have no root *.jsonl — cwd lives in a subdir."""
+        from clawjournal.parsing.parser import _read_project_cwd
+        d = tmp_path / "proj"
+        sa = d / "session-uuid" / "subagents"
+        sa.mkdir(parents=True)
+        (sa / "agent-a.jsonl").write_text(
+            '{"type":"user","cwd":"/Users/x/Rayward/Codes/llm-gateway-infra"}\n'
+        )
+        assert _read_project_cwd(d) == "/Users/x/Rayward/Codes/llm-gateway-infra"
+
+    def test_prefers_root_then_searches_extra_dirs(self, tmp_path):
+        """Multiple dirs are searched in order; first cwd found wins."""
+        from clawjournal.parsing.parser import _read_project_cwd
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        nested = tmp_path / "la" / "-sessions-proc"
+        nested.mkdir(parents=True)
+        (nested / "s.jsonl").write_text('{"type":"user","cwd":"/Users/x/code/app"}\n')
+        assert _read_project_cwd(empty, nested) == "/Users/x/code/app"
+
+    def test_ignores_none_and_missing_dirs(self, tmp_path):
+        from clawjournal.parsing.parser import _read_project_cwd
+        missing = tmp_path / "does-not-exist"
+        assert _read_project_cwd(None, missing) is None
+
+
 # --- _normalize_timestamp ---
 
 
@@ -617,14 +667,63 @@ class TestDiscoverProjects:
 
         session = proj / "session1.jsonl"
         session.write_text(
-            '{"type":"user","timestamp":1706000000000,"message":{"content":"Hello"},"cwd":"/tmp"}\n'
+            '{"type":"user","timestamp":1706000000000,"message":{"content":"Hello"},"cwd":"/Users/testuser/code/test-project"}\n'
             '{"type":"assistant","timestamp":1706000001000,"message":{"model":"m","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":1,"output_tokens":1}}}\n'
         )
 
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", projects_dir)
         sessions = parse_project_sessions("test-project", mock_anonymizer)
         assert len(sessions) == 1
+        # Project is the cwd basename (consistent with codex/opencode/openclaw).
         assert sessions[0]["project"] == "claude:test-project"
+
+    def test_parse_project_sessions_uses_cwd_basename_for_hyphenated_project(
+        self, tmp_path, monkeypatch, mock_anonymizer
+    ):
+        """Regression: a project folder whose own name contains hyphens (e.g.
+        'llm-gateway-infra') must yield just the basename. The hyphen-encoded
+        dir name is ambiguous, so the real cwd in the session content is used —
+        otherwise it leaks the full path as 'claude:Rayward-Codes-...'."""
+        self._disable_codex(tmp_path, monkeypatch)
+        projects_dir = tmp_path / "projects"
+        dir_name = "-Users-testuser-Rayward-Codes-llm-gateway-infra"
+        proj = projects_dir / dir_name
+        proj.mkdir(parents=True)
+        (proj / "session1.jsonl").write_text(
+            '{"type":"user","timestamp":1706000000000,"message":{"content":"Hi"},'
+            '"cwd":"/Users/testuser/Rayward/Codes/llm-gateway-infra"}\n'
+            '{"type":"assistant","timestamp":1706000001000,"message":{"model":"m",'
+            '"content":[{"type":"text","text":"Ok"}],"usage":{"input_tokens":1,"output_tokens":1}}}\n'
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", projects_dir)
+        sessions = parse_project_sessions(dir_name, mock_anonymizer)
+        assert len(sessions) == 1
+        assert sessions[0]["project"] == "claude:llm-gateway-infra"
+
+    def test_subagent_only_project_uses_cwd_basename(
+        self, tmp_path, monkeypatch, mock_anonymizer
+    ):
+        """Subagent-only native projects (no root *.jsonl) still recover the
+        basename from the cwd recorded in the nested subagent transcript."""
+        self._disable_codex(tmp_path, monkeypatch)
+        projects_dir = tmp_path / "projects"
+        dir_name = "-Users-testuser-Rayward-Codes-llm-gateway-infra"
+        proj = projects_dir / dir_name
+        sa = proj / "session-uuid" / "subagents"
+        sa.mkdir(parents=True)
+        (sa / "agent-a.jsonl").write_text(
+            json.dumps(_make_subagent_entry(
+                "user", "Do work", "2026-01-01T00:00:00Z",
+                cwd="/Users/testuser/Rayward/Codes/llm-gateway-infra",
+            )) + "\n"
+            + json.dumps(_make_subagent_entry(
+                "assistant", "Done", "2026-01-01T00:00:01Z",
+            )) + "\n"
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", projects_dir)
+        sessions = parse_project_sessions(dir_name, mock_anonymizer)
+        assert len(sessions) == 1
+        assert sessions[0]["project"] == "claude:llm-gateway-infra"
 
     def test_parse_nonexistent_project(self, tmp_path, monkeypatch, mock_anonymizer):
         self._disable_codex(tmp_path, monkeypatch)
@@ -2074,7 +2173,7 @@ class TestDiscoverCustomProjects:
 # --- Claude Desktop local-agent support ---
 
 _VALID_CLAUDE_JSONL = (
-    '{"type":"user","timestamp":1706000000000,"message":{"content":"Hello"},"cwd":"/tmp","sessionId":"sess-001"}\n'
+    '{"type":"user","timestamp":1706000000000,"message":{"content":"Hello"},"cwd":"/Users/testuser/code/test-project","sessionId":"sess-001"}\n'
     '{"type":"assistant","timestamp":1706000001000,"message":{"model":"claude-sonnet-4","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":1,"output_tokens":1}}}\n'
 )
 
@@ -2430,6 +2529,46 @@ class TestParseProjectSessionsWithLocator:
         assert sessions[0]["outer_session_id"] == "local_xyz"
         assert sessions[0]["raw_source_path"] is not None
         assert sessions[0]["source"] == "claude"
+
+    def test_la_only_session_uses_cwd_basename(self, tmp_path, monkeypatch, mock_anonymizer):
+        """Local-agent-only projects (no native_project_dir) recover the
+        basename from the cwd in the nested transcript, not the hyphenated key."""
+        la_dir = tmp_path / "local-agent"
+        _setup_local_agent_session(
+            la_dir,
+            session_id="local_hy",
+            cli_session_id="sess-hy",
+            user_selected_folders=["/Users/testuser/Rayward/Codes/llm-gateway-infra"],
+            jsonl_content=(
+                '{"type":"user","timestamp":1706000000000,"message":{"content":"Hi"},'
+                '"cwd":"/Users/testuser/Rayward/Codes/llm-gateway-infra"}\n'
+                '{"type":"assistant","timestamp":1706000001000,"message":{"model":"m",'
+                '"content":[{"type":"text","text":"Ok"}],"usage":{"input_tokens":1,"output_tokens":1}}}\n'
+            ),
+        )
+        nested_dir = la_dir / _ROOT_UUID / _WORKSPACE_UUID / "local_hy" / ".claude" / "projects" / "-sessions-test-process"
+
+        locator = {
+            "native_project_dir": None,
+            "local_agent_sessions": [{
+                "wrapper_path": la_dir / _ROOT_UUID / _WORKSPACE_UUID / "local_hy.json",
+                "session_dir": la_dir / _ROOT_UUID / _WORKSPACE_UUID / "local_hy",
+                "nested_project_dir": nested_dir,
+                "audit_path": None,
+                "cli_session_id": "sess-hy",
+                "outer_session_id": "local_hy",
+                "process_name": "test-process",
+                "wrapper_meta": {"title": "Test", "model": "claude-sonnet-4", "createdAt": 1706000000000, "lastActivityAt": 1706000001000},
+            }],
+        }
+
+        sessions = parse_project_sessions(
+            "-Users-testuser-Rayward-Codes-llm-gateway-infra",
+            mock_anonymizer,
+            locator=locator,
+        )
+        assert len(sessions) == 1
+        assert sessions[0]["project"] == "claude:llm-gateway-infra"
 
     def test_locator_none_backward_compatible(self, tmp_path, monkeypatch, mock_anonymizer):
         """When locator=None, behaves exactly as before."""

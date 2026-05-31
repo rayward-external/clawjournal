@@ -831,6 +831,29 @@ def parse_project_sessions(
     elif not locator:
         native_dir = PROJECTS_DIR / project_dir_name
 
+    # Prefer the basename of the real cwd recorded in the session content. The
+    # hyphen-encoded dir name can't be split back into a basename when a folder
+    # name itself contains hyphens (e.g. "llm-gateway-infra"), which is why the
+    # dir-name heuristic leaks the full path (claude:Rayward-Codes-...). This
+    # keeps Claude consistent with codex/opencode/openclaw (basename only).
+    # Cover every Claude session location: native root sessions, subagent-only
+    # transcripts (read recursively below native_dir), and local-agent nested
+    # project dirs — all of which record an absolute cwd.
+    if not project_dir_name.startswith("_cowork_"):
+        cwd_dirs: list[Path] = []
+        if native_dir:
+            cwd_dirs.append(native_dir)
+        if locator:
+            for la_session in locator.get("local_agent_sessions", []):
+                nested = la_session.get("nested_project_dir")
+                if nested:
+                    cwd_dirs.append(nested)
+        cwd = _read_project_cwd(*cwd_dirs)
+        if cwd:
+            # `or cwd` guards a root cwd ("/") whose basename is empty, matching
+            # the codex/opencode builders.
+            project_name = f"claude:{Path(cwd).name or cwd}"
+
     if native_dir and native_dir.exists():
         for session_file in sorted(native_dir.glob("*.jsonl")):
             parsed = _parse_claude_session_file(session_file, anonymizer, include_thinking)
@@ -2097,6 +2120,62 @@ def _extract_codex_cwd(session_file: Path) -> str | None:
                     return cwd
     except OSError:
         return None
+    return None
+
+
+def _first_cwd_in_session_file(session_file: Path) -> str | None:
+    """Return the first absolute ``cwd`` recorded in a session JSONL, or None."""
+    try:
+        with open(session_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = obj.get("cwd") if isinstance(obj, dict) else None
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def _read_project_cwd(*project_dirs: Path) -> str | None:
+    """Recover the project's real working directory from session content.
+
+    Claude encodes the project dir name as the cwd with ``/`` replaced by
+    ``-``, which is lossy when a folder name itself contains ``-`` (e.g.
+    ``llm-gateway-infra`` is indistinguishable from ``llm/gateway/infra``).
+    Each Claude session JSONL records the absolute ``cwd``, so reading it
+    recovers the true basename. Searches the given directories — root sessions
+    first, then nested subagent / local-agent transcripts — and returns the
+    first ``cwd`` found, or None."""
+    for project_dir in project_dirs:
+        if not project_dir:
+            continue
+        try:
+            roots = sorted(project_dir.glob("*.jsonl"))
+        except OSError:
+            roots = []
+        for session_file in roots:
+            cwd = _first_cwd_in_session_file(session_file)
+            if cwd:
+                return cwd
+        # Nested fallback: subagent-only projects have no root *.jsonl; subagent
+        # and local-agent transcripts live in subdirectories. Materialize inside
+        # the try — rglob is lazy and raises OSError during iteration (e.g. an
+        # unreadable subdir), not at creation — and sort for deterministic order.
+        try:
+            nested = sorted(project_dir.rglob("*.jsonl"))
+        except OSError:
+            nested = []
+        for session_file in nested:
+            cwd = _first_cwd_in_session_file(session_file)
+            if cwd:
+                return cwd
     return None
 
 
