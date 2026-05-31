@@ -15,6 +15,9 @@ export interface DoneStepProps {
   onNew: () => void;
   globalStyles: React.ReactNode;
   shareDestination: ShareDestination | null;
+  destinationLoading: boolean;
+  destinationFailed: boolean;
+  onRetryDestination: () => void;
 }
 
 export function DoneStep(p: DoneStepProps) {
@@ -155,7 +158,35 @@ export function DoneStep(p: DoneStepProps) {
           >
             <Icon name="download" size={15} /> Download zip
           </button>
-          {hostedShareUrl && !submitted && (
+          {!submitted && p.destinationLoading && (
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', gap: 8,
+              padding: '11px 20px', background: colors.white, color: colors.gray400,
+              border: `1px solid ${colors.gray200}`, borderRadius: 8,
+              fontSize: 14, fontWeight: 600,
+            }}>
+              <span style={{
+                width: 13, height: 13, borderRadius: '50%',
+                border: `2px solid ${colors.gray200}`, borderTopColor: colors.gray400,
+                animation: 'clawSpin 0.7s linear infinite',
+              }} />
+              Checking submission options…
+            </span>
+          )}
+          {!submitted && !p.destinationLoading && p.destinationFailed && (
+            <button
+              onClick={p.onRetryDestination}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 8,
+                padding: '11px 20px', background: colors.white, color: colors.gray900,
+                border: `1px solid ${colors.gray300}`, borderRadius: 8,
+                fontSize: 14, fontWeight: 600, cursor: 'pointer',
+              }}
+            >
+              <Icon name="retry" size={14} /> Retry submission check
+            </button>
+          )}
+          {!submitted && !p.destinationLoading && !p.destinationFailed && hostedShareUrl && (
             <a
               href={hostedShareUrl}
               target="_blank"
@@ -177,6 +208,10 @@ export function DoneStep(p: DoneStepProps) {
               {p.hostedStatus ? `Status: ${p.hostedStatus}. ` : null}
               {p.supportContact ? `For deletion or withdrawal, contact ${p.supportContact} with the receipt ID.` : null}
             </>
+          ) : p.destinationLoading ? (
+            <>Checking whether hosted submission is available…</>
+          ) : p.destinationFailed ? (
+            <>Couldn&rsquo;t reach the submission service. Your redacted zip is saved locally — retry above to check for the Submit option.</>
           ) : hostedShareLabel ? (
             <>
               Upload this zip at <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}>{hostedShareLabel}</span> to contribute to research.

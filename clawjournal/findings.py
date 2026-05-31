@@ -523,23 +523,32 @@ def _resolve_field_text(blob: dict[str, Any], finding: Finding) -> str | None:
 
     # tool_uses[<idx>].<input|output> or tool_uses[<idx>].<input|output>.<key>
     match = re.match(r"tool_uses\[(\d+)\]\.(\w+)(?:\.(.+))?$", field)
-    if not match:
-        return None
-    tool_idx = int(match.group(1))
-    branch = match.group(2)
-    nested_key = match.group(3)
-    tool_uses = msg.get("tool_uses")
-    if not isinstance(tool_uses, list) or tool_idx >= len(tool_uses):
-        return None
-    tool = tool_uses[tool_idx]
-    if not isinstance(tool, dict):
-        return None
-    value = tool.get(branch)
-    if nested_key:
-        if isinstance(value, dict) and isinstance(value.get(nested_key), str):
-            return value[nested_key]
-        return None
-    return value if isinstance(value, str) else None
+    if match:
+        tool_idx = int(match.group(1))
+        branch = match.group(2)
+        nested_key = match.group(3)
+        tool_uses = msg.get("tool_uses")
+        if not isinstance(tool_uses, list) or tool_idx >= len(tool_uses):
+            return None
+        tool = tool_uses[tool_idx]
+        if not isinstance(tool, dict):
+            return None
+        value = tool.get(branch)
+        if nested_key:
+            if isinstance(value, dict) and isinstance(value.get(nested_key), str):
+                return value[nested_key]
+            return None
+        return value if isinstance(value, str) else None
+
+    # Widened message model (author / invocations[...] / snippets[...] /
+    # extra.*). The labels come from iter_widened_text_locations; resolve by
+    # re-walking and matching the label rather than re-parsing the path.
+    from .parsing.widened import iter_widened_text_locations  # noqa: PLC0415 — lazy
+
+    for text, label in iter_widened_text_locations(msg):
+        if label == field:
+            return text
+    return None
 
 
 def derive_preview(

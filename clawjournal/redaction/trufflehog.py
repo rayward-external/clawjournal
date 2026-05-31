@@ -73,6 +73,30 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
 #   returns ``unverified`` for those, so they are never real leaks.
 EXCLUDED_DETECTORS: tuple[str, ...] = ("refiner",)
 
+# Detectors whose UNVERIFIED findings are dropped as structural false
+# positives, while their verified/unknown findings still block. This is
+# narrower than EXCLUDED_DETECTORS (which disables a detector entirely,
+# reserved for detectors that never catch real leaks): the detector stays
+# active, so a real, live secret it confirms still blocks the share.
+#
+# - ``Azure`` is TruffleHog's legacy generic Azure detector (type 3). Its
+#   broad pattern, fed through the PLAIN and BASE64 decoders, matches ordinary
+#   agent-session terminal content — ``127.0.0.1:5432`` connection lines, file
+#   paths like ``scripts/foo.sh``, ANSI color codes (``\x1b[0m``) — and
+#   Azure-API verification returns unverified for all of them. The specific
+#   Azure detectors (AzureStorage, AzureSAS, AzureBatch, …) stay active and
+#   still catch real Azure keys by type.
+NOISY_UNVERIFIED_DETECTORS: frozenset[str] = frozenset({"Azure"})
+
+
+def _is_suppressed_noise(detector: str, status: str) -> bool:
+    """True for a structural false positive to drop: an UNVERIFIED finding
+    from a broad detector in NOISY_UNVERIFIED_DETECTORS. Applied uniformly by
+    the gate (``scan_file``) and the redaction-engine path
+    (``_scan_text_for_raw_matches``) so they never disagree about what counts
+    as a secret — verified/unknown findings from those detectors still count."""
+    return status == "unverified" and detector in NOISY_UNVERIFIED_DETECTORS
+
 INSTALL_HINT = (
     "TruffleHog is required to export shares but was not found on PATH.\n"
     "Install it with:\n"
@@ -417,6 +441,10 @@ def scan_file(path: Path) -> TruffleHogReport:
         finding = _parse_finding(parsed)
         if finding is None:
             continue
+        # Drop structural false positives from broad detectors (see
+        # NOISY_UNVERIFIED_DETECTORS) before they can block the gate.
+        if _is_suppressed_noise(finding.detector, finding.status):
+            continue
         key = (finding.detector, finding.status, finding.line, finding.raw_sha256)
         if key in seen_keys:
             continue
@@ -562,6 +590,10 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
         if not isinstance(detector, str) or not isinstance(raw, str) or not raw:
             continue
         status = _classify_trufflehog_status(parsed)
+        # Same suppression as the gate: a broad detector's unverified false
+        # positives must not be redacted as fake secrets either.
+        if _is_suppressed_noise(detector, status):
+            continue
         key = (detector, raw)
         if key in seen:
             continue
@@ -576,10 +608,18 @@ def placeholder_for_detector(detector: str) -> str:
     return f"[REDACTED_{normalized}]" if normalized else "[REDACTED_TRUFFLEHOG]"
 
 
-def _iter_session_text_fields(session: dict):
+def _iter_session_text_fields(session: dict, *, include_widened: bool = False):
     """Yield ``(text, field, msg_idx, tool_field)`` for every scannable
     string in ``session``. Mirrors ``secrets._iter_text_locations`` but
-    returns only what the findings-engine entry point needs."""
+    returns only what the findings-engine entry point needs.
+
+    ``include_widened`` adds the widened message fields (author / invocations
+    / snippets / extra). It is used for finding RELOCATION only — the scan
+    payload deliberately omits them, since the full-JSON serialization in
+    ``_serialize_session_for_scan`` already covers them and duplicating large
+    widened values would push big sessions past the engine's size cap."""
+    from ..parsing.widened import iter_widened_text_locations  # noqa: PLC0415 — lazy
+
     for field_name in ("display_title", "project", "git_branch"):
         val = session.get(field_name)
         if isinstance(val, str) and val:
@@ -608,6 +648,14 @@ def _iter_session_text_fields(session: dict):
                                 msg_idx,
                                 branch,
                             )
+        # Widened message model — mirror secrets._iter_text_locations so
+        # TruffleHog hits in author/invocations/snippets/extra also surface as
+        # reviewable findings (apply-time redaction already covers them via the
+        # blob re-scan in trufflehog_secret_map_from_blob). Relocation only:
+        # see the docstring on why the scan payload omits these.
+        if include_widened:
+            for widened_text, field_label in iter_widened_text_locations(msg):
+                yield widened_text, field_label, msg_idx, None
 
 
 def _serialize_session_for_scan(session: dict) -> str:
@@ -648,7 +696,9 @@ def scan_session_for_trufflehog_findings(
             continue
         detector = match["detector"]
         confidence = 1.0 if match["status"] == "verified" else 0.9
-        for text, field_name, msg_idx, tool_field in _iter_session_text_fields(session):
+        for text, field_name, msg_idx, tool_field in _iter_session_text_fields(
+            session, include_widened=True
+        ):
             start = 0
             while True:
                 idx = text.find(raw, start)
