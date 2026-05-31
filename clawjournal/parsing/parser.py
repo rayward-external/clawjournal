@@ -334,6 +334,36 @@ def _build_cowork_project_name(workspace_key: str, la_sessions: list[dict]) -> s
     return f"claude:cowork/{outer_id[:12]}"
 
 
+def _claude_cwd_dirs(
+    native_dir: Path | None = None,
+    local_agent_sessions: list[dict] | None = None,
+) -> list[Path]:
+    """Return Claude transcript dirs that may contain a recorded cwd."""
+    dirs: list[Path] = []
+    if native_dir:
+        dirs.append(native_dir)
+    for la_session in local_agent_sessions or []:
+        nested = la_session.get("nested_project_dir")
+        if nested:
+            dirs.append(nested)
+    return dirs
+
+
+def _build_claude_project_name(
+    project_dir_name: str,
+    *,
+    native_dir: Path | None = None,
+    local_agent_sessions: list[dict] | None = None,
+) -> str:
+    if project_dir_name.startswith("_cowork_"):
+        return _build_cowork_project_name(project_dir_name, local_agent_sessions or [])
+
+    cwd = _read_project_cwd(*_claude_cwd_dirs(native_dir, local_agent_sessions))
+    if cwd:
+        return f"claude:{Path(cwd).name or cwd}"
+    return _build_project_name(project_dir_name)
+
+
 def discover_projects(source_filter: str | None = None) -> list[dict]:
     """Discover supported source projects with optional source filtering."""
     discovery_by_source = {
@@ -385,7 +415,10 @@ def _discover_claude_projects() -> list[dict]:
                     total_size += sa_file.stat().st_size
             canonical[project_dir.name] = {
                 "dir_name": project_dir.name,
-                "display_name": _build_project_name(project_dir.name),
+                "display_name": _build_claude_project_name(
+                    project_dir.name,
+                    native_dir=project_dir,
+                ),
                 "session_count": total_count,
                 "total_size_bytes": total_size,
                 "source": CLAUDE_SOURCE,
@@ -402,6 +435,11 @@ def _discover_claude_projects() -> list[dict]:
         if workspace_key in canonical:
             # Merge into existing native project
             canonical[workspace_key]["locator"]["local_agent_sessions"].extend(la_sessions)
+            canonical[workspace_key]["display_name"] = _build_claude_project_name(
+                workspace_key,
+                native_dir=canonical[workspace_key]["locator"]["native_project_dir"],
+                local_agent_sessions=canonical[workspace_key]["locator"]["local_agent_sessions"],
+            )
             native_ids = _get_native_session_ids(canonical[workspace_key]["locator"]["native_project_dir"])
             new_la = [s for s in la_sessions if s["cli_session_id"] not in native_ids and s.get("nested_project_dir")]
             canonical[workspace_key]["session_count"] += len(new_la)
@@ -410,10 +448,10 @@ def _discover_claude_projects() -> list[dict]:
             )
         else:
             # New project from local-agent only
-            if workspace_key.startswith("_cowork_"):
-                display_name = _build_cowork_project_name(workspace_key, la_sessions)
-            else:
-                display_name = _build_project_name(workspace_key)
+            display_name = _build_claude_project_name(
+                workspace_key,
+                local_agent_sessions=la_sessions,
+            )
             parseable = [s for s in la_sessions if s.get("nested_project_dir")]
             canonical[workspace_key] = {
                 "dir_name": workspace_key,
@@ -815,15 +853,6 @@ def parse_project_sessions(
     sessions = []
     seen_session_ids: set[str] = set()
 
-    # Determine project display name
-    if project_dir_name.startswith("_cowork_"):
-        project_name = _build_cowork_project_name(
-            project_dir_name,
-            locator.get("local_agent_sessions", []) if locator else [],
-        )
-    else:
-        project_name = _build_project_name(project_dir_name)
-
     # Priority 1: Native ~/.claude/projects
     native_dir = None
     if locator and locator.get("native_project_dir"):
@@ -831,28 +860,11 @@ def parse_project_sessions(
     elif not locator:
         native_dir = PROJECTS_DIR / project_dir_name
 
-    # Prefer the basename of the real cwd recorded in the session content. The
-    # hyphen-encoded dir name can't be split back into a basename when a folder
-    # name itself contains hyphens (e.g. "llm-gateway-infra"), which is why the
-    # dir-name heuristic leaks the full path (claude:Rayward-Codes-...). This
-    # keeps Claude consistent with codex/opencode/openclaw (basename only).
-    # Cover every Claude session location: native root sessions, subagent-only
-    # transcripts (read recursively below native_dir), and local-agent nested
-    # project dirs — all of which record an absolute cwd.
-    if not project_dir_name.startswith("_cowork_"):
-        cwd_dirs: list[Path] = []
-        if native_dir:
-            cwd_dirs.append(native_dir)
-        if locator:
-            for la_session in locator.get("local_agent_sessions", []):
-                nested = la_session.get("nested_project_dir")
-                if nested:
-                    cwd_dirs.append(nested)
-        cwd = _read_project_cwd(*cwd_dirs)
-        if cwd:
-            # `or cwd` guards a root cwd ("/") whose basename is empty, matching
-            # the codex/opencode builders.
-            project_name = f"claude:{Path(cwd).name or cwd}"
+    project_name = _build_claude_project_name(
+        project_dir_name,
+        native_dir=native_dir,
+        local_agent_sessions=locator.get("local_agent_sessions", []) if locator else [],
+    )
 
     if native_dir and native_dir.exists():
         for session_file in sorted(native_dir.glob("*.jsonl")):

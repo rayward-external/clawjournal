@@ -25,6 +25,7 @@ from clawjournal.workbench.index import (
     query_unscored_sessions,
     remove_policy,
     search_fts,
+    session_matches_excluded_projects,
     set_hold_state,
     update_session,
     upsert_sessions,
@@ -1051,6 +1052,17 @@ class TestShares:
 
         assert [s["session_id"] for s in stats["sessions"]] == ["public"]
         assert stats["recommended_session_ids"] == ["public"]
+
+    def test_exclusion_matches_legacy_claude_hyphenated_name(self):
+        session = {
+            "project": "claude:llm-gateway-infra",
+            "source": "claude",
+        }
+
+        assert session_matches_excluded_projects(
+            session,
+            ["claude:Rayward-Codes-llm-gateway-infra"],
+        )
 
 
 class TestPolicies:

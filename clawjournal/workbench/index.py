@@ -926,7 +926,23 @@ def session_matches_excluded_projects(
     candidates = {project}
     if isinstance(source, str) and source and ":" not in project:
         candidates.add(f"{source}:{project}")
-    return any(candidate in excluded_projects for candidate in candidates)
+    if any(candidate in excluded_projects for candidate in candidates):
+        return True
+
+    # Pre-basename Claude config entries looked like claude:path-to-project.
+    # Keep them protective after sessions are re-keyed to claude:project.
+    if project.startswith("claude:"):
+        basename = project.removeprefix("claude:")
+        if basename and not basename.startswith(("cowork/", "~")):
+            legacy_suffix = f"-{basename}"
+            for excluded in excluded_projects:
+                if not isinstance(excluded, str):
+                    continue
+                legacy_name = excluded.removeprefix("claude:")
+                if legacy_name != basename and legacy_name.endswith(legacy_suffix):
+                    return True
+
+    return False
 
 
 def get_effective_share_settings(
