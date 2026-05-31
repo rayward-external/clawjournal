@@ -93,6 +93,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
 AUTO_SCORE_BATCH_SIZE = 20
+# Don't auto-score a session until it has been quiet this long. Prevents
+# grading a still-running trace mid-flight (which then never gets corrected),
+# and keeps the re-score-on-growth path from churning on an active session.
+SCORE_SETTLE_SECONDS = 180
 SCORING_DISPLAY_NAMES = {
     "claude": "Claude Code",
     "codex": "Codex",
@@ -361,11 +365,18 @@ class Scanner:
                 # age cap (`since` is None for the background path). The
                 # `limit` bounds cost; callers that want a rolling window
                 # (CLI `--window`) pass `since` explicitly.
+                #
+                # `include_stale_scored` also re-selects sessions that were
+                # graded mid-flight and then grew (end_time advanced past
+                # ai_scored_at); `settle_seconds` defers sessions that are still
+                # active so we don't grade them prematurely in the first place.
                 sessions = query_unscored_sessions(
                     conn,
                     limit=limit,
                     source=FAILURE_VALUE_SOURCE_SCOPE,
                     since=since,
+                    include_stale_scored=True,
+                    settle_seconds=SCORE_SETTLE_SECONDS,
                 )
                 if not sessions:
                     return 0
