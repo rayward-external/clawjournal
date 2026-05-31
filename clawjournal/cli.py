@@ -7,7 +7,7 @@ import sys
 import urllib.error
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, cast
 
@@ -65,7 +65,7 @@ WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "opencode", "openclaw", "cursor",
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
-SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-v1", "all", "auto", "both"}
+SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-corpus", "failure-v1", "all", "auto", "both"}
 
 
 def _mask_secret(s: str) -> str:
@@ -89,12 +89,12 @@ def _normalize_score_source_filter(raw: str | None) -> str | list[str] | None:
     if raw is None:
         return list(FAILURE_VALUE_SOURCE_SCOPE)
     value = raw.strip().lower()
-    if value in ("", "failure-v1"):
+    if value in ("", "failure-corpus", "failure-v1"):
         return list(FAILURE_VALUE_SOURCE_SCOPE)
     if value == "both":
         print(
             "Warning: --source both is deprecated for scoring; use "
-            "--source failure-v1 or --source claude,codex,opencode,openclaw.",
+            "--source failure-corpus or --source claude,codex,opencode,openclaw.",
             file=sys.stderr,
         )
         return ["claude", "codex"]
@@ -363,10 +363,12 @@ def _merge_config_list(config: ClawJournalConfig, key: str, new_values: list[str
 def configure(
     repo: str | None = None,
     source: str | None = None,
+    scorer_backend: str | None = None,
     exclude: list[str] | None = None,
     redact: list[str] | None = None,
     redact_usernames: list[str] | None = None,
     confirm_projects: bool = False,
+    ai_pii_review: bool | None = None,
 ):
     """Set config values non-interactively. Lists are MERGED (append), not replaced."""
     config = load_config()
@@ -374,6 +376,13 @@ def configure(
         config["repo"] = repo
     if source is not None:
         config["source"] = source
+    if scorer_backend is not None:
+        if scorer_backend == "none":
+            config.pop("scorer_backend", None)
+            config.pop("scorer_backend_confirmed_at", None)
+        else:
+            config["scorer_backend"] = scorer_backend
+            config["scorer_backend_confirmed_at"] = datetime.now(timezone.utc).isoformat()
     if exclude is not None:
         if config.get("excluded_projects"):
             config["excluded_projects"] = normalize_excluded_project_names(
@@ -390,6 +399,8 @@ def configure(
         _merge_config_list(config, "redact_usernames", redact_usernames)
     if confirm_projects:
         config["projects_confirmed"] = True
+    if ai_pii_review is not None:
+        config["ai_pii_review_enabled"] = ai_pii_review
     save_config(config)
     print(f"Config saved to {CONFIG_FILE}")
     print(json.dumps(_mask_config_for_display(config), indent=2))
@@ -1510,6 +1521,16 @@ def _run_bundle_export(args) -> None:
 
     config = load_config()
 
+    # AI-PII review only runs inside the uploadable-zip finalize pass, so the
+    # flag is a no-op for a plain on-disk export. Warn instead of silently
+    # ignoring it.
+    if getattr(args, "ai_pii_review", False) is True and getattr(args, "zip", False) is not True:
+        print(
+            "Note: --ai-pii-review only applies when building the uploadable zip; "
+            "pass --zip to enable it.",
+            file=sys.stderr,
+        )
+
     conn = open_index()
     try:
         settings = get_effective_share_settings(conn, config)
@@ -1550,7 +1571,11 @@ def _run_bundle_export(args) -> None:
         if getattr(args, "zip", False) is True:
             from .workbench.daemon import finalize_share_export_for_upload
 
-            error, manifest = finalize_share_export_for_upload(export_dir, manifest)
+            error, manifest = finalize_share_export_for_upload(
+                export_dir,
+                manifest,
+                ai_pii=getattr(args, "ai_pii_review", False) is True,
+            )
             if error:
                 if error.get("block_reason"):
                     print(f"Share blocked: {error.get('block_reason')}")
@@ -1625,6 +1650,22 @@ _REDACTION_TYPE_LABELS: dict[str, str] = {
 }
 
 
+def _daemon_port_is_open(port: int) -> bool:
+    """Return True if the local workbench daemon appears to be listening.
+
+    The check is intentionally cheap — a short-timeout TCP connect on
+    127.0.0.1:<port>. False negatives (timeouts, ECONNREFUSED) are fine; we
+    use the result only to nudge the user toward `clawjournal serve`.
+    """
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
 def _format_redaction_summary(redaction_summary: dict) -> str:
     """Format a redaction summary dict into a human-readable string."""
     total = redaction_summary.get("total_redactions", 0)
@@ -1692,6 +1733,8 @@ def _print_share_pii_warning(output_json: bool = False) -> dict[str, Any]:
 def _run_verify_email(args) -> None:
     """Handle the verify-email CLI command."""
     from .workbench.daemon import (
+        _expiry_is_valid,
+        _hosted_is_local_dev,
         _is_edu_email,
         confirm_email_verification,
         request_email_verification,
@@ -1703,9 +1746,8 @@ def _run_verify_email(args) -> None:
 
     if not args.email and not args.code:
         if existing and existing_token:
-            import time as _time
             expires_at = config.get("verified_email_token_expires_at", 0)
-            expired = not isinstance(expires_at, (int, float)) or _time.time() >= expires_at
+            expired = not _expiry_is_valid(expires_at, grace_seconds=0)
             status = "expired" if expired else "verified"
             info: dict = {"verified_email": existing, "status": status}
             if expired:
@@ -1716,13 +1758,13 @@ def _run_verify_email(args) -> None:
         elif existing:
             print(json.dumps({
                 "error": "No active upload token. Re-verify your email before sharing.",
-                "hint": "Run `clawjournal verify-email <your-email@university.edu>` again.",
+                "hint": "Run `clawjournal verify-email <your-email@academic-domain>` again.",
             }, indent=2))
             sys.exit(1)
         else:
             print(json.dumps({
-                "error": "No verified email. Usage: clawjournal verify-email <your-email@university.edu>",
-                "hint": "Only .edu email addresses are accepted.",
+                "error": "No verified email. Usage: clawjournal verify-email <your-email@academic-domain>",
+                "hint": "Academic email addresses are accepted.",
             }, indent=2))
             sys.exit(1)
         return
@@ -1734,8 +1776,8 @@ def _run_verify_email(args) -> None:
 
     if not _is_edu_email(email):
         print(json.dumps({
-            "error": f"'{email}' is not a .edu email address.",
-            "hint": "Only .edu email addresses are accepted for data sharing.",
+            "error": f"'{email}' is not an accepted academic email address.",
+            "hint": "Use an academic email address, or contact support if you are an explicit collaborator.",
         }, indent=2))
         sys.exit(1)
 
@@ -1743,43 +1785,41 @@ def _run_verify_email(args) -> None:
         # Step 2: Confirm with verification code
         try:
             result = confirm_email_verification(email, args.code)
-        except (OSError, ValueError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             print(json.dumps({"error": f"Verification failed: {e}"}, indent=2))
             sys.exit(1)
 
-        if result.get("verified"):
-            expires_at = result.get("upload_token_expires_at", 0)
-            print(json.dumps({
-                "verified_email": email.strip().lower(),
-                "status": "verified",
-                "message": "Email verified! Upload token valid for one upload within 1 hour.",
-                "upload_token_expires_at": expires_at,
-            }, indent=2))
-        else:
-            print(json.dumps({
-                "error": result.get("error", "Verification failed."),
-                "hint": "Check the code and try again, or request a new code.",
-            }, indent=2))
-            sys.exit(1)
+        expires_at = result.get("upload_token_expires_at", 0)
+        print(json.dumps({
+            "verified_email": email.strip().lower(),
+            "status": "verified",
+            "message": "Email verified. Submit from the workbench Share tab to review consent terms.",
+            "upload_token_expires_at": expires_at,
+        }, indent=2))
     else:
         # Step 1: Request verification
         try:
-            request_email_verification(email)
-        except (OSError, ValueError) as e:
+            result = request_email_verification(email)
+        except (OSError, RuntimeError, ValueError) as e:
             print(json.dumps({"error": f"Request failed: {e}"}, indent=2))
             sys.exit(1)
 
-        print(json.dumps({
+        payload = {
             "status": "verification_sent",
             "email": email.strip().lower(),
-            "message": "If the ingest service is configured correctly, you will receive a verification code by email.",
+            "message": "You will receive a verification code by email.",
             "next_command": f"clawjournal verify-email {email} --code <CODE>",
-        }, indent=2))
+        }
+        # `dev_code` is a local-development convenience; only surface it when the
+        # hosted service is a local/dev deployment, never against production.
+        if result.get("dev_code") and _hosted_is_local_dev():
+            payload["dev_code"] = result["dev_code"]
+        print(json.dumps(payload, indent=2))
 
 
 def _run_bundle_share(args) -> None:
-    """Share a bundle via the ingest service."""
-    from .workbench.daemon import ensure_share_upload_ready, upload_share
+    """Share a bundle via the explicit self-hosted ingest service."""
+    from .workbench.daemon import upload_share_to_self_hosted_ingest
     from .workbench.index import get_effective_share_settings, open_index
 
     config = load_config()
@@ -1792,10 +1832,8 @@ def _run_bundle_share(args) -> None:
             print(f"Bundle not found: {args.share_id}")
             sys.exit(1)
 
-        ensure_share_upload_ready()
-
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        result = upload_share(
+        result = upload_share_to_self_hosted_ingest(
             conn,
             share_id,
             force=args.force,
@@ -1804,6 +1842,7 @@ def _run_bundle_share(args) -> None:
             excluded_projects=settings["excluded_projects"],
             blocked_domains=settings["blocked_domains"],
             allowlist_entries=settings["allowlist_entries"],
+            ai_pii_review_enabled=getattr(args, "ai_pii_review", False) is True,
         )
         if result.get("ok"):
             if getattr(args, "json", False):
@@ -1830,10 +1869,11 @@ def _run_bundle_share(args) -> None:
 
 
 def _run_share(args) -> None:
-    """One-step: create bundle + export + share. With --preview, show bundle contents."""
-    from .workbench.daemon import ensure_share_upload_ready
+    """Create and package a share. Hosted submission happens in the workbench."""
     from .workbench.index import (
+        create_share,
         get_effective_share_settings,
+        get_share,
         open_index,
         query_sessions,
         session_matches_excluded_projects,
@@ -1882,36 +1922,63 @@ def _run_share(args) -> None:
                 _share_preview(session_rows, output_json=False)
             return
 
-        ensure_share_upload_ready()
-
-        # PII redaction is now mandatory inside upload_share() itself
-        from .workbench.daemon import upload_share
-        from .workbench.index import create_share
+        from .workbench.daemon import _prepare_share_export_for_upload
 
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
         share_id = create_share(conn, session_ids, note=args.note)
-        result = upload_share(
+        share = get_share(conn, share_id)
+        if share is None:
+            print("Share failed: newly created share could not be loaded.")
+            sys.exit(1)
+        # The explicit --ai-pii-review flag forces AI review on; otherwise fall
+        # back to the persisted config default (clawjournal config --ai-pii-review).
+        ai_pii_review = (
+            getattr(args, "ai_pii_review", False) is True
+            or bool(settings.get("ai_pii_review_enabled", False))
+        )
+        export_dir, manifest, error = _prepare_share_export_for_upload(
             conn,
             share_id,
-            force=args.force,
-            custom_strings=settings["custom_strings"],
-            extra_usernames=settings["extra_usernames"],
-            excluded_projects=settings["excluded_projects"],
-            blocked_domains=settings["blocked_domains"],
-            allowlist_entries=settings["allowlist_entries"],
+            share,
+            settings,
+            reuse_finalized=True,
+            ai_pii_review_enabled=ai_pii_review,
         )
+        if error:
+            print(error.get("error", "Share failed."))
+            sys.exit(1)
+        if export_dir is None:
+            print("Share failed: could not prepare bundle.")
+            sys.exit(1)
+
+        port = config.get("daemon_port") or 8384
+        ai_pii_param = "&ai_pii=1" if ai_pii_review else ""
+        workbench_url = f"http://localhost:{port}/share?share={share_id}&step=submit{ai_pii_param}"
+        daemon_running = _daemon_port_is_open(port)
+        result = {
+            "ok": True,
+            "share_id": share_id,
+            "bundle_id": share_id,
+            "export_path": str(export_dir),
+            "session_count": len(manifest.get("sessions", [])),
+            "next_step": "submit_in_workbench",
+            "workbench_url": workbench_url,
+            "daemon_running": daemon_running,
+            "redaction_summary": manifest.get("redaction_summary", {}),
+        }
         if result.get("ok"):
             if getattr(args, "json", False):
-                result["share_id"] = share_id
-                result["bundle_id"] = share_id
                 result["pii_status"] = pii_status
                 result.pop("status", None)
                 result.pop("gcs_uri", None)
                 print(json.dumps(result, indent=2))
             else:
                 count = result.get("session_count", len(session_ids))
-                print(f"Shared {count} sessions.")
-                print(f"Bundle {share_id[:8]} uploaded successfully.")
+                print(f"Packaged {count} sessions.")
+                print(f"Bundle {share_id[:8]} is ready for hosted submission in the workbench.")
+                print(f"Next step: open {workbench_url} and review the Submit step.")
+                if not daemon_running:
+                    print(f"Start `clawjournal serve` first so the workbench is reachable on port {port}.")
                 redaction_summary = result.get("redaction_summary")
                 if redaction_summary is not None:
                     print(f"Privacy: {_format_redaction_summary(redaction_summary)}")
@@ -1965,7 +2032,7 @@ def _share_preview(sessions: list[dict], *, output_json: bool = False, limit: in
             "total": total,
             "upload_auth": {
                 "required": True,
-                "note": "Upload sends the bundle separately from your verified .edu email authentication data.",
+                "note": "Hosted submission uses your verified academic email and a short-lived upload token.",
             },
         }
 
@@ -1995,7 +2062,7 @@ def _share_preview(sessions: list[dict], *, output_json: bool = False, limit: in
 
     if total > limit:
         print(f"\n  ... and {total - limit} more sessions.")
-    print("\nNote: upload authentication is separate from this preview and uses your verified .edu email plus a short-lived upload token.")
+    print("\nNote: hosted submission uses your verified academic email plus a short-lived upload token.")
     return None
 
 
@@ -2531,7 +2598,13 @@ def _run_score_batch(args) -> None:
 
     conn = open_index()
     source_filter = _normalize_score_source_filter(args.source)
-    sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter)
+    window_days = getattr(args, "window", None)
+    since = (
+        (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+        if window_days is not None
+        else None
+    )
+    sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter, since=since)
     conn.close()
 
     print(json.dumps(sessions, indent=2))
@@ -2764,10 +2837,16 @@ def _run_score(args) -> None:
     batch = args.batch
     auto_triage = getattr(args, "auto_triage", False)
     source_filter = _normalize_score_source_filter(args.source)
+    window_days = getattr(args, "window", None)
+    since = (
+        (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+        if window_days is not None
+        else None
+    )
 
     if batch:
         # Batch mode: score unscored sessions
-        sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter)
+        sessions = query_unscored_sessions(conn, limit=args.limit, source=source_filter, since=since)
         if not sessions:
             print(json.dumps({"message": "No unscored sessions found.", "scored": 0}))
             conn.close()
@@ -3567,6 +3646,8 @@ def main() -> None:
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
                      help="Set export source scope explicitly: claude, codex, gemini, or all")
+    cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
+                     help="Confirm the AI scoring backend for automatic workbench scoring")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
     cfg.add_argument("--redact", type=str,
                      help="Comma-separated strings to always redact (API keys, usernames, domains)")
@@ -3574,6 +3655,9 @@ def main() -> None:
                      help="Comma-separated usernames to anonymize (GitHub handles, Discord names)")
     cfg.add_argument("--confirm-projects", action="store_true",
                      help="Mark project selection as confirmed (include all)")
+    cfg.add_argument("--ai-pii-review", action=argparse.BooleanOptionalAction, default=None,
+                     help="Default AI-assisted PII review on (--ai-pii-review) or off "
+                          "(--no-ai-pii-review) for the workbench/CLI share flow")
 
     events_parser = sub.add_parser("events", help="Execution recorder commands")
     events_sub = events_parser.add_subparsers(dest="events_command", required=True)
@@ -3971,15 +4055,19 @@ def main() -> None:
 
     sb = sub.add_parser("score-batch", help="List unscored sessions for AI scoring")
     sb.add_argument("--limit", type=int, default=50)
-    sb.add_argument("--source", default="failure-v1",
-                    help="Source scope: failure-v1, comma list, all/auto, or a single source")
+    sb.add_argument("--source", default="failure-corpus",
+                    help="Source scope: failure-corpus, comma list, all/auto, or a single source")
+    sb.add_argument("--window", type=_parse_window_days, default=None,
+                    help="Only include unscored sessions from the last Nd days (e.g. 7d)")
 
     sc = sub.add_parser("score", help="Auto-score sessions via the current agent's automation CLI or an explicit backend")
     sc.add_argument("session_ids", nargs="*", help="Session IDs to score")
     sc.add_argument("--batch", action="store_true", help="Score all unscored sessions")
-    sc.add_argument("--limit", type=int, default=10, help="Max sessions for batch mode (default: 10)")
-    sc.add_argument("--source", default="failure-v1",
-                    help="Batch source scope: failure-v1, comma list, all/auto, or a single source")
+    sc.add_argument("--limit", type=int, default=20, help="Max sessions for batch mode (default: 20)")
+    sc.add_argument("--source", default="failure-corpus",
+                    help="Batch source scope: failure-corpus, comma list, all/auto, or a single source")
+    sc.add_argument("--window", type=_parse_window_days, default=None,
+                    help="Only score unscored sessions from the last Nd days (e.g. 7d)")
     sc.add_argument("--backend", choices=SCORING_BACKEND_CHOICES, default="auto",
                     help="Scoring backend (default: auto = current agent's automation CLI)")
     sc.add_argument("--model", type=str, default=None,
@@ -4000,8 +4088,8 @@ def main() -> None:
     )
     rs.add_argument(
         "--source",
-        default="failure-v1",
-        help="Source scope: failure-v1, comma list, all/auto, or a single source",
+        default="failure-corpus",
+        help="Source scope: failure-corpus, comma list, all/auto, or a single source",
     )
     rs.add_argument("--limit", type=int, default=200, help="Max sessions to rescore (default: 200)")
     rs.add_argument(
@@ -4044,11 +4132,15 @@ def main() -> None:
     be.add_argument("--training-format", action="store_true",
                     help="Also produce a training-format JSONL (turn-based, cleaned)")
     be.add_argument("--zip", action="store_true", help="Also write an uploadable zip")
+    be.add_argument("--ai-pii-review", action="store_true",
+                    help="Requires --zip: opt in to AI-assisted PII review before writing the uploadable zip")
     be.add_argument("--json", action="store_true", help="Output JSON")
 
     bs = sub.add_parser("bundle-share", help="Share bundle via self-hosted ingest service")
     bs.add_argument("share_id", help="Bundle ID (or prefix)")
     bs.add_argument("--force", action="store_true", help="Override duplicate check")
+    bs.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review before upload")
     bs.add_argument("--json", action="store_true", help="Output JSON")
 
     # Share command (one-step: create + export + share)
@@ -4060,10 +4152,12 @@ def main() -> None:
     sh.add_argument("--force", action="store_true", help="Override duplicate check")
     sh.add_argument("--preview", action="store_true",
                     help="Show the trace bundle contents that would be shared without uploading")
+    sh.add_argument("--ai-pii-review", action="store_true",
+                    help="Opt in to AI-assisted PII review while packaging")
     sh.add_argument("--json", action="store_true", help="Output JSON")
 
-    ve = sub.add_parser("verify-email", help="Verify a .edu email address for a short-lived upload token")
-    ve.add_argument("email", nargs="?", help="Your .edu email address")
+    ve = sub.add_parser("verify-email", help="Verify an academic email address for a short-lived upload token")
+    ve.add_argument("email", nargs="?", help="Your academic email address")
     ve.add_argument("--code", type=str, default=None, help="Verification code from email")
 
     # PII review/apply commands
@@ -4398,37 +4492,37 @@ def main() -> None:
         if args.json:
             print(json.dumps(result, indent=2))
         else:
-            status = result.get("status")
-            if status == "not-a-checkout":
+            selfupdate_status = result.get("status")
+            if selfupdate_status == "not-a-checkout":
                 print("clawjournal is not installed from an editable git checkout — nothing to update.")
-            elif status == "up-to-date":
+            elif selfupdate_status == "up-to-date":
                 print(f"Already up to date ({str(result.get('head', ''))[:7]}).")
-            elif status == "behind":
+            elif selfupdate_status == "behind":
                 print(
                     f"Update available: {str(result.get('head', ''))[:7]} -> "
                     f"{str(result.get('upstream', ''))[:7]}. Run `clawjournal selfupdate` to apply."
                 )
-            elif status == "updated":
+            elif selfupdate_status == "updated":
                 print(
                     f"Updated {str(result.get('head', ''))[:7]} -> "
                     f"{str(result.get('upstream', ''))[:7]}."
                 )
-            elif status == "dirty":
+            elif selfupdate_status == "dirty":
                 print("Skipped: the checkout has local changes. Commit/stash or pass --force.")
-            elif isinstance(status, str) and status.startswith("branch-"):
-                print(f"Skipped: not on the main branch ({status[len('branch-'):]}). Check out main first.")
-            elif status == "ahead":
+            elif isinstance(selfupdate_status, str) and selfupdate_status.startswith("branch-"):
+                print(f"Skipped: not on the main branch ({selfupdate_status[len('branch-'):]}). Check out main first.")
+            elif selfupdate_status == "ahead":
                 print("Skipped: local main has commits not present on origin/main. Update manually.")
-            elif status == "diverged":
+            elif selfupdate_status == "diverged":
                 print("Skipped: local main has diverged from origin/main. Update manually.")
-            elif status == "ancestry-failed":
+            elif selfupdate_status == "ancestry-failed":
                 print("Skipped: could not compare local main with origin/main.")
-            elif status == "fetch-failed":
+            elif selfupdate_status == "fetch-failed":
                 print(f"Fetch failed: {result.get('stderr', '')}".rstrip())
-            elif status == "update-failed":
+            elif selfupdate_status == "update-failed":
                 print(f"Update failed: {result.get('stderr', '')}".rstrip())
             else:
-                print(f"selfupdate status: {status}")
+                print(f"selfupdate status: {selfupdate_status}")
         return
 
     if command == "list":
@@ -4456,13 +4550,16 @@ def _parse_csv_arg(value: str | None) -> list[str] | None:
 
 def _handle_config(args) -> None:
     """Handle the config subcommand."""
+    ai_pii_review = getattr(args, "ai_pii_review", None)
     has_changes = (
         args.repo
         or args.source
+        or args.scorer_backend
         or args.exclude
         or args.redact
         or args.redact_usernames
         or args.confirm_projects
+        or ai_pii_review is not None
     )
     if not has_changes:
         print(json.dumps(_mask_config_for_display(load_config()), indent=2))
@@ -4470,10 +4567,12 @@ def _handle_config(args) -> None:
     configure(
         repo=args.repo,
         source=args.source,
+        scorer_backend=args.scorer_backend,
         exclude=_parse_csv_arg(args.exclude),
         redact=_parse_csv_arg(args.redact),
         redact_usernames=_parse_csv_arg(args.redact_usernames),
         confirm_projects=args.confirm_projects or bool(args.exclude),
+        ai_pii_review=ai_pii_review,
     )
 
 

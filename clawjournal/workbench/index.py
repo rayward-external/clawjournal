@@ -31,7 +31,8 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
-WORKBENCH_SCHEMA_VERSION = WIDENED_MESSAGE_SCHEMA_VERSION
+HOSTED_SUBMISSION_SCHEMA_VERSION = 5
+WORKBENCH_SCHEMA_VERSION = HOSTED_SUBMISSION_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
 SHARE_RECOMMENDATION_LIMIT = 10
@@ -123,7 +124,10 @@ CREATE TABLE IF NOT EXISTS shares (
     bundle_hash     TEXT,
     manifest        TEXT,
     shared_at       TEXT,
-    gcs_uri         TEXT
+    gcs_uri         TEXT,
+    hosted_receipt_id TEXT,
+    hosted_status     TEXT,
+    hosted_submission_url TEXT
 );
 
 CREATE TABLE IF NOT EXISTS share_sessions (
@@ -328,6 +332,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_security_refactor(conn)
     _migrate_session_identity_bridge(conn)
     _migrate_widened_message_model(conn)
+    _migrate_hosted_submission_receipts(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -483,6 +488,32 @@ def _migrate_widened_message_model(conn: sqlite3.Connection) -> None:
             "WHERE message_schema_version IS NULL OR message_schema_version = 2"
         )
         conn.execute(f"PRAGMA user_version = {WIDENED_MESSAGE_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_hosted_submission_receipts(conn: sqlite3.Connection) -> None:
+    """Add hosted research submission receipt fields. Advances v4 -> v5."""
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= HOSTED_SUBMISSION_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for col, col_type in [
+            ("hosted_receipt_id", "TEXT"),
+            ("hosted_status", "TEXT"),
+            ("hosted_submission_url", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE shares ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+        conn.execute(f"PRAGMA user_version = {HOSTED_SUBMISSION_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -933,6 +964,7 @@ def get_effective_share_settings(
         "allowlist_entries": allowlist_entries,
         "excluded_projects": _dedupe_strings(excluded_projects),
         "blocked_domains": _dedupe_strings(blocked_domains),
+        "ai_pii_review_enabled": bool(resolved.get("ai_pii_review_enabled", False)),
     }
 
 
@@ -2414,25 +2446,84 @@ def effective_hold_state(
     return "released" if parsed <= current else state
 
 
+# Seconds ``end_time`` must advance past ``ai_scored_at`` before an
+# already-scored session counts as "grew after it was scored" and is
+# re-selected. Small margin avoids re-scoring on a near-simultaneous
+# score/finish.
+RESCORE_GROWTH_MARGIN_SECONDS = 60
+
+_UNSCORED_RETURN_KEYS = (
+    "session_id", "display_title", "task_type", "outcome_badge", "project", "source",
+)
+
+
+def _parse_score_ts(ts: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp (accepting a trailing ``Z``) to aware UTC."""
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def query_unscored_sessions(
     conn: sqlite3.Connection,
     *,
     limit: int = 50,
     source: str | list[str] | tuple[str, ...] | None = None,
     since: str | None = None,
+    include_stale_scored: bool = False,
+    settle_seconds: int = 0,
+    growth_margin_seconds: int = RESCORE_GROWTH_MARGIN_SECONDS,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Return sessions missing either legacy quality or failure-value score.
+    """Return sessions that need (re)scoring.
 
-    Returns a list of dicts with session_id, display_title, task_type,
+    By default, returns sessions missing either legacy quality or failure-value
+    score — a list of dicts with session_id, display_title, task_type,
     outcome_badge, project, and source. Segmented parent sessions
-    (``review_status='segmented'``) are skipped — their scorable content
-    lives in the per-segment child rows, not the parent umbrella.
+    (``review_status='segmented'``) are skipped — their scorable content lives
+    in the per-segment child rows, not the parent umbrella.
+
+    Two opt-in behaviors support the background scanner, which would otherwise
+    grade a session once (often mid-flight) and never revisit it:
+
+    - ``include_stale_scored``: also return *already-scored* sessions whose
+      ``end_time`` advanced more than ``growth_margin_seconds`` past
+      ``ai_scored_at`` — i.e. they kept going after they were graded. Re-scoring
+      reads the current blob, so the stale early grade is corrected; once a
+      session is scored after it finishes, ``ai_scored_at >= end_time`` and it
+      drops out of this selection.
+    - ``settle_seconds``: skip sessions whose last activity (``end_time``) is
+      within ``settle_seconds`` of ``now`` — they are likely still in-flight, so
+      scoring now would just produce another premature grade (and, on the
+      re-score path, churn every scan cycle).
+
+    With both opt-ins off (the default) the behavior and return shape are
+    unchanged from the original contract.
     """
+    extended = include_stale_scored or settle_seconds > 0
     params: list[Any] = []
+    score_missing = "(ai_quality_score IS NULL OR ai_failure_value_score IS NULL)"
+    if include_stale_scored:
+        # Coarse pre-filter; the precise margin check happens in Python because
+        # ``end_time`` (``…Z``) and ``ai_scored_at`` (``…+00:00``) use different
+        # UTC spellings. Lexicographic ``>`` is safe as a *pre*-filter since a
+        # truly grown session differs in the minute/second portion.
+        where = (
+            f"({score_missing} OR (ai_scored_at IS NOT NULL "
+            "AND end_time IS NOT NULL AND end_time > ai_scored_at))"
+        )
+    else:
+        where = score_missing
     sql = (
-        "SELECT session_id, display_title, task_type, outcome_badge, project, source "
-        "FROM sessions WHERE (ai_quality_score IS NULL OR ai_failure_value_score IS NULL) "
-        "AND review_status != 'segmented'"
+        "SELECT session_id, display_title, task_type, outcome_badge, project, source, "
+        "end_time, ai_scored_at, ai_quality_score, ai_failure_value_score "
+        f"FROM sessions WHERE {where} AND review_status != 'segmented'"
     )
     if since is not None:
         sql += " AND start_time >= ?"
@@ -2447,10 +2538,38 @@ def query_unscored_sessions(
             sql += " AND source = ?"
             params.append(source)
     sql += " ORDER BY start_time DESC LIMIT ?"
-    params.append(limit)
+    # Over-fetch when we will refine in Python so we can still return `limit`
+    # rows after dropping non-stale / unsettled candidates.
+    params.append(max(limit * 5, 200) if extended else limit)
 
     rows = conn.execute(sql, params).fetchall()
-    return [dict(row) for row in rows]
+    if not extended:
+        return [{k: row[k] for k in _UNSCORED_RETURN_KEYS} for row in rows]
+
+    clock = now or datetime.now(timezone.utc)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        never_scored = row["ai_quality_score"] is None or row["ai_failure_value_score"] is None
+        end_dt = _parse_score_ts(row["end_time"])
+        scored_dt = _parse_score_ts(row["ai_scored_at"])
+        grew = (
+            include_stale_scored
+            and scored_dt is not None
+            and end_dt is not None
+            and (end_dt - scored_dt).total_seconds() > growth_margin_seconds
+        )
+        if not (never_scored or grew):
+            continue
+        if (
+            settle_seconds
+            and end_dt is not None
+            and (clock - end_dt).total_seconds() < settle_seconds
+        ):
+            continue
+        out.append({k: row[k] for k in _UNSCORED_RETURN_KEYS})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def query_sessions_for_rescore(
@@ -3374,7 +3493,7 @@ def get_share_ready_stats(
         " ai_failure_attribution, ai_failure_modes, ai_learning_summary,"
         " user_messages, assistant_messages, tool_uses,"
         " input_tokens, output_tokens, outcome_badge, client_origin,"
-        " runtime_channel, start_time, review_status"
+        " runtime_channel, start_time, review_status, hold_state, embargo_until"
         " FROM sessions"
         f"{where_status}"
         f"{' AND' if where_status else ' WHERE'} session_id NOT IN ("
@@ -3399,7 +3518,7 @@ def get_share_ready_stats(
             "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
             "user_messages", "assistant_messages", "tool_uses", "input_tokens",
             "output_tokens", "outcome_badge", "client_origin", "runtime_channel",
-            "start_time", "review_status"]
+            "start_time", "review_status", "hold_state", "embargo_until"]
     sessions = [dict(zip(cols, r)) for r in rows]
     for session in sessions:
         for field in ("ai_recovery_labels", "ai_failure_modes"):
@@ -3408,6 +3527,22 @@ def get_share_ready_stats(
                     session[field] = json.loads(session[field])
                 except (json.JSONDecodeError, ValueError):
                     session[field] = []
+    # Only offer sessions that are actually shareable: drop explicit holds
+    # (`pending_review`, active `embargoed`) so the student cannot pick a
+    # session that the submit-time release gate would later reject. Auto-expired
+    # embargoes pass through via `effective_hold_state`. The two helper columns
+    # are consumed here and removed so the response shape is unchanged.
+    # NOTE: this runs before the recommendation pool and the projects/models
+    # sets are computed below, so all of those are derived from the shareable
+    # subset only (a project whose sessions are all held won't be offered).
+    shareable_sessions: list[dict[str, Any]] = []
+    for session in sessions:
+        effective = effective_hold_state(
+            session.pop("hold_state", None), session.pop("embargo_until", None)
+        )
+        if effective in SHAREABLE_HOLD_STATES:
+            shareable_sessions.append(session)
+    sessions = shareable_sessions
     if excluded_projects:
         sessions = [
             session for session in sessions
@@ -3513,6 +3648,59 @@ EXPORT_FIELDS = {
 }
 
 
+def build_trufflehog_blocked_sessions(
+    manifest: dict[str, Any],
+    report: Any,
+) -> list[dict[str, Any]]:
+    """Map TruffleHog JSONL line findings back to exported sessions.
+
+    ``sessions.jsonl`` is one line per exported session. If every finding has
+    a valid line number, the UI can offer an explicit "remove these traces and
+    retry" recovery path. If any finding cannot be mapped, return an empty
+    list so callers keep the existing hard block.
+    """
+    findings = list(getattr(report, "findings", []) or [])
+    if not findings:
+        return []
+
+    sessions = manifest.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return []
+
+    blocked_by_id: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        line = getattr(finding, "line", None)
+        if not isinstance(line, int) or line < 1 or line > len(sessions):
+            return []
+
+        session = sessions[line - 1]
+        if not isinstance(session, dict):
+            return []
+        session_id = session.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return []
+
+        entry = blocked_by_id.setdefault(
+            session_id,
+            {
+                "session_id": session_id,
+                "project": session.get("project"),
+                "source": session.get("source"),
+                "model": session.get("model"),
+                "line": line,
+                "findings": [],
+            },
+        )
+        entry["findings"].append({
+            "line": line,
+            "detector": getattr(finding, "detector", None),
+            "status": getattr(finding, "status", None),
+            "masked": getattr(finding, "masked", None),
+        })
+
+    return sorted(blocked_by_id.values(), key=lambda item: item["line"])
+
+
 def export_share_to_disk(
     conn: sqlite3.Connection,
     share_id: str,
@@ -3581,10 +3769,10 @@ def export_share_to_disk(
                     clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
                     f.write(json.dumps(clean, default=str) + "\n")
                     manifest["sessions"].append({
-                        "session_id": s["session_id"],
-                        "project": s.get("project"),
-                        "source": s.get("source"),
-                        "model": s.get("model"),
+                        "session_id": clean.get("session_id") or s["session_id"],
+                        "project": clean.get("project"),
+                        "source": clean.get("source"),
+                        "model": clean.get("model"),
                         # Aggregated counts per §Bundle manifest provenance —
                         # no hashes, plaintext, or offsets.
                         "redactions": build_session_redactions_summary(
@@ -3615,6 +3803,9 @@ def export_share_to_disk(
         manifest["blocked"] = True
         manifest["block_reason"] = trufflehog_report.block_reason
         manifest["block_message"] = trufflehog_scanner.format_block_message(trufflehog_report)
+        blocked_sessions = build_trufflehog_blocked_sessions(manifest, trufflehog_report)
+        if blocked_sessions:
+            manifest["blocked_sessions"] = blocked_sessions
         with open(export_dir / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2, default=str)
         # Record the block on the share row so the UI can surface it,

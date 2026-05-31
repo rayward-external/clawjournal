@@ -2,24 +2,26 @@
 
 Review and curate your coding agent conversation traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, automatically anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
-## Install in one step (no coding required)
+## Install or refresh in one step (no coding required)
 
-If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Hermes**, **Gemini CLI**, or similar — you can install ClawJournal without writing any code or running any commands yourself.
+If you have an AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Hermes**, **Gemini CLI**, or similar — you can install or refresh ClawJournal without writing any code or running any commands yourself. Use the same prompt for a first-time install, **or to refresh an existing install before you package or submit a bundle** (an out-of-date copy is the most common cause of submission errors).
 
 **1.** Open your AI assistant.
 
 **2.** Paste this message:
 
-> *Install ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow the install instructions for my operating system. Install any missing prerequisites. Verify it works at the end.*
+> *Install or refresh ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow the instructions for my operating system. If ClawJournal is already installed, update it from the public GitHub repo and rebuild the browser workbench. Install any missing prerequisites. Verify it works at the end.*
 
-**3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, and tell you when it's done.
+**3.** The AI does the rest. It'll figure out your operating system (Mac, Windows, Linux), install any background tools it needs (git, Python, Node.js), run the install script, rebuild the workbench when needed, and tell you when it's done.
 
 ### What to expect
 
 - **Permission prompts — lots of them.** Your AI will ask permission to run several commands. Expect 10–25 prompts before install finishes — more if your computer is fresh, fewer if it already has dev tools. **Click "Allow" each time.** This is normal. The tools the AI installs (git for fetching code, Python for running ClawJournal, Node.js for the browser workbench) are widely-used software your computer probably has parts of already.
 - **A separate password prompt on Mac.** macOS may ask for *your computer password* (the one you use to log in) when installing certain tools. This is your operating system asking, not the AI. Type your password and hit Enter — installing software almost always requires this.
 - **Silent waiting periods.** Some downloads and compiles take 30–90 seconds with no visible progress. **The AI isn't frozen — it's working.** Wait for it to come back. Total install time is usually 2–10 minutes depending on your network and what's already installed.
-- **A success message at the end:** `[ok] ClawJournal 0.1.15 installed.` (the version number may differ).
+- **A success message at the end:** `[ok] ClawJournal 0.1.15 installed.` (the version number may differ). On a refresh, the AI should also confirm that `clawjournal status` works and that `clawjournal bundle-export --help` shows the `--zip` option.
+
+> **Already installed? Refresh before submitting.** Re-paste the same prompt any time before you package or upload a bundle — it updates ClawJournal and rebuilds the browser workbench. Refresh first if you see **`unrecognized arguments: --zip`** or the Share tab says **"Your queue is empty"**; both mean your copy is out of date.
 
 ### Open the workbench
 
@@ -55,7 +57,7 @@ The other three are read-only views: **Dashboard** (overview of what's been scan
 <details>
 <summary><b>For AI agents reading this README directly</b> (humans following the 3 steps above can skip this)</summary>
 
-Detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status`. The install script handles Python detection, venv creation, and dependency install. You have everything you need; proceed.
+Detect the user's OS, follow the matching block in [Quickstart](#quickstart) below, install all missing prereqs (git, Python 3.10+, and Node.js — the install includes the browser workbench by default), then verify with `clawjournal status` and `clawjournal bundle-export --help`. If a checkout already exists, fetch/update it from `rayward-external/clawjournal` first and rerun the installer with `--with-frontend` so the built workbench assets match the current source. The install script handles Python detection, venv creation, dependency install, and frontend build. You have everything you need; proceed.
 
 </details>
 
@@ -74,15 +76,15 @@ Everything in the default workflow runs on your own computer:
 - The review UI opens on `localhost:8384` in your own browser — no account, no cloud service.
 - `scan` auto-runs a secrets + PII findings pipeline per session. Findings are stored as hashed references in your local SQLite DB — plaintext is never persisted.
 - `bundle-export` writes redacted files to your disk. It does not upload them.
-- Uploading is a separate, opt-in flow. If you never configure an ingest endpoint and never run a share command, nothing is sent anywhere.
+- Uploading is a separate, opt-in flow. If you never use the workbench Submit step and never run `bundle-share` against a configured self-hosted ingest endpoint, nothing is sent anywhere.
 
 ## If you decide to share
 
-Sharing is fully opt-in and separate from local review. When you do choose to export or upload, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and similar) on top of the scan-time findings, and the workbench Share flow adds an AI-assisted PII review on top of that.
+Sharing is fully opt-in and separate from local review. When you do choose to export or upload, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and similar) on top of the scan-time findings. The workbench Share flow can also add AI-assisted PII review when you opt in for a bundle.
 
-The AI-assisted PII review uses the same backend as `score` — your current coding agent's automation CLI (e.g. `codex exec`, the Claude CLI). Home-dir paths and usernames are anonymized locally before anything is sent to the agent; if your agent routes to a cloud provider, that's where the PII review happens. Override with `--backend` to keep the call on a local model.
+The optional AI-assisted PII review uses the same backend as `score` — your current coding agent's automation CLI (e.g. `codex exec`, the Claude CLI). Home-dir paths and usernames are anonymized locally before anything is sent to the agent; if your agent routes to a cloud provider, that's where the PII review happens.
 
-See [PRIVACY.md](PRIVACY.md) for the full redaction list and the two sharing paths (local file vs. self-configured upload).
+See [PRIVACY.md](PRIVACY.md) for the full redaction list and the sharing paths (local file, hosted research submission, or self-configured ingest upload).
 
 ---
 
@@ -318,62 +320,114 @@ AI-assisted scoring now records two labels in one pass: a legacy productivity sc
 
 **Just say to your AI:** *"Score my unscored ClawJournal sessions and auto-block the noise."*
 
-The agent batches the scoring over the v1 failure-source scope (`claude`, `codex`, `opencode`, `openclaw`). Productivity-1 sessions get auto-blocked when `--auto-triage` is set only if failure value is 1-2; failure value 3+ stays visible for review and sharing.
+The agent batches the scoring over the `failure-corpus` source scope (`claude`, `codex`, `opencode`, `openclaw`). Productivity-1 sessions get auto-blocked when `--auto-triage` is set only if failure value is 1-2; failure value 3+ stays visible for review and sharing.
 
 <details>
 <summary><b>Show shell commands</b></summary>
 
 ```bash
-clawjournal score --batch --source failure-v1 --auto-triage  # score failure-value scope; auto-block low-value productivity-1 noise
+clawjournal score --batch --source failure-corpus --auto-triage  # score failure-value scope; auto-block low-value productivity-1 noise
+clawjournal score --batch --source failure-corpus --window 7d     # restrict to traces from the last N days
 clawjournal score-view <id>                          # show score details
 clawjournal set-score <id> --failure-value 4 --failure-evidence "User corrected a fabricated API call"
 clawjournal set-score <id> --quality 4               # legacy productivity override
 ```
 
-By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
+By default scoring uses the current agent's automation CLI (e.g. `codex exec` inside Codex, the Claude CLI inside Claude Code). Supported backends are `claude`, `codex`, `hermes`, and `openclaw`; use `--backend` to override. For Codex specifically, `codex exec` reuses saved CLI authentication by default; for automation the recommended explicit credential is `CODEX_API_KEY`.
+
+The browser workbench also keeps share-ready traces warm: on app load it offers to score the latest unscored `failure-corpus` traces in the background. It scores only after you confirm a backend once; the choice is persisted to `~/.clawjournal/config.json`. If you never open the workbench, confirm a backend headlessly with `clawjournal config --scorer-backend <claude|codex|hermes|openclaw>` (use `--scorer-backend none` to clear it).
 
 </details>
 
 ### 6. Package & Share
 
-Package a set of traces into a redacted file on your computer. Uploading anywhere is a separate, opt-in step — by default the file just sits on your disk.
+Packaging is **100% local** — it writes a redacted ZIP to your own computer. Uploading is a **separate, opt-in step**. By default the ZIP just sits on your disk.
 
-This happens on the **Share** tab, which has its own five-step flow: **Queue → Redact → Review → Package → Done**.
-
-**Step 1 (Queue) is where new users most often get stuck, so here's how it works:**
-
-- If you have high-scoring approved traces, the queue **fills itself** with the ones the workbench recommends — start right away.
-- If the queue is **empty** — normal on a fresh install, even right after you approve a few traces — Share lets you pick what to add right there: a search picker (by project, source, date, or score), or a short list of suggested traces. Add *any* trace, approved or not. Approving in **Sessions** just gives the queue a head start; it's never required to share.
-
-From there the agent walks you through the rest: **Redact** uses AI to catch any personal info the automatic scan missed, **Review** lets you eyeball each redacted trace, and **Package** writes the file. (Upload-time PII review runs a small parallel worker pool by default; set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer AI review per trace.)
+This happens on the **Share** tab, which starts with the **Queue** step. If recommended traces are available, the queue fills itself; if nothing is preselected but shareable traces exist, Share opens a picker so you can add approved or unapproved traces before redaction and review.
 
 **Just say to your AI:** *"Open the ClawJournal Share page and help me build a bundle to export. If the queue is empty, pick the sessions to include."*
 
-To actually upload after packaging (optional), use the hosted Rayward submission page. The Done screen shows **Submit to ClawJournal Research** by default; that page verifies email, shows consent, and asks for the downloaded zip. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables the hosted button.
+Then follow the path below. **Rayward / STEM Data Program participants: use the workbench (Step B).**
 
-> *(optional)* *"Open the ClawJournal Research submission page so I can upload the exported zip."*
+#### A. First, refresh if you installed a while ago
 
-Uploads are gated: only conversations you approved and confirmed for sharing leave your machine.
+Almost every submission problem is an out-of-date copy. **Refresh before you package or submit** if you installed more than a few days ago — or if you hit either of these exact messages:
+
+- `clawjournal bundle-export ...` says **`error: unrecognized arguments: --zip`**
+- The **Share** tab says **"Your queue is empty"** even though you approved sessions
+
+The easy way: re-paste the install prompt from the [top of this README](#install-or-refresh-in-one-step-no-coding-required) into your AI assistant — *"Install or refresh ClawJournal…"*. To do it by hand:
+
+```bash
+cd ~/clawjournal
+./scripts/install.sh --with-frontend     # rebuilds the CLI *and* the browser workbench
+```
+
+> This rebuilds the browser workbench too (`--with-frontend`), which is what clears a stale "Your queue is empty" Share tab. You don't need to refresh every time you run `clawjournal serve` — just before a submission window.
+
+#### B. Submit through the workbench (recommended)
+
+1. Run `clawjournal serve` and open the workbench in your browser.
+2. Click **Share**.
+3. Walk through the steps: **Queue → Redact → Review → Package**. Redaction always runs on your machine first.
+4. ClawJournal then sends you to **one** of two final steps **automatically** — you don't choose which:
+
+   | You land on… | What it means | What to do |
+   |--------------|---------------|------------|
+   | **Submit** | Hosted submissions are open | Verify your academic email when prompted, review the consent terms, then click **Submit to ClawJournal Research**. The workbench uploads the finalized ZIP straight from your computer and saves a receipt locally — no manual download or re-upload. |
+   | **Done** | Hosted submissions are closed (or this build has no hosted integration) | Click **Download zip**, then upload that file at **[data.rayward.ai/share](https://data.rayward.ai/share)** once submissions reopen. |
+
+   Seeing **Done** instead of **Submit** is normal — it just means submissions aren't open right now. Nothing is broken.
+
+#### If the Share queue is empty (after refreshing)
+
+If shareable traces exist but none are recommended, the Queue step opens a picker directly. Add any trace you want to include — approved or not — then review the redacted version before packaging.
+
+If the picker is empty or you see **No traces ready to share**:
+
+- **Refresh or scan again** — the workbench may still be indexing.
+- **Release any holds** — sessions on hold (`pending_review`) or under an active embargo are excluded until you release them.
+- **Check your exclusions** — a project you excluded with `clawjournal config --exclude` won't show up.
+
+#### Alternative: package on the command line, upload in a browser
+
+Only if you prefer the terminal. This builds the **same** redacted ZIP, which you then upload yourself:
+
+```bash
+clawjournal bundle-create --status approved
+clawjournal bundle-list
+clawjournal bundle-view <bundle_id>          # inspect before exporting
+clawjournal bundle-export <bundle_id> --zip  # prints the export folder AND a zip_path
+```
+
+Upload the printed `zip_path` at **[data.rayward.ai/share](https://data.rayward.ai/share)** when submissions are open.
+
+> ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** There is no Rayward hosted CLI upload in this local-first build — that's why `bundle-share` reports *"Hosted sharing is not configured."* It only uploads to a **self-hosted** ingest server you set up yourself via `CLAWJOURNAL_INGEST_URL`. STEM Data Program participants should ignore it.
+
+**What leaves your machine — and what's redacted.** Only sessions you explicitly add to a bundle and confirm for sharing are ever uploaded; `pending_review` and active `embargoed` sessions are blocked. Redaction (your configured strings, file paths, usernames, secrets) is applied to **everything in the bundle** — the session traces *and* the `manifest.json` metadata (project, source, model, and IDs). If you saw a configured term in `manifest.json` before, refresh and re-export: that's fixed.
 
 <details>
 <summary><b>Show shell commands</b></summary>
 
 ```bash
+# Recommended — browser workbench:
+clawjournal serve
+# open http://localhost:8384/share → Queue → Redact → Review → Package → Submit/Done
+# Submit uploads directly; Done offers "Download zip" to upload at https://data.rayward.ai/share
+
+# Alternative — package via CLI, then upload the zip in a browser:
 clawjournal bundle-create --status approved          # bundle all approved sessions
 clawjournal bundle-list
 clawjournal bundle-view <bundle_id>                  # inspect before exporting
-clawjournal bundle-export <bundle_id> --zip          # write an uploadable zip plus export folder
+clawjournal bundle-export <bundle_id> --zip          # writes an export folder + an uploadable zip
+# upload the printed zip_path at https://data.rayward.ai/share when submissions are open
 
-# Optional hosted browser upload:
-python -m webbrowser "https://data.rayward.ai/share"  # packaged default
-
-# Advanced self-hosted ingest upload:
-clawjournal verify-email you@university.edu          # one-time email verification
+# Self-hosted ingest ONLY (not the Rayward path; requires CLAWJOURNAL_INGEST_URL):
 clawjournal share --preview --status approved        # dry-run
-clawjournal bundle-share <bundle_id>                 # self-hosted ingest upload
+clawjournal bundle-share <bundle_id>
 ```
 
-Upload is gated on hold-state: only sessions in `auto_redacted` or `released` can leave the machine.
+**Opt-in AI PII review** (workbench Redact step): on top of the always-on deterministic redaction, you can enable an extra AI pass to catch contextual personal info. It runs a small parallel worker pool by default — set `CLAWJOURNAL_UPLOAD_PII_WORKERS=1` to serialize it, or `CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS=90` to allow longer review per trace.
 
 </details>
 
@@ -477,9 +531,10 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal serve` | Open workbench UI at localhost:8384 |
 | `clawjournal config --source all` | Select source scope (required) |
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
-| `clawjournal score --batch --source failure-v1 --auto-triage` | AI-score failure-value scope; auto-block low-value productivity-1 noise |
+| `clawjournal config --scorer-backend codex` | Confirm the AI scoring backend used for background workbench scoring (`none` clears it) |
+| `clawjournal score --batch --source failure-corpus --auto-triage` | AI-score failure-value scope; auto-block low-value productivity-1 noise |
 | `clawjournal bundle-create --status approved` | Bundle approved sessions |
-| `clawjournal bundle-export <bundle_id> --zip` | Export bundle to disk and write an uploadable zip |
+| `clawjournal bundle-export <bundle_id> --zip` | Package approved sessions into a redacted ZIP on disk (then upload it in a browser) |
 
 ### Triage & review
 
@@ -490,7 +545,8 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal approve <id> [id ...]` | Approve sessions |
 | `clawjournal block <id> [id ...]` | Block sessions |
 | `clawjournal shortlist <id> [id ...]` | Shortlist sessions |
-| `clawjournal score --batch --source failure-v1 --limit 20` | AI-score up to 20 in-scope sessions |
+| `clawjournal score --batch --source failure-corpus --limit 20` | AI-score up to 20 in-scope sessions |
+| `clawjournal score --batch --source failure-corpus --window 7d` | AI-score only in-scope sessions from the last N days |
 | `clawjournal score-view <id>` | View score details |
 | `clawjournal set-score <id> --failure-value <1-5>` | Manually set the failure-value score; 4-5 requires `--failure-evidence` |
 | `clawjournal set-score <id> --quality <1-5>` | Manually set the legacy productivity score |
@@ -523,8 +579,8 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal bundle-create --status approved` | Create bundle from all approved sessions |
 | `clawjournal bundle-list` | List bundles |
 | `clawjournal bundle-view <bundle_id>` | View bundle details |
-| `clawjournal bundle-export <bundle_id> --zip` | Export bundle and write an uploadable zip |
-| `clawjournal bundle-share <bundle_id>` | Advanced self-hosted ingest upload |
+| `clawjournal bundle-export <bundle_id> --zip` | Export a redacted ZIP for manual browser upload at `https://data.rayward.ai/share` |
+| `clawjournal bundle-share <bundle_id>` | Advanced self-hosted ingest only; requires `CLAWJOURNAL_INGEST_URL` |
 
 ### Quick share
 
@@ -536,13 +592,15 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal card <id> --depth workflow` | Workflow-only card (safe for public channels) |
 | `clawjournal card <id> --depth full` | Full card with redacted content |
 
-### Advanced self-hosted ingest upload
+### Hosted upload helpers and self-hosted ingest
 
 | Command | Description |
 |---------|-------------|
-| `clawjournal verify-email you@university.edu` | Verify a `.edu` email for upload authorization |
-| `clawjournal share --preview --status approved` | Preview what would be uploaded through ingest |
-| `clawjournal share --status approved` | Create a bundle and upload through the configured self-hosted ingest service |
+| `clawjournal verify-email you@university.edu` | Verify an academic email for the hosted browser submission flow |
+| `clawjournal share --preview --status approved` | Preview what would be packaged |
+| `clawjournal share --status approved` | Package locally and print the workbench Share URL; hosted upload still happens in the browser |
+| `clawjournal share --status approved --ai-pii-review` | Package locally with optional AI-assisted PII review |
+| `clawjournal bundle-share <bundle_id>` | Upload through an explicitly configured self-hosted ingest service; not Rayward hosted upload |
 
 ### Configuration
 
@@ -551,6 +609,7 @@ ClawJournal can parse session data from: Claude Code, Claude Desktop, Codex, Gem
 | `clawjournal config --exclude "a,b"` | Add excluded projects (appends) |
 | `clawjournal config --redact "str1,str2"` | Add strings to always redact (appends) |
 | `clawjournal config --redact-usernames "u1,u2"` | Add usernames to anonymize (appends) |
+| `clawjournal config --ai-pii-review` / `--no-ai-pii-review` | Set the default AI-assisted PII review on/off for the share flow |
 | `clawjournal list` | List all projects with exclusion status |
 | `clawjournal status` | Show current stage and next steps (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |
@@ -626,8 +685,10 @@ Each line in the exported JSONL is one session:
 
 - **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
 - **Source and project confirmation are required** — the CLI blocks export until both are set.
-- **`scan` already redacts.** Secrets and PII findings are computed and stored as hashed references at scan time. For additional LLM-PII review, use the workbench Share page. The legacy `--pii-review` / `--pii-apply` CLI path still works for sanitizing already-exported files.
+- **`scan` already redacts.** Secrets and PII findings are computed and stored as hashed references at scan time. For additional LLM-PII review, opt in on the workbench Share page. The legacy `--pii-review` / `--pii-apply` CLI path still works for sanitizing already-exported files.
 - **Hold-state gates uploads.** Sessions in `pending_review` or active `embargoed` cannot be shared; `auto_redacted` (default) and `released` can.
+- **If `bundle-export --zip` is not recognized, your shell is running an older ClawJournal.** Re-run the GitHub installer, then use `~/.clawjournal-venv/bin/clawjournal bundle-export <bundle_id> --zip` or put `~/.clawjournal-venv/bin` first on `PATH`. The PyPI fallback can lag behind the README.
+- **"Your queue is empty" in the Share tab?** Refresh first (`./scripts/install.sh --with-frontend` rebuilds the workbench). If it persists, release any holds/embargoes, check `clawjournal config --exclude`, and scan again so the workbench can find shareable sessions.
 - **Large exports take time** — 500+ sessions may take 1–3 minutes.
 - **Virtual environment recommended** — modern Linux (and some macOS setups) block system-wide pip installs. Use a venv to avoid issues.
 

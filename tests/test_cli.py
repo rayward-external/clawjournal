@@ -4,6 +4,7 @@ import json
 import shutil
 import sys
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,7 @@ from clawjournal.cli import (
     _format_token_count,
     _has_session_sources,
     _merge_config_list,
+    _normalize_score_source_filter,
     _parse_csv_arg,
     _scan_for_text_occurrences,
     _scan_high_entropy_strings,
@@ -322,6 +324,28 @@ class TestConfigure:
         configure(source="codex")
         assert saved["source"] == "codex"
 
+    def test_sets_ai_pii_review_flag(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(ai_pii_review=True)
+        assert saved["ai_pii_review_enabled"] is True
+
+        configure(ai_pii_review=False)
+        assert saved["ai_pii_review_enabled"] is False
+
+    def test_ai_pii_review_unset_leaves_config_untouched(self, tmp_config, monkeypatch, capsys):
+        # The tri-state default (None) must not write the key when the flag is omitted.
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(source="codex")
+        assert "ai_pii_review_enabled" not in saved
+
 
 # --- list_projects ---
 
@@ -407,6 +431,13 @@ class TestListProjects:
         data = json.loads(captured.out)
         assert len(data) == 1
         assert data[0]["name"] == "codex:proj2"
+
+    def test_main_status_dispatch_is_not_shadowed(self, monkeypatch):
+        called = []
+        monkeypatch.setattr("clawjournal.cli.status", lambda: called.append(True))
+        monkeypatch.setattr("sys.argv", ["clawjournal", "status"])
+        main()
+        assert called == [True]
 
 
 class TestWorkflowGateMessages:
@@ -873,6 +904,7 @@ class TestBundleExport:
             output=None,
             json=True,
             zip=True,
+            ai_pii_review=True,
             training_format=False,
         )
         _run_bundle_export(args)
@@ -894,6 +926,28 @@ class TestBundleExport:
         assert "[REDACTED_NAME]" in sessions_content
         assert manifest["redaction_summary"]["pii_review"]["finding_count"] == 1
         assert manifest["redaction_summary"]["coverage"] == {"full": 2, "rules_only": 0}
+
+    def test_export_ai_pii_review_without_zip_warns(self, bundle_index, capsys, monkeypatch):
+        """--ai-pii-review is a no-op without --zip; the CLI must say so rather
+        than silently ignore it."""
+        from clawjournal.workbench.index import create_share, open_index
+        conn = open_index()
+        bundle_id = create_share(conn, ["sess-0", "sess-1"])
+        conn.close()
+
+        def fail_hybrid(*_a, **_k):
+            raise AssertionError("AI PII review must not run without --zip")
+
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fail_hybrid)
+
+        from clawjournal.cli import _run_bundle_export
+        args = MagicMock(
+            share_id=bundle_id, output=None, json=True,
+            zip=False, ai_pii_review=True, training_format=False,
+        )
+        _run_bundle_export(args)
+        captured = capsys.readouterr()
+        assert "--ai-pii-review only applies when building the uploadable zip" in captured.err
 
     def test_export_zip_appends_suffix_to_output_directory(self, bundle_index, tmp_path, capsys):
         from clawjournal.workbench.index import create_share, open_index
@@ -934,7 +988,7 @@ class TestBundleExport:
         sessions = [
             {
                 "session_id": "redact-test",
-                "project": "test-project",
+                "project": "MySecretName-project",
                 "source": "claude",
                 "model": "claude-sonnet-4",
                 "messages": [
@@ -965,6 +1019,9 @@ class TestBundleExport:
         content = sessions_file.read_text()
         assert "MySecretName" not in content, "Custom redact_string was not redacted"
         assert "sk-ant-api03" not in content, "API key was not redacted"
+
+        manifest_content = (Path(output["export_path"]) / "manifest.json").read_text()
+        assert "MySecretName" not in manifest_content, "manifest metadata was not redacted"
 
     def test_export_applies_policy_rules(self, tmp_path, monkeypatch, capsys):
         """Bundle export applies workbench policy rules in addition to config."""
@@ -1567,25 +1624,28 @@ class TestShareHelpers:
 
 class TestShare:
     def test_share_approved(self, bundle_index, capsys, monkeypatch):
-        """share --status approved creates bundle + exports + shares."""
+        """share --status approved packages locally and points to the workbench submit step."""
         from clawjournal.cli import _run_share
 
-        def mock_upload_share(conn, bundle_id, **kwargs):
-            return {"ok": True, "session_count": 3, "bundle_hash": "abc123",
-                    "shared_at": "2026-01-01",
-                    "redaction_summary": {"total_redactions": 2, "by_type": {"jwt": 1, "email": 1}}}
-
-        # _run_share imports upload_share from clawjournal.workbench.daemon at call time
-        monkeypatch.setattr("clawjournal.workbench.daemon.ensure_share_upload_ready", lambda: None)
-        monkeypatch.setattr("clawjournal.workbench.daemon.upload_share", mock_upload_share)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._prepare_share_export_for_upload",
+            lambda conn, share_id, share, settings, reuse_finalized=False, **_kw: (
+                Path("/tmp/clawjournal-share"),
+                {
+                    "sessions": [{}, {}, {}],
+                    "redaction_summary": {"total_redactions": 2, "by_type": {"jwt": 1, "email": 1}},
+                },
+                None,
+            ),
+        )
         monkeypatch.setattr("clawjournal.cli._collect_pii_findings", lambda *args, **kwargs: [])
 
         args = MagicMock(session_ids=[], status="approved", note="test",
                          force=False, json=False, preview=False)
         _run_share(args)
         out = capsys.readouterr().out
-        assert "Shared 3 sessions" in out
-        assert "uploaded successfully" in out
+        assert "Packaged 3 sessions" in out
+        assert "ready for hosted submission in the workbench" in out
         assert "Privacy:" in out
         assert "2 redactions applied" in out
 
@@ -1602,16 +1662,13 @@ class TestShare:
         """share --json restores the legacy bundle_id alias."""
         from clawjournal.cli import _run_share
 
-        monkeypatch.setattr("clawjournal.workbench.daemon.ensure_share_upload_ready", lambda: None)
         monkeypatch.setattr(
-            "clawjournal.workbench.daemon.upload_share",
-            lambda conn, share_id, **kwargs: {
-                "ok": True,
-                "session_count": 3,
-                "bundle_hash": "abc123",
-                "shared_at": "2026-01-01",
-                "redaction_summary": {"total_redactions": 0, "by_type": {}},
-            },
+            "clawjournal.workbench.daemon._prepare_share_export_for_upload",
+            lambda conn, share_id, share, settings, reuse_finalized=False, **_kw: (
+                Path("/tmp/clawjournal-share"),
+                {"sessions": [{}, {}, {}], "redaction_summary": {"total_redactions": 0, "by_type": {}}},
+                None,
+            ),
         )
 
         args = MagicMock(session_ids=[], status="approved", note="test",
@@ -1620,6 +1677,37 @@ class TestShare:
         output = json.loads(capsys.readouterr().out)
         assert output["share_id"]
         assert output["bundle_id"] == output["share_id"]
+        assert output["next_step"] == "submit_in_workbench"
+
+    def test_share_honors_config_ai_pii_default(self, bundle_index, capsys, monkeypatch):
+        """With no --ai-pii-review flag, the persisted config default opts in."""
+        from clawjournal.cli import _run_share
+
+        # bundle_index points cli.load_config at {}; opt in via the config default.
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"ai_pii_review_enabled": True})
+
+        captured = {}
+
+        def _stub(conn, share_id, share, settings, reuse_finalized=False, **kw):
+            captured.update(kw)
+            return (
+                Path("/tmp/clawjournal-share"),
+                {"sessions": [{}], "redaction_summary": {"total_redactions": 0, "by_type": {}}},
+                None,
+            )
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._prepare_share_export_for_upload", _stub)
+
+        # No ai_pii_review on the namespace → the flag is absent.
+        args = MagicMock(session_ids=[], status="approved", note="test",
+                         force=False, json=True, preview=False)
+        del args.ai_pii_review
+        _run_share(args)
+
+        assert captured.get("ai_pii_review_enabled") is True
+        output = json.loads(capsys.readouterr().out)
+        assert output["workbench_url"].endswith("&ai_pii=1")
 
 
 class TestVerifyEmail:
@@ -1631,6 +1719,20 @@ class TestVerifyEmail:
         payload = json.loads(capsys.readouterr().out)
         assert "No active upload token" in payload["error"]
 
+    def test_verify_email_status_accepts_iso_expiry(self, monkeypatch, capsys):
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {
+            "verified_email": "test@university.edu",
+            "verified_email_token": "token",
+            "verified_email_token_expires_at": expires_at,
+        })
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email"])
+
+        main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["status"] == "verified"
+
     def test_verify_email_request_outputs_next_command(self, monkeypatch, capsys):
         monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
         monkeypatch.setattr("clawjournal.workbench.daemon.request_email_verification", lambda email: {"ok": True})
@@ -1639,6 +1741,32 @@ class TestVerifyEmail:
         payload = json.loads(capsys.readouterr().out)
         assert payload["status"] == "verification_sent"
         assert payload["next_command"] == "clawjournal verify-email test@university.edu --code <CODE>"
+
+    def test_verify_email_request_suppresses_dev_code_on_prod(self, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon._is_edu_email", lambda email: True)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.request_email_verification",
+            lambda email: {"status": "ok", "dev_code": "424242"},
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_is_local_dev", lambda: False)
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email", "test@university.edu"])
+        main()
+        payload = json.loads(capsys.readouterr().out)
+        assert "dev_code" not in payload
+
+    def test_verify_email_request_surfaces_dev_code_on_local(self, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon._is_edu_email", lambda email: True)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.request_email_verification",
+            lambda email: {"status": "ok", "dev_code": "424242"},
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_is_local_dev", lambda: True)
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email", "test@university.edu"])
+        main()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dev_code"] == "424242"
 
 
 class TestScore:
@@ -1808,13 +1936,54 @@ class TestScore:
         assert result["session_id"] == "sess-1"
         assert "Judge failed: backend auth failed" in result["error"]
 
-    def test_score_help_includes_default_limit_10(self, capsys, monkeypatch):
+    def test_score_help_includes_default_limit_20(self, capsys, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["clawjournal", "score", "--help"])
         with pytest.raises(SystemExit) as excinfo:
             main()
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
-        assert "Max sessions for batch mode (default: 10)" in out
+        assert "Max sessions for batch mode (default: 20)" in out
+        assert "failure-corpus" in out
+
+    def test_failure_corpus_alias_matches_legacy_failure_v1(self):
+        assert _normalize_score_source_filter("failure-corpus") == _normalize_score_source_filter("failure-v1")
+
+    def test_score_batch_window_filters_recent_sessions(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        from clawjournal.cli import _run_score_batch
+        from clawjournal.workbench.index import open_index, upsert_sessions
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [
+            {
+                "session_id": "old-sess",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "start_time": (now - timedelta(days=30)).isoformat(),
+                "messages": [{"role": "user", "content": "Old"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            },
+            {
+                "session_id": "recent-sess",
+                "project": "test-project",
+                "source": "codex",
+                "model": "gpt-5",
+                "start_time": (now - timedelta(days=1)).isoformat(),
+                "messages": [{"role": "user", "content": "Recent"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            },
+        ])
+        conn.close()
+
+        _run_score_batch(MagicMock(limit=50, source="failure-corpus", window=7))
+
+        output = json.loads(capsys.readouterr().out)
+        assert [row["session_id"] for row in output] == ["recent-sess"]
 
     def test_share_preview_json(self, bundle_index, capsys):
         """share --preview --json outputs session list as JSON."""

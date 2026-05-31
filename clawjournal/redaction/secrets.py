@@ -230,6 +230,54 @@ SECRET_PLACEHOLDER: dict[str, str] = {
     "high_entropy": "[REDACTED_SECRET]",
 }
 
+TOOL_SERVER_ID_PLACEHOLDER = "[REDACTED_TOOL_SERVER_ID]"
+
+_TOOL_SERVER_ID_ASSIGNMENT_RE = re.compile(
+    r"""(?i)(?:"serverId"|serverId|server_id|server-id)\s*[:=]\s*["'](?P<value>[A-Za-z0-9_-]{8,})["']"""
+)
+
+
+def _is_tool_server_id_key(key: str) -> bool:
+    return re.sub(r"[^a-z0-9]", "", key.lower()) == "serverid"
+
+
+def _collect_infrastructure_secret_map(value: Any) -> dict[str, str]:
+    """Collect local tool/browser infrastructure IDs that should not export.
+
+    Preview/browser tools often store opaque handles as ``serverId``. Some
+    handles are harmless locally but look like provider tokens to TruffleHog
+    once serialized as JSON, so redact them deterministically before the
+    mandatory final scan.
+    """
+    out: dict[str, str] = {}
+
+    def add(raw: str) -> None:
+        if len(raw) < 8 or raw.startswith("[REDACTED"):
+            return
+        out.setdefault(raw, TOOL_SERVER_ID_PLACEHOLDER)
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                if isinstance(key, str) and _is_tool_server_id_key(key):
+                    if isinstance(nested, str):
+                        add(nested)
+                    else:
+                        walk(nested)
+                    continue
+                walk(nested)
+            return
+        if isinstance(item, list):
+            for nested in item:
+                walk(nested)
+            return
+        if isinstance(item, str):
+            for match in _TOOL_SERVER_ID_ASSIGNMENT_RE.finditer(item):
+                add(match.group("value"))
+
+    walk(value)
+    return out
+
 ALLOWLIST = [
     re.compile(r"noreply@"),
     re.compile(r"@example\.com"),
@@ -837,6 +885,7 @@ def redact_session(
             texts, user_allowlist=user_allowlist,
             custom_strings=custom_strings if pass_num == 0 else None,  # custom strings only on first pass
         )
+        secret_map.update(_collect_infrastructure_secret_map(session))
 
         if not secret_map:
             break  # Nothing more to redact
@@ -1102,6 +1151,7 @@ def apply_findings_to_blob(
             secret_map.update(
                 pii_secret_map_from_text_decisions(ai_text, decisions, user_allowlist)
             )
+        secret_map.update(_collect_infrastructure_secret_map(blob))
         secret_map.update(trufflehog_map)
         # Note on loop termination: once trufflehog_map is non-empty the
         # `not secret_map` guard never fires, so the pass loop now

@@ -142,11 +142,27 @@ Write-Host "Or add the venv to PATH for this session:"
 Write-Host "        `$env:Path = `"$VenvBin;`" + `$env:Path"
 
 # 6) Soft hints for optional runtime deps.
-$frontendBuilt = Test-Path (Join-Path $RepoDir 'clawjournal\web\frontend\dist\index.html')
+$DistHtml = Join-Path $RepoDir 'clawjournal\web\frontend\dist\index.html'
+$FeSrcDir = Join-Path $RepoDir 'clawjournal\web\frontend\src'
+$frontendBuilt = Test-Path $DistHtml
 if (-not $frontendBuilt) {
     Write-Host ""
     Write-Host "[i] Browser workbench not built. To enable 'clawjournal serve':"
     Write-Host "      .\scripts\install.ps1 -WithFrontend     (requires Node.js)"
+}
+elseif (Test-Path $FeSrcDir) {
+    # Source newer than the built assets — a sync without a rebuild leaves
+    # 'clawjournal serve' showing a stale workbench (e.g. an empty Share queue).
+    $distTime = (Get-Item $DistHtml).LastWriteTimeUtc
+    $newestSrc = Get-ChildItem -Path $FeSrcDir -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    if ($newestSrc -and $newestSrc.LastWriteTimeUtc -gt $distTime) {
+        Write-Host ""
+        Write-Host "[i] The browser workbench build looks out of date (its source is newer"
+        Write-Host "    than the built assets). 'clawjournal serve' may show an old UI until"
+        Write-Host "    you rebuild:"
+        Write-Host "      .\scripts\install.ps1 -WithFrontend     (requires Node.js)"
+    }
 }
 
 if (-not (Get-Command trufflehog -ErrorAction SilentlyContinue)) {

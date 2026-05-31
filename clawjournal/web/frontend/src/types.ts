@@ -160,6 +160,10 @@ export interface Share {
   manifest: Record<string, unknown> | null;
   shared_at: string | null;
   gcs_uri?: string | null;
+  hosted_receipt_id?: string | null;
+  hosted_status?: string | null;
+  hosted_submission_url?: string | null;
+  zip_size_bytes?: number | null;
   sessions?: Session[];
 }
 
@@ -240,7 +244,7 @@ export interface RedactionReport {
   redaction_count: number;
   redaction_log: RedactionLogEntry[];
   ai_pii_findings?: AiPiiFinding[];
-  ai_coverage?: 'full' | 'rules_only';
+  ai_coverage?: 'full' | 'rules_only' | 'disabled';
   redacted_session: SessionDetail;
 }
 

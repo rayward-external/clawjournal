@@ -30,7 +30,13 @@ class ClawJournalConfig(TypedDict, total=False):
     daemon_port: int | None
     verified_email: str | None
     verified_email_token: str | None
-    verified_email_token_expires_at: int | None
+    verified_email_token_expires_at: str | int | float | None
+    pending_verification_id: str | None
+    pending_verification_email: str | None
+    pending_verification_expires_at: str | int | None
+    ai_pii_review_enabled: bool
+    scorer_backend: str | None
+    scorer_backend_confirmed_at: str | None
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {

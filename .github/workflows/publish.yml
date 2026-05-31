@@ -1,0 +1,97 @@
+name: Publish to PyPI
+
+# Cuts a PyPI release automatically when a vX.Y.Z tag is pushed.
+#
+# ONE-TIME SETUP (required before the first tag — uses Trusted Publishing,
+# so there is no API token to store):
+#   1. On https://pypi.org/manage/project/clawjournal/settings/publishing/
+#      add a GitHub trusted publisher with:
+#        Owner:        rayward-external
+#        Repository:   clawjournal
+#        Workflow:     publish.yml
+#        Environment:  pypi
+#   2. (Optional) In repo Settings → Environments, create an environment named
+#      `pypi` and add reviewers/branch rules if you want a manual approval gate.
+#
+# RELEASE FLOW after setup: bump the version (see test_repo_layout for the
+# files that must agree), merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip "setuptools>=77.0" wheel build twine
+
+      # Refuse to publish a tag whose version disagrees with the source, so a
+      # stray tag can never ship a mismatched (or already-released) version.
+      - name: Verify tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python -c 'import tomllib, pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} ($tag) does not match pyproject version $pkg. Bump the version or fix the tag."
+            exit 1
+          fi
+          echo "Tag and package version agree: $pkg"
+
+      # The wheel ships the pre-built workbench assets, so build the frontend
+      # before packaging (mirrors the smoke job in test.yml).
+      - name: Build browser workbench
+        working-directory: clawjournal/web/frontend
+        run: |
+          npm ci
+          npm run build
+      - run: test -f clawjournal/web/frontend/dist/index.html
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Verify wheel ships the frontend assets
+        run: |
+          wheel_file=$(ls dist/clawjournal-*.whl)
+          python -m zipfile -l "$wheel_file" | grep -q 'web/frontend/dist/index.html' \
+            || { echo "::error::wheel missing frontend assets: $wheel_file"; exit 1; }
+
+      - name: Check artifact metadata
+        run: python -m twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/clawjournal
+    permissions:
+      id-token: write  # OIDC token for PyPI Trusted Publishing (no stored secret)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Re-running a tag that is already on PyPI is a no-op instead of a
+          # hard failure; a genuine new release still requires a version bump.
+          skip-existing: true

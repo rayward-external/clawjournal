@@ -74,10 +74,10 @@ Present the traces to the user as a numbered list showing title, source, badges,
 
 ```bash
 clawjournal scan
-clawjournal score --batch --source failure-v1 --auto-triage
+clawjournal score --batch --source failure-corpus --auto-triage
 ```
 
-`--source failure-v1` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: failure value (the primary signal for teachable agent failures) and productivity (legacy compatibility).
+`--source failure-corpus` scopes scoring to claude / codex / opencode / openclaw. Each session gets two AI ratings: failure value (the primary signal for teachable agent failures) and productivity (legacy compatibility).
 
 Present summary:
 
@@ -155,7 +155,7 @@ clawjournal bundle-create --status approved --note "<user's comment>" --json
 clawjournal bundle-export <bundle_id> --zip --json
 ```
 
-Parse the export result, use `zip_path` as the upload file, and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `CLAWJOURNAL_INGEST_URL`; use the workbench Done screen's "Submit to ClawJournal Research" button when it is available, then have the user upload the zip on that page. If the destination is not configured, tell the user the redacted zip is ready on their computer.
+Parse the export result and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `CLAWJOURNAL_INGEST_URL`; use the workbench Share tab's Submit step so email verification, consent, and receipt handling happen in the UI. If the destination is not configured, tell the user the redacted zip is ready on their computer.
 
 ### Quick Share
 
@@ -272,14 +272,14 @@ clawjournal shortlist <id> [id ...]
 clawjournal search <query> [--json] [--limit 20]
 
 # Scoring
-clawjournal score --batch [--source failure-v1] [--auto-triage] [--limit 20]
-clawjournal rescore --window 7d [--source failure-v1] [--limit 200]
+clawjournal score --batch [--source failure-corpus] [--auto-triage] [--limit 20]
+clawjournal rescore --window 7d [--source failure-corpus] [--limit 200]
 clawjournal score-view <id>
 clawjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--reason "..."]
 clawjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only
 
 # Advanced self-hosted ingest upload
-clawjournal share --status approved [--note "..."] [--preview] [--json]
+clawjournal share --status approved [--note "..."] [--preview] [--json]  # package locally; hosted submit is workbench-only
 
 # Bundles
 clawjournal bundle-create [ids ...] [--status approved]
@@ -308,4 +308,4 @@ clawjournal serve [--port 8384] [--no-browser] [--remote]
 - **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
 - **`clawjournal inbox --json`** is the preferred way for agents to read trace data.
 - **`clawjournal serve`** opens a browser automatically. Use `--no-browser` to suppress.
-- **Everything is local by default** — nothing leaves the machine unless the user explicitly uploads the zip or uses a configured self-hosted ingest command.
+- **Everything is local by default** — nothing leaves the machine unless the user explicitly submits from the workbench or uses a configured self-hosted ingest command.

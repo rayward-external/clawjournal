@@ -7,7 +7,7 @@ ClawJournal is designed to be usable without uploading anything.
 - `clawjournal scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` run locally.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
 - `bundle-export` writes files to disk. It does not contact a server.
-- If you never upload the zip in a hosted browser page, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share` / `share`, nothing is uploaded.
+- If you never use the workbench Submit step, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
 
 ## Automatic redaction
 
@@ -72,7 +72,7 @@ brew install trufflehog
 # https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
 ```
 
-For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the AI-PII pass rewrites the file. Either scan finding something aborts the upload. The AI-PII pass reviews sessions in a small bounded worker pool and falls back to deterministic PII rules when an AI backend errors or times out; the manifest records `redaction_summary.coverage.full` vs. `rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
+For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the final PII pass rewrites the file. Either scan finding something aborts the upload. The final PII pass always runs deterministic rules. If you opt in to AI-assisted review for a bundle, it also reviews sessions in a small bounded worker pool and falls back to deterministic PII rules when an AI backend errors or times out; the manifest records `redaction_summary.pii_review.ai_enabled` plus `redaction_summary.coverage.full` vs. `rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
 
 One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
 
@@ -92,11 +92,11 @@ Depending on how you export, bundle content can include user messages, assistant
 
 Uploading is a separate path from local export.
 
-- Hosted research submission uses Rayward's browser upload page by default. Self-hosters can override it with `CLAWJOURNAL_SHARE_URL`, and setting `CLAWJOURNAL_SHARE_URL=` disables the hosted button.
+- Hosted research submission uses the local workbench Submit step by default. The browser talks to the local daemon, the daemon sends the finalized zip to Rayward's hosted API, and the hosted service returns a receipt ID. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables hosted submission.
 - Advanced self-hosted ingest upload is disabled unless `CLAWJOURNAL_INGEST_URL` is configured.
 - The ingest and hosted-share URLs must use `https://`, except for `localhost` and `127.0.0.1` during local development.
-- Self-hosted ingest commands are `clawjournal bundle-share <bundle_id>` or `clawjournal share ...`.
-- You can inspect what would be included in self-hosted ingest with `clawjournal share --preview --status approved`.
+- Self-hosted ingest upload uses `clawjournal bundle-share <bundle_id>`.
+- You can inspect what would be packaged with `clawjournal share --preview --status approved`.
 
 ### Email verification
 
@@ -107,12 +107,13 @@ clawjournal verify-email you@university.edu
 clawjournal verify-email you@university.edu --code <CODE>
 ```
 
-The `.edu` email is used for verification and short-lived upload authorization. It is not included in the exported bundle itself.
+The academic email is used for verification and short-lived upload authorization. It is not included in the exported bundle itself, and the upload token stays in the local daemon rather than browser JavaScript.
 
 ## Practical guidance
 
 - If you only want local review, stop at `scan`, `serve`, `export`, or `bundle-export`.
 - If you want to distribute data yourself, use `bundle-export` and share the files however you choose.
-- If you want network upload, configure ingest explicitly and treat that as a separate opt-in step.
+- If you want hosted research upload, use the workbench Submit step so the current consent terms are shown before upload.
+- If you want self-hosted network upload, configure ingest explicitly and treat that as a separate opt-in step.
 
 For security reporting and threat-model scope, see [SECURITY.md](SECURITY.md).

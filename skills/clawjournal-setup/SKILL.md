@@ -94,10 +94,10 @@ Ask: "Would you like me to auto-score your sessions? Each session gets two AI ra
 If yes:
 
 ```bash
-~/.clawjournal-venv/bin/clawjournal score --batch --source failure-v1 --auto-triage
+~/.clawjournal-venv/bin/clawjournal score --batch --source failure-corpus --auto-triage
 ```
 
-`--source failure-v1` scopes to the supported sources (claude, codex, opencode, openclaw); auto-triage archives productivity-1 sessions only when failure value is 1-2.
+`--source failure-corpus` scopes to the supported sources (claude, codex, opencode, openclaw); auto-triage archives productivity-1 sessions only when failure value is 1-2.
 
 Show summary: "N sessions scored. Failure-value distribution: ... M productivity-1 low-failure-value sessions auto-archived as noise."
 
@@ -157,6 +157,26 @@ Tell the user:
 - "You can review and share traces anytime with `/clawjournal`"
 - "Score sessions with `/clawjournal-score`"
 - "Everything stays 100% local until you explicitly choose to share"
+
+## Before sharing: source scope + project confirmation
+
+Sharing/exporting is gated until two one-time confirmations are set — this
+prevents accidentally contributing traces from a source or project the user
+didn't intend. Local review and scoring do **not** need these; only the first
+share does. The workbench Share flow and `clawjournal` export both block until
+both are in place:
+
+- **Source scope** — explicitly choose which agents' traces are in scope:
+  ```bash
+  ~/.clawjournal-venv/bin/clawjournal config --source <claude|codex|gemini|all>
+  ```
+- **Project confirmation** — confirm the projects whose traces may be shared:
+  ```bash
+  ~/.clawjournal-venv/bin/clawjournal config --confirm-projects
+  ```
+
+It's fine to defer this until the user is ready to contribute — if they try to
+share first, ClawJournal prints the exact command to run.
 
 ## Troubleshooting
 

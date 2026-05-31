@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "clawjournal",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "ClawJournal — review, curate, and share your coding agent conversation traces. 100% local. Scans sessions from Claude Code, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline. Auto-redacts secrets and PII. Browser workbench for triage and export.",
   "owner": {
     "name": "rayward-external",
@@ -11,7 +11,7 @@
     {
       "name": "clawjournal",
       "description": "ClawJournal agent skills: /clawjournal-setup (install + scan + launch workbench), /clawjournal (review, triage, and share traces), and /clawjournal-score (AI-assisted quality scoring).",
-      "version": "0.1.15",
+      "version": "0.1.16",
       "author": {
         "name": "rayward-external",
         "url": "https://github.com/rayward-external"
