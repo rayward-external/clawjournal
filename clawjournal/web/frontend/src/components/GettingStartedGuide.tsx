@@ -17,7 +17,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
   ];
 
   return (
-    <div style={{
+    <div role="note" aria-label="Getting started" style={{
       display: 'flex',
       flexWrap: 'wrap',
       gap: 14,
@@ -37,7 +37,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
         </div>
       </div>
 
-      <div style={{
+      <div role="list" style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(auto-fit, minmax(132px, 1fr))',
         gap: 6,
@@ -47,6 +47,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
         {steps.map((step, idx) => (
           <div
             key={step.label}
+            role="listitem"
             style={{
               display: 'flex',
               gap: 7,
@@ -58,7 +59,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
               background: colors.white,
             }}
           >
-            <span style={{
+            <span aria-hidden="true" style={{
               width: 20,
               height: 20,
               borderRadius: '50%',
@@ -103,8 +104,8 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
         <button
           type="button"
           onClick={onDismiss}
-          aria-label="Dismiss"
-          title="Dismiss"
+          aria-label="Dismiss getting-started guide"
+          title="Dismiss getting-started guide"
           style={{
             width: 28,
             height: 28,
@@ -119,7 +120,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
             lineHeight: 1,
           }}
         >
-          ✕
+          <span aria-hidden="true">✕</span>
         </button>
       </div>
     </div>
