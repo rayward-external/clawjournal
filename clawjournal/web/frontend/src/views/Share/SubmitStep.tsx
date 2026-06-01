@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api.ts';
 import { colors } from '../../theme.ts';
 import { Spinner } from '../../components/Spinner.tsx';
@@ -18,6 +18,13 @@ export interface SubmitStepProps {
   toast: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
 
+type UploadStatus = {
+  verified_email: string | null;
+  token_valid: boolean;
+  expires_at: string | number | null;
+  pending_email: string | null;
+};
+
 export function SubmitStep(p: SubmitStepProps) {
   const [consent, setConsent] = useState<HostedConsent | null>(null);
   const [loadingConsent, setLoadingConsent] = useState(true);
@@ -30,31 +37,116 @@ export function SubmitStep(p: SubmitStepProps) {
   const [acceptTerms, setAcceptTerms] = useState(false);
   const [ownership, setOwnership] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitStageIndex, setSubmitStageIndex] = useState(0);
+  const [submitProgress, setSubmitProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+
+  const submitStages = useMemo(() => [
+    {
+      buttonLabel: 'Checking...',
+      detail: 'Refreshing consent and email verification.',
+      delayMs: 0,
+      progress: 8,
+    },
+    {
+      buttonLabel: p.aiPiiEnabled ? 'Reviewing PII...' : 'Applying rules...',
+      detail: p.aiPiiEnabled
+        ? 'AI PII review is running before upload.'
+        : 'Rules-only redaction is running before upload.',
+      delayMs: 900,
+      progress: 28,
+    },
+    {
+      buttonLabel: 'Rebuilding bundle...',
+      detail: 'Re-exporting the redacted bundle.',
+      delayMs: 7000,
+      progress: 50,
+    },
+    {
+      buttonLabel: 'Secret scan...',
+      detail: 'Running the final secret scan.',
+      delayMs: 14000,
+      progress: 70,
+    },
+    {
+      buttonLabel: 'Uploading...',
+      detail: 'Uploading the finalized zip.',
+      delayMs: 22000,
+      progress: 86,
+    },
+  ], [p.aiPiiEnabled]);
+
+  const applySubmitState = useCallback((consentData: HostedConsent, status: UploadStatus) => {
+    setConsent(consentData);
+    setTokenValid(!!status.token_valid);
+    setVerifiedEmail(status.verified_email);
+    setPendingEmail(status.pending_email);
+    setEmail(status.pending_email || status.verified_email || '');
+  }, []);
+
+  const refreshSubmitState = useCallback(async () => {
+    const [consentData, status] = await Promise.all([
+      api.share.consent(),
+      api.share.uploadStatus(),
+    ]);
+    applySubmitState(consentData, status);
+    return { consentData, status };
+  }, [applySubmitState]);
 
   const loadSubmitState = useCallback(async () => {
     setLoadingConsent(true);
     try {
-      const [consentData, status] = await Promise.all([
-        api.share.consent(),
-        api.share.uploadStatus(),
-      ]);
-      setConsent(consentData);
-      setTokenValid(!!status.token_valid);
-      setVerifiedEmail(status.verified_email);
-      setPendingEmail(status.pending_email);
-      setEmail(status.pending_email || status.verified_email || '');
+      await refreshSubmitState();
       setError(null);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Could not load hosted submission state');
     } finally {
       setLoadingConsent(false);
     }
-  }, []);
+  }, [refreshSubmitState]);
 
   useEffect(() => {
     void loadSubmitState();
   }, [loadSubmitState]);
+
+  useEffect(() => {
+    if (!tokenValid || busy) return;
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') void loadSubmitState();
+    };
+    window.addEventListener('focus', refreshIfVisible);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+    return () => {
+      window.removeEventListener('focus', refreshIfVisible);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
+  }, [busy, loadSubmitState, tokenValid]);
+
+  useEffect(() => {
+    if (!submitting) {
+      setSubmitStageIndex(0);
+      setSubmitProgress(0);
+      return;
+    }
+
+    setSubmitStageIndex(0);
+    setSubmitProgress(submitStages[0]?.progress ?? 8);
+    const timers = submitStages.slice(1).map((stage, index) => (
+      window.setTimeout(() => {
+        setSubmitStageIndex(index + 1);
+        setSubmitProgress((prev) => Math.max(prev, stage.progress));
+      }, stage.delayMs)
+    ));
+    const tick = window.setInterval(() => {
+      setSubmitProgress((prev) => Math.min(92, prev + (prev < 64 ? 3 : 1)));
+    }, 700);
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+      window.clearInterval(tick);
+    };
+  }, [submitting, submitStages]);
 
   const sendCode = async () => {
     if (!email.trim()) return;
@@ -91,19 +183,25 @@ export function SubmitStep(p: SubmitStepProps) {
   };
 
   const submit = async () => {
-    if (!p.shareId || !consent) return;
+    if (!p.shareId) return;
     setBusy(true);
+    setSubmitting(true);
     setError(null);
     try {
+      const { consentData, status } = await refreshSubmitState();
+      if (!status.token_valid) {
+        setError('Verification expired. Send a new code to continue.');
+        return;
+      }
       const result = await api.shares.upload(p.shareId, {
         accept_terms: acceptTerms,
         ownership_certification: ownership,
-        consent_version: consent.consent_version,
-        retention_policy_version: consent.retention_policy_version,
+        consent_version: consentData.consent_version,
+        retention_policy_version: consentData.retention_policy_version,
         ai_pii: p.aiPiiEnabled,
       });
       p.toast('Submitted', 'success');
-      p.onSubmitted(result.receipt_id, result.hosted_status || null, consent.support_contact || p.shareDestination?.support_contact || null);
+      p.onSubmitted(result.receipt_id, result.hosted_status || null, consentData.support_contact || p.shareDestination?.support_contact || null);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Submission failed';
       setError(msg);
@@ -122,6 +220,7 @@ export function SubmitStep(p: SubmitStepProps) {
       }
     } finally {
       setBusy(false);
+      setSubmitting(false);
     }
   };
 
@@ -131,6 +230,10 @@ export function SubmitStep(p: SubmitStepProps) {
 
   const disabled = busy || loadingConsent || !p.shareId || !tokenValid || !acceptTerms || !ownership || !consent;
   const supportContact = consent?.support_contact || p.shareDestination?.support_contact || null;
+  const currentSubmitStage = submitStages[submitStageIndex] ?? submitStages[0];
+  const submitPipelineLabel = p.aiPiiEnabled
+    ? 'AI PII review -> redaction -> secret scan -> upload'
+    : 'redaction -> secret scan -> upload';
 
   return (
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
@@ -240,9 +343,78 @@ export function SubmitStep(p: SubmitStepProps) {
               <CheckboxRow checked={ownership} onChange={setOwnership}>
                 I certify this bundle is mine to submit and contains no third-party confidential material.
               </CheckboxRow>
-              <button onClick={submit} disabled={disabled} style={{ ...btnPrimary, justifyContent: 'center', opacity: disabled ? 0.45 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}>
-                <Icon name="check" size={14} /> Submit to ClawJournal Research
+              <button
+                onClick={submit}
+                disabled={disabled}
+                aria-busy={submitting}
+                style={{
+                  ...btnPrimary,
+                  justifyContent: 'center',
+                  opacity: disabled && !submitting ? 0.45 : 1,
+                  cursor: submitting ? 'wait' : disabled ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {submitting ? (
+                  <>
+                    <span style={{
+                      width: 14,
+                      height: 14,
+                      border: '2px solid rgba(255,255,255,0.35)',
+                      borderTopColor: colors.white,
+                      borderRadius: '50%',
+                      animation: 'clawSpin 700ms linear infinite',
+                      flexShrink: 0,
+                    }} />
+                    {currentSubmitStage.buttonLabel}
+                  </>
+                ) : (
+                  <>
+                    <Icon name="check" size={14} /> Submit to ClawJournal Research
+                  </>
+                )}
               </button>
+              {submitting && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  style={{
+                    display: 'grid',
+                    gap: 8,
+                    padding: '10px 12px',
+                    border: `1px solid ${colors.primary200}`,
+                    background: colors.primary50,
+                    borderRadius: 8,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: colors.gray700 }}>
+                    <span style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: '50%',
+                      background: colors.primary500,
+                      boxShadow: `0 0 0 3px ${colors.primary100}`,
+                      flexShrink: 0,
+                    }} />
+                    {currentSubmitStage.detail}
+                  </div>
+                  <div style={{ height: 4, background: colors.gray200, borderRadius: 2, overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${submitProgress}%`,
+                      height: '100%',
+                      background: `linear-gradient(90deg, ${colors.primary500}, ${colors.green500})`,
+                      transition: 'width 300ms ease',
+                    }} />
+                  </div>
+                  <div style={{
+                    fontSize: 11,
+                    color: colors.gray500,
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    overflowWrap: 'anywhere',
+                  }}>
+                    {submitPipelineLabel}
+                  </div>
+                </div>
+              )}
               {supportContact && (
                 <div style={{ fontSize: 11.5, color: colors.gray500, textAlign: 'center' }}>
                   Support: {supportContact}
