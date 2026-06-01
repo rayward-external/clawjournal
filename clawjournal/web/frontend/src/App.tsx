@@ -42,9 +42,9 @@ function Sidebar() {
   const NAV_ITEMS = [
     { to: '/dashboard', label: 'Dashboard', badge: null },
     { to: '/insights', label: 'Insights', badge: counts.recommendations > 0 ? counts.recommendations : null },
+    { to: '/benchmark', label: 'Benchmark', badge: null },
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
-    { to: '/benchmark', label: 'Benchmark', badge: null },
     { to: '/share', label: 'Share', badge: null },
   ];
 
