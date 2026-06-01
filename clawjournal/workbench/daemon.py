@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import urllib.error
@@ -3741,6 +3742,56 @@ npm run build</pre>
         self.wfile.write(data)
 
 
+def _warn_if_frontend_stale() -> None:
+    """In a dev checkout, warn loudly when the served bundle is older than source.
+
+    The editable install serves the gitignored ``dist/`` straight off disk, so
+    ``src/`` edits (or a freshly-merged feature) are invisible until someone runs
+    a build. We only have a ``src/`` tree in a dev checkout — the shipped wheel
+    packages only ``dist/`` — so its presence is what distinguishes "developer who
+    should rebuild" from "user running the released package". Silent on the latter.
+    """
+    src_dir = FRONTEND_DIST.parent / "src"
+    if not src_dir.is_dir():
+        return  # installed wheel, not a dev checkout — nothing to compare against
+
+    index_html = FRONTEND_DIST / "index.html"
+    # Absolute --prefix so the hint is copy-pasteable regardless of the cwd the
+    # daemon was launched from (`clawjournal serve` is a global entry point).
+    build_cmd = f"npm --prefix {FRONTEND_DIST.parent} run build"
+
+    def _banner(lines: list[str]) -> None:
+        width = max(len(line) for line in lines) + 2
+        bar = "=" * width
+        print(f"\n{bar}", file=sys.stderr)
+        for line in lines:
+            print(f" {line}", file=sys.stderr)
+        print(f"{bar}\n", file=sys.stderr)
+
+    if not index_html.exists():
+        _banner([
+            "⚠  frontend bundle is MISSING — the workbench will serve a placeholder.",
+            f"   build it:  {build_cmd}",
+        ])
+        return
+
+    try:
+        dist_mtime = index_html.stat().st_mtime
+        newest_src = max(
+            (p.stat().st_mtime for p in src_dir.rglob("*") if p.is_file()),
+            default=0.0,
+        )
+    except OSError:
+        return  # can't stat — don't block startup over a warning
+
+    if newest_src > dist_mtime:
+        _banner([
+            "⚠  frontend bundle is STALE — src/ has changes not in dist/.",
+            "   You are seeing an OLD UI. Rebuild to pick up frontend changes:",
+            f"     {build_cmd}",
+        ])
+
+
 def run_server(
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
@@ -3765,6 +3816,8 @@ def run_server(
 
     url = f"http://localhost:{port}/"
     logger.info("Workbench running at %s", url)
+
+    _warn_if_frontend_stale()
 
     if remote:
         import socket
