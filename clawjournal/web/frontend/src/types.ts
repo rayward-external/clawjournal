@@ -204,6 +204,11 @@ export interface Policy {
   created_at: string;
 }
 
+export interface Features {
+  /** Whether the Benchmark tab is shown in the workbench UI (config: benchmark_tab_enabled). */
+  benchmark_tab_enabled: boolean;
+}
+
 export interface Stats {
   total: number;
   by_status: Record<string, number>;

@@ -2044,6 +2044,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_allowlist()
         elif path == "/api/findings/allowlist":
             self._handle_list_findings_allowlist()
+        elif path == "/api/features":
+            self._handle_features()
         elif path == "/api/benchmarks":
             self._handle_benchmarks_list()
         elif path == "/api/benchmarks/latest":
@@ -2822,6 +2824,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             })
         finally:
             conn.close()
+
+    def _handle_features(self) -> None:
+        """Return UI feature flags read fresh from config (no DB, no restart needed
+        to pick up a toggle — the browser just reloads)."""
+        from ..config import load_config
+        config = load_config()
+        _json_response(self, {
+            "benchmark_tab_enabled": bool(config.get("benchmark_tab_enabled", True)),
+        })
 
     def _handle_list_allowlist(self) -> None:
         """Return current allowlist entries from config."""

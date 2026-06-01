@@ -346,6 +346,28 @@ class TestConfigure:
         configure(source="codex")
         assert "ai_pii_review_enabled" not in saved
 
+    def test_sets_benchmark_tab_flag(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(benchmark_tab_enabled=False)
+        assert saved["benchmark_tab_enabled"] is False
+
+        configure(benchmark_tab_enabled=True)
+        assert saved["benchmark_tab_enabled"] is True
+
+    def test_benchmark_tab_unset_leaves_config_untouched(self, tmp_config, monkeypatch, capsys):
+        # Tri-state default (None): omitting the flag must not write the key.
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(source="codex")
+        assert "benchmark_tab_enabled" not in saved
+
 
 # --- list_projects ---
 

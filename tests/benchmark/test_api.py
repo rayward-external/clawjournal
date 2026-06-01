@@ -228,3 +228,19 @@ class TestWorkerUnit:
         conn.close()
         assert got["status"] == "failed" and "kaboom" in got["error"]
         assert not dmod._BENCHMARK_GEN_LOCK.locked()
+
+
+class TestFeatures:
+    def test_default_enabled_when_key_missing(self, api, monkeypatch):
+        # Older configs lack the key → the gate defaults ON.
+        monkeypatch.setattr("clawjournal.config.load_config", lambda: {})
+        status, body = _get(api, "/api/features")
+        assert status == 200
+        assert body == {"benchmark_tab_enabled": True}
+
+    def test_respects_disabled_flag(self, api, monkeypatch):
+        monkeypatch.setattr("clawjournal.config.load_config",
+                            lambda: {"benchmark_tab_enabled": False})
+        status, body = _get(api, "/api/features")
+        assert status == 200
+        assert body == {"benchmark_tab_enabled": False}

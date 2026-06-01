@@ -18,7 +18,7 @@ interface SidebarCounts {
   recommendations: number;
 }
 
-function Sidebar() {
+function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
   const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0, recommendations: 0 });
 
   useEffect(() => {
@@ -42,7 +42,7 @@ function Sidebar() {
   const NAV_ITEMS = [
     { to: '/dashboard', label: 'Dashboard', badge: null },
     { to: '/insights', label: 'Insights', badge: counts.recommendations > 0 ? counts.recommendations : null },
-    { to: '/benchmark', label: 'Benchmark', badge: null },
+    ...(benchmarkEnabled ? [{ to: '/benchmark', label: 'Benchmark', badge: null }] : []),
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
     { to: '/share', label: 'Share', badge: null },
@@ -121,6 +121,16 @@ function Sidebar() {
 const SCORING_WARMUP_DECLINED_KEY = 'cj.scoringWarmupDeclined';
 
 export default function App() {
+  // Gate the Benchmark tab on a config flag (default on). Initialised to true so
+  // the common (enabled) case never flashes; only an explicitly-disabled install
+  // briefly shows it before /api/features resolves on localhost.
+  const [benchmarkEnabled, setBenchmarkEnabled] = useState(true);
+  useEffect(() => {
+    api.features()
+      .then(f => setBenchmarkEnabled(f.benchmark_tab_enabled))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     const timer = window.setTimeout(async () => {
@@ -166,7 +176,7 @@ export default function App() {
           color: colors.gray900,
           WebkitFontSmoothing: 'antialiased',
         }}>
-          <Sidebar />
+          <Sidebar benchmarkEnabled={benchmarkEnabled} />
           <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
             <Routes>
               <Route path="/dashboard" element={<Dashboard />} />
@@ -176,7 +186,7 @@ export default function App() {
               <Route path="/session/:id" element={<SessionDetail />} />
               <Route path="/bundles" element={<Navigate to="/share" replace />} />
               <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
-              <Route path="/benchmark" element={<Benchmark />} />
+              <Route path="/benchmark" element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/dashboard" replace />} />
               <Route path="/share" element={<Share />} />
               <Route path="/share/rules" element={<Policies />} />
             </Routes>

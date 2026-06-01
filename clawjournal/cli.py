@@ -369,6 +369,7 @@ def configure(
     redact_usernames: list[str] | None = None,
     confirm_projects: bool = False,
     ai_pii_review: bool | None = None,
+    benchmark_tab_enabled: bool | None = None,
 ):
     """Set config values non-interactively. Lists are MERGED (append), not replaced."""
     config = load_config()
@@ -401,6 +402,8 @@ def configure(
         config["projects_confirmed"] = True
     if ai_pii_review is not None:
         config["ai_pii_review_enabled"] = ai_pii_review
+    if benchmark_tab_enabled is not None:
+        config["benchmark_tab_enabled"] = benchmark_tab_enabled
     save_config(config)
     print(f"Config saved to {CONFIG_FILE}")
     print(json.dumps(_mask_config_for_display(config), indent=2))
@@ -3658,6 +3661,10 @@ def main() -> None:
     cfg.add_argument("--ai-pii-review", action=argparse.BooleanOptionalAction, default=None,
                      help="Default AI-assisted PII review on (--ai-pii-review) or off "
                           "(--no-ai-pii-review) for the workbench/CLI share flow")
+    cfg.add_argument("--benchmark-tab", dest="benchmark_tab_enabled",
+                     action=argparse.BooleanOptionalAction, default=None,
+                     help="Show (--benchmark-tab) or hide (--no-benchmark-tab) the "
+                          "Benchmark tab in the workbench UI")
 
     events_parser = sub.add_parser("events", help="Execution recorder commands")
     events_sub = events_parser.add_subparsers(dest="events_command", required=True)
@@ -4572,6 +4579,7 @@ def _parse_csv_arg(value: str | None) -> list[str] | None:
 def _handle_config(args) -> None:
     """Handle the config subcommand."""
     ai_pii_review = getattr(args, "ai_pii_review", None)
+    benchmark_tab_enabled = getattr(args, "benchmark_tab_enabled", None)
     has_changes = (
         args.repo
         or args.source
@@ -4581,6 +4589,7 @@ def _handle_config(args) -> None:
         or args.redact_usernames
         or args.confirm_projects
         or ai_pii_review is not None
+        or benchmark_tab_enabled is not None
     )
     if not has_changes:
         print(json.dumps(_mask_config_for_display(load_config()), indent=2))
@@ -4594,6 +4603,7 @@ def _handle_config(args) -> None:
         redact_usernames=_parse_csv_arg(args.redact_usernames),
         confirm_projects=args.confirm_projects or bool(args.exclude),
         ai_pii_review=ai_pii_review,
+        benchmark_tab_enabled=benchmark_tab_enabled,
     )
 
 

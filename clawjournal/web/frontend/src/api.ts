@@ -21,6 +21,7 @@ import type {
   Benchmark,
   BenchmarkSummary,
   BenchmarkTrend,
+  Features,
 } from './types.ts';
 
 const BASE = '/api';
@@ -159,6 +160,10 @@ export const api = {
 
   stats(params: { start?: string; end?: string } = {}): Promise<Stats> {
     return request(`/stats${qs(params)}`);
+  },
+
+  features(): Promise<Features> {
+    return request('/features');
   },
 
   dashboard(params: { start?: string; end?: string } = {}): Promise<DashboardData> {

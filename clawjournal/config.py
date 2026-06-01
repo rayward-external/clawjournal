@@ -37,6 +37,7 @@ class ClawJournalConfig(TypedDict, total=False):
     ai_pii_review_enabled: bool
     scorer_backend: str | None
     scorer_backend_confirmed_at: str | None
+    benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {
@@ -45,6 +46,7 @@ DEFAULT_CONFIG: ClawJournalConfig = {
     "excluded_projects": [],
     "redact_strings": [],
     "allowlist_entries": [],
+    "benchmark_tab_enabled": True,
 }
 
 
