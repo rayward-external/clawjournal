@@ -73,30 +73,6 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
 #   returns ``unverified`` for those, so they are never real leaks.
 EXCLUDED_DETECTORS: tuple[str, ...] = ("refiner",)
 
-# Detectors whose UNVERIFIED findings are dropped as structural false
-# positives, while their verified/unknown findings still block. This is
-# narrower than EXCLUDED_DETECTORS (which disables a detector entirely,
-# reserved for detectors that never catch real leaks): the detector stays
-# active, so a real, live secret it confirms still blocks the share.
-#
-# - ``Azure`` is TruffleHog's legacy generic Azure detector (type 3). Its
-#   broad pattern, fed through the PLAIN and BASE64 decoders, matches ordinary
-#   agent-session terminal content — ``127.0.0.1:5432`` connection lines, file
-#   paths like ``scripts/foo.sh``, ANSI color codes (``\x1b[0m``) — and
-#   Azure-API verification returns unverified for all of them. The specific
-#   Azure detectors (AzureStorage, AzureSAS, AzureBatch, …) stay active and
-#   still catch real Azure keys by type.
-NOISY_UNVERIFIED_DETECTORS: frozenset[str] = frozenset({"Azure"})
-
-
-def _is_suppressed_noise(detector: str, status: str) -> bool:
-    """True for a structural false positive to drop: an UNVERIFIED finding
-    from a broad detector in NOISY_UNVERIFIED_DETECTORS. Applied uniformly by
-    the gate (``scan_file``) and the redaction-engine path
-    (``_scan_text_for_raw_matches``) so they never disagree about what counts
-    as a secret — verified/unknown findings from those detectors still count."""
-    return status == "unverified" and detector in NOISY_UNVERIFIED_DETECTORS
-
 INSTALL_HINT = (
     "TruffleHog is required to export shares but was not found on PATH.\n"
     "Install it with:\n"
@@ -441,10 +417,6 @@ def scan_file(path: Path) -> TruffleHogReport:
         finding = _parse_finding(parsed)
         if finding is None:
             continue
-        # Drop structural false positives from broad detectors (see
-        # NOISY_UNVERIFIED_DETECTORS) before they can block the gate.
-        if _is_suppressed_noise(finding.detector, finding.status):
-            continue
         key = (finding.detector, finding.status, finding.line, finding.raw_sha256)
         if key in seen_keys:
             continue
@@ -590,10 +562,6 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
         if not isinstance(detector, str) or not isinstance(raw, str) or not raw:
             continue
         status = _classify_trufflehog_status(parsed)
-        # Same suppression as the gate: a broad detector's unverified false
-        # positives must not be redacted as fake secrets either.
-        if _is_suppressed_noise(detector, status):
-            continue
         key = (detector, raw)
         if key in seen:
             continue

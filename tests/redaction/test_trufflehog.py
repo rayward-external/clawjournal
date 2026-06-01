@@ -208,16 +208,17 @@ class TestScanFile:
         assert other["Raw"] not in payload
         assert "GitHub" in summary["top_detectors"]
 
-    def test_unverified_generic_azure_false_positives_are_suppressed(self, tmp_path, monkeypatch):
+    def test_unverified_generic_azure_findings_still_block(self, tmp_path, monkeypatch):
         """The legacy generic Azure detector fires on ordinary agent-session
         terminal content (localhost connection strings, file paths, ANSI color
-        codes) and Azure-API verification returns unverified for all of them.
-        Those must not block the share."""
+        codes) and Azure-API verification can return unverified. The export
+        gate remains fail-closed: TruffleHog findings still block unless the
+        detector is explicitly excluded."""
         self._enable_real_scan(monkeypatch)
         target = tmp_path / "sessions.jsonl"
         target.write_text("x\n")
 
-        false_positives = [
+        findings = [
             {
                 "DetectorName": "Azure",
                 "Verified": False,
@@ -237,20 +238,20 @@ class TestScanFile:
                 "SourceMetadata": {"Data": {"Filesystem": {"line": 5}}},
             },
         ]
-        stdout = "\n".join(json.dumps(x) for x in false_positives) + "\n"
+        stdout = "\n".join(json.dumps(x) for x in findings) + "\n"
         monkeypatch.setattr(
             subprocess,
             "run",
             lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 183, stdout=stdout, stderr=""),
         )
         report = trufflehog.scan_file(target)
-        assert report.findings == []
-        assert report.unverified == 0
-        assert report.blocking is False
+        assert len(report.findings) == 3
+        assert report.unverified == 3
+        assert report.blocking is True
 
     def test_verified_generic_azure_still_blocks(self, tmp_path, monkeypatch):
-        """Suppression is surgical: a *verified* generic-Azure finding is a
-        real, live credential and must still block."""
+        """A verified generic-Azure finding is a real, live credential and
+        must still block."""
         self._enable_real_scan(monkeypatch)
         target = tmp_path / "sessions.jsonl"
         target.write_text("x\n")
@@ -271,8 +272,8 @@ class TestScanFile:
         assert report.blocking is True
 
     def test_specific_azure_detector_unverified_still_blocks(self, tmp_path, monkeypatch):
-        """Only the generic ``Azure`` detector is treated as noisy. Specific
-        Azure detectors (AzureStorage, …) still block even when unverified."""
+        """Specific Azure detectors (AzureStorage, etc.) also block even when
+        unverified."""
         self._enable_real_scan(monkeypatch)
         target = tmp_path / "sessions.jsonl"
         target.write_text("x\n")
@@ -427,10 +428,9 @@ class TestFindingsEngineEntryPoints:
             ],
         )
 
-    def test_scan_text_for_raw_matches_suppresses_unverified_noisy_detector(self, monkeypatch):
-        """The generic Azure detector's unverified false positives are dropped
-        in the redaction-engine path too (not just the gate), so they are never
-        redacted as fake secrets. Verified Azure and other detectors pass."""
+    def test_scan_text_for_raw_matches_keeps_unverified_generic_azure(self, monkeypatch):
+        """The redaction-engine path preserves unverified generic Azure hits so
+        it stays consistent with the fail-closed gate."""
         monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
         monkeypatch.setattr(trufflehog, "is_available", lambda: True)
         rows = [
@@ -445,9 +445,9 @@ class TestFindingsEngineEntryPoints:
         )
         matches = trufflehog._scan_text_for_raw_matches("payload")
         pairs = {(m["detector"], m["status"]) for m in matches}
-        assert ("Azure", "unverified") not in pairs   # suppressed
-        assert ("Azure", "verified") in pairs          # real Azure still found
-        assert ("Slack", "unverified") in pairs        # other detectors unaffected
+        assert ("Azure", "unverified") in pairs
+        assert ("Azure", "verified") in pairs
+        assert ("Slack", "unverified") in pairs
 
     def test_serialize_session_does_not_duplicate_widened_text(self):
         """Widened leaves appear once (via the JSON dump), not twice — the
