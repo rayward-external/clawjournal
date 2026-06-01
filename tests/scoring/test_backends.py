@@ -11,6 +11,7 @@ from clawjournal.scoring.backends import (
     AgentResult,
     BACKEND_CHOICES,
     SUPPORTED_BACKENDS,
+    _agent_subprocess_env,
     _build_claude_cmd,
     _build_codex_cmd,
     _build_hermes_cmd,
@@ -317,6 +318,46 @@ def _stub_subprocess(monkeypatch, *, stdout="", stderr="", returncode=0):
 def _stub_which(monkeypatch):
     """Make shutil.which always succeed."""
     monkeypatch.setattr("clawjournal.scoring.backends.shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+
+
+class TestAgentSubprocessEnv:
+    """The spawned agent CLI must not inherit an external ANTHROPIC_API_KEY,
+    so it falls back to the user's subscription login (the "default agent")."""
+
+    def test_strips_anthropic_api_key_by_default(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-invalid")
+        monkeypatch.delenv("CLAWJOURNAL_KEEP_API_KEY", raising=False)
+        env = _agent_subprocess_env()
+        assert "ANTHROPIC_API_KEY" not in env
+        # unrelated environment is preserved
+        assert "PATH" in env
+
+    def test_keep_api_key_opt_out(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-keepme")
+        for val in ("1", "true", "yes", "on"):
+            monkeypatch.setenv("CLAWJOURNAL_KEEP_API_KEY", val)
+            assert _agent_subprocess_env()["ANTHROPIC_API_KEY"] == "sk-ant-keepme"
+
+    def test_keep_api_key_falsey_still_strips(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-invalid")
+        monkeypatch.setenv("CLAWJOURNAL_KEEP_API_KEY", "0")
+        assert "ANTHROPIC_API_KEY" not in _agent_subprocess_env()
+
+    def test_claude_subprocess_receives_sanitized_env(self, monkeypatch, tmp_path):
+        """End-to-end: the claude subprocess gets env without the API key."""
+        _stub_which(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-invalid")
+        monkeypatch.delenv("CLAWJOURNAL_KEEP_API_KEY", raising=False)
+        captured = {}
+
+        def spy_run(cmd, **kw):
+            captured.update(kw)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="claude", cwd=tmp_path, task_prompt="hello")
+        assert "env" in captured
+        assert "ANTHROPIC_API_KEY" not in captured["env"]
 
 
 class TestRunDefaultAgentTaskClaude:

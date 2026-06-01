@@ -353,6 +353,33 @@ def _build_hermes_cmd(
     return cmd
 
 
+# Environment variables that flip a spawned agent CLI into external
+# API-billing mode. ANTHROPIC_API_KEY in particular makes the `claude` CLI
+# bypass the interactive subscription login: when set it is *always*
+# preferred, so a stale/invalid key (e.g. exported in a shell profile) makes
+# every task die with "Invalid API key · Fix external API key", and a valid
+# one silently bills the API — defeating the "default agent = your
+# subscription" contract. Strip it for the spawned CLI so it falls back to
+# the logged-in account.
+_AGENT_ENV_STRIP_KEYS = ("ANTHROPIC_API_KEY",)
+
+
+def _agent_subprocess_env() -> dict[str, str]:
+    """Build the environment for a spawned agent CLI.
+
+    Removes external provider API keys so the CLI uses its interactive
+    login (the "default agent" path the user opted into). Set
+    ``CLAWJOURNAL_KEEP_API_KEY=1`` to opt back in to key-based auth.
+    """
+    env = dict(os.environ)
+    keep = (env.get("CLAWJOURNAL_KEEP_API_KEY") or "").strip().lower()
+    if keep in ("1", "true", "yes", "on"):
+        return env
+    for var in _AGENT_ENV_STRIP_KEYS:
+        env.pop(var, None)
+    return env
+
+
 def run_default_agent_task(
     *,
     backend: str = "auto",
@@ -400,6 +427,7 @@ def run_default_agent_task(
     resolved = resolve_backend(backend)
     check_backend_runtime(resolved)
     command = require_backend_command(resolved)
+    agent_env = _agent_subprocess_env()
 
     if codex_output_file and ("/" in codex_output_file or "\\" in codex_output_file):
         raise ValueError(
@@ -420,6 +448,7 @@ def run_default_agent_task(
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
+                env=agent_env,
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -461,6 +490,7 @@ def run_default_agent_task(
                 cmd,
                 capture_output=True,
                 text=True,
+                env=agent_env,
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
@@ -499,6 +529,7 @@ def run_default_agent_task(
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
+                env=agent_env,
                 timeout=timeout_seconds + 10,
             )
         except subprocess.TimeoutExpired:
@@ -523,6 +554,7 @@ def run_default_agent_task(
                 cwd=str(cwd),
                 capture_output=True,
                 text=True,
+                env=agent_env,
                 timeout=timeout_seconds + 10,
             )
         except subprocess.TimeoutExpired:
