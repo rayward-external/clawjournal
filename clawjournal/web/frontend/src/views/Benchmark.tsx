@@ -324,6 +324,44 @@ export function Benchmark() {
     return () => { if (pollRef.current) window.clearInterval(pollRef.current); };
   }, [load]);
 
+  // Attach the progress banner to a running generation and poll it to completion.
+  // Shared by the Regenerate button and by adoption of a server-side run below.
+  const beginPolling = useCallback((id: string, stage: string, startMs: number) => {
+    if (pollRef.current) window.clearInterval(pollRef.current);
+    setGenStart(startMs);
+    setGenerating({ id, stage });
+    let fails = 0;
+    const stop = () => {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+      setGenerating(null);
+      setGenStart(null);
+    };
+    pollRef.current = window.setInterval(async () => {
+      try {
+        const st = await api.benchmarks.status(id);
+        fails = 0;
+        if (st.status === 'generating') { setGenerating({ id, stage: st.stage || 'working…' }); return; }
+        stop();
+        if (st.status === 'failed') toast(`Generation failed: ${st.error || 'unknown'}`, 'error');
+        else toast('Benchmark ready', 'success');
+        load();
+      } catch {
+        // Tolerate transient blips, but don't spin forever on a persistent error.
+        if (++fails >= 5) { stop(); toast('Lost contact with the generation — check the workbench daemon.', 'error'); }
+      }
+    }, 2000);
+  }, [toast, load]);
+
+  // Adopt a generation already running server-side — kicked off from the CLI,
+  // another tab, or surviving a page reload — so the progress bar shows here too.
+  useEffect(() => {
+    if (generating || pollRef.current) return;
+    const inflight = list.find(b => b.status === 'generating');
+    if (!inflight) return;
+    const parsed = Date.parse(inflight.generated_at);
+    beginPolling(inflight.benchmark_id, inflight.stage || 'working…', Number.isNaN(parsed) ? Date.now() : parsed);
+  }, [list, generating, beginPolling]);
+
   const selectWeek = async (id: string) => {
     if (id === current?.benchmark_id) return;
     try {
@@ -340,24 +378,7 @@ export function Benchmark() {
     try {
       const res = await api.benchmarks.generate({});
       if (!res.benchmark_id) { toast(res.error || 'Could not start generation', 'error'); return; }
-      setGenStart(Date.now());
-      setGenerating({ id: res.benchmark_id, stage: 'starting…' });
-      let fails = 0;
-      const stop = () => { if (pollRef.current) window.clearInterval(pollRef.current); setGenerating(null); setGenStart(null); };
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const st = await api.benchmarks.status(res.benchmark_id!);
-          fails = 0;
-          if (st.status === 'generating') { setGenerating({ id: res.benchmark_id!, stage: st.stage || 'working…' }); return; }
-          stop();
-          if (st.status === 'failed') toast(`Generation failed: ${st.error || 'unknown'}`, 'error');
-          else toast('Benchmark ready', 'success');
-          load();
-        } catch {
-          // Tolerate transient blips, but don't spin forever on a persistent error.
-          if (++fails >= 5) { stop(); toast('Lost contact with the generation — check the workbench daemon.', 'error'); }
-        }
-      }, 2000);
+      beginPolling(res.benchmark_id, 'starting…', Date.now());
     } catch (e) {
       const msg = e instanceof ApiError ? (e.status === 409 ? 'A generation is already running' : e.message) : 'Could not start generation';
       toast(msg, 'error');

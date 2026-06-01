@@ -466,6 +466,7 @@ export interface BenchmarkSummary {
   window_end: string;
   generated_at: string;
   status: string;
+  stage: string | null;
   backend: string | null;
   n_tasks: number | null;
   total_points: number | null;
