@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -3790,6 +3792,135 @@ def _warn_if_frontend_stale() -> None:
             "   You are seeing an OLD UI. Rebuild to pick up frontend changes:",
             f"     {build_cmd}",
         ])
+
+
+# Env vars that coordinate the --reload supervisor with its server child.
+RELOAD_CHILD_ENV = "CLAWJOURNAL_RELOAD_CHILD"  # set on the child: "run the server, don't supervise"
+RELOAD_OPEN_BROWSER_ENV = "CLAWJOURNAL_RELOAD_OPEN_BROWSER"  # set only on the first child
+_RELOAD_POLL_SECONDS = 1.0
+_RELOAD_DEBOUNCE_SECONDS = 0.3
+# Directories with no backend source (or huge trees) we never want to walk.
+_RELOAD_SKIP_DIRS = {"node_modules", ".git", "__pycache__", "dist", ".mypy_cache", ".pytest_cache"}
+
+
+def _python_source_signature(root: Path) -> dict[str, float]:
+    """Map every ``*.py`` path under ``root`` to its mtime, pruning noise dirs.
+
+    Pruning is not optional: ``node_modules`` lives *inside* the package tree
+    (``web/frontend/``), so a naive ``rglob`` would traverse thousands of JS
+    dirs on every poll.
+    """
+    sig: dict[str, float] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _RELOAD_SKIP_DIRS]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                sig[path] = os.stat(path).st_mtime
+            except OSError:
+                continue
+    return sig
+
+
+def _terminate_child(proc: subprocess.Popen) -> None:
+    """SIGTERM the server child, escalating to SIGKILL if it doesn't exit."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def run_with_reload(open_browser: bool = True) -> None:
+    """Dev supervisor: run the daemon as a child and restart it on ``*.py`` edits.
+
+    Python imports each module once per process, so a long-running ``clawjournal
+    serve`` keeps executing the code it loaded at startup — backend edits stay
+    invisible until a manual restart. This parent watches the package's Python
+    files and respawns the server child whenever they change.
+
+    We restart the whole child rather than reload modules in-process: the daemon
+    owns a bound HTTP socket and background scanner threads, so in-process
+    ``importlib.reload`` would leave half-swapped state. This is the same
+    full-restart strategy uvicorn/flask ``--reload`` use. On a child crash (e.g.
+    a syntax error in a just-saved file) we hold instead of hot-looping, and
+    respawn on the next edit.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    )
+    watch_root = Path(__file__).resolve().parent.parent  # the clawjournal/ package
+
+    # Install explicit handlers rather than relying on KeyboardInterrupt: a
+    # process backgrounded with `&` inherits SIGINT=SIG_IGN (Python keeps it
+    # ignored), so Ctrl-C alone wouldn't fire. Handling SIGTERM too means
+    # `kill`/`pkill` of the supervisor tears the child down instead of orphaning
+    # it. (SIGKILL of the supervisor can still orphan the child — unavoidable.)
+    stopping = threading.Event()
+
+    def _on_signal(_signum: int, _frame: object) -> None:
+        stopping.set()
+
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _on_signal)
+        except (ValueError, OSError):
+            pass  # not the main thread / platform doesn't support it
+
+    def _spawn(first: bool) -> subprocess.Popen:
+        env = dict(os.environ)
+        env[RELOAD_CHILD_ENV] = "1"
+        # Only the first child opens a browser tab; restarts must not spawn more.
+        env.pop(RELOAD_OPEN_BROWSER_ENV, None)
+        if first and open_browser:
+            env[RELOAD_OPEN_BROWSER_ENV] = "1"
+        return subprocess.Popen([sys.executable, *sys.argv], env=env)
+
+    logger.info(
+        "reloader: watching %s/**/*.py — save a backend file to restart the server",
+        watch_root,
+    )
+    sig = _python_source_signature(watch_root)
+    proc = _spawn(first=True)
+
+    try:
+        while not stopping.is_set():
+            stopping.wait(_RELOAD_POLL_SECONDS)
+            if stopping.is_set():
+                break
+
+            if proc.poll() is not None:
+                # Child exited on its own — almost always a crash in edited code.
+                # Hold (don't hot-loop respawning) until the next save, then retry.
+                logger.error(
+                    "reloader: server exited (code %s) — fix it and save to retry",
+                    proc.returncode,
+                )
+                while proc.poll() is not None and not stopping.is_set():
+                    stopping.wait(_RELOAD_POLL_SECONDS)
+                    new_sig = _python_source_signature(watch_root)
+                    if new_sig != sig:
+                        sig = new_sig
+                        logger.info("reloader: change detected — restarting server")
+                        proc = _spawn(first=False)
+                continue
+
+            new_sig = _python_source_signature(watch_root)
+            if new_sig != sig:
+                stopping.wait(_RELOAD_DEBOUNCE_SECONDS)  # let a burst of saves settle
+                sig = _python_source_signature(watch_root)
+                logger.info("reloader: change detected — restarting server")
+                _terminate_child(proc)
+                proc = _spawn(first=False)
+    finally:
+        logger.info("reloader: shutting down")
+        _terminate_child(proc)
 
 
 def run_server(

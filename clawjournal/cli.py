@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -3962,6 +3963,9 @@ def main() -> None:
                               help="Print SSH tunnel command for remote VM access")
     serve_parser.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None,
                               help="Only scan this source")
+    serve_parser.add_argument("--reload", action="store_true",
+                              help="Dev: restart the server automatically when backend "
+                                   "(*.py) files change")
 
     scan_parser = sub.add_parser("scan", help="One-shot index sessions into local workbench DB")
     scan_parser.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None,
@@ -4311,12 +4315,28 @@ def main() -> None:
     command = args.command or "export"
 
     if command == "serve":
+        from .workbench.daemon import RELOAD_CHILD_ENV, RELOAD_OPEN_BROWSER_ENV
+        is_reload_child = os.environ.get(RELOAD_CHILD_ENV) == "1"
+
+        # Supervisor: watch *.py and restart the server child on change. The
+        # child re-runs this same command with RELOAD_CHILD_ENV set, so it falls
+        # through to run_server below instead of recursing into the supervisor.
+        if args.reload and not is_reload_child:
+            from .workbench.daemon import run_with_reload
+            run_with_reload(open_browser=not args.no_browser and not args.remote)
+            return
+
         from .pricing import ensure_pricing_fresh
         ensure_pricing_fresh()
         from .workbench.daemon import run_server
+        if is_reload_child:
+            # Only the first child gets the browser; restarts must not open tabs.
+            open_browser = os.environ.get(RELOAD_OPEN_BROWSER_ENV) == "1"
+        else:
+            open_browser = not args.no_browser
         run_server(
             port=args.port,
-            open_browser=not args.no_browser,
+            open_browser=open_browser,
             source_filter=args.source,
             remote=args.remote,
         )
