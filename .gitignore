@@ -30,3 +30,7 @@ node_modules/
 *_dashboard.html
 /search-page*.png
 /share-page*.png
+
+# Local-only personalized-benchmark scratch files — contain real PII, never commit
+/benchmark-cc.md
+/benchmark-codex.md
