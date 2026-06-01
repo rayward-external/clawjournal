@@ -10,8 +10,8 @@ import { GettingStartedGuide } from '../components/GettingStartedGuide.tsx';
 import { colors, selectStyle } from '../theme.ts';
 
 const PAGE_SIZE = 10;
-const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedDismissed';
-const LEGACY_SHARE_GUIDE_DISMISSED_KEY = 'cj.shareGuideDismissed';
+const TYPE_CHIP_PREVIEW_LIMIT = 16;
+const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedGuideV2Dismissed';
 
 function failureBadge(score: number | null): string {
   if (score == null) return '\u2014';
@@ -110,10 +110,7 @@ export function Inbox() {
   const [stats, setStats] = useState<Stats>({ total: 0, by_status: {}, by_source: {}, by_project: {}, by_task_type: {} });
   const [showGettingStartedGuide, setShowGettingStartedGuide] = useState(() => {
     try {
-      return (
-        localStorage.getItem(GETTING_STARTED_DISMISSED_KEY) !== '1'
-        && localStorage.getItem(LEGACY_SHARE_GUIDE_DISMISSED_KEY) !== '1'
-      );
+      return localStorage.getItem(GETTING_STARTED_DISMISSED_KEY) !== '1';
     } catch {
       return true;
     }
@@ -129,6 +126,7 @@ export function Inbox() {
   const [recoveryFilter, setRecoveryFilter] = useState<string | null>(null);
   const [attributionFilter, setAttributionFilter] = useState<string | null>(null);
   const [modeFilter, setModeFilter] = useState<string | null>(null);
+  const [showAllTaskTypes, setShowAllTaskTypes] = useState(false);
 
   // Agent-classified type filter (dynamic, not hardcoded)
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
@@ -292,10 +290,15 @@ export function Inbox() {
   // Derive agent-classified types from stats (dynamic, not hardcoded)
   const taskTypes = Object.entries(stats.by_task_type ?? {})
     .sort(([, a], [, b]) => b - a);
-
-  const approved = stats.by_status['approved'] ?? 0;
-  const blocked = stats.by_status['blocked'] ?? 0;
-  const hasTriageProgress = approved + blocked > 0;
+  const visibleTaskTypes = showAllTaskTypes ? taskTypes : (() => {
+    const top = taskTypes.slice(0, TYPE_CHIP_PREVIEW_LIMIT);
+    if (typeFilter && !top.some(([type]) => type === typeFilter)) {
+      const active = taskTypes.find(([type]) => type === typeFilter);
+      return active ? [...top, active] : top;
+    }
+    return top;
+  })();
+  const hiddenTaskTypeCount = Math.max(0, taskTypes.length - TYPE_CHIP_PREVIEW_LIMIT);
 
   const dismissGettingStartedGuide = () => {
     setShowGettingStartedGuide(false);
@@ -328,7 +331,7 @@ export function Inbox() {
         </div>
       </div>
 
-      {showGettingStartedGuide && stats.total > 0 && sessions.length > 0 && !hasTriageProgress && !typeFilter && (
+      {showGettingStartedGuide && stats.total > 0 && sessions.length > 0 && !typeFilter && (
         <GettingStartedGuide stats={stats} onDismiss={dismissGettingStartedGuide} />
       )}
 
@@ -417,7 +420,7 @@ export function Inbox() {
           >
             All ({stats.total})
           </button>
-          {taskTypes.map(([type, count]) => {
+          {visibleTaskTypes.map(([type, count]) => {
             const active = typeFilter === type;
             const c = typeColor(type);
             return (
@@ -449,6 +452,23 @@ export function Inbox() {
               </button>
             );
           })}
+          {hiddenTaskTypeCount > 0 && (
+            <button
+              onClick={() => setShowAllTaskTypes(prev => !prev)}
+              style={{
+                padding: '4px 12px',
+                borderRadius: 9999,
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: 'pointer',
+                border: `1px solid ${colors.gray300}`,
+                background: colors.gray50,
+                color: colors.gray600,
+              }}
+            >
+              {showAllTaskTypes ? 'Show fewer' : `More (${hiddenTaskTypeCount})`}
+            </button>
+          )}
         </div>
       )}
 
