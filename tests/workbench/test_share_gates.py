@@ -250,6 +250,43 @@ class TestExportManifestRedactions:
         assert n >= 1
         assert any(entry["type"] == "trufflehog_slack" for entry in log)
 
+    def test_apply_share_redactions_strips_terminal_control_sequences(self, conn):
+        """Terminal ANSI escape codes are stripped from shared content so they
+        don't bloat the bundle or trip TruffleHog's broad detectors."""
+        sess = _settled_session("sess-ansi", content="\x1b[90mnull\x1b[0m done")
+        sess["messages"][0]["thinking"] = "think \x1b[31mred\x1b[0m"
+        sess["messages"][0]["tool_uses"] = [
+            {"name": "bash", "input": "ls \x1b[1mx\x1b[0m", "output": "ok\x1b[0m\x07"}
+        ]
+        upsert_sessions(conn, [sess])
+        conn.commit()
+
+        redacted, _, _ = apply_share_redactions(conn, sess)
+        msg = redacted["messages"][0]
+        assert msg["content"] == "null done"
+        assert "\x1b" not in msg["thinking"]
+        assert "\x1b" not in msg["tool_uses"][0]["input"]
+        assert "\x1b" not in msg["tool_uses"][0]["output"]
+
+    def test_apply_share_redactions_strips_ansi_in_widened_message_fields(self, conn):
+        """ANSI must also be stripped from the widened message model
+        (author / invocations / snippets / extra), not just legacy fields."""
+        sess = _settled_session("sess-widened", content="hi")
+        msg = sess["messages"][0]
+        msg["author"] = "agent\x1b[0m"
+        msg["invocations"] = [{"name": "bash", "result": "out \x1b[31mred\x1b[0m"}]
+        msg["snippets"] = [{"code": "x = 1 \x1b[2K"}]
+        msg["extra"] = {"raw": {"line": "deep \x1b[90mgray\x1b[0m"}}
+        upsert_sessions(conn, [sess])
+        conn.commit()
+
+        redacted, _, _ = apply_share_redactions(conn, sess)
+        m = redacted["messages"][0]
+        assert "\x1b" not in m["author"]
+        assert "\x1b" not in m["invocations"][0]["result"]
+        assert "\x1b" not in m["snippets"][0]["code"]
+        assert "\x1b" not in m["extra"]["raw"]["line"]
+
     def test_apply_share_redactions_raises_on_missing_session_id(self, conn):
         """Deterministic engines route through the findings table,
         keyed by session_id. A session stripped of its ID would

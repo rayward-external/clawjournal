@@ -1285,10 +1285,44 @@ def apply_share_redactions(
 ) -> tuple[dict[str, Any], int, list[dict[str, Any]]]:
     """Apply the full share/export redaction pipeline to a session."""
     from ..redaction.anonymizer import Anonymizer
+    from ..redaction.normalize import strip_terminal_control_sequences
     from ..redaction.secrets import apply_findings_to_blob
 
     total_redactions = 0
     redaction_log: list[dict[str, Any]] = []
+
+    # Normalize terminal control sequences (ANSI colors, cursor moves, stray
+    # control bytes) out of all text up front. They are rendering noise, not
+    # content: stripping them keeps shared bundles clean, lets downstream
+    # redaction patterns match cleanly, and stops TruffleHog's broad detectors
+    # from flagging them as false positives. This is normalization, not
+    # redaction, so it is not counted in total_redactions.
+    for field in ("display_title", "project", "git_branch"):
+        if session.get(field):
+            session[field] = _transform_nested_strings(
+                session[field], strip_terminal_control_sequences
+            )
+    for msg in session.get("messages", []):
+        for field in ("content", "thinking"):
+            if msg.get(field):
+                msg[field] = _transform_nested_strings(
+                    msg[field], strip_terminal_control_sequences
+                )
+        for tool_use in msg.get("tool_uses", []):
+            for tool_field in ("input", "output"):
+                if tool_use.get(tool_field):
+                    tool_use[tool_field] = _transform_nested_strings(
+                        tool_use[tool_field], strip_terminal_control_sequences
+                    )
+        # Widened message model (author / invocations / snippets / extra) —
+        # these ship in the export too, so normalize them with the same
+        # recursive walk the secrets stage uses (iter_widened_text_locations).
+        for widened_field in ("author", "invocations", "snippets", "extra"):
+            if msg.get(widened_field):
+                msg[widened_field] = _transform_nested_strings(
+                    msg[widened_field], strip_terminal_control_sequences
+                )
+    _apply_to_ai_text(session, lambda text, _label: strip_terminal_control_sequences(text))
 
     if custom_strings:
         custom_total = 0

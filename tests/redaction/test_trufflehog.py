@@ -208,6 +208,91 @@ class TestScanFile:
         assert other["Raw"] not in payload
         assert "GitHub" in summary["top_detectors"]
 
+    def test_unverified_generic_azure_findings_still_block(self, tmp_path, monkeypatch):
+        """The legacy generic Azure detector fires on ordinary agent-session
+        terminal content (localhost connection strings, file paths, ANSI color
+        codes) and Azure-API verification can return unverified. The export
+        gate remains fail-closed: TruffleHog findings still block unless the
+        detector is explicitly excluded."""
+        self._enable_real_scan(monkeypatch)
+        target = tmp_path / "sessions.jsonl"
+        target.write_text("x\n")
+
+        findings = [
+            {
+                "DetectorName": "Azure",
+                "Verified": False,
+                "Raw": "127.0.0.1:51678->127.0.0.1:5432:",
+                "SourceMetadata": {"Data": {"Filesystem": {"line": 3}}},
+            },
+            {
+                "DetectorName": "Azure",
+                "Verified": False,
+                "Raw": "scripts/seed-routing-rules.sh\n??",
+                "SourceMetadata": {"Data": {"Filesystem": {"line": 3}}},
+            },
+            {
+                "DetectorName": "Azure",
+                "Verified": False,
+                "Raw": "[90mnull[0m[0m\n",
+                "SourceMetadata": {"Data": {"Filesystem": {"line": 5}}},
+            },
+        ]
+        stdout = "\n".join(json.dumps(x) for x in findings) + "\n"
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 183, stdout=stdout, stderr=""),
+        )
+        report = trufflehog.scan_file(target)
+        assert len(report.findings) == 3
+        assert report.unverified == 3
+        assert report.blocking is True
+
+    def test_verified_generic_azure_still_blocks(self, tmp_path, monkeypatch):
+        """A verified generic-Azure finding is a real, live credential and
+        must still block."""
+        self._enable_real_scan(monkeypatch)
+        target = tmp_path / "sessions.jsonl"
+        target.write_text("x\n")
+        finding = {
+            "DetectorName": "Azure",
+            "Verified": True,
+            "Raw": "a-real-confirmed-azure-secret-0001",
+            "SourceMetadata": {"Data": {"Filesystem": {"line": 4}}},
+        }
+        stdout = json.dumps(finding) + "\n"
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 183, stdout=stdout, stderr=""),
+        )
+        report = trufflehog.scan_file(target)
+        assert report.verified == 1
+        assert report.blocking is True
+
+    def test_specific_azure_detector_unverified_still_blocks(self, tmp_path, monkeypatch):
+        """Specific Azure detectors (AzureStorage, etc.) also block even when
+        unverified."""
+        self._enable_real_scan(monkeypatch)
+        target = tmp_path / "sessions.jsonl"
+        target.write_text("x\n")
+        finding = {
+            "DetectorName": "AzureStorage",
+            "Verified": False,
+            "Raw": "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=y==",
+            "SourceMetadata": {"Data": {"Filesystem": {"line": 6}}},
+        }
+        stdout = json.dumps(finding) + "\n"
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 183, stdout=stdout, stderr=""),
+        )
+        report = trufflehog.scan_file(target)
+        assert report.unverified == 1
+        assert report.blocking is True
+
     def test_unexpected_exit_code_blocks_with_error_report(self, tmp_path, monkeypatch):
         self._enable_real_scan(monkeypatch)
         target = tmp_path / "sessions.jsonl"
@@ -342,6 +427,59 @@ class TestFindingsEngineEntryPoints:
                 for raw, detector in raws
             ],
         )
+
+    def test_scan_text_for_raw_matches_keeps_unverified_generic_azure(self, monkeypatch):
+        """The redaction-engine path preserves unverified generic Azure hits so
+        it stays consistent with the fail-closed gate."""
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        rows = [
+            {"DetectorName": "Azure", "Verified": False, "Raw": "127.0.0.1:5432"},
+            {"DetectorName": "Azure", "Verified": True, "Raw": "real-azure-secret-0001"},
+            {"DetectorName": "Slack", "Verified": False, "Raw": "xoxb-abc-def"},
+        ]
+        stdout = ("\n".join(json.dumps(r) for r in rows) + "\n").encode()
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 183, stdout=stdout, stderr=b""),
+        )
+        matches = trufflehog._scan_text_for_raw_matches("payload")
+        pairs = {(m["detector"], m["status"]) for m in matches}
+        assert ("Azure", "unverified") in pairs
+        assert ("Azure", "verified") in pairs
+        assert ("Slack", "unverified") in pairs
+
+    def test_serialize_session_does_not_duplicate_widened_text(self):
+        """Widened leaves appear once (via the JSON dump), not twice — the
+        relocation walk must not bloat the scan payload toward the size cap."""
+        raw = "WIDENEDUNIQUEMARKERXYZ"
+        session = {"messages": [{"content": "c", "extra": {"k": raw}, "tool_uses": []}]}
+        payload = trufflehog._serialize_session_for_scan(session)
+        assert payload.count(raw) == 1
+
+    def test_findings_emitted_for_widened_message_fields(self, monkeypatch):
+        """A secret living only in the widened message model (author /
+        invocations / snippets / extra) must surface as a reviewable
+        RawFinding, not just get redacted silently at apply time."""
+        raw_secret = "synthetic_widened_secret_abcdef"
+        self._fake_matches(monkeypatch, [(raw_secret, "Stripe")])
+        session = {
+            "messages": [
+                {
+                    "content": "legacy text",
+                    "author": raw_secret,
+                    "invocations": [{"result": f"out {raw_secret}"}],
+                    "extra": {"raw": {"deep": raw_secret}},
+                    "tool_uses": [],
+                },
+            ],
+        }
+        out = trufflehog.scan_session_for_trufflehog_findings(session)
+        fields = {f.field for f in out}
+        assert "author" in fields
+        assert any(f.field.startswith("invocations[0]") for f in out)
+        assert any(f.field.startswith("extra") for f in out)
+        assert all(f.entity_text == raw_secret for f in out)
 
     def test_findings_emitted_per_occurrence(self, monkeypatch):
         from clawjournal.findings import RawFinding

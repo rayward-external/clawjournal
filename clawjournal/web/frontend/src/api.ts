@@ -320,17 +320,31 @@ export const api = {
         throw new ApiError(res.status, body.error || `HTTP ${res.status}`, body);
       }
       const disposition = res.headers.get('Content-Disposition') || '';
-      const match = /filename="?([^";]+)"?/.exec(disposition);
-      const filename = match ? match[1] : `share-${id}.zip`;
+      // Prefer RFC 5987 `filename*=charset'lang'percent-encoded` when present,
+      // else plain `filename="..."`. Fall back to a name that still carries the
+      // .zip extension so the OS can open the saved file.
+      const extMatch = /filename\*=[^']*'[^']*'([^";]+)/i.exec(disposition);
+      const plainMatch = /filename="?([^";]+)"?/i.exec(disposition);
+      let filename = plainMatch ? plainMatch[1] : `clawjournal-share-${id}.zip`;
+      if (extMatch) {
+        // Malformed percent-encoding must not abort an otherwise valid
+        // download — fall back to the plain form / default instead of throwing.
+        try { filename = decodeURIComponent(extMatch[1]); } catch { /* keep fallback */ }
+      }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = filename;
+      a.rel = 'noopener';
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      // Revoke on a later tick, not synchronously. Chromium processes a blob
+      // download asynchronously after click(); revoking the object URL right
+      // away drops the suggested filename (the browser then saves a bare UUID
+      // with no .zip extension) and can truncate large downloads.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
     },
 
     upload(id: string, body: {

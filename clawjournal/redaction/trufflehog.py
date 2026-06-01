@@ -576,10 +576,18 @@ def placeholder_for_detector(detector: str) -> str:
     return f"[REDACTED_{normalized}]" if normalized else "[REDACTED_TRUFFLEHOG]"
 
 
-def _iter_session_text_fields(session: dict):
+def _iter_session_text_fields(session: dict, *, include_widened: bool = False):
     """Yield ``(text, field, msg_idx, tool_field)`` for every scannable
     string in ``session``. Mirrors ``secrets._iter_text_locations`` but
-    returns only what the findings-engine entry point needs."""
+    returns only what the findings-engine entry point needs.
+
+    ``include_widened`` adds the widened message fields (author / invocations
+    / snippets / extra). It is used for finding RELOCATION only — the scan
+    payload deliberately omits them, since the full-JSON serialization in
+    ``_serialize_session_for_scan`` already covers them and duplicating large
+    widened values would push big sessions past the engine's size cap."""
+    from ..parsing.widened import iter_widened_text_locations  # noqa: PLC0415 — lazy
+
     for field_name in ("display_title", "project", "git_branch"):
         val = session.get(field_name)
         if isinstance(val, str) and val:
@@ -608,6 +616,14 @@ def _iter_session_text_fields(session: dict):
                                 msg_idx,
                                 branch,
                             )
+        # Widened message model — mirror secrets._iter_text_locations so
+        # TruffleHog hits in author/invocations/snippets/extra also surface as
+        # reviewable findings (apply-time redaction already covers them via the
+        # blob re-scan in trufflehog_secret_map_from_blob). Relocation only:
+        # see the docstring on why the scan payload omits these.
+        if include_widened:
+            for widened_text, field_label in iter_widened_text_locations(msg):
+                yield widened_text, field_label, msg_idx, None
 
 
 def _serialize_session_for_scan(session: dict) -> str:
@@ -648,7 +664,9 @@ def scan_session_for_trufflehog_findings(
             continue
         detector = match["detector"]
         confidence = 1.0 if match["status"] == "verified" else 0.9
-        for text, field_name, msg_idx, tool_field in _iter_session_text_fields(session):
+        for text, field_name, msg_idx, tool_field in _iter_session_text_fields(
+            session, include_widened=True
+        ):
             start = 0
             while True:
                 idx = text.find(raw, start)

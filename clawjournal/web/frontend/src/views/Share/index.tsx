@@ -112,23 +112,46 @@ export function Share() {
   const [candidates, setCandidates] = useState<Session[]>([]);
   const [scoringBackend, setScoringBackend] = useState<{ backend: string | null; display_name: string | null } | null>(null);
   const [shareDestination, setShareDestination] = useState<ShareDestination | null>(null);
+  // Distinguish "still loading / failed to reach" from "loaded, not configured".
+  // The hosted-destination probe is a remote network call, so collapsing all
+  // three into `shareDestination === null` made the Done page hide the Submit
+  // button on a transient failure (or a slow load right after a daemon
+  // restart), which looks identical to "no submit option for this install".
+  const [destinationLoading, setDestinationLoading] = useState(true);
+  const [destinationFailed, setDestinationFailed] = useState(false);
 
   // =================================================
   // Initial load
   // =================================================
 
+  const loadShareDestination = useCallback(() => {
+    setDestinationLoading(true);
+    setDestinationFailed(false);
+    api.shareDestination()
+      .then((destination) => {
+        setShareDestination(destination);
+        setSupportContact(destination?.support_contact || null);
+      })
+      .catch(() => {
+        setShareDestination(null);
+        setDestinationFailed(true);
+      })
+      .finally(() => setDestinationLoading(false));
+  }, []);
+
   useEffect(() => {
+    // The hosted-destination probe can be slow/flaky (remote round-trip); load
+    // it independently so it never blocks the page or its failure poisons the
+    // whole initial load.
+    loadShareDestination();
     Promise.all([
       api.shareReady({ includeUnapproved: true }),
       api.shares.list(),
       api.scoringBackend().catch(() => ({ backend: null, display_name: null })),
-      api.shareDestination().catch(() => null),
-    ]).then(([stats, shareList, backend, destination]) => {
+    ]).then(([stats, shareList, backend]) => {
       setReadyStats(stats);
       setShares(shareList);
       setScoringBackend(backend);
-      setShareDestination(destination);
-      setSupportContact(destination?.support_contact || null);
       if (!selectionInitialized && stats.sessions.length > 0) {
         // Server recommendation is an ordered, reviewable default package.
         // Trust it and only filter out ids the client can't resolve
@@ -725,25 +748,30 @@ export function Share() {
   // animation has finished. Runs even if the inline `setActiveStep('done')`
   // inside `runPackage` fell through a silent error path.
   useEffect(() => {
-    if (activeStep === 'package' && packagedShareId && packageProgress >= 100 && !packagingFailed) {
+    // Wait for the destination probe before deciding submit-vs-done. The probe
+    // loads independently of the page now, so a null `shareDestination` here may
+    // just mean "still loading" — routing to Done on that would strand a
+    // genuinely-submittable bundle, since this effect can't re-route once
+    // `activeStep` leaves 'package'.
+    if (activeStep === 'package' && packagedShareId && packageProgress >= 100 && !packagingFailed && !destinationLoading) {
       setCompletedKeys((prev) => new Set([...prev, 'package']));
       const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
       setActiveStep(canSubmit ? 'submit' : 'done');
     }
-  }, [activeStep, packagedShareId, packageProgress, packagingFailed, shareDestination]);
+  }, [activeStep, packagedShareId, packageProgress, packagingFailed, shareDestination, destinationLoading]);
 
   // Reload/deep-link robustness: a page reload or bookmark can land directly on
   // Submit. If hosted submission isn't available (disabled, closed, or the
   // destination failed to load) and the share hasn't already been submitted,
   // fall back to the download-only Done view instead of stranding the user on a
-  // Submit step they can't complete. Gated on `loading` so we wait for the
-  // initial destination fetch (a still-null destination after load means
-  // not-submittable). Mirrors the package→done branch above.
+  // Submit step they can't complete. Gated on `destinationLoading` so we wait
+  // for the (now-independent) destination probe — a still-null destination only
+  // after it resolves means not-submittable. Mirrors the package→done branch.
   useEffect(() => {
-    if (activeStep !== 'submit' || receiptId || loading) return;
+    if (activeStep !== 'submit' || receiptId || loading || destinationLoading) return;
     const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
     if (!canSubmit) setActiveStep('done');
-  }, [activeStep, shareDestination, receiptId, loading]);
+  }, [activeStep, shareDestination, receiptId, loading, destinationLoading]);
 
   // A Submit deep-link with no packaged share has nothing to act on; send the
   // user back to the start rather than rendering a dead-end Submit bound to a
@@ -941,6 +969,9 @@ export function Share() {
         onNew={() => { startFreshShare(); reload(); }}
         globalStyles={globalStyles}
         shareDestination={shareDestination}
+        destinationLoading={destinationLoading}
+        destinationFailed={destinationFailed}
+        onRetryDestination={loadShareDestination}
       />
     );
   }

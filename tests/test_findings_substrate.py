@@ -345,6 +345,25 @@ class TestDerivePreview:
         assert preview["before"].endswith("🔑 x")
         assert preview["after"].startswith("tail")
 
+    def test_resolves_widened_message_field(self, conn):
+        """A finding whose field is a widened-model label (e.g. ``author``)
+        must resolve to real preview context, not empty strings."""
+        finding = Finding(
+            finding_id="f1", session_id="s", engine="trufflehog", rule="r",
+            entity_type="r", entity_hash="h", entity_length=6,
+            field="author", message_index=0, tool_field=None,
+            offset=4, length=6, confidence=1.0,
+            status="open", decided_by=None, decision_source_id=None,
+            decided_at=None, decision_reason=None,
+            revision="v1:x", created_at="now",
+        )
+        # "pre SECRET post": SECRET at offset 4, length 6.
+        blob = {"messages": [{"role": "user", "content": "x", "author": "pre SECRET post"}]}
+        preview = derive_preview(blob, finding, context_chars=10)
+        assert preview["before"].endswith("pre ")
+        assert preview["after"].startswith(" post")
+        assert preview["match_placeholder"] == "[...]"
+
 
 class TestAllowlistRetroactive:
     def test_add_flips_existing_open_findings(self, conn):
