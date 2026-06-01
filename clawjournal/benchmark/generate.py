@@ -48,6 +48,18 @@ BLOB_EXTRACT_MAX_CHARS = 8000
 # `--model`). `None` means "the CLI's default model".
 _DEFAULT_GEN_MODEL: dict[str, str] = {"claude": "sonnet"}
 
+# Per-stage subprocess ceilings (seconds). The architect call synthesises ALL
+# deep-read seeds in one shot — the heaviest single call — and was timing out
+# at the old flat 180s; design builds a full task and also runs long. Reads and
+# critique are per-item and lighter. These are upper bounds, not expected
+# durations: a healthy call returns well under them.
+_STAGE_TIMEOUTS: dict[str, int] = {
+    "deepread": 240,
+    "architect": 600,
+    "design": 360,
+    "critique": 240,
+}
+
 ProgressFn = Callable[[str], None]
 
 
@@ -140,7 +152,7 @@ class AgentBackendCaller:
 
     backend: str = "auto"
     model: str | None = None
-    timeout_seconds: int = 180
+    timeout_seconds: int = 240  # fallback for stages not in _STAGE_TIMEOUTS
 
     def __post_init__(self) -> None:
         self.resolved = resolve_backend(self.backend)
@@ -164,7 +176,7 @@ class AgentBackendCaller:
                 system_prompt_file=sys_file,
                 task_prompt=task,
                 model=self.model,
-                timeout_seconds=self.timeout_seconds,
+                timeout_seconds=_STAGE_TIMEOUTS.get(stage, self.timeout_seconds),
                 codex_sandbox="read-only",
                 codex_output_file="out.json",
                 openclaw_message=task,

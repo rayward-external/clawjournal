@@ -307,6 +307,40 @@ class TestDefaultModel:
         assert AgentBackendCaller(backend="auto", model="opus").model == "opus"
 
 
+class TestStageTimeouts:
+    """The heavy synthesis stages (architect/design) get a longer subprocess
+    ceiling than per-item reads; unknown stages fall back to the default."""
+
+    def _timeout_for(self, monkeypatch, stage):
+        monkeypatch.setattr("clawjournal.benchmark.generate.resolve_backend", lambda b: "claude")
+        captured = {}
+
+        def fake_run(**kw):
+            captured.update(kw)
+
+            class _R:
+                stdout = '{"ok": true}'
+                stderr = ''
+                returncode = 0
+            return _R()
+
+        monkeypatch.setattr("clawjournal.benchmark.generate.run_default_agent_task", fake_run)
+        AgentBackendCaller(backend="auto")(stage=stage, system_prompt="sys", task_prompt="task")
+        return captured["timeout_seconds"]
+
+    def test_architect_gets_the_longest_ceiling(self, monkeypatch):
+        assert self._timeout_for(monkeypatch, "architect") == 600
+
+    def test_design_ceiling(self, monkeypatch):
+        assert self._timeout_for(monkeypatch, "design") == 360
+
+    def test_deepread_ceiling(self, monkeypatch):
+        assert self._timeout_for(monkeypatch, "deepread") == 240
+
+    def test_unknown_stage_uses_default(self, monkeypatch):
+        assert self._timeout_for(monkeypatch, "mystery") == 240
+
+
 class TestProgressMessages:
     def test_incremental_human_messages(self, index_conn):
         for sid in ("s1", "s2", "s3"):
