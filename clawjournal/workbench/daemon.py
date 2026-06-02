@@ -2884,6 +2884,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "scorer_backend": config.get("scorer_backend"),
             "scorer_backend_confirmed_at": config.get("scorer_backend_confirmed_at"),
             "benchmark_tab_enabled": bool(config.get("benchmark_tab_enabled", True)),
+            "scoring_warmup_declined": bool(config.get("scoring_warmup_declined", False)),
             "source_choices": source_choices,
             "scorer_backend_choices": [b for b in SUPPORTED_SCORING_BACKENDS if b != "auto"],
             "scorer_backend_detected": _suggest_scoring_backend(),
@@ -2915,6 +2916,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             kwargs["ai_pii_review"] = bool(body["ai_pii_review_enabled"])
         if body.get("benchmark_tab_enabled") is not None:
             kwargs["benchmark_tab_enabled"] = bool(body["benchmark_tab_enabled"])
+        if body.get("scoring_warmup_declined") is not None:
+            kwargs["scoring_warmup_declined"] = bool(body["scoring_warmup_declined"])
 
         if not kwargs:
             _json_response(self, {"error": "No recognized config fields"}, 400)

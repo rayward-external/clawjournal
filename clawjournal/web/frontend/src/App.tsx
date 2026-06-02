@@ -243,6 +243,9 @@ export default function App() {
           variant="primary"
           onConfirm={confirmWarmup}
           onCancel={declineWarmup}
+          // A backdrop misclick / Escape only defers (re-offered next load); the
+          // server-side decline is persisted ONLY by the explicit Cancel button.
+          onDismiss={() => setWarmupPrompt(null)}
         />
       </ToastProvider>
     </BrowserRouter>

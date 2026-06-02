@@ -59,7 +59,7 @@ class TestGetConfig:
         assert status == 200
         for key in (
             "source", "projects_confirmed", "ai_pii_review_enabled",
-            "scorer_backend", "benchmark_tab_enabled",
+            "scorer_backend", "benchmark_tab_enabled", "scoring_warmup_declined",
             "source_choices", "scorer_backend_choices", "scorer_backend_detected",
         ):
             assert key in body
@@ -102,6 +102,16 @@ class TestUpdateConfig:
     def test_confirm_projects(self, api):
         _post(api, "/api/config", {"confirm_projects": True})
         assert load_config()["projects_confirmed"] is True
+
+    def test_scoring_warmup_declined_toggle(self, api):
+        # The Settings "Background AI scoring" toggle round-trips through here:
+        # disabling sets the decline; re-enabling pops it.
+        _post(api, "/api/config", {"scoring_warmup_declined": True})
+        assert load_config()["scoring_warmup_declined"] is True
+        assert _get(api, "/api/config")[1]["scoring_warmup_declined"] is True
+        _post(api, "/api/config", {"scoring_warmup_declined": False})
+        assert load_config().get("scoring_warmup_declined") in (None, False)
+        assert _get(api, "/api/config")[1]["scoring_warmup_declined"] is False
 
     def test_invalid_source_400(self, api):
         assert _post(api, "/api/config", {"source": "bogus"})[0] == 400

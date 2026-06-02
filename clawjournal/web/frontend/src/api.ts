@@ -177,6 +177,7 @@ export const api = {
       confirm_projects: boolean;
       ai_pii_review_enabled: boolean;
       benchmark_tab_enabled: boolean;
+      scoring_warmup_declined: boolean;
     }>): Promise<WorkbenchConfig> {
       return request('/config', {
         method: 'POST',

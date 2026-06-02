@@ -218,6 +218,7 @@ export interface WorkbenchConfig {
   scorer_backend: string | null;
   scorer_backend_confirmed_at: string | null;
   benchmark_tab_enabled: boolean;
+  scoring_warmup_declined: boolean;
   source_choices: string[];
   scorer_backend_choices: string[];
   scorer_backend_detected: string | null;

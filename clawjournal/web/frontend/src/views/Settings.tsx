@@ -10,6 +10,7 @@ type ConfigPatch = Partial<{
   confirm_projects: boolean;
   ai_pii_review_enabled: boolean;
   benchmark_tab_enabled: boolean;
+  scoring_warmup_declined: boolean;
 }>;
 
 const cardStyle: React.CSSProperties = {
@@ -156,6 +157,25 @@ export function Settings() {
             <option key={b} value={b}>{b}</option>
           ))}
         </select>
+      </div>
+
+      {/* Background AI scoring */}
+      <div style={cardStyle}>
+        <div style={titleStyle}>Background AI scoring</div>
+        <p style={helpStyle}>
+          When on, ClawJournal scores recent traces in the background using your configured AI
+          backend (each trace is anonymized on this machine before it is sent, and the agent may
+          incur usage cost). Turn it off to stop the auto-scorer and the first-run prompt.
+        </p>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: colors.gray700 }}>
+          <input
+            type="checkbox"
+            checked={!cfg.scoring_warmup_declined}
+            disabled={saving}
+            onChange={e => save({ scoring_warmup_declined: !e.target.checked })}
+          />
+          Enable background AI scoring
+        </label>
       </div>
 
       {/* Benchmark tab visibility */}

@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { colors, btnPrimary, btnSecondary, btnDanger } from '../theme.ts';
 
 interface ConfirmDialogProps {
@@ -8,16 +9,30 @@ interface ConfirmDialogProps {
   variant?: 'danger' | 'primary';
   onConfirm: () => void;
   onCancel: () => void;
+  // Backdrop click / Escape. Defaults to onCancel so existing call sites whose
+  // onCancel is a harmless state-clear keep working. Pass a distinct onDismiss
+  // when onCancel has a side effect (e.g. persisting a decision) that a stray
+  // backdrop misclick must NOT trigger.
+  onDismiss?: () => void;
 }
 
-export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', variant = 'primary', onConfirm, onCancel }: ConfirmDialogProps) {
+export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', variant = 'primary', onConfirm, onCancel, onDismiss }: ConfirmDialogProps) {
+  const dismiss = onDismiss ?? onCancel;
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [open, dismiss]);
+
   if (!open) return null;
 
   const confirmStyle = variant === 'danger' ? btnDanger : btnPrimary;
 
   return (
     <div
-      onClick={onCancel}
+      onClick={dismiss}
       style={{
         position: 'fixed',
         inset: 0,
