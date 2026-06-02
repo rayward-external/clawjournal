@@ -1,6 +1,7 @@
 """Tests for the workbench daemon HTTP API."""
 
 import json
+import os
 import time
 import urllib.error
 import zipfile
@@ -19,7 +20,9 @@ from clawjournal.workbench.daemon import (
     run_server,
     _SHARE_COOLDOWN_SECONDS,
     _apply_upload_pii_redactions,
+    _reload_child_command,
     _missing_ingest_url_error,
+    _warn_if_frontend_stale,
     trigger_scoring_warmup,
 )
 from clawjournal.workbench.index import open_index, upsert_sessions
@@ -138,6 +141,12 @@ def _post(port, path, data=None, *, skip_auth=False):
     resp = conn.getresponse()
     resp_body = resp.read().decode()
     return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
+
+
+def _write_with_mtime(path, content, mtime):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    os.utime(path, (mtime, mtime))
 
 
 def _patch(port, path, data=None, *, skip_auth=False):
@@ -981,6 +990,66 @@ class TestPoliciesAPI:
     def test_add_missing_fields(self, server):
         status, data = _post(server, "/api/policies", {"policy_type": "redact_string"})
         assert status == 400
+
+
+class TestFrontendStaleWarning:
+    @pytest.mark.parametrize("changed_input", [
+        "index.html",
+        "public/icons.svg",
+        "vite.config.ts",
+    ])
+    def test_warns_when_build_input_outside_src_is_newer(
+        self, tmp_path, monkeypatch, capsys, changed_input
+    ):
+        frontend = tmp_path / "frontend"
+        dist = frontend / "dist"
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        _write_with_mtime(dist / "index.html", "<!doctype html>", 200)
+        _write_with_mtime(frontend / "src" / "App.tsx", "export {}", 100)
+        _write_with_mtime(frontend / changed_input, "changed", 300)
+
+        _warn_if_frontend_stale()
+
+        err = capsys.readouterr().err
+        assert "frontend bundle is STALE" in err
+        assert "build inputs are newer than dist" in err
+
+    def test_silent_when_src_tree_missing_like_packaged_wheel(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        frontend = tmp_path / "frontend"
+        dist = frontend / "dist"
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        _write_with_mtime(dist / "index.html", "<!doctype html>", 100)
+        _write_with_mtime(frontend / "public" / "icons.svg", "<svg />", 200)
+
+        _warn_if_frontend_stale()
+
+        assert capsys.readouterr().err == ""
+
+
+class TestReloadSupervisor:
+    def test_reload_child_command_uses_module_invocation(self, monkeypatch):
+        import clawjournal.workbench.daemon as daemon
+
+        monkeypatch.setattr(daemon.sys, "executable", "/venv/bin/python")
+        monkeypatch.setattr(
+            daemon.sys,
+            "argv",
+            ["clawjournal/cli.py", "serve", "--reload", "--port", "9999"],
+        )
+
+        assert _reload_child_command() == [
+            "/venv/bin/python",
+            "-m",
+            "clawjournal.cli",
+            "serve",
+            "--reload",
+            "--port",
+            "9999",
+        ]
 
 
 class TestStaticServing:

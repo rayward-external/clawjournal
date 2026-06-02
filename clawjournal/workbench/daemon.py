@@ -136,6 +136,16 @@ WORKBENCH_SOURCES = {
 
 # Path to the built frontend dist directory.
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "web" / "frontend" / "dist"
+_FRONTEND_BUILD_INPUT_DIRS = ("src", "public")
+_FRONTEND_BUILD_INPUT_FILES = (
+    "index.html",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.app.json",
+    "tsconfig.json",
+    "tsconfig.node.json",
+    "vite.config.ts",
+)
 
 
 def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: Any) -> bool:
@@ -3745,22 +3755,24 @@ npm run build</pre>
 
 
 def _warn_if_frontend_stale() -> None:
-    """In a dev checkout, warn loudly when the served bundle is older than source.
+    """In a dev checkout, warn when the served bundle is older than build inputs.
 
     The editable install serves the gitignored ``dist/`` straight off disk, so
-    ``src/`` edits (or a freshly-merged feature) are invisible until someone runs
-    a build. We only have a ``src/`` tree in a dev checkout — the shipped wheel
-    packages only ``dist/`` — so its presence is what distinguishes "developer who
-    should rebuild" from "user running the released package". Silent on the latter.
+    frontend edits (or a freshly-merged feature) are invisible until someone runs
+    a build. We only have a ``src/`` tree in a dev checkout -- the shipped wheel
+    packages only ``dist/`` -- so its presence is what distinguishes "developer
+    who should rebuild" from "user running the released package". Silent on the
+    latter.
     """
-    src_dir = FRONTEND_DIST.parent / "src"
+    frontend_root = FRONTEND_DIST.parent
+    src_dir = frontend_root / "src"
     if not src_dir.is_dir():
-        return  # installed wheel, not a dev checkout — nothing to compare against
+        return  # installed wheel, not a dev checkout -- nothing to compare against
 
     index_html = FRONTEND_DIST / "index.html"
     # Absolute --prefix so the hint is copy-pasteable regardless of the cwd the
     # daemon was launched from (`clawjournal serve` is a global entry point).
-    build_cmd = f"npm --prefix {FRONTEND_DIST.parent} run build"
+    build_cmd = f"npm --prefix {frontend_root} run build"
 
     def _banner(lines: list[str]) -> None:
         width = max(len(line) for line in lines) + 2
@@ -3779,19 +3791,34 @@ def _warn_if_frontend_stale() -> None:
 
     try:
         dist_mtime = index_html.stat().st_mtime
-        newest_src = max(
-            (p.stat().st_mtime for p in src_dir.rglob("*") if p.is_file()),
-            default=0.0,
-        )
+        newest_input = _newest_frontend_build_input_mtime(frontend_root)
     except OSError:
-        return  # can't stat — don't block startup over a warning
+        return  # can't stat -- don't block startup over a warning
 
-    if newest_src > dist_mtime:
+    if newest_input > dist_mtime:
         _banner([
-            "⚠  frontend bundle is STALE — src/ has changes not in dist/.",
+            "⚠  frontend bundle is STALE — build inputs are newer than dist/.",
             "   You are seeing an OLD UI. Rebuild to pick up frontend changes:",
             f"     {build_cmd}",
         ])
+
+
+def _newest_frontend_build_input_mtime(frontend_root: Path) -> float:
+    newest = 0.0
+    for rel in _FRONTEND_BUILD_INPUT_FILES:
+        path = frontend_root / rel
+        if not path.is_file():
+            continue
+        newest = max(newest, path.stat().st_mtime)
+
+    for rel in _FRONTEND_BUILD_INPUT_DIRS:
+        root = frontend_root / rel
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file():
+                newest = max(newest, path.stat().st_mtime)
+    return newest
 
 
 # Env vars that coordinate the --reload supervisor with its server child.
@@ -3834,6 +3861,11 @@ def _terminate_child(proc: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+def _reload_child_command() -> list[str]:
+    """Run the CLI as a module so reload works for console scripts and -m."""
+    return [sys.executable, "-m", "clawjournal.cli", *sys.argv[1:]]
 
 
 def run_with_reload(open_browser: bool = True) -> None:
@@ -3880,7 +3912,7 @@ def run_with_reload(open_browser: bool = True) -> None:
         env.pop(RELOAD_OPEN_BROWSER_ENV, None)
         if first and open_browser:
             env[RELOAD_OPEN_BROWSER_ENV] = "1"
-        return subprocess.Popen([sys.executable, *sys.argv], env=env)
+        return subprocess.Popen(_reload_child_command(), env=env)
 
     logger.info(
         "reloader: watching %s/**/*.py — save a backend file to restart the server",
