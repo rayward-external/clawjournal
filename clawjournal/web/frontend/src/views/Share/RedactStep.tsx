@@ -90,7 +90,7 @@ export function RedactStep(p: RedactStepProps) {
           </div>
           <div style={{ fontSize: 13, color: colors.gray500 }}>
             {p.aiPiiEnabled
-              ? 'Deterministic rules \u2192 Policy rules \u2192 AI review. All on-device.'
+              ? 'Deterministic + policy rules run on your device. AI review sends the already-redacted text to your configured AI backend.'
               : 'Deterministic rules \u2192 Policy rules. AI review is off for this bundle.'}
           </div>
         </div>
@@ -223,7 +223,9 @@ export function RedactStep(p: RedactStepProps) {
                 ? (totals.flagged > 0
                   ? `${totals.flagged} item${totals.flagged === 1 ? '' : 's'} need your review next`
                   : 'Everything cleared automatically')
-                : 'Running on your device'}
+                : (p.aiPiiEnabled
+                  ? 'Redacting on your device; AI review uses your backend'
+                  : 'Running on your device')}
             </div>
           </div>
           <div style={{ marginLeft: 'auto' }}>

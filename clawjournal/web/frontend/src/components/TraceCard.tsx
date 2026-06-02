@@ -137,7 +137,7 @@ export function TraceCard({
           )}
           {session.ai_quality_score != null && (
             <span
-              title="Legacy productivity score"
+              title="Productivity score"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -151,7 +151,7 @@ export function TraceCard({
                 flexShrink: 0,
               }}
             >
-              P {session.ai_quality_score}/5
+              Prod {session.ai_quality_score}/5
             </span>
           )}
           <span style={{ fontSize: 12, color: '#9ca3af', flexShrink: 0 }}>

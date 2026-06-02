@@ -1018,8 +1018,13 @@ def _parse_opencode_session(
                         cache = tokens.get("cache", {})
                         cache_read = _safe_int(cache.get("read")) if isinstance(cache, dict) else 0
                         cache_write = _safe_int(cache.get("write")) if isinstance(cache, dict) else 0
-                        stats["input_tokens"] += _safe_int(tokens.get("input")) + cache_read + cache_write
+                        # OpenCode reports non-cached input separately from cache
+                        # read/write. Keep them in the dedicated buckets so cache
+                        # reads price at 0.1x (see pricing.estimate_cost), not 1.0x.
+                        stats["input_tokens"] += _safe_int(tokens.get("input"))
                         stats["output_tokens"] += _safe_int(tokens.get("output"))
+                        stats["cache_read_tokens"] += cache_read
+                        stats["cache_creation_tokens"] += cache_write
     except (sqlite3.Error, OSError):
         return None
 
@@ -1367,8 +1372,15 @@ def _parse_gemini_session_file(
 
             tokens = msg_data.get("tokens", {})
             if tokens:
-                stats["input_tokens"] += tokens.get("input", 0) + tokens.get("cached", 0)
-                stats["output_tokens"] += tokens.get("output", 0)
+                # Gemini's `input` (promptTokenCount) already INCLUDES `cached`
+                # (cachedContentTokenCount) as a subset, so subtract to recover the
+                # non-cached input and price the cached portion at 0.1x as a cache
+                # read (mirrors the Codex/OpenAI subset handling below).
+                raw_input = _safe_int(tokens.get("input"))
+                cached = _safe_int(tokens.get("cached"))
+                stats["input_tokens"] += max(0, raw_input - cached)
+                stats["output_tokens"] += _safe_int(tokens.get("output"))
+                stats["cache_read_tokens"] += cached
 
             msg = {"role": "assistant"}
             if timestamp:
@@ -1534,8 +1546,15 @@ def _parse_openclaw_session_file(
 
             usage = msg_data.get("usage", {})
             if isinstance(usage, dict):
-                stats["input_tokens"] += _safe_int(usage.get("input")) + _safe_int(usage.get("cacheRead"))
+                # OpenClaw uses the Claude wire shape: `input` is non-cached and
+                # cache reads/writes are reported separately. Route them to the
+                # dedicated buckets so cache reads price at 0.1x, not 1.0x.
+                stats["input_tokens"] += _safe_int(usage.get("input"))
                 stats["output_tokens"] += _safe_int(usage.get("output"))
+                stats["cache_read_tokens"] += _safe_int(usage.get("cacheRead"))
+                stats["cache_creation_tokens"] += (
+                    _safe_int(usage.get("cacheCreation")) + _safe_int(usage.get("cacheWrite"))
+                )
 
             content = msg_data.get("content", [])
             if not isinstance(content, list):

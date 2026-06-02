@@ -8,9 +8,12 @@ import { Policies } from './views/Policies.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Insights } from './views/Insights.tsx';
 import { Benchmark } from './views/Benchmark.tsx';
+import { Settings } from './views/Settings.tsx';
 import { ToastProvider } from './components/Toast.tsx';
+import { ConfirmDialog } from './components/ConfirmDialog.tsx';
 import { colors, fontFamily } from './theme.ts';
-import { api } from './api.ts';
+import { api, ApiError } from './api.ts';
+import type { Features } from './types.ts';
 
 interface SidebarCounts {
   toReview: number;
@@ -39,13 +42,16 @@ function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
     return () => clearInterval(iv);
   }, []);
 
-  const NAV_ITEMS = [
+  const NAV_ITEMS: { to: string; label: string; badge: number | null; end?: boolean }[] = [
     { to: '/dashboard', label: 'Dashboard', badge: null },
     { to: '/insights', label: 'Insights', badge: counts.recommendations > 0 ? counts.recommendations : null },
     ...(benchmarkEnabled ? [{ to: '/benchmark', label: 'Benchmark', badge: null }] : []),
     { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
-    { to: '/share', label: 'Share', badge: null },
+    // `end` on Share so the /share/rules sub-route highlights Rules, not Share.
+    { to: '/share', label: 'Share', badge: null, end: true },
+    { to: '/share/rules', label: 'Rules', badge: null },
+    { to: '/settings', label: 'Settings', badge: null },
   ];
 
   return (
@@ -72,7 +78,7 @@ function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
         <NavLink
           key={item.to}
           to={item.to}
-          end={item.to === '/'}
+          end={item.to === '/' || item.end === true}
           style={({ isActive }) => ({
             display: 'flex',
             alignItems: 'center',
@@ -118,19 +124,36 @@ function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
   );
 }
 
-const SCORING_WARMUP_DECLINED_KEY = 'cj.scoringWarmupDeclined';
-
 export default function App() {
-  // Gate the Benchmark tab on a config flag (default on). Initialised to true so
-  // the common (enabled) case never flashes; only an explicitly-disabled install
-  // briefly shows it before /api/features resolves on localhost.
-  const [benchmarkEnabled, setBenchmarkEnabled] = useState(true);
+  // Feature flags + the persisted auto-scorer decline come from /api/features.
+  // benchmark_tab_enabled is initialised true so the common case never flashes;
+  // only an explicitly-disabled install briefly shows the tab before it resolves.
+  const [features, setFeatures] = useState<Features>({
+    benchmark_tab_enabled: true,
+    scoring_warmup_declined: false,
+  });
+  const benchmarkEnabled = features.benchmark_tab_enabled;
+
+  // The same probe doubles as a connectivity check: the loopback daemon going
+  // away (e.g. `clawjournal serve` stopped) otherwise just renders zero counts
+  // silently. A persistent banner makes that state visible.
+  const [daemonReachable, setDaemonReachable] = useState(true);
   useEffect(() => {
-    api.features()
-      .then(f => setBenchmarkEnabled(f.benchmark_tab_enabled))
-      .catch(() => {});
+    let cancelled = false;
+    const probe = () => api.features()
+      .then(f => { if (!cancelled) { setFeatures(f); setDaemonReachable(true); } })
+      // An ApiError means the daemon answered (any HTTP status) — connectivity is
+      // fine. Only a fetch-level failure (network/daemon down) flips the banner.
+      .catch(err => { if (!cancelled) setDaemonReachable(err instanceof ApiError); });
+    probe();
+    const iv = setInterval(probe, 20_000);
+    return () => { cancelled = true; clearInterval(iv); };
   }, []);
 
+  // Deferred, non-blocking warmup prompt (replaces the old mount-time
+  // window.confirm). The server gates this: a previously-declined install
+  // returns status 'declined', so we never re-prompt.
+  const [warmupPrompt, setWarmupPrompt] = useState<{ backend: string; displayName: string } | null>(null);
   useEffect(() => {
     let cancelled = false;
     const timer = window.setTimeout(async () => {
@@ -139,23 +162,7 @@ export default function App() {
         if (cancelled || warmup.status !== 'needs_confirmation' || !warmup.backend) {
           return;
         }
-        // Ask at most once. There is no server-side "declined" flag, so a
-        // browser that has already said no must remember it locally —
-        // otherwise this blocking dialog re-fires on every reload.
-        if (localStorage.getItem(SCORING_WARMUP_DECLINED_KEY)) {
-          return;
-        }
-        const accepted = window.confirm(
-          `Use ${warmup.display_name ?? warmup.backend} to score recent failure-corpus traces in the background?`,
-        );
-        if (cancelled) {
-          return;
-        }
-        if (accepted) {
-          await api.scoringWarmup({ confirm_backend: true, backend: warmup.backend });
-        } else {
-          localStorage.setItem(SCORING_WARMUP_DECLINED_KEY, '1');
-        }
+        setWarmupPrompt({ backend: warmup.backend, displayName: warmup.display_name ?? warmup.backend });
       } catch {
         // Background scoring is opportunistic; the workbench stays usable.
       }
@@ -166,32 +173,77 @@ export default function App() {
     };
   }, []);
 
+  const confirmWarmup = async () => {
+    const prompt = warmupPrompt;
+    setWarmupPrompt(null);
+    if (!prompt) return;
+    try {
+      await api.scoringWarmup({ confirm_backend: true, backend: prompt.backend });
+    } catch { /* opportunistic */ }
+  };
+
+  const declineWarmup = async () => {
+    setWarmupPrompt(null);
+    setFeatures(f => ({ ...f, scoring_warmup_declined: true }));
+    try {
+      await api.scoringWarmup({ decline: true });
+    } catch { /* opportunistic */ }
+  };
+
   return (
     <BrowserRouter>
       <ToastProvider>
         <div style={{
           display: 'flex',
+          flexDirection: 'column',
           height: '100vh',
           fontFamily,
           color: colors.gray900,
           WebkitFontSmoothing: 'antialiased',
         }}>
-          <Sidebar benchmarkEnabled={benchmarkEnabled} />
-          <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
-            <Routes>
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/insights" element={<Insights />} />
-              <Route path="/" element={<Inbox />} />
-              <Route path="/search" element={<Search />} />
-              <Route path="/session/:id" element={<SessionDetail />} />
-              <Route path="/bundles" element={<Navigate to="/share" replace />} />
-              <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
-              <Route path="/benchmark" element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/dashboard" replace />} />
-              <Route path="/share" element={<Share />} />
-              <Route path="/share/rules" element={<Policies />} />
-            </Routes>
-          </main>
+          {!daemonReachable && (
+            <div style={{
+              background: colors.red50,
+              color: colors.red700,
+              padding: '8px 16px',
+              fontSize: 13,
+              fontWeight: 500,
+              borderBottom: `1px solid ${colors.red200}`,
+              flexShrink: 0,
+            }}>
+              Can’t reach the ClawJournal workbench. Is <code>clawjournal serve</code> still running?
+            </div>
+          )}
+          <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+            <Sidebar benchmarkEnabled={benchmarkEnabled} />
+            <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
+              <Routes>
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/insights" element={<Insights />} />
+                <Route path="/" element={<Inbox />} />
+                <Route path="/search" element={<Search />} />
+                <Route path="/session/:id" element={<SessionDetail />} />
+                <Route path="/bundles" element={<Navigate to="/share" replace />} />
+                <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
+                <Route path="/benchmark" element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/dashboard" replace />} />
+                <Route path="/share" element={<Share />} />
+                <Route path="/share/rules" element={<Policies />} />
+                <Route path="/settings" element={<Settings />} />
+              </Routes>
+            </main>
+          </div>
         </div>
+        <ConfirmDialog
+          open={warmupPrompt !== null}
+          title="Turn on background AI scoring?"
+          message={warmupPrompt
+            ? `Run ${warmupPrompt.displayName} on your recent traces in the background to grade them? Each trace is anonymized on this machine (home-dir paths and usernames removed) before it is sent to your configured AI backend (${warmupPrompt.displayName}), which runs locally as a subprocess but may call its provider and incur usage cost.`
+            : ''}
+          confirmLabel="Turn on"
+          variant="primary"
+          onConfirm={confirmWarmup}
+          onCancel={declineWarmup}
+        />
       </ToastProvider>
     </BrowserRouter>
   );

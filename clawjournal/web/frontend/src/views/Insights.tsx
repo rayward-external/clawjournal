@@ -282,7 +282,7 @@ function HighlightCard({ item }: { item: HighlightItem }) {
               fontSize: 11, fontWeight: 600, color: scoreColor,
               background: `${scoreColor}18`, padding: '2px 7px', borderRadius: 10,
             }}>
-              FV {item.ai_failure_value_score}/5
+              Failure value {item.ai_failure_value_score}/5
             </span>
           )}
           {item.outcome && (
@@ -520,11 +520,15 @@ export function Insights() {
 
       {/* Summary stats */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
-        {[
-          { label: 'API Equivalent', value: formatCost(stats.total_cost_usd) },
+        {([
+          { label: 'API-equivalent cost', value: formatCost(stats.total_cost_usd) },
           { label: 'Sessions', value: String(stats.total_sessions) },
-          { label: 'API Cost/Session', value: formatCost(stats.cost_per_session) },
-        ].map(s => (
+          {
+            label: 'API-equivalent / session', value: formatCost(stats.cost_per_session),
+            // The average is over priced sessions only; disclose how many were excluded.
+            sub: stats.unpriced_sessions ? `${stats.unpriced_sessions} unpriced excluded` : '',
+          },
+        ] as { label: string; value: string; sub?: string }[]).map(s => (
           <div key={s.label} style={{
             flex: 1, minWidth: 100, background: colors.white,
             border: `1px solid ${colors.gray200}`, borderRadius: 8,
@@ -532,6 +536,7 @@ export function Insights() {
           }}>
             <div style={{ fontSize: 22, fontWeight: 700, color: colors.gray900 }}>{s.value}</div>
             <div style={{ fontSize: 12, color: colors.gray500, marginTop: 2 }}>{s.label}</div>
+            {s.sub && <div style={{ fontSize: 11, color: colors.gray400, marginTop: 2 }}>{s.sub}</div>}
           </div>
         ))}
       </div>

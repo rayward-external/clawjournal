@@ -368,6 +368,40 @@ class TestConfigure:
         configure(source="codex")
         assert "benchmark_tab_enabled" not in saved
 
+    def test_scoring_warmup_decline_roundtrip(self, tmp_config, monkeypatch, capsys):
+        # Real file round-trip: declining sets the key, re-enabling pops it.
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        from clawjournal.config import load_config
+
+        configure(scoring_warmup_declined=True)
+        assert load_config()["scoring_warmup_declined"] is True
+
+        configure(scoring_warmup_declined=False)
+        assert "scoring_warmup_declined" not in load_config()
+
+    def test_handle_config_inverts_scoring_warmup_flag(self, tmp_config, monkeypatch, capsys):
+        # The user-facing flag is positive; the stored key is the inverse
+        # "declined" boolean. --no-scoring-warmup => declined True.
+        import argparse
+        from clawjournal.cli import _handle_config
+        from clawjournal.config import load_config
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+
+        def _args(**kw):
+            ns = argparse.Namespace(
+                repo=None, source=None, scorer_backend=None, exclude=None,
+                redact=None, redact_usernames=None, confirm_projects=False,
+                ai_pii_review=None, benchmark_tab_enabled=None, scoring_warmup=None,
+            )
+            for k, v in kw.items():
+                setattr(ns, k, v)
+            return ns
+
+        _handle_config(_args(scoring_warmup=False))   # --no-scoring-warmup
+        assert load_config()["scoring_warmup_declined"] is True
+        _handle_config(_args(scoring_warmup=True))     # --scoring-warmup
+        assert "scoring_warmup_declined" not in load_config()
+
 
 # --- list_projects ---
 

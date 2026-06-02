@@ -342,9 +342,9 @@ export function QueueStep(p: QueueStepProps) {
                         <span style={{ opacity: 0.5 }}>&middot;</span>
                         <span
                           style={{ color: colors.gray500 }}
-                          title="Legacy productivity score"
+                          title="Productivity score"
                         >
-                          productivity {s.ai_quality_score}/5
+                          Productivity {s.ai_quality_score}/5
                         </span>
                       </>)}
                       {s.ai_failure_attribution && (<>

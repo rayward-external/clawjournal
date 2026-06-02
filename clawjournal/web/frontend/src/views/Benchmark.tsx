@@ -29,6 +29,18 @@ const EXPORT_KINDS: { kind: string; label: string }[] = [
   { kind: 'grader_packet_json', label: 'Grader packet (.json)' },
 ];
 
+// Generation controls — defaults mirror the `benchmark` CLI flags.
+const WINDOW_OPTIONS: { v: number; label: string }[] = [
+  { v: 7, label: 'Last 7 days' },
+  { v: 14, label: 'Last 14 days' },
+  { v: 30, label: 'Last 30 days' },
+];
+const BACKEND_OPTIONS: { v: string; label: string }[] = [
+  { v: 'auto', label: 'Auto-detect' },
+  { v: 'claude', label: 'Claude CLI' },
+  { v: 'codex', label: 'Codex' },
+];
+
 function shortDate(iso: string | null | undefined): string {
   return iso ? String(iso).slice(0, 10) : '?';
 }
@@ -80,7 +92,7 @@ function stagePercent(stage: string): number {
   return 8;
 }
 
-function GeneratingBanner({ stage, elapsedMs }: { stage: string; elapsedMs: number }) {
+function GeneratingBanner({ stage, elapsedMs, windowDays = 7 }: { stage: string; elapsedMs: number; windowDays?: number }) {
   const pct = stagePercent(stage);
   const secs = Math.floor(elapsedMs / 1000);
   const elapsed = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
@@ -100,7 +112,7 @@ function GeneratingBanner({ stage, elapsedMs }: { stage: string; elapsedMs: numb
         }} />
       </div>
       <div style={{ fontSize: 12, color: colors.gray500, marginTop: 8 }}>
-        Runs the deep pipeline against your last 7 days of failures (~40+ model calls). A few minutes is normal — you can leave this tab and come back; it keeps running.
+        Runs the deep pipeline against your last {windowDays} days of failures (~40+ model calls). A few minutes is normal — you can leave this tab and come back; it keeps running.
       </div>
     </div>
   );
@@ -289,6 +301,11 @@ export function Benchmark() {
   const [genStart, setGenStart] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [exportOpen, setExportOpen] = useState(false);
+  // Generation controls (defaults mirror the `benchmark` CLI flags).
+  const [genWindow, setGenWindow] = useState(7);
+  const [genCap, setGenCap] = useState(15);
+  const [genBackend, setGenBackend] = useState('auto');
+  const [genModel, setGenModel] = useState('');
   const pollRef = useRef<number | null>(null);
 
   // Tick a 1s clock while generating so the banner shows live elapsed time.
@@ -376,7 +393,12 @@ export function Benchmark() {
 
   const regenerate = async () => {
     try {
-      const res = await api.benchmarks.generate({});
+      const res = await api.benchmarks.generate({
+        window_days: genWindow,
+        cap: genCap,
+        backend: genBackend,
+        model: genModel.trim() || undefined,
+      });
       if (!res.benchmark_id) { toast(res.error || 'Could not start generation', 'error'); return; }
       beginPolling(res.benchmark_id, 'starting…', Date.now());
     } catch (e) {
@@ -403,14 +425,20 @@ export function Benchmark() {
   if (!current) {
     return (
       <div style={{ padding: 40 }}>
-        <Header generating={generating} onRegenerate={regenerate} />
+        <Header
+          generating={generating} onRegenerate={regenerate}
+          genWindow={genWindow} setGenWindow={setGenWindow}
+          genCap={genCap} setGenCap={setGenCap}
+          genBackend={genBackend} setGenBackend={setGenBackend}
+          genModel={genModel} setGenModel={setGenModel}
+        />
         {generating ? (
-          <GeneratingBanner stage={generating.stage} elapsedMs={genStart ? now - genStart : 0} />
+          <GeneratingBanner stage={generating.stage} elapsedMs={genStart ? now - genStart : 0} windowDays={genWindow} />
         ) : (
           <div style={{ marginTop: 24 }}>
             <EmptyState
               title="No benchmark yet"
-              description="Generate a personalized benchmark from your last 7 days of agent failures. It runs the deep pipeline against your own traces — a few minutes, and stored locally."
+              description="Generate a personalized benchmark from your recent agent failures. It runs the deep pipeline against your own traces — a few minutes, and stored locally."
               action={<button style={btnPrimary} onClick={regenerate} disabled={!!generating}>Generate benchmark</button>}
             />
           </div>
@@ -433,6 +461,10 @@ export function Benchmark() {
           current={current} stale={stale} list={list} generating={generating}
           onRegenerate={regenerate} onSelectWeek={selectWeek}
           exportOpen={exportOpen} setExportOpen={setExportOpen} onExport={doExport}
+          genWindow={genWindow} setGenWindow={setGenWindow}
+          genCap={genCap} setGenCap={setGenCap}
+          genBackend={genBackend} setGenBackend={setGenBackend}
+          genModel={genModel} setGenModel={setGenModel}
         />
         {/* summary chips */}
         <div style={{ display: 'flex', gap: 14, marginTop: 14, fontSize: 12, color: colors.gray500, flexWrap: 'wrap' }}>
@@ -443,7 +475,7 @@ export function Benchmark() {
           <span style={{ color: colors.yellow700 }}>{current.needs_staging_count} need staging</span>
           <span>{current.source_count} sessions deep-read{current.dropped_for_cost ? `, ${current.dropped_for_cost} dropped for cost` : ''}</span>
         </div>
-        {generating && <GeneratingBanner stage={generating.stage} elapsedMs={genStart ? now - genStart : 0} />}
+        {generating && <GeneratingBanner stage={generating.stage} elapsedMs={genStart ? now - genStart : 0} windowDays={genWindow} />}
         {/* tabs */}
         <div style={{ display: 'flex', gap: 4, marginTop: 16, borderBottom: `1px solid ${colors.gray200}` }}>
           {(['tasks', 'themes', 'trend'] as const).map(t => (
@@ -550,8 +582,14 @@ function Header(props: {
   generating: { id: string; stage: string } | null;
   onRegenerate: () => void; onSelectWeek?: (id: string) => void;
   exportOpen?: boolean; setExportOpen?: (v: boolean) => void; onExport?: (k: string) => void;
+  genWindow: number; setGenWindow: (v: number) => void;
+  genCap: number; setGenCap: (v: number) => void;
+  genBackend: string; setGenBackend: (v: string) => void;
+  genModel: string; setGenModel: (v: string) => void;
 }) {
-  const { current, stale, list, generating, onRegenerate, onSelectWeek, exportOpen, setExportOpen, onExport } = props;
+  const { current, stale, list, generating, onRegenerate, onSelectWeek, exportOpen, setExportOpen, onExport,
+    genWindow, setGenWindow, genCap, setGenCap, genBackend, setGenBackend, genModel, setGenModel } = props;
+  const windowLabel = WINDOW_OPTIONS.find(o => o.v === genWindow)?.label.replace('Last ', '') ?? `${genWindow}d`;
   // Only offer ready runs — a generating/failed row would load as a blank benchmark.
   const readyRuns = (list || []).filter(b => b.status === 'ready');
   return (
@@ -571,8 +609,29 @@ function Header(props: {
             {readyRuns.map(b => <option key={b.benchmark_id} value={b.benchmark_id}>{b.benchmark_id} ({shortDate(b.window_end)})</option>)}
           </select>
         )}
+        {!generating && (
+          <>
+            <select value={genWindow} onChange={e => setGenWindow(Number(e.target.value))} style={selectStyle} title="Time window">
+              {WINDOW_OPTIONS.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+            </select>
+            <input
+              type="number" min={1} max={50} value={genCap}
+              onChange={e => setGenCap(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
+              title="Max sessions deep-read"
+              style={{ ...selectStyle, width: 64 }}
+            />
+            <select value={genBackend} onChange={e => setGenBackend(e.target.value)} style={selectStyle} title="Scoring backend">
+              {BACKEND_OPTIONS.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+            </select>
+            <input
+              type="text" value={genModel} onChange={e => setGenModel(e.target.value)}
+              placeholder="model (optional)" title="Override model (optional)"
+              style={{ ...selectStyle, width: 140 }}
+            />
+          </>
+        )}
         <button style={generating ? { ...btnPrimary, opacity: 0.7, cursor: 'default' } : btnPrimary} onClick={onRegenerate} disabled={!!generating}>
-          {generating ? '⟳ Generating…' : '⟳ Regenerate (last 7d)'}
+          {generating ? '⟳ Generating…' : `⟳ Regenerate (${windowLabel})`}
         </button>
         {current && onExport && setExportOpen && (
           <div style={{ position: 'relative' }}>

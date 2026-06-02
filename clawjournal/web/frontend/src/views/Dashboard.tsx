@@ -252,7 +252,7 @@ export function Dashboard() {
       <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
         <StatCard label="Sessions" value={formatNumber(summary.total_sessions)} sub={`${approved} approved`} />
         <StatCard label="Tokens" value={formatNumber(summary.total_tokens)} sub={`${tokens_by_source.length} sources`} />
-        <StatCard label="API Equivalent" value={formatCost(summary.total_cost)} sub={`${summary.unique_projects} projects`} color={colors.emerald400} />
+        <StatCard label="API-equivalent cost" value={formatCost(summary.total_cost)} sub={summary.unpriced_sessions ? `${summary.unique_projects} projects · ${summary.unpriced_sessions} unpriced` : `${summary.unique_projects} projects`} color={colors.emerald400} />
         <StatCard label="Avg Failure Value" value={avgFailureValue ?? '--'} sub={totalFailureScored > 0 ? `${totalFailureScored} scored` : 'none scored'} color={avgFailureValue && parseFloat(avgFailureValue) >= 4 ? colors.red500 : avgFailureValue ? colors.yellow400 : colors.gray400} />
         {resolve_rate != null && (() => {
           const pct = Math.round(resolve_rate * 100);
@@ -399,10 +399,10 @@ export function Dashboard() {
                   <tr style={{ borderBottom: `1px solid ${colors.gray200}`, color: colors.gray500, fontSize: 12 }}>
                     <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 600 }}>Model</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Sessions</th>
-                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Avg FV</th>
+                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }} title="Average failure value">Avg failure value</th>
                     <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Resolve Rate</th>
-                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }} title="Average API cost per session (total cost ÷ sessions)">Avg Cost / Session</th>
-                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Total API Cost</th>
+                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }} title="Average API-equivalent cost per session (total ÷ sessions)">Avg cost / session</th>
+                    <th style={{ textAlign: 'right', padding: '6px 8px', fontWeight: 600 }}>Total API-equivalent</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -434,7 +434,7 @@ export function Dashboard() {
             const filtered = insights.cost_by_model.filter(c => c.cost > 0).slice(0, 8);
             const maxCost = Math.max(...filtered.map(x => x.cost || 0), 0.01);
             return (
-            <Section title="Cost by Model" subtitle="Spend distribution across models">
+            <Section title="Cost by Model" subtitle="API-equivalent cost across models">
               {filtered.map(c => (
                 <BarRow key={c.model} label={shortModel(c.model)} value={c.cost || 0} max={maxCost} color={colors.emerald400} fmt={formatCost} />
               ))}
@@ -493,8 +493,8 @@ export function Dashboard() {
                 const pctTotal = totalFailureScored > 0 ? ((count / totalFailureScored) * 100).toFixed(0) : '0';
                 return (
                   <div key={score} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
-                    <div style={{ width: 80, fontSize: 13, color: colors.gray700, flexShrink: 0 }}>
-                      <span style={{ color: SCORE_COLORS[score], fontWeight: 700 }}>FV {score}</span>
+                    <div style={{ width: 104, fontSize: 13, color: colors.gray700, flexShrink: 0 }}>
+                      <span style={{ color: SCORE_COLORS[score], fontWeight: 700 }}>Failure value {score}</span>
                     </div>
                     <div style={{ flex: 1, background: colors.gray100, borderRadius: 3, height: 16 }}>
                       <div style={{
@@ -555,7 +555,7 @@ export function Dashboard() {
           </Section>
         )}
 
-        {/* Legacy productivity distribution */}
+        {/* Productivity score distribution */}
         <Section title="Productivity" subtitle={totalProductivityScored > 0 ? `${totalProductivityScored} scored, ${productivityUnscored} pending` : 'No productivity scores yet'}>
           {totalProductivityScored > 0 ? (
             <>
@@ -566,8 +566,8 @@ export function Dashboard() {
                 const pctTotal = totalProductivityScored > 0 ? ((count / totalProductivityScored) * 100).toFixed(0) : '0';
                 return (
                   <div key={score} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
-                    <div style={{ width: 54, fontSize: 13, color: colors.gray700, flexShrink: 0 }}>
-                      <span style={{ color: PRODUCTIVITY_COLORS[score], fontWeight: 700 }}>P {score}</span>
+                    <div style={{ width: 100, fontSize: 13, color: colors.gray700, flexShrink: 0 }}>
+                      <span style={{ color: PRODUCTIVITY_COLORS[score], fontWeight: 700 }}>Productivity {score}</span>
                     </div>
                     <div style={{ flex: 1, background: colors.gray100, borderRadius: 3, height: 14 }}>
                       <div style={{

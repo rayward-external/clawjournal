@@ -368,7 +368,7 @@ export default function SessionDetail() {
           />
           <MetaRow label="Tool uses" value={String(session.tool_uses)} />
           {session.estimated_cost_usd != null && session.estimated_cost_usd > 0 && (
-            <MetaRow label="API equivalent" value={`$${session.estimated_cost_usd.toFixed(2)}`} />
+            <MetaRow label="API-equivalent cost" value={`$${session.estimated_cost_usd.toFixed(2)}`} />
           )}
           {session.parent_session_id && (
             <MetaRow label="Parent" value={session.parent_session_id.slice(0, 12) + '...'} mono />
@@ -414,7 +414,7 @@ export default function SessionDetail() {
                         background: '#fef2f2', color: '#b91c1c', whiteSpace: 'nowrap',
                       }}
                     >
-                      Failure {session.ai_failure_value_score}/5
+                      Failure value {session.ai_failure_value_score}/5
                     </span>
                   )}
                   {session.ai_failure_attribution && (
@@ -580,7 +580,7 @@ export default function SessionDetail() {
                   fontWeight: 700,
                   color: colors.red500,
                 }}>
-                  FV {displayScore}/5
+                  Failure value {displayScore}/5
                 </span>
                 <span style={{ fontSize: 13, fontWeight: 600, color: colors.gray700 }}>
                   {failureValueLabel(displayScore)}
@@ -602,8 +602,9 @@ export default function SessionDetail() {
                 </div>
               )}
               {session.ai_quality_score != null && (
-                <div style={{ fontSize: 11, color: colors.gray400, lineHeight: 1.4, marginBottom: 8 }}>
-                  Legacy productivity {session.ai_quality_score}/5
+                <div style={{ fontSize: 11, color: colors.gray400, lineHeight: 1.4, marginBottom: 8 }}
+                  title="Earlier productivity score">
+                  Productivity {session.ai_quality_score}/5
                 </div>
               )}
             </div>
@@ -645,6 +646,12 @@ export default function SessionDetail() {
           >
             {scoring ? 'Scoring…' : (session.ai_failure_value_score ? 'Re-score with AI' : 'Score with AI')}
           </button>
+
+          <div style={{ fontSize: 11, color: colors.gray400, lineHeight: 1.45, marginBottom: 10 }}>
+            Sends this trace — anonymized (home-dir paths &amp; usernames stripped) and redacted —
+            to your configured AI backend (Claude Code / Codex) for a 1–5 score. Runs locally as a
+            subprocess; the agent itself may call its provider and incur usage cost.
+          </div>
 
           <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray700, marginBottom: 4 }}>Override failure value</div>
           <textarea

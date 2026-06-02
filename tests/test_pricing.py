@@ -14,6 +14,8 @@ from clawjournal.pricing import (
     _save_cache,
     _cache_is_stale,
     _normalize_model_name,
+    cheapest_equivalent_rate,
+    downgrade_savings_ratio,
     estimate_cost,
     format_cost,
     refresh_pricing,
@@ -285,3 +287,33 @@ class TestFormatCost:
 
     def test_large(self):
         assert format_cost(5.73) == "$5.73"
+
+
+class TestModelDowngradeHelpers:
+    """cheapest_equivalent_rate / downgrade_savings_ratio over the builtin table."""
+
+    def test_cheapest_in_family(self):
+        # opus -> haiku is the cheapest claude-family input rate (1.0/1M).
+        assert cheapest_equivalent_rate("claude-opus-4") == (1.0, 5.0)
+
+    def test_already_cheapest_returns_none(self):
+        assert cheapest_equivalent_rate("claude-haiku-4") is None
+
+    def test_unknown_model_returns_none(self):
+        assert cheapest_equivalent_rate("totally-unknown-model-xyz") is None
+
+    def test_savings_ratio_opus_to_haiku(self):
+        # 1 - (1.0 / 15.0) ≈ 0.9333
+        ratio = downgrade_savings_ratio("claude-opus-4")
+        assert ratio == pytest.approx(1 - 1 / 15)
+
+    def test_savings_ratio_none_when_cheapest(self):
+        assert downgrade_savings_ratio("claude-haiku-4") is None
+
+    def test_savings_ratio_none_for_unknown(self):
+        assert downgrade_savings_ratio("totally-unknown-model-xyz") is None
+
+    def test_savings_ratio_ignores_effort_via_prefix(self):
+        # An "@ effort" suffix still prefix-matches the base model.
+        ratio = downgrade_savings_ratio("claude-opus-4 @ xhigh")
+        assert ratio == pytest.approx(1 - 1 / 15)

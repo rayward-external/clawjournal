@@ -233,6 +233,77 @@ def estimate_cost(
     return None
 
 
+def _model_family(normalized: str) -> str:
+    """Coarse family key (leading alphabetic run) for grouping comparable models.
+
+    e.g. 'claude-opus-4' -> 'claude', 'gpt-4.1-mini' -> 'gpt',
+    'gemini-2.5-pro' -> 'gemini', 'deepseek-r1' -> 'deepseek'.
+    """
+    head = normalized.rsplit("/", 1)[-1]
+    out: list[str] = []
+    for ch in head:
+        if ch.isalpha():
+            out.append(ch)
+        else:
+            break
+    return "".join(out) or head
+
+
+def cheapest_equivalent_rate(model: str | None) -> tuple[float, float] | None:
+    """Return the (input, output) per-1M rate of the cheapest same-family model
+    that undercuts *model* on input price, or None if the model is unknown or is
+    already the cheapest in its family.
+
+    Used to estimate model-downgrade savings with a grounded substitution (e.g.
+    opus -> haiku) instead of a flat guess.
+    """
+    if not model:
+        return None
+    normalized = _normalize_model_name(model)
+    pricing_table, sorted_prefixes = _get_pricing()
+    current: tuple[float, float] | None = None
+    for prefix in sorted_prefixes:
+        if normalized.startswith(prefix):
+            current = pricing_table[prefix]
+            break
+    if current is None or current[0] <= 0:
+        return None
+    family = _model_family(normalized)
+    cheapest: tuple[float, float] | None = None
+    for name, (in_rate, out_rate) in pricing_table.items():
+        if _model_family(name) != family:
+            continue
+        if in_rate < current[0] and (cheapest is None or in_rate < cheapest[0]):
+            cheapest = (in_rate, out_rate)
+    return cheapest
+
+
+def downgrade_savings_ratio(model: str | None) -> float | None:
+    """Fraction of input cost saved by switching *model* to its cheapest
+    same-family sibling, clamped to [0, 1), or None if no cheaper sibling or
+    price is known.
+
+    Grounds the model-downgrade savings estimate in the live pricing table
+    instead of a flat guess.
+    """
+    if not model:
+        return None
+    normalized = _normalize_model_name(model)
+    pricing_table, sorted_prefixes = _get_pricing()
+    current: tuple[float, float] | None = None
+    for prefix in sorted_prefixes:
+        if normalized.startswith(prefix):
+            current = pricing_table[prefix]
+            break
+    if current is None or current[0] <= 0:
+        return None
+    cheaper = cheapest_equivalent_rate(model)
+    if cheaper is None:
+        return None
+    ratio = 1.0 - (cheaper[0] / current[0])
+    return max(0.0, min(1.0, ratio))
+
+
 def format_cost(cost: float | None) -> str:
     """Format cost as a human-readable string like '$0.32' or '$1.73'."""
     if cost is None:

@@ -9,9 +9,11 @@ interface GettingStartedGuideProps {
 
 export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuideProps) {
   const toReview = (stats.by_status['new'] ?? 0) + (stats.by_status['shortlisted'] ?? 0);
+  // Labels for the in-Share phases come from the canonical stepper so they can
+  // never drift from the real wizard (Share/types.ts STEPS).
   const steps = [
     { label: 'Review', detail: toReview > 0 ? `${toReview} waiting` : 'Scan sessions' },
-    { label: 'Pick', detail: 'In Share' },
+    { label: 'Queue', detail: 'In Share' },
     { label: 'Redact', detail: 'Local review' },
     { label: 'Package', detail: 'Submit or zip' },
   ];

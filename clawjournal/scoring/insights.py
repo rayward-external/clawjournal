@@ -1,4 +1,8 @@
-"""Token Efficiency Advisor — AI-powered insights on usage patterns."""
+"""Token Efficiency Advisor — heuristic insights on usage patterns.
+
+This module is deterministic: SQL aggregates plus rule-based recommendations.
+No LLM is involved (the "Insights" UI surface reflects this).
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from ..pricing import format_cost
+from ..pricing import downgrade_savings_ratio, format_cost
 
 
 def collect_advisor_stats(
@@ -17,8 +21,8 @@ def collect_advisor_stats(
 ) -> dict[str, Any]:
     """Collect aggregate stats for the advisor from the session index.
 
-    Returns a summary dict suitable for passing to the advisor LLM or
-    for generating rule-based recommendations.
+    Returns a summary dict used to generate the heuristic, rule-based
+    recommendations (no LLM is involved).
     """
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
@@ -34,6 +38,7 @@ def collect_advisor_stats(
     row = conn.execute(
         "SELECT COUNT(*) as sessions, "
         "SUM(estimated_cost_usd) as cost, "
+        "SUM(CASE WHEN estimated_cost_usd IS NOT NULL THEN 1 ELSE 0 END) as priced_sessions, "
         "SUM(input_tokens) as input_tokens, "
         "SUM(output_tokens) as output_tokens "
         "FROM sessions WHERE DATE(start_time) >= ? AND DATE(start_time) <= ?",
@@ -41,6 +46,11 @@ def collect_advisor_stats(
     ).fetchone()
     result["total_sessions"] = row["sessions"] or 0
     result["total_cost_usd"] = round(row["cost"] or 0, 2)
+    # Sessions whose model isn't in the pricing table have a NULL cost: they drop
+    # out of SUM/AVG but would otherwise dilute per-session averages if counted in
+    # the denominator. Track the priced count so averages use SUM/COUNT(priced).
+    result["priced_sessions"] = row["priced_sessions"] or 0
+    result["unpriced_sessions"] = (row["sessions"] or 0) - (row["priced_sessions"] or 0)
     result["total_input_tokens"] = row["input_tokens"] or 0
     result["total_output_tokens"] = row["output_tokens"] or 0
 
@@ -228,6 +238,7 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
             "summary_stats": {
                 "total_cost_usd": 0,
                 "total_sessions": 0,
+                "unpriced_sessions": 0,
                 "cost_per_session": 0,
                 "most_efficient_model": None,
                 "highest_quality_model": None,
@@ -238,7 +249,20 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
     # Model downgrade
     candidates = stats.get("model_downgrade_candidates", [])
     if candidates:
-        potential_savings = sum(c["cost"] * 0.6 for c in candidates)
+        # Estimate per-candidate savings from a real cheapest-same-family
+        # substitution (e.g. opus -> haiku). Fall back to a flat 0.6 of cost
+        # only when the model (or a cheaper sibling) isn't in the pricing table,
+        # so an unpriced model still yields a non-zero recommendation.
+        def _candidate_savings(c: dict[str, Any]) -> float:
+            cost = c["cost"]
+            # Candidate labels may carry an "@ effort" suffix; price the base model.
+            base_model = str(c.get("model") or "").split(" @ ", 1)[0]
+            ratio = downgrade_savings_ratio(base_model)
+            if ratio is None:
+                ratio = 0.6
+            return cost * ratio
+
+        potential_savings = sum(_candidate_savings(c) for c in candidates)
         recommendations.append({
             "type": "model_downgrade",
             "priority": "high",
@@ -353,8 +377,11 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
             f"No specific optimization suggestions."
         )
 
-    # Summary stats
-    cost_per_session = total_cost / total_sessions if total_sessions else 0
+    # Summary stats. Average over PRICED sessions only — unpriced (NULL-cost)
+    # sessions contribute 0 to total_cost, so counting them in the denominator
+    # would understate the true per-session API-equivalent cost.
+    priced_sessions = stats.get("priced_sessions", total_sessions)
+    cost_per_session = total_cost / priced_sessions if priced_sessions else 0
     scored_models = [m for m in by_model if m["avg_score"] > 0]
     most_efficient = min(scored_models, key=lambda m: m["cost"] / max(m["sessions"], 1))["model"] if scored_models else None
     highest_quality = max(scored_models, key=lambda m: m["avg_score"])["model"] if scored_models else None
@@ -367,6 +394,7 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
         "summary_stats": {
             "total_cost_usd": total_cost,
             "total_sessions": total_sessions,
+            "unpriced_sessions": stats.get("unpriced_sessions", 0),
             "cost_per_session": round(cost_per_session, 2),
             "most_efficient_model": most_efficient,
             "highest_quality_model": highest_quality,

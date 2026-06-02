@@ -268,13 +268,27 @@ function titleCase(s: string): string {
   return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
+// Kind-scoped label/description overrides for values whose meaning differs by
+// context. The flat LABELS map keys by value alone, so a recovery `blocked`
+// (external-constraint-blocked) would otherwise borrow the status label
+// 'blocked' -> 'Skipped'. Keep it "Blocked", matching the Inbox recovery filter.
+const KIND_LABELS: Partial<Record<BadgeKind, Record<string, string>>> = {
+  recovery: { blocked: 'Blocked' },
+};
+const KIND_DESCRIPTIONS: Partial<Record<BadgeKind, Record<string, string>>> = {
+  recovery: {
+    blocked: 'Progress stopped mainly by external constraints (missing data, credentials, quota, access, dependencies)',
+  },
+};
+
 export function BadgeChip({ kind, value }: { kind: BadgeKind; value: string }) {
   const palette = COLORS[kind]?.[value] ?? hashColor(value);
-  const label = LABELS[value] ?? titleCase(value);
+  const label = KIND_LABELS[kind]?.[value] ?? LABELS[value] ?? titleCase(value);
+  const description = KIND_DESCRIPTIONS[kind]?.[value] ?? DESCRIPTIONS[value];
 
   return (
     <span
-      title={DESCRIPTIONS[value]}
+      title={description}
       style={{
         display: 'inline-block',
         padding: '1px 8px',

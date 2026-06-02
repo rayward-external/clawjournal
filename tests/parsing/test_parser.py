@@ -1062,8 +1062,12 @@ class TestDiscoverProjects:
         assert len(sessions) == 1
         assert sessions[0]["project"] == "opencode:repo"
         assert sessions[0]["model"] == "openai/gpt-5.3-codex"
-        assert sessions[0]["stats"]["input_tokens"] == 150
+        # input (120) is non-cached; cache.read (30) / cache.write (0) are separate
+        # buckets so the cache read prices at 0.1x rather than the full input rate.
+        assert sessions[0]["stats"]["input_tokens"] == 120
         assert sessions[0]["stats"]["output_tokens"] == 40
+        assert sessions[0]["stats"]["cache_read_tokens"] == 30
+        assert sessions[0]["stats"]["cache_creation_tokens"] == 0
         assert sessions[0]["messages"][0]["role"] == "user"
         assert sessions[0]["messages"][1]["role"] == "assistant"
         assert sessions[0]["messages"][1]["tool_uses"][0]["tool"] == "bash"
@@ -1867,7 +1871,7 @@ class TestParseOpenclawSessionFile:
         fpath.unlink()
 
     def test_cache_read_tokens(self, mock_anonymizer):
-        """cacheRead should be added to input_tokens."""
+        """cacheRead should land in cache_read_tokens, not be folded into input."""
         import tempfile
         from pathlib import Path
 
@@ -1884,8 +1888,47 @@ class TestParseOpenclawSessionFile:
             fpath = Path(f.name)
 
         result = _parse_openclaw_session_file(fpath, mock_anonymizer)
-        assert result["stats"]["input_tokens"] == 300  # 100 + 200
+        # input stays non-cached; the cache read is priced separately at 0.1x.
+        assert result["stats"]["input_tokens"] == 100
         assert result["stats"]["output_tokens"] == 50
+        assert result["stats"]["cache_read_tokens"] == 200
+        fpath.unlink()
+
+
+class TestParseGeminiSessionFile:
+    def test_cached_tokens_priced_as_cache_read(self, mock_anonymizer):
+        """Gemini `cached` is a subset of `input` (promptTokenCount); it must be
+        recovered as a cache read (0.1x), not left folded into input at 1.0x."""
+        import tempfile
+        from pathlib import Path
+        from clawjournal.parsing.parser import _parse_gemini_session_file
+
+        data = {
+            "sessionId": "g1",
+            "startTime": "2026-01-10T10:00:00Z",
+            "lastUpdated": "2026-01-10T10:01:00Z",
+            "messages": [
+                {"type": "user", "timestamp": "2026-01-10T10:00:00Z", "content": "Hi"},
+                {
+                    "type": "gemini",
+                    "timestamp": "2026-01-10T10:00:30Z",
+                    "model": "gemini-2.5-pro",
+                    "content": "Hello",
+                    "tokens": {"input": 120, "output": 40, "cached": 30},
+                },
+            ],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            fpath = Path(f.name)
+
+        result = _parse_gemini_session_file(fpath, mock_anonymizer)
+        assert result is not None
+        # input (120) includes cached (30) as a subset -> non-cached input is 90.
+        assert result["stats"]["input_tokens"] == 90
+        assert result["stats"]["output_tokens"] == 40
+        assert result["stats"]["cache_read_tokens"] == 30
+        assert result["stats"]["cache_creation_tokens"] == 0
         fpath.unlink()
 
 

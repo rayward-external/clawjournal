@@ -207,6 +207,20 @@ export interface Policy {
 export interface Features {
   /** Whether the Benchmark tab is shown in the workbench UI (config: benchmark_tab_enabled). */
   benchmark_tab_enabled: boolean;
+  /** Whether the user declined the background auto-scorer warmup (config: scoring_warmup_declined). */
+  scoring_warmup_declined: boolean;
+}
+
+export interface WorkbenchConfig {
+  source: string | null;
+  projects_confirmed: boolean;
+  ai_pii_review_enabled: boolean;
+  scorer_backend: string | null;
+  scorer_backend_confirmed_at: string | null;
+  benchmark_tab_enabled: boolean;
+  source_choices: string[];
+  scorer_backend_choices: string[];
+  scorer_backend_detected: string | null;
 }
 
 export interface Stats {
@@ -270,6 +284,8 @@ export interface DashboardData {
     unique_projects: number;
     unique_sources: number;
     total_cost: number;
+    priced_sessions?: number;
+    unpriced_sessions?: number;
   };
   activity: { day: string; count: number }[];
   weekly_activity: { week: string; week_start: string; count: number }[];
@@ -397,6 +413,7 @@ export interface AdvisorData {
   summary_stats: {
     total_cost_usd: number;
     total_sessions: number;
+    unpriced_sessions?: number;
     cost_per_session: number;
     most_efficient_model: string | null;
     highest_quality_model: string | null;

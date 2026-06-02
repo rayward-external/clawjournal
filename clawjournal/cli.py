@@ -371,8 +371,14 @@ def configure(
     confirm_projects: bool = False,
     ai_pii_review: bool | None = None,
     benchmark_tab_enabled: bool | None = None,
+    scoring_warmup_declined: bool | None = None,
+    quiet: bool = False,
 ):
-    """Set config values non-interactively. Lists are MERGED (append), not replaced."""
+    """Set config values non-interactively. Lists are MERGED (append), not replaced.
+
+    Pass ``quiet=True`` to suppress the stdout summary (used by the daemon's
+    config write endpoint, where printing to the server log would be noise).
+    """
     config = load_config()
     if repo is not None:
         config["repo"] = repo
@@ -405,9 +411,17 @@ def configure(
         config["ai_pii_review_enabled"] = ai_pii_review
     if benchmark_tab_enabled is not None:
         config["benchmark_tab_enabled"] = benchmark_tab_enabled
+    if scoring_warmup_declined is not None:
+        if scoring_warmup_declined:
+            config["scoring_warmup_declined"] = True
+        else:
+            # Re-enabling pops the key rather than storing False, keeping
+            # config.json clean (mirrors the scorer_backend "none" pattern).
+            config.pop("scoring_warmup_declined", None)
     save_config(config)
-    print(f"Config saved to {CONFIG_FILE}")
-    print(json.dumps(_mask_config_for_display(config), indent=2))
+    if not quiet:
+        print(f"Config saved to {CONFIG_FILE}")
+        print(json.dumps(_mask_config_for_display(config), indent=2))
 
 
 # Common words that should not be scrubbed during username fragment removal
@@ -3666,6 +3680,11 @@ def main() -> None:
                      action=argparse.BooleanOptionalAction, default=None,
                      help="Show (--benchmark-tab) or hide (--no-benchmark-tab) the "
                           "Benchmark tab in the workbench UI")
+    cfg.add_argument("--scoring-warmup", dest="scoring_warmup",
+                     action=argparse.BooleanOptionalAction, default=None,
+                     help="Enable (--scoring-warmup) or decline (--no-scoring-warmup) the "
+                          "background AI auto-scorer. Declining also stops a backend "
+                          "enabled via env/CLI from auto-scoring on scan.")
 
     events_parser = sub.add_parser("events", help="Execution recorder commands")
     events_sub = events_parser.add_subparsers(dest="events_command", required=True)
@@ -4473,6 +4492,22 @@ def main() -> None:
         success = refresh_pricing(quiet=False)
         if not success:
             sys.exit(1)
+        # Re-price already-indexed sessions against the refreshed table. This is
+        # the one place the frozen-cost guarantee is intentionally overridden, so
+        # a pricing update (or a re-scan that corrected token accounting) is
+        # reflected in dashboard totals.
+        try:
+            from .workbench.index import open_index, recompute_estimated_costs
+            conn = open_index()
+            try:
+                changed = recompute_estimated_costs(conn)
+            finally:
+                conn.close()
+            if changed:
+                print(f"Re-priced {changed} session{'s' if changed != 1 else ''}.")
+        except Exception as exc:  # index may not exist yet on a fresh install
+            print(f"Pricing cache refreshed; skipped re-pricing sessions ({exc}).",
+                  file=sys.stderr)
         return
 
     if command == "search":
@@ -4600,6 +4635,10 @@ def _handle_config(args) -> None:
     """Handle the config subcommand."""
     ai_pii_review = getattr(args, "ai_pii_review", None)
     benchmark_tab_enabled = getattr(args, "benchmark_tab_enabled", None)
+    # User-facing flag is positive (--scoring-warmup = enabled); the stored key
+    # is the inverse "declined" boolean.
+    scoring_warmup = getattr(args, "scoring_warmup", None)
+    scoring_warmup_declined = None if scoring_warmup is None else (not scoring_warmup)
     has_changes = (
         args.repo
         or args.source
@@ -4610,6 +4649,7 @@ def _handle_config(args) -> None:
         or args.confirm_projects
         or ai_pii_review is not None
         or benchmark_tab_enabled is not None
+        or scoring_warmup is not None
     )
     if not has_changes:
         print(json.dumps(_mask_config_for_display(load_config()), indent=2))
@@ -4624,6 +4664,7 @@ def _handle_config(args) -> None:
         confirm_projects=args.confirm_projects or bool(args.exclude),
         ai_pii_review=ai_pii_review,
         benchmark_tab_enabled=benchmark_tab_enabled,
+        scoring_warmup_declined=scoring_warmup_declined,
     )
 
 

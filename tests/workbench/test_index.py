@@ -23,6 +23,7 @@ from clawjournal.workbench.index import (
     query_sessions,
     query_sessions_for_rescore,
     query_unscored_sessions,
+    recompute_estimated_costs,
     remove_policy,
     search_fts,
     session_matches_excluded_projects,
@@ -171,6 +172,42 @@ class TestUpsertSessions:
         session = _make_session()
         del session["session_id"]
         assert upsert_sessions(index_conn, [session]) == 0
+
+
+class TestCostAccounting:
+    def test_recompute_estimated_costs_overrides_frozen(self, index_conn, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.estimate_cost", lambda *a, **k: 10.0)
+        upsert_sessions(index_conn, [_make_session()])
+        # Simulate a stale frozen cost left by an earlier (mis-)estimate.
+        index_conn.execute(
+            "UPDATE sessions SET estimated_cost_usd = 999.0 WHERE session_id = 'sess-1'")
+        index_conn.commit()
+
+        changed = recompute_estimated_costs(index_conn)
+        assert changed == 1
+        row = index_conn.execute(
+            "SELECT estimated_cost_usd FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert row["estimated_cost_usd"] == pytest.approx(10.0)
+        # Idempotent: a second pass changes nothing.
+        assert recompute_estimated_costs(index_conn) == 0
+
+    def test_dashboard_reports_priced_and_unpriced_counts(self, index_conn, monkeypatch):
+        # Price only the "priced-model" session; the other returns None (unpriced).
+        def fake_cost(model, *a, **k):
+            return 5.0 if model == "priced-model" else None
+        monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", fake_cost)
+        upsert_sessions(index_conn, [
+            _make_session("sess-priced", model="priced-model"),
+            _make_session("sess-unpriced", model="unpriced-model"),
+        ])
+
+        summary = get_dashboard_analytics(index_conn)["summary"]
+        assert summary["total_sessions"] == 2
+        assert summary["priced_sessions"] == 1
+        assert summary["unpriced_sessions"] == 1
+        assert summary["total_cost"] == pytest.approx(5.0)
 
     def test_empty_list(self, index_conn):
         assert upsert_sessions(index_conn, []) == 0

@@ -22,6 +22,7 @@ import type {
   BenchmarkSummary,
   BenchmarkTrend,
   Features,
+  WorkbenchConfig,
 } from './types.ts';
 
 const BASE = '/api';
@@ -166,6 +167,25 @@ export const api = {
     return request('/features');
   },
 
+  config: {
+    get(): Promise<WorkbenchConfig> {
+      return request('/config');
+    },
+    update(body: Partial<{
+      source: string;
+      scorer_backend: string;
+      confirm_projects: boolean;
+      ai_pii_review_enabled: boolean;
+      benchmark_tab_enabled: boolean;
+    }>): Promise<WorkbenchConfig> {
+      return request('/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+  },
+
   dashboard(params: { start?: string; end?: string } = {}): Promise<DashboardData> {
     return request(`/dashboard${qs(params)}`);
   },
@@ -254,8 +274,8 @@ export const api = {
     return request('/scoring/backend');
   },
 
-  scoringWarmup(body?: { confirm_backend?: boolean; backend?: string | null }): Promise<{
-    status: 'started' | 'already_running' | 'needs_confirmation' | 'disabled';
+  scoringWarmup(body?: { confirm_backend?: boolean; backend?: string | null; decline?: boolean }): Promise<{
+    status: 'started' | 'already_running' | 'needs_confirmation' | 'disabled' | 'declined';
     backend?: string | null;
     display_name?: string | null;
     reason?: string;
@@ -477,7 +497,7 @@ export const api = {
     status(id: string): Promise<{ benchmark_id: string; status: string; stage: string | null; error: string | null }> {
       return request(`/benchmarks/${encodeURIComponent(id)}/status`);
     },
-    generate(body: { window_days?: number; cap?: number } = {}): Promise<{ status: string; benchmark_id?: string; error?: string }> {
+    generate(body: { window_days?: number; cap?: number; backend?: string; model?: string } = {}): Promise<{ status: string; benchmark_id?: string; error?: string }> {
       return request('/benchmarks/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

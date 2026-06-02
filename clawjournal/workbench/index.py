@@ -1697,6 +1697,48 @@ def _resolve_estimated_cost(
     )
 
 
+def recompute_estimated_costs(conn: sqlite3.Connection) -> int:
+    """Re-price every session's ``estimated_cost_usd`` from its stored token
+    columns and the current pricing table. Returns the number of rows changed.
+
+    This deliberately overrides the frozen-cost stability guarantee in
+    :func:`_resolve_estimated_cost`, so it is only invoked from the explicit
+    ``refresh-pricing`` CLI path — never on routine ``scan``/``serve``. Run it
+    after a ``scan --force`` if you also need corrected token columns (e.g. after
+    a parser cache-accounting fix).
+    """
+    rows = conn.execute(
+        "SELECT session_id, model, input_tokens, output_tokens, "
+        "cache_read_tokens, cache_creation_tokens, estimated_cost_usd "
+        "FROM sessions"
+    ).fetchall()
+    changed = 0
+    for r in rows:
+        new_cost = estimate_cost(
+            r["model"],
+            r["input_tokens"] or 0,
+            r["output_tokens"] or 0,
+            cache_read_tokens=r["cache_read_tokens"] or 0,
+            cache_creation_tokens=r["cache_creation_tokens"] or 0,
+        )
+        old_cost = r["estimated_cost_usd"]
+        if new_cost is None and old_cost is None:
+            continue
+        if (
+            new_cost is not None
+            and old_cost is not None
+            and abs(new_cost - old_cost) < 1e-9
+        ):
+            continue
+        conn.execute(
+            "UPDATE sessions SET estimated_cost_usd = ? WHERE session_id = ?",
+            (new_cost, r["session_id"]),
+        )
+        changed += 1
+    conn.commit()
+    return changed
+
+
 def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) -> int:
     """Index parsed sessions into the database.
 
@@ -2822,16 +2864,24 @@ def get_dashboard_analytics(
         "  + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) as total_tokens, "
         "COUNT(DISTINCT project) as unique_projects, "
         "COUNT(DISTINCT source) as unique_sources, "
-        "SUM(estimated_cost_usd) as total_cost "
+        "SUM(estimated_cost_usd) as total_cost, "
+        "SUM(CASE WHEN estimated_cost_usd IS NOT NULL THEN 1 ELSE 0 END) as priced_sessions "
         f"FROM sessions{filtered_where}",
         filtered_params,
     ).fetchone()
+    # Sessions whose model isn't in the pricing table have a NULL cost: they fall
+    # out of SUM(total_cost) but stay in COUNT(*), so total_cost understates spend.
+    # Expose the priced/unpriced split so the UI can disclose "N unpriced".
+    total_sessions = row["total_sessions"] or 0
+    priced_sessions = row["priced_sessions"] or 0
     result["summary"] = {
-        "total_sessions": row["total_sessions"] or 0,
+        "total_sessions": total_sessions,
         "total_tokens": row["total_tokens"] or 0,
         "unique_projects": row["unique_projects"] or 0,
         "unique_sources": row["unique_sources"] or 0,
         "total_cost": round(row["total_cost"] or 0, 2),
+        "priced_sessions": priced_sessions,
+        "unpriced_sessions": total_sessions - priced_sessions,
     }
 
     # Resolve rate with previous-period comparison for trend coloring

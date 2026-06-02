@@ -38,6 +38,7 @@ class ClawJournalConfig(TypedDict, total=False):
     scorer_backend: str | None
     scorer_backend_confirmed_at: str | None
     benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
+    scoring_warmup_declined: bool  # user declined the background auto-scorer (suppresses prompt + server-side auto-start)
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {

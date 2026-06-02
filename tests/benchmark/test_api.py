@@ -170,6 +170,30 @@ class TestGenerate:
         assert st["status"] == "ready"
         assert _get(api, f"/api/benchmarks/{bid}")[1]["n_tasks"] == 1
 
+    def test_backend_and_model_threaded_to_worker(self, api, monkeypatch):
+        self._seed_failure()
+        captured: dict = {}
+
+        def fake(conn, *, week_slice=None, backend="auto", model=None, **kw):
+            captured["backend"] = backend
+            captured["model"] = model
+            b = _canned()
+            b.window_start, b.window_end = week_slice.window_start, week_slice.window_end
+            b.generated_at = week_slice.window_end
+            return b
+        monkeypatch.setattr("clawjournal.benchmark.generate.generate_benchmark", fake)
+
+        s, data = _post(api, "/api/benchmarks/generate",
+                        {"backend": "codex", "model": "gpt-5.4"})
+        assert s == 202
+        bid = data["benchmark_id"]
+        for _ in range(60):
+            st = _get(api, f"/api/benchmarks/{bid}/status")[1]
+            if st["status"] != "generating":
+                break
+            time.sleep(0.05)
+        assert captured == {"backend": "codex", "model": "gpt-5.4"}
+
     def test_no_candidates_400(self, api):
         assert _post(api, "/api/benchmarks/generate", {})[0] == 400
 
@@ -236,11 +260,11 @@ class TestFeatures:
         monkeypatch.setattr("clawjournal.config.load_config", lambda: {})
         status, body = _get(api, "/api/features")
         assert status == 200
-        assert body == {"benchmark_tab_enabled": True}
+        assert body == {"benchmark_tab_enabled": True, "scoring_warmup_declined": False}
 
     def test_respects_disabled_flag(self, api, monkeypatch):
         monkeypatch.setattr("clawjournal.config.load_config",
                             lambda: {"benchmark_tab_enabled": False})
         status, body = _get(api, "/api/features")
         assert status == 200
-        assert body == {"benchmark_tab_enabled": False}
+        assert body == {"benchmark_tab_enabled": False, "scoring_warmup_declined": False}
