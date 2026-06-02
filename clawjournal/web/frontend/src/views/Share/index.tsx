@@ -821,7 +821,10 @@ export function Share() {
   // itself is unchanged (helpers.ts still uses it for full-flow step indexing).
   const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
   const visibleSteps = (!destinationLoading && !canSubmit)
-    ? STEPS.filter(s => s.key !== 'submit')
+    // Keep the current step even if it's 'submit' (e.g. a Submit deep-link
+    // resolving to a non-submittable destination) so the stepper never
+    // highlights nothing for the frame before the reroute to 'done'.
+    ? STEPS.filter(s => s.key !== 'submit' || s.key === activeStep)
     : STEPS;
 
   const stepperHeader = (

@@ -403,6 +403,14 @@ class Scanner:
 
                 scored = 0
                 for s in sessions:
+                    # Honor a mid-batch opt-out: if the user turns off background
+                    # scoring (Settings / decline) while this batch is running,
+                    # stop before egressing the next trace. Re-read config each
+                    # iteration — it's the source of truth and cheap relative to a
+                    # scoring call.
+                    if load_config().get("scoring_warmup_declined"):
+                        logger.info("Automatic scoring stopped: background scoring turned off")
+                        break
                     sid = s["session_id"]
                     try:
                         result = score_session(conn, sid, backend=backend)
@@ -2876,7 +2884,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         from ..cli import EXPLICIT_SOURCE_CHOICES
         from ..scoring.scoring import SUPPORTED_SCORING_BACKENDS
         config = load_config()
-        source_choices = sorted(c for c in EXPLICIT_SOURCE_CHOICES if c != "both")
+        # 'both' is deprecated and hidden from the picker, but surface it if it is
+        # the currently-stored value so the select shows the real value rather
+        # than a misleading "Select a source…" placeholder.
+        stored_source = config.get("source")
+        source_choices = sorted(
+            c for c in EXPLICIT_SOURCE_CHOICES if c != "both" or stored_source == "both"
+        )
         _json_response(self, {
             "source": config.get("source"),
             "projects_confirmed": bool(config.get("projects_confirmed", False)),

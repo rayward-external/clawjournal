@@ -153,6 +153,39 @@ class TestScoringWarmupDecline:
         assert load_config().get("scoring_warmup_declined") in (None, False)
 
 
+class TestScoringBatchCancel:
+    def test_toggle_off_mid_batch_stops_scoring(self, tmp_path, monkeypatch):
+        # Isolate index + config to tmp.
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        cfg_dir = tmp_path / ".clawjournal"
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", cfg_dir)
+        monkeypatch.setattr("clawjournal.config.CONFIG_FILE", cfg_dir / "config.json")
+        open_index().close()
+
+        fake_sessions = [{"session_id": f"s{i}"} for i in range(3)]
+        monkeypatch.setattr(dmod, "query_unscored_sessions", lambda *a, **k: fake_sessions)
+        monkeypatch.setattr(dmod, "_persist_scoring_result", lambda *a, **k: True)
+        monkeypatch.setattr(dmod, "_maybe_create_trace_note", lambda *a, **k: None)
+
+        calls = []
+
+        def fake_score(conn, sid, backend="auto"):
+            calls.append(sid)
+            # Simulate the user turning OFF background scoring after the 1st trace.
+            cfg = load_config()
+            cfg["scoring_warmup_declined"] = True
+            save_config(cfg)
+            return {"ok": True}
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scored = dmod.Scanner().score_unscored_once()
+        # Only the first trace was scored; the loop broke before egressing more.
+        assert calls == ["s0"]
+        assert scored == 1
+
+
 class TestTriggerWarmupGate:
     def test_declined_short_circuits_without_scoring(self, monkeypatch):
         monkeypatch.setattr(dmod, "load_config", lambda: {"scoring_warmup_declined": True})

@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { colors, btnPrimary, btnSecondary, btnDanger } from '../theme.ts';
 
 interface ConfirmDialogProps {
@@ -18,13 +18,23 @@ interface ConfirmDialogProps {
 
 export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', variant = 'primary', onConfirm, onCancel, onDismiss }: ConfirmDialogProps) {
   const dismiss = onDismiss ?? onCancel;
+  const confirmRef = useRef<HTMLButtonElement>(null);
 
+  // While open, behave like a real modal: a capture-phase listener swallows page
+  // keystrokes so route-level shortcuts (e.g. Inbox j/k/Enter) don't fire behind
+  // the dialog (the native window.confirm this replaced blocked them). Enter
+  // confirms, Escape dismisses — matching window.confirm's OK/Cancel keys.
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss(); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [open, dismiss]);
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { e.stopPropagation(); dismiss(); return; }
+      if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); onConfirm(); return; }
+      e.stopPropagation();
+    };
+    window.addEventListener('keydown', handler, true);
+    confirmRef.current?.focus();
+    return () => window.removeEventListener('keydown', handler, true);
+  }, [open, dismiss, onConfirm]);
 
   if (!open) return null;
 
@@ -64,7 +74,7 @@ export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', 
         </p>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button onClick={onCancel} style={btnSecondary}>Cancel</button>
-          <button onClick={onConfirm} style={{ ...confirmStyle, fontWeight: 600 }}>
+          <button ref={confirmRef} onClick={onConfirm} style={{ ...confirmStyle, fontWeight: 600 }}>
             {confirmLabel}
           </button>
         </div>

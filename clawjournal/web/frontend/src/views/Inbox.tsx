@@ -242,16 +242,22 @@ export function Inbox() {
 
   const handleBulkAction = async (action: 'approved' | 'blocked') => {
     const ids = [...selectedIds];
-    try {
-      await Promise.all(ids.map(id => api.sessions.update(id, { status: action })));
-      setSessions(prev => prev.filter(s => !selectedIds.has(s.session_id)));
-      setSelectedIds(new Set());
-      loadStats();
-      toast(`${ids.length} session${ids.length > 1 ? 's' : ''} ${action === 'approved' ? 'approved' : 'skipped'}`, 'success');
-    } catch (e) {
-      toast(e instanceof Error ? e.message : 'Bulk action failed', 'error');
-    }
+    const verb = action === 'approved' ? 'approved' : 'skipped';
+    // Per-item settle so one failed update doesn't strand the rest: remove only
+    // the ones that actually succeeded and keep the failures selected.
+    const results = await Promise.allSettled(ids.map(id => api.sessions.update(id, { status: action })));
+    const okIds = new Set(ids.filter((_, i) => results[i].status === 'fulfilled'));
+    const failed = ids.length - okIds.size;
+    setSessions(prev => prev.filter(s => !okIds.has(s.session_id)));
+    setSelectedIds(prev => new Set([...prev].filter(id => !okIds.has(id))));
+    loadStats();
     setConfirm(null);
+    if (okIds.size > 0) {
+      toast(`${okIds.size} session${okIds.size > 1 ? 's' : ''} ${verb}`, 'success');
+    }
+    if (failed > 0) {
+      toast(`${failed} session${failed > 1 ? 's' : ''} failed to update`, 'error');
+    }
   };
 
   const handleExpand = async (sessionId: string) => {
@@ -309,6 +315,17 @@ export function Inbox() {
     try {
       localStorage.setItem(GETTING_STARTED_DISMISSED_KEY, '1');
     } catch { /* ignore */ }
+  };
+
+  const hasActiveFilter = !!(typeFilter || sourceFilter || projectFilter
+    || recoveryFilter || attributionFilter || modeFilter);
+  const clearAllFilters = () => {
+    setTypeFilter(null);
+    setSourceFilter(null);
+    setProjectFilter(null);
+    setRecoveryFilter(null);
+    setAttributionFilter(null);
+    setModeFilter(null);
   };
 
   return (
@@ -519,26 +536,28 @@ export function Inbox() {
           background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: '8px',
           padding: '24px 20px', textAlign: 'center', marginTop: '12px',
         }}>
-          <h3 style={{ margin: '0 0 4px', fontSize: '15px', fontWeight: 600, color: colors.green500 }}>
-            {typeFilter ? `No "${LABELS[typeFilter] ?? typeFilter}" sessions found` : 'You’re all caught up'}
+          <h3 style={{ margin: '0 0 4px', fontSize: '15px', fontWeight: 600, color: hasActiveFilter ? colors.gray700 : colors.green500 }}>
+            {hasActiveFilter
+              ? (typeFilter ? `No "${LABELS[typeFilter] ?? typeFilter}" sessions found` : 'No sessions match your filters')
+              : 'You’re all caught up'}
           </h3>
           <p style={{ margin: '0 0 10px', fontSize: '13px', color: colors.gray500 }}>
-            {typeFilter
-              ? 'Try selecting a different type or clear the filter.'
+            {hasActiveFilter
+              ? 'Try adjusting or clearing your filters.'
               : 'Every session has been reviewed. Open Share to package approved traces, or run clawjournal scan to pick up new ones.'}
           </p>
-          {typeFilter && (
+          {hasActiveFilter && (
             <button
-              onClick={() => setTypeFilter(null)}
+              onClick={clearAllFilters}
               style={{
                 display: 'inline-block', padding: '7px 18px', background: colors.primary500, color: colors.white,
                 borderRadius: '6px', fontSize: '13px', fontWeight: 600, border: 'none', cursor: 'pointer',
               }}
             >
-              Show all sessions
+              Clear filters
             </button>
           )}
-          {!typeFilter && (stats.by_status['approved'] ?? 0) > 0 && (
+          {!hasActiveFilter && (stats.by_status['approved'] ?? 0) > 0 && (
             <Link to="/share" style={{
               display: 'inline-block', padding: '7px 18px', background: colors.primary500, color: colors.white,
               borderRadius: '6px', fontSize: '13px', fontWeight: 600, textDecoration: 'none',
@@ -583,7 +602,7 @@ export function Inbox() {
                 <input
                   type="checkbox"
                   checked={isSelected}
-                  aria-label="Select session"
+                  aria-label={`Select session: ${s.display_title || 'Untitled'}`}
                   onClick={e => e.stopPropagation()}
                   onChange={() => toggleSelect(s.session_id)}
                   style={{ flexShrink: 0, cursor: 'pointer' }}
