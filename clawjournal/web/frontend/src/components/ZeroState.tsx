@@ -1,5 +1,6 @@
 import { colors } from '../theme.ts';
 import { STEPS } from '../views/Share/types.ts';
+import { LOCAL_FIRST_CAVEAT } from './onboardingCopy.ts';
 
 /**
  * First-run walkthrough shown in the Sessions view when no sessions have been
@@ -23,9 +24,7 @@ export function ZeroState() {
       </h3>
       <p style={{ margin: '0 0 14px', fontSize: 13.5, color: colors.gray600, lineHeight: 1.5, maxWidth: 620 }}>
         ClawJournal scans your coding-agent session logs (Claude Code, Codex, and more),
-        scores them, and helps you redact and share traces. Everything stays on your machine by
-        default — AI scoring/review (when enabled) sends an anonymized, redacted trace to your
-        configured AI backend; nothing is uploaded for sharing until you explicitly approve it.
+        scores them, and helps you redact and share traces. {LOCAL_FIRST_CAVEAT}
       </p>
       <div style={{ marginBottom: 14 }}>
         <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray500, marginBottom: 4 }}>

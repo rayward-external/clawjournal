@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import type { Stats } from '../types.ts';
 import { colors } from '../theme.ts';
+import { LOCAL_FIRST_CAVEAT } from './onboardingCopy.ts';
 
 interface GettingStartedGuideProps {
   stats: Stats;
@@ -35,7 +36,7 @@ export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuidePro
           New here? Turn your sessions into shareable traces.
         </div>
         <div style={{ fontSize: 12, color: colors.gray600, lineHeight: 1.45 }}>
-          Inspect captured sessions here, then open Share to pick traces, redact, and review locally. Nothing leaves your machine until you approve sharing.
+          Inspect captured sessions here, then open Share to pick traces, redact, and review locally. {LOCAL_FIRST_CAVEAT}
         </div>
       </div>
 
