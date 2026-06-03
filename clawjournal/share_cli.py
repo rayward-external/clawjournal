@@ -96,13 +96,45 @@ def die(msg: str, code: int = 1):
     sys.exit(code)
 
 
+_SYS_PROMPT_PREFIXES = (
+    "you are", "you're", "your task", "act as", "system:",
+    "base directory for this skill",
+)
+
+
+def _looks_like_system_prompt(text: str) -> bool:
+    s = (text or "").strip().lower()
+    return s.startswith(_SYS_PROMPT_PREFIXES) or "you are an ai" in s[:40]
+
+
+def user_prompt_title(conn, row: dict) -> str | None:
+    """Pull a meaningful title from the first user message, skipping a leading
+    system-prompt / instruction preamble (so e.g. eval-judge traces show the
+    actual content being judged instead of the identical 'You are a … judge'
+    boilerplate). Returns None if no usable user message is found."""
+    detail = get_session_detail(conn, row["session_id"])
+    for m in (detail or {}).get("messages") or []:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if not isinstance(c, str) or not c.strip():
+            continue
+        text = c.strip()
+        head, sep, tail = text.partition("\n\n")
+        if sep and _looks_like_system_prompt(head) and tail.strip():
+            text = tail.strip()
+        return text.replace("\n", " ")
+    return None
+
+
 def resolve_title(r: dict, summarized: bool) -> str:
     """Title to display for a trace, by mode:
-    - default (summarized=False): exactly what the web Queue step shows —
-      the raw ``display_title`` (or "Untitled"), system prompts and all.
+    - default (summarized=False): the raw ``display_title`` (or "Untitled").
+      step_queue replaces system-prompt-looking titles with the underlying
+      user prompt (see user_prompt_title) before display.
     - --summary (summarized=True): the AI-summarized title — scoring's
       ai_display_title, or a clawshare summary ensure_titles placed on the row;
-      falls back to the raw web title if no AI summary is available."""
+      falls back to the raw title if no AI summary is available."""
     raw = (r.get("display_title") or "").strip().replace("\n", " ") or "Untitled"
     if summarized:
         return (r.get("ai_display_title") or "").strip() or raw
@@ -402,7 +434,12 @@ def step_queue(conn, settings, args) -> list[dict]:
     do_summary = args.summary or bool(args.summary_model)
     ensure_titles(conn, rows, do_summary, summary_model=args.summary_model)
     for r in rows:
-        r["_clawshare_title"] = resolve_title(r, do_summary)
+        title = resolve_title(r, do_summary)
+        # In default mode, never surface a system-prompt title — fall back to the
+        # underlying user prompt (loads the trace only for those rows).
+        if not do_summary and _looks_like_system_prompt(title):
+            title = user_prompt_title(conn, r) or title
+        r["_clawshare_title"] = title
 
     print(f"\n  {'#':>3}  {'Last turn':<11} {'Source':<8} {'Msgs':>5} {'Tokens':>9} "
           f"{'Tools':>5} {'Fail':>4}  Title")
