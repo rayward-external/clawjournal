@@ -15,9 +15,9 @@ Exposed two ways (both ship with the package):
     clawjournal share-cli     # subcommand alias
 
 Usage:
-    clawshare                      # today's traces (default, fast; no LLM summaries)
+    clawshare                      # past 24h of traces (default, fast; no LLM summaries)
     clawshare --summary            # generate LLM summary titles (Haiku)
-    clawshare --weekly             # this week's traces
+    clawshare --weekly             # past 7 days (168h) of traces
     clawshare --all                # every trace, any date/status
     clawshare --codex              # only Codex traces
     clawshare --claude --limit 60  # this many Claude traces (default cap 40)
@@ -204,19 +204,19 @@ def _parse_ts(ts):
 
 
 def _in_time_range(row: dict, time_range: str) -> bool:
-    """True if the trace's LAST turn (end_time) falls in the range. Compared in
-    local time so 'today'/'this week' match the user's wall clock."""
+    """True if the trace's LAST turn (end_time) falls in the range. Uses rolling
+    windows (not calendar boundaries) so the list doesn't empty out at midnight:
+    'today' = the past 24h, 'weekly' = the past 168h (7 days)."""
     if time_range == "all":
         return True
     dt = _parse_ts(row.get("end_time")) or _parse_ts(row.get("start_time"))
     if dt is None:
         return False
-    day = dt.astimezone().date()
-    today = datetime.now().date()
+    now = datetime.now(timezone.utc)
     if time_range == "today":
-        return day == today
+        return dt >= now - timedelta(hours=24)
     if time_range == "weekly":
-        return day >= today - timedelta(days=today.weekday())  # since Monday
+        return dt >= now - timedelta(hours=168)
     return True
 
 
@@ -395,12 +395,12 @@ def step_queue(conn, settings, args) -> list[dict]:
         and _in_time_range(r, args.time_range)
     ]
     if not rows:
-        ranges = {"today": "today", "weekly": "this week", "all": "the index"}
+        ranges = {"today": "the past 24h", "weekly": "the past 7 days", "all": "the index"}
         hint = "" if args.time_range == "all" else "  (try --weekly or --all)"
         die(f"No shareable traces found in {ranges[args.time_range]}.{hint}")
 
     rows = rows[:args.limit]
-    label = {"today": "today", "weekly": "this week", "all": "all time"}[args.time_range]
+    label = {"today": "past 24h", "weekly": "past 7 days", "all": "all time"}[args.time_range]
     print(f"  {DIM}Showing {len(rows)} shareable trace(s) — {label}"
           f" (limit {args.limit}; use --limit to change).{RST}")
 
@@ -822,7 +822,7 @@ def add_share_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     # Time range — default is today (last turn happened today).
     when = parser.add_mutually_exclusive_group()
     when.add_argument("--weekly", dest="time_range", action="store_const", const="weekly",
-                      help="traces from this week (default: today only)")
+                      help="traces from the past 7 days (default: past 24h)")
     when.add_argument("--all", dest="time_range", action="store_const", const="all",
                       help="all traces, any date and any status")
     parser.set_defaults(time_range="today")
