@@ -96,35 +96,17 @@ def die(msg: str, code: int = 1):
     sys.exit(code)
 
 
-_SYS_PROMPT_PREFIXES = (
-    "you are", "you're", "your task", "act as", "system:", "<",
-    "base directory for this skill", "# ",
-)
-_NO_TITLE = "⟨system prompt — run with --summary for a title⟩"
-_NO_AI_TITLE = "⟨no AI summary⟩"
-
-
-def _looks_like_system_prompt(text: str) -> bool:
-    s = (text or "").strip().lower()
-    if not s:
-        return True
-    return s.startswith(_SYS_PROMPT_PREFIXES) or "you are an ai" in s[:40]
-
-
 def resolve_title(r: dict, summarized: bool) -> str:
     """Title to display for a trace, by mode:
-    - default (summarized=False): the original, NON-AI title (raw first message);
-      a system-prompt-looking title is hidden behind a placeholder.
+    - default (summarized=False): exactly what the web Queue step shows —
+      the raw ``display_title`` (or "Untitled"), system prompts and all.
     - --summary (summarized=True): the AI-summarized title — scoring's
-      ai_display_title, or a clawshare summary ensure_titles placed on the row."""
+      ai_display_title, or a clawshare summary ensure_titles placed on the row;
+      falls back to the raw web title if no AI summary is available."""
+    raw = (r.get("display_title") or "").strip().replace("\n", " ") or "Untitled"
     if summarized:
-        ai = (r.get("ai_display_title") or "").strip()
-        if ai:
-            return ai
-        raw = (r.get("display_title") or "").strip().replace("\n", " ")
-        return _NO_AI_TITLE if _looks_like_system_prompt(raw) else raw
-    raw = (r.get("display_title") or "").strip().replace("\n", " ")
-    return _NO_TITLE if _looks_like_system_prompt(raw) else raw
+        return (r.get("ai_display_title") or "").strip() or raw
+    return raw
 
 
 def trace_title(r: dict, width: int = 52) -> str:
