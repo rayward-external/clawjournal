@@ -15,8 +15,8 @@ Exposed two ways (both ship with the package):
     clawjournal share-cli     # subcommand alias
 
 Usage:
-    clawshare                      # past 24h of traces (default, fast; no LLM summaries)
-    clawshare --summary            # generate LLM summary titles (Haiku)
+    clawshare                      # past 24h; original (non-AI) titles, fast
+    clawshare --summary            # AI-summarized titles (Haiku)
     clawshare --weekly             # past 7 days (168h) of traces
     clawshare --all                # every trace, any date/status
     clawshare --codex              # only Codex traces
@@ -100,7 +100,8 @@ _SYS_PROMPT_PREFIXES = (
     "you are", "you're", "your task", "act as", "system:", "<",
     "base directory for this skill", "# ",
 )
-_NO_TITLE = "⟨no summary — run with --summary⟩"
+_NO_TITLE = "⟨system prompt — run with --summary for a title⟩"
+_NO_AI_TITLE = "⟨no AI summary⟩"
 
 
 def _looks_like_system_prompt(text: str) -> bool:
@@ -110,19 +111,29 @@ def _looks_like_system_prompt(text: str) -> bool:
     return s.startswith(_SYS_PROMPT_PREFIXES) or "you are an ai" in s[:40]
 
 
-def trace_title(r: dict, width: int = 52) -> str:
-    """Best title for a trace. Prefers an LLM summary (ai_display_title); falls
-    back to the raw first-message title — but never shows a system prompt, since
-    that tells the user nothing about the trace."""
-    ai = (r.get("ai_display_title") or "").strip()
-    if ai:
-        t = ai
-    else:
+def resolve_title(r: dict, summarized: bool) -> str:
+    """Title to display for a trace, by mode:
+    - default (summarized=False): the original, NON-AI title (raw first message);
+      a system-prompt-looking title is hidden behind a placeholder.
+    - --summary (summarized=True): the AI-summarized title — scoring's
+      ai_display_title, or a clawshare summary ensure_titles placed on the row."""
+    if summarized:
+        ai = (r.get("ai_display_title") or "").strip()
+        if ai:
+            return ai
         raw = (r.get("display_title") or "").strip().replace("\n", " ")
-        if _looks_like_system_prompt(raw):
-            return _NO_TITLE
-        t = raw
-    t = t.replace("\n", " ")
+        return _NO_AI_TITLE if _looks_like_system_prompt(raw) else raw
+    raw = (r.get("display_title") or "").strip().replace("\n", " ")
+    return _NO_TITLE if _looks_like_system_prompt(raw) else raw
+
+
+def trace_title(r: dict, width: int = 52) -> str:
+    """Truncated title for display. Uses the mode-aware title precomputed onto
+    the row (``_clawshare_title``); falls back to the raw/original title."""
+    t = r.get("_clawshare_title")
+    if t is None:
+        t = resolve_title(r, False)
+    t = (t or "").replace("\n", " ")
     return (t[: width - 1] + "…") if len(t) > width else t
 
 
@@ -408,6 +419,8 @@ def step_queue(conn, settings, args) -> list[dict]:
     # it, system-prompt-looking titles are hidden behind a placeholder instead.
     do_summary = args.summary or bool(args.summary_model)
     ensure_titles(conn, rows, do_summary, summary_model=args.summary_model)
+    for r in rows:
+        r["_clawshare_title"] = resolve_title(r, do_summary)
 
     print(f"\n  {'#':>3}  {'Last turn':<11} {'Source':<8} {'Msgs':>5} {'Tokens':>9} "
           f"{'Tools':>5} {'Fail':>4}  Title")
@@ -843,7 +856,8 @@ def add_share_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--limit", type=int, default=40,
                         help="max traces to list (default 40)")
     parser.add_argument("--summary", action="store_true",
-                        help="generate LLM summary titles (Haiku; default: off, faster)")
+                        help="show AI-summarized titles (Haiku); default shows the "
+                             "original, non-AI titles (faster)")
     parser.add_argument("--summary-model", default=None, metavar="MODEL",
                         help="model for --summary titles (default: a light model per "
                              "backend, e.g. claude/haiku; implies --summary)")
