@@ -34,6 +34,7 @@ export function Settings() {
   const [cfg, setCfg] = useState<WorkbenchConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   useEffect(() => {
     api.config.get()
@@ -136,6 +137,26 @@ export function Settings() {
         </label>
       </div>
 
+      {/* Advanced — scoring + UI toggles most users never change. Collapsed by
+          default so the page leads with the export-gate essentials above. */}
+      <button
+        onClick={() => setShowAdvanced(v => !v)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 6, width: '100%',
+          background: 'none', border: 'none', cursor: 'pointer',
+          padding: '4px 0', margin: '8px 0 12px',
+          fontSize: 13, fontWeight: 600, color: colors.gray700,
+        }}
+      >
+        <span style={{ fontSize: 11, color: colors.gray500 }}>{showAdvanced ? '▾' : '▸'}</span>
+        Advanced
+        <span style={{ fontWeight: 400, color: colors.gray400, fontSize: 12 }}>
+          scoring backend, background scoring, Benchmark tab
+        </span>
+      </button>
+
+      {showAdvanced && (
+      <>
       {/* Scorer backend */}
       <div style={cardStyle}>
         <div style={titleStyle}>AI scoring backend</div>
@@ -195,6 +216,8 @@ export function Settings() {
           Show the Benchmark tab
         </label>
       </div>
+      </>
+      )}
 
       <p style={{ fontSize: 11.5, color: colors.gray400, marginTop: 4 }}>
         Settings are stored locally in <code>~/.clawjournal/config.json</code>.

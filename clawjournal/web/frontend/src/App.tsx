@@ -5,6 +5,7 @@ import { Search } from './views/Search.tsx';
 import SessionDetail from './views/SessionDetail.tsx';
 import { Share } from './views/Share/index.tsx';
 import { Policies } from './views/Policies.tsx';
+import { Analytics } from './views/Analytics.tsx';
 import { Dashboard } from './views/Dashboard.tsx';
 import { Insights } from './views/Insights.tsx';
 import { Benchmark } from './views/Benchmark.tsx';
@@ -42,16 +43,14 @@ function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
     return () => clearInterval(iv);
   }, []);
 
+  // Three intent-based items — "browse my sessions", "understand my sessions"
+  // (Analytics wraps Dashboard/Insights/Benchmark), "share my sessions" (Share
+  // owns the redaction Rules sub-route). Settings is pinned separately below as
+  // a gear. Search folds into the Sessions toolbar; Rules lives inside Share.
   const NAV_ITEMS: { to: string; label: string; badge: number | null; end?: boolean }[] = [
-    { to: '/dashboard', label: 'Dashboard', badge: null },
-    { to: '/insights', label: 'Insights', badge: counts.recommendations > 0 ? counts.recommendations : null },
-    ...(benchmarkEnabled ? [{ to: '/benchmark', label: 'Benchmark', badge: null }] : []),
-    { to: '/search', label: 'Search', badge: null },
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
-    // `end` on Share so the /share/rules sub-route highlights Rules, not Share.
-    { to: '/share', label: 'Share', badge: null, end: true },
-    { to: '/share/rules', label: 'Rules', badge: null },
-    { to: '/settings', label: 'Settings', badge: null },
+    { to: '/analytics', label: 'Analytics', badge: counts.recommendations > 0 ? counts.recommendations : null },
+    { to: '/share', label: 'Share', badge: null },
   ];
 
   return (
@@ -117,6 +116,27 @@ function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
         </NavLink>
       ))}
       <div style={{ flex: 1 }} />
+      <NavLink
+        to="/settings"
+        style={({ isActive }) => ({
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: '8px 16px',
+          fontSize: 14,
+          fontWeight: isActive ? 600 : 400,
+          color: isActive ? colors.gray800 : colors.gray500,
+          background: isActive ? colors.gray200 : 'transparent',
+          textDecoration: 'none',
+          borderLeft: isActive ? `3px solid ${colors.gray700}` : '3px solid transparent',
+          borderRadius: '0 6px 6px 0',
+          marginRight: 8,
+          transition: 'background 0.15s ease',
+        })}
+      >
+        <span aria-hidden="true">⚙</span>
+        <span>Settings</span>
+      </NavLink>
       <div style={{ padding: '8px 16px', fontSize: 12, color: colors.gray400 }}>
         Workbench v0.1
       </div>
@@ -218,17 +238,27 @@ export default function App() {
             <Sidebar benchmarkEnabled={benchmarkEnabled} />
             <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
               <Routes>
-                <Route path="/dashboard" element={<Dashboard />} />
-                <Route path="/insights" element={<Insights />} />
                 <Route path="/" element={<Inbox />} />
                 <Route path="/search" element={<Search />} />
                 <Route path="/session/:id" element={<SessionDetail />} />
-                <Route path="/bundles" element={<Navigate to="/share" replace />} />
-                <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
-                <Route path="/benchmark" element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/dashboard" replace />} />
+                {/* Analytics groups the three read-only "understand" views as sub-tabs. */}
+                <Route path="/analytics" element={<Analytics benchmarkEnabled={benchmarkEnabled} />}>
+                  <Route index element={<Dashboard />} />
+                  <Route path="insights" element={<Insights />} />
+                  <Route
+                    path="benchmark"
+                    element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/analytics" replace />}
+                  />
+                </Route>
                 <Route path="/share" element={<Share />} />
                 <Route path="/share/rules" element={<Policies />} />
                 <Route path="/settings" element={<Settings />} />
+                {/* Back-compat redirects for the pre-regroup routes + bookmarks. */}
+                <Route path="/dashboard" element={<Navigate to="/analytics" replace />} />
+                <Route path="/insights" element={<Navigate to="/analytics/insights" replace />} />
+                <Route path="/benchmark" element={<Navigate to="/analytics/benchmark" replace />} />
+                <Route path="/bundles" element={<Navigate to="/share" replace />} />
+                <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
               </Routes>
             </main>
           </div>

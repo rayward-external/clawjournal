@@ -167,6 +167,7 @@ export function Dashboard() {
   const [triage, setTriage] = useState<TriageStats | null>(null);
   const [insights, setInsights] = useState<InsightsData | null>(null);
   const [timeRange, setTimeRange] = useState<string>('1w');
+  const [showAllMetrics, setShowAllMetrics] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
@@ -251,9 +252,7 @@ export function Dashboard() {
       {/* Stat cards */}
       <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
         <StatCard label="Sessions" value={formatNumber(summary.total_sessions)} sub={`${approved} approved`} />
-        <StatCard label="Tokens" value={formatNumber(summary.total_tokens)} sub={`${tokens_by_source.length} sources`} />
         <StatCard label="API-equivalent cost" value={formatCost(summary.total_cost)} sub={summary.unpriced_sessions ? `${summary.unique_projects} projects · ${summary.unpriced_sessions} unpriced` : `${summary.unique_projects} projects`} color={colors.emerald400} />
-        <StatCard label="Avg Failure Value" value={avgFailureValue ?? '--'} sub={totalFailureScored > 0 ? `${totalFailureScored} scored` : 'none scored'} color={avgFailureValue && parseFloat(avgFailureValue) >= 4 ? colors.red500 : avgFailureValue ? colors.yellow400 : colors.gray400} />
         {resolve_rate != null && (() => {
           const pct = Math.round(resolve_rate * 100);
           const trend = resolve_rate_previous != null
@@ -265,6 +264,22 @@ export function Dashboard() {
           const trendColor = trend === 'up' ? colors.green500 : trend === 'down' ? colors.red400 : colors.gray500;
           return <StatCard label="Resolve Rate" value={`${pct}%${arrow}`} sub={totalProductivityScored > 0 ? `${totalProductivityScored} scored` : 'not scored'} color={trendColor} />;
         })()}
+        {showAllMetrics && (
+          <>
+            <StatCard label="Tokens" value={formatNumber(summary.total_tokens)} sub={`${tokens_by_source.length} sources`} />
+            <StatCard label="Avg Failure Value" value={avgFailureValue ?? '--'} sub={totalFailureScored > 0 ? `${totalFailureScored} scored` : 'none scored'} color={avgFailureValue && parseFloat(avgFailureValue) >= 4 ? colors.red500 : avgFailureValue ? colors.yellow400 : colors.gray400} />
+          </>
+        )}
+        <button
+          onClick={() => setShowAllMetrics(v => !v)}
+          style={{
+            alignSelf: 'center', marginLeft: 2, padding: '4px 10px', borderRadius: 6,
+            border: `1px solid ${colors.gray200}`, background: colors.white,
+            color: colors.gray500, fontSize: 12.5, cursor: 'pointer', whiteSpace: 'nowrap',
+          }}
+        >
+          {showAllMetrics ? 'Fewer metrics' : 'More metrics'}
+        </button>
       </div>
 
       {/* Time range selector */}

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import type { Session, Stats } from '../types.ts';
 import { api } from '../api.ts';
 import { useToast } from '../components/Toast.tsx';
@@ -11,7 +11,10 @@ import { ZeroState } from '../components/ZeroState.tsx';
 import { colors, selectStyle, btnPrimary, btnDanger, btnSecondary } from '../theme.ts';
 
 const PAGE_SIZE = 10;
-const TYPE_CHIP_PREVIEW_LIMIT = 16;
+// Show only the top few task-type chips by default; the long tail collapses
+// behind a "More (N)" toggle. Keeps the toolbar to one calm row instead of ~17
+// chips wrapping across the viewport.
+const TYPE_CHIP_PREVIEW_LIMIT = 6;
 const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedGuideV2Dismissed';
 
 function failureBadge(score: number | null): string {
@@ -107,6 +110,8 @@ function hexAlpha(hex: string, alpha: number): string {
 
 export function Inbox() {
   const { toast } = useToast();
+  const navigate = useNavigate();
+  const [searchBox, setSearchBox] = useState('');
   const [sessions, setSessions] = useState<Session[]>([]);
   const [stats, setStats] = useState<Stats>({ total: 0, by_status: {}, by_source: {}, by_project: {}, by_task_type: {} });
   const [showGettingStartedGuide, setShowGettingStartedGuide] = useState(() => {
@@ -337,6 +342,25 @@ export function Inbox() {
           <span style={{ fontSize: 13, color: colors.gray400 }}>{stats.total} sessions</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <input
+            type="search"
+            value={searchBox}
+            onChange={e => setSearchBox(e.target.value)}
+            onKeyDown={e => {
+              // Full-text search lives in the dedicated results view; the toolbar
+              // box is just the entry point and hands the query off via ?q=.
+              if (e.key === 'Enter' && searchBox.trim()) {
+                navigate(`/search?q=${encodeURIComponent(searchBox.trim())}`);
+              }
+            }}
+            placeholder="Search…"
+            aria-label="Search sessions"
+            style={{
+              ...selectStyle,
+              width: 150,
+              cursor: 'text',
+            }}
+          />
           <select value={sort} onChange={e => setSort(e.target.value)} style={selectStyle}>
             <option value="ai_failure_value_score:desc">Top failures</option>
             <option value="ai_quality_score:desc">Highest productivity</option>

@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import type { Session } from '../types.ts';
 import { api } from '../api.ts';
 import { TraceCard } from '../components/TraceCard.tsx';
@@ -11,7 +12,9 @@ const SEARCH_SHELL_WIDTH = 1120;
 
 export function Search() {
   const { toast } = useToast();
-  const [query, setQuery] = useState('');
+  const [searchParams] = useSearchParams();
+  const initialQuery = searchParams.get('q') ?? '';
+  const [query, setQuery] = useState(initialQuery);
   const [results, setResults] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
@@ -44,6 +47,14 @@ export function Search() {
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => doSearch(value), 300);
   };
+
+  // Run the handed-off query once on mount (e.g. arriving from the Sessions
+  // toolbar search box at /search?q=…), so the results are already there.
+  useEffect(() => {
+    if (initialQuery.trim()) doSearch(initialQuery);
+    // Mount-only: the box owns the query after this initial hand-off.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div style={{ maxWidth: SEARCH_SHELL_WIDTH, margin: '0 auto', padding: '32px 24px 48px' }}>
