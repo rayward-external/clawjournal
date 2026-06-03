@@ -409,15 +409,19 @@ def step_queue(conn, settings, args) -> list[dict]:
     do_summary = args.summary or bool(args.summary_model)
     ensure_titles(conn, rows, do_summary, summary_model=args.summary_model)
 
-    print(f"\n  {'#':>3}  {'Last turn':<11} {'Source':<8} {'Msgs':>5} {'Tokens':>9}  Title")
-    print("  " + "-" * 100)
+    print(f"\n  {'#':>3}  {'Last turn':<11} {'Source':<8} {'Msgs':>5} {'Tokens':>9} "
+          f"{'Tools':>5} {'Fail':>4}  Title")
+    print("  " + "-" * 108)
     for i, r in enumerate(rows, 1):
         msgs = (r.get("user_messages") or 0) + (r.get("assistant_messages") or 0)
         toks = (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0)
+        tools = r.get("tool_uses") or 0
+        fv = r.get("ai_failure_value_score")
+        fv_str = str(fv) if fv is not None else "—"
         dt = _parse_ts(r.get("end_time"))
         when = dt.astimezone().strftime("%m-%d %H:%M") if dt else "—"
         print(f"  {i:>3}  {when:<11} {r.get('source', ''):<8} "
-              f"{msgs:>5} {toks:>9,}  {trace_title(r)}")
+              f"{msgs:>5} {toks:>9,} {tools:>5} {fv_str:>4}  {trace_title(r)}")
     print()
 
     if args.indices:
