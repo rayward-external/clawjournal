@@ -3721,6 +3721,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             if content_type == "text/html":
+                # index.html references content-hashed asset filenames, so it must
+                # never be cached: a stale copy pins the browser to an old bundle
+                # after a rebuild (the dev-staleness trap that `--reload` targets).
+                # Hashed assets under /assets/* stay implicitly cacheable.
+                self.send_header("Cache-Control", "no-store, must-revalidate")
                 self._maybe_set_api_token_cookie()
             self.end_headers()
             self.wfile.write(data)
@@ -4071,6 +4076,32 @@ def run_with_reload(open_browser: bool = True) -> None:
         _terminate_child(proc)
 
 
+def _try_serve_ipv6_loopback(port: int, scanner: "Scanner") -> ThreadingHTTPServer | None:
+    """Start a companion IPv6 (``::1``) loopback server on ``port``, serving in a
+    daemon thread with the same handler/scanner as the primary IPv4 server.
+
+    Returns the server, or ``None`` if IPv6 loopback isn't available (no IPv6
+    stack, or the port is already taken on ``::1``) — the IPv4 socket still
+    serves, so this is best-effort.
+    """
+    import socket as _socket
+
+    class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+        address_family = _socket.AF_INET6
+
+    try:
+        v6 = _IPv6ThreadingHTTPServer(("::1", port), WorkbenchHandler)
+    except OSError as exc:
+        logger.info(
+            "IPv6 loopback (::1) bind skipped (%s); reach the workbench via 127.0.0.1",
+            exc,
+        )
+        return None
+    v6._scanner = scanner  # type: ignore[attr-defined]
+    threading.Thread(target=v6.serve_forever, daemon=True).start()
+    return v6
+
+
 def run_server(
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
@@ -4085,13 +4116,22 @@ def run_server(
 
     scanner = Scanner(source_filter=source_filter)
 
-    # Start HTTP server first so it's responsive immediately
+    # Start HTTP server first so it's responsive immediately. The primary socket
+    # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
+    # expect.
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), WorkbenchHandler)
     except OSError:
         server = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]
+
+    # Companion IPv6 loopback socket on the same port. Browsers resolve
+    # `localhost` to ::1 (IPv6) first and don't all fall back to IPv4, so an
+    # IPv4-only daemon leaves the workbench unreachable via localhost on
+    # IPv6-preferring systems. Each family is its own ::1 / 127.0.0.1 loopback
+    # socket — nothing is exposed beyond the local host.
+    v6_server = _try_serve_ipv6_loopback(port, scanner)
 
     url = f"http://localhost:{port}/"
     logger.info("Workbench running at %s", url)
@@ -4145,3 +4185,5 @@ def run_server(
     finally:
         scanner.stop()
         server.shutdown()
+        if v6_server is not None:
+            v6_server.shutdown()
