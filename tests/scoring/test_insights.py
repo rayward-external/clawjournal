@@ -81,6 +81,22 @@ class TestCostPerSessionDenominator:
         assert summary["cost_per_session"] == pytest.approx(10.0)
         assert summary["unpriced_sessions"] == 1
 
+    def test_unpriced_models_do_not_win_most_efficient(self, index_conn):
+        upsert_sessions(index_conn, [_make_session("priced"), _make_session("unpriced")])
+        index_conn.execute(
+            "UPDATE sessions SET model = 'claude-sonnet-4', ai_quality_score = 4, "
+            "estimated_cost_usd = 5.0 WHERE session_id = 'priced'")
+        index_conn.execute(
+            "UPDATE sessions SET model = 'unknown-future-model', ai_quality_score = 5, "
+            "estimated_cost_usd = NULL WHERE session_id = 'unpriced'")
+        index_conn.commit()
+
+        summary = generate_recommendations(collect_advisor_stats(index_conn, days=30))["summary_stats"]
+        assert summary["most_efficient_model"] == "claude-sonnet-4"
+        # Quality is independent of pricing, so the unpriced model can still win
+        # the highest-quality field when its score is higher.
+        assert summary["highest_quality_model"] == "unknown-future-model"
+
 
 class TestModelDowngradeSavings:
     def _make_candidate(self, index_conn, cost: float) -> None:

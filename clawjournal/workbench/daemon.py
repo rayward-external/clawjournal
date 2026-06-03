@@ -2602,6 +2602,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         cap = max(1, min(int(body.get("cap", 15) or 15), 50))
         backend = str(body.get("backend") or "auto").strip().lower() or "auto"
         model = (str(body.get("model")).strip() or None) if body.get("model") else None
+        if backend != "auto" and backend not in SUPPORTED_BACKENDS:
+            _json_response(self, {"error": f"Unsupported benchmark backend: {backend}"}, 400)
+            return
 
         if not _BENCHMARK_GEN_LOCK.acquire(blocking=False):
             _json_response(self, {"status": "busy",

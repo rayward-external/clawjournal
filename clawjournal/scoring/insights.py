@@ -383,7 +383,10 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
     priced_sessions = stats.get("priced_sessions", total_sessions)
     cost_per_session = total_cost / priced_sessions if priced_sessions else 0
     scored_models = [m for m in by_model if m["avg_score"] > 0]
-    most_efficient = min(scored_models, key=lambda m: m["cost"] / max(m["sessions"], 1))["model"] if scored_models else None
+    # Unpriced models have NULL cost in SQLite and arrive here as cost=0. Do not
+    # let them "win" a cost-efficiency ranking; zero is unknown, not free.
+    priced_scored_models = [m for m in scored_models if m.get("cost", 0) > 0]
+    most_efficient = min(priced_scored_models, key=lambda m: m["cost"] / max(m["sessions"], 1))["model"] if priced_scored_models else None
     highest_quality = max(scored_models, key=lambda m: m["avg_score"])["model"] if scored_models else None
 
     return {

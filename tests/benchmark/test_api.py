@@ -197,6 +197,12 @@ class TestGenerate:
     def test_no_candidates_400(self, api):
         assert _post(api, "/api/benchmarks/generate", {})[0] == 400
 
+    def test_invalid_backend_400(self, api):
+        self._seed_failure()
+        status, body = _post(api, "/api/benchmarks/generate", {"backend": "bogus"})
+        assert status == 400
+        assert "Unsupported benchmark backend" in body["error"]
+
     def test_busy_returns_409(self, api):
         dmod._BENCHMARK_GEN_LOCK.acquire()
         try:

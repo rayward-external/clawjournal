@@ -4497,7 +4497,9 @@ def main() -> None:
         # a pricing update (or a re-scan that corrected token accounting) is
         # reflected in dashboard totals.
         try:
-            from .workbench.index import open_index, recompute_estimated_costs
+            from .workbench.index import INDEX_DB, open_index, recompute_estimated_costs
+            if not INDEX_DB.exists():
+                return
             conn = open_index()
             try:
                 changed = recompute_estimated_costs(conn)
