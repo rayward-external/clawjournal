@@ -1268,6 +1268,35 @@ class TestTimelineRoute:
         assert "SameSite=Strict" in set_cookie
         assert "Path=/timeline" in set_cookie
 
+    def test_index_html_no_store_and_assets_cacheable(self, server, tmp_path, monkeypatch):
+        # Point the daemon at a real built-shaped dist so the _serve_static
+        # text/html branch runs (the index_setup fixture's nonexistent dist would
+        # serve the placeholder instead). index.html must be no-store — it
+        # references content-hashed asset names, so a cached copy pins the browser
+        # to a stale bundle after a rebuild — while hashed /assets/* must stay
+        # implicitly cacheable (no Cache-Control), or no-store would defeat
+        # content-hash caching.
+        dist = tmp_path / "dist"
+        (dist / "assets").mkdir(parents=True)
+        (dist / "index.html").write_text("<!doctype html><html><body>cj</body></html>")
+        (dist / "assets" / "app-abc123.js").write_text("console.log('cj')")
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 200
+        assert resp.getheader("Content-Type") == "text/html"
+        assert resp.getheader("Cache-Control") == "no-store, must-revalidate"
+
+        conn = HTTPConnection("127.0.0.1", server, timeout=5)
+        conn.request("GET", "/assets/app-abc123.js")
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 200
+        assert resp.getheader("Cache-Control") is None
+
     def test_timeline_route_accepts_cookie_auth(self, server, index_setup):
         seeded = _seed_timeline(index_setup)
 
