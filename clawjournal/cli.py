@@ -4156,6 +4156,14 @@ def main() -> None:
                     help="Opt in to AI-assisted PII review while packaging")
     sh.add_argument("--json", action="store_true", help="Output JSON")
 
+    # Interactive share wizard (also exposed as the standalone `clawshare` command)
+    from .share_cli import add_share_cli_args
+    shc = sub.add_parser(
+        "share-cli",
+        help="Interactive share wizard in the terminal (alias: `clawshare`)",
+    )
+    add_share_cli_args(shc)
+
     ve = sub.add_parser("verify-email", help="Verify an academic email address for a short-lived upload token")
     ve.add_argument("email", nargs="?", help="Your academic email address")
     ve.add_argument("--code", type=str, default=None, help="Verification code from email")
@@ -4389,6 +4397,11 @@ def main() -> None:
 
     if command == "share":
         _run_share(args)
+        return
+
+    if command == "share-cli":
+        from .share_cli import run as _run_share_cli
+        _run_share_cli(args)
         return
 
     if command == "verify-email":

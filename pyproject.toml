@@ -34,6 +34,7 @@ Issues = "https://github.com/rayward-external/clawjournal/issues"
 
 [project.scripts]
 clawjournal = "clawjournal.cli:main"
+clawshare = "clawjournal.share_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["clawjournal*"]
