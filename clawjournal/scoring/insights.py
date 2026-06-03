@@ -324,9 +324,13 @@ def generate_recommendations(stats: dict[str, Any]) -> dict[str, Any]:
     by_model = stats.get("by_model", [])
     if len(by_model) >= 2:
         scored_models = [m for m in by_model if m["avg_score"] > 0]
-        if len(scored_models) >= 2:
+        # Unpriced models have NULL cost -> 0 here; don't let them win the
+        # "most cost-effective" slot ($0 is unknown, not free). Quality is
+        # price-independent, so best_quality still ranks over all scored models.
+        priced_scored = [m for m in scored_models if m.get("cost", 0) > 0]
+        if len(scored_models) >= 2 and priced_scored:
             best_quality = max(scored_models, key=lambda m: m["avg_score"])
-            cheapest = min(scored_models, key=lambda m: m["cost"] / max(m["sessions"], 1))
+            cheapest = min(priced_scored, key=lambda m: m["cost"] / max(m["sessions"], 1))
             if best_quality["model"] != cheapest["model"]:
                 recommendations.append({
                     "type": "model_comparison",

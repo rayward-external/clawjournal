@@ -97,6 +97,33 @@ class TestCostPerSessionDenominator:
         # the highest-quality field when its score is higher.
         assert summary["highest_quality_model"] == "unknown-future-model"
 
+    def test_unpriced_model_not_named_cost_effective_in_recommendation(self, index_conn):
+        # The model_comparison recommendation card (not just summary_stats) must
+        # not crown an unpriced (NULL->0 cost) model as "most cost-effective"
+        # ($0.00 total). Two priced models (so the card fires) + one unpriced.
+        upsert_sessions(index_conn, [
+            _make_session("opus"), _make_session("haiku"), _make_session("unknown"),
+        ])
+        index_conn.execute(
+            "UPDATE sessions SET model = 'claude-opus-4', ai_quality_score = 5, "
+            "estimated_cost_usd = 50.0 WHERE session_id = 'opus'")
+        index_conn.execute(
+            "UPDATE sessions SET model = 'claude-haiku-4', ai_quality_score = 4, "
+            "estimated_cost_usd = 2.0 WHERE session_id = 'haiku'")
+        index_conn.execute(
+            "UPDATE sessions SET model = 'unknown-future-model', ai_quality_score = 3, "
+            "estimated_cost_usd = NULL WHERE session_id = 'unknown'")
+        index_conn.commit()
+
+        recs = generate_recommendations(collect_advisor_stats(index_conn, days=30))["recommendations"]
+        comparison = next((r for r in recs if r["type"] == "model_comparison"), None)
+        assert comparison is not None, "model_comparison card should fire"
+        detail = comparison["detail"]
+        # The cheap *priced* model wins, not the unpriced one with a bogus $0.00.
+        assert "claude-haiku-4" in detail
+        assert "unknown-future-model" not in detail
+        assert "$0.00" not in detail
+
 
 class TestModelDowngradeSavings:
     def _make_candidate(self, index_conn, cost: float) -> None:
