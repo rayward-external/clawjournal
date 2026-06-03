@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom';
 import type { Stats } from '../types.ts';
 import { colors } from '../theme.ts';
+import { STEPS } from '../views/Share/types.ts';
 import { LOCAL_FIRST_CAVEAT } from './onboardingCopy.ts';
 
 interface GettingStartedGuideProps {
@@ -10,13 +11,15 @@ interface GettingStartedGuideProps {
 
 export function GettingStartedGuide({ stats, onDismiss }: GettingStartedGuideProps) {
   const toReview = (stats.by_status['new'] ?? 0) + (stats.by_status['shortlisted'] ?? 0);
-  // Labels for the in-Share phases come from the canonical stepper so they can
-  // never drift from the real wizard (Share/types.ts STEPS).
+  // The in-Share phase labels are derived from the canonical stepper so they
+  // can't drift from the real wizard (Share/types.ts STEPS). "Review" is the
+  // local triage step here, not a Share phase, so it stays a literal.
+  const shareLabel = (key: string) => STEPS.find(s => s.key === key)?.label ?? key;
   const steps = [
     { label: 'Review', detail: toReview > 0 ? `${toReview} waiting` : 'Scan sessions' },
-    { label: 'Queue', detail: 'In Share' },
-    { label: 'Redact', detail: 'Local review' },
-    { label: 'Package', detail: 'Submit or zip' },
+    { label: shareLabel('queue'), detail: 'In Share' },
+    { label: shareLabel('redact'), detail: 'Local review' },
+    { label: shareLabel('package'), detail: 'Submit or zip' },
   ];
 
   return (

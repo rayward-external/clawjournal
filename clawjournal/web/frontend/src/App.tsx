@@ -22,7 +22,7 @@ interface SidebarCounts {
   recommendations: number;
 }
 
-function Sidebar({ benchmarkEnabled }: { benchmarkEnabled: boolean }) {
+function Sidebar() {
   const [counts, setCounts] = useState<SidebarCounts>({ toReview: 0, approved: 0, recommendations: 0 });
 
   useEffect(() => {
@@ -235,7 +235,7 @@ export default function App() {
             </div>
           )}
           <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-            <Sidebar benchmarkEnabled={benchmarkEnabled} />
+            <Sidebar />
             <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
               <Routes>
                 <Route path="/" element={<Inbox />} />

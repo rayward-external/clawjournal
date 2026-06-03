@@ -203,7 +203,7 @@ export function Settings() {
       <div style={cardStyle}>
         <div style={titleStyle}>Benchmark tab</div>
         <p style={helpStyle}>
-          Show or hide the personalized weekly Benchmark tab in the sidebar. Updates on the next
+          Show or hide the personalized weekly Benchmark tab under Analytics. Updates on the next
           refresh.
         </p>
         <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: colors.gray700 }}>
