@@ -80,7 +80,7 @@ export function Settings() {
 
       {/* Export source scope */}
       <div style={cardStyle}>
-        <div style={titleStyle}>Export source scope</div>
+        <h3 style={titleStyle}>Export source scope</h3>
         <p style={helpStyle}>
           Which agents’ traces are eligible for export and sharing. Required (with project
           confirmation below) before any export.
@@ -100,7 +100,7 @@ export function Settings() {
 
       {/* Project confirmation */}
       <div style={cardStyle}>
-        <div style={titleStyle}>Project confirmation</div>
+        <h3 style={titleStyle}>Project confirmation</h3>
         <p style={helpStyle}>
           Confirms you’ve reviewed which project folders are included (after applying any
           exclusions). Required before export.
@@ -120,7 +120,7 @@ export function Settings() {
 
       {/* AI-PII review default */}
       <div style={cardStyle}>
-        <div style={titleStyle}>AI-assisted PII review (share default)</div>
+        <h3 style={titleStyle}>AI-assisted PII review (share default)</h3>
         <p style={helpStyle}>
           When on, the share flow adds an AI pass over your <strong>already-redacted</strong>,
           anonymized transcript to flag contextual identifiers. This step sends that text to your
@@ -159,7 +159,7 @@ export function Settings() {
       <>
       {/* Scorer backend */}
       <div style={cardStyle}>
-        <div style={titleStyle}>AI scoring backend</div>
+        <h3 style={titleStyle}>AI scoring backend</h3>
         <p style={helpStyle}>
           The agent CLI used to score sessions and generate benchmarks. Scoring sends your
           anonymized transcript to this backend.
@@ -182,7 +182,7 @@ export function Settings() {
 
       {/* Background AI scoring */}
       <div style={cardStyle}>
-        <div style={titleStyle}>Background AI scoring</div>
+        <h3 style={titleStyle}>Background AI scoring</h3>
         <p style={helpStyle}>
           When on, ClawJournal scores recent traces in the background using your configured AI
           backend (each trace is anonymized on this machine before it is sent, and the agent may
@@ -201,7 +201,7 @@ export function Settings() {
 
       {/* Benchmark tab visibility */}
       <div style={cardStyle}>
-        <div style={titleStyle}>Benchmark tab</div>
+        <h3 style={titleStyle}>Benchmark tab</h3>
         <p style={helpStyle}>
           Show or hide the personalized weekly Benchmark tab under Analytics. Updates on the next
           refresh.

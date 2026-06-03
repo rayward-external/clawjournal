@@ -222,7 +222,7 @@ export default function App() {
           WebkitFontSmoothing: 'antialiased',
         }}>
           {!daemonReachable && (
-            <div style={{
+            <div role="status" aria-live="polite" style={{
               background: colors.red50,
               color: colors.red700,
               padding: '8px 16px',
