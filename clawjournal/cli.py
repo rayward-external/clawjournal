@@ -4145,8 +4145,9 @@ def main() -> None:
 
     # Share command (one-step: create + export + share)
     sh = sub.add_parser("share", help="Bundle and share sessions in one step")
-    sh.add_argument("session_ids", nargs="*", help="Session IDs (omit to use --status)")
-    sh.add_argument("--status", choices=["approved", "shortlisted"],
+    sh.add_argument("session_ids", nargs="*",
+                    help="Session IDs (omit to use --status); in --interactive mode, the list #s")
+    sh.add_argument("--status", choices=["new", "shortlisted", "approved", "blocked"],
                     help="Auto-select sessions with this review status")
     sh.add_argument("--note", type=str, default=None, help="Submission note")
     sh.add_argument("--force", action="store_true", help="Override duplicate check")
@@ -4155,14 +4156,11 @@ def main() -> None:
     sh.add_argument("--ai-pii-review", action="store_true",
                     help="Opt in to AI-assisted PII review while packaging")
     sh.add_argument("--json", action="store_true", help="Output JSON")
-
-    # Interactive share wizard (also exposed as the standalone `clawshare` command)
-    from .share_cli import add_share_cli_args
-    shc = sub.add_parser(
-        "share-cli",
-        help="Interactive share wizard in the terminal (alias: `clawshare`)",
-    )
-    add_share_cli_args(shc)
+    # Interactive terminal share wizard (also exposed as the `clawshare` alias).
+    sh.add_argument("-i", "--interactive", action="store_true",
+                    help="Run the interactive terminal share wizard")
+    from .share_cli import add_interactive_flags
+    add_interactive_flags(sh)
 
     ve = sub.add_parser("verify-email", help="Verify an academic email address for a short-lived upload token")
     ve.add_argument("email", nargs="?", help="Your academic email address")
@@ -4396,12 +4394,11 @@ def main() -> None:
         return
 
     if command == "share":
-        _run_share(args)
-        return
-
-    if command == "share-cli":
-        from .share_cli import run as _run_share_cli
-        _run_share_cli(args)
+        if getattr(args, "interactive", False):
+            from .share_cli import run as _run_share_cli
+            _run_share_cli(args)
+        else:
+            _run_share(args)
         return
 
     if command == "verify-email":
