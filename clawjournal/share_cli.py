@@ -810,6 +810,8 @@ def add_interactive_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentP
                         help="non-interactively certify the bundle is yours to submit")
     parser.add_argument("--download", action="store_true",
                         help="with --yes, also write the bundle zip to ~/Downloads")
+    parser.add_argument("--no-refresh", action="store_true",
+                        help="skip the startup index scan (use the existing index as-is)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="assume yes for preview/review/download prompts (NOT consent)")
     return parser
@@ -829,6 +831,15 @@ def add_share_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     return parser
 
 
+def refresh_index(source_filter: str | None = None) -> int:
+    """One-shot incremental scan (same as `clawjournal scan` / the daemon's
+    initial scan), so the wizard sees fresh traces without a running
+    `clawjournal serve`. Returns the number of newly indexed sessions."""
+    from .workbench.daemon import Scanner
+    results = Scanner(source_filter=source_filter).scan_once()
+    return sum(results.values())
+
+
 def _normalize_indices(args):
     """Accept indices either as the wizard's int positional or as `share`'s
     string `session_ids` positional (interpreted as list #s)."""
@@ -844,6 +855,17 @@ def _normalize_indices(args):
 def run(args) -> None:
     """Run the interactive share wizard against a parsed argparse namespace."""
     _normalize_indices(args)
+    # Refresh the index first so the wizard reflects recent traces even when
+    # `clawjournal serve` isn't running (its background scanner is the only other
+    # thing that ingests). Incremental, so it's cheap on repeat.
+    if not getattr(args, "no_refresh", False):
+        print(f"{DIM}Refreshing trace index…{RST}")
+        try:
+            n = refresh_index(args.source)
+            print(f"{DIM}{('Indexed %d new session(s).' % n) if n else 'Index already up to date.'}"
+                  f"{RST}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"{YEL}Index refresh skipped: {exc}{RST}")
     config = load_config()
     conn = open_index()
     try:

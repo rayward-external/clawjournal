@@ -298,3 +298,20 @@ def test_resolve_download_dest(tmp_path):
     assert share_cli._resolve_download_dest(str(custom), default, fname) == custom
     d = tmp_path / "adir"; d.mkdir()
     assert share_cli._resolve_download_dest(str(d), default, fname) == d / fname
+
+
+# ---- startup index refresh (so the wizard works without `clawjournal serve`) -
+
+def test_refresh_index_counts_new_sessions(monkeypatch):
+    import clawjournal.workbench.daemon as d
+
+    class FakeScanner:
+        def __init__(self, source_filter=None):
+            self.source_filter = source_filter
+
+        def scan_once(self):
+            return {"claude": 2, "codex": 1}
+
+    monkeypatch.setattr(d, "Scanner", FakeScanner)
+    assert share_cli.refresh_index() == 3
+    assert share_cli.refresh_index("codex") == 3
