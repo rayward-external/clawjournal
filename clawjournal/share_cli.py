@@ -309,6 +309,15 @@ def ensure_titles(conn, rows: list[dict], do_summarize: bool, summary_model: str
 
 # ---- step 1: queue ----------------------------------------------------------
 
+def _parse_selection(raw: str, count: int) -> list[int]:
+    """Parse the queue selection input into 1-based indices. 'all' (or 'a'/'*')
+    selects every listed trace; otherwise space/comma-separated numbers."""
+    low = raw.strip().lower()
+    if low in ("all", "a", "*"):
+        return list(range(1, count + 1))
+    return [int(x) for x in raw.replace(",", " ").split()]  # raises ValueError if not numbers
+
+
 def select_queue_rows(rows: list[dict], settings: dict, args) -> list[dict]:
     """Filter to shareable, in-window traces (+ optional search/project/min-fv),
     then rank by failure value descending with unscored (None) last — the web
@@ -381,14 +390,14 @@ def step_queue(conn, settings, args) -> list[dict]:
     if args.indices:
         idxs = args.indices
     else:
-        raw = ask(f"{BOLD}Enter trace #(s) to share{RST} (space/comma separated; "
-                  f"order = bundle order): ")
+        raw = ask(f"{BOLD}Enter trace #(s) to share{RST} (space/comma separated, "
+                  f"or {BOLD}all{RST}; order = bundle order): ")
         if not raw:
             die("Nothing selected.")
         try:
-            idxs = [int(x) for x in raw.replace(",", " ").split()]
+            idxs = _parse_selection(raw, len(rows))
         except ValueError:
-            die("Indices must be numbers.")
+            die("Enter trace numbers, or 'all'.")
     chosen = []
     for n in idxs:
         if n < 1 or n > len(rows):

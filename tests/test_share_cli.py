@@ -315,3 +315,17 @@ def test_refresh_index_counts_new_sessions(monkeypatch):
     monkeypatch.setattr(d, "Scanner", FakeScanner)
     assert share_cli.refresh_index() == 3
     assert share_cli.refresh_index("codex") == 3
+
+
+# ---- queue selection input ('all') ------------------------------------------
+
+def test_parse_selection_all_and_numbers():
+    assert share_cli._parse_selection("all", 4) == [1, 2, 3, 4]
+    assert share_cli._parse_selection("ALL", 3) == [1, 2, 3]
+    assert share_cli._parse_selection("a", 2) == [1, 2]
+    assert share_cli._parse_selection("*", 2) == [1, 2]
+    assert share_cli._parse_selection("5 1 3", 9) == [5, 1, 3]   # order preserved
+    assert share_cli._parse_selection("1,3, 5", 9) == [1, 3, 5]
+    import pytest
+    with pytest.raises(ValueError):
+        share_cli._parse_selection("nope", 4)
