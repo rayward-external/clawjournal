@@ -1,5 +1,7 @@
 """Tests for the interactive share wizard CLI surface."""
 import argparse
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -158,3 +160,141 @@ def test_blocked_all_blocked_aborts(monkeypatch):
     with pytest.raises(SystemExit):
         share_cli.step_package(conn=None, settings={}, included=_recs("a", "b"),
                                package_ai=False, args=args)
+
+
+# ---- time-range windows (rolling 24h / 168h) --------------------------------
+
+def _row(fv=None, end_delta_hours=None, **extra):
+    r = {"hold_state": None, "shared_at": None, "ai_failure_value_score": fv}
+    if end_delta_hours is not None:
+        r["end_time"] = (datetime.now(timezone.utc) - timedelta(hours=end_delta_hours)).isoformat()
+    r.update(extra)
+    r.setdefault("session_id", "s")
+    return r
+
+
+def test_in_time_range_rolling_windows():
+    assert share_cli._in_time_range(_row(end_delta_hours=1), "today")
+    assert not share_cli._in_time_range(_row(end_delta_hours=30), "today")
+    assert share_cli._in_time_range(_row(end_delta_hours=30), "weekly")
+    assert not share_cli._in_time_range(_row(end_delta_hours=200), "weekly")
+    assert share_cli._in_time_range(_row(end_delta_hours=200), "all")
+    assert not share_cli._in_time_range({"end_time": None}, "today")
+    assert share_cli._in_time_range({"end_time": None}, "all")
+
+
+# ---- queue selection: filtering + failure-value ranking (#4) ----------------
+
+_SETTINGS = {"excluded_projects": []}
+
+
+def _qargs(**kw):
+    base = dict(time_range="all", project=None, min_failure_value=None, search=None, limit=40)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_select_excludes_shared_and_held():
+    rows = [_row(fv=5, session_id="ok"),
+            _row(fv=5, session_id="shared", shared_at="2026-01-01"),
+            _row(fv=5, session_id="held", hold_state="pending_review")]
+    out = share_cli.select_queue_rows(rows, _SETTINGS, _qargs())
+    assert [r["session_id"] for r in out] == ["ok"]
+
+
+def test_select_ranked_by_failure_value_nulls_last():
+    rows = [_row(fv=2, session_id="b"), _row(fv=5, session_id="a"),
+            _row(fv=None, session_id="z"), _row(fv=4, session_id="c")]
+    out = share_cli.select_queue_rows(rows, _SETTINGS, _qargs())
+    assert [r["session_id"] for r in out] == ["a", "c", "b", "z"]
+
+
+def test_select_filters_search_project_minfv():
+    rows = [
+        _row(fv=5, session_id="a", display_title="fix the judge", project="evalproj"),
+        _row(fv=1, session_id="b", display_title="hello world", project="evalproj"),
+        _row(fv=5, session_id="c", display_title="judge again", project="other"),
+    ]
+    assert {r["session_id"] for r in share_cli.select_queue_rows(rows, _SETTINGS, _qargs(search="judge"))} == {"a", "c"}
+    assert {r["session_id"] for r in share_cli.select_queue_rows(rows, _SETTINGS, _qargs(min_failure_value=4))} == {"a", "c"}
+    assert {r["session_id"] for r in share_cli.select_queue_rows(rows, _SETTINGS, _qargs(project="evalproj"))} == {"a", "b"}
+
+
+def test_select_limit():
+    rows = [_row(fv=5, session_id=str(i)) for i in range(10)]
+    assert len(share_cli.select_queue_rows(rows, _SETTINGS, _qargs(limit=3))) == 3
+
+
+# ---- title logic ------------------------------------------------------------
+
+def test_resolve_title_modes():
+    r = {"display_title": "raw first msg", "ai_display_title": "AI Title"}
+    assert share_cli.resolve_title(r, summarized=False) == "raw first msg"
+    assert share_cli.resolve_title(r, summarized=True) == "AI Title"
+    assert share_cli.resolve_title({"display_title": ""}, False) == "Untitled"
+    assert share_cli.resolve_title({"display_title": "x"}, True) == "x"  # falls back when no AI title
+
+
+def test_looks_like_system_prompt():
+    assert share_cli._looks_like_system_prompt("You are a strict evaluation judge")
+    assert share_cli._looks_like_system_prompt("Your task is to ...")
+    assert not share_cli._looks_like_system_prompt("哪些 benchmark 适合做成 RL 环境")
+    assert not share_cli._looks_like_system_prompt("Read the file and fix the bug")
+
+
+def test_user_prompt_title_strips_preamble(monkeypatch):
+    detail = {"messages": [
+        {"role": "user", "content": 'You are a judge. Compare.\n\n{"candidate": 2}'},
+    ]}
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: detail)
+    assert share_cli.user_prompt_title(None, {"session_id": "x"}) == '{"candidate": 2}'
+
+
+# ---- step_redact AI consistency (preview == shipped, #2/#3) -----------------
+
+def _fake_rec(coverage, status="review"):
+    return {"redacted": {"messages": []}, "count": 0,
+            "buckets": {k: 0 for k in share_cli.share_flow.BUCKET_KEYS},
+            "th_hits": 0, "ai_findings": [], "ai_coverage": coverage, "status": status}
+
+
+def test_step_redact_degrades_to_rules_only_when_ai_unavailable(monkeypatch):
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": []})
+    seen = []
+
+    def fake_build(conn, detail, settings, use_ai, **k):
+        seen.append(use_ai)
+        return _fake_rec("rules_only" if use_ai else "disabled")
+    monkeypatch.setattr(share_cli, "build_redaction_record", fake_build)
+
+    chosen = [{"session_id": "a", "display_title": "A"}]
+    scrubbed, package_ai = share_cli.step_redact(None, {}, chosen, assume_yes=True,
+                                                 ai_pii_requested=True)
+    assert package_ai is False                       # degraded so what ships == what was shown
+    assert scrubbed[0]["ai_coverage"] == "disabled"  # rebuilt rules-only
+    assert seen == [True, False]                     # tried AI, then rebuilt without
+
+
+def test_step_redact_keeps_ai_when_uniformly_full(monkeypatch):
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": []})
+    monkeypatch.setattr(share_cli, "build_redaction_record",
+                        lambda conn, detail, settings, use_ai, **k: _fake_rec("full", "clear"))
+    chosen = [{"session_id": "a", "display_title": "A"}]
+    _scrubbed, package_ai = share_cli.step_redact(None, {}, chosen, assume_yes=True,
+                                                  ai_pii_requested=True)
+    assert package_ai is True
+
+
+# ---- download path resolution (regression: a stray 'y' must not be a path) --
+
+def test_resolve_download_dest(tmp_path):
+    default = tmp_path / "bundle.zip"
+    fname = "bundle.zip"
+    assert share_cli._resolve_download_dest("y", default, fname) == default
+    assert share_cli._resolve_download_dest("", default, fname) == default
+    assert share_cli._resolve_download_dest("yes", default, fname) == default
+    assert share_cli._resolve_download_dest("n", default, fname) is None
+    custom = tmp_path / "sub" / "out.zip"
+    assert share_cli._resolve_download_dest(str(custom), default, fname) == custom
+    d = tmp_path / "adir"; d.mkdir()
+    assert share_cli._resolve_download_dest(str(d), default, fname) == d / fname

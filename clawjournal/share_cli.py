@@ -309,46 +309,49 @@ def ensure_titles(conn, rows: list[dict], do_summarize: bool, summary_model: str
 
 # ---- step 1: queue ----------------------------------------------------------
 
-def step_queue(conn, settings, args) -> list[dict]:
-    step(1, "Queue — select traces")
-    rows = query_sessions(conn, status=args.status, source=args.source,
-                          limit=5000, sort="end_time", order="desc")
-    rows = [
+def select_queue_rows(rows: list[dict], settings: dict, args) -> list[dict]:
+    """Filter to shareable, in-window traces (+ optional search/project/min-fv),
+    then rank by failure value descending with unscored (None) last — the web
+    Queue ordering. Returns at most args.limit rows."""
+    out = [
         r for r in rows
         if not session_matches_excluded_projects(r, settings["excluded_projects"])
         and r.get("hold_state") in (None, "auto_redacted", "released")
         and not r.get("shared_at")
         and _in_time_range(r, args.time_range)
     ]
-    # extra queue filters (#4)
     if args.project:
-        rows = [r for r in rows if args.project.lower() in (r.get("project") or "").lower()]
+        out = [r for r in out if args.project.lower() in (r.get("project") or "").lower()]
     if args.min_failure_value is not None:
-        rows = [r for r in rows
-                if (r.get("ai_failure_value_score") or 0) >= args.min_failure_value]
+        out = [r for r in out if (r.get("ai_failure_value_score") or 0) >= args.min_failure_value]
     if args.search:
         q = args.search.lower()
-        rows = [r for r in rows if q in (
+        out = [r for r in out if q in (
             (r.get("display_title") or "") + " " + (r.get("ai_display_title") or "")
             + " " + (r.get("project") or "")).lower()]
+    out.sort(key=lambda r: (r.get("ai_failure_value_score") is None,
+                            -(r.get("ai_failure_value_score") or 0)))
+    return out[:args.limit]
 
+
+def step_queue(conn, settings, args) -> list[dict]:
+    step(1, "Queue — select traces")
+    # Fetch recent candidates (so time windows are accurate), then rank by value.
+    candidates = query_sessions(conn, status=args.status, source=args.source,
+                                limit=5000, sort="end_time", order="desc")
+    rows = select_queue_rows(candidates, settings, args)
     if not rows:
         ranges = {"today": "the past 24h", "weekly": "the past 7 days", "all": "the index"}
         hint = "" if args.time_range == "all" else "  (try --weekly or --all)"
         die(f"No shareable traces found in {ranges[args.time_range]}.{hint}")
 
-    rows = rows[:args.limit]
     label = {"today": "past 24h", "weekly": "past 7 days", "all": "all time"}[args.time_range]
     unscored = sum(1 for r in rows if r.get("ai_failure_value_score") is None)
-    recommended = sum(1 for r in rows if (r.get("ai_failure_value_score") or 0) >= 4)
-    print(f"  {DIM}Showing {len(rows)} shareable trace(s) — {label} (limit {args.limit}).{RST}")
-    note = []
-    if recommended:
-        note.append(f"★ = recommended (failure value ≥4): {recommended}")
+    print(f"  {DIM}Showing {len(rows)} shareable trace(s) — {label}, ranked by failure "
+          f"value (limit {args.limit}).{RST}")
     if unscored:
-        note.append(f"{unscored} unscored (run `clawjournal score` for value/title)")
-    if note:
-        print(f"  {DIM}{'  ·  '.join(note)}{RST}")
+        print(f"  {DIM}{unscored} unscored (run `clawjournal score` for value/title); "
+              f"listed last.{RST}")
 
     do_summary = args.summary or bool(args.summary_model)
     ensure_titles(conn, rows, do_summary, summary_model=args.summary_model)
@@ -358,20 +361,19 @@ def step_queue(conn, settings, args) -> list[dict]:
             title = user_prompt_title(conn, r) or title
         r["_clawshare_title"] = title
 
-    print(f"\n  {'#':>3} {'★':<1} {'Last turn':<11} {'Source':<8} {'Msgs':>5} {'Tokens':>9} "
-          f"{'Tools':>5} {'Fail':>4}  Title")
-    print("  " + "-" * 110)
+    print(f"\n  {'#':>3}  {'Fail':>4} {'Last turn':<11} {'Source':<8} {'Msgs':>5} "
+          f"{'Tokens':>9} {'Tools':>5}  Title")
+    print("  " + "-" * 108)
     for i, r in enumerate(rows, 1):
         msgs = (r.get("user_messages") or 0) + (r.get("assistant_messages") or 0)
         toks = (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0)
         tools = r.get("tool_uses") or 0
         fv = r.get("ai_failure_value_score")
         fv_str = str(fv) if fv is not None else "—"
-        star = "★" if (fv or 0) >= 4 else " "
         dt = _parse_ts(r.get("end_time"))
         when = dt.astimezone().strftime("%m-%d %H:%M") if dt else "—"
-        print(f"  {i:>3} {star:<1} {when:<11} {r.get('source', ''):<8} "
-              f"{msgs:>5} {toks:>9,} {tools:>5} {fv_str:>4}  {trace_title(r)}")
+        print(f"  {i:>3}  {fv_str:>4} {when:<11} {r.get('source', ''):<8} "
+              f"{msgs:>5} {toks:>9,} {tools:>5}  {trace_title(r)}")
     print()
     print(f"  {DIM}Tip: filter with --search/--project/--min-failure-value, widen with "
           f"--weekly/--all, more with --limit.{RST}")
@@ -729,6 +731,19 @@ def step_submit(conn, settings, share_id: str, package_ai: bool, args):
 
 # ---- step 6: done (+ optional download) -------------------------------------
 
+def _resolve_download_dest(ans: str, default: Path, fname: str):
+    """Resolve the download prompt answer to a destination Path, or None to skip.
+    Enter/y/yes = default; n/no/skip = None; anything else = a path (a directory
+    gets the filename appended). Guards against a stray 'y' becoming the filename."""
+    low = ans.strip().lower()
+    if low in ("n", "no", "q", "skip"):
+        return None
+    dest = default if low in ("", "y", "yes") else Path(ans.strip()).expanduser()
+    if dest.is_dir() or str(dest).endswith(os.sep):
+        dest = dest / fname
+    return dest
+
+
 def step_done(share_id: str, export_dir: Path, result, assume_yes: bool, download_default: bool):
     step(6, "Done")
     if result:
@@ -748,15 +763,11 @@ def step_done(share_id: str, export_dir: Path, result, assume_yes: bool, downloa
             return
         dest = default
     else:
-        # Default to yes when there's no hosted receipt (download is the outcome).
         ans = ask(f"\n  {BOLD}Download the bundle zip?{RST} "
-                  f"{DIM}[Enter/y = {default}, n = skip, or type a path]{RST}\n  > ").strip()
-        low = ans.lower()
-        if low in ("n", "no", "q", "skip"):
+                  f"{DIM}[Enter/y = {default}, n = skip, or type a path]{RST}\n  > ")
+        dest = _resolve_download_dest(ans, default, fname)
+        if dest is None:
             return
-        dest = default if low in ("", "y", "yes") else Path(ans).expanduser()
-    if dest.is_dir() or str(dest).endswith(os.sep):
-        dest = dest / fname
     try:
         data = build_zip(export_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
