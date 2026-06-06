@@ -19,7 +19,10 @@ const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedGuideV2Dismissed';
 
 function failureBadge(score: number | null): string {
   if (score == null) return '\u2014';
-  return `${score} failure`;
+  // Noun-first with an explicit /5 denominator so it reads as a score, not a
+  // count of failures. "Value" signals this rates the trace's worth as a
+  // failure example, not how badly the session failed.
+  return `Failure value ${score}/5`;
 }
 
 function outcomeText(badge: string | null): string {
@@ -156,6 +159,8 @@ export function Inbox() {
   expandedIdRef.current = expandedId;
   const expandedMsgsRef = useRef(expandedMessages);
   expandedMsgsRef.current = expandedMessages;
+  // Session ids with an in-flight redacted-content fetch (single-flight guard).
+  const loadingIdsRef = useRef<Set<string>>(new Set());
 
   // Confirm dialog
   const [confirm, setConfirm] = useState<{ action: string; ids: string[] } | null>(null);
@@ -270,7 +275,17 @@ export function Inbox() {
       setExpandedId(null);
       return;
     }
-    if (!expandedMsgsRef.current[sessionId]) {
+    // Open the row immediately so the loading placeholder renders while the
+    // redacted-content fetch runs. The fetch can take many seconds for large
+    // sessions; without this optimistic open the click feels dead (nothing
+    // visibly happens until the request resolves).
+    setExpandedId(sessionId);
+    // Single-flight per session: if a fetch is already in flight, a quick
+    // collapse/reopen must not start a second request. Two overlapping
+    // promises would race on the same cache entry, and a failing retry could
+    // clobber an already-successful response with "(unable to load)".
+    if (!expandedMsgsRef.current[sessionId] && !loadingIdsRef.current.has(sessionId)) {
+      loadingIdsRef.current.add(sessionId);
       try {
         const detail = await api.sessions.redacted(sessionId);
         const msgs = (detail.messages || []).map((m: { role: string; content: string; tool_uses?: Array<{ tool: string }> }) => ({
@@ -281,9 +296,10 @@ export function Inbox() {
         setExpandedMessages(prev => ({ ...prev, [sessionId]: msgs }));
       } catch {
         setExpandedMessages(prev => ({ ...prev, [sessionId]: [{ role: 'system', content: '(unable to load)' }] }));
+      } finally {
+        loadingIdsRef.current.delete(sessionId);
       }
     }
-    setExpandedId(sessionId);
   };
 
   const toggleSelect = (id: string) => {
@@ -362,7 +378,7 @@ export function Inbox() {
             }}
           />
           <select value={sort} onChange={e => setSort(e.target.value)} style={selectStyle}>
-            <option value="ai_failure_value_score:desc">Top failures</option>
+            <option value="ai_failure_value_score:desc">Most instructive failures</option>
             <option value="ai_quality_score:desc">Highest productivity</option>
             <option value="start_time:desc">Newest first</option>
             <option value="start_time:asc">Oldest first</option>
@@ -634,14 +650,20 @@ export function Inbox() {
                 {/* Failure + productivity scores */}
                 <div style={{
                   display: 'flex', flexDirection: 'column', gap: 1,
-                  fontSize: '12px', whiteSpace: 'nowrap', minWidth: '74px',
+                  fontSize: '12px', whiteSpace: 'nowrap', minWidth: '104px',
                 }}>
-                  <span style={{ color: colors.red500, fontWeight: 700 }}>
+                  <span
+                    title="Failure value (1–5): how useful this trace is for studying agent failure behavior — not how badly the session failed"
+                    style={{ color: colors.yellow700, fontWeight: 700 }}
+                  >
                     {failureBadge(s.ai_failure_value_score)}
                   </span>
                   {s.ai_quality_score != null && (
-                    <span title="Productivity score" style={{ color: colors.gray400, fontSize: 11, fontWeight: 600 }}>
-                      Prod {s.ai_quality_score}/5
+                    <span
+                      title="Productivity (1–5): how much useful work this session accomplished"
+                      style={{ color: colors.gray400, fontSize: 11, fontWeight: 600 }}
+                    >
+                      Productivity {s.ai_quality_score}/5
                     </span>
                   )}
                 </div>
@@ -707,7 +729,7 @@ export function Inbox() {
                   maxHeight: '350px', overflowY: 'auto',
                 }}>
                   {!msgs ? (
-                    <div style={{ padding: '8px 0', fontSize: '13px', color: colors.gray400 }}>Loading redacted content...</div>
+                    <Spinner text="Loading redacted content…" />
                   ) : msgs.length === 0 ? (
                     <div style={{ padding: '8px 0', fontSize: '13px', color: colors.gray400 }}>No message content available. Try running <code>clawjournal scan</code> to re-index.</div>
                   ) : msgs.map((m, i) => (
