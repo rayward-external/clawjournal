@@ -72,6 +72,25 @@ export function outcomeBadge(outcome: string | null): string {
   return '';
 }
 
+// Plain-English gloss for each outcome badge — surfaced as a hover tooltip so
+// users can tell the similar-looking states apart (notably failed vs errored).
+// "Outcome" describes how the session *ended*; it is a heuristic, not an AI score.
+export function outcomeTooltip(outcome: string | null): string {
+  if (!outcome) return '';
+  const b = outcome.toLowerCase();
+  if (b === 'resolved') return 'Outcome: the task was resolved successfully.';
+  if (b === 'partial') return 'Outcome: interrupted — the user spoke last and the agent never replied.';
+  if (b === 'abandoned') return 'Outcome: abandoned before reaching a result.';
+  if (b === 'exploratory') return 'Outcome: exploratory — no concrete change was expected.';
+  if (b === 'trivial') return 'Outcome: trivial — minimal work.';
+  if (b.includes('pass')) return 'Outcome: a test run reported passing tests.';
+  if (b.includes('fail')) return 'Outcome: a test or build explicitly failed.';
+  if (b.includes('analysis')) return 'Outcome: analysis only — no code changes.';
+  if (b.includes('completed')) return 'Outcome: ran to the end with no error or test-failure signals.';
+  if (b.includes('errored')) return 'Outcome: hit a runtime error (exception, traceback, etc.) near the end — distinct from a test/build failure.';
+  return 'How this session ended (heuristic, not a score).';
+}
+
 export const formatTokens = (t: number) => t >= 1_000_000 ? `${(t / 1_000_000).toFixed(1)}M` : `${(t / 1000).toFixed(0)}k`;
 export const formatBytes = (bytes: number) => {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;

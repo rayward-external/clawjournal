@@ -1,6 +1,6 @@
 import { colors } from '../../theme.ts';
 
-export const SHARE_SHELL_WIDTH = '1120px';
+export const SHARE_SHELL_WIDTH = '1360px';
 
 export const btnPrimary = {
   display: 'inline-flex', alignItems: 'center', gap: 8,

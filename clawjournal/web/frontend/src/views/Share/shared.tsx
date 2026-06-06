@@ -5,7 +5,7 @@ import { hexAlpha, sourceFullLabel } from './helpers.ts';
 
 export function SourceBadge({ s }: { s: { source: string; client_origin?: string | null; runtime_channel?: string | null } }) {
   const { label, color } = sourceFullLabel(s);
-  return <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4, background: hexAlpha(color, 0.10), color, marginRight: 3 }}>{label}</span>;
+  return <span style={{ fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 4, background: hexAlpha(color, 0.10), color, marginRight: 3, whiteSpace: 'nowrap', flexShrink: 0 }}>{label}</span>;
 }
 
 export function ThinkingBlock({ text }: { text: string }) {
