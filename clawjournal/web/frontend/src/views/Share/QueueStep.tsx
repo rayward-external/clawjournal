@@ -304,7 +304,7 @@ export function QueueStep(p: QueueStepProps) {
               <div><span style={{ fontWeight: 600 }}>Failure value N/5</span>{' — how instructive this trace is for AI training (not how badly the session went)'}</div>
               <div><span style={{ fontWeight: 600 }}>Productivity N/5</span>{' — how much useful work the session accomplished'}</div>
               <div><span style={{ fontWeight: 600 }}>Who caused it</span>{': agent caused = the AI made a mistake · environment = external tool/infra problem · preexisting problem = bug existed before · user redirect = user changed direction · unclear = ambiguous'}</div>
-              <div><span style={{ fontWeight: 600 }}>Outcome</span>{': ✓ passed/completed · ✗ failed (test or build said no) · ✗ errored (runtime exception near the end) · ~ partial (session was interrupted)'}</div>
+              <div><span style={{ fontWeight: 600 }}>Outcome</span>{': ✓ resolved/passed · ✗ failed (test or build said no) · ✗ errored (runtime exception near the end) · ~ partial/interrupted · — inconclusive (no decisive signal)'}</div>
             </div>
           </div>
 
@@ -352,7 +352,7 @@ export function QueueStep(p: QueueStepProps) {
                       </>)}
                     </div>
                     {/* Row 2: scores · attribution · outcome */}
-                    <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2, flexWrap: 'nowrap' }}>
+                    <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2, flexWrap: 'wrap', rowGap: 2 }}>
                       {s.ai_failure_value_score != null ? (
                         <span
                           style={{ color: colors.yellow700, fontWeight: 700, whiteSpace: 'nowrap' }}

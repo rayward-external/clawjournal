@@ -924,6 +924,41 @@ class TestShares:
         assert [s["session_id"] for s in stats["sessions"]] == ["failure", "legacy"]
         assert stats["recommended_session_ids"] == ["failure"]
 
+    def test_share_ready_returns_normalized_outcome_labels(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("raw-completed"),
+            _make_session("raw-partial"),
+            _make_session("ai-partial"),
+        ])
+        for sid in ("raw-completed", "raw-partial", "ai-partial"):
+            update_session(
+                index_conn,
+                sid,
+                status="approved",
+                ai_quality_score=5,
+                ai_failure_value_score=5,
+            )
+        index_conn.execute(
+            "UPDATE sessions SET outcome_badge = 'completed' WHERE session_id = ?",
+            ("raw-completed",),
+        )
+        index_conn.execute(
+            "UPDATE sessions SET outcome_badge = 'partial' WHERE session_id = ?",
+            ("raw-partial",),
+        )
+        index_conn.execute(
+            "UPDATE sessions SET outcome_badge = 'completed' WHERE session_id = ?",
+            ("ai-partial",),
+        )
+        update_session(index_conn, "ai-partial", ai_outcome_badge="partial")
+
+        stats = get_share_ready_stats(index_conn)
+        by_id = {s["session_id"]: s for s in stats["sessions"]}
+
+        assert by_id["raw-completed"]["outcome_badge"] == "inconclusive"
+        assert by_id["raw-partial"]["outcome_badge"] == "interrupted"
+        assert by_id["ai-partial"]["outcome_badge"] == "partial"
+
     def test_share_ready_excludes_held_sessions(self, index_conn):
         """The queue must offer only shareable sessions: explicit holds
         (pending_review, active embargo) are dropped, but an auto-expired

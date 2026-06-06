@@ -31,15 +31,19 @@ function outcomeText(badge: string | null): string {
   // New resolution labels
   if (b === 'resolved') return '\u2713 resolved';
   if (b === 'partial') return '~ partial';
+  if (b === 'interrupted') return '~ interrupted';
+  if (b === 'inconclusive') return '\u2014 inconclusive';
   if (b === 'failed') return '\u2717 failed';
   if (b === 'abandoned') return '\u2717 abandoned';
   if (b === 'exploratory') return '\u2014 exploratory';
   if (b === 'trivial') return '\u2014 trivial';
+  if (b === 'unscored') return '\u2014 unscored';
+  if (b === 'unknown') return '\u2014 unknown';
   // Legacy outcome labels
   if (b.includes('pass')) return '\u2713 passed';
   if (b.includes('fail')) return '\u2717 failed';
   if (b.includes('analysis')) return '\u2014 analysis';
-  if (b.includes('completed')) return '\u2713 completed';
+  if (b.includes('completed')) return '\u2014 completed';
   if (b.includes('errored')) return '\u2717 errored';
   return '';
 }
@@ -54,13 +58,16 @@ function outcomeTooltip(badge: string | null): string {
   // "user spoke last" case normalizes to 'interrupted' before reaching the Inbox.
   if (b === 'partial') return 'Outcome: useful progress was made but the task was not fully completed.';
   if (b === 'interrupted') return 'Outcome: interrupted — the user spoke last and the agent never replied.';
+  if (b === 'inconclusive') return 'Outcome: inconclusive — the session ended without a decisive success or failure signal.';
   if (b === 'abandoned') return 'Outcome: abandoned before reaching a result.';
   if (b === 'exploratory') return 'Outcome: exploratory — no concrete change was expected.';
   if (b === 'trivial') return 'Outcome: trivial — minimal work.';
+  if (b === 'unscored') return 'Outcome: unscored — no outcome signal is available yet.';
+  if (b === 'unknown') return 'Outcome: unknown — the stored outcome was not recognized.';
   if (b.includes('pass')) return 'Outcome: a test run reported passing tests.';
   if (b.includes('fail')) return 'Outcome: a test or build explicitly failed.';
   if (b.includes('analysis')) return 'Outcome: analysis only — no code changes.';
-  if (b.includes('completed')) return 'Outcome: ran to the end with no error or test-failure signals.';
+  if (b.includes('completed')) return 'Outcome: ran to the end without a decisive success or failure signal.';
   if (b.includes('errored')) return 'Outcome: hit a runtime error (exception, traceback, etc.) near the end — distinct from a test/build failure.';
   return 'How this session ended (heuristic, not a score).';
 }

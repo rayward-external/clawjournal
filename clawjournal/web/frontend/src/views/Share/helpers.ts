@@ -60,33 +60,41 @@ export function outcomeBadge(outcome: string | null): string {
   const b = outcome.toLowerCase();
   if (b === 'resolved') return '✓ resolved';
   if (b === 'partial') return '~ partial';
+  if (b === 'interrupted') return '~ interrupted';
+  if (b === 'inconclusive') return '— inconclusive';
   if (b === 'failed') return '✗ failed';
   if (b === 'abandoned') return '✗ abandoned';
   if (b === 'exploratory') return '— exploratory';
   if (b === 'trivial') return '— trivial';
+  if (b === 'unscored') return '— unscored';
+  if (b === 'unknown') return '— unknown';
   if (b.includes('pass')) return '✓ passed';
   if (b.includes('fail')) return '✗ failed';
   if (b.includes('analysis')) return '— analysis';
-  if (b.includes('completed')) return '✓ completed';
+  if (b.includes('completed')) return '— completed';
   if (b.includes('errored')) return '✗ errored';
   return '';
 }
 
 // Plain-English gloss for each outcome badge — surfaced as a hover tooltip so
 // users can tell the similar-looking states apart (notably failed vs errored).
-// "Outcome" describes how the session *ended*; it is a heuristic, not an AI score.
+// "Outcome" describes how the session ended; it is a label, not a score.
 export function outcomeTooltip(outcome: string | null): string {
   if (!outcome) return '';
   const b = outcome.toLowerCase();
   if (b === 'resolved') return 'Outcome: the task was resolved successfully.';
-  if (b === 'partial') return 'Outcome: interrupted — the user spoke last and the agent never replied.';
+  if (b === 'partial') return 'Outcome: useful progress was made but the task was not fully completed.';
+  if (b === 'interrupted') return 'Outcome: interrupted — the user spoke last and the agent never replied.';
+  if (b === 'inconclusive') return 'Outcome: inconclusive — the session ended without a decisive success or failure signal.';
   if (b === 'abandoned') return 'Outcome: abandoned before reaching a result.';
   if (b === 'exploratory') return 'Outcome: exploratory — no concrete change was expected.';
   if (b === 'trivial') return 'Outcome: trivial — minimal work.';
+  if (b === 'unscored') return 'Outcome: unscored — no outcome signal is available yet.';
+  if (b === 'unknown') return 'Outcome: unknown — the stored outcome was not recognized.';
   if (b.includes('pass')) return 'Outcome: a test run reported passing tests.';
   if (b.includes('fail')) return 'Outcome: a test or build explicitly failed.';
   if (b.includes('analysis')) return 'Outcome: analysis only — no code changes.';
-  if (b.includes('completed')) return 'Outcome: ran to the end with no error or test-failure signals.';
+  if (b.includes('completed')) return 'Outcome: ran to the end without a decisive success or failure signal.';
   if (b.includes('errored')) return 'Outcome: hit a runtime error (exception, traceback, etc.) near the end — distinct from a test/build failure.';
   return 'How this session ended (heuristic, not a score).';
 }
