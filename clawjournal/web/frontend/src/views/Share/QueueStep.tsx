@@ -6,7 +6,7 @@ import { colors } from '../../theme.ts';
 import { SessionDrawer } from '../../components/SessionDrawer.tsx';
 import { TraceCard } from '../../components/TraceCard.tsx';
 import type { ReadySession, ShareReadyStats } from './types.ts';
-import { autoDescription, formatDate, formatTokens, outcomeBadge, sessionTotalTokens } from './helpers.ts';
+import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip, sessionTotalTokens } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
 
@@ -270,10 +270,13 @@ export function QueueStep(p: QueueStepProps) {
 
           {/* Bundle summary */}
           <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            padding: '12px 14px', background: colors.gray50,
+            background: colors.gray50,
             border: `1px solid ${colors.gray200}`, borderRadius: 8, marginBottom: 10,
           }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '12px 14px 8px',
+            }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <div style={{ fontSize: 13, color: colors.gray900, fontWeight: 500 }}>draft-bundle</div>
               <div style={{ fontSize: 12, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
@@ -291,6 +294,18 @@ export function QueueStep(p: QueueStepProps) {
               <Icon name="grip" size={12} />
               Drag to reorder
             </span>
+            </div>
+            <div style={{
+              padding: '7px 14px 10px',
+              fontSize: 11, color: colors.gray400,
+              borderTop: `1px solid ${colors.gray200}`,
+              display: 'flex', flexDirection: 'column', gap: 3,
+            }}>
+              <div><span style={{ fontWeight: 600 }}>Failure value N/5</span>{' — how instructive this trace is for AI training (not how badly the session went)'}</div>
+              <div><span style={{ fontWeight: 600 }}>Productivity N/5</span>{' — how much useful work the session accomplished'}</div>
+              <div><span style={{ fontWeight: 600 }}>Who caused it</span>{': agent caused = the AI made a mistake · environment = external tool/infra problem · preexisting problem = bug existed before · user redirect = user changed direction · unclear = ambiguous'}</div>
+              <div><span style={{ fontWeight: 600 }}>Outcome</span>{': ✓ passed/completed · ✗ failed (test or build said no) · ✗ errored (runtime exception near the end) · ~ partial (session was interrupted)'}</div>
+            </div>
           </div>
 
           {/* Trace list */}
@@ -325,46 +340,52 @@ export function QueueStep(p: QueueStepProps) {
                     }}>
                       {s.display_title || 'Untitled'}
                     </div>
-                    <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 10, alignItems: 'center', marginTop: 2 }}>
+                    {/* Row 1: source · project · tokens · tools */}
+                    <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2, flexWrap: 'nowrap', overflow: 'hidden' }}>
                       <SourceBadge s={s} />
-                      <span>{s.project}</span>
-                      <span style={{ opacity: 0.5 }}>&middot;</span>
-                      <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flexShrink: 1 }}>{s.project}</span>
+                      <span style={{ opacity: 0.5, flexShrink: 0 }}>&middot;</span>
+                      <span style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>{formatTokens(sessionTotalTokens(s))} tokens</span>
                       {s.tool_uses > 0 && (<>
-                        <span style={{ opacity: 0.5 }}>&middot;</span>
-                        <span>{s.tool_uses} tools</span>
+                        <span style={{ opacity: 0.5, flexShrink: 0 }}>&middot;</span>
+                        <span style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>{s.tool_uses} tools</span>
                       </>)}
-                      {s.ai_failure_value_score != null && (<>
-                        <span style={{ opacity: 0.5 }}>&middot;</span>
-                        <span style={{ color: '#991b1b', fontWeight: 700 }}>{s.ai_failure_value_score} failure value</span>
-                      </>)}
-                      {s.ai_quality_score != null && (<>
-                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                    </div>
+                    {/* Row 2: scores · attribution · outcome */}
+                    <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2, flexWrap: 'nowrap' }}>
+                      {s.ai_failure_value_score != null ? (
                         <span
-                          style={{ color: colors.gray500 }}
-                          title="Productivity score"
+                          style={{ color: colors.yellow700, fontWeight: 700, whiteSpace: 'nowrap' }}
+                          title="Failure value (1–5): how useful this trace is for studying agent failure behavior — not how badly the session failed"
                         >
-                          Productivity {s.ai_quality_score}/5
+                          Failure value {s.ai_failure_value_score}/5
                         </span>
-                      </>)}
-                      {s.ai_failure_attribution && (<>
-                        <span style={{ opacity: 0.5 }}>&middot;</span>
-                        <span>{s.ai_failure_attribution.replace(/_/g, ' ')}</span>
-                      </>)}
-                      {s.ai_failure_value_score == null && (<>
-                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                      ) : (
                         <span
-                          style={{ color: colors.gray500, fontStyle: 'italic' }}
+                          style={{ color: colors.gray500, fontStyle: 'italic', whiteSpace: 'nowrap' }}
                           title={s.ai_quality_score == null
                             ? "This session hasn't been scored yet. Click Preview → Score with AI, or run `clawjournal score` from a terminal."
                             : "This legacy-scored session is missing failure value. Re-score it with AI before sharing."}
                         >
                           {s.ai_quality_score == null ? 'unscored' : 'failure value missing'}
                         </span>
+                      )}
+                      {s.ai_quality_score != null && (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span
+                          style={{ whiteSpace: 'nowrap' }}
+                          title="Productivity (1–5): how much useful work this session accomplished"
+                        >
+                          Productivity {s.ai_quality_score}/5
+                        </span>
+                      </>)}
+                      {s.ai_failure_attribution && (<>
+                        <span style={{ opacity: 0.5 }}>&middot;</span>
+                        <span style={{ whiteSpace: 'nowrap' }}>{s.ai_failure_attribution.replace(/_/g, ' ')}</span>
                       </>)}
                       {s.outcome_badge && (<>
                         <span style={{ opacity: 0.5 }}>&middot;</span>
-                        <span>{outcomeBadge(s.outcome_badge)}</span>
+                        <span style={{ whiteSpace: 'nowrap' }} title={outcomeTooltip(s.outcome_badge)}>{outcomeBadge(s.outcome_badge)}</span>
                       </>)}
                     </div>
                   </div>

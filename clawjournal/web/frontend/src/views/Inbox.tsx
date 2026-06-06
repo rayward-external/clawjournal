@@ -44,6 +44,27 @@ function outcomeText(badge: string | null): string {
   return '';
 }
 
+// Plain-English gloss for each outcome badge, shown on hover so the
+// similar-looking states (notably failed vs errored) are distinguishable.
+function outcomeTooltip(badge: string | null): string {
+  if (!badge) return '';
+  const b = badge.toLowerCase();
+  if (b === 'resolved') return 'Outcome: the task was resolved successfully.';
+  // 'partial' here is the AI-judge label (useful progress, not fully complete) — the heuristic
+  // "user spoke last" case normalizes to 'interrupted' before reaching the Inbox.
+  if (b === 'partial') return 'Outcome: useful progress was made but the task was not fully completed.';
+  if (b === 'interrupted') return 'Outcome: interrupted — the user spoke last and the agent never replied.';
+  if (b === 'abandoned') return 'Outcome: abandoned before reaching a result.';
+  if (b === 'exploratory') return 'Outcome: exploratory — no concrete change was expected.';
+  if (b === 'trivial') return 'Outcome: trivial — minimal work.';
+  if (b.includes('pass')) return 'Outcome: a test run reported passing tests.';
+  if (b.includes('fail')) return 'Outcome: a test or build explicitly failed.';
+  if (b.includes('analysis')) return 'Outcome: analysis only — no code changes.';
+  if (b.includes('completed')) return 'Outcome: ran to the end with no error or test-failure signals.';
+  if (b.includes('errored')) return 'Outcome: hit a runtime error (exception, traceback, etc.) near the end — distinct from a test/build failure.';
+  return 'How this session ended (heuristic, not a score).';
+}
+
 function riskFlags(session: Session): string[] {
   const flags: string[] = [];
   const risks = session.risk_level;
@@ -706,7 +727,7 @@ export function Inbox() {
                     }}>{sourceInfo(s).label}</span>
                     <span>
                       {s.project} &middot; {s.user_messages + s.assistant_messages} msgs
-                      {s.outcome_label ? ` · ${outcomeText(s.outcome_label)}` : ''}
+                      {s.outcome_label ? <> &middot; <span title={outcomeTooltip(s.outcome_label)}>{outcomeText(s.outcome_label)}</span></> : ''}
                       {s.ai_failure_attribution ? ` · ${s.ai_failure_attribution.replace(/_/g, ' ')}` : ''}
                     </span>
                   </div>
