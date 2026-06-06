@@ -618,18 +618,23 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
         blocked = res.get("blocked_sessions") or []
         if blocked:
             blocked_ids = {b if isinstance(b, str) else b.get("session_id") for b in blocked}
-            print(f"{RED}Packaging blocked — secrets/PII detected in:{RST}")
+            reason = res.get("error") or "TruffleHog blocked the share."
+            print(f"{RED}Packaging blocked by the final secret scan:{RST}")
+            print(f"  {DIM}{reason}{RST}")
+            # Same as the web: a blocked trace can't be submitted, so it is removed
+            # (not retained) and the rest are retried.
+            print(f"  {RED}Removed blocked trace(s):{RST}")
             for s in recs:
                 if s["row"]["session_id"] in blocked_ids:
                     print(f"  • {s['row']['session_id'][:12]}  {trace_title(s['row'], 50)}")
             remaining = [s for s in recs if s["row"]["session_id"] not in blocked_ids]
             if not remaining:
-                die("All included traces were blocked — nothing to package.")
-            if args.yes or yesno(f"  Remove the {len(blocked_ids)} blocked trace(s) and retry "
-                                 f"with the remaining {len(remaining)}?", default_yes=True):
-                recs = remaining
-                continue
-            die("Aborted — blocked traces not removed.")
+                die("All included traces were blocked by the final secret scan — nothing to "
+                    "package. To keep one, go back and add a redaction rule (allowlist / custom "
+                    "string) so the secret is scrubbed, then retry.")
+            print(f"  {DIM}Retrying with the remaining {len(remaining)}…{RST}")
+            recs = remaining
+            continue
         die(res.get("error", "Packaging failed."))
 
 

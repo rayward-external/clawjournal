@@ -141,7 +141,8 @@ def test_blocked_recovery_removes_and_retries(monkeypatch):
                 "manifest": {"sessions": session_ids}}
     monkeypatch.setattr(share_cli.share_flow, "package", _package)
 
-    args = SimpleNamespace(yes=True, note=None)
+    # yes=False: blocked traces are auto-removed (no keep-prompt), same as the web.
+    args = SimpleNamespace(yes=False, note=None)
     share_id, export_dir = share_cli.step_package(
         conn=None, settings={}, included=_recs("good", "bad"), package_ai=False, args=args)
     assert share_id == "share123"

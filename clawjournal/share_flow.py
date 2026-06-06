@@ -227,7 +227,9 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
     if export_dir is None:
         return {"ok": False, "share_id": share_id, "error": "Packaging failed: no bundle produced."}
     if manifest.get("blocked"):
-        return {"ok": False, "share_id": share_id, "error": "Bundle marked blocked.",
+        return {"ok": False, "share_id": share_id,
+                "error": manifest.get("block_message") or manifest.get("block_reason")
+                or "Bundle marked blocked.",
                 "blocked_sessions": manifest.get("blocked_sessions") or []}
     return {"ok": True, "share_id": share_id, "export_dir": export_dir, "manifest": manifest,
             "blocked_sessions": []}
