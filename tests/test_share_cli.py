@@ -411,3 +411,16 @@ def test_verify_coverage_consistency():
     m_partial = {"redaction_summary": {"pii_review": {"ai_enabled": True,
                                                       "coverage": {"full": 1, "rules_only": 1}}}}
     assert sf.verify_coverage(m_partial, package_ai=True)[0] is False
+
+
+# ---- #7/#9: CLI depends on share_flow, not daemon-private helpers ------------
+
+def test_cli_uses_share_flow_not_daemon_private():
+    import inspect
+    src = inspect.getsource(share_cli)
+    # Daemon-private share helpers must be reached via share_flow, not the CLI.
+    for name in ("_prepare_share_export_for_upload", "_build_share_zip",
+                 "submit_share_to_hosted", "_fetch_hosted_share_capabilities",
+                 "fetch_hosted_consent", "hosted_upload_status"):
+        assert name not in src, f"{name} should be accessed via share_flow, not in the CLI"
+    assert "order = bundle order" not in src, "dropped the false bundle-order claim"

@@ -395,7 +395,7 @@ def step_queue(conn, settings, args) -> list[dict]:
         idxs = args.indices
     else:
         raw = ask(f"{BOLD}Enter trace #(s) to share{RST} (space/comma separated, "
-                  f"or {BOLD}all{RST}; order = bundle order): ")
+                  f"or {BOLD}all{RST}): ")
         if not raw:
             die("Nothing selected.")
         try:
