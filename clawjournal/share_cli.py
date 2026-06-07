@@ -33,6 +33,8 @@ from pathlib import Path
 
 from .config import load_config
 from .workbench.index import (
+    SHAREABLE_HOLD_STATES,
+    effective_hold_state,
     get_effective_share_settings,
     get_session_detail,
     open_index,
@@ -325,7 +327,9 @@ def select_queue_rows(rows: list[dict], settings: dict, args) -> list[dict]:
     out = [
         r for r in rows
         if not session_matches_excluded_projects(r, settings["excluded_projects"])
-        and r.get("hold_state") in (None, "auto_redacted", "released")
+        # Use the same effective hold-state as the web/release gate so EXPIRED
+        # embargoes are shareable (raw hold_state would wrongly drop them).
+        and effective_hold_state(r.get("hold_state"), r.get("embargo_until")) in SHAREABLE_HOLD_STATES
         and not r.get("shared_at")
         and _in_time_range(r, args.time_range)
     ]
@@ -532,7 +536,8 @@ def _show_redaction_detail(rec: dict):
             print(f"    {DIM}AI review unavailable.{RST}")
 
 
-def step_review(conn, scrubbed: list[dict], assume_yes: bool) -> list[dict]:
+def step_review(conn, scrubbed: list[dict], assume_yes: bool,
+                include_needs_review: bool = False) -> list[dict]:
     step(3, "Review — inspect & include before packaging")
     print(f"  {DIM}Including a trace here affects this bundle only — it does not change "
           f"its local review status.{RST}")
@@ -548,7 +553,19 @@ def step_review(conn, scrubbed: list[dict], assume_yes: bool) -> list[dict]:
     included_ids: set[str] = set()
 
     if assume_yes:
-        included_ids = {s["row"]["session_id"] for s in scrubbed}
+        # Non-interactive: include clear traces. Needs-review traces are NOT
+        # silently included (we can't show their redacted preview here) — they
+        # require the explicit --include-needs-review opt-in.
+        included_ids = {s["row"]["session_id"] for s in clear}
+        if review:
+            if include_needs_review:
+                included_ids |= {s["row"]["session_id"] for s in review}
+                print(f"  {YEL}Including {len(review)} needs-review trace(s) unreviewed "
+                      f"(--include-needs-review).{RST}")
+            else:
+                die(f"{len(review)} trace(s) need review and --yes can't show their redacted "
+                    f"preview. Re-run interactively to inspect them, or pass "
+                    f"--include-needs-review to include them unreviewed.")
     else:
         if clear and yesno(f"\n{BOLD}Include all {len(clear)} clear trace(s)?{RST}", default_yes=True):
             included_ids |= {s["row"]["session_id"] for s in clear}
@@ -606,6 +623,13 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
                 zip_size = len(build_zip(export_dir))
             except Exception:  # noqa: BLE001
                 zip_size = 0
+            # #2: refuse to ship a sealed bundle whose AI coverage differs from
+            # the preview the user reviewed (seal can silently fall back to rules-only).
+            ok, why = share_flow.verify_coverage(manifest, package_ai)
+            if not ok:
+                die(f"AI coverage mismatch — {why}. Refusing to share a bundle that differs "
+                    f"from what you reviewed. Re-run (the seal will retry AI), or run without "
+                    f"--ai-pii-review to review and ship rules-only consistently.")
             print(f"{GRN}✓ packaged{RST}")
             print(f"  bundle:   {share_id[:8]}   sessions: {len(manifest.get('sessions', []))}")
             print(f"  path:     {export_dir}")
@@ -826,9 +850,44 @@ def add_interactive_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentP
                         help="with --yes, also write the bundle zip to ~/Downloads")
     parser.add_argument("--no-refresh", action="store_true",
                         help="skip the startup index scan (use the existing index as-is)")
+    parser.add_argument("--include-needs-review", action="store_true",
+                        help="with --yes, include needs-review traces unreviewed (default: refuse)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="assume yes for preview/review/download prompts (NOT consent)")
     return parser
+
+
+# Interactive-only option dests + the flag spelling to show when misused outside
+# `--interactive`. Used to reject silently-ignored flags on non-interactive share.
+_INTERACTIVE_ONLY_CHECKS = (
+    ("time_range", lambda v: v not in (None, "today"), "--weekly/--all"),
+    ("source", lambda v: bool(v), "--source/--codex/--claude"),
+    ("search", lambda v: bool(v), "--search"),
+    ("project", lambda v: bool(v), "--project"),
+    ("min_failure_value", lambda v: v is not None, "--min-failure-value"),
+    ("limit", lambda v: v not in (None, 40), "--limit"),
+    ("summary", lambda v: bool(v), "--summary"),
+    ("summary_model", lambda v: bool(v), "--summary-model"),
+    ("yes", lambda v: bool(v), "--yes"),
+    ("accept_terms", lambda v: bool(v), "--accept-terms"),
+    ("certify_ownership", lambda v: bool(v), "--certify-ownership"),
+    ("download", lambda v: bool(v), "--download"),
+    ("no_refresh", lambda v: bool(v), "--no-refresh"),
+    ("include_needs_review", lambda v: bool(v), "--include-needs-review"),
+)
+
+
+def noninteractive_share_rejections(args) -> list[str]:
+    """Flags/values that are only meaningful in the interactive wizard and would
+    be silently ignored by non-interactive `clawjournal share`. Returns the list
+    of offending flag descriptions (empty = fine)."""
+    bad = [label for dest, is_set, label in _INTERACTIVE_ONLY_CHECKS
+           if is_set(getattr(args, dest, None))]
+    # #5: non-interactive one-step share must not auto-package new/blocked sessions.
+    if getattr(args, "status", None) in ("new", "blocked"):
+        bad.append("--status new/blocked (interactive only; non-interactive supports "
+                   "approved/shortlisted)")
+    return bad
 
 
 def add_share_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -887,7 +946,8 @@ def run(args) -> None:
         ai_pii_requested = bool(args.ai_pii_review or settings.get("ai_pii_review_enabled"))
         chosen = step_queue(conn, settings, args)
         scrubbed, package_ai = step_redact(conn, settings, chosen, args.yes, ai_pii_requested)
-        included = step_review(conn, scrubbed, args.yes)
+        included = step_review(conn, scrubbed, args.yes,
+                               include_needs_review=getattr(args, "include_needs_review", False))
         share_id, export_dir = step_package(conn, settings, included, package_ai, args)
         result = step_submit(conn, settings, share_id, package_ai, args)
         step_done(share_id, export_dir, result, args.yes,

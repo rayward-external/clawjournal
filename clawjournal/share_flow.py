@@ -235,6 +235,26 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             "blocked_sessions": []}
 
 
+def verify_coverage(manifest: dict, package_ai: bool) -> tuple[bool, str]:
+    """CLI-side guard (no daemon change): the sealed artifact's AI coverage must
+    match the preview decision, so we never ship something LESS redacted than
+    what the user reviewed. The seal pass uses ignore_llm_errors=True and can
+    silently fall back to rules-only; this catches that divergence.
+
+    Returns (ok, message). ok=True means the sealed bundle is consistent."""
+    if not package_ai:
+        return True, ""  # rules-only preview -> rules-only seal is consistent
+    summary = (manifest or {}).get("redaction_summary") or {}
+    pr = summary.get("pii_review") or {}
+    if not pr.get("ai_enabled"):
+        return False, "preview was AI-reviewed but the sealed bundle ran rules-only"
+    rules_only = (pr.get("coverage") or {}).get("rules_only", 0)
+    if rules_only:
+        return False, (f"preview was AI-reviewed but AI review failed for {rules_only} "
+                       f"trace(s) during sealing (those shipped rules-only)")
+    return True, ""
+
+
 def build_zip(export_dir: Path) -> bytes:
     return _daemon_build_zip(export_dir)
 

@@ -4398,6 +4398,14 @@ def main() -> None:
             from .share_cli import run as _run_share_cli
             _run_share_cli(args)
         else:
+            # Interactive-only flags must not be silently ignored by the
+            # non-interactive one-step share.
+            from .share_cli import noninteractive_share_rejections
+            bad = noninteractive_share_rejections(args)
+            if bad:
+                print("These options only apply with --interactive: "
+                      + ", ".join(bad), file=sys.stderr)
+                sys.exit(2)
             _run_share(args)
         return
 

@@ -51,13 +51,28 @@ def test_review_does_not_import_update_session():
     assert "update_session" not in src, "share wizard must not touch review_status"
 
 
-def test_review_is_share_local(monkeypatch):
-    # assume_yes includes everything and returns the in-memory selection; no DB write.
-    recs = [
-        {"row": {"session_id": "a", "display_title": "A"}, "status": "clear"},
-        {"row": {"session_id": "b", "display_title": "B"}, "status": "review"},
-    ]
+def _rec(sid, status):
+    return {"row": {"session_id": sid, "display_title": sid}, "status": status}
+
+
+def test_review_is_share_local_clear_only():
+    # assume_yes includes the clear traces; returns in-memory selection, no DB write.
+    recs = [_rec("a", "clear"), _rec("b", "clear")]
     included = share_cli.step_review(conn=None, scrubbed=recs, assume_yes=True)
+    assert {s["row"]["session_id"] for s in included} == {"a", "b"}
+
+
+def test_review_yes_refuses_needs_review():
+    # #3: --yes must NOT silently include needs-review traces.
+    recs = [_rec("a", "clear"), _rec("b", "review")]
+    with pytest.raises(SystemExit):
+        share_cli.step_review(conn=None, scrubbed=recs, assume_yes=True)
+
+
+def test_review_yes_include_needs_review_optin():
+    recs = [_rec("a", "clear"), _rec("b", "review")]
+    included = share_cli.step_review(conn=None, scrubbed=recs, assume_yes=True,
+                                     include_needs_review=True)
     assert {s["row"]["session_id"] for s in included} == {"a", "b"}
 
 
@@ -330,3 +345,69 @@ def test_parse_selection_all_and_numbers():
     import pytest
     with pytest.raises(ValueError):
         share_cli._parse_selection("nope", 4)
+
+
+# ---- #4/#5: non-interactive share must reject interactive-only flags --------
+
+def test_noninteractive_rejections_flags_and_status():
+    # interactive-only flags flagged
+    a = SimpleNamespace(time_range="weekly", source="codex", search=None, project=None,
+                        min_failure_value=None, limit=40, summary=False, summary_model=None,
+                        yes=False, accept_terms=False, certify_ownership=False, download=False,
+                        no_refresh=False, include_needs_review=False, status="approved")
+    bad = share_cli.noninteractive_share_rejections(a)
+    assert any("weekly" in b for b in bad) and any("source" in b for b in bad)
+
+    # status new/blocked rejected non-interactively (#5)
+    b = SimpleNamespace(time_range="today", source=None, search=None, project=None,
+                        min_failure_value=None, limit=40, summary=False, summary_model=None,
+                        yes=False, accept_terms=False, certify_ownership=False, download=False,
+                        no_refresh=False, include_needs_review=False, status="new")
+    assert any("new/blocked" in x for x in share_cli.noninteractive_share_rejections(b))
+
+    # plain non-interactive share is fine
+    c = SimpleNamespace(time_range="today", source=None, search=None, project=None,
+                        min_failure_value=None, limit=40, summary=False, summary_model=None,
+                        yes=False, accept_terms=False, certify_ownership=False, download=False,
+                        no_refresh=False, include_needs_review=False, status="approved")
+    assert share_cli.noninteractive_share_rejections(c) == []
+
+
+# ---- #6: expired embargo is shareable (effective hold state) ----------------
+
+def test_queue_includes_expired_embargo_excludes_active(monkeypatch):
+    past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    rows = [
+        _row(fv=5, session_id="released", hold_state="released"),
+        _row(fv=5, session_id="expired_embargo", hold_state="embargoed", embargo_until=past),
+        _row(fv=5, session_id="active_embargo", hold_state="embargoed", embargo_until=future),
+        _row(fv=5, session_id="pending", hold_state="pending_review"),
+    ]
+    out = share_cli.select_queue_rows(rows, _SETTINGS, _qargs())
+    ids = {r["session_id"] for r in out}
+    assert "released" in ids
+    assert "expired_embargo" in ids       # expired embargo -> effectively released
+    assert "active_embargo" not in ids    # still embargoed
+    assert "pending" not in ids
+
+
+# ---- #2: sealed-coverage verification (preview == shipped) ------------------
+
+def test_verify_coverage_consistency():
+    from clawjournal import share_flow as sf
+    # AI off -> always consistent
+    assert sf.verify_coverage({}, package_ai=False)[0] is True
+    # AI on + sealed fully AI -> ok
+    m_full = {"redaction_summary": {"pii_review": {"ai_enabled": True,
+                                                   "coverage": {"full": 2, "rules_only": 0}}}}
+    assert sf.verify_coverage(m_full, package_ai=True)[0] is True
+    # AI on but sealed ran rules-only -> mismatch
+    m_off = {"redaction_summary": {"pii_review": {"ai_enabled": False,
+                                                  "coverage": {"full": 0, "rules_only": 2}}}}
+    ok, why = sf.verify_coverage(m_off, package_ai=True)
+    assert ok is False and "rules-only" in why
+    # AI on but some traces fell back to rules-only during seal -> mismatch
+    m_partial = {"redaction_summary": {"pii_review": {"ai_enabled": True,
+                                                      "coverage": {"full": 1, "rules_only": 1}}}}
+    assert sf.verify_coverage(m_partial, package_ai=True)[0] is False
