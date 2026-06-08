@@ -116,28 +116,31 @@ export function TraceCard({
       <div style={{ flex: 1, minWidth: 0 }}>
         {/* Title row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontWeight: 600, fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <span style={{ fontWeight: 600, fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
             {session.display_title}
           </span>
           {session.ai_failure_value_score != null && (
-            <span style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: '2px 7px',
-              borderRadius: 9999,
-              fontSize: 11,
-              fontWeight: 700,
-              color: '#991b1b',
-              background: '#fee2e2',
-              flexShrink: 0,
-            }}>
-              {session.ai_failure_value_score} failure value
+            <span
+              title="Failure value (1–5): how useful this trace is for studying agent failure behavior — not how badly the session failed"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '2px 7px',
+                borderRadius: 9999,
+                fontSize: 11,
+                fontWeight: 700,
+                color: '#7a5508',
+                background: '#fdf3d4',
+                flexShrink: 0,
+              }}
+            >
+              Failure value {session.ai_failure_value_score}/5
             </span>
           )}
           {session.ai_quality_score != null && (
             <span
-              title="Productivity score"
+              title="Productivity (1–5): how much useful work this session accomplished"
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -151,7 +154,7 @@ export function TraceCard({
                 flexShrink: 0,
               }}
             >
-              Prod {session.ai_quality_score}/5
+              Productivity {session.ai_quality_score}/5
             </span>
           )}
           <span style={{ fontSize: 12, color: '#9ca3af', flexShrink: 0 }}>

@@ -3647,7 +3647,7 @@ def get_share_ready_stats(
         " ai_quality_score, ai_failure_value_score, ai_recovery_labels,"
         " ai_failure_attribution, ai_failure_modes, ai_learning_summary,"
         " user_messages, assistant_messages, tool_uses,"
-        " input_tokens, output_tokens, outcome_badge, client_origin,"
+        f" input_tokens, output_tokens, ({_OUTCOME_NORMALIZE_SQL}) as outcome_badge, client_origin,"
         " runtime_channel, start_time, review_status, hold_state, embargo_until"
         " FROM sessions"
         f"{where_status}"
