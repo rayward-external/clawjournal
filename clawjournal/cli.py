@@ -5147,7 +5147,7 @@ def _run_trufflehog_command(args) -> None:
     sub_command = getattr(args, "trufflehog_command", None)
 
     if sub_command == "install":
-        result = install(force=args.force)
+        result = install(force=args.force, progress=None if args.json else print)
         if args.json:
             print(json.dumps(result, indent=2))
         else:
@@ -5155,13 +5155,16 @@ def _run_trufflehog_command(args) -> None:
             if status == "installed":
                 print(f"Installed TruffleHog {result['version']} at {result['path']}.")
             elif status == "already-installed":
-                version = result.get("version") or "unknown version"
                 print(
-                    f"Already installed ({version}) at {result['path']}. "
+                    f"Already installed ({result['version']}) at {result['path']}. "
                     "Pass --force to reinstall."
                 )
             else:
                 print(f"Install failed ({status}): {result.get('error', '')}")
+                if result.get("url"):
+                    print(f"  URL: {result['url']}")
+                if result.get("hint"):
+                    print(f"  {result['hint']}")
         if result["status"] not in ("installed", "already-installed"):
             sys.exit(1)
         return
@@ -5170,16 +5173,22 @@ def _run_trufflehog_command(args) -> None:
     resolved = trufflehog.resolve_binary()
     managed = managed_binary_path()
     fingerprint = trufflehog.engine_fingerprint()
+    version_match = trufflehog._VERSION_RE.search(fingerprint)
     payload = {
         "resolved_path": resolved,
         "managed": resolved == str(managed),
         "managed_path": str(managed),
-        "version": fingerprint,
+        # Bare version (e.g. "3.95.5") to match install --json; the raw
+        # engine fingerprint (e.g. "trufflehog 3.95.5") rides alongside.
+        "version": version_match.group(1) if version_match else None,
+        "fingerprint": fingerprint,
         "pinned_version": PINNED_VERSION,
         "available": resolved is not None,
     }
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2))
+        if resolved is None:
+            sys.exit(1)
         return
     if resolved is None:
         print("TruffleHog: not installed — share exports will be blocked.")

@@ -17,6 +17,7 @@ in-process and nothing is redistributed by us.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import http.client
 import os
@@ -28,6 +29,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 from .trufflehog import _VERSION_RE, _scrubbed_subprocess_env, managed_binary_path
 
@@ -43,6 +45,7 @@ _ARCHIVE_SHA256: dict[str, str] = {
     "linux_amd64": "8d151a19465973bec226be5992a2a11b053f4ab92c77861f642089892ae9aa58",
     "linux_arm64": "bb876c4e5a84fa4fdbda4fc24143ed2d12eac32cfd3f7e41c79cbd7d33607b4a",
     "windows_amd64": "4421ac2786b2a356d62d2f4c59798bba5069c7a9f4dc7af9558061568b642c4d",
+    "windows_arm64": "bfece06dcbb4e1b4d366376294e702fa548f782048b32501cb58f97d713b7110",
 }
 
 _DOWNLOAD_URL_TEMPLATE = (
@@ -53,6 +56,19 @@ _DOWNLOAD_URL_TEMPLATE = (
 _MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # archives are ~30–60 MB
 _MAX_BINARY_BYTES = 500 * 1024 * 1024  # decompressed binary cap
 _DOWNLOAD_TIMEOUT_SECONDS = 120
+_PROGRESS_TICK_BYTES = 16 * 1024 * 1024
+
+DOWNLOAD_FAILED_HINT = (
+    "Check your network and proxy settings (HTTPS_PROXY/HTTP_PROXY are honored) "
+    "and retry. If this machine is offline, install TruffleHog manually: "
+    "https://github.com/trufflesecurity/trufflehog#floppy_disk-installation"
+)
+CHECKSUM_MISMATCH_HINT = (
+    "The downloaded archive does not match the checksum pinned in this clawjournal "
+    "release. Common causes: a TLS-intercepting (corporate/campus) proxy rewriting "
+    "the download, a truncated transfer, or an outdated clawjournal — run "
+    "`clawjournal selfupdate` and retry. Nothing was installed."
+)
 
 
 def platform_key() -> str | None:
@@ -83,16 +99,28 @@ def download_url(key: str) -> str:
     return _DOWNLOAD_URL_TEMPLATE.format(version=PINNED_VERSION, platform=key)
 
 
-def _download_archive(url: str, dest_fd: int) -> str:
+def _download_archive(
+    url: str,
+    dest_fd: int,
+    progress: Callable[[str], None] | None = None,
+) -> str:
     """Stream ``url`` into ``dest_fd``; return the payload's sha256 hex.
 
     Raises ``urllib.error.URLError``/``OSError`` on network trouble and
-    ``ValueError`` if the payload exceeds the size cap.
+    ``ValueError`` if the payload exceeds the size cap. ``progress``
+    (if given) receives a start line and a tick every ~16 MB so a slow
+    link doesn't look like a hang.
     """
     digest = hashlib.sha256()
     total = 0
     request = urllib.request.Request(url, headers={"User-Agent": "clawjournal"})
     with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        if progress is not None:
+            length = getattr(response, "headers", None)
+            length = length.get("Content-Length") if length else None
+            size = f" ({int(length) // (1024 * 1024)} MB)" if length and str(length).isdigit() else ""
+            progress(f"Downloading TruffleHog v{PINNED_VERSION}{size} from GitHub releases…")
+        next_tick = _PROGRESS_TICK_BYTES
         while True:
             chunk = response.read(65536)
             if not chunk:
@@ -104,14 +132,22 @@ def _download_archive(url: str, dest_fd: int) -> str:
                 )
             digest.update(chunk)
             os.write(dest_fd, chunk)
+            if progress is not None and total >= next_tick:
+                progress(f"  … {total // (1024 * 1024)} MB")
+                next_tick += _PROGRESS_TICK_BYTES
     return digest.hexdigest()
 
 
-def _extract_binary(archive_path: Path, binary_name: str, dest_path: Path) -> None:
-    """Pull exactly the ``binary_name`` member out of the release tarball
-    into ``dest_path`` (parent must exist). Member names are matched
-    exactly — anything resembling a path (``/``, ``..``) is never written,
-    so a malicious archive cannot traverse out of the target directory.
+def _extract_binary(archive_path: Path, binary_name: str, dest_dir: Path) -> Path:
+    """Stage exactly the ``binary_name`` member of the release tarball
+    into a temp file under ``dest_dir`` and return its path. Member names
+    are matched exactly — anything resembling a path (``/``, ``..``) is
+    never written, so a malicious archive cannot traverse out of the
+    target directory.
+
+    The staged file is chmod 0o755 and fsynced but NOT published: the
+    caller verifies it executes before os.replace()-ing it into place,
+    so a bad download can never displace a working managed binary.
 
     Raises ``ValueError`` if the member is absent or oversized, and
     ``tarfile.TarError`` on a corrupt archive.
@@ -129,7 +165,7 @@ def _extract_binary(archive_path: Path, binary_name: str, dest_path: Path) -> No
         source = tar.extractfile(member)
         if source is None:
             raise ValueError(f"archive member '{binary_name}' is not readable")
-        fd, tmp_name = tempfile.mkstemp(dir=str(dest_path.parent), prefix=f".{binary_name}.")
+        fd, tmp_name = tempfile.mkstemp(dir=str(dest_dir), prefix=f".{binary_name}.")
         try:
             try:
                 with source:
@@ -138,18 +174,19 @@ def _extract_binary(archive_path: Path, binary_name: str, dest_path: Path) -> No
                         if not chunk:
                             break
                         os.write(fd, chunk)
+                os.fsync(fd)
             finally:
                 os.close(fd)
             # os.chmod on the path, not os.fchmod on the fd — fchmod doesn't
             # exist on Windows before Python 3.13 and this must run on 3.10+.
             os.chmod(tmp_name, 0o755)
-            os.replace(tmp_name, dest_path)
         except BaseException:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
             raise
+    return Path(tmp_name)
 
 
 def _verify_installed_binary(path: Path) -> str | None:
@@ -176,16 +213,24 @@ def _verify_installed_binary(path: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def install(*, force: bool = False) -> dict:
+def install(
+    *,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
     """Install the pinned TruffleHog into ``~/.clawjournal/bin``.
 
-    Returns a result dict with ``status`` plus context fields; never
-    raises. Statuses: ``installed``, ``already-installed``,
+    Returns a result dict with ``status`` plus context fields (and a
+    ``hint`` with remediation advice on network/checksum failures);
+    never raises. Statuses: ``installed``, ``already-installed``,
     ``unsupported-platform``, ``download-failed``, ``checksum-mismatch``,
     ``archive-invalid``, ``verify-failed``, ``install-failed``.
+
+    ``progress`` (if given) receives human-readable download progress
+    lines — the CLI passes ``print`` so a slow link doesn't look hung.
     """
     try:
-        return _install(force=force)
+        return _install(force=force, progress=progress)
     except Exception as exc:
         # Backstop for anything the specific handlers below don't name
         # (e.g. a stray file blocking the bin-dir mkdir). The CLI shows a
@@ -197,16 +242,26 @@ def install(*, force: bool = False) -> dict:
         }
 
 
-def _install(*, force: bool = False) -> dict:
+def _install(
+    *,
+    force: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
     target = managed_binary_path()
     binary_name = target.name
 
-    if target.exists() and not force:
-        return {
-            "status": "already-installed",
-            "path": str(target),
-            "version": _verify_installed_binary(target),
-        }
+    # "Already installed" must mean "the share gate will use it AND it
+    # is the pinned version" — an unexecutable file, a directory, or an
+    # off-pin copy from an older clawjournal falls through to a fresh
+    # install (the atomic publish below makes overwriting safe).
+    if not force and target.is_file() and os.access(target, os.X_OK):
+        current = _verify_installed_binary(target)
+        if current == PINNED_VERSION:
+            return {
+                "status": "already-installed",
+                "path": str(target),
+                "version": current,
+            }
 
     key = platform_key()
     if key is None:
@@ -227,14 +282,20 @@ def _install(*, force: bool = False) -> dict:
         dir=str(target.parent), prefix=".trufflehog-download.", suffix=".tar.gz"
     )
     archive_path = Path(archive_name)
+    staged: Path | None = None
     try:
         try:
-            actual_sha256 = _download_archive(url, archive_fd)
+            actual_sha256 = _download_archive(url, archive_fd, progress=progress)
         except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
             # HTTPException covers e.g. IncompleteRead on a truncated
             # chunked response; URLError is already an OSError subclass
             # but is named for clarity.
-            return {"status": "download-failed", "url": url, "error": str(exc)}
+            return {
+                "status": "download-failed",
+                "url": url,
+                "error": str(exc),
+                "hint": DOWNLOAD_FAILED_HINT,
+            }
         finally:
             os.close(archive_fd)
 
@@ -247,29 +308,59 @@ def _install(*, force: bool = False) -> dict:
                     f"sha256 {actual_sha256} does not match the pinned "
                     f"checksum {expected_sha256} for {key}"
                 ),
+                "hint": CHECKSUM_MISMATCH_HINT,
+            }
+
+        # Failure domains are reported distinctly: a bad archive is
+        # "archive-invalid" (re-download might help), local file I/O is
+        # "install-failed" (the archive already passed its checksum).
+        # gzip.BadGzipFile and EOFError are raised by truncated/corrupt
+        # streams mid-extract; BadGzipFile subclasses OSError so it must
+        # be matched before the OSError clause.
+        try:
+            staged = _extract_binary(archive_path, binary_name, target.parent)
+        except (tarfile.TarError, gzip.BadGzipFile, EOFError, ValueError) as exc:
+            return {"status": "archive-invalid", "url": url, "error": str(exc)}
+        except OSError as exc:
+            return {
+                "status": "install-failed",
+                "error": f"local file I/O failed while staging the binary: {exc}",
+            }
+
+        # Verify BEFORE publish: a binary that doesn't run (wrong arch,
+        # truncation the checksum somehow missed) never displaces an
+        # existing working managed binary.
+        version = _verify_installed_binary(staged)
+        if version is None:
+            return {
+                "status": "verify-failed",
+                "path": str(target),
+                "error": (
+                    "downloaded binary failed to execute `--version`; "
+                    "the existing managed binary (if any) was left untouched"
+                ),
             }
 
         try:
-            _extract_binary(archive_path, binary_name, target)
-        except (tarfile.TarError, ValueError, OSError, EOFError) as exc:
-            # EOFError: gzip stream truncated mid-member.
-            return {"status": "archive-invalid", "url": url, "error": str(exc)}
+            os.replace(staged, target)
+        except OSError as exc:
+            # E.g. Windows refusing to replace a running .exe, or a
+            # directory squatting on the target path.
+            return {
+                "status": "install-failed",
+                "error": (
+                    f"could not move the verified binary into place at "
+                    f"{target}: {exc}"
+                ),
+            }
+        staged = None  # published — nothing to clean up
     finally:
-        try:
-            archive_path.unlink()
-        except OSError:
-            pass
-
-    version = _verify_installed_binary(target)
-    if version is None:
-        try:
-            target.unlink()
-        except OSError:
-            pass
-        return {
-            "status": "verify-failed",
-            "path": str(target),
-            "error": "installed binary failed to execute `--version`; removed it",
-        }
+        for leftover in (archive_path, staged):
+            if leftover is None:
+                continue
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
     return {"status": "installed", "path": str(target), "version": version}

@@ -65,8 +65,8 @@ The scan is mandatory. Outcomes:
 Install:
 
 ```bash
-# Any platform — pinned version, sha256-verified against the official
-# release, installed to ~/.clawjournal/bin (preferred over PATH):
+# macOS / Linux / Windows (x86-64 and ARM64) — pinned version, sha256-verified
+# against the official release, installed to ~/.clawjournal/bin (preferred over PATH):
 clawjournal trufflehog install
 
 # Or install it yourself:

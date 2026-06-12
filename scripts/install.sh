@@ -164,7 +164,7 @@ if ! command -v trufflehog >/dev/null 2>&1 && [ ! -x "$HOME/.clawjournal/bin/tru
   cat <<EOF
 
 [i] TruffleHog is required when sharing exports. Install it before 'bundle-export':
-    clawjournal trufflehog install      (pinned version, sha256-verified, no root needed)
+    $VENV_BIN/clawjournal trufflehog install      (pinned version, sha256-verified, no root needed)
     Or: brew install trufflehog (macOS) / https://github.com/trufflesecurity/trufflehog/releases
 EOF
 fi

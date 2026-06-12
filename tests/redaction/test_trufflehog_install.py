@@ -133,6 +133,8 @@ class TestInstall:
         result = trufflehog_install.install()
 
         assert result["status"] == "checksum-mismatch"
+        # Remediation guidance rides along for the CLI to print.
+        assert "proxy" in result["hint"]
         assert not install_env["target"].exists()
         # Nothing left behind in the bin dir either.
         bin_dir = install_env["target"].parent
@@ -142,12 +144,51 @@ class TestInstall:
         target = install_env["target"]
         target.parent.mkdir(parents=True)
         target.write_bytes(b"existing")
+        target.chmod(0o755)  # fixture's verify stub reports the pinned version
 
         result = trufflehog_install.install()
 
         assert result["status"] == "already-installed"
+        assert result["version"] == trufflehog_install.PINNED_VERSION
         assert target.read_bytes() == b"existing"
         assert install_env["urls"] == []  # no network touch
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX exec-bit semantics")
+    def test_non_executable_existing_file_is_reinstalled(self, install_env):
+        # A managed file the share gate would refuse (no exec bit) must not
+        # report already-installed — that combination previously claimed
+        # success while resolve_binary() ignored the file.
+        target = install_env["target"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"existing")
+        target.chmod(0o644)
+        install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
+
+        result = trufflehog_install.install()
+
+        assert result["status"] == "installed"
+        assert target.read_bytes() == BINARY_CONTENT
+        assert os.access(target, os.X_OK)
+
+    def test_off_pin_existing_binary_is_upgraded(self, install_env, monkeypatch):
+        # A managed binary from an older clawjournal pin is upgraded, not
+        # reported as already-installed.
+        target = install_env["target"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"old pinned version")
+        target.chmod(0o755)
+        monkeypatch.setattr(
+            trufflehog_install,
+            "_verify_installed_binary",
+            lambda path: "3.90.0" if Path(path) == target else "3.95.5",
+        )
+        install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
+
+        result = trufflehog_install.install()
+
+        assert result["status"] == "installed"
+        assert result["version"] == "3.95.5"
+        assert target.read_bytes() == BINARY_CONTENT
 
     def test_force_reinstalls(self, install_env):
         target = install_env["target"]
@@ -159,6 +200,15 @@ class TestInstall:
 
         assert result["status"] == "installed"
         assert target.read_bytes() == BINARY_CONTENT
+
+    def test_progress_callback_reports_download(self, install_env):
+        install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
+        messages: list[str] = []
+
+        result = trufflehog_install.install(progress=messages.append)
+
+        assert result["status"] == "installed"
+        assert messages and "Downloading TruffleHog" in messages[0]
 
     def test_unsupported_platform(self, install_env, monkeypatch):
         monkeypatch.setattr(trufflehog_install, "platform_key", lambda: None)
@@ -176,6 +226,7 @@ class TestInstall:
         result = trufflehog_install.install()
 
         assert result["status"] == "download-failed"
+        assert "proxy" in result["hint"]
         assert not install_env["target"].exists()
 
     def test_oversized_download_aborts(self, install_env, monkeypatch):
@@ -209,7 +260,7 @@ class TestInstall:
         assert result["status"] == "archive-invalid"
         assert not install_env["target"].exists()
 
-    def test_verify_failure_removes_binary(self, install_env, monkeypatch):
+    def test_verify_failure_never_publishes(self, install_env, monkeypatch):
         install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
         monkeypatch.setattr(
             trufflehog_install, "_verify_installed_binary", lambda path: None
@@ -219,6 +270,46 @@ class TestInstall:
 
         assert result["status"] == "verify-failed"
         assert not install_env["target"].exists()
+        # The staged temp and the downloaded archive are both cleaned up.
+        bin_dir = install_env["target"].parent
+        assert not bin_dir.exists() or list(bin_dir.iterdir()) == []
+
+    def test_verify_failure_leaves_existing_binary_untouched(self, install_env, monkeypatch):
+        # Verification happens BEFORE publish: a bad download (even under
+        # --force) must never displace a working managed binary.
+        target = install_env["target"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"known good binary")
+        target.chmod(0o755)
+        install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
+        monkeypatch.setattr(
+            trufflehog_install, "_verify_installed_binary", lambda path: None
+        )
+
+        result = trufflehog_install.install(force=True)
+
+        assert result["status"] == "verify-failed"
+        assert "left untouched" in result["error"]
+        assert target.read_bytes() == b"known good binary"
+
+    def test_replace_failure_is_install_failed_not_archive_invalid(self, install_env):
+        # A directory squatting on the target path fails at publish time —
+        # a LOCAL error. Reporting it as "archive-invalid" (with the GitHub
+        # URL) would misdirect the user at a re-download remediation right
+        # after the checksum proved the archive is byte-identical to
+        # upstream.
+        target = install_env["target"]
+        (target / "occupied").mkdir(parents=True)
+        install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
+
+        result = trufflehog_install.install(force=True)
+
+        assert result["status"] == "install-failed"
+        assert "into place" in result["error"]
+        assert target.is_dir()  # nothing destroyed
+        # Staged temp and archive cleaned; only the squatting dir remains.
+        leftovers = [p.name for p in target.parent.iterdir()]
+        assert leftovers == [target.name]
 
 
 class TestInstallNeverRaises:
@@ -340,7 +431,7 @@ class TestPlatformKey:
             ("linux", "posix", "x86_64", "linux_amd64"),
             ("linux", "posix", "aarch64", "linux_arm64"),
             ("win32", "nt", "AMD64", "windows_amd64"),
-            ("win32", "nt", "ARM64", None),  # no windows_arm64 release row
+            ("win32", "nt", "ARM64", "windows_arm64"),
             ("linux", "posix", "riscv64", None),
             ("sunos5", "posix", "x86_64", None),
         ],
@@ -360,7 +451,7 @@ class TestPlatformKey:
         assert set(trufflehog_install._ARCHIVE_SHA256) == {
             "darwin_amd64", "darwin_arm64",
             "linux_amd64", "linux_arm64",
-            "windows_amd64",
+            "windows_amd64", "windows_arm64",
         }
         for value in trufflehog_install._ARCHIVE_SHA256.values():
             assert len(value) == 64
@@ -453,7 +544,7 @@ class TestBinaryResolution:
 
 
 class TestCliCommand:
-    def test_status_json_when_missing(self, tmp_path, monkeypatch, capsys):
+    def test_status_json_when_missing_exits_nonzero(self, tmp_path, monkeypatch, capsys):
         import json as json_mod
 
         from clawjournal.cli import _run_trufflehog_command
@@ -464,11 +555,17 @@ class TestCliCommand:
         )
         args = Namespace(trufflehog_command="status", json=True)
 
-        _run_trufflehog_command(args)
+        # Exit code matches human mode — a script gets both the JSON on
+        # stdout and a non-zero exit when the gate binary is missing.
+        with pytest.raises(SystemExit) as excinfo:
+            _run_trufflehog_command(args)
 
+        assert excinfo.value.code == 1
         payload = json_mod.loads(capsys.readouterr().out)
         assert payload["available"] is False
         assert payload["resolved_path"] is None
+        assert payload["version"] is None
+        assert payload["fingerprint"] == "missing"
         assert payload["pinned_version"] == trufflehog_install.PINNED_VERSION
 
     def test_status_human_when_missing_exits_nonzero(self, tmp_path, monkeypatch, capsys):
@@ -491,8 +588,9 @@ class TestCliCommand:
 
         calls = {}
 
-        def fake_install(*, force=False):
+        def fake_install(*, force=False, progress=None):
             calls["force"] = force
+            calls["progress"] = progress
             return {"status": "installed", "path": "/x/trufflehog", "version": "3.95.5"}
 
         monkeypatch.setattr(
@@ -503,6 +601,7 @@ class TestCliCommand:
         cli._run_trufflehog_command(args)
 
         assert calls["force"] is True
+        assert calls["progress"] is not None  # human mode streams progress
         assert "Installed TruffleHog 3.95.5" in capsys.readouterr().out
 
     def test_install_failure_exits_nonzero(self, monkeypatch, capsys):
@@ -510,7 +609,12 @@ class TestCliCommand:
 
         monkeypatch.setattr(
             "clawjournal.redaction.trufflehog_install.install",
-            lambda *, force=False: {"status": "download-failed", "error": "offline"},
+            lambda *, force=False, progress=None: {
+                "status": "download-failed",
+                "error": "offline",
+                "url": "https://example.invalid/archive.tar.gz",
+                "hint": "Check your network.",
+            },
         )
         args = Namespace(trufflehog_command="install", force=False, json=False)
 
@@ -518,7 +622,11 @@ class TestCliCommand:
             cli._run_trufflehog_command(args)
 
         assert excinfo.value.code == 1
-        assert "download-failed" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "download-failed" in out
+        # Failure output carries the URL and the remediation hint.
+        assert "https://example.invalid/archive.tar.gz" in out
+        assert "Check your network." in out
 
     def test_parser_roundtrip_via_main(self, tmp_path, monkeypatch, capsys):
         import sys as sys_mod
@@ -534,7 +642,9 @@ class TestCliCommand:
             sys_mod, "argv", ["clawjournal", "trufflehog", "status", "--json"]
         )
 
-        main()
+        with pytest.raises(SystemExit) as excinfo:
+            main()
 
+        assert excinfo.value.code == 1
         out = capsys.readouterr().out
         assert '"available": false' in out

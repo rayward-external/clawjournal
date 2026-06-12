@@ -169,6 +169,6 @@ $managedTrufflehog = Join-Path $HOME ".clawjournal\bin\trufflehog.exe"
 if (-not (Get-Command trufflehog -ErrorAction SilentlyContinue) -and -not (Test-Path $managedTrufflehog)) {
     Write-Host ""
     Write-Host "[i] TruffleHog is required when sharing exports."
-    Write-Host "    Install a pinned, checksum-verified copy: clawjournal trufflehog install"
+    Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalExe trufflehog install"
     Write-Host "    Or download a release binary: https://github.com/trufflesecurity/trufflehog/releases"
 }

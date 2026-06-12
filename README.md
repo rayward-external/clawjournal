@@ -132,7 +132,8 @@ Use [Quickstart](#quickstart) above (or the install prompt at the top). TruffleH
 <summary><b>Show TruffleHog install commands</b></summary>
 
 ```bash
-# Any platform — pinned version, sha256-verified, installed to ~/.clawjournal/bin, no root needed:
+# macOS / Linux / Windows (x86-64 and ARM64) — pinned version, sha256-verified,
+# installed to ~/.clawjournal/bin, no root needed:
 clawjournal trufflehog install
 
 # Or install it yourself:
