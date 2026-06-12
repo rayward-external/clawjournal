@@ -230,6 +230,10 @@ clawjournal share --interactive --weekly
 
 It lists shareable traces, prioritizes AI-scored high-failure-value sessions, shows the redacted preview, asks for consent, then uploads when hosted submission is available or saves a ZIP for manual upload. Useful filters: `--all`, `--source codex`, `--source claude`, `--search "text"`, and `--ai-pii-review` for the optional AI PII pass.
 
+Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
+
+> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.*
+
 > ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** It only uploads to a **self-hosted** ingest server you configure via `CLAWJOURNAL_INGEST_URL`; without it, it reports *"Hosted sharing is not configured."* Rayward / STEM Data Program participants should ignore it and use the workbench above.
 
 <details>
