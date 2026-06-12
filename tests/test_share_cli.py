@@ -446,3 +446,45 @@ def test_cli_uses_share_flow_not_daemon_private():
                  "fetch_hosted_consent", "hosted_upload_status"):
         assert name not in src, f"{name} should be accessed via share_flow, not in the CLI"
     assert "order = bundle order" not in src, "dropped the false bundle-order claim"
+
+
+# ---- --score: CLI runs failure-value scoring on unscored traces -------------
+
+def test_score_traces_scores_unscored_and_updates(monkeypatch):
+    scored_ids = []
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        scored_ids.append(sid)
+        return {"ok": True, "fields": {"x": 1}, "failure_value": 5,
+                "display_title": f"scored {sid}"}
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+
+    rows = [_row(fv=3, session_id="already"),
+            _row(fv=None, session_id="u1"),
+            _row(fv=None, session_id="u2")]
+    n = share_cli.score_traces(None, rows, backend="auto")
+    assert n == 2
+    assert set(scored_ids) == {"u1", "u2"}                 # only the unscored ones (parallel)
+    assert rows[1]["ai_failure_value_score"] == 5          # mutated in place
+    assert rows[1]["ai_display_title"] == "scored u1"
+    assert rows[0]["ai_failure_value_score"] == 3          # already-scored untouched
+
+
+def test_score_traces_respects_cap(monkeypatch):
+    monkeypatch.setattr(share_cli.share_flow, "score_compute",
+                        lambda sid, **k: {"ok": True, "fields": {}, "failure_value": 4,
+                                          "display_title": None})
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [_row(fv=None, session_id=str(i)) for i in range(5)]
+    assert share_cli.score_traces(None, rows, cap=2) == 2
+    assert sum(1 for r in rows if r.get("ai_failure_value_score") == 4) == 2
+
+
+def test_no_score_is_interactive_only():
+    a = SimpleNamespace(time_range="today", source=None, search=None, project=None,
+                        min_failure_value=None, limit=40, summary=False, summary_model=None,
+                        no_score=True, score_model=None, yes=False, accept_terms=False,
+                        certify_ownership=False, download=False, no_refresh=False,
+                        include_needs_review=False, status="approved")
+    assert any("--no-score" in x for x in share_cli.noninteractive_share_rejections(a))

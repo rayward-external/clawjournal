@@ -313,10 +313,60 @@ def _parse_selection(raw: str, count: int) -> list[int]:
     return [int(x) for x in raw.replace(",", " ").split()]  # raises ValueError if not numbers
 
 
-def select_queue_rows(rows: list[dict], settings: dict, args) -> list[dict]:
+def _rank_key(r: dict):
+    """Rank by failure value desc, unscored (None) last — the web Queue order."""
+    return (r.get("ai_failure_value_score") is None, -(r.get("ai_failure_value_score") or 0))
+
+
+def score_traces(conn, rows: list[dict], *, backend: str = "auto",
+                 model: str | None = None, cap: int | None = None, workers: int = 6) -> int:
+    """Score the unscored rows for failure value, IN PARALLEL: the slow AI-judge
+    step runs in worker threads (each with its own read connection via
+    share_flow.score_compute), while DB writes happen serially on `conn` (single
+    writer; WAL handles the readers). Shows a simple `scored X/N` counter that
+    ticks up as each completes; Ctrl-C skips the rest. Mutates rows in place and
+    persists. Returns the count scored."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
+    if cap is not None:
+        unscored = unscored[:cap]
+    if not unscored:
+        return 0
+    total = len(unscored)
+    by_sid = {r["session_id"]: r for r in unscored}
+    n_workers = max(1, min(workers, total))
+    print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
+          f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
+    done = 0
+    pool = ThreadPoolExecutor(max_workers=n_workers)
+    futures = {pool.submit(share_flow.score_compute, sid, backend=backend, model=model): sid
+               for sid in by_sid}
+    try:
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res.get("ok"):
+                sid = futures[fut]
+                share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
+                r = by_sid[sid]
+                r["ai_failure_value_score"] = res.get("failure_value")
+                if res.get("display_title"):
+                    r["ai_display_title"] = res["display_title"]
+                done += 1
+            print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+        print()
+    except KeyboardInterrupt:
+        print(f"\n  {YEL}Skipped remaining scoring ({done}/{total} done).{RST}")
+        return done
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return done
+
+
+def select_queue_rows(rows: list[dict], settings: dict, args, *, limit: bool = True) -> list[dict]:
     """Filter to shareable, in-window traces (+ optional search/project/min-fv),
     then rank by failure value descending with unscored (None) last — the web
-    Queue ordering. Returns at most args.limit rows."""
+    Queue ordering. With limit=False, returns the full ranked set (no cap)."""
     out = [
         r for r in rows
         if not session_matches_excluded_projects(r, settings["excluded_projects"])
@@ -335,9 +385,8 @@ def select_queue_rows(rows: list[dict], settings: dict, args) -> list[dict]:
         out = [r for r in out if q in (
             (r.get("display_title") or "") + " " + (r.get("ai_display_title") or "")
             + " " + (r.get("project") or "")).lower()]
-    out.sort(key=lambda r: (r.get("ai_failure_value_score") is None,
-                            -(r.get("ai_failure_value_score") or 0)))
-    return out[:args.limit]
+    out.sort(key=_rank_key)
+    return out[:args.limit] if limit else out
 
 
 def step_queue(conn, settings, args) -> list[dict]:
@@ -345,6 +394,23 @@ def step_queue(conn, settings, args) -> list[dict]:
     # Fetch recent candidates (so time windows are accurate), then rank by value.
     candidates = query_sessions(conn, status=args.status, source=args.source,
                                 limit=5000, sort="end_time", order="desc")
+
+    # By default (like the web), score the in-window unscored traces on open so
+    # the queue shows real failure values instead of "—". Skip with --no-score.
+    # (Scored before the --min-failure-value filter so freshly-scored ones can
+    # still qualify; only runs if an agent backend is available.)
+    if not getattr(args, "no_score", False):
+        try:
+            resolve_backend("auto")
+            backend_ok = True
+        except Exception:  # noqa: BLE001
+            backend_ok = False
+        if backend_ok:
+            from types import SimpleNamespace
+            pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})
+            pool = select_queue_rows(candidates, settings, pool_args, limit=False)
+            score_traces(conn, pool, model=getattr(args, "score_model", None), cap=args.limit)
+
     rows = select_queue_rows(candidates, settings, args)
     if not rows:
         ranges = {"today": "the past 24h", "weekly": "the past 7 days", "all": "the index"}
@@ -356,8 +422,8 @@ def step_queue(conn, settings, args) -> list[dict]:
     print(f"  {DIM}Showing {len(rows)} shareable trace(s) — {label}, ranked by failure "
           f"value (limit {args.limit}).{RST}")
     if unscored:
-        print(f"  {DIM}{unscored} unscored (run `clawjournal score` for value/title); "
-              f"listed last.{RST}")
+        print(f"  {DIM}{unscored} still unscored (no agent backend, scoring skipped via "
+              f"--no-score, or it failed) — run `clawjournal score`; listed last.{RST}")
 
     do_summary = args.summary or bool(args.summary_model)
     ensure_titles(conn, rows, do_summary, summary_model=args.summary_model)
@@ -835,6 +901,11 @@ def add_interactive_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentP
                         help="show AI-summarized titles using the selected backend default; default shows original titles")
     parser.add_argument("--summary-model", default=None, metavar="MODEL",
                         help="model for --summary titles (implies --summary)")
+    parser.add_argument("--no-score", action="store_true",
+                        help="don't score unscored traces on open (default: score them so the "
+                             "queue shows real failure values, like the web)")
+    parser.add_argument("--score-model", default=None, metavar="MODEL",
+                        help="model for on-open scoring (default: backend default)")
     parser.add_argument("--accept-terms", action="store_true",
                         help="non-interactively accept the hosted consent/data-use terms")
     parser.add_argument("--certify-ownership", action="store_true",
@@ -861,6 +932,8 @@ _INTERACTIVE_ONLY_CHECKS = (
     ("limit", lambda v: v not in (None, 40), "--limit"),
     ("summary", lambda v: bool(v), "--summary"),
     ("summary_model", lambda v: bool(v), "--summary-model"),
+    ("no_score", lambda v: bool(v), "--no-score"),
+    ("score_model", lambda v: bool(v), "--score-model"),
     ("yes", lambda v: bool(v), "--yes"),
     ("accept_terms", lambda v: bool(v), "--accept-terms"),
     ("certify_ownership", lambda v: bool(v), "--certify-ownership"),

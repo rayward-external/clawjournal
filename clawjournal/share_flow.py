@@ -255,6 +255,55 @@ def verify_coverage(manifest: dict, package_ai: bool) -> tuple[bool, str]:
     return True, ""
 
 
+def _scoring_result_fields(r) -> dict:
+    """The update_session field set the `clawjournal score` CLI persists."""
+    import json as _json
+    return dict(
+        ai_quality_score=r.quality, ai_score_reason=r.reason, ai_scoring_detail=r.detail_json,
+        ai_task_type=r.task_type, ai_outcome_badge=r.outcome_label or None,
+        ai_value_badges=_json.dumps(r.value_labels), ai_risk_badges=_json.dumps(r.risk_level),
+        ai_display_title=r.display_title or None, ai_effort_estimate=r.effort_estimate,
+        ai_summary=r.summary or None,
+        ai_failure_value_score=getattr(r, "failure_value_score", None),
+        ai_recovery_labels=_json.dumps(getattr(r, "recovery_labels", [])),
+        ai_failure_attribution=getattr(r, "failure_attribution", "") or None,
+        ai_failure_modes=_json.dumps(getattr(r, "failure_modes", [])),
+        ai_learning_summary=getattr(r, "learning_summary", "") or None,
+        ai_scorer_backend=getattr(r, "scorer_backend", "") or None,
+        ai_scorer_model=getattr(r, "scorer_model", "") or None,
+        ai_rubric_git_sha=getattr(r, "rubric_git_sha", "") or None,
+        ai_scored_at=getattr(r, "scored_at", "") or None,
+    )
+
+
+def score_compute(session_id: str, *, backend: str = "auto", model: str | None = None) -> dict:
+    """Run the existing failure-value scoring (the slow AI-judge step) on one
+    trace WITHOUT writing. Opens its own short-lived read connection, so it's
+    safe to call from worker threads in parallel (the DB write is the caller's
+    job — see persist_score). Returns {ok, fields, failure_value, display_title}
+    or {ok: False, error}."""
+    from .workbench.index import open_index
+    from .scoring.scoring import score_session
+    conn = open_index()
+    try:
+        r = score_session(conn, session_id, model=model, backend=backend)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+    fields = _scoring_result_fields(r)
+    return {"ok": True, "fields": fields,
+            "failure_value": fields["ai_failure_value_score"],
+            "display_title": fields["ai_display_title"]}
+
+
+def persist_score(conn, session_id: str, fields: dict) -> None:
+    """Persist a score_compute() result. Call serially on the main connection
+    (single writer; WAL handles the concurrent reader connections)."""
+    from .workbench.index import update_session
+    update_session(conn, session_id, **fields)
+
+
 def build_zip(export_dir: Path) -> bytes:
     return _daemon_build_zip(export_dir)
 
