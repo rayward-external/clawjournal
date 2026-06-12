@@ -115,6 +115,9 @@ class TestScanFile:
     def _enable_real_scan(self, monkeypatch):
         monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
         monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        # Pin resolution so argv assertions don't depend on whether the
+        # machine running the tests has a real binary installed.
+        monkeypatch.setattr(trufflehog, "resolve_binary", lambda: "trufflehog")
 
     def test_bypass_env_var_short_circuits(self, tmp_path, monkeypatch):
         target = tmp_path / "sessions.jsonl"
@@ -835,6 +838,7 @@ class TestSubprocessHardening:
     def test_payload_streams_via_stdin_not_tempfile(self, tmp_path, monkeypatch):
         monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
         monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(trufflehog, "resolve_binary", lambda: "trufflehog")
 
         captured: dict = {}
 

@@ -132,6 +132,10 @@ Use [Quickstart](#quickstart) above (or the install prompt at the top). TruffleH
 <summary><b>Show TruffleHog install commands</b></summary>
 
 ```bash
+# Any platform — pinned version, sha256-verified, installed to ~/.clawjournal/bin, no root needed:
+clawjournal trufflehog install
+
+# Or install it yourself:
 brew install trufflehog                                    # macOS
 curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux
 # Windows: download a release binary from https://github.com/trufflesecurity/trufflehog/releases
@@ -357,6 +361,8 @@ clawjournal bundle-share <bundle_id>
 | `clawjournal list` / `clawjournal status` | List projects with exclusion status / show current stage (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |
 | `clawjournal selfupdate [--check] [--force]` | Fast-forward to latest from `rayward-external/clawjournal` |
+| `clawjournal trufflehog install [--force]` | Download the pinned, checksum-verified TruffleHog (share-gate dependency) into `~/.clawjournal/bin` |
+| `clawjournal trufflehog status [--json]` | Show which TruffleHog binary the share gate will use |
 
 ### Export & sanitize (advanced)
 

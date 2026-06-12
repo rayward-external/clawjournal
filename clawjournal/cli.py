@@ -3660,6 +3660,19 @@ def main() -> None:
                     help="Discard local changes on main before applying a fast-forward update")
     su.add_argument("--json", action="store_true", help="Output result as JSON")
 
+    th = sub.add_parser("trufflehog",
+                        help="Manage the TruffleHog binary required by the share gate")
+    th_sub = th.add_subparsers(dest="trufflehog_command")
+    th_install = th_sub.add_parser(
+        "install",
+        help="Download the pinned, checksum-verified TruffleHog into ~/.clawjournal/bin")
+    th_install.add_argument("--force", action="store_true",
+                            help="Reinstall even if a managed binary already exists")
+    th_install.add_argument("--json", action="store_true", help="Output result as JSON")
+    th_status = th_sub.add_parser(
+        "status", help="Show which TruffleHog binary clawjournal will use")
+    th_status.add_argument("--json", action="store_true", help="Output result as JSON")
+
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
@@ -4636,6 +4649,10 @@ def main() -> None:
                 print(f"selfupdate status: {selfupdate_status}")
         return
 
+    if command == "trufflehog":
+        _run_trufflehog_command(args)
+        return
+
     if command == "list":
         config = load_config()
         resolved_source_choice, _ = _resolve_source_choice(args.source, config)
@@ -5120,6 +5137,60 @@ def _run_events_doctor(args) -> None:
             )
         )
     sys.exit(exit_code_for(report))
+
+
+def _run_trufflehog_command(args) -> None:
+    """`clawjournal trufflehog install|status` — manage the share-gate binary."""
+    from .redaction import trufflehog
+    from .redaction.trufflehog_install import PINNED_VERSION, install, managed_binary_path
+
+    sub_command = getattr(args, "trufflehog_command", None)
+
+    if sub_command == "install":
+        result = install(force=args.force)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            status = result["status"]
+            if status == "installed":
+                print(f"Installed TruffleHog {result['version']} at {result['path']}.")
+            elif status == "already-installed":
+                version = result.get("version") or "unknown version"
+                print(
+                    f"Already installed ({version}) at {result['path']}. "
+                    "Pass --force to reinstall."
+                )
+            else:
+                print(f"Install failed ({status}): {result.get('error', '')}")
+        if result["status"] not in ("installed", "already-installed"):
+            sys.exit(1)
+        return
+
+    # Default (and explicit `status`): report what the share gate will use.
+    resolved = trufflehog.resolve_binary()
+    managed = managed_binary_path()
+    fingerprint = trufflehog.engine_fingerprint()
+    payload = {
+        "resolved_path": resolved,
+        "managed": resolved == str(managed),
+        "managed_path": str(managed),
+        "version": fingerprint,
+        "pinned_version": PINNED_VERSION,
+        "available": resolved is not None,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        return
+    if resolved is None:
+        print("TruffleHog: not installed — share exports will be blocked.")
+        print("Run `clawjournal trufflehog install` to install "
+              f"the pinned v{PINNED_VERSION}.")
+        sys.exit(1)
+    origin = "managed install" if payload["managed"] else "PATH"
+    print(f"TruffleHog: {fingerprint} ({origin}: {resolved})")
+    if not payload["managed"]:
+        print(f"A pinned v{PINNED_VERSION} can be installed with "
+              "`clawjournal trufflehog install` (managed copy takes precedence).")
 
 
 def _run_events_features(args) -> None:

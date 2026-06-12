@@ -65,12 +65,16 @@ The scan is mandatory. Outcomes:
 Install:
 
 ```bash
-# macOS
-brew install trufflehog
+# Any platform — pinned version, sha256-verified against the official
+# release, installed to ~/.clawjournal/bin (preferred over PATH):
+clawjournal trufflehog install
 
-# Linux / Windows
-# https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
+# Or install it yourself:
+brew install trufflehog          # macOS
+# Linux / Windows: https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
 ```
+
+The managed copy is downloaded from TruffleHog's own GitHub release artifacts at your explicit request and is only ever invoked as a subprocess. `clawjournal trufflehog status` shows which binary the gate will use.
 
 For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the final PII pass rewrites the file. Either scan finding something aborts the upload. The final PII pass always runs deterministic rules. If you opt in to AI-assisted review for a bundle, it also reviews sessions in a small bounded worker pool and falls back to deterministic PII rules when an AI backend errors or times out; the manifest records `redaction_summary.pii_review.ai_enabled` plus `redaction_summary.coverage.full` vs. `rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
 

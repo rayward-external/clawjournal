@@ -7,11 +7,13 @@ unverified, or unknown) blocks the export and leaves the directory
 intact for debugging.
 
 TruffleHog is invoked as a subprocess — it is AGPL-3.0 and must not
-be linked in-process. Install via ``brew install trufflehog`` or the
-upstream Go binary. The escape hatch ``CLAWJOURNAL_SKIP_TRUFFLEHOG=1``
-exists for CI / development only and is recorded in the share
-manifest so downstream reviewers can tell a scanned share from a
-bypassed one.
+be linked in-process. The binary is resolved managed-install first
+(``~/.clawjournal/bin/``, populated by ``clawjournal trufflehog
+install`` — see ``trufflehog_install.py``), then ``PATH`` (e.g.
+``brew install trufflehog``). The escape hatch
+``CLAWJOURNAL_SKIP_TRUFFLEHOG=1`` exists for CI / development only
+and is recorded in the share manifest so downstream reviewers can
+tell a scanned share from a bypassed one.
 """
 
 import hashlib
@@ -74,8 +76,10 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
 EXCLUDED_DETECTORS: tuple[str, ...] = ("refiner",)
 
 INSTALL_HINT = (
-    "TruffleHog is required to export shares but was not found on PATH.\n"
-    "Install it with:\n"
+    "TruffleHog is required to export shares but was not found.\n"
+    "Install a pinned, checksum-verified copy with:\n"
+    "  clawjournal trufflehog install\n"
+    "Or install it yourself:\n"
     "  macOS:  brew install trufflehog\n"
     "  Linux:  https://github.com/trufflesecurity/trufflehog#floppy_disk-installation\n"
     "Or set CLAWJOURNAL_SKIP_TRUFFLEHOG=1 to bypass (unsafe — the share "
@@ -152,8 +156,36 @@ class TruffleHogReport:
         }
 
 
+def managed_binary_path() -> Path:
+    """Path of the managed binary that ``clawjournal trufflehog install``
+    maintains. Reads ``config.CONFIG_DIR`` at call time (not import time)
+    so tests and future env overrides that monkeypatch the attribute see
+    the change.
+    """
+    from .. import config  # noqa: PLC0415 — call-time so CONFIG_DIR patches apply
+
+    name = "trufflehog.exe" if os.name == "nt" else "trufflehog"
+    return config.CONFIG_DIR / "bin" / name
+
+
+def resolve_binary() -> str | None:
+    """Resolve the TruffleHog binary: managed install first, then PATH.
+
+    The managed copy wins because its version is pinned and its archive
+    checksum was verified at install time; an unmanaged PATH binary is
+    whatever brew/go last put there.
+    """
+    managed = managed_binary_path()
+    try:
+        if managed.is_file() and os.access(managed, os.X_OK):
+            return str(managed)
+    except OSError:
+        pass
+    return shutil.which("trufflehog")
+
+
 def is_available() -> bool:
-    return shutil.which("trufflehog") is not None
+    return resolve_binary() is not None
 
 
 _version_cache: dict[tuple, str] = {}
@@ -165,11 +197,11 @@ def _binary_signature() -> tuple:
     """Stable per-binary key for the fingerprint cache.
 
     Folds the resolved path and its mtime+size so a ``brew upgrade``
-    (new inode, new size, new mtime) invalidates cached entries in
-    a long-running daemon without requiring a restart. Returns
-    ``("missing",)`` if the binary isn't on PATH.
+    or ``clawjournal trufflehog install`` (new inode, new size, new
+    mtime) invalidates cached entries in a long-running daemon without
+    requiring a restart. Returns ``("missing",)`` if no binary resolves.
     """
-    resolved = shutil.which("trufflehog")
+    resolved = resolve_binary()
     if resolved is None:
         return ("missing",)
     try:
@@ -195,9 +227,10 @@ def engine_fingerprint() -> str:
     if signature[0] == "missing":
         _version_cache[signature] = "missing"
         return "missing"
+    binary = signature[1] if signature[0] == "unknown" else signature[0]
     try:
         result = subprocess.run(
-            ["trufflehog", "--version"],
+            [binary, "--version"],
             capture_output=True,
             text=True,
             check=False,
@@ -352,8 +385,10 @@ def scan_file(path: Path) -> TruffleHogReport:
             binary_missing=True,
         )
 
+    # `or "trufflehog"` covers callers that stub is_available() without
+    # providing a real binary (tests); production always resolves a path.
     args = [
-        "trufflehog",
+        resolve_binary() or "trufflehog",
         "filesystem",
         str(path),
         "-j",
@@ -513,7 +548,7 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
         return []
 
     args = [
-        "trufflehog",
+        resolve_binary() or "trufflehog",
         "stdin",
         "-j",
         "--results=verified,unknown,unverified",

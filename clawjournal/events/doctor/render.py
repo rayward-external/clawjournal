@@ -84,7 +84,10 @@ def render_human(report: DoctorReport, *, stream: TextIO | None = None) -> str:
     if th.state == "present":
         buf.write(f"TruffleHog:  {sanitize_for_human(th.version)} (present)\n")
     elif th.state == "missing":
-        buf.write("TruffleHog:  missing — install via `brew install trufflehog`\n")
+        buf.write(
+            "TruffleHog:  missing — install via `clawjournal trufflehog install` "
+            "(or `brew install trufflehog`)\n"
+        )
     else:
         buf.write(
             f"TruffleHog:  {sanitize_for_human(th.version) or 'unknown'} "
