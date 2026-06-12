@@ -503,32 +503,28 @@ def test_score_traces_scores_unscored_and_updates(monkeypatch):
             _row(fv=None, session_id="u2")]
     n = share_cli.score_traces(None, rows, backend="auto")
     assert n == 2
-    assert scored_ids == ["u1", "u2"]                     # only the unscored ones
+    assert set(scored_ids) == {"u1", "u2"}                # only the unscored ones (parallel; any order)
     assert rows[1]["ai_failure_value_score"] == 5          # mutated in place
     assert rows[1]["ai_display_title"] == "scored u1"
     assert rows[0]["ai_failure_value_score"] == 3          # already-scored untouched
 
 
-def test_score_traces_keyboard_interrupt_stops_before_next(monkeypatch):
-    calls = []
+def test_score_traces_keyboard_interrupt_is_graceful(monkeypatch):
+    # Parallel: Ctrl-C (here, raised from a worker) must be handled gracefully —
+    # score_traces returns a count and does not propagate, cancelling pending work.
+    def boom(sid, *, backend="auto", model=None):
+        raise KeyboardInterrupt
 
-    def fake_compute(sid, *, backend="auto", model=None):
-        calls.append(sid)
-        if sid == "u2":
-            raise KeyboardInterrupt
-        return {"ok": True, "fields": {}, "failure_value": 5, "display_title": None}
-
-    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", boom)
     monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
 
     rows = [_row(fv=None, session_id="u1"),
             _row(fv=None, session_id="u2"),
             _row(fv=None, session_id="u3")]
 
-    assert share_cli.score_traces(None, rows) == 1
-    assert calls == ["u1", "u2"]
-    assert rows[0]["ai_failure_value_score"] == 5
-    assert rows[2]["ai_failure_value_score"] is None
+    result = share_cli.score_traces(None, rows, workers=2)
+    assert result == 0                                    # nothing completed; no crash
+    assert all(r.get("ai_failure_value_score") is None for r in rows)
 
 
 def test_score_traces_respects_cap(monkeypatch):

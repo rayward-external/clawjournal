@@ -321,28 +321,39 @@ def _rank_key(r: dict):
 
 
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
-                 model: str | None = None, cap: int | None = None) -> int:
-    """Score unscored rows for failure value, one at a time.
+                 model: str | None = None, cap: int | None = None, workers: int = 6) -> int:
+    """Score unscored rows for failure value, IN PARALLEL.
 
-    Runs before queue display, mutates rows in place, and persists each finished
-    score. Ctrl-C stops before launching the next AI judge call, so it does not
-    start extra background work after the user chooses to skip.
+    The slow AI-judge step runs in worker threads (each with its own read
+    connection via share_flow.score_compute), while DB writes happen serially on
+    `conn` (single writer; WAL handles the readers) — so N traces take about one
+    judge call, not N. At most `workers` judge calls are in flight at once; on
+    Ctrl-C, pending (not-yet-started) calls are cancelled and we return what's
+    done (in-flight calls may still finish). Mutates rows in place and persists.
     """
+    from concurrent.futures import as_completed
+
     unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
     if cap is not None:
         unscored = unscored[:cap]
     if not unscored:
         return 0
     total = len(unscored)
+    by_sid = {r["session_id"]: r for r in unscored}
+    n_workers = max(1, min(workers, total))
     print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
-          f"(AI judge — Ctrl-C to skip the rest)…{RST}")
+          f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
+    pool = ThreadPoolExecutor(max_workers=n_workers)
+    futures = {pool.submit(share_flow.score_compute, sid, backend=backend, model=model): sid
+               for sid in by_sid}
     try:
-        for r in unscored:
-            sid = r["session_id"]
-            res = share_flow.score_compute(sid, backend=backend, model=model)
+        for fut in as_completed(futures):
+            res = fut.result()
             if res.get("ok"):
+                sid = futures[fut]
                 share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
+                r = by_sid[sid]
                 r["ai_failure_value_score"] = res.get("failure_value")
                 if res.get("display_title"):
                     r["ai_display_title"] = res["display_title"]
@@ -352,6 +363,8 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     except KeyboardInterrupt:
         print(f"\n  {YEL}Skipped remaining scoring ({done}/{total} done).{RST}")
         return done
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return done
 
 
