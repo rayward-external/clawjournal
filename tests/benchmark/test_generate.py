@@ -15,6 +15,7 @@ from clawjournal.benchmark.generate import (
     generate_benchmark,
 )
 from clawjournal.redaction.anonymizer import Anonymizer
+from clawjournal.scoring.backends import DEFAULT_CLAUDE_MODEL
 
 NOW = datetime(2026, 5, 31, 12, 0, 0, tzinfo=timezone.utc)
 NO_ANON = Anonymizer(enabled=False)
@@ -294,9 +295,9 @@ class TestBlobExtract:
 
 
 class TestDefaultModel:
-    def test_claude_defaults_to_sonnet(self, monkeypatch):
+    def test_claude_defaults_to_sonnet_46(self, monkeypatch):
         monkeypatch.setattr("clawjournal.benchmark.generate.resolve_backend", lambda b: "claude")
-        assert AgentBackendCaller(backend="auto").model == "sonnet"
+        assert AgentBackendCaller(backend="auto").model == DEFAULT_CLAUDE_MODEL
 
     def test_codex_keeps_cli_default(self, monkeypatch):
         monkeypatch.setattr("clawjournal.benchmark.generate.resolve_backend", lambda b: "codex")

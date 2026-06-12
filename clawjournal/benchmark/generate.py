@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from ..redaction.anonymizer import Anonymizer
-from ..scoring.backends import resolve_backend, run_default_agent_task
+from ..scoring.backends import default_model_for_backend, resolve_backend, run_default_agent_task
 from . import schema as bm
 from .select import DEFAULT_DEEPREAD_CAP, DEFAULT_WINDOW_DAYS, FailureCandidate, WeekSlice, select_week_failures
 
@@ -42,11 +42,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_WORKERS = 4
 BLOB_EXTRACT_MAX_CHARS = 8000
 
-# Generation makes ~40+ calls; default each backend to a fast, inexpensive model
-# (still through the CLI/subscription — no raw API). Only claude exposes a stable
-# alias; codex model slugs vary, so leave it at the CLI default (override with
-# `--model`). `None` means "the CLI's default model".
-_DEFAULT_GEN_MODEL: dict[str, str] = {"claude": "sonnet"}
+# Generation makes ~40+ calls; default each backend to ClawJournal's fast model
+# choice (still through the CLI/subscription — no raw API). Codex model slugs
+# vary, so it stays at the CLI default unless the caller passes `--model`.
 
 # Per-stage subprocess ceilings (seconds). The architect call synthesises ALL
 # deep-read seeds in one shot — the heaviest single call — and was timing out
@@ -158,7 +156,7 @@ class AgentBackendCaller:
         self.resolved = resolve_backend(self.backend)
         # Fall back to the per-backend fast default unless the caller named a model.
         if self.model is None:
-            self.model = _DEFAULT_GEN_MODEL.get(self.resolved)
+            self.model = default_model_for_backend(self.resolved)
 
     def __call__(self, *, stage: str, system_prompt: str, task_prompt: str) -> dict[str, Any]:
         import tempfile

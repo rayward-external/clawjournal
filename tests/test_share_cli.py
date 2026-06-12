@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from clawjournal import share_cli
+from clawjournal.scoring.backends import DEFAULT_CLAUDE_MODEL
 
 
 # ---- argument parsing -------------------------------------------------------
@@ -41,6 +42,10 @@ def test_arg_parsing_flags():
 def test_codex_claude_shortcuts():
     assert _parse(["--codex"]).source == "codex"
     assert _parse(["--claude"]).source == "claude"
+
+
+def test_claude_summary_titles_use_fast_default():
+    assert share_cli._LIGHT_SUMMARY_MODEL["claude"] == DEFAULT_CLAUDE_MODEL
 
 
 # ---- review must not mutate global review_status (#5) -----------------------

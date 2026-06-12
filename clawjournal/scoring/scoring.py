@@ -29,6 +29,7 @@ from .backends import (
     SUPPORTED_BACKENDS,
     detect_current_agent,
     resolve_backend,
+    resolve_model_for_backend,
     run_default_agent_task,
 )
 
@@ -906,6 +907,7 @@ def call_judge(
     """Call the resolved scoring backend and return a validated judge result."""
     rubric = load_scoring_rubric()
     resolved = resolve_backend(backend)
+    effective_model = resolve_model_for_backend(resolved, model)
     session_payload = session_data or {}
     metadata_payload = metadata or {}
 
@@ -947,7 +949,7 @@ def call_judge(
             cwd=tmp_path,
             system_prompt_file=_SCORER_PROMPT_FILE,
             task_prompt=task_prompt,
-            model=model,
+            model=effective_model,
             timeout_seconds=120,
             codex_sandbox="read-only",
             codex_output_schema=JUDGE_SCHEMA,
@@ -959,7 +961,7 @@ def call_judge(
         return _attach_scorer_metadata(
             parsed,
             backend=resolved,
-            model=model,
+            model=effective_model,
             rubric=rubric,
         )
 

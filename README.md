@@ -202,7 +202,7 @@ clawjournal set-score <id> --failure-value 4 --failure-evidence "User corrected 
 clawjournal set-score <id> --quality 4               # legacy productivity override
 ```
 
-Scoring uses the current agent's automation CLI by default (`codex exec` in Codex, the Claude CLI in Claude Code); backends are `claude`, `codex`, `hermes`, `openclaw` (override with `--backend`). For Codex specifically, run `codex login` or set `CODEX_API_KEY` for headless scoring. The workbench can also auto-score share-ready traces in the background, but only after you confirm a backend once; confirm it headlessly with `clawjournal config --scorer-backend <backend>` (`none` clears it).
+Scoring uses the current agent's automation CLI by default (`codex exec` in Codex, the Claude CLI in Claude Code); backends are `claude`, `codex`, `hermes`, `openclaw` (override with `--backend`). Claude-backed AI features default to `claude-sonnet-4-6` for speed unless you pass `--model`. For Codex specifically, run `codex login` or set `CODEX_API_KEY` for headless scoring. The workbench can also auto-score share-ready traces in the background, but only after you confirm a backend once; confirm it headlessly with `clawjournal config --scorer-backend <backend>` (`none` clears it).
 
 </details>
 

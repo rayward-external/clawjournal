@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
+from .scoring.backends import DEFAULT_CLAUDE_MODEL
 from .workbench.index import (
     SHAREABLE_HOLD_STATES,
     effective_hold_state,
@@ -221,7 +222,7 @@ def summarize_trace(session_detail: dict, *, backend: str = "auto",
     return title.strip().strip('"').strip("'")[:80]
 
 
-_LIGHT_SUMMARY_MODEL = {"claude": "haiku"}
+_LIGHT_SUMMARY_MODEL = {"claude": DEFAULT_CLAUDE_MODEL}
 
 
 def _title_cache_path() -> Path:
@@ -261,7 +262,7 @@ def ensure_titles(conn, rows: list[dict], do_summarize: bool, summary_model: str
     import shutil
     from .scoring.backends import resolve_backend
     if not summary_model and shutil.which("claude"):
-        backend, model = "claude", "haiku"
+        backend, model = "claude", DEFAULT_CLAUDE_MODEL
     else:
         try:
             backend = resolve_backend("auto")
