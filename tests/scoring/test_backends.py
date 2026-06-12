@@ -11,6 +11,7 @@ from clawjournal.scoring.backends import (
     AgentResult,
     BACKEND_CHOICES,
     DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
     SUPPORTED_BACKENDS,
     _agent_subprocess_env,
     _build_claude_cmd,
@@ -40,11 +41,15 @@ class TestConstants:
     def test_supported_backends(self):
         assert set(SUPPORTED_BACKENDS) == {"claude", "codex", "hermes", "openclaw"}
 
-    def test_default_claude_model(self):
+    def test_default_backend_models(self):
         assert DEFAULT_CLAUDE_MODEL == "claude-sonnet-4-6"
+        assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
-        assert default_model_for_backend("codex") is None
+        assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
+        assert default_model_for_backend("hermes") is None
+        assert default_model_for_backend("openclaw") is None
         assert resolve_model_for_backend("claude", None) == DEFAULT_CLAUDE_MODEL
+        assert resolve_model_for_backend("codex", None) == DEFAULT_CODEX_MODEL
         assert resolve_model_for_backend("claude", "opus") == "opus"
 
 
@@ -455,6 +460,20 @@ class TestRunDefaultAgentTaskCodex:
         )
         assert result.stdout == "done"
         assert result.returncode == 0
+
+    def test_default_model_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="codex", cwd=tmp_path, task_prompt="review",
+        )
+        assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CODEX_MODEL
 
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)

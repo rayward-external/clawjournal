@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
-from .scoring.backends import DEFAULT_CLAUDE_MODEL
+from .scoring.backends import default_model_for_backend, resolve_backend
 from .workbench.index import (
     SHAREABLE_HOLD_STATES,
     effective_hold_state,
@@ -222,9 +222,6 @@ def summarize_trace(session_detail: dict, *, backend: str = "auto",
     return title.strip().strip('"').strip("'")[:80]
 
 
-_LIGHT_SUMMARY_MODEL = {"claude": DEFAULT_CLAUDE_MODEL}
-
-
 def _title_cache_path() -> Path:
     from .config import CONFIG_DIR
     return Path(CONFIG_DIR) / "clawshare_titles.json"
@@ -259,17 +256,12 @@ def ensure_titles(conn, rows: list[dict], do_summarize: bool, summary_model: str
     if not need:
         return
 
-    import shutil
-    from .scoring.backends import resolve_backend
-    if not summary_model and shutil.which("claude"):
-        backend, model = "claude", DEFAULT_CLAUDE_MODEL
-    else:
-        try:
-            backend = resolve_backend("auto")
-        except Exception:  # noqa: BLE001
-            print(f"  {DIM}(no agent backend available — using raw titles){RST}")
-            return
-        model = summary_model or _LIGHT_SUMMARY_MODEL.get(backend)
+    try:
+        backend = resolve_backend("auto")
+    except Exception:  # noqa: BLE001
+        print(f"  {DIM}(no agent backend available — using raw titles){RST}")
+        return
+    model = summary_model or default_model_for_backend(backend)
 
     label = f"{backend}/{model}" if model else backend
     print(f"  {DIM}Summarizing {len(need)} title(s) with {label} — Ctrl-C to skip…{RST}")

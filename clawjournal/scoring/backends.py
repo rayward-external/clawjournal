@@ -22,7 +22,11 @@ SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
 AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
-DEFAULT_BACKEND_MODELS: dict[str, str] = {"claude": DEFAULT_CLAUDE_MODEL}
+DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+DEFAULT_BACKEND_MODELS: dict[str, str] = {
+    "claude": DEFAULT_CLAUDE_MODEL,
+    "codex": DEFAULT_CODEX_MODEL,
+}
 
 # Prefix of the RuntimeError raised by resolve_backend() when no usable backend
 # can be found. Kept as a constant so callers (e.g. the daemon's auto-score
@@ -421,9 +425,9 @@ def run_default_agent_task(
         task_prompt: The task instruction. Delivered via stdin (Claude),
             positional arg (Codex), scripted one-shot (Hermes), or
             ``--message`` (OpenClaw).
-        model: Optional model override for Claude/Codex. Claude defaults to
-            ``DEFAULT_CLAUDE_MODEL`` when not provided so AI features do not
-            inherit a slower Opus CLI default.
+        model: Optional model override for Claude/Codex. Claude and Codex use
+            fast backend-specific defaults when not provided; other backends
+            keep their agent CLI default.
         timeout_seconds: Subprocess timeout.
         codex_sandbox: Codex sandbox mode ("read-only" or None for
             full access). Ignored by other backends.

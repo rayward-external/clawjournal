@@ -9,6 +9,7 @@ from clawjournal.redaction.pii import _PII_PROMPT_FILE
 from clawjournal.scoring.backends import (
     AgentResult,
     DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
     _classify_process_command,
     _detect_current_agent_from_env,
     check_backend_runtime as _check_backend_runtime,
@@ -566,6 +567,7 @@ class TestBackendSelection:
         def fake_run(*, backend, cwd, task_prompt=None, **kw):
             captured["task_prompt"] = task_prompt
             captured["backend"] = backend
+            captured["model"] = kw.get("model")
             captured["codex_output_schema"] = kw.get("codex_output_schema")
             scoring = {
                 "substance": 4,
@@ -593,6 +595,7 @@ class TestBackendSelection:
         assert result["substance"] == 4
         assert result["task_type"] == "debugging"
         assert captured["backend"] == "codex"
+        assert captured["model"] == DEFAULT_CODEX_MODEL
         assert captured["task_prompt"] == _SCORE_TASK_PROMPT_CODEX
         assert captured["codex_output_schema"] is not None
 
