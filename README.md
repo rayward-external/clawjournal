@@ -221,6 +221,15 @@ Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploa
 
 Seeing **Done** instead of **Submit** is normal — submissions just aren't open right now.
 
+**Sharing from a remote machine or SSH session.** If the browser workbench is inconvenient, use the terminal wizard:
+
+```bash
+clawjournal share --interactive --weekly
+# or: clawshare --weekly
+```
+
+It lists shareable traces, prioritizes AI-scored high-failure-value sessions, shows the redacted preview, asks for consent, then uploads when hosted submission is available or saves a ZIP for manual upload. Useful filters: `--all`, `--source codex`, `--source claude`, `--search "text"`, and `--ai-pii-review` for the optional AI PII pass.
+
 > ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** It only uploads to a **self-hosted** ingest server you configure via `CLAWJOURNAL_INGEST_URL`; without it, it reports *"Hosted sharing is not configured."* Rayward / STEM Data Program participants should ignore it and use the workbench above.
 
 <details>
@@ -312,6 +321,7 @@ clawjournal bundle-share <bundle_id>
 | `clawjournal verify-email you@university.edu` | Request a code for the hosted submission flow (a code is emailed; confirm with `clawjournal verify-email you@university.edu --code <CODE>`) |
 | `clawjournal share --preview --status approved` | Preview what would be packaged |
 | `clawjournal share --status approved [--ai-pii-review]` | Package locally + print the Share URL; hosted upload happens in the browser |
+| `clawjournal share --interactive --weekly` / `clawshare --weekly` | Terminal Share wizard for remote/SSH sessions; review redactions, consent, upload or save ZIP |
 | `clawjournal card <id> [--depth workflow\|full]` | Generate a share card (`workflow` is safe for public channels) |
 
 ### Configuration & maintenance
