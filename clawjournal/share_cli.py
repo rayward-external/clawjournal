@@ -832,7 +832,7 @@ def add_interactive_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentP
                         help="only traces with failure value >= N (1-5)")
     parser.add_argument("--limit", type=int, default=40, help="max traces to list (default 40)")
     parser.add_argument("--summary", action="store_true",
-                        help="show AI-summarized titles (Haiku); default shows original titles")
+                        help="show AI-summarized titles using the selected backend default; default shows original titles")
     parser.add_argument("--summary-model", default=None, metavar="MODEL",
                         help="model for --summary titles (implies --summary)")
     parser.add_argument("--accept-terms", action="store_true",
