@@ -2,6 +2,24 @@
 
 Review and curate your coding-agent session traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
+## Copy-paste prompts
+
+Use one of these prompts in Claude Code, Codex, Cursor, or another coding assistant.
+
+> [!TIP]
+> **Ordinary workflow — browser workbench**
+>
+> ```text
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions using the browser workbench. If needed, configure source `all`, confirm projects, and scan first. Open the local workbench with `clawjournal serve`, guide me through Share -> Queue -> Redact -> Review -> Package -> Submit, and stop for my consent before upload. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> ```
+
+> [!IMPORTANT]
+> **CLI-only workflow — remote terminal or SSH**
+>
+> ```text
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> ```
+
 ## Install or update (no coding required)
 
 The same prompt installs ClawJournal the first time and updates it later. Run it before you package or submit a bundle — an out-of-date copy is the #1 cause of submission errors.
