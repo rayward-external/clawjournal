@@ -110,6 +110,11 @@ class TruffleHogReport:
     bypassed: bool = False
     binary_missing: bool = False
     scan_error: str | None = None
+    # Which engine actually scanned (engine_fingerprint() form, e.g.
+    # "trufflehog 3.95.5"). Stamped by the export chokepoints before the
+    # report is persisted — scan_file itself never spawns a second
+    # subprocess. "" means not stamped (preview scans).
+    engine: str = ""
 
     @property
     def blocking(self) -> bool:
@@ -144,6 +149,7 @@ class TruffleHogReport:
             "bypassed": self.bypassed,
             "binary_missing": self.binary_missing,
             "scan_error": self.scan_error,
+            "engine": self.engine,
             "examples": [
                 {
                     "detector": f.detector,
@@ -186,6 +192,32 @@ def resolve_binary() -> str | None:
 
 def is_available() -> bool:
     return resolve_binary() is not None
+
+
+def managed_off_pin() -> tuple[str, str] | None:
+    """``(actual_version, pinned_version)`` when the gate resolves the
+    managed copy and that copy is off the source pin; ``None`` otherwise.
+
+    Only the managed copy is judged against the pin — a PATH binary's
+    freshness is the user's package manager's business. This is the
+    drift signal: ``selfupdate`` moves ``PINNED_VERSION`` in source
+    within hours of a pin bump, but nothing re-installs the binary, so
+    status/doctor surface the mismatch and point at
+    ``clawjournal trufflehog install`` (warn, never block — an off-pin
+    scanner is still a working backstop).
+    """
+    from .trufflehog_install import PINNED_VERSION  # noqa: PLC0415 — avoid import cycle
+
+    resolved = resolve_binary()
+    if resolved is None or resolved != str(managed_binary_path()):
+        return None
+    match = _VERSION_RE.search(engine_fingerprint())
+    if match is None:
+        return None
+    actual = match.group(1)
+    if actual == PINNED_VERSION:
+        return None
+    return (actual, PINNED_VERSION)
 
 
 _version_cache: dict[tuple, str] = {}
@@ -509,6 +541,7 @@ def write_report(path: Path, report: TruffleHogReport) -> None:
         "bypassed": report.bypassed,
         "binary_missing": report.binary_missing,
         "scan_error": report.scan_error,
+        "engine": report.engine,
         "findings": [
             {
                 "detector": f.detector,

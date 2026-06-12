@@ -61,6 +61,10 @@ _FS_PROBES: tuple[tuple[str, str], ...] = (
 class TruffleHogStatus:
     state: str  # "present" | "missing" | "unparseable-version"
     version: str | None
+    # Pinned version this clawjournal expects, set only when the resolved
+    # binary is the managed copy AND it drifted off the pin (additive field;
+    # None for PATH binaries and pin-matched managed copies).
+    off_pin_expected: str | None = None
 
 
 @dataclass
@@ -139,9 +143,19 @@ def _trufflehog_status() -> TruffleHogStatus:
     if not th.is_available():
         return TruffleHogStatus(state="missing", version=None)
     fingerprint = th.engine_fingerprint()
+    off_pin = th.managed_off_pin()
+    off_pin_expected = off_pin[1] if off_pin else None
     if fingerprint.startswith("trufflehog "):
-        return TruffleHogStatus(state="present", version=fingerprint.split(" ", 1)[1])
-    return TruffleHogStatus(state="unparseable-version", version=fingerprint)
+        return TruffleHogStatus(
+            state="present",
+            version=fingerprint.split(" ", 1)[1],
+            off_pin_expected=off_pin_expected,
+        )
+    return TruffleHogStatus(
+        state="unparseable-version",
+        version=fingerprint,
+        off_pin_expected=off_pin_expected,
+    )
 
 
 def _detect_home_warning() -> dict[str, str] | None:

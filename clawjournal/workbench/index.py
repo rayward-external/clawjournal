@@ -3956,6 +3956,10 @@ def export_share_to_disk(
     from ..redaction import trufflehog as trufflehog_scanner
 
     trufflehog_report = trufflehog_scanner.scan_file(sessions_file)
+    # Stamp which engine version scanned so the manifest/report make
+    # staleness auditable per share (the managed binary can drift from
+    # the source pin between installs).
+    trufflehog_report.engine = trufflehog_scanner.engine_fingerprint()
     trufflehog_scanner.write_report(export_dir / "trufflehog.json", trufflehog_report)
     manifest["redaction_summary"]["trufflehog"] = trufflehog_report.summary()
 

@@ -60,6 +60,22 @@ def test_render_human_includes_versions():
     assert "security_schema_version" in text
 
 
+def test_render_human_flags_off_pin_managed_trufflehog():
+    report = _base_report(
+        trufflehog=TruffleHogStatus(
+            state="present", version="3.94.3", off_pin_expected="3.95.5"
+        )
+    )
+    text = render.render_human(report)
+    assert "behind pin v3.95.5" in text
+    assert "clawjournal trufflehog install" in text
+
+
+def test_render_human_no_off_pin_noise_when_pin_matched():
+    text = render.render_human(_base_report())
+    assert "behind pin" not in text
+
+
 def test_render_human_sanitizes_client_version():
     obs = ClientObservation(
         client="claude",

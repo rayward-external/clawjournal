@@ -82,7 +82,13 @@ def render_human(report: DoctorReport, *, stream: TextIO | None = None) -> str:
     )
     th = report.trufflehog
     if th.state == "present":
-        buf.write(f"TruffleHog:  {sanitize_for_human(th.version)} (present)\n")
+        off_pin = ""
+        if getattr(th, "off_pin_expected", None):
+            off_pin = (
+                f" — managed copy behind pin v{th.off_pin_expected}; "
+                "run `clawjournal trufflehog install` to update"
+            )
+        buf.write(f"TruffleHog:  {sanitize_for_human(th.version)} (present){off_pin}\n")
     elif th.state == "missing":
         buf.write(
             "TruffleHog:  missing — install via `clawjournal trufflehog install` "

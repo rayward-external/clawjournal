@@ -1295,6 +1295,7 @@ def finalize_share_export_for_upload(
     # `trufflehog.json` is the authoritative report shipped in the zip.
     # `trufflehog.post-pii.json` is a compatibility/diagnostic marker that
     # proves the final artifact passed the post-PII gate.
+    post_pii_report.engine = trufflehog_scanner.engine_fingerprint()
     trufflehog_scanner.write_report(export_dir / "trufflehog.json", post_pii_report)
     trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
     if isinstance(redaction_summary, dict):

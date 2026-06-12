@@ -5170,19 +5170,28 @@ def _run_trufflehog_command(args) -> None:
         return
 
     # Default (and explicit `status`): report what the share gate will use.
+    import shutil
+
     resolved = trufflehog.resolve_binary()
     managed = managed_binary_path()
     fingerprint = trufflehog.engine_fingerprint()
     version_match = trufflehog._VERSION_RE.search(fingerprint)
+    off_pin = trufflehog.managed_off_pin()
+    is_managed = resolved == str(managed)
+    shadowed_path = shutil.which("trufflehog") if is_managed else None
     payload = {
         "resolved_path": resolved,
-        "managed": resolved == str(managed),
+        "managed": is_managed,
         "managed_path": str(managed),
         # Bare version (e.g. "3.95.5") to match install --json; the raw
         # engine fingerprint (e.g. "trufflehog 3.95.5") rides alongside.
         "version": version_match.group(1) if version_match else None,
         "fingerprint": fingerprint,
         "pinned_version": PINNED_VERSION,
+        # True when the managed copy drifted from the source pin (e.g.
+        # selfupdate bumped PINNED_VERSION but install was never re-run).
+        "managed_off_pin": off_pin is not None,
+        "shadowed_path_binary": shadowed_path,
         "available": resolved is not None,
     }
     if getattr(args, "json", False):
@@ -5195,9 +5204,14 @@ def _run_trufflehog_command(args) -> None:
         print("Run `clawjournal trufflehog install` to install "
               f"the pinned v{PINNED_VERSION}.")
         sys.exit(1)
-    origin = "managed install" if payload["managed"] else "PATH"
+    origin = "managed install" if is_managed else "PATH"
     print(f"TruffleHog: {fingerprint} ({origin}: {resolved})")
-    if not payload["managed"]:
+    if off_pin is not None:
+        print(f"Warning: the managed copy is v{off_pin[0]} but this clawjournal "
+              f"pins v{off_pin[1]} — run `clawjournal trufflehog install` to update.")
+    if shadowed_path:
+        print(f"(The managed copy takes precedence over the PATH copy at {shadowed_path}.)")
+    if not is_managed:
         print(f"A pinned v{PINNED_VERSION} can be installed with "
               "`clawjournal trufflehog install` (managed copy takes precedence).")
 

@@ -170,6 +170,28 @@ class TestInstall:
         assert target.read_bytes() == BINARY_CONTENT
         assert os.access(target, os.X_OK)
 
+    def test_corrupt_executable_existing_file_is_reinstalled(self, install_env, monkeypatch):
+        # A truncated/corrupt managed binary that kept its exec bit fails
+        # the --version probe; already-installed must NOT be reported (that
+        # would exit 0 while the share gate keeps using a broken binary) —
+        # the install falls through and repairs it.
+        target = install_env["target"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"\x7fELF truncated garbage")
+        target.chmod(0o755)
+        monkeypatch.setattr(
+            trufflehog_install,
+            "_verify_installed_binary",
+            lambda path: None if Path(path) == target else "3.95.5",
+        )
+        install_env["serve"](_tar_gz({"trufflehog": BINARY_CONTENT}))
+
+        result = trufflehog_install.install()
+
+        assert result["status"] == "installed"
+        assert result["version"] == "3.95.5"
+        assert target.read_bytes() == BINARY_CONTENT
+
     def test_off_pin_existing_binary_is_upgraded(self, install_env, monkeypatch):
         # A managed binary from an older clawjournal pin is upgraded, not
         # reported as already-installed.
@@ -543,6 +565,57 @@ class TestBinaryResolution:
         assert "clawjournal trufflehog install" in trufflehog.INSTALL_HINT
 
 
+class TestManagedOffPin:
+    """managed_off_pin(): the drift signal between the installed managed
+    binary and the source pin (selfupdate moves the pin; nothing
+    re-installs the binary)."""
+
+    def _managed(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / ".clawjournal"
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", config_dir)
+        managed = trufflehog.managed_binary_path()
+        managed.parent.mkdir(parents=True)
+        managed.write_bytes(BINARY_CONTENT)
+        managed.chmod(0o755)
+        return managed
+
+    def test_none_for_path_resolved_binary(self, tmp_path, monkeypatch):
+        # No managed copy; PATH provides the binary — its freshness is the
+        # package manager's business, never flagged.
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+        monkeypatch.setattr(
+            "clawjournal.redaction.trufflehog.shutil.which",
+            lambda name: "/usr/local/bin/trufflehog",
+        )
+        monkeypatch.setattr(
+            trufflehog, "engine_fingerprint", lambda: "trufflehog 1.0.0"
+        )
+        assert trufflehog.managed_off_pin() is None
+
+    def test_none_when_managed_matches_pin(self, tmp_path, monkeypatch):
+        self._managed(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            trufflehog,
+            "engine_fingerprint",
+            lambda: f"trufflehog {trufflehog_install.PINNED_VERSION}",
+        )
+        assert trufflehog.managed_off_pin() is None
+
+    def test_reports_drift_for_off_pin_managed_copy(self, tmp_path, monkeypatch):
+        self._managed(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            trufflehog, "engine_fingerprint", lambda: "trufflehog 3.90.0"
+        )
+        assert trufflehog.managed_off_pin() == (
+            "3.90.0", trufflehog_install.PINNED_VERSION
+        )
+
+    def test_none_when_fingerprint_unparseable(self, tmp_path, monkeypatch):
+        self._managed(tmp_path, monkeypatch)
+        monkeypatch.setattr(trufflehog, "engine_fingerprint", lambda: "unknown")
+        assert trufflehog.managed_off_pin() is None
+
+
 class TestCliCommand:
     def test_status_json_when_missing_exits_nonzero(self, tmp_path, monkeypatch, capsys):
         import json as json_mod
@@ -627,6 +700,72 @@ class TestCliCommand:
         # Failure output carries the URL and the remediation hint.
         assert "https://example.invalid/archive.tar.gz" in out
         assert "Check your network." in out
+
+    def _managed_setup(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / ".clawjournal"
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", config_dir)
+        managed = trufflehog.managed_binary_path()
+        managed.parent.mkdir(parents=True)
+        managed.write_bytes(BINARY_CONTENT)
+        managed.chmod(0o755)
+        return managed
+
+    def test_status_warns_when_managed_copy_off_pin(self, tmp_path, monkeypatch, capsys):
+        from clawjournal.cli import _run_trufflehog_command
+
+        self._managed_setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "clawjournal.redaction.trufflehog.engine_fingerprint",
+            lambda: "trufflehog 3.90.0",
+        )
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        args = Namespace(trufflehog_command="status", json=False)
+
+        # Warn, never block: off-pin status still exits 0.
+        _run_trufflehog_command(args)
+
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "v3.90.0" in out
+        assert f"pins v{trufflehog_install.PINNED_VERSION}" in out
+        assert "clawjournal trufflehog install" in out
+
+    def test_status_json_reports_off_pin_flag(self, tmp_path, monkeypatch, capsys):
+        import json as json_mod
+
+        from clawjournal.cli import _run_trufflehog_command
+
+        self._managed_setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "clawjournal.redaction.trufflehog.engine_fingerprint",
+            lambda: "trufflehog 3.90.0",
+        )
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        args = Namespace(trufflehog_command="status", json=True)
+
+        _run_trufflehog_command(args)
+
+        payload = json_mod.loads(capsys.readouterr().out)
+        assert payload["managed_off_pin"] is True
+        assert payload["version"] == "3.90.0"
+
+    def test_status_notes_shadowed_path_binary(self, tmp_path, monkeypatch, capsys):
+        from clawjournal.cli import _run_trufflehog_command
+
+        self._managed_setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "clawjournal.redaction.trufflehog.engine_fingerprint",
+            lambda: f"trufflehog {trufflehog_install.PINNED_VERSION}",
+        )
+        monkeypatch.setattr("shutil.which", lambda name: "/opt/homebrew/bin/trufflehog")
+        args = Namespace(trufflehog_command="status", json=False)
+
+        _run_trufflehog_command(args)
+
+        out = capsys.readouterr().out
+        assert "precedence over the PATH copy at /opt/homebrew/bin/trufflehog" in out
+        # Pin matched — no drift warning.
+        assert "Warning" not in out
 
     def test_parser_roundtrip_via_main(self, tmp_path, monkeypatch, capsys):
         import sys as sys_mod

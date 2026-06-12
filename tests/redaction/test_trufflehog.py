@@ -402,6 +402,27 @@ class TestWriteReport:
         assert payload["findings"][0]["masked"] == "ghp_a***4567"
         assert "raw" not in json.dumps(payload).lower() or "raw_sha256" in json.dumps(payload)
 
+    def test_engine_version_recorded_in_report_and_summary(self, tmp_path):
+        # The export chokepoints stamp `engine` before persisting so each
+        # share records which scanner version actually ran (the managed
+        # binary can drift from the source pin between installs).
+        report = trufflehog.TruffleHogReport(
+            scanned_path="/x",
+            scanned_sha256="sha256:abcd",
+            engine="trufflehog 3.95.5",
+        )
+        assert report.summary()["engine"] == "trufflehog 3.95.5"
+        out = tmp_path / "report.json"
+        trufflehog.write_report(out, report)
+        payload = json.loads(out.read_text())
+        assert payload["engine"] == "trufflehog 3.95.5"
+        assert payload["summary"]["engine"] == "trufflehog 3.95.5"
+
+    def test_engine_defaults_to_empty_for_unstamped_reports(self):
+        report = trufflehog.TruffleHogReport(scanned_path="/x", scanned_sha256="")
+        assert report.engine == ""
+        assert report.summary()["engine"] == ""
+
 
 class TestPlaceholderForDetector:
     def test_normalizes_to_upper_snake(self):
