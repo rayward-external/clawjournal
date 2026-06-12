@@ -68,6 +68,7 @@ from .index import (
     query_unscored_sessions,
     remove_policy,
     search_fts,
+    SCORE_SETTLE_SECONDS,
     update_session,
     upsert_sessions,
 )
@@ -96,10 +97,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
 AUTO_SCORE_BATCH_SIZE = 20
-# Don't auto-score a session until it has been quiet this long. Prevents
-# grading a still-running trace mid-flight (which then never gets corrected),
-# and keeps the re-score-on-growth path from churning on an active session.
-SCORE_SETTLE_SECONDS = 180
 SCORING_DISPLAY_NAMES = {
     "claude": "Claude Code",
     "codex": "Codex",

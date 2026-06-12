@@ -2599,6 +2599,11 @@ def effective_hold_state(
 # score/finish.
 RESCORE_GROWTH_MARGIN_SECONDS = 60
 
+# Don't auto-score a session until it has been quiet this long. Prevents
+# grading a still-running trace mid-flight, which can otherwise leave a stale
+# early score behind.
+SCORE_SETTLE_SECONDS = 180
+
 _UNSCORED_RETURN_KEYS = (
     "session_id", "display_title", "task_type", "outcome_badge", "project", "source",
 )

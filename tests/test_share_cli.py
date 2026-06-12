@@ -227,7 +227,11 @@ _SETTINGS = {"excluded_projects": []}
 
 
 def _qargs(**kw):
-    base = dict(time_range="all", project=None, min_failure_value=None, search=None, limit=40)
+    base = dict(
+        time_range="all", project=None, min_failure_value=None, search=None, limit=40,
+        status=None, source=None, no_score=False, score_model=None,
+        summary=False, summary_model=None, indices=[1],
+    )
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -261,6 +265,40 @@ def test_select_filters_search_project_minfv():
 def test_select_limit():
     rows = [_row(fv=5, session_id=str(i)) for i in range(10)]
     assert len(share_cli.select_queue_rows(rows, _SETTINGS, _qargs(limit=3))) == 3
+
+
+def test_step_queue_scores_only_settled_unscored_candidates(monkeypatch):
+    rows = [
+        _row(fv=None, session_id="active", display_title="Active", source="codex"),
+        _row(fv=None, session_id="settled", display_title="Settled", source="codex"),
+    ]
+    unscored_kwargs = {}
+    scored_ids = []
+
+    monkeypatch.setattr(share_cli, "query_sessions", lambda *a, **k: rows)
+    monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: "codex")
+
+    def fake_unscored(conn, **kwargs):
+        unscored_kwargs.update(kwargs)
+        return [{"session_id": "settled"}]
+
+    def fake_score(conn, pool, **kwargs):
+        scored_ids.extend(r["session_id"] for r in pool)
+        for r in pool:
+            r["ai_failure_value_score"] = 4
+        return len(pool)
+
+    monkeypatch.setattr(share_cli, "query_unscored_sessions", fake_unscored)
+    monkeypatch.setattr(share_cli, "score_traces", fake_score)
+    monkeypatch.setattr(share_cli, "ensure_titles", lambda *a, **k: None)
+
+    chosen = share_cli.step_queue(None, _SETTINGS, _qargs(source="codex"))
+
+    assert unscored_kwargs["settle_seconds"] == share_cli.SCORE_SETTLE_SECONDS
+    assert unscored_kwargs["source"] == "codex"
+    assert scored_ids == ["settled"]
+    assert rows[0]["ai_failure_value_score"] is None
+    assert chosen[0]["session_id"] == "settled"
 
 
 # ---- title logic ------------------------------------------------------------
@@ -465,10 +503,32 @@ def test_score_traces_scores_unscored_and_updates(monkeypatch):
             _row(fv=None, session_id="u2")]
     n = share_cli.score_traces(None, rows, backend="auto")
     assert n == 2
-    assert set(scored_ids) == {"u1", "u2"}                 # only the unscored ones (parallel)
+    assert scored_ids == ["u1", "u2"]                     # only the unscored ones
     assert rows[1]["ai_failure_value_score"] == 5          # mutated in place
     assert rows[1]["ai_display_title"] == "scored u1"
     assert rows[0]["ai_failure_value_score"] == 3          # already-scored untouched
+
+
+def test_score_traces_keyboard_interrupt_stops_before_next(monkeypatch):
+    calls = []
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        calls.append(sid)
+        if sid == "u2":
+            raise KeyboardInterrupt
+        return {"ok": True, "fields": {}, "failure_value": 5, "display_title": None}
+
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+
+    rows = [_row(fv=None, session_id="u1"),
+            _row(fv=None, session_id="u2"),
+            _row(fv=None, session_id="u3")]
+
+    assert share_cli.score_traces(None, rows) == 1
+    assert calls == ["u1", "u2"]
+    assert rows[0]["ai_failure_value_score"] == 5
+    assert rows[2]["ai_failure_value_score"] is None
 
 
 def test_score_traces_respects_cap(monkeypatch):

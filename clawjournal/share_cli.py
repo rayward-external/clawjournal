@@ -40,6 +40,8 @@ from .workbench.index import (
     get_session_detail,
     open_index,
     query_sessions,
+    query_unscored_sessions,
+    SCORE_SETTLE_SECONDS,
     session_matches_excluded_projects,
 )
 from . import share_flow
@@ -319,36 +321,28 @@ def _rank_key(r: dict):
 
 
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
-                 model: str | None = None, cap: int | None = None, workers: int = 6) -> int:
-    """Score the unscored rows for failure value, IN PARALLEL: the slow AI-judge
-    step runs in worker threads (each with its own read connection via
-    share_flow.score_compute), while DB writes happen serially on `conn` (single
-    writer; WAL handles the readers). Shows a simple `scored X/N` counter that
-    ticks up as each completes; Ctrl-C skips the rest. Mutates rows in place and
-    persists. Returns the count scored."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+                 model: str | None = None, cap: int | None = None) -> int:
+    """Score unscored rows for failure value, one at a time.
 
+    Runs before queue display, mutates rows in place, and persists each finished
+    score. Ctrl-C stops before launching the next AI judge call, so it does not
+    start extra background work after the user chooses to skip.
+    """
     unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
     if cap is not None:
         unscored = unscored[:cap]
     if not unscored:
         return 0
     total = len(unscored)
-    by_sid = {r["session_id"]: r for r in unscored}
-    n_workers = max(1, min(workers, total))
     print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
-          f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
+          f"(AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
-    pool = ThreadPoolExecutor(max_workers=n_workers)
-    futures = {pool.submit(share_flow.score_compute, sid, backend=backend, model=model): sid
-               for sid in by_sid}
     try:
-        for fut in as_completed(futures):
-            res = fut.result()
+        for r in unscored:
+            sid = r["session_id"]
+            res = share_flow.score_compute(sid, backend=backend, model=model)
             if res.get("ok"):
-                sid = futures[fut]
                 share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
-                r = by_sid[sid]
                 r["ai_failure_value_score"] = res.get("failure_value")
                 if res.get("display_title"):
                     r["ai_display_title"] = res["display_title"]
@@ -358,8 +352,6 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     except KeyboardInterrupt:
         print(f"\n  {YEL}Skipped remaining scoring ({done}/{total} done).{RST}")
         return done
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
     return done
 
 
@@ -409,6 +401,15 @@ def step_queue(conn, settings, args) -> list[dict]:
             from types import SimpleNamespace
             pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})
             pool = select_queue_rows(candidates, settings, pool_args, limit=False)
+            ready_ids = {
+                r["session_id"] for r in query_unscored_sessions(
+                    conn,
+                    limit=5000,
+                    source=args.source,
+                    settle_seconds=SCORE_SETTLE_SECONDS,
+                )
+            }
+            pool = [r for r in pool if r["session_id"] in ready_ids]
             score_traces(conn, pool, model=getattr(args, "score_model", None), cap=args.limit)
 
     rows = select_queue_rows(candidates, settings, args)
@@ -423,7 +424,8 @@ def step_queue(conn, settings, args) -> list[dict]:
           f"value (limit {args.limit}).{RST}")
     if unscored:
         print(f"  {DIM}{unscored} still unscored (no agent backend, scoring skipped via "
-              f"--no-score, or it failed) — run `clawjournal score`; listed last.{RST}")
+              f"--no-score, trace still active/recent, or it failed) — run "
+              f"`clawjournal score`; listed last.{RST}")
 
     do_summary = args.summary or bool(args.summary_model)
     ensure_titles(conn, rows, do_summary, summary_model=args.summary_model)
