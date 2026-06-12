@@ -411,6 +411,9 @@ def step_queue(conn, settings, args) -> list[dict]:
         except Exception:  # noqa: BLE001
             backend_ok = False
         if backend_ok:
+            # Scoring uses the backend's fast default model (Claude → haiku,
+            # Codex → gpt-5.4-mini) via score_session; --score-model overrides.
+            score_model = getattr(args, "score_model", None)
             from types import SimpleNamespace
             pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})
             pool = select_queue_rows(candidates, settings, pool_args, limit=False)
@@ -423,7 +426,7 @@ def step_queue(conn, settings, args) -> list[dict]:
                 )
             }
             pool = [r for r in pool if r["session_id"] in ready_ids]
-            score_traces(conn, pool, model=getattr(args, "score_model", None), cap=args.limit)
+            score_traces(conn, pool, model=score_model, cap=args.limit)
 
     rows = select_queue_rows(candidates, settings, args)
     if not rows:

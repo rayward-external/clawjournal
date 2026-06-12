@@ -42,7 +42,7 @@ class TestConstants:
         assert set(SUPPORTED_BACKENDS) == {"claude", "codex", "hermes", "openclaw"}
 
     def test_default_backend_models(self):
-        assert DEFAULT_CLAUDE_MODEL == "claude-sonnet-4-6"
+        assert DEFAULT_CLAUDE_MODEL == "claude-haiku-4-5"
         assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
         assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
