@@ -10,6 +10,8 @@ import pytest
 from clawjournal.scoring.backends import (
     AgentResult,
     BACKEND_CHOICES,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
     SUPPORTED_BACKENDS,
     _agent_subprocess_env,
     _build_claude_cmd,
@@ -21,10 +23,12 @@ from clawjournal.scoring.backends import (
     _detect_current_agent_from_process_tree,
     _get_process_field,
     check_backend_runtime,
+    default_model_for_backend,
     detect_available_backend,
     format_codex_runtime_error,
     require_backend_command,
     resolve_backend,
+    resolve_model_for_backend,
     run_default_agent_task,
     summarize_process_error,
 )
@@ -36,6 +40,17 @@ class TestConstants:
 
     def test_supported_backends(self):
         assert set(SUPPORTED_BACKENDS) == {"claude", "codex", "hermes", "openclaw"}
+
+    def test_default_backend_models(self):
+        assert DEFAULT_CLAUDE_MODEL == "claude-sonnet-4-6"
+        assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
+        assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
+        assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
+        assert default_model_for_backend("hermes") is None
+        assert default_model_for_backend("openclaw") is None
+        assert resolve_model_for_backend("claude", None) == DEFAULT_CLAUDE_MODEL
+        assert resolve_model_for_backend("codex", None) == DEFAULT_CODEX_MODEL
+        assert resolve_model_for_backend("claude", "opus") == "opus"
 
 
 class TestDetection:
@@ -372,6 +387,34 @@ class TestRunDefaultAgentTaskClaude:
         assert result.returncode == 0
         assert result.cwd == tmp_path
 
+    def test_default_model_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="claude", cwd=tmp_path, task_prompt="score this",
+        )
+        assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CLAUDE_MODEL
+
+    def test_explicit_model_overrides_default(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="claude", cwd=tmp_path, task_prompt="score this", model="opus",
+        )
+        assert captured_cmd[captured_cmd.index("--model") + 1] == "opus"
+
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)
         _stub_subprocess(monkeypatch, returncode=1, stderr="error: bad prompt")
@@ -417,6 +460,20 @@ class TestRunDefaultAgentTaskCodex:
         )
         assert result.stdout == "done"
         assert result.returncode == 0
+
+    def test_default_model_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="codex", cwd=tmp_path, task_prompt="review",
+        )
+        assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CODEX_MODEL
 
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)

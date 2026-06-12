@@ -8,6 +8,8 @@ import pytest
 from clawjournal.redaction.pii import _PII_PROMPT_FILE
 from clawjournal.scoring.backends import (
     AgentResult,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
     _classify_process_command,
     _detect_current_agent_from_env,
     check_backend_runtime as _check_backend_runtime,
@@ -565,6 +567,7 @@ class TestBackendSelection:
         def fake_run(*, backend, cwd, task_prompt=None, **kw):
             captured["task_prompt"] = task_prompt
             captured["backend"] = backend
+            captured["model"] = kw.get("model")
             captured["codex_output_schema"] = kw.get("codex_output_schema")
             scoring = {
                 "substance": 4,
@@ -592,6 +595,7 @@ class TestBackendSelection:
         assert result["substance"] == 4
         assert result["task_type"] == "debugging"
         assert captured["backend"] == "codex"
+        assert captured["model"] == DEFAULT_CODEX_MODEL
         assert captured["task_prompt"] == _SCORE_TASK_PROMPT_CODEX
         assert captured["codex_output_schema"] is not None
 
@@ -641,6 +645,39 @@ class TestBackendSelection:
         assert "blob_path" not in captured["session_payload"]
         assert "raw_source_path" not in captured["session_payload"]
         assert len(captured["session_payload"]["commands_run"][0]) == 240
+
+    def test_call_judge_defaults_claude_to_sonnet_46(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.scoring.scoring.load_scoring_rubric", lambda: "rubric")
+        captured = {}
+
+        def fake_run(*, backend, cwd, model=None, **kw):
+            captured["backend"] = backend
+            captured["model"] = model
+            scoring = {
+                "substance": 4,
+                **_failure_fields(ai_quality_score=4),
+                "reasoning": "Good session",
+                "display_title": "Fix auth tests",
+                "summary": "Fixed auth tests.",
+                "resolution": "resolved",
+                "effort_estimate": 0.4,
+                "task_type": "debugging",
+                "session_tags": [],
+                "privacy_flags": [],
+                "project_areas": [],
+            }
+            (cwd / "scoring.json").write_text(json.dumps(scoring))
+            return AgentResult(stdout="", stderr="", returncode=0, cwd=cwd)
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.run_default_agent_task", fake_run)
+        result = call_judge(
+            "prompt",
+            session_data={"messages": []},
+            metadata={"total_steps": 1},
+            backend="claude",
+        )
+        assert captured == {"backend": "claude", "model": DEFAULT_CLAUDE_MODEL}
+        assert result["_scorer_model"] == DEFAULT_CLAUDE_MODEL
 
     def test_codex_judge_schema_forbids_additional_properties(self):
         assert JUDGE_SCHEMA["type"] == "object"

@@ -202,7 +202,7 @@ clawjournal set-score <id> --failure-value 4 --failure-evidence "User corrected 
 clawjournal set-score <id> --quality 4               # legacy productivity override
 ```
 
-Scoring uses the current agent's automation CLI by default (`codex exec` in Codex, the Claude CLI in Claude Code); backends are `claude`, `codex`, `hermes`, `openclaw` (override with `--backend`). For Codex specifically, run `codex login` or set `CODEX_API_KEY` for headless scoring. The workbench can also auto-score share-ready traces in the background, but only after you confirm a backend once; confirm it headlessly with `clawjournal config --scorer-backend <backend>` (`none` clears it).
+Scoring uses the current agent's automation CLI by default (`codex exec` in Codex, the Claude CLI in Claude Code); backends are `claude`, `codex`, `hermes`, `openclaw` (override with `--backend`). Claude Code-backed AI features default to `claude-sonnet-4-6`, Codex-backed AI features default to `gpt-5.4-mini`, and the other backends use their own agent defaults unless you pass `--model`. For Codex specifically, run `codex login` or set `CODEX_API_KEY` for headless scoring. The workbench can also auto-score share-ready traces in the background, but only after you confirm a backend once; confirm it headlessly with `clawjournal config --scorer-backend <backend>` (`none` clears it).
 
 </details>
 
@@ -220,6 +220,19 @@ Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploa
 | **Done** | Hosted submissions are closed | Click **Download zip**, then upload that file at **[data.rayward.ai/share](https://data.rayward.ai/share)** when submissions reopen. |
 
 Seeing **Done** instead of **Submit** is normal — submissions just aren't open right now.
+
+**Sharing from a remote machine or SSH session.** If the browser workbench is inconvenient, use the terminal wizard:
+
+```bash
+clawjournal share --interactive --weekly
+# or: clawshare --weekly
+```
+
+It lists shareable traces, prioritizes AI-scored high-failure-value sessions, shows the redacted preview, asks for consent, then uploads when hosted submission is available or saves a ZIP for manual upload. Useful filters: `--all`, `--source codex`, `--source claude`, `--search "text"`, and `--ai-pii-review` for the optional AI PII pass.
+
+Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
+
+> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.*
 
 > ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** It only uploads to a **self-hosted** ingest server you configure via `CLAWJOURNAL_INGEST_URL`; without it, it reports *"Hosted sharing is not configured."* Rayward / STEM Data Program participants should ignore it and use the workbench above.
 
@@ -312,6 +325,7 @@ clawjournal bundle-share <bundle_id>
 | `clawjournal verify-email you@university.edu` | Request a code for the hosted submission flow (a code is emailed; confirm with `clawjournal verify-email you@university.edu --code <CODE>`) |
 | `clawjournal share --preview --status approved` | Preview what would be packaged |
 | `clawjournal share --status approved [--ai-pii-review]` | Package locally + print the Share URL; hosted upload happens in the browser |
+| `clawjournal share --interactive --weekly` / `clawshare --weekly` | Terminal Share wizard for remote/SSH sessions; review redactions, consent, upload or save ZIP |
 | `clawjournal card <id> [--depth workflow\|full]` | Generate a share card (`workflow` is safe for public channels) |
 
 ### Configuration & maintenance

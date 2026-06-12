@@ -15,7 +15,7 @@ from typing import Any, Mapping, cast
 from .redaction.anonymizer import Anonymizer
 from .config import CONFIG_FILE, ClawJournalConfig, load_config, normalize_excluded_project_names, save_config
 from .parsing.parser import CLAUDE_DIR, CODEX_DIR, COPILOT_DIR, CURSOR_DIR, CUSTOM_DIR, GEMINI_DIR, KIMI_DIR, LOCAL_AGENT_DIR, OPENCODE_DIR, OPENCLAW_DIR, discover_projects, parse_project_sessions
-from .scoring.backends import BACKEND_CHOICES
+from .scoring.backends import BACKEND_CHOICES, DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from .redaction.pii import apply_findings_to_session, load_findings, load_jsonl_sessions, review_session_pii, review_session_pii_hybrid, review_session_pii_with_agent, write_findings, write_jsonl_sessions
 from .scoring.scoring import SCORING_BACKEND_CHOICES
 from .redaction.secrets import _has_mixed_char_types, _shannon_entropy, redact_session
@@ -4020,7 +4020,15 @@ def main() -> None:
     bench_p.add_argument("--window", type=int, default=7, help="Coverage window in days (default 7)")
     bench_p.add_argument("--cap", type=int, default=15, help="Max sessions to deep-read (cost bound)")
     bench_p.add_argument("--backend", default="auto", help="Scoring backend (auto|claude|codex|...)")
-    bench_p.add_argument("--model", help="Model override for generation (default: a fast model per backend — sonnet for Claude)")
+    model_default_help = (
+        f"Optional model override (defaults: Claude {DEFAULT_CLAUDE_MODEL}, "
+        f"Codex {DEFAULT_CODEX_MODEL}; others use agent default)"
+    )
+
+    bench_p.add_argument(
+        "--model",
+        help=model_default_help,
+    )
     bench_p.add_argument("--list", action="store_true", help="List stored benchmarks")
     bench_p.add_argument("--show", metavar="ID", help="Render a stored benchmark as markdown (ID or 'latest')")
     bench_p.add_argument("--export", metavar="ID", help="Export a benchmark to a local file (ID or 'latest')")
@@ -4117,7 +4125,7 @@ def main() -> None:
     sc.add_argument("--backend", choices=SCORING_BACKEND_CHOICES, default="auto",
                     help="Scoring backend (default: auto = current agent's automation CLI)")
     sc.add_argument("--model", type=str, default=None,
-                    help="Optional model override for the selected backend")
+                    help=model_default_help)
     sc.add_argument("--dry-run", action="store_true", help="Show score-view without calling a scoring backend")
     sc.add_argument("--auto-triage", action="store_true",
                     help="After scoring, auto-archive 1/5 noise sessions")
@@ -4148,7 +4156,7 @@ def main() -> None:
         "--model",
         type=str,
         default=None,
-        help="Optional model override for the selected backend",
+        help=model_default_help,
     )
     rs.add_argument(
         "--dry-run",

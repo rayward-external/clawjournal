@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from clawjournal import share_cli
+from clawjournal.scoring.backends import DEFAULT_CODEX_MODEL
 
 
 # ---- argument parsing -------------------------------------------------------
@@ -41,6 +42,27 @@ def test_arg_parsing_flags():
 def test_codex_claude_shortcuts():
     assert _parse(["--codex"]).source == "codex"
     assert _parse(["--claude"]).source == "claude"
+
+
+def test_summary_titles_use_resolved_backend_default(monkeypatch):
+    rows = [{"session_id": "s1", "ai_display_title": "", "display_title": "raw"}]
+    captured = {}
+
+    monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: "codex")
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": []})
+    monkeypatch.setattr(share_cli, "_load_title_cache", lambda: {})
+    monkeypatch.setattr(share_cli, "_save_title_cache", lambda cache: None)
+
+    def fake_summary(detail, *, backend="auto", model=None):
+        captured["backend"] = backend
+        captured["model"] = model
+        return "Short title"
+
+    monkeypatch.setattr(share_cli, "summarize_trace", fake_summary)
+    share_cli.ensure_titles(None, rows, do_summarize=True)
+
+    assert captured == {"backend": "codex", "model": DEFAULT_CODEX_MODEL}
+    assert rows[0]["ai_display_title"] == "Short title"
 
 
 # ---- review must not mutate global review_status (#5) -----------------------

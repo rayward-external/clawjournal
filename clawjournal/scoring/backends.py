@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
 AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+DEFAULT_BACKEND_MODELS: dict[str, str] = {
+    "claude": DEFAULT_CLAUDE_MODEL,
+    "codex": DEFAULT_CODEX_MODEL,
+}
 
 # Prefix of the RuntimeError raised by resolve_backend() when no usable backend
 # can be found. Kept as a constant so callers (e.g. the daemon's auto-score
@@ -54,6 +60,16 @@ BACKEND_COMMAND_ALIASES: dict[str, tuple[str, ...]] = {
     "hermes": ("hermes",),
     "openclaw": ("openclaw",),
 }
+
+
+def default_model_for_backend(backend: str) -> str | None:
+    """Return ClawJournal's fast default model for a resolved backend."""
+    return DEFAULT_BACKEND_MODELS.get(backend)
+
+
+def resolve_model_for_backend(backend: str, model: str | None) -> str | None:
+    """Use an explicit model when provided, otherwise the backend fast default."""
+    return model if model else default_model_for_backend(backend)
 
 
 def _detect_current_agent_from_env(env: dict[str, str] | None = None) -> str | None:
@@ -409,7 +425,9 @@ def run_default_agent_task(
         task_prompt: The task instruction. Delivered via stdin (Claude),
             positional arg (Codex), scripted one-shot (Hermes), or
             ``--message`` (OpenClaw).
-        model: Optional model override for Claude/Codex.
+        model: Optional model override for Claude/Codex. Claude and Codex use
+            fast backend-specific defaults when not provided; other backends
+            keep their agent CLI default.
         timeout_seconds: Subprocess timeout.
         codex_sandbox: Codex sandbox mode ("read-only" or None for
             full access). Ignored by other backends.
@@ -428,6 +446,7 @@ def run_default_agent_task(
     check_backend_runtime(resolved)
     command = require_backend_command(resolved)
     agent_env = _agent_subprocess_env()
+    effective_model = resolve_model_for_backend(resolved, model)
 
     if codex_output_file and ("/" in codex_output_file or "\\" in codex_output_file):
         raise ValueError(
@@ -438,7 +457,7 @@ def run_default_agent_task(
         cmd = _build_claude_cmd(
             command,
             system_prompt_file=system_prompt_file,
-            model=model,
+            model=effective_model,
             bare=claude_bare,
         )
         try:
@@ -478,7 +497,7 @@ def run_default_agent_task(
         cmd = _build_codex_cmd(
             command,
             cwd=cwd,
-            model=model,
+            model=effective_model,
             sandbox=codex_sandbox,
             output_schema_path=schema_path,
             output_file_path=output_path,
@@ -513,7 +532,7 @@ def run_default_agent_task(
         )
 
     if resolved == "openclaw":
-        if model:
+        if effective_model:
             raise RuntimeError(
                 "OpenClaw backend does not support --model override from clawjournal"
             )
@@ -547,7 +566,7 @@ def run_default_agent_task(
         )
 
     if resolved == "hermes":
-        cmd = _build_hermes_cmd(command, message=task_prompt, model=model)
+        cmd = _build_hermes_cmd(command, message=task_prompt, model=effective_model)
         try:
             proc = subprocess.run(
                 cmd,
