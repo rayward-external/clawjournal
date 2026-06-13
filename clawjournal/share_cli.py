@@ -327,11 +327,12 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     The slow AI-judge step runs in worker threads (each with its own read
     connection via share_flow.score_compute), while DB writes happen serially on
     `conn` (single writer; WAL handles the readers) — so N traces take about one
-    judge call, not N. At most `workers` judge calls are in flight at once; on
-    Ctrl-C, pending (not-yet-started) calls are cancelled and we return what's
-    done (in-flight calls may still finish). Mutates rows in place and persists.
+    judge call, not N. Only `workers` judge calls are submitted at a time; on
+    Ctrl-C we stop queueing new calls, cancel any submitted calls that have not
+    started, and return what's done (in-flight calls may still finish). Mutates
+    rows in place and persists.
     """
-    from concurrent.futures import as_completed
+    from concurrent.futures import FIRST_COMPLETED, wait
 
     unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
     if cap is not None:
@@ -339,28 +340,50 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     if not unscored:
         return 0
     total = len(unscored)
-    by_sid = {r["session_id"]: r for r in unscored}
     n_workers = max(1, min(workers, total))
     print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
           f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
     pool = ThreadPoolExecutor(max_workers=n_workers)
-    futures = {pool.submit(share_flow.score_compute, sid, backend=backend, model=model): sid
-               for sid in by_sid}
+    rows_iter = iter(unscored)
+    futures = {}
+
+    def submit_next() -> bool:
+        try:
+            r = next(rows_iter)
+        except StopIteration:
+            return False
+        sid = r["session_id"]
+        futures[pool.submit(share_flow.score_compute, sid, backend=backend, model=model)] = r
+        return True
+
+    for _ in range(n_workers):
+        submit_next()
+
     try:
-        for fut in as_completed(futures):
-            res = fut.result()
-            if res.get("ok"):
-                sid = futures[fut]
+        while futures:
+            completed, _pending = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+            if not completed:
+                continue
+            for fut in completed:
+                r = futures.pop(fut)
+                sid = r["session_id"]
+                res = fut.result()
+                if not res.get("ok"):
+                    print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                    submit_next()
+                    continue
                 share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
-                r = by_sid[sid]
                 r["ai_failure_value_score"] = res.get("failure_value")
                 if res.get("display_title"):
                     r["ai_display_title"] = res["display_title"]
                 done += 1
-            print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                submit_next()
         print()
     except KeyboardInterrupt:
+        for fut in futures:
+            fut.cancel()
         print(f"\n  {YEL}Skipped remaining scoring ({done}/{total} done).{RST}")
         return done
     finally:

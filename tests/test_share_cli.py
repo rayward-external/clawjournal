@@ -1,5 +1,6 @@
 """Tests for the interactive share wizard CLI surface."""
 import argparse
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -525,6 +526,34 @@ def test_score_traces_keyboard_interrupt_is_graceful(monkeypatch):
     result = share_cli.score_traces(None, rows, workers=2)
     assert result == 0                                    # nothing completed; no crash
     assert all(r.get("ai_failure_value_score") is None for r in rows)
+
+
+def test_score_traces_keyboard_interrupt_does_not_submit_beyond_workers(monkeypatch):
+    started = []
+    release = threading.Event()
+    u2_started = threading.Event()
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        started.append(sid)
+        if sid == "u1":
+            u2_started.wait(timeout=1)
+            raise KeyboardInterrupt
+        if sid == "u2":
+            u2_started.set()
+        release.wait(timeout=1)
+        return {"ok": True, "fields": {}, "failure_value": 5, "display_title": None}
+
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+
+    rows = [_row(fv=None, session_id=f"u{i}") for i in range(1, 5)]
+    try:
+        result = share_cli.score_traces(None, rows, workers=2)
+    finally:
+        release.set()
+
+    assert result == 0
+    assert set(started) == {"u1", "u2"}
 
 
 def test_score_traces_respects_cap(monkeypatch):
