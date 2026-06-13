@@ -1,6 +1,7 @@
 """Tests for the TruffleHog share-time gate."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -946,6 +947,49 @@ class TestEngineFingerprint:
         sig[1] = 200
         trufflehog.engine_fingerprint()
         assert calls["n"] == 2
+
+    def test_invalidation_through_real_os_stat_seam(self, tmp_path, monkeypatch):
+        """Cache invalidation must work through the REAL `os.stat` path,
+        not just a stubbed `_binary_signature`. This is the seam the
+        daemon relies on to notice an in-place `trufflehog install` —
+        when a managed binary is overwritten, its size/mtime change and
+        the cached fingerprint must be recomputed.
+        """
+        trufflehog.reset_version_cache()
+        config_dir = tmp_path / ".clawjournal"
+        monkeypatch.setattr("clawjournal.config.CONFIG_DIR", config_dir)
+        managed = trufflehog.managed_binary_path()
+        managed.parent.mkdir(parents=True)
+        managed.write_bytes(b"v1")
+        managed.chmod(0o755)
+        # No PATH fallback so the managed copy is the resolved binary.
+        monkeypatch.setattr(
+            "clawjournal.redaction.trufflehog.shutil.which", lambda name: None
+        )
+
+        version = {"v": "3.90.0"}
+
+        def fake_run(args, **kwargs):
+            # Real argv resolves to the managed path — proves we went
+            # through resolve_binary()/os.stat, not a stub.
+            assert args[0] == str(managed)
+            return subprocess.CompletedProcess(
+                args, 0, stdout=f"trufflehog {version['v']}\n", stderr=""
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert trufflehog.engine_fingerprint() == "trufflehog 3.90.0"
+
+        # Simulate an in-place upgrade: new bytes (new size), and bump the
+        # mtime explicitly so the change is observable even on filesystems
+        # with coarse mtime granularity.
+        version["v"] = "3.95.5"
+        managed.write_bytes(b"v2-which-is-longer")
+        st = managed.stat()
+        os.utime(managed, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+        assert trufflehog.engine_fingerprint() == "trufflehog 3.95.5"
 
 
 class TestFormatBlockMessage:

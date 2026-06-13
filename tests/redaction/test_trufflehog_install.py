@@ -479,6 +479,14 @@ class TestPlatformKey:
             assert len(value) == 64
             int(value, 16)  # valid hex
 
+    def test_checksum_values_are_pairwise_distinct(self):
+        # Each platform archive is a distinct artifact, so a repeated hash
+        # means a copy-paste slip during a pin bump (e.g. darwin_arm64's
+        # row left holding darwin_amd64's checksum) — which the key-set and
+        # hex-format checks above would not catch.
+        values = list(trufflehog_install._ARCHIVE_SHA256.values())
+        assert len(values) == len(set(values))
+
     def test_download_url_shape(self):
         url = trufflehog_install.download_url("linux_amd64")
         assert url == (
