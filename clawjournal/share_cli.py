@@ -321,37 +321,73 @@ def _rank_key(r: dict):
 
 
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
-                 model: str | None = None, cap: int | None = None) -> int:
-    """Score unscored rows for failure value, one at a time.
+                 model: str | None = None, cap: int | None = None, workers: int = 6) -> int:
+    """Score unscored rows for failure value, IN PARALLEL.
 
-    Runs before queue display, mutates rows in place, and persists each finished
-    score. Ctrl-C stops before launching the next AI judge call, so it does not
-    start extra background work after the user chooses to skip.
+    The slow AI-judge step runs in worker threads (each with its own read
+    connection via share_flow.score_compute), while DB writes happen serially on
+    `conn` (single writer; WAL handles the readers) — so N traces take about one
+    judge call, not N. Only `workers` judge calls are submitted at a time; on
+    Ctrl-C we stop queueing new calls, cancel any submitted calls that have not
+    started, and return what's done (in-flight calls may still finish). Mutates
+    rows in place and persists.
     """
+    from concurrent.futures import FIRST_COMPLETED, wait
+
     unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
     if cap is not None:
         unscored = unscored[:cap]
     if not unscored:
         return 0
     total = len(unscored)
+    n_workers = max(1, min(workers, total))
     print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
-          f"(AI judge — Ctrl-C to skip the rest)…{RST}")
+          f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
+    pool = ThreadPoolExecutor(max_workers=n_workers)
+    rows_iter = iter(unscored)
+    futures = {}
+
+    def submit_next() -> bool:
+        try:
+            r = next(rows_iter)
+        except StopIteration:
+            return False
+        sid = r["session_id"]
+        futures[pool.submit(share_flow.score_compute, sid, backend=backend, model=model)] = r
+        return True
+
+    for _ in range(n_workers):
+        submit_next()
+
     try:
-        for r in unscored:
-            sid = r["session_id"]
-            res = share_flow.score_compute(sid, backend=backend, model=model)
-            if res.get("ok"):
+        while futures:
+            completed, _pending = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+            if not completed:
+                continue
+            for fut in completed:
+                r = futures.pop(fut)
+                sid = r["session_id"]
+                res = fut.result()
+                if not res.get("ok"):
+                    print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                    submit_next()
+                    continue
                 share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
                 r["ai_failure_value_score"] = res.get("failure_value")
                 if res.get("display_title"):
                     r["ai_display_title"] = res["display_title"]
                 done += 1
-            print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                submit_next()
         print()
     except KeyboardInterrupt:
+        for fut in futures:
+            fut.cancel()
         print(f"\n  {YEL}Skipped remaining scoring ({done}/{total} done).{RST}")
         return done
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return done
 
 
@@ -398,6 +434,9 @@ def step_queue(conn, settings, args) -> list[dict]:
         except Exception:  # noqa: BLE001
             backend_ok = False
         if backend_ok:
+            # Scoring uses the backend's fast default model (Claude → haiku,
+            # Codex → gpt-5.4-mini) via score_session; --score-model overrides.
+            score_model = getattr(args, "score_model", None)
             from types import SimpleNamespace
             pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})
             pool = select_queue_rows(candidates, settings, pool_args, limit=False)
@@ -410,7 +449,7 @@ def step_queue(conn, settings, args) -> list[dict]:
                 )
             }
             pool = [r for r in pool if r["session_id"] in ready_ids]
-            score_traces(conn, pool, model=getattr(args, "score_model", None), cap=args.limit)
+            score_traces(conn, pool, model=score_model, cap=args.limit)
 
     rows = select_queue_rows(candidates, settings, args)
     if not rows:
