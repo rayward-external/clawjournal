@@ -321,8 +321,14 @@ def _rank_key(r: dict):
 
 
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
-                 model: str | None = None, cap: int | None = None, workers: int = 6) -> int:
+                 model: str | None = None, cap: int | None = None, workers: int = 6,
+                 force_ids: set[str] | None = None) -> int:
     """Score unscored rows for failure value, IN PARALLEL.
+
+    Scores rows with no failure value, plus any row whose session_id is in
+    `force_ids` — used to re-score sessions that grew since they were last graded
+    (the web's `include_stale_scored` behavior), so a stale early grade is
+    overwritten with one that reflects the current content.
 
     The slow AI-judge step runs in worker threads (each with its own read
     connection via share_flow.score_compute), while DB writes happen serially on
@@ -334,14 +340,18 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     """
     from concurrent.futures import FIRST_COMPLETED, wait
 
-    unscored = [r for r in rows if r.get("ai_failure_value_score") is None]
+    force_ids = force_ids or set()
+    unscored = [r for r in rows
+                if r.get("ai_failure_value_score") is None or r["session_id"] in force_ids]
     if cap is not None:
         unscored = unscored[:cap]
     if not unscored:
         return 0
     total = len(unscored)
+    restale = sum(1 for r in unscored if r.get("ai_failure_value_score") is not None)
+    suffix = f" ({restale} re-scored after new activity)" if restale else ""
     n_workers = max(1, min(workers, total))
-    print(f"  {DIM}Scoring {total} unscored trace(s) for failure value "
+    print(f"  {DIM}Scoring {total} trace(s) for failure value{suffix} "
           f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
     pool = ThreadPoolExecutor(max_workers=n_workers)
@@ -440,16 +450,20 @@ def step_queue(conn, settings, args) -> list[dict]:
             from types import SimpleNamespace
             pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})
             pool = select_queue_rows(candidates, settings, pool_args, limit=False)
+            # include_stale_scored re-selects sessions that were graded earlier
+            # and then grew (end_time advanced past ai_scored_at) — matches the
+            # web's background scorer so a stale early grade gets refreshed.
             ready_ids = {
                 r["session_id"] for r in query_unscored_sessions(
                     conn,
                     limit=5000,
                     source=args.source,
                     settle_seconds=SCORE_SETTLE_SECONDS,
+                    include_stale_scored=True,
                 )
             }
             pool = [r for r in pool if r["session_id"] in ready_ids]
-            score_traces(conn, pool, model=score_model, cap=args.limit)
+            score_traces(conn, pool, model=score_model, cap=args.limit, force_ids=ready_ids)
 
     rows = select_queue_rows(candidates, settings, args)
     if not rows:

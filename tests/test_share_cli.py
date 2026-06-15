@@ -556,6 +556,26 @@ def test_score_traces_keyboard_interrupt_does_not_submit_beyond_workers(monkeypa
     assert set(started) == {"u1", "u2"}
 
 
+def test_score_traces_rescores_stale_via_force_ids(monkeypatch):
+    """Already-scored rows in force_ids are re-scored (the web's stale-grade
+    refresh); other already-scored rows are left untouched."""
+    scored = []
+    monkeypatch.setattr(share_cli.share_flow, "score_compute",
+                        lambda sid, **k: scored.append(sid) or
+                        {"ok": True, "fields": {}, "failure_value": 5, "display_title": None})
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [
+        _row(fv=None, session_id="never"),   # never scored -> always scored
+        _row(fv=2, session_id="stale"),      # scored but grew -> in force_ids -> re-scored
+        _row(fv=3, session_id="fresh"),      # scored, not stale -> skipped
+    ]
+    done = share_cli.score_traces(None, rows, force_ids={"stale"})
+    assert done == 2
+    assert set(scored) == {"never", "stale"}
+    assert next(r for r in rows if r["session_id"] == "stale")["ai_failure_value_score"] == 5
+    assert next(r for r in rows if r["session_id"] == "fresh")["ai_failure_value_score"] == 3
+
+
 def test_score_traces_respects_cap(monkeypatch):
     monkeypatch.setattr(share_cli.share_flow, "score_compute",
                         lambda sid, **k: {"ok": True, "fields": {}, "failure_value": 4,
