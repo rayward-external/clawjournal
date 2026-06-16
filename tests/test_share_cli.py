@@ -576,6 +576,52 @@ def test_score_traces_rescores_stale_via_force_ids(monkeypatch):
     assert next(r for r in rows if r["session_id"] == "fresh")["ai_failure_value_score"] == 3
 
 
+def test_backend_unavailable_matcher():
+    assert share_cli._backend_unavailable("codex exited 1: ERROR: Your workspace is out of credits.")
+    assert share_cli._backend_unavailable("ERROR: not logged in. Run codex login")
+    assert share_cli._backend_unavailable("HTTP 401 Unauthorized")
+    # per-trace failures must NOT be treated as a dead backend
+    assert not share_cli._backend_unavailable("judge timed out after 120s")
+    assert not share_cli._backend_unavailable("could not parse scoring JSON")
+
+
+def test_score_traces_falls_back_on_unavailable_backend(monkeypatch):
+    """codex out of credits -> retry the trace on the next installed backend."""
+    monkeypatch.setattr(share_cli, "_backend_chain", lambda backend: ["codex", "claude"])
+    used = []
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        used.append(backend)
+        if backend == "codex":
+            return {"ok": False, "error": "codex exited 1: ERROR: out of credits."}
+        return {"ok": True, "fields": {}, "failure_value": 4, "display_title": None}
+
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [_row(fv=None, session_id=f"s{i}") for i in range(3)]
+    done = share_cli.score_traces(None, rows, workers=2)
+    assert done == 3
+    assert all(r["ai_failure_value_score"] == 4 for r in rows)
+    assert "codex" in used and "claude" in used  # tried codex, fell back to claude
+
+
+def test_score_traces_no_fallback_on_per_trace_error(monkeypatch):
+    """A judge timeout is not a dead backend — don't waste a fallback attempt."""
+    monkeypatch.setattr(share_cli, "_backend_chain", lambda backend: ["codex", "claude"])
+    used = []
+
+    def fake_compute(sid, *, backend="auto", model=None):
+        used.append(backend)
+        return {"ok": False, "error": "judge timed out after 120s"}
+
+    monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)
+    monkeypatch.setattr(share_cli.share_flow, "persist_score", lambda conn, sid, fields: None)
+    rows = [_row(fv=None, session_id="s0")]
+    done = share_cli.score_traces(None, rows, workers=1)
+    assert done == 0
+    assert used == ["codex"]  # no fallback for a per-trace failure
+
+
 def test_score_traces_respects_cap(monkeypatch):
     monkeypatch.setattr(share_cli.share_flow, "score_compute",
                         lambda sid, **k: {"ok": True, "fields": {}, "failure_value": 4,

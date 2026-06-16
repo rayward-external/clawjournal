@@ -32,7 +32,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
-from .scoring.backends import default_model_for_backend, resolve_backend
+from .scoring.backends import (
+    AUTO_BACKEND_FALLBACK_ORDER,
+    BACKEND_COMMANDS,
+    default_model_for_backend,
+    resolve_backend,
+)
 from .workbench.index import (
     SHAREABLE_HOLD_STATES,
     effective_hold_state,
@@ -320,6 +325,32 @@ def _rank_key(r: dict):
     return (r.get("ai_failure_value_score") is None, -(r.get("ai_failure_value_score") or 0))
 
 
+# Errors that mean the backend *itself* is unusable (no credits / not logged in /
+# CLI missing) — worth retrying the trace on another backend — as opposed to a
+# per-trace failure (judge timeout, bad output) that another backend won't fix.
+_BACKEND_UNAVAILABLE_RE = re.compile(
+    r"out of credits|not logged in|please run|log\s?in|unauthoriz|forbidden|"
+    r"\b40[13]\b|quota|insufficient|command not found|not installed|no such file",
+    re.IGNORECASE,
+)
+
+
+def _backend_unavailable(err: str) -> bool:
+    return bool(_BACKEND_UNAVAILABLE_RE.search(err or ""))
+
+
+def _backend_chain(backend: str) -> list[str]:
+    """Resolved primary backend first, then other *installed* backends to fall
+    back to (in AUTO_BACKEND_FALLBACK_ORDER) when the primary turns out unusable."""
+    import shutil
+    primary = resolve_backend(backend)
+    chain = [primary]
+    for b in AUTO_BACKEND_FALLBACK_ORDER:
+        if b != primary and b not in chain and shutil.which(BACKEND_COMMANDS[b]):
+            chain.append(b)
+    return chain
+
+
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
                  model: str | None = None, cap: int | None = None, workers: int = 6,
                  force_ids: set[str] | None = None) -> int:
@@ -337,6 +368,10 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     Ctrl-C we stop queueing new calls, cancel any submitted calls that have not
     started, and return what's done (in-flight calls may still finish). Mutates
     rows in place and persists.
+
+    If the chosen backend turns out unusable (no credits / not logged in / CLI
+    missing), traces are automatically retried on the next installed backend
+    (model defaults follow the new backend) rather than all failing.
     """
     from concurrent.futures import FIRST_COMPLETED, wait
 
@@ -356,16 +391,28 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     done = 0
     pool = ThreadPoolExecutor(max_workers=n_workers)
     rows_iter = iter(unscored)
-    futures = {}
+    futures = {}  # future -> (row, backend_used)
+
+    chain = _backend_chain(backend)
+    dead: set[str] = set()
+
+    def active_backend():
+        return next((b for b in chain if b not in dead), None)
+
+    def submit(r) -> bool:
+        be = active_backend()
+        if be is None:
+            return False
+        futures[pool.submit(share_flow.score_compute, r["session_id"],
+                            backend=be, model=model)] = (r, be)
+        return True
 
     def submit_next() -> bool:
         try:
             r = next(rows_iter)
         except StopIteration:
             return False
-        sid = r["session_id"]
-        futures[pool.submit(share_flow.score_compute, sid, backend=backend, model=model)] = r
-        return True
+        return submit(r)
 
     for _ in range(n_workers):
         submit_next()
@@ -376,19 +423,35 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
             if not completed:
                 continue
             for fut in completed:
-                r = futures.pop(fut)
+                r, used = futures.pop(fut)
                 sid = r["session_id"]
                 res = fut.result()
-                if not res.get("ok"):
+                if res.get("ok"):
+                    share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
+                    r["ai_failure_value_score"] = res.get("failure_value")
+                    if res.get("display_title"):
+                        r["ai_display_title"] = res["display_title"]
+                    done += 1
                     print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
                     submit_next()
                     continue
-                share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
-                r["ai_failure_value_score"] = res.get("failure_value")
-                if res.get("display_title"):
-                    r["ai_display_title"] = res["display_title"]
-                done += 1
-                print(f"\r  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
+                err = str(res.get("error") or "unknown error")
+                if _backend_unavailable(err):
+                    newly = used not in dead
+                    dead.add(used)
+                    nxt = active_backend()
+                    if nxt is not None:
+                        if newly:
+                            print(f"\r  {YEL}⚠ backend '{used}' unavailable "
+                                  f"({err[:80]}); switching to '{nxt}'…{RST}")
+                        submit(r)  # retry this trace on the next backend
+                        continue
+                    if newly:
+                        print(f"\r  {RED}✗ no usable scoring backend left "
+                              f"('{used}': {err[:80]}).{RST}")
+                else:
+                    print(f"\r  {YEL}✗ {sid[:8]} scoring failed: {err[:160]}{RST}")
+                print(f"  {DIM}scored {done}/{total}…{RST}", end="", flush=True)
                 submit_next()
         print()
     except KeyboardInterrupt:
