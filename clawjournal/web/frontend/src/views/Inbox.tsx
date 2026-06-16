@@ -188,6 +188,7 @@ export function Inbox() {
   expandedIdRef.current = expandedId;
   const expandedMsgsRef = useRef(expandedMessages);
   expandedMsgsRef.current = expandedMessages;
+  const loadRequestSeqRef = useRef(0);
   // Session ids with an in-flight redacted-content fetch (single-flight guard).
   const loadingIdsRef = useRef<Set<string>>(new Set());
 
@@ -202,6 +203,8 @@ export function Inbox() {
   }, []);
 
   const loadSessions = useCallback(async (currentOffset: number, append: boolean) => {
+    const requestSeq = loadRequestSeqRef.current + 1;
+    loadRequestSeqRef.current = requestSeq;
     setLoading(true);
     const [sortField, sortOrder] = sort.split(':');
     try {
@@ -215,20 +218,29 @@ export function Inbox() {
         failure_mode: modeFilter,
         sort: sortField,
         order: sortOrder,
-        limit: pageSize,
+        limit: pageSize + 1,
         offset: currentOffset,
       });
-      setSessions(prev => append ? [...prev, ...data] : data);
-      // A full batch means there may be more; a short/empty batch is the end.
-      setHasMore(data.length === pageSize);
+      if (requestSeq !== loadRequestSeqRef.current) return;
+      const visibleRows = data.slice(0, pageSize);
+      setSessions(prev => append ? [...prev, ...visibleRows] : visibleRows);
+      setOffset(currentOffset);
+      setHasMore(data.length > pageSize);
     } catch (e) {
+      if (requestSeq !== loadRequestSeqRef.current) return;
       toast(e instanceof Error ? e.message : 'Failed to load sessions', 'error');
     }
-    finally { setLoading(false); setLoaded(true); }
+    finally {
+      if (requestSeq === loadRequestSeqRef.current) {
+        setLoading(false);
+        setLoaded(true);
+      }
+    }
   }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, pageSize, toast]);
 
   useEffect(() => {
     setOffset(0);
+    setHasMore(false);
     setSelectedIds(new Set());
     setFocusIndex(-1);
     loadSessions(0, false);
@@ -805,7 +817,7 @@ export function Inbox() {
       {hasMore && sessions.length > 0 && (
         <div style={{ textAlign: 'center', marginTop: '8px' }}>
           <button
-            onClick={() => { const n = offset + pageSize; setOffset(n); loadSessions(n, true); }}
+            onClick={() => { void loadSessions(offset + pageSize, true); }}
             disabled={loading}
             style={{
               padding: '5px 18px', background: colors.gray100, color: colors.gray700, border: `1px solid ${colors.gray300}`,
