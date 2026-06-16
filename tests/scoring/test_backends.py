@@ -43,7 +43,7 @@ class TestConstants:
 
     def test_default_backend_models(self):
         assert DEFAULT_CLAUDE_MODEL == "claude-haiku-4-5"
-        assert DEFAULT_CODEX_MODEL == "gpt-5.3-codex-spark"
+        assert DEFAULT_CODEX_MODEL == "gpt-5.5"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
         assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
         assert default_model_for_backend("hermes") is None
@@ -474,6 +474,19 @@ class TestRunDefaultAgentTaskCodex:
             backend="codex", cwd=tmp_path, task_prompt="review",
         )
         assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CODEX_MODEL
+
+    def test_low_reasoning_effort_forwarded(self, monkeypatch, tmp_path):
+        """gpt-5.5 defaults to xhigh (times out on big traces); we pin low effort."""
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review")
+        assert 'model_reasoning_effort="low"' in captured_cmd
 
     def test_stdin_closed_to_avoid_hang(self, monkeypatch, tmp_path):
         """codex exec reads stdin in addition to the prompt arg; we must give it

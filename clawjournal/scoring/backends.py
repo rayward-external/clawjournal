@@ -21,12 +21,15 @@ logger = logging.getLogger(__name__)
 SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
 # When no current agent is detected (e.g. a plain terminal), pick the first
-# *installed* backend in this order. claude is first (haiku handles large traces
-# within the judge timeout where codex models time out); if it is missing or
-# unusable, scoring falls back to the next installed backend at call time.
-AUTO_BACKEND_FALLBACK_ORDER = ("claude", "codex", "hermes", "openclaw")
+# *installed* backend in this order. codex is first (cheaper); if it is missing
+# or unusable, scoring falls back to the next installed backend at call time.
+AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
-DEFAULT_CODEX_MODEL = "gpt-5.3-codex-spark"
+DEFAULT_CODEX_MODEL = "gpt-5.5"
+# gpt-5.5 defaults to xhigh reasoning, which blows the judge timeout on large
+# traces. Pin a low effort for scoring — at "low"/"none" gpt-5.5 grades a 1.5M-
+# token trace in well under the 120s budget; at xhigh it times out.
+DEFAULT_CODEX_REASONING_EFFORT = "low"
 DEFAULT_BACKEND_MODELS: dict[str, str] = {
     "claude": DEFAULT_CLAUDE_MODEL,
     "codex": DEFAULT_CODEX_MODEL,
@@ -329,6 +332,9 @@ def _build_codex_cmd(
     cmd = [
         command, "exec",
         "-c", "analytics.enabled=false",
+        # Keep reasoning low: gpt-5.5 defaults to xhigh, which times out the
+        # judge on large traces (see DEFAULT_CODEX_REASONING_EFFORT).
+        "-c", f'model_reasoning_effort="{DEFAULT_CODEX_REASONING_EFFORT}"',
         "--skip-git-repo-check",
         "--ephemeral",
         "--color", "never",
