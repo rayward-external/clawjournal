@@ -26,10 +26,8 @@ BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
 # or unusable, scoring falls back to the next installed backend at call time.
 AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
-DEFAULT_CODEX_MODEL = "gpt-5.5"
-# gpt-5.5 defaults to xhigh reasoning, which blows the judge timeout on large
-# traces. Pin a low effort for scoring — at "low"/"none" gpt-5.5 grades a 1.5M-
-# token trace in well under the 120s budget; at xhigh it times out.
+DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+# Keep reasoning low for lower-latency scoring on large traces.
 DEFAULT_CODEX_REASONING_EFFORT = "low"
 DEFAULT_BACKEND_MODELS: dict[str, str] = {
     "claude": DEFAULT_CLAUDE_MODEL,
@@ -362,8 +360,7 @@ def _build_codex_cmd(
     cmd = [
         command, "exec",
         "-c", "analytics.enabled=false",
-        # Keep reasoning low: gpt-5.5 defaults to xhigh, which times out the
-        # judge on large traces (see DEFAULT_CODEX_REASONING_EFFORT).
+        # Keep reasoning low for predictable scoring latency on large traces.
         "-c", f'model_reasoning_effort="{DEFAULT_CODEX_REASONING_EFFORT}"',
         "--skip-git-repo-check",
         "--ephemeral",

@@ -45,7 +45,7 @@ class TestConstants:
 
     def test_default_backend_models(self):
         assert DEFAULT_CLAUDE_MODEL == "claude-haiku-4-5"
-        assert DEFAULT_CODEX_MODEL == "gpt-5.5"
+        assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
         assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
         assert default_model_for_backend("hermes") is None
@@ -501,7 +501,7 @@ class TestRunDefaultAgentTaskCodex:
         assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CODEX_MODEL
 
     def test_low_reasoning_effort_forwarded(self, monkeypatch, tmp_path):
-        """gpt-5.5 defaults to xhigh (times out on big traces); we pin low effort."""
+        """Codex scoring pins low effort for better latency on large traces."""
         _stub_which(monkeypatch)
         captured_cmd = []
 
