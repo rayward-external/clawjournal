@@ -651,6 +651,81 @@ class TestScanner:
         assert scanner._auto_score_disabled_reason is not None
         assert NO_BACKEND_DETECTED_ERROR in scanner._auto_score_disabled_reason
 
+    def _settled_session(self, sid, now):
+        return {
+            "session_id": sid, "project": "p", "source": "claude", "model": "m",
+            "start_time": (now - timedelta(minutes=20)).isoformat(),
+            "end_time": (now - timedelta(minutes=10)).isoformat(),
+            "messages": [{"role": "user", "content": "Fix it", "tool_uses": []},
+                         {"role": "assistant", "content": "Done", "tool_uses": []}],
+            "stats": {"user_messages": 1, "assistant_messages": 1, "tool_uses": 0,
+                      "input_tokens": 100, "output_tokens": 50},
+        }
+
+    def _ok_result(self, now):
+        return SimpleNamespace(
+            quality=4, reason="ok", detail_json="{}", task_type="t",
+            outcome_label="resolved", value_labels=[], risk_level=[], display_title="T",
+            effort_estimate=0.5, summary="s", failure_value_score=4, recovery_labels=[],
+            failure_attribution="agent_caused", failure_modes=[], learning_summary="l",
+            scorer_backend="claude", scorer_model="haiku", rubric_git_sha="sha",
+            scored_at=now.isoformat())
+
+    def test_score_unscored_once_falls_back_to_next_backend(self, tmp_path, monkeypatch):
+        """codex out of credits -> auto-switch to the next installed backend."""
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [self._settled_session("sess-fb", now)])
+        conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.resolve_backend", lambda b: "codex")
+        monkeypatch.setattr("clawjournal.workbench.daemon.installed_fallback_chain",
+                            lambda primary: ["codex", "claude"])
+        seen = []
+
+        def fake_score(conn, session_id, model=None, backend="auto"):
+            seen.append(backend)
+            if backend == "codex":
+                raise RuntimeError("codex exited 1: ERROR: Your workspace is out of credits.")
+            return self._ok_result(now)
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=5) == 1
+        assert seen == ["codex", "claude"]  # tried codex, fell back to claude
+        assert scanner._auto_score_disabled_reason is None
+
+    def test_score_unscored_once_disables_when_all_backends_unavailable(self, tmp_path, monkeypatch):
+        """Every backend out of credits -> arm the circuit breaker, don't loop."""
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [self._settled_session("sess-all", now)])
+        conn.close()
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.resolve_backend", lambda b: "codex")
+        monkeypatch.setattr("clawjournal.workbench.daemon.installed_fallback_chain",
+                            lambda primary: ["codex", "claude"])
+
+        def boom(conn, session_id, model=None, backend="auto"):
+            raise RuntimeError("ERROR: out of credits.")
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", boom)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=5) == 0
+        assert scanner._auto_score_disabled_reason is not None
+
     def test_score_unscored_once_respects_since_window(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
         monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
