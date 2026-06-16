@@ -885,6 +885,36 @@ class TestScoringWarmupAPI:
         assert data["status"] == "already_running"
         assert scanner.calls == [{"limit": 20, "backend": "codex"}]
 
+    def test_helper_starts_when_confirmed_backend_missing_but_fallback_installed(self, monkeypatch):
+        calls = []
+        scanner = SimpleNamespace(
+            trigger_auto_score=lambda **kw: calls.append(kw) or {"status": "started", **kw}
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"scorer_backend": "codex"},
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.installed_fallback_chain",
+            lambda primary: ["codex", "claude"],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.resolve_backend",
+            lambda backend: backend,
+        )
+
+        def require_backend(backend):
+            if backend == "codex":
+                raise RuntimeError("codex CLI not found. Install it.")
+            return backend
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.require_backend_command", require_backend)
+
+        result = trigger_scoring_warmup(scanner)
+
+        assert result == {"status": "started", "limit": 20, "backend": "codex"}
+        assert calls == [{"limit": 20, "backend": "codex"}]
+
     def test_helper_disables_when_no_backend_detected(self, monkeypatch):
         scanner = SimpleNamespace(trigger_auto_score=lambda **kw: {"status": "started"})
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})

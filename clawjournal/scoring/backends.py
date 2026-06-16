@@ -84,6 +84,7 @@ def installed_fallback_chain(primary: str) -> list[str]:
         ):
             chain.append(backend)
     return chain
+
 BACKEND_ENV_MARKERS: dict[str, tuple[str, ...]] = {
     "claude": ("CLAUDECODE", "CLAUDE_CODE", "CLAUDECODE_SESSION_ID", "CLAUDE_PROJECT_DIR"),
     "codex": ("CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI"),

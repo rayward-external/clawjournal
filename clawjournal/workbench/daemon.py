@@ -208,6 +208,23 @@ def _scoring_backend_payload(backend: str | None) -> dict[str, Any]:
     }
 
 
+def _fallback_chain_has_installed_backend(backend: str) -> bool:
+    """True when `backend` or one of its fallback backends is runnable."""
+    try:
+        chain = installed_fallback_chain(resolve_backend(backend))
+    except Exception:  # noqa: BLE001
+        chain = [backend]
+    for candidate in chain:
+        if candidate not in SUPPORTED_BACKENDS:
+            continue
+        try:
+            require_backend_command(candidate)
+        except RuntimeError:
+            continue
+        return True
+    return False
+
+
 def trigger_scoring_warmup(
     scanner: "Scanner | None",
     *,
@@ -241,7 +258,8 @@ def trigger_scoring_warmup(
         try:
             require_backend_command(backend)
         except RuntimeError as exc:
-            return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
+            if not _fallback_chain_has_installed_backend(backend):
+                return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
         if not confirm_backend and _env_scoring_backend() is None:
             return {
                 "status": "needs_confirmation",
@@ -253,7 +271,8 @@ def trigger_scoring_warmup(
     try:
         require_backend_command(backend)
     except RuntimeError as exc:
-        return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
+        if not _fallback_chain_has_installed_backend(backend):
+            return {"status": "disabled", "reason": str(exc), **_scoring_backend_payload(backend)}
 
     return scanner.trigger_auto_score(limit=limit, backend=backend)
 
