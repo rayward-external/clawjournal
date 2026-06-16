@@ -341,9 +341,16 @@ def _backend_unavailable(err: str) -> bool:
 
 def _backend_chain(backend: str) -> list[str]:
     """Resolved primary backend first, then other *installed* backends to fall
-    back to (in AUTO_BACKEND_FALLBACK_ORDER) when the primary turns out unusable."""
+    back to (in AUTO_BACKEND_FALLBACK_ORDER) when the primary turns out unusable.
+
+    If the backend can't be resolved up front (none detected/installed), return
+    the requested value as-is and let score_compute surface the error per trace —
+    the pre-fallback behavior."""
     import shutil
-    primary = resolve_backend(backend)
+    try:
+        primary = resolve_backend(backend)
+    except Exception:  # noqa: BLE001 — no backend resolvable; degrade gracefully
+        return [backend]
     chain = [primary]
     for b in AUTO_BACKEND_FALLBACK_ORDER:
         if b != primary and b not in chain and shutil.which(BACKEND_COMMANDS[b]):
