@@ -580,6 +580,10 @@ def test_backend_unavailable_matcher():
     assert share_cli._backend_unavailable("codex exited 1: ERROR: Your workspace is out of credits.")
     assert share_cli._backend_unavailable("ERROR: not logged in. Run codex login")
     assert share_cli._backend_unavailable("HTTP 401 Unauthorized")
+    # usage/session limits count as "switch backend" (Kai's case)
+    assert share_cli._backend_unavailable("You've hit your usage limit; resets at 5pm")
+    assert share_cli._backend_unavailable("rate limited (HTTP 429)")
+    assert share_cli._backend_unavailable("limit reached, will reset tomorrow")
     # per-trace failures must NOT be treated as a dead backend
     assert not share_cli._backend_unavailable("judge timed out after 120s")
     assert not share_cli._backend_unavailable("could not parse scoring JSON")

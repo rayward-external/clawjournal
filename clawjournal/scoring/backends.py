@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 SUPPORTED_BACKENDS = ("claude", "codex", "hermes", "openclaw")
 BACKEND_CHOICES = ("auto", *SUPPORTED_BACKENDS)
 # When no current agent is detected (e.g. a plain terminal), pick the first
-# *installed* backend in this order. claude is first so the haiku default is used
-# by default; if its CLI is missing the next installed one is used.
-AUTO_BACKEND_FALLBACK_ORDER = ("claude", "codex", "hermes", "openclaw")
+# *installed* backend in this order. codex is first (cheaper); if it is missing
+# or unusable, scoring falls back to the next installed backend at call time.
+AUTO_BACKEND_FALLBACK_ORDER = ("codex", "claude", "hermes", "openclaw")
 DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
 DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 DEFAULT_BACKEND_MODELS: dict[str, str] = {

@@ -330,7 +330,9 @@ def _rank_key(r: dict):
 # per-trace failure (judge timeout, bad output) that another backend won't fix.
 _BACKEND_UNAVAILABLE_RE = re.compile(
     r"out of credits|not logged in|please run|log\s?in|unauthoriz|forbidden|"
-    r"\b40[13]\b|quota|insufficient|command not found|not installed|no such file",
+    r"\b40[13]\b|\b429\b|quota|insufficient|usage limit|rate.?limit|limit reached|"
+    r"limit (?:will )?reset|resets? at|too many requests|"
+    r"command not found|not installed|no such file",
     re.IGNORECASE,
 )
 
