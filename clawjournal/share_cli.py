@@ -33,9 +33,9 @@ from pathlib import Path
 
 from .config import load_config
 from .scoring.backends import (
-    AUTO_BACKEND_FALLBACK_ORDER,
-    BACKEND_COMMANDS,
     default_model_for_backend,
+    installed_fallback_chain,
+    is_backend_unavailable_error,
     resolve_backend,
 )
 from .workbench.index import (
@@ -325,20 +325,8 @@ def _rank_key(r: dict):
     return (r.get("ai_failure_value_score") is None, -(r.get("ai_failure_value_score") or 0))
 
 
-# Errors that mean the backend *itself* is unusable (no credits / not logged in /
-# CLI missing) — worth retrying the trace on another backend — as opposed to a
-# per-trace failure (judge timeout, bad output) that another backend won't fix.
-_BACKEND_UNAVAILABLE_RE = re.compile(
-    r"out of credits|not logged in|please run|log\s?in|unauthoriz|forbidden|"
-    r"\b40[13]\b|\b429\b|quota|insufficient|usage limit|rate.?limit|limit reached|"
-    r"limit (?:will )?reset|resets? at|too many requests|"
-    r"command not found|not installed|no such file",
-    re.IGNORECASE,
-)
-
-
 def _backend_unavailable(err: str) -> bool:
-    return bool(_BACKEND_UNAVAILABLE_RE.search(err or ""))
+    return is_backend_unavailable_error(err)
 
 
 def _backend_chain(backend: str) -> list[str]:
@@ -348,16 +336,11 @@ def _backend_chain(backend: str) -> list[str]:
     If the backend can't be resolved up front (none detected/installed), return
     the requested value as-is and let score_compute surface the error per trace —
     the pre-fallback behavior."""
-    import shutil
     try:
         primary = resolve_backend(backend)
     except Exception:  # noqa: BLE001 — no backend resolvable; degrade gracefully
         return [backend]
-    chain = [primary]
-    for b in AUTO_BACKEND_FALLBACK_ORDER:
-        if b != primary and b not in chain and shutil.which(BACKEND_COMMANDS[b]):
-            chain.append(b)
-    return chain
+    return installed_fallback_chain(primary)
 
 
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
@@ -516,8 +499,8 @@ def step_queue(conn, settings, args) -> list[dict]:
         except Exception:  # noqa: BLE001
             backend_ok = False
         if backend_ok:
-            # Scoring uses the backend's fast default model (Claude → haiku,
-            # Codex → gpt-5.4-mini) via score_session; --score-model overrides.
+            # Scoring uses the backend's fast default model via score_session;
+            # --score-model overrides.
             score_model = getattr(args, "score_model", None)
             from types import SimpleNamespace
             pool_args = SimpleNamespace(**{**vars(args), "min_failure_value": None})

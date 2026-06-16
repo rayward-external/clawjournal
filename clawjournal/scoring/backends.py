@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -55,6 +56,35 @@ BACKEND_COMMANDS: dict[str, str] = {
     "hermes": "hermes",
     "openclaw": "openclaw",
 }
+
+# Errors that mean the backend itself is unusable (no credits, auth failure,
+# rate limit, or CLI missing), so callers can try another installed backend.
+_BACKEND_UNAVAILABLE_RE = re.compile(
+    r"out of credits|not logged in|please run|log\s?in|unauthoriz|forbidden|"
+    r"\b40[13]\b|\b429\b|quota|insufficient|usage limit|rate.?limit|limit reached|"
+    r"limit (?:will )?reset|resets? at|too many requests|"
+    r"cli not found|command not found|not installed|no such file",
+    re.IGNORECASE,
+)
+
+
+def is_backend_unavailable_error(message: str) -> bool:
+    """True if a scoring error means the backend is unusable for this run."""
+    return bool(_BACKEND_UNAVAILABLE_RE.search(message or ""))
+
+
+def installed_fallback_chain(primary: str) -> list[str]:
+    """Return primary first, then other installed backends in fallback order."""
+    chain = [primary]
+    for backend in AUTO_BACKEND_FALLBACK_ORDER:
+        if (
+            backend != primary
+            and backend not in chain
+            and shutil.which(BACKEND_COMMANDS[backend])
+        ):
+            chain.append(backend)
+    return chain
+
 BACKEND_ENV_MARKERS: dict[str, tuple[str, ...]] = {
     "claude": ("CLAUDECODE", "CLAUDE_CODE", "CLAUDECODE_SESSION_ID", "CLAUDE_PROJECT_DIR"),
     "codex": ("CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_CI"),

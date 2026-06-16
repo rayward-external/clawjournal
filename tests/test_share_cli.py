@@ -580,6 +580,7 @@ def test_backend_unavailable_matcher():
     assert share_cli._backend_unavailable("codex exited 1: ERROR: Your workspace is out of credits.")
     assert share_cli._backend_unavailable("ERROR: not logged in. Run codex login")
     assert share_cli._backend_unavailable("HTTP 401 Unauthorized")
+    assert share_cli._backend_unavailable("codex CLI not found. Install it.")
     # usage/session limits count as "switch backend" (Kai's case)
     assert share_cli._backend_unavailable("You've hit your usage limit; resets at 5pm")
     assert share_cli._backend_unavailable("rate limited (HTTP 429)")
@@ -589,15 +590,15 @@ def test_backend_unavailable_matcher():
     assert not share_cli._backend_unavailable("could not parse scoring JSON")
 
 
-def test_score_traces_falls_back_on_unavailable_backend(monkeypatch):
-    """codex out of credits -> retry the trace on the next installed backend."""
+def test_score_traces_falls_back_on_missing_backend_cli(monkeypatch):
+    """A missing primary CLI is a backend failure, not a per-trace failure."""
     monkeypatch.setattr(share_cli, "_backend_chain", lambda backend: ["codex", "claude"])
     used = []
 
     def fake_compute(sid, *, backend="auto", model=None):
         used.append(backend)
         if backend == "codex":
-            return {"ok": False, "error": "codex exited 1: ERROR: out of credits."}
+            return {"ok": False, "error": "codex CLI not found. Install it."}
         return {"ok": True, "fields": {}, "failure_value": 4, "display_title": None}
 
     monkeypatch.setattr(share_cli.share_flow, "score_compute", fake_compute)

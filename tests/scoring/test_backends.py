@@ -26,6 +26,8 @@ from clawjournal.scoring.backends import (
     default_model_for_backend,
     detect_available_backend,
     format_codex_runtime_error,
+    installed_fallback_chain,
+    is_backend_unavailable_error,
     require_backend_command,
     resolve_backend,
     resolve_model_for_backend,
@@ -51,6 +53,29 @@ class TestConstants:
         assert resolve_model_for_backend("claude", None) == DEFAULT_CLAUDE_MODEL
         assert resolve_model_for_backend("codex", None) == DEFAULT_CODEX_MODEL
         assert resolve_model_for_backend("claude", "opus") == "opus"
+
+
+class TestBackendFallbackHelpers:
+    def test_is_backend_unavailable_error(self):
+        assert is_backend_unavailable_error(
+            "codex exited 1: ERROR: Your workspace is out of credits."
+        )
+        assert is_backend_unavailable_error("not logged in; run codex login")
+        assert is_backend_unavailable_error("HTTP 401 Unauthorized")
+        assert is_backend_unavailable_error("codex CLI not found. Install it.")
+        assert is_backend_unavailable_error("You've hit your usage limit; resets at 5pm")
+        assert is_backend_unavailable_error("rate limited (HTTP 429)")
+        assert is_backend_unavailable_error("limit reached, will reset tomorrow")
+        assert not is_backend_unavailable_error("judge timed out after 120s")
+        assert not is_backend_unavailable_error("could not parse scoring JSON")
+
+    def test_installed_fallback_chain_orders_and_filters(self, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.scoring.backends.shutil.which",
+            lambda cmd: cmd in {"codex", "claude"},
+        )
+        assert installed_fallback_chain("codex") == ["codex", "claude"]
+        assert installed_fallback_chain("claude") == ["claude", "codex"]
 
 
 class TestDetection:
