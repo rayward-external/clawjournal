@@ -43,7 +43,7 @@ class TestConstants:
 
     def test_default_backend_models(self):
         assert DEFAULT_CLAUDE_MODEL == "claude-haiku-4-5"
-        assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
+        assert DEFAULT_CODEX_MODEL == "gpt-5.3-codex-spark"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
         assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
         assert default_model_for_backend("hermes") is None
