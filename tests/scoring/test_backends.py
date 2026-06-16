@@ -475,6 +475,21 @@ class TestRunDefaultAgentTaskCodex:
         )
         assert captured_cmd[captured_cmd.index("--model") + 1] == DEFAULT_CODEX_MODEL
 
+    def test_stdin_closed_to_avoid_hang(self, monkeypatch, tmp_path):
+        """codex exec reads stdin in addition to the prompt arg; we must give it
+        EOF (stdin=DEVNULL) or it blocks until timeout in non-interactive contexts."""
+        _stub_which(monkeypatch)
+        captured = {}
+
+        def spy_run(cmd, **kw):
+            captured.update(kw)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review")
+        assert captured.get("stdin") is subprocess.DEVNULL
+        assert "input" not in captured  # cannot pass both
+
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)
         _stub_subprocess(monkeypatch, returncode=1, stderr="401 Unauthorized")

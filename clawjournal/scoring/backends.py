@@ -515,6 +515,11 @@ def run_default_agent_task(
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds,
+                # codex exec reads stdin in addition to the prompt arg; without an
+                # explicit EOF it blocks ("Reading additional input from stdin…")
+                # whenever stdin isn't a closed/empty stream (daemon, pipelines,
+                # background jobs), hanging until the timeout. DEVNULL gives EOF.
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for codex ({timeout_seconds}s)")
@@ -554,6 +559,7 @@ def run_default_agent_task(
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds + 10,
+                stdin=subprocess.DEVNULL,  # avoid blocking on inherited stdin (see codex note)
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for openclaw ({timeout_seconds}s)")
@@ -579,6 +585,7 @@ def run_default_agent_task(
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds + 10,
+                stdin=subprocess.DEVNULL,  # avoid blocking on inherited stdin (see codex note)
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for hermes ({timeout_seconds}s)")
