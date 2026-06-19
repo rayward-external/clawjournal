@@ -644,3 +644,75 @@ def test_no_score_is_interactive_only():
                         certify_ownership=False, download=False, no_refresh=False,
                         include_needs_review=False, status="approved")
     assert any("--no-score" in x for x in share_cli.noninteractive_share_rejections(a))
+
+
+# ---- _transcript_lines helper and render_transcript refactor ----------------
+
+def test_transcript_lines_counts_and_hides():
+    session = {"messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi there"},
+        {"role": "assistant", "content": "   "},   # blank -> hidden
+        {"role": "assistant", "content": "None"},  # literal None -> hidden
+    ]}
+    lines = share_cli._transcript_lines(session)
+    body = "\n".join(lines)
+    assert "all 2 content messages" in lines[0]
+    assert "2 empty/thinking hidden" in lines[0]
+    assert "hello" in body
+    assert "hi there" in body
+
+
+def test_transcript_lines_truncates_long_content():
+    session = {"messages": [{"role": "user", "content": "x" * 50}]}
+    body = "\n".join(share_cli._transcript_lines(session, max_chars=10))
+    assert "more chars)" in body
+
+
+def test_transcript_lines_max_msgs_adds_more_hint():
+    session = {"messages": [{"role": "user", "content": f"m{i}"} for i in range(5)]}
+    body = "\n".join(share_cli._transcript_lines(session, max_msgs=2))
+    assert "first 2 of 5" in body
+    assert "press [v] for the full transcript" in body
+
+
+def test_render_transcript_prints_the_lines(capsys):
+    session = {"messages": [{"role": "user", "content": "hello world"}]}
+    share_cli.render_transcript(session)
+    out = capsys.readouterr().out
+    expected = "\n".join(share_cli._transcript_lines(session)) + "\n"
+    assert out == expected
+
+
+def test_transcript_lines_strip_terminal_escapes_from_content():
+    # Agent-log content can carry raw terminal control sequences; they must be
+    # neutralized so they can't manipulate the reviewer's terminal on display.
+    session = {"messages": [
+        {"role": "user", "content": "hi \x1b]0;PWNED\x07 there \x1b[2J"},
+    ]}
+    body = "\n".join(share_cli._transcript_lines(session))
+    clean = share_cli._ANSI_RE.sub("", body)  # drop our own SGR color codes
+    assert "\x1b" not in clean and "\x07" not in clean  # content escapes removed
+    assert "hi" in clean and "there" in clean and "PWNED" in clean  # text kept inert
+
+
+def test_transcript_lines_handles_zero_messages():
+    for messages in ([], None):
+        lines = share_cli._transcript_lines({"messages": messages})
+        assert len(lines) == 1
+        assert "all 0 content messages" in lines[0]
+    assert "all 0 content messages" in share_cli._transcript_lines({})[0]
+
+
+def test_view_transcript_is_wired_into_share_cli():
+    import inspect
+    from clawjournal import transcript_viewer
+    assert share_cli.view_transcript is transcript_viewer.view_transcript
+    redact_src = inspect.getsource(share_cli.step_redact)
+    review_src = inspect.getsource(share_cli.step_review)
+    # Full-transcript views now go through the scrollable viewer.
+    assert "view_transcript(" in redact_src
+    assert "view_transcript(" in review_src
+    # And no longer dump the full transcript inline.
+    assert "render_transcript(scrubbed[n - 1]" not in redact_src
+    assert "render_transcript(s[\"redacted\"])" not in review_src

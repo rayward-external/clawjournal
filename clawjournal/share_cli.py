@@ -58,12 +58,17 @@ from .share_flow import (
     gate_blockers,
     hosted_destination,
 )
+from .transcript_viewer import view_transcript
 
 # ---- tty helpers ------------------------------------------------------------
 
 BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"; YEL = "\033[33m"; RED = "\033[31m"
 CYN = "\033[36m"; RST = "\033[0m"
 _ANSI_RE = re.compile(r"(\033\[[0-9;]*m)")
+# C0 control chars + DEL, excluding \t (0x09) and \n (0x0a). Stripped from
+# displayed message content so terminal escape sequences embedded in
+# (untrusted) agent logs can't manipulate the reviewer's terminal.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 NSTEPS = 6
 
 
@@ -582,7 +587,8 @@ def step_queue(conn, settings, args) -> list[dict]:
 
 # ---- step 2: redact ---------------------------------------------------------
 
-def render_transcript(redacted_session: dict, max_msgs: int | None = None, max_chars: int = 2000):
+def _transcript_lines(redacted_session: dict, max_msgs: int | None = None,
+                      max_chars: int = 2000) -> list[str]:
     all_msgs = redacted_session.get("messages") or []
     msgs, hidden = [], 0
     for m in all_msgs:
@@ -597,20 +603,30 @@ def render_transcript(redacted_session: dict, max_msgs: int | None = None, max_c
     if hidden:
         note += f", {hidden} empty/thinking hidden"
     note += " — already scrubbed)"
-    print(f"  {DIM}{note}{RST}")
+    out = [f"  {DIM}{note}{RST}"]
     for m in shown:
         role = m.get("role", "?")
-        content = m["content"]
+        # Neutralize terminal escapes embedded in agent-log content before display.
+        content = _CONTROL_CHARS_RE.sub("", m["content"])
         color = CYN if role == "user" else (YEL if role == "assistant" else DIM)
         body = content
         if len(body) > max_chars:
             body = body[:max_chars] + f"  …(+{len(content) - max_chars} more chars)"
         lines = body.split("\n")
-        print(f"  {color}{role:>9}{RST}  {lines[0] if lines else ''}")
+        # NOTE: the "  {role:>9}  " layout here is parsed by
+        # transcript_viewer._role_line_fragments to recolor role labels — keep in sync.
+        out.append(f"  {color}{role:>9}{RST}  {lines[0] if lines else ''}")
         for ln in lines[1:]:
-            print(f"             {ln}")
+            out.append(f"             {ln}")
     if max_msgs is not None and len(msgs) > max_msgs:
-        print(f"  {DIM}… {len(msgs) - max_msgs} more — press [v] for the full transcript{RST}")
+        out.append(f"  {DIM}… {len(msgs) - max_msgs} more — press [v] for the full transcript{RST}")
+    return out
+
+
+def render_transcript(redacted_session: dict, max_msgs: int | None = None,
+                      max_chars: int = 2000):
+    for line in _transcript_lines(redacted_session, max_msgs, max_chars):
+        print(line)
 
 
 def _build_records(conn, settings, chosen, ai_pii):
@@ -683,7 +699,8 @@ def step_redact(conn, settings, chosen, assume_yes, ai_pii_requested) -> tuple[l
                 print(f"{YEL}Enter a # between 1 and {len(scrubbed)}, or blank to skip.{RST}")
                 continue
             print()
-            render_transcript(scrubbed[n - 1]["redacted"])
+            view_transcript(scrubbed[n - 1]["redacted"],
+                            title=trace_title(scrubbed[n - 1]["row"]))
     print(f"{GRN}✓ scrubbed {len(scrubbed)} trace(s){RST}")
     return scrubbed, package_ai
 
@@ -750,7 +767,7 @@ def step_review(conn, scrubbed: list[dict], assume_yes: bool,
                                  f"{BOLD}[i]{RST}nclude  {BOLD}[r]{RST}emove: ").lower()
                     if choice in ("v", "view"):
                         print()
-                        render_transcript(s["redacted"])
+                        view_transcript(s["redacted"], title=trace_title(s["row"]))
                         continue
                     if choice in ("i", "include", "y", "yes"):
                         included_ids.add(s["row"]["session_id"])
