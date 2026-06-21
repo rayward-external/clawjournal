@@ -463,13 +463,15 @@ def _trim_prompt_counts(counts: dict[str, int], today: date) -> dict[str, int]:
 def _prompt_message(client: str, launch_command: str, snooze_command: str) -> str:
     agent = "Claude Code" if client == "claude" else "Codex"
     return (
-        f"{PROFILE_DISPLAY_NAME} is enabled for your research enrollment.\n"
-        "ClawJournal can review and redact your recent agent failure traces locally, "
-        "then submit them for OpenRefinery research.\n\n"
-        f"Ask the participant: Review now?  y: Review and submit  n: Later  d: Pause reminders\n\n"
+        f"{PROFILE_DISPLAY_NAME} reminder.\n\n"
+        "Ask the user one concise question with three choices:\n"
+        "- y: Open local ClawJournal review\n"
+        "- n: Later\n"
+        "- d: Pause reminders for 30 days\n\n"
         f"If they choose y, run `{launch_command}`. If they choose d, run "
-        f"`{snooze_command}`. Do not submit anything until they have reviewed the "
-        f"redacted bundle in ClawJournal. Current agent: {agent}."
+        f"`{snooze_command}`. Do not run either command until the user chooses. "
+        "The launch command only opens local ClawJournal review; it does not "
+        f"upload or submit anything. Current agent: {agent}."
     )
 
 
@@ -526,8 +528,6 @@ def render_hook_response(result: HookRunResult, *, client: str, output_json: boo
         return ""
     if client == "claude":
         payload = {
-            "decision": "block",
-            "reason": result.message,
             "hookSpecificOutput": {
                 "hookEventName": "Stop",
                 "additionalContext": result.message,

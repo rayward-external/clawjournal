@@ -124,12 +124,11 @@ differently.
 
 For Claude Code, the hook returns JSON with:
 
-- `decision: "block"`
-- `reason: <prompt text>`
 - `hookSpecificOutput.hookEventName: "Stop"`
 - `hookSpecificOutput.additionalContext: <prompt text>`
 
-This asks Claude Code to continue the turn with the participant-facing prompt.
+This asks Claude Code to continue the turn with the participant-facing prompt
+without labeling the response as a Stop-hook error.
 
 For Codex, the hook returns:
 

@@ -137,7 +137,7 @@ def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     rendered = hooks.render_hook_response(first, client="codex")
     payload = json.loads(rendered)
     assert payload["decision"] == "block"
-    assert "Review now?" in payload["reason"]
+    assert "Open local ClawJournal review" in payload["reason"]
     assert [result.should_prompt for result in results[:10]] == [True] * 10
     assert over_limit.should_prompt is False
     assert over_limit.reason == "daily-prompt-limit-reached"
@@ -172,7 +172,7 @@ def test_claude_hook_response_includes_additional_context(isolated_hook_env):
 
     payload = json.loads(hooks.render_hook_response(result, client="claude"))
 
-    assert payload["decision"] == "block"
+    assert "decision" not in payload
     assert payload["hookSpecificOutput"]["hookEventName"] == "Stop"
     assert "OpenRefinery Agent Failure Sharing" in payload["hookSpecificOutput"]["additionalContext"]
 
