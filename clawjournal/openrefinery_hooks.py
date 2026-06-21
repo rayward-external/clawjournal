@@ -1,9 +1,9 @@
 """OpenRefinery enrollment hooks for Claude Code and Codex.
 
 The hook itself does not package or upload traces. It only nudges an enrolled
-participant once per day and launches the existing local Share workflow on
-request, so the normal source/project confirmation, redaction, hold-state, and
-TruffleHog gates remain authoritative.
+participant up to a small daily cap and launches the existing local Share
+workflow on request, so the normal source/project confirmation, redaction,
+hold-state, and TruffleHog gates remain authoritative.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ SUPPORTED_AGENTS = ("claude", "codex")
 SUPPORTED_UI_MODES = ("auto", "web", "cli")
 DEFAULT_PORT = 8384
 DEFAULT_SNOOZE_DAYS = 30
+DEFAULT_MAX_PROMPTS_PER_DAY = 10
 STATE_VERSION = 1
 
 AgentName = Literal["claude", "codex"]
@@ -100,6 +101,8 @@ def load_state() -> dict[str, Any]:
             "enabled": False,
             "ui": "auto",
             "cadence": "daily",
+            "max_prompts_per_day": DEFAULT_MAX_PROMPTS_PER_DAY,
+            "prompt_counts_by_date": {},
             "installed_agents": [],
             "created_at": _now().isoformat(),
         }
@@ -109,7 +112,15 @@ def load_state() -> dict[str, Any]:
     state.setdefault("enabled", False)
     state.setdefault("ui", "auto")
     state.setdefault("cadence", "daily")
+    state.setdefault("max_prompts_per_day", DEFAULT_MAX_PROMPTS_PER_DAY)
     state.setdefault("installed_agents", [])
+    counts = state.get("prompt_counts_by_date")
+    if not isinstance(counts, dict):
+        counts = {}
+    legacy_last_prompt = state.get("last_prompt_date")
+    if legacy_last_prompt and str(legacy_last_prompt) not in counts:
+        counts[str(legacy_last_prompt)] = 1
+    state["prompt_counts_by_date"] = counts
     return state
 
 
@@ -377,12 +388,16 @@ def uninstall_profile(
 def status(*, profile: str = PROFILE_NAME) -> dict[str, Any]:
     _normalize_profile(profile)
     state = load_state()
+    today = _today().isoformat()
+    prompt_counts = _prompt_counts_by_date(state)
     return {
         "profile": PROFILE_NAME,
         "display_name": PROFILE_DISPLAY_NAME,
         "enabled": bool(state.get("enabled", False)),
         "ui": state.get("ui", "auto"),
         "cadence": state.get("cadence", "daily"),
+        "max_prompts_per_day": _max_prompts_per_day(state),
+        "prompts_today": prompt_counts.get(today, 0),
         "installed_agents": list(state.get("installed_agents") or []),
         "last_prompt_date": state.get("last_prompt_date"),
         "snooze_until": state.get("snooze_until"),
@@ -406,6 +421,43 @@ def _hook_disabled_by_env() -> bool:
         os.environ.get("CLAWJOURNAL_DISABLE_SHARE_NUDGE") == "1"
         or os.environ.get("OPENREFINERY_SHARE_HOOK_DISABLE") == "1"
     )
+
+
+def _max_prompts_per_day(state: dict[str, Any]) -> int:
+    try:
+        value = int(state.get("max_prompts_per_day", DEFAULT_MAX_PROMPTS_PER_DAY))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_PROMPTS_PER_DAY
+    return value if value > 0 else DEFAULT_MAX_PROMPTS_PER_DAY
+
+
+def _prompt_counts_by_date(state: dict[str, Any]) -> dict[str, int]:
+    raw_counts = state.get("prompt_counts_by_date")
+    if not isinstance(raw_counts, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for raw_day, raw_count in raw_counts.items():
+        try:
+            day = date.fromisoformat(str(raw_day)).isoformat()
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            counts[day] = count
+    return counts
+
+
+def _trim_prompt_counts(counts: dict[str, int], today: date) -> dict[str, int]:
+    earliest = today - timedelta(days=31)
+    trimmed: dict[str, int] = {}
+    for raw_day, count in counts.items():
+        try:
+            day = date.fromisoformat(raw_day)
+        except ValueError:
+            continue
+        if day >= earliest:
+            trimmed[day.isoformat()] = count
+    return trimmed
 
 
 def _prompt_message(client: str, launch_command: str, snooze_command: str) -> str:
@@ -437,10 +489,16 @@ def run_hook(
         return HookRunResult(False, "disabled", state_path=_state_path())
     if not force and _is_snoozed(state, today):
         return HookRunResult(False, "snoozed", state_path=_state_path())
-    if not force and state.get("last_prompt_date") == today.isoformat():
-        return HookRunResult(False, "already-prompted-today", state_path=_state_path())
+    today_key = today.isoformat()
+    prompt_counts = _prompt_counts_by_date(state)
+    prompt_count = prompt_counts.get(today_key, 0)
+    max_prompts = _max_prompts_per_day(state)
+    if not force and prompt_count >= max_prompts:
+        return HookRunResult(False, "daily-prompt-limit-reached", state_path=_state_path())
 
-    state["last_prompt_date"] = today.isoformat()
+    prompt_counts[today_key] = prompt_count + 1
+    state["prompt_counts_by_date"] = _trim_prompt_counts(prompt_counts, today)
+    state["last_prompt_date"] = today_key
     state["last_prompt_client"] = client
     path = save_state(state)
     launch_command = f"clawjournal hooks launch {PROFILE_NAME}"

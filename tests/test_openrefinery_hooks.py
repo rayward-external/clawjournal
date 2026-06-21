@@ -124,12 +124,13 @@ def test_install_profile_updates_existing_openrefinery_hook(isolated_hook_env, m
     ]
 
 
-def test_daily_hook_prompts_once_then_suppresses(isolated_hook_env):
+def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     hooks.install_profile(agent="codex", ui="cli", home=isolated_hook_env / "home")
     now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
 
-    first = hooks.run_hook(client="codex", now=now)
-    second = hooks.run_hook(client="codex", now=now)
+    results = [hooks.run_hook(client="codex", now=now) for _ in range(11)]
+    first = results[0]
+    over_limit = results[-1]
 
     assert first.should_prompt is True
     assert first.reason == "prompt"
@@ -137,8 +138,18 @@ def test_daily_hook_prompts_once_then_suppresses(isolated_hook_env):
     payload = json.loads(rendered)
     assert payload["decision"] == "block"
     assert "Review now?" in payload["reason"]
-    assert second.should_prompt is False
-    assert second.reason == "already-prompted-today"
+    assert [result.should_prompt for result in results[:10]] == [True] * 10
+    assert over_limit.should_prompt is False
+    assert over_limit.reason == "daily-prompt-limit-reached"
+
+    monkeypatch.setattr(
+        hooks,
+        "_today",
+        lambda now=None: datetime(2026, 6, 21, tzinfo=timezone.utc).date(),
+    )
+    status = hooks.status()
+    assert status["max_prompts_per_day"] == 10
+    assert status["prompts_today"] == 10
 
 
 def test_snooze_suppresses_daily_hook(isolated_hook_env):

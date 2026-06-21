@@ -47,7 +47,7 @@ Research participants who are explicitly enrolled in OpenRefinery Agent Failure 
 clawjournal enroll openrefinery --agent all --ui auto
 ```
 
-The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one nudge per day asking whether to review recent agent failures with ClawJournal. If the participant accepts, run:
+The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows up to 10 nudges per day asking whether to review recent agent failures with ClawJournal. If the participant accepts, run:
 
 ```bash
 clawjournal hooks launch openrefinery-failures
@@ -380,7 +380,7 @@ clawjournal bundle-share <bundle_id>
 | `clawjournal list` / `clawjournal status` | List projects with exclusion status / show current stage (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |
 | `clawjournal enroll openrefinery --agent all` | Install/update OpenRefinery Agent Failure Sharing hooks for enrolled participants |
-| `clawjournal hooks status openrefinery-failures` | Show enrollment hook state, daily cadence, and installed agents |
+| `clawjournal hooks status openrefinery-failures` | Show enrollment hook state, daily cap, and installed agents |
 | `clawjournal hooks launch openrefinery-failures` | Open the Share workflow or print the CLI fallback command |
 | `clawjournal hooks snooze openrefinery-failures --days 30` / `disable` | Pause or disable the daily enrollment reminder |
 | `clawjournal selfupdate [--check] [--force]` | Fast-forward to latest from `rayward-external/clawjournal` |

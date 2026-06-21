@@ -4756,7 +4756,12 @@ def main() -> None:
                     agents = ", ".join(result.get("installed_agents") or []) or "none"
                     print(f"{result['display_name']}: {enabled}")
                     print(f"Agents: {agents}")
-                    print(f"UI: {result.get('ui')}  Cadence: {result.get('cadence')}")
+                    max_prompts = result.get("max_prompts_per_day")
+                    prompts_today = result.get("prompts_today")
+                    print(
+                        f"UI: {result.get('ui')}  Cadence: {result.get('cadence')} "
+                        f"({prompts_today}/{max_prompts} prompts today)"
+                    )
                     print(f"Last prompt: {result.get('last_prompt_date') or 'never'}")
                     if result.get("snooze_until"):
                         print(f"Snoozed until: {result['snooze_until']}")

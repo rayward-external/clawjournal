@@ -73,7 +73,7 @@ The hook installer writes only user-level agent config and ClawJournal state:
 |---|---|
 | `~/.claude/settings.json` | Claude Code Stop hook definition |
 | `~/.codex/hooks.json` | Codex Stop hook definition |
-| `~/.clawjournal/hooks/openrefinery-failures.json` | Local profile state, daily cadence, snooze status |
+| `~/.clawjournal/hooks/openrefinery-failures.json` | Local profile state, daily prompt cap, prompt counts, snooze status |
 | `~/.clawjournal/config.json` | Existing ClawJournal config; enrollment sets `source` to `both` |
 
 The hook command installed into both agents is:
@@ -92,7 +92,7 @@ happens to be first on `PATH`.
 |---|---|
 | `clawjournal enroll openrefinery --agent all --ui auto` | Update if possible, install Claude+Codex hooks, enable the profile |
 | `clawjournal hooks install openrefinery-failures --agent all --ui auto` | Install or repair hooks without running selfupdate |
-| `clawjournal hooks status openrefinery-failures` | Show enabled state, installed agents, last prompt date, snooze date |
+| `clawjournal hooks status openrefinery-failures` | Show enabled state, installed agents, daily cap, prompt count, snooze date |
 | `clawjournal hooks launch openrefinery-failures` | Open Share UI or print terminal wizard fallback |
 | `clawjournal hooks snooze openrefinery-failures --days 30` | Pause daily reminders |
 | `clawjournal hooks disable openrefinery-failures` | Keep hook files but stop prompting |
@@ -109,11 +109,13 @@ Prompt eligibility:
 2. `CLAWJOURNAL_DISABLE_SHARE_NUDGE=1` and
    `OPENREFINERY_SHARE_HOOK_DISABLE=1` must not be set.
 3. The profile must not be snoozed through today.
-4. `last_prompt_date` must not equal today's local date unless `--force` is used.
+4. The profile must not have reached `max_prompts_per_day` for today's local
+   date unless `--force` is used.
 
-When eligible, the hook records `last_prompt_date` before returning the prompt.
-This makes the daily cadence shared across Claude Code and Codex: if both agents
-are used on the same day, only the first eligible Stop hook prompts.
+When eligible, the hook increments `prompt_counts_by_date[today]` and records
+`last_prompt_date` before returning the prompt. The default cap is 10 prompts
+per day. This cap is shared across Claude Code and Codex: if both agents are
+used on the same day, they draw from the same daily prompt budget.
 
 ## Agent-Specific Prompt Semantics
 
@@ -183,7 +185,7 @@ The implementation is covered by `tests/test_openrefinery_hooks.py`:
 
 - Claude and Codex hook JSON installation.
 - Existing hook update without clobbering unrelated hooks.
-- Shared daily prompt suppression.
+- Shared daily prompt cap.
 - Snooze suppression.
 - Claude-specific `additionalContext` response.
 - Web launch, CLI fallback, and missing-frontend fallback.
