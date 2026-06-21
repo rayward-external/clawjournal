@@ -61,7 +61,7 @@ SETUP_TO_PUBLISH_STEPS = [
 ]
 
 EXPLICIT_SOURCE_CHOICES = {"claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
-SOURCE_CHOICES = ["auto", "claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all"]
+SOURCE_CHOICES = ["auto", "claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"]
 WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "gemini", "kimi"]
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
@@ -3652,6 +3652,90 @@ def main() -> None:
     us.add_argument("target", choices=["claude", "openclaw", "codex", "cline"],
                     help="Agent to install skill for")
 
+    enroll = sub.add_parser("enroll", help="Install research-enrollment workflows")
+    enroll_sub = enroll.add_subparsers(dest="enroll_command")
+    enroll_openrefinery = enroll_sub.add_parser(
+        "openrefinery",
+        help="Install OpenRefinery Agent Failure Sharing hooks",
+    )
+    enroll_openrefinery.add_argument(
+        "--agent",
+        choices=["claude", "codex", "all"],
+        default="all",
+        help="Agent hook(s) to install (default: all)",
+    )
+    enroll_openrefinery.add_argument(
+        "--ui",
+        choices=["auto", "web", "cli"],
+        default="auto",
+        help="Preferred review surface when the participant accepts the prompt",
+    )
+    enroll_openrefinery.add_argument(
+        "--skip-selfupdate",
+        action="store_true",
+        help="Do not try to fast-forward the editable ClawJournal checkout first",
+    )
+    enroll_openrefinery.add_argument("--json", action="store_true", help="Output result as JSON")
+
+    hooks = sub.add_parser("hooks", help="Manage ClawJournal agent hooks")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command")
+    hooks_install = hooks_sub.add_parser(
+        "install",
+        help="Install a ClawJournal hook profile",
+    )
+    hooks_install.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_install.add_argument(
+        "--agent",
+        choices=["claude", "codex", "all"],
+        default="all",
+        help="Agent hook(s) to install (default: all)",
+    )
+    hooks_install.add_argument(
+        "--ui",
+        choices=["auto", "web", "cli"],
+        default="auto",
+        help="Preferred review surface when the participant accepts the prompt",
+    )
+    hooks_install.add_argument("--json", action="store_true", help="Output result as JSON")
+    hooks_status = hooks_sub.add_parser("status", help="Show hook profile status")
+    hooks_status.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_status.add_argument("--json", action="store_true", help="Output result as JSON")
+    hooks_disable = hooks_sub.add_parser("disable", help="Disable a hook profile locally")
+    hooks_disable.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_disable.add_argument("--json", action="store_true", help="Output result as JSON")
+    hooks_uninstall = hooks_sub.add_parser("uninstall", help="Remove a hook profile from agent config")
+    hooks_uninstall.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_uninstall.add_argument(
+        "--agent",
+        choices=["claude", "codex", "all"],
+        default="all",
+        help="Agent hook(s) to remove (default: all)",
+    )
+    hooks_uninstall.add_argument("--json", action="store_true", help="Output result as JSON")
+    hooks_snooze = hooks_sub.add_parser("snooze", help="Pause hook reminders for a number of days")
+    hooks_snooze.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_snooze.add_argument("--days", type=int, default=30, help="Snooze duration (default: 30)")
+    hooks_snooze.add_argument("--json", action="store_true", help="Output result as JSON")
+    hooks_run = hooks_sub.add_parser("run", help="Run a hook handler from agent config")
+    hooks_run.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_run.add_argument("--client", choices=["claude", "codex"], required=True)
+    hooks_run.add_argument("--force", action="store_true", help="Prompt even if already shown today")
+    hooks_run.add_argument("--json", action="store_true", help="Output diagnostic JSON")
+    hooks_launch = hooks_sub.add_parser(
+        "launch",
+        help="Open the review surface for a hook profile",
+    )
+    hooks_launch.add_argument("profile", choices=["openrefinery-failures"])
+    hooks_launch.add_argument(
+        "--ui",
+        choices=["auto", "web", "cli"],
+        default=None,
+        help="Override the enrolled review surface",
+    )
+    hooks_launch.add_argument("--port", type=int, default=None, help="Workbench port override")
+    hooks_launch.add_argument("--no-browser", action="store_true", help="Do not open a browser")
+    hooks_launch.add_argument("--json", action="store_true", help="Output result as JSON")
+
     su = sub.add_parser("selfupdate",
                         help="Pull the latest clawjournal from the public repo (manual sync update)")
     su.add_argument("--check", action="store_true",
@@ -4609,6 +4693,123 @@ def main() -> None:
     if command == "update-skill":
         update_skill(args.target)
         return
+
+    if command == "enroll":
+        if args.enroll_command != "openrefinery":
+            print("error: enroll requires a subcommand (openrefinery)", file=sys.stderr)
+            sys.exit(2)
+        from .openrefinery_hooks import HookError, enroll_openrefinery
+        try:
+            result = enroll_openrefinery(
+                agent=args.agent,
+                ui=args.ui,
+                skip_selfupdate=args.skip_selfupdate,
+            )
+        except HookError as exc:
+            print(f"Enrollment failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            update = result.get("update") or {}
+            update_status = update.get("status") if isinstance(update, dict) else None
+            if update_status:
+                print(f"ClawJournal update status: {update_status}")
+            install = result["install"]
+            installed = install.get("installed", [])
+            agents = ", ".join(item.get("agent", "?") for item in installed)
+            print(f"Installed OpenRefinery Agent Failure Sharing hook for: {agents}.")
+            print(f"Daily reminders are enabled; state: {install.get('state_path')}")
+            print(f"Review command: {result['next']['review']}")
+            if not install.get("projects_confirmed"):
+                print(f"Project confirmation still required: {result['next']['project_confirmation']}")
+        return
+
+    if command == "hooks":
+        from .openrefinery_hooks import (
+            HookError,
+            disable_profile,
+            install_profile,
+            launch_share_flow,
+            render_hook_response,
+            run_hook,
+            snooze_profile,
+            status as hook_status,
+            uninstall_profile,
+        )
+        try:
+            if args.hooks_command == "install":
+                result = install_profile(profile=args.profile, agent=args.agent, ui=args.ui)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    installed = ", ".join(item.get("agent", "?") for item in result.get("installed", []))
+                    print(f"Installed {args.profile} for: {installed}.")
+                    print(f"Daily reminders are enabled; state: {result.get('state_path')}")
+                return
+            if args.hooks_command == "status":
+                result = hook_status(profile=args.profile)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    enabled = "enabled" if result.get("enabled") else "disabled"
+                    agents = ", ".join(result.get("installed_agents") or []) or "none"
+                    print(f"{result['display_name']}: {enabled}")
+                    print(f"Agents: {agents}")
+                    print(f"UI: {result.get('ui')}  Cadence: {result.get('cadence')}")
+                    print(f"Last prompt: {result.get('last_prompt_date') or 'never'}")
+                    if result.get("snooze_until"):
+                        print(f"Snoozed until: {result['snooze_until']}")
+                    print(f"State: {result['state_path']}")
+                return
+            if args.hooks_command == "disable":
+                result = disable_profile(profile=args.profile)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    print(f"Disabled {args.profile}.")
+                return
+            if args.hooks_command == "uninstall":
+                result = uninstall_profile(profile=args.profile, agent=args.agent)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    removed = ", ".join(item.get("agent", "?") for item in result.get("removed", []))
+                    print(f"Removed {args.profile} from: {removed}.")
+                return
+            if args.hooks_command == "snooze":
+                result = snooze_profile(profile=args.profile, days=args.days)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    print(f"Snoozed {args.profile} until {result['snooze_until']}.")
+                return
+            if args.hooks_command == "run":
+                result = run_hook(profile=args.profile, client=args.client, force=args.force)
+                rendered = render_hook_response(result, client=args.client, output_json=args.json)
+                if rendered:
+                    print(rendered)
+                return
+            if args.hooks_command == "launch":
+                result = launch_share_flow(
+                    profile=args.profile,
+                    ui=args.ui,
+                    open_browser=not args.no_browser,
+                    port=args.port,
+                )
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    if result.get("mode") == "web":
+                        print(f"Opened ClawJournal Share: {result['url']}")
+                    else:
+                        print(result["message"])
+                return
+        except HookError as exc:
+            print(f"Hook command failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print("error: hooks requires a subcommand", file=sys.stderr)
+        sys.exit(2)
 
     if command == "selfupdate":
         from .selfupdate import selfupdate_sync

@@ -1,0 +1,631 @@
+"""OpenRefinery enrollment hooks for Claude Code and Codex.
+
+The hook itself does not package or upload traces. It only nudges an enrolled
+participant once per day and launches the existing local Share workflow on
+request, so the normal source/project confirmation, redaction, hold-state, and
+TruffleHog gates remain authoritative.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import webbrowser
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+from . import config as config_module
+
+PROFILE_NAME = "openrefinery-failures"
+PROFILE_DISPLAY_NAME = "OpenRefinery Agent Failure Sharing"
+SUPPORTED_AGENTS = ("claude", "codex")
+SUPPORTED_UI_MODES = ("auto", "web", "cli")
+DEFAULT_PORT = 8384
+DEFAULT_SNOOZE_DAYS = 30
+STATE_VERSION = 1
+
+AgentName = Literal["claude", "codex"]
+UiMode = Literal["auto", "web", "cli"]
+
+
+class HookError(RuntimeError):
+    """Raised for user-actionable hook setup problems."""
+
+
+@dataclass(frozen=True)
+class HookRunResult:
+    should_prompt: bool
+    reason: str
+    message: str | None = None
+    state_path: Path | None = None
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _today(now: datetime | None = None) -> date:
+    return (now or _now()).astimezone().date()
+
+
+def _state_path() -> Path:
+    return config_module.CONFIG_DIR / "hooks" / f"{PROFILE_NAME}.json"
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise HookError(f"Could not parse {path}: {exc}") from exc
+    except OSError as exc:
+        raise HookError(f"Could not read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HookError(f"{path} must contain a JSON object.")
+    return data
+
+
+def _write_json_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def load_state() -> dict[str, Any]:
+    state = _read_json_file(_state_path())
+    if not state:
+        state = {
+            "version": STATE_VERSION,
+            "profile": PROFILE_NAME,
+            "display_name": PROFILE_DISPLAY_NAME,
+            "enabled": False,
+            "ui": "auto",
+            "cadence": "daily",
+            "installed_agents": [],
+            "created_at": _now().isoformat(),
+        }
+    state.setdefault("version", STATE_VERSION)
+    state.setdefault("profile", PROFILE_NAME)
+    state.setdefault("display_name", PROFILE_DISPLAY_NAME)
+    state.setdefault("enabled", False)
+    state.setdefault("ui", "auto")
+    state.setdefault("cadence", "daily")
+    state.setdefault("installed_agents", [])
+    return state
+
+
+def save_state(state: dict[str, Any]) -> Path:
+    state["version"] = STATE_VERSION
+    state["profile"] = PROFILE_NAME
+    state["display_name"] = PROFILE_DISPLAY_NAME
+    state["updated_at"] = _now().isoformat()
+    path = _state_path()
+    _write_json_file(path, state)
+    return path
+
+
+def _normalize_profile(profile: str) -> str:
+    if profile != PROFILE_NAME:
+        raise HookError(f"Unknown hook profile: {profile}. Expected {PROFILE_NAME}.")
+    return profile
+
+
+def _normalize_agents(agent: str | None) -> list[AgentName]:
+    value = (agent or "all").strip().lower()
+    if value in ("all", "both"):
+        return ["claude", "codex"]
+    if value not in SUPPORTED_AGENTS:
+        allowed = ", ".join((*SUPPORTED_AGENTS, "all"))
+        raise HookError(f"Unsupported agent: {agent}. Expected one of: {allowed}.")
+    return [value]  # type: ignore[list-item]
+
+
+def _normalize_ui(ui: str | None) -> UiMode:
+    value = (ui or "auto").strip().lower()
+    if value not in SUPPORTED_UI_MODES:
+        raise HookError(
+            f"Unsupported UI mode: {ui}. Expected one of: {', '.join(SUPPORTED_UI_MODES)}."
+        )
+    return value  # type: ignore[return-value]
+
+
+def _home_dir(home: Path | None = None) -> Path:
+    return (home or Path.home()).expanduser()
+
+
+def _claude_settings_path(home: Path | None = None) -> Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser() / "settings.json"
+    return _home_dir(home) / ".claude" / "settings.json"
+
+
+def _codex_hooks_path(home: Path | None = None) -> Path:
+    override = os.environ.get("CODEX_HOME")
+    if override:
+        return Path(override).expanduser() / "hooks.json"
+    return _home_dir(home) / ".codex" / "hooks.json"
+
+
+def _hook_command(client: AgentName) -> str:
+    pieces = [
+        shlex.quote(sys.executable),
+        "-m",
+        "clawjournal.cli",
+        "hooks",
+        "run",
+        PROFILE_NAME,
+        "--client",
+        client,
+    ]
+    return " ".join(pieces)
+
+
+def _handler_for(client: AgentName) -> dict[str, Any]:
+    return {
+        "type": "command",
+        "command": _hook_command(client),
+        "timeout": 30,
+        "statusMessage": "Checking OpenRefinery sharing reminder",
+    }
+
+
+def _handler_is_ours(handler: Any) -> bool:
+    return (
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and PROFILE_NAME in str(handler.get("command", ""))
+        and "hooks run" in str(handler.get("command", ""))
+    )
+
+
+def _upsert_stop_hook(document: dict[str, Any], client: AgentName) -> bool:
+    hooks = document.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise HookError("The existing hooks field must be a JSON object.")
+    groups = hooks.setdefault("Stop", [])
+    if not isinstance(groups, list):
+        raise HookError("The existing Stop hooks field must be a JSON array.")
+
+    desired = _handler_for(client)
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        handlers = group.setdefault("hooks", [])
+        if not isinstance(handlers, list):
+            continue
+        for idx, handler in enumerate(handlers):
+            if _handler_is_ours(handler):
+                if handler == desired:
+                    return False
+                handlers[idx] = desired
+                return True
+
+    groups.append({"hooks": [desired]})
+    return True
+
+
+def _remove_stop_hook(document: dict[str, Any]) -> bool:
+    hooks = document.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    groups = hooks.get("Stop")
+    if not isinstance(groups, list):
+        return False
+    changed = False
+    kept_groups = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept_groups.append(group)
+            continue
+        handlers = group.get("hooks")
+        if not isinstance(handlers, list):
+            kept_groups.append(group)
+            continue
+        kept_handlers = [handler for handler in handlers if not _handler_is_ours(handler)]
+        if len(kept_handlers) != len(handlers):
+            changed = True
+        if kept_handlers:
+            group = dict(group)
+            group["hooks"] = kept_handlers
+            kept_groups.append(group)
+    if changed:
+        hooks["Stop"] = kept_groups
+    return changed
+
+
+def install_agent_hook(agent: AgentName, *, home: Path | None = None) -> dict[str, Any]:
+    path = _claude_settings_path(home) if agent == "claude" else _codex_hooks_path(home)
+    document = _read_json_file(path)
+    changed = _upsert_stop_hook(document, agent)
+    if changed or not path.exists():
+        _write_json_file(path, document)
+    return {
+        "agent": agent,
+        "path": str(path),
+        "changed": changed,
+        "command": _hook_command(agent),
+    }
+
+
+def uninstall_agent_hook(agent: AgentName, *, home: Path | None = None) -> dict[str, Any]:
+    path = _claude_settings_path(home) if agent == "claude" else _codex_hooks_path(home)
+    if not path.exists():
+        return {"agent": agent, "path": str(path), "changed": False}
+    document = _read_json_file(path)
+    changed = _remove_stop_hook(document)
+    if changed:
+        _write_json_file(path, document)
+    return {"agent": agent, "path": str(path), "changed": changed}
+
+
+def install_profile(
+    *,
+    profile: str = PROFILE_NAME,
+    agent: str | None = "all",
+    ui: str | None = "auto",
+    source_scope: str | None = "both",
+    home: Path | None = None,
+) -> dict[str, Any]:
+    _normalize_profile(profile)
+    agents = _normalize_agents(agent)
+    ui_mode = _normalize_ui(ui)
+
+    installed = [install_agent_hook(agent_name, home=home) for agent_name in agents]
+    state = load_state()
+    known_agents = set(state.get("installed_agents") or [])
+    known_agents.update(agents)
+    state.update(
+        {
+            "enabled": True,
+            "ui": ui_mode,
+            "cadence": "daily",
+            "installed_agents": sorted(known_agents),
+            "source_scope": source_scope or "both",
+        }
+    )
+    state_path = save_state(state)
+
+    if source_scope:
+        config = config_module.load_config()
+        config["source"] = source_scope
+        config_module.save_config(config)
+
+    return {
+        "profile": PROFILE_NAME,
+        "enabled": True,
+        "ui": ui_mode,
+        "cadence": "daily",
+        "state_path": str(state_path),
+        "installed": installed,
+        "source_scope": source_scope,
+        "projects_confirmed": bool(config_module.load_config().get("projects_confirmed", False)),
+    }
+
+
+def disable_profile(*, profile: str = PROFILE_NAME) -> dict[str, Any]:
+    _normalize_profile(profile)
+    state = load_state()
+    state["enabled"] = False
+    path = save_state(state)
+    return {"profile": PROFILE_NAME, "enabled": False, "state_path": str(path)}
+
+
+def snooze_profile(
+    *,
+    profile: str = PROFILE_NAME,
+    days: int = DEFAULT_SNOOZE_DAYS,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    _normalize_profile(profile)
+    if days < 1:
+        raise HookError("--days must be at least 1.")
+    state = load_state()
+    until = _today(now) + timedelta(days=days)
+    state["snooze_until"] = until.isoformat()
+    path = save_state(state)
+    return {
+        "profile": PROFILE_NAME,
+        "snooze_until": state["snooze_until"],
+        "state_path": str(path),
+    }
+
+
+def uninstall_profile(
+    *,
+    profile: str = PROFILE_NAME,
+    agent: str | None = "all",
+    home: Path | None = None,
+) -> dict[str, Any]:
+    _normalize_profile(profile)
+    agents = _normalize_agents(agent)
+    removed = [uninstall_agent_hook(agent_name, home=home) for agent_name in agents]
+    state = load_state()
+    installed = set(state.get("installed_agents") or [])
+    installed.difference_update(agents)
+    state["installed_agents"] = sorted(installed)
+    if not installed:
+        state["enabled"] = False
+    path = save_state(state)
+    return {
+        "profile": PROFILE_NAME,
+        "enabled": bool(state.get("enabled")),
+        "state_path": str(path),
+        "removed": removed,
+    }
+
+
+def status(*, profile: str = PROFILE_NAME) -> dict[str, Any]:
+    _normalize_profile(profile)
+    state = load_state()
+    return {
+        "profile": PROFILE_NAME,
+        "display_name": PROFILE_DISPLAY_NAME,
+        "enabled": bool(state.get("enabled", False)),
+        "ui": state.get("ui", "auto"),
+        "cadence": state.get("cadence", "daily"),
+        "installed_agents": list(state.get("installed_agents") or []),
+        "last_prompt_date": state.get("last_prompt_date"),
+        "snooze_until": state.get("snooze_until"),
+        "state_path": str(_state_path()),
+        "source_scope": state.get("source_scope"),
+    }
+
+
+def _is_snoozed(state: dict[str, Any], today: date) -> bool:
+    raw = state.get("snooze_until")
+    if not raw:
+        return False
+    try:
+        return date.fromisoformat(str(raw)) >= today
+    except ValueError:
+        return False
+
+
+def _hook_disabled_by_env() -> bool:
+    return (
+        os.environ.get("CLAWJOURNAL_DISABLE_SHARE_NUDGE") == "1"
+        or os.environ.get("OPENREFINERY_SHARE_HOOK_DISABLE") == "1"
+    )
+
+
+def _prompt_message(client: str, launch_command: str, snooze_command: str) -> str:
+    agent = "Claude Code" if client == "claude" else "Codex"
+    return (
+        f"{PROFILE_DISPLAY_NAME} is enabled for your research enrollment.\n"
+        "ClawJournal can review and redact your recent agent failure traces locally, "
+        "then submit them for OpenRefinery research.\n\n"
+        f"Ask the participant: Review now?  y: Review and submit  n: Later  d: Pause reminders\n\n"
+        f"If they choose y, run `{launch_command}`. If they choose d, run "
+        f"`{snooze_command}`. Do not submit anything until they have reviewed the "
+        f"redacted bundle in ClawJournal. Current agent: {agent}."
+    )
+
+
+def run_hook(
+    *,
+    profile: str = PROFILE_NAME,
+    client: str = "codex",
+    force: bool = False,
+    now: datetime | None = None,
+) -> HookRunResult:
+    _normalize_profile(profile)
+    today = _today(now)
+    state = load_state()
+    if _hook_disabled_by_env():
+        return HookRunResult(False, "disabled-by-env", state_path=_state_path())
+    if not state.get("enabled", False):
+        return HookRunResult(False, "disabled", state_path=_state_path())
+    if not force and _is_snoozed(state, today):
+        return HookRunResult(False, "snoozed", state_path=_state_path())
+    if not force and state.get("last_prompt_date") == today.isoformat():
+        return HookRunResult(False, "already-prompted-today", state_path=_state_path())
+
+    state["last_prompt_date"] = today.isoformat()
+    state["last_prompt_client"] = client
+    path = save_state(state)
+    launch_command = f"clawjournal hooks launch {PROFILE_NAME}"
+    snooze_command = f"clawjournal hooks snooze {PROFILE_NAME} --days {DEFAULT_SNOOZE_DAYS}"
+    return HookRunResult(
+        True,
+        "prompt",
+        _prompt_message(client, launch_command, snooze_command),
+        state_path=path,
+    )
+
+
+def render_hook_response(result: HookRunResult, *, client: str, output_json: bool = False) -> str:
+    if output_json:
+        return json.dumps(
+            {
+                "should_prompt": result.should_prompt,
+                "reason": result.reason,
+                "message": result.message,
+                "state_path": str(result.state_path) if result.state_path else None,
+            },
+            indent=2,
+        )
+    if not result.should_prompt or not result.message:
+        return ""
+    if client == "claude":
+        payload = {
+            "decision": "block",
+            "reason": result.message,
+            "hookSpecificOutput": {
+                "hookEventName": "Stop",
+                "additionalContext": result.message,
+            },
+        }
+    else:
+        payload = {"decision": "block", "reason": result.message}
+    return json.dumps(payload)
+
+
+def _port_is_open(port: int) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def _open_browser(url: str) -> bool:
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
+
+
+def _frontend_available() -> bool:
+    try:
+        from .workbench.daemon import FRONTEND_DIST
+    except Exception:
+        return False
+    return (FRONTEND_DIST / "index.html").exists()
+
+
+def _start_detached_server(port: int) -> subprocess.Popen[Any]:
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    else:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "clawjournal.cli",
+            "serve",
+            "--port",
+            str(port),
+            "--no-browser",
+        ],
+        **kwargs,
+    )
+
+
+def _wait_for_port(port: int, *, timeout_seconds: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _port_is_open(port):
+            return True
+        time.sleep(0.1)
+    return _port_is_open(port)
+
+
+def launch_share_flow(
+    *,
+    profile: str = PROFILE_NAME,
+    ui: str | None = None,
+    open_browser: bool = True,
+    port: int | None = None,
+) -> dict[str, Any]:
+    _normalize_profile(profile)
+    state = load_state()
+    ui_mode = _normalize_ui(ui or str(state.get("ui") or "auto"))
+    config = config_module.load_config()
+    resolved_port = int(port or config.get("daemon_port") or DEFAULT_PORT)
+    url = f"http://localhost:{resolved_port}/share"
+
+    if ui_mode in ("auto", "web"):
+        if not _frontend_available():
+            if ui_mode == "web":
+                raise HookError(
+                    "The ClawJournal browser workbench is not built. Re-run "
+                    "`./scripts/install.sh --with-frontend` or use `--ui cli`."
+                )
+            return _cli_launch_result()
+        already_running = _port_is_open(resolved_port)
+        started = False
+        pid: int | None = None
+        if not already_running:
+            try:
+                proc = _start_detached_server(resolved_port)
+                started = True
+                pid = proc.pid
+            except OSError as exc:
+                if ui_mode == "web":
+                    raise HookError(f"Could not start the ClawJournal workbench: {exc}") from exc
+        if already_running or _wait_for_port(resolved_port):
+            opened = _open_browser(url) if open_browser else False
+            return {
+                "mode": "web",
+                "url": url,
+                "port": resolved_port,
+                "already_running": already_running,
+                "started": started,
+                "pid": pid,
+                "browser_opened": opened,
+            }
+        if ui_mode == "web":
+            raise HookError("Started the ClawJournal workbench, but it did not become reachable.")
+
+    return _cli_launch_result()
+
+
+def _cli_launch_result() -> dict[str, Any]:
+    command = "clawjournal share --interactive --weekly"
+    return {
+        "mode": "cli",
+        "command": command,
+        "message": f"Run `{command}` to review, redact, package, and submit recent traces.",
+    }
+
+
+def enroll_openrefinery(
+    *,
+    agent: str | None = "all",
+    ui: str | None = "auto",
+    skip_selfupdate: bool = False,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    update_result: dict[str, Any] | None = None
+    if not skip_selfupdate:
+        from .selfupdate import selfupdate_sync
+
+        update_result = dict(selfupdate_sync())
+    install_result = install_profile(
+        profile=PROFILE_NAME,
+        agent=agent,
+        ui=ui,
+        source_scope="both",
+        home=home,
+    )
+    return {
+        "profile": PROFILE_NAME,
+        "update": update_result,
+        "install": install_result,
+        "next": {
+            "review": f"clawjournal hooks launch {PROFILE_NAME}",
+            "status": f"clawjournal hooks status {PROFILE_NAME}",
+            "project_confirmation": (
+                "Open the Share workflow or run `clawjournal list --source both`, "
+                "then `clawjournal config --confirm-projects` after review."
+            ),
+        },
+    }
