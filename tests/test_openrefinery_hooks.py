@@ -127,8 +127,9 @@ def test_install_profile_updates_existing_openrefinery_hook(isolated_hook_env, m
 def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     hooks.install_profile(agent="codex", ui="cli", home=isolated_hook_env / "home")
     now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    cap = hooks.DEFAULT_MAX_PROMPTS_PER_DAY
 
-    results = [hooks.run_hook(client="codex", now=now) for _ in range(11)]
+    results = [hooks.run_hook(client="codex", now=now) for _ in range(cap + 1)]
     first = results[0]
     over_limit = results[-1]
 
@@ -138,7 +139,7 @@ def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     payload = json.loads(rendered)
     assert payload["decision"] == "block"
     assert "Open local ClawJournal review" in payload["reason"]
-    assert [result.should_prompt for result in results[:10]] == [True] * 10
+    assert [result.should_prompt for result in results[:cap]] == [True] * cap
     assert over_limit.should_prompt is False
     assert over_limit.reason == "daily-prompt-limit-reached"
 
@@ -148,8 +149,65 @@ def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
         lambda now=None: datetime(2026, 6, 21, tzinfo=timezone.utc).date(),
     )
     status = hooks.status()
-    assert status["max_prompts_per_day"] == 10
-    assert status["prompts_today"] == 10
+    assert status["max_prompts_per_day"] == cap
+    assert status["prompts_today"] == cap
+
+
+def test_dry_run_previews_without_consuming(isolated_hook_env):
+    hooks.install_profile(agent="claude", ui="cli", home=isolated_hook_env / "home")
+    now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+
+    preview = hooks.run_hook(client="claude", dry_run=True, now=now)
+
+    assert preview.should_prompt is True
+    assert preview.reason == "dry-run"
+    assert "OpenRefinery Agent Failure Sharing" in (preview.message or "")
+    # A preview must not consume a slot: a real run still treats today as fresh.
+    assert hooks.status(now=now)["prompts_today"] == 0
+    follow = hooks.run_hook(client="claude", now=now)
+    assert follow.should_prompt is True
+    assert follow.reason == "prompt"
+
+
+def test_stop_hook_active_suppresses_without_consuming(isolated_hook_env):
+    hooks.install_profile(agent="claude", ui="cli", home=isolated_hook_env / "home")
+    now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+
+    guarded = hooks.run_hook(client="claude", stop_hook_active=True, now=now)
+    assert guarded.should_prompt is False
+    assert guarded.reason == "stop-hook-active"
+    assert hooks.status(now=now)["prompts_today"] == 0
+
+    # --force overrides the loop guard.
+    forced = hooks.run_hook(client="claude", stop_hook_active=True, force=True, now=now)
+    assert forced.should_prompt is True
+
+
+def test_status_reports_readiness_and_next_prompt(isolated_hook_env):
+    hooks.install_profile(agent="claude", ui="cli", home=isolated_hook_env / "home")
+    now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+
+    st = hooks.status(now=now)
+    assert st["eligible_now"] is True
+    assert st["next_prompt"] == "2026-06-21"
+    assert st["source_confirmed"] is True  # install set source=both
+    assert st["projects_confirmed"] is False
+    assert st["share_ready"] is False
+
+    hooks.snooze_profile(days=3, now=now)
+    st2 = hooks.status(now=now)
+    assert st2["snoozed"] is True
+    assert st2["snooze_days_remaining"] == 4  # today + 3 days, inclusive of today
+    assert st2["next_prompt"] == "2026-06-25"  # snooze_until (06-24) + 1 day
+    assert st2["eligible_now"] is False
+
+
+def test_share_readiness_tracks_config():
+    assert hooks.share_readiness({"source": "auto"})["source_confirmed"] is False
+    assert hooks.share_readiness({"source": "both"})["source_confirmed"] is True
+    ready = hooks.share_readiness({"source": "both", "projects_confirmed": True})
+    assert ready["ready"] is True
+    assert hooks.share_readiness({})["ready"] is False
 
 
 def test_snooze_suppresses_daily_hook(isolated_hook_env):

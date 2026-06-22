@@ -3720,6 +3720,11 @@ def main() -> None:
     hooks_run.add_argument("profile", choices=["openrefinery-failures"])
     hooks_run.add_argument("--client", choices=["claude", "codex"], required=True)
     hooks_run.add_argument("--force", action="store_true", help="Prompt even if already shown today")
+    hooks_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the reminder without consuming a daily slot or changing state",
+    )
     hooks_run.add_argument("--json", action="store_true", help="Output diagnostic JSON")
     hooks_launch = hooks_sub.add_parser(
         "launch",
@@ -4733,6 +4738,7 @@ def main() -> None:
             launch_share_flow,
             render_hook_response,
             run_hook,
+            share_readiness,
             snooze_profile,
             status as hook_status,
             uninstall_profile,
@@ -4763,8 +4769,28 @@ def main() -> None:
                         f"({prompts_today}/{max_prompts} prompts today)"
                     )
                     print(f"Last prompt: {result.get('last_prompt_date') or 'never'}")
-                    if result.get("snooze_until"):
-                        print(f"Snoozed until: {result['snooze_until']}")
+                    if result.get("snoozed"):
+                        days = result.get("snooze_days_remaining")
+                        print(f"Snoozed until: {result['snooze_until']} ({days} day(s) left)")
+                    next_prompt = result.get("next_prompt")
+                    if not result.get("enabled"):
+                        print("Next reminder: never (disabled)")
+                    elif result.get("eligible_now"):
+                        print("Next reminder: eligible now (this session)")
+                    elif next_prompt:
+                        print(f"Next reminder: {next_prompt}")
+                    if result.get("share_ready"):
+                        print("Share scope: confirmed (source + projects)")
+                    else:
+                        missing = []
+                        if not result.get("source_confirmed"):
+                            missing.append("source")
+                        if not result.get("projects_confirmed"):
+                            missing.append("projects")
+                        print(
+                            f"Share scope: NOT confirmed ({', '.join(missing)} pending) — "
+                            "the upload step will block until you confirm."
+                        )
                     print(f"State: {result['state_path']}")
                 return
             if args.hooks_command == "disable":
@@ -4790,8 +4816,35 @@ def main() -> None:
                     print(f"Snoozed {args.profile} until {result['snooze_until']}.")
                 return
             if args.hooks_command == "run":
-                result = run_hook(profile=args.profile, client=args.client, force=args.force)
-                rendered = render_hook_response(result, client=args.client, output_json=args.json)
+                # Honor the Stop-hook input's `stop_hook_active` flag to avoid
+                # re-prompting inside a reminder-extended turn. Only read piped
+                # input so an interactive `hooks run` never blocks on a TTY.
+                stop_hook_active = False
+                if not args.dry_run and not sys.stdin.isatty():
+                    try:
+                        raw = sys.stdin.read()
+                        if raw.strip():
+                            stop_hook_active = bool(json.loads(raw).get("stop_hook_active"))
+                    except (json.JSONDecodeError, ValueError, OSError):
+                        stop_hook_active = False
+                result = run_hook(
+                    profile=args.profile,
+                    client=args.client,
+                    force=args.force,
+                    dry_run=args.dry_run,
+                    stop_hook_active=stop_hook_active,
+                )
+                if args.json:
+                    print(render_hook_response(result, client=args.client, output_json=True))
+                    return
+                if args.dry_run:
+                    if result.should_prompt and result.message:
+                        print("[dry-run] Reminder preview (no state changed):\n")
+                        print(result.message)
+                    else:
+                        print(f"[dry-run] No reminder would be shown now (reason: {result.reason}).")
+                    return
+                rendered = render_hook_response(result, client=args.client, output_json=False)
                 if rendered:
                     print(rendered)
                 return
@@ -4809,6 +4862,21 @@ def main() -> None:
                         print(f"Opened ClawJournal Share: {result['url']}")
                     else:
                         print(result["message"])
+                    readiness = share_readiness()
+                    if not readiness["ready"]:
+                        missing = []
+                        if not readiness["source_confirmed"]:
+                            missing.append("source scope (`clawjournal config --source both`)")
+                        if not readiness["projects_confirmed"]:
+                            missing.append(
+                                "project list (`clawjournal list --source both` then "
+                                "`clawjournal config --confirm-projects`)"
+                            )
+                        print(
+                            "Heads up: the upload step will block until you confirm "
+                            + " and ".join(missing)
+                            + "."
+                        )
                 return
         except HookError as exc:
             print(f"Hook command failed: {exc}", file=sys.stderr)

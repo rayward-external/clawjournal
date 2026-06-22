@@ -10,7 +10,8 @@ review and redaction workflow instead of uploading anything directly.
 
 The hook is intentionally narrow:
 
-- It prompts at most once per local day.
+- It prompts at most a few times per local day (default cap: 3) and never twice
+  within the same reminder-extended turn.
 - It can open the ClawJournal Share UI or point to the terminal Share wizard.
 - It never packages, submits, or uploads traces by itself.
 - It leaves ClawJournal's existing source/project confirmation, hold-state,
@@ -43,15 +44,20 @@ That command:
 5. Does not mark projects confirmed. The participant still reviews project
    scope before sharing.
 
-When the daily hook fires, it asks the agent to prompt:
+When the hook fires, it asks the agent to surface one concise question:
 
 ```text
-OpenRefinery Agent Failure Sharing is enabled for your research enrollment.
-ClawJournal can review and redact your recent agent failure traces locally, then
-submit them for OpenRefinery research.
+OpenRefinery Agent Failure Sharing reminder (opt-in research enrollment).
 
-Review now?  y: Review and submit  n: Later  d: Pause reminders
+Surface ONE concise question to the user, then wait for their choice:
+- y: Open local ClawJournal review
+- n: Later
+- d: Pause reminders for 30 days
 ```
+
+The agent is told to wait for an explicit choice and to never run a command on
+the participant's behalf. To preview the exact wording without consuming a daily
+slot, run `clawjournal hooks run openrefinery-failures --client claude --dry-run`.
 
 If the participant chooses `y`, the agent should run:
 
@@ -92,12 +98,13 @@ happens to be first on `PATH`.
 |---|---|
 | `clawjournal enroll openrefinery --agent all --ui auto` | Update if possible, install Claude+Codex hooks, enable the profile |
 | `clawjournal hooks install openrefinery-failures --agent all --ui auto` | Install or repair hooks without running selfupdate |
-| `clawjournal hooks status openrefinery-failures` | Show enabled state, installed agents, daily cap, prompt count, snooze date |
+| `clawjournal hooks status openrefinery-failures` | Show enabled state, installed agents, daily cap/count, next-prompt date, snooze state, and Share-scope readiness |
 | `clawjournal hooks launch openrefinery-failures` | Open Share UI or print terminal wizard fallback |
 | `clawjournal hooks snooze openrefinery-failures --days 30` | Pause daily reminders |
 | `clawjournal hooks disable openrefinery-failures` | Keep hook files but stop prompting |
 | `clawjournal hooks uninstall openrefinery-failures --agent all` | Remove hook definitions from agent config and disable if no agents remain |
 | `clawjournal hooks run openrefinery-failures --client codex --json` | Diagnostic hook invocation |
+| `clawjournal hooks run openrefinery-failures --client claude --dry-run` | Preview the reminder text without consuming a daily slot |
 
 ## Hook Runtime Behavior
 
@@ -108,14 +115,23 @@ Prompt eligibility:
 1. The profile must be enabled.
 2. `CLAWJOURNAL_DISABLE_SHARE_NUDGE=1` and
    `OPENREFINERY_SHARE_HOOK_DISABLE=1` must not be set.
-3. The profile must not be snoozed through today.
-4. The profile must not have reached `max_prompts_per_day` for today's local
+3. The Stop-hook input must not report `stop_hook_active` (this Stop already
+   followed a reminder), unless `--force` is used. This prevents a reminder from
+   re-firing within its own extended turn and draining the daily budget at once.
+4. The profile must not be snoozed through today.
+5. The profile must not have reached `max_prompts_per_day` for today's local
    date unless `--force` is used.
 
 When eligible, the hook increments `prompt_counts_by_date[today]` and records
-`last_prompt_date` before returning the prompt. The default cap is 10 prompts
+`last_prompt_date` before returning the prompt. The default cap is 3 prompts
 per day. This cap is shared across Claude Code and Codex: if both agents are
 used on the same day, they draw from the same daily prompt budget.
+
+`--dry-run` renders the prompt the hook *would* return without incrementing the
+counter, recording state, or honoring the loop guard — useful for verifying the
+wording without spending a daily slot. `clawjournal hooks status
+openrefinery-failures` reports the per-day count, the next eligible date, snooze
+state, and whether the Share scope (source + project confirmation) is ready.
 
 ## Agent-Specific Prompt Semantics
 
@@ -127,16 +143,21 @@ For Claude Code, the hook returns JSON with:
 - `hookSpecificOutput.hookEventName: "Stop"`
 - `hookSpecificOutput.additionalContext: <prompt text>`
 
-This asks Claude Code to continue the turn with the participant-facing prompt
-without labeling the response as a Stop-hook error.
+This is the non-blocking path: the current turn completes normally (the
+participant still sees the agent's real answer) and the reminder is delivered to
+Claude Code as a system reminder on its next model request. We deliberately avoid
+`decision: "block"` here because, on a Stop hook, `block` *suppresses* the
+agent's response and shows `reason` in its place — too disruptive for a nudge.
 
 For Codex, the hook returns:
 
 - `decision: "block"`
 - `reason: <prompt text>`
 
-Codex may also require the participant to review and trust the newly installed
-hook through `/hooks` before non-managed user hooks run.
+Codex's Stop hook does not surface `additionalContext`, so `decision: "block"` +
+`reason` is the supported way to deliver the reminder there. Codex may also
+require the participant to review and trust the newly installed hook through
+`/hooks` before non-managed user hooks run.
 
 ## Launch Behavior
 
@@ -184,8 +205,11 @@ The implementation is covered by `tests/test_openrefinery_hooks.py`:
 
 - Claude and Codex hook JSON installation.
 - Existing hook update without clobbering unrelated hooks.
-- Shared daily prompt cap.
+- Shared daily prompt cap (cadence-agnostic, keyed off the default).
 - Snooze suppression.
+- `--dry-run` previews without consuming a slot.
+- `stop_hook_active` loop guard suppresses (and `--force` overrides it).
+- `status` reports next-prompt date, snooze days left, and Share-scope readiness.
 - Claude-specific `additionalContext` response.
 - Web launch, CLI fallback, and missing-frontend fallback.
 - Uninstall removes only the OpenRefinery hook.

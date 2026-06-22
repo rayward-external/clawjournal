@@ -29,7 +29,7 @@ SUPPORTED_AGENTS = ("claude", "codex")
 SUPPORTED_UI_MODES = ("auto", "web", "cli")
 DEFAULT_PORT = 8384
 DEFAULT_SNOOZE_DAYS = 30
-DEFAULT_MAX_PROMPTS_PER_DAY = 10
+DEFAULT_MAX_PROMPTS_PER_DAY = 3
 STATE_VERSION = 1
 
 AgentName = Literal["claude", "codex"]
@@ -385,24 +385,37 @@ def uninstall_profile(
     }
 
 
-def status(*, profile: str = PROFILE_NAME) -> dict[str, Any]:
+def status(*, profile: str = PROFILE_NAME, now: datetime | None = None) -> dict[str, Any]:
     _normalize_profile(profile)
     state = load_state()
-    today = _today().isoformat()
+    today = _today(now)
+    today_key = today.isoformat()
     prompt_counts = _prompt_counts_by_date(state)
+    max_prompts = _max_prompts_per_day(state)
+    prompts_today = prompt_counts.get(today_key, 0)
+    next_prompt = _next_prompt_date(state, today, prompts_today, max_prompts)
+    readiness = share_readiness()
     return {
         "profile": PROFILE_NAME,
         "display_name": PROFILE_DISPLAY_NAME,
         "enabled": bool(state.get("enabled", False)),
         "ui": state.get("ui", "auto"),
         "cadence": state.get("cadence", "daily"),
-        "max_prompts_per_day": _max_prompts_per_day(state),
-        "prompts_today": prompt_counts.get(today, 0),
+        "max_prompts_per_day": max_prompts,
+        "prompts_today": prompts_today,
+        "prompts_remaining_today": max(0, max_prompts - prompts_today),
         "installed_agents": list(state.get("installed_agents") or []),
         "last_prompt_date": state.get("last_prompt_date"),
         "snooze_until": state.get("snooze_until"),
+        "snoozed": _is_snoozed(state, today),
+        "snooze_days_remaining": _snooze_days_remaining(state, today),
+        "next_prompt": next_prompt,
+        "eligible_now": next_prompt == today_key,
         "state_path": str(_state_path()),
         "source_scope": state.get("source_scope"),
+        "source_confirmed": readiness["source_confirmed"],
+        "projects_confirmed": readiness["projects_confirmed"],
+        "share_ready": readiness["ready"],
     }
 
 
@@ -460,18 +473,76 @@ def _trim_prompt_counts(counts: dict[str, int], today: date) -> dict[str, int]:
     return trimmed
 
 
-def _prompt_message(client: str, launch_command: str, snooze_command: str) -> str:
+def share_readiness(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Report whether the existing Share gates are satisfied.
+
+    The hook only nudges; the actual upload still requires an explicit source
+    scope and a confirmed project list. Surfacing this lets `status`/`launch`
+    tell the participant what is still missing instead of sending them into a
+    Share flow that will block.
+    """
+    cfg = config if config is not None else config_module.load_config()
+    source = cfg.get("source")
+    source_confirmed = bool(source) and str(source).strip().lower() != "auto"
+    projects_confirmed = bool(cfg.get("projects_confirmed", False))
+    return {
+        "source": source,
+        "source_confirmed": source_confirmed,
+        "projects_confirmed": projects_confirmed,
+        "ready": source_confirmed and projects_confirmed,
+    }
+
+
+def _snooze_days_remaining(state: dict[str, Any], today: date) -> int:
+    raw = state.get("snooze_until")
+    if not raw:
+        return 0
+    try:
+        until = date.fromisoformat(str(raw))
+    except ValueError:
+        return 0
+    return (until - today).days + 1 if until >= today else 0
+
+
+def _next_prompt_date(
+    state: dict[str, Any], today: date, prompts_today: int, max_prompts: int
+) -> str | None:
+    """ISO date the next reminder is eligible, or None if reminders are off."""
+    if not state.get("enabled", False):
+        return None
+    raw = state.get("snooze_until")
+    if raw:
+        try:
+            until = date.fromisoformat(str(raw))
+            if until >= today:
+                return (until + timedelta(days=1)).isoformat()
+        except ValueError:
+            pass
+    if prompts_today >= max_prompts:
+        return (today + timedelta(days=1)).isoformat()
+    return today.isoformat()
+
+
+def _prompt_message(
+    client: str,
+    launch_command: str,
+    snooze_command: str,
+    disable_command: str,
+    snooze_days: int = DEFAULT_SNOOZE_DAYS,
+) -> str:
     agent = "Claude Code" if client == "claude" else "Codex"
     return (
-        f"{PROFILE_DISPLAY_NAME} reminder.\n\n"
-        "Ask the user one concise question with three choices:\n"
+        f"{PROFILE_DISPLAY_NAME} reminder (opt-in research enrollment).\n\n"
+        "Surface ONE concise question to the user, then wait for their choice:\n"
         "- y: Open local ClawJournal review\n"
         "- n: Later\n"
-        "- d: Pause reminders for 30 days\n\n"
+        f"- d: Pause reminders for {snooze_days} days\n\n"
         f"If they choose y, run `{launch_command}`. If they choose d, run "
-        f"`{snooze_command}`. Do not run either command until the user chooses. "
-        "The launch command only opens local ClawJournal review; it does not "
-        f"upload or submit anything. Current agent: {agent}."
+        f"`{snooze_command}`. To stop reminders entirely they can run "
+        f"`{disable_command}`. Do not run any command until the user chooses. "
+        "The launch command only opens the local ClawJournal review UI on this "
+        "machine — nothing is uploaded or submitted until the user has reviewed "
+        f"and approved the redacted bundle themselves. Current agent: {agent}."
     )
 
 
@@ -480,6 +551,8 @@ def run_hook(
     profile: str = PROFILE_NAME,
     client: str = "codex",
     force: bool = False,
+    dry_run: bool = False,
+    stop_hook_active: bool = False,
     now: datetime | None = None,
 ) -> HookRunResult:
     _normalize_profile(profile)
@@ -489,6 +562,10 @@ def run_hook(
         return HookRunResult(False, "disabled-by-env", state_path=_state_path())
     if not state.get("enabled", False):
         return HookRunResult(False, "disabled", state_path=_state_path())
+    # `stop_hook_active` means this Stop fired because a previous reminder kept the
+    # turn going; re-prompting now would loop and burn the daily budget at once.
+    if stop_hook_active and not force:
+        return HookRunResult(False, "stop-hook-active", state_path=_state_path())
     if not force and _is_snoozed(state, today):
         return HookRunResult(False, "snoozed", state_path=_state_path())
     today_key = today.isoformat()
@@ -498,19 +575,22 @@ def run_hook(
     if not force and prompt_count >= max_prompts:
         return HookRunResult(False, "daily-prompt-limit-reached", state_path=_state_path())
 
+    launch_command = f"clawjournal hooks launch {PROFILE_NAME}"
+    snooze_command = f"clawjournal hooks snooze {PROFILE_NAME} --days {DEFAULT_SNOOZE_DAYS}"
+    disable_command = f"clawjournal hooks disable {PROFILE_NAME}"
+    message = _prompt_message(
+        client, launch_command, snooze_command, disable_command, DEFAULT_SNOOZE_DAYS
+    )
+    # A preview must never consume a daily slot or mutate state.
+    if dry_run:
+        return HookRunResult(True, "dry-run", message, state_path=_state_path())
+
     prompt_counts[today_key] = prompt_count + 1
     state["prompt_counts_by_date"] = _trim_prompt_counts(prompt_counts, today)
     state["last_prompt_date"] = today_key
     state["last_prompt_client"] = client
     path = save_state(state)
-    launch_command = f"clawjournal hooks launch {PROFILE_NAME}"
-    snooze_command = f"clawjournal hooks snooze {PROFILE_NAME} --days {DEFAULT_SNOOZE_DAYS}"
-    return HookRunResult(
-        True,
-        "prompt",
-        _prompt_message(client, launch_command, snooze_command),
-        state_path=path,
-    )
+    return HookRunResult(True, "prompt", message, state_path=path)
 
 
 def render_hook_response(result: HookRunResult, *, client: str, output_json: bool = False) -> str:
