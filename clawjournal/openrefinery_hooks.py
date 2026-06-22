@@ -310,6 +310,10 @@ def install_profile(
             "enabled": True,
             "ui": ui_mode,
             "cadence": "daily",
+            # Refresh the cap to the current default so an explicit re-install
+            # adopts a changed cadence instead of keeping a value frozen in the
+            # state file from an earlier version.
+            "max_prompts_per_day": DEFAULT_MAX_PROMPTS_PER_DAY,
             "installed_agents": sorted(known_agents),
             "source_scope": source_scope or "both",
         }

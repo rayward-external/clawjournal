@@ -153,6 +153,20 @@ def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     assert status["prompts_today"] == cap
 
 
+def test_reinstall_refreshes_stale_prompt_cap(isolated_hook_env):
+    home = isolated_hook_env / "home"
+    hooks.install_profile(agent="claude", home=home)
+    # Simulate a state file written by an older version with a higher cap.
+    state = hooks.load_state()
+    state["max_prompts_per_day"] = 10
+    hooks.save_state(state)
+    assert hooks.status()["max_prompts_per_day"] == 10
+
+    hooks.install_profile(agent="claude", home=home)
+
+    assert hooks.status()["max_prompts_per_day"] == hooks.DEFAULT_MAX_PROMPTS_PER_DAY
+
+
 def test_dry_run_previews_without_consuming(isolated_hook_env):
     hooks.install_profile(agent="claude", ui="cli", home=isolated_hook_env / "home")
     now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
