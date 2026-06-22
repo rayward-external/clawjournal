@@ -10,8 +10,11 @@ review and redaction workflow instead of uploading anything directly.
 
 The hook is intentionally narrow:
 
-- It prompts at most a few times per local day (default cap: 3) and never twice
-  within the same reminder-extended turn.
+- It prompts at most once per local day (production cap: 1) and never twice
+  within the same reminder-extended turn. Developers can set
+  `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day for testing.
+- Because participants are already enrolled, the nudge offers only "review now"
+  or "later" — it does not advertise pausing or disabling reminders.
 - It can open the ClawJournal Share UI or point to the terminal Share wizard.
 - It never packages, submits, or uploads traces by itself.
 - It leaves ClawJournal's existing source/project confirmation, hold-state,
@@ -47,12 +50,11 @@ That command:
 When the hook fires, it asks the agent to surface one concise question:
 
 ```text
-OpenRefinery Agent Failure Sharing reminder (opt-in research enrollment).
+OpenRefinery Agent Failure Sharing reminder (research enrollment).
 
 Surface ONE concise question to the user, then wait for their choice:
 - y: Open local ClawJournal review
 - n: Later
-- d: Pause reminders for 30 days
 ```
 
 The agent is told to wait for an explicit choice and to never run a command on
@@ -65,11 +67,11 @@ If the participant chooses `y`, the agent should run:
 clawjournal hooks launch openrefinery-failures
 ```
 
-If the participant chooses `d`, the agent should run:
-
-```bash
-clawjournal hooks snooze openrefinery-failures --days 30
-```
+The reminder no longer offers a pause/snooze choice — participants are already
+enrolled. `clawjournal hooks snooze` and `clawjournal hooks disable` remain
+available as administrative escape hatches (and `OPENREFINERY_SHARE_HOOK_DISABLE=1`
+/ `CLAWJOURNAL_DISABLE_SHARE_NUDGE=1` as env opt-outs), but the nudge itself does
+not advertise them.
 
 ## Installed Files
 
@@ -123,9 +125,12 @@ Prompt eligibility:
    date unless `--force` is used.
 
 When eligible, the hook increments `prompt_counts_by_date[today]` and records
-`last_prompt_date` before returning the prompt. The default cap is 3 prompts
-per day. This cap is shared across Claude Code and Codex: if both agents are
-used on the same day, they draw from the same daily prompt budget.
+`last_prompt_date` before returning the prompt. The production cap is 1 prompt
+per day; setting `OPENREFINERY_SHARE_HOOK_TEST=1` raises it to 10 for local
+testing. This cap is shared across Claude Code and Codex: if both agents are
+used on the same day, they draw from the same daily prompt budget. Re-running
+`clawjournal hooks install` (or `enroll`) rewrites the stored cap to the current
+default, so an upgraded participant is not left frozen at an old cadence.
 
 `--dry-run` renders the prompt the hook *would* return without incrementing the
 counter, recording state, or honoring the loop guard — useful for verifying the

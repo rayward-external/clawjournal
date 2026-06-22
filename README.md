@@ -47,7 +47,7 @@ Research participants who are explicitly enrolled in OpenRefinery Agent Failure 
 clawjournal enroll openrefinery --agent all --ui auto
 ```
 
-The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows up to 3 gentle nudges per day asking whether to review recent agent failures with ClawJournal (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). If the participant accepts, run:
+The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one gentle nudge per day asking whether to review recent agent failures with ClawJournal — answer **y** to open local review or **n** for later (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). Developers testing the hook can set `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day. If the participant accepts, run:
 
 ```bash
 clawjournal hooks launch openrefinery-failures

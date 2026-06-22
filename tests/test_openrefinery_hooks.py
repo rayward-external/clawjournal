@@ -19,6 +19,7 @@ def isolated_hook_env(tmp_path, monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("CLAWJOURNAL_DISABLE_SHARE_NUDGE", raising=False)
     monkeypatch.delenv("OPENREFINERY_SHARE_HOOK_DISABLE", raising=False)
+    monkeypatch.delenv("OPENREFINERY_SHARE_HOOK_TEST", raising=False)
     return tmp_path
 
 
@@ -222,6 +223,44 @@ def test_share_readiness_tracks_config():
     ready = hooks.share_readiness({"source": "both", "projects_confirmed": True})
     assert ready["ready"] is True
     assert hooks.share_readiness({})["ready"] is False
+
+
+def test_prod_cadence_is_one_per_day(isolated_hook_env):
+    hooks.install_profile(agent="claude", home=isolated_hook_env / "home")
+    now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+
+    assert hooks.DEFAULT_MAX_PROMPTS_PER_DAY == 1
+    first = hooks.run_hook(client="claude", now=now)
+    second = hooks.run_hook(client="claude", now=now)
+
+    assert first.should_prompt is True
+    assert second.should_prompt is False
+    assert second.reason == "daily-prompt-limit-reached"
+
+
+def test_test_mode_env_raises_cap(isolated_hook_env, monkeypatch):
+    hooks.install_profile(agent="claude", home=isolated_hook_env / "home")
+    now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setenv("OPENREFINERY_SHARE_HOOK_TEST", "1")
+
+    results = [hooks.run_hook(client="claude", now=now) for _ in range(10)]
+
+    assert all(r.should_prompt for r in results)
+    assert hooks.status(now=now)["max_prompts_per_day"] == hooks.TEST_MAX_PROMPTS_PER_DAY
+
+
+def test_prompt_message_omits_pause_for_enrolled_participant(isolated_hook_env):
+    hooks.install_profile(agent="claude", home=isolated_hook_env / "home")
+    result = hooks.run_hook(
+        client="claude", dry_run=True, now=datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+    )
+
+    message = result.message or ""
+    assert "Open local ClawJournal review" in message
+    assert "Later" in message
+    assert "Pause" not in message
+    assert "snooze" not in message.lower()
+    assert "disable" not in message.lower()
 
 
 def test_snooze_suppresses_daily_hook(isolated_hook_env):

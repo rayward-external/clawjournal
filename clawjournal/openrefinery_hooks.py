@@ -29,7 +29,11 @@ SUPPORTED_AGENTS = ("claude", "codex")
 SUPPORTED_UI_MODES = ("auto", "web", "cli")
 DEFAULT_PORT = 8384
 DEFAULT_SNOOZE_DAYS = 30
-DEFAULT_MAX_PROMPTS_PER_DAY = 3
+# Production cadence: a single daily nudge for an already-enrolled participant.
+DEFAULT_MAX_PROMPTS_PER_DAY = 1
+# Test cadence: opt-in via OPENREFINERY_SHARE_HOOK_TEST=1 so it can never ship as
+# the default. Lets a developer see the reminder fire repeatedly in one day.
+TEST_MAX_PROMPTS_PER_DAY = 10
 STATE_VERSION = 1
 
 AgentName = Literal["claude", "codex"]
@@ -440,7 +444,14 @@ def _hook_disabled_by_env() -> bool:
     )
 
 
+def _test_mode() -> bool:
+    """Opt-in testing cadence so the reminder can fire repeatedly in one day."""
+    return os.environ.get("OPENREFINERY_SHARE_HOOK_TEST") == "1"
+
+
 def _max_prompts_per_day(state: dict[str, Any]) -> int:
+    if _test_mode():
+        return TEST_MAX_PROMPTS_PER_DAY
     try:
         value = int(state.get("max_prompts_per_day", DEFAULT_MAX_PROMPTS_PER_DAY))
     except (TypeError, ValueError):
@@ -527,26 +538,18 @@ def _next_prompt_date(
     return today.isoformat()
 
 
-def _prompt_message(
-    client: str,
-    launch_command: str,
-    snooze_command: str,
-    disable_command: str,
-    snooze_days: int = DEFAULT_SNOOZE_DAYS,
-) -> str:
+def _prompt_message(client: str, launch_command: str) -> str:
     agent = "Claude Code" if client == "claude" else "Codex"
     return (
-        f"{PROFILE_DISPLAY_NAME} reminder (opt-in research enrollment).\n\n"
+        f"{PROFILE_DISPLAY_NAME} reminder (research enrollment).\n\n"
         "Surface ONE concise question to the user, then wait for their choice:\n"
         "- y: Open local ClawJournal review\n"
-        "- n: Later\n"
-        f"- d: Pause reminders for {snooze_days} days\n\n"
-        f"If they choose y, run `{launch_command}`. If they choose d, run "
-        f"`{snooze_command}`. To stop reminders entirely they can run "
-        f"`{disable_command}`. Do not run any command until the user chooses. "
-        "The launch command only opens the local ClawJournal review UI on this "
-        "machine — nothing is uploaded or submitted until the user has reviewed "
-        f"and approved the redacted bundle themselves. Current agent: {agent}."
+        "- n: Later\n\n"
+        f"If they choose y, run `{launch_command}`. Do not run any command until "
+        "the user chooses. The launch command only opens the local ClawJournal "
+        "review UI on this machine — nothing is uploaded or submitted until the "
+        "user has reviewed and approved the redacted bundle themselves. "
+        f"Current agent: {agent}."
     )
 
 
@@ -580,11 +583,7 @@ def run_hook(
         return HookRunResult(False, "daily-prompt-limit-reached", state_path=_state_path())
 
     launch_command = f"clawjournal hooks launch {PROFILE_NAME}"
-    snooze_command = f"clawjournal hooks snooze {PROFILE_NAME} --days {DEFAULT_SNOOZE_DAYS}"
-    disable_command = f"clawjournal hooks disable {PROFILE_NAME}"
-    message = _prompt_message(
-        client, launch_command, snooze_command, disable_command, DEFAULT_SNOOZE_DAYS
-    )
+    message = _prompt_message(client, launch_command)
     # A preview must never consume a daily slot or mutate state.
     if dry_run:
         return HookRunResult(True, "dry-run", message, state_path=_state_path())
