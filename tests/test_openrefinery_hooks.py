@@ -139,7 +139,7 @@ def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     rendered = hooks.render_hook_response(first, client="codex")
     payload = json.loads(rendered)
     assert payload["decision"] == "block"
-    assert "Open local ClawJournal review" in payload["reason"]
+    assert "share with OpenRefinery" in payload["reason"]
     assert [result.should_prompt for result in results[:cap]] == [True] * cap
     assert over_limit.should_prompt is False
     assert over_limit.reason == "daily-prompt-limit-reached"
@@ -256,11 +256,16 @@ def test_prompt_message_omits_pause_for_enrolled_participant(isolated_hook_env):
     )
 
     message = result.message or ""
-    assert "Open local ClawJournal review" in message
-    assert "Later" in message
+    assert "open the local review" in message
+    assert "not now" in message
     assert "Pause" not in message
     assert "snooze" not in message.lower()
     assert "disable" not in message.lower()
+    # The reminder must explain what it is and reassure on privacy, not leak the
+    # agent-only scaffolding that used to surface verbatim to the user.
+    assert "OpenRefinery" in message
+    assert "nothing leaves your computer until you" in message
+    assert "Surface ONE" not in message
 
 
 def test_snooze_suppresses_daily_hook(isolated_hook_env):

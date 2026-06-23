@@ -200,7 +200,7 @@ def _handler_for(client: AgentName) -> dict[str, Any]:
         "type": "command",
         "command": _hook_command(client),
         "timeout": 30,
-        "statusMessage": "Checking OpenRefinery sharing reminder",
+        "statusMessage": "Checking OpenRefinery failure-sharing reminder",
     }
 
 
@@ -540,16 +540,29 @@ def _next_prompt_date(
 
 def _prompt_message(client: str, launch_command: str) -> str:
     agent = "Claude Code" if client == "claude" else "Codex"
+    # This text is injected as agent context, so it does double duty: a short
+    # briefing for the agent followed by the exact question to relay. Keeping the
+    # question self-contained — and free of agent-only scaffolding like "surface a
+    # question to the user" — stops the internal instructions from leaking into
+    # what the user sees, and makes the ask understandable on its own.
     return (
-        f"{PROFILE_DISPLAY_NAME} reminder (research enrollment).\n\n"
-        "Surface ONE concise question to the user, then wait for their choice:\n"
-        "- y: Open local ClawJournal review\n"
-        "- n: Later\n\n"
-        f"If they choose y, run `{launch_command}`. Do not run any command until "
-        "the user chooses. The launch command only opens the local ClawJournal "
-        "review UI on this machine — nothing is uploaded or submitted until the "
-        "user has reviewed and approved the redacted bundle themselves. "
-        f"Current agent: {agent}."
+        f"[{PROFILE_DISPLAY_NAME}] You're enrolled in OpenRefinery, a research "
+        "program that improves coding agents by learning from sessions where they "
+        "got stuck or failed. About once a day, ClawJournal reminds you to look "
+        "over recent failed sessions and decide whether to contribute a redacted "
+        "copy.\n\n"
+        "Ask the user this, then wait for their answer — don't run anything yet:\n\n"
+        "    Review recent agent-failure sessions to share with OpenRefinery?\n"
+        "    This opens a review screen on your own machine where you pick what to "
+        "share — nothing leaves your computer until you look it over and approve it.\n"
+        "      y — open the local review now\n"
+        "      n — not now (I'll remind you tomorrow)\n\n"
+        f"If they say yes, run `{launch_command}`: a local ClawJournal command that "
+        "only opens that review UI and uploads nothing. If a permission or "
+        "auto-mode check blocks it as unrelated to the current task, don't keep "
+        f"retrying — tell the user they can run `{launch_command}` themselves in a "
+        "terminal. If they say no, acknowledge it and carry on. "
+        f"(Delivered via {agent}.)"
     )
 
 

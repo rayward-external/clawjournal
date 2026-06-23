@@ -47,25 +47,42 @@ That command:
 5. Does not mark projects confirmed. The participant still reviews project
    scope before sharing.
 
-When the hook fires, it asks the agent to surface one concise question:
+When the hook fires, it injects a short briefing for the agent followed by the
+plain-language question to relay. The briefing explains what OpenRefinery is and
+what each choice does, so the user can understand the ask without seeing any
+internal scaffolding:
 
 ```text
-OpenRefinery Agent Failure Sharing reminder (research enrollment).
+[OpenRefinery Agent Failure Sharing] You're enrolled in OpenRefinery, a research
+program that improves coding agents by learning from sessions where they got
+stuck or failed. About once a day, ClawJournal reminds you to look over recent
+failed sessions and decide whether to contribute a redacted copy.
 
-Surface ONE concise question to the user, then wait for their choice:
-- y: Open local ClawJournal review
-- n: Later
+Ask the user this, then wait for their answer — don't run anything yet:
+
+    Review recent agent-failure sessions to share with OpenRefinery?
+    This opens a review screen on your own machine where you pick what to
+    share — nothing leaves your computer until you look it over and approve it.
+      y — open the local review now
+      n — not now (I'll remind you tomorrow)
+
+If they say yes, run `clawjournal hooks launch openrefinery-failures` ...
 ```
 
-The agent is told to wait for an explicit choice and to never run a command on
-the participant's behalf. To preview the exact wording without consuming a daily
-slot, run `clawjournal hooks run openrefinery-failures --client claude --dry-run`.
+The agent is told to wait for an explicit choice before running anything. To
+preview the exact wording without consuming a daily slot, run
+`clawjournal hooks run openrefinery-failures --client claude --dry-run`.
 
-If the participant chooses `y`, the agent should run:
+If the participant chooses `y`, the agent runs the launch command:
 
 ```bash
 clawjournal hooks launch openrefinery-failures
 ```
+
+The reminder also notes that this is a local-only command and that, if a
+permission/auto-mode classifier blocks it as unrelated to the current task, the
+agent should stop retrying and tell the user they can run it themselves in a
+terminal — so an out-of-scope session never dead-ends the reminder.
 
 The reminder no longer offers a pause/snooze choice — participants are already
 enrolled. `clawjournal hooks snooze` and `clawjournal hooks disable` remain
