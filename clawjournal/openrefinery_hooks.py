@@ -538,31 +538,15 @@ def _next_prompt_date(
     return today.isoformat()
 
 
-def _prompt_message(client: str, launch_command: str) -> str:
-    agent = "Claude Code" if client == "claude" else "Codex"
-    # This text is injected as agent context, so it does double duty: a short
-    # briefing for the agent followed by the exact question to relay. Keeping the
-    # question self-contained — and free of agent-only scaffolding like "surface a
-    # question to the user" — stops the internal instructions from leaking into
-    # what the user sees, and makes the ask understandable on its own.
+def _prompt_message(launch_command: str) -> str:
+    # Claude Code prints this string verbatim in the transcript as "Stop hook
+    # feedback", so it must stay short and read like a tidy reminder, not a wall
+    # of agent-only instructions. Keep it to a terse directive: the agent expands
+    # it into a friendly question (and adds the privacy reassurance) when it asks.
     return (
-        f"[{PROFILE_DISPLAY_NAME}] You're enrolled in OpenRefinery, a research "
-        "program that improves coding agents by learning from sessions where they "
-        "got stuck or failed. About once a day, ClawJournal reminds you to look "
-        "over recent failed sessions and decide whether to contribute a redacted "
-        "copy.\n\n"
-        "Ask the user this, then wait for their answer — don't run anything yet:\n\n"
-        "    Review recent agent-failure sessions to share with OpenRefinery?\n"
-        "    This opens a review screen on your own machine where you pick what to "
-        "share — nothing leaves your computer until you look it over and approve it.\n"
-        "      y — open the local review now\n"
-        "      n — not now (I'll remind you tomorrow)\n\n"
-        f"If they say yes, run `{launch_command}`: a local ClawJournal command that "
-        "only opens that review UI and uploads nothing. If a permission or "
-        "auto-mode check blocks it as unrelated to the current task, don't keep "
-        f"retrying — tell the user they can run `{launch_command}` themselves in a "
-        "terminal. If they say no, acknowledge it and carry on. "
-        f"(Delivered via {agent}.)"
+        "OpenRefinery daily reminder — ask the user (y/n) whether to open the "
+        "local review of recent agent-failure sessions to consider sharing. "
+        f"On yes, run `{launch_command}`. On no, drop it."
     )
 
 
@@ -596,7 +580,7 @@ def run_hook(
         return HookRunResult(False, "daily-prompt-limit-reached", state_path=_state_path())
 
     launch_command = f"clawjournal hooks launch {PROFILE_NAME}"
-    message = _prompt_message(client, launch_command)
+    message = _prompt_message(launch_command)
     # A preview must never consume a daily slot or mutate state.
     if dry_run:
         return HookRunResult(True, "dry-run", message, state_path=_state_path())

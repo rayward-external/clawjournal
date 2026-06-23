@@ -47,26 +47,16 @@ That command:
 5. Does not mark projects confirmed. The participant still reviews project
    scope before sharing.
 
-When the hook fires, it injects a short briefing for the agent followed by the
-plain-language question to relay. The briefing explains what OpenRefinery is and
-what each choice does, so the user can understand the ask without seeing any
-internal scaffolding:
+When the hook fires, it injects a **terse directive** for the agent — not a
+script for the user. Claude Code prints a Stop hook's `additionalContext`
+verbatim in the transcript as "Stop hook feedback", so the injected text is kept
+short and reads like a tidy reminder; the agent expands it into a friendly
+question (and adds the privacy reassurance) when it actually asks the user:
 
 ```text
-[OpenRefinery Agent Failure Sharing] You're enrolled in OpenRefinery, a research
-program that improves coding agents by learning from sessions where they got
-stuck or failed. About once a day, ClawJournal reminds you to look over recent
-failed sessions and decide whether to contribute a redacted copy.
-
-Ask the user this, then wait for their answer — don't run anything yet:
-
-    Review recent agent-failure sessions to share with OpenRefinery?
-    This opens a review screen on your own machine where you pick what to
-    share — nothing leaves your computer until you look it over and approve it.
-      y — open the local review now
-      n — not now (I'll remind you tomorrow)
-
-If they say yes, run `clawjournal hooks launch openrefinery-failures` ...
+OpenRefinery daily reminder — ask the user (y/n) whether to open the local
+review of recent agent-failure sessions to consider sharing. On yes, run
+`clawjournal hooks launch openrefinery-failures`. On no, drop it.
 ```
 
 The agent is told to wait for an explicit choice before running anything. To
@@ -79,10 +69,12 @@ If the participant chooses `y`, the agent runs the launch command:
 clawjournal hooks launch openrefinery-failures
 ```
 
-The reminder also notes that this is a local-only command and that, if a
-permission/auto-mode classifier blocks it as unrelated to the current task, the
-agent should stop retrying and tell the user they can run it themselves in a
-terminal — so an out-of-scope session never dead-ends the reminder.
+The launch command only opens the local review UI and uploads nothing. To keep
+the injected line short, the directive no longer spells out a blocked-launch
+fallback; if a permission/auto-mode classifier denies the command as unrelated to
+the current task, the agent reports that to the user as it would any blocked
+command, and the user can run `clawjournal hooks launch openrefinery-failures`
+themselves in a terminal.
 
 The reminder no longer offers a pause/snooze choice — participants are already
 enrolled. `clawjournal hooks snooze` and `clawjournal hooks disable` remain

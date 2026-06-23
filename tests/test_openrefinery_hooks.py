@@ -139,7 +139,7 @@ def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     rendered = hooks.render_hook_response(first, client="codex")
     payload = json.loads(rendered)
     assert payload["decision"] == "block"
-    assert "share with OpenRefinery" in payload["reason"]
+    assert "clawjournal hooks launch openrefinery-failures" in payload["reason"]
     assert [result.should_prompt for result in results[:cap]] == [True] * cap
     assert over_limit.should_prompt is False
     assert over_limit.reason == "daily-prompt-limit-reached"
@@ -176,7 +176,7 @@ def test_dry_run_previews_without_consuming(isolated_hook_env):
 
     assert preview.should_prompt is True
     assert preview.reason == "dry-run"
-    assert "OpenRefinery Agent Failure Sharing" in (preview.message or "")
+    assert "OpenRefinery" in (preview.message or "")
     # A preview must not consume a slot: a real run still treats today as fresh.
     assert hooks.status(now=now)["prompts_today"] == 0
     follow = hooks.run_hook(client="claude", now=now)
@@ -256,15 +256,18 @@ def test_prompt_message_omits_pause_for_enrolled_participant(isolated_hook_env):
     )
 
     message = result.message or ""
+    # The injected text is printed verbatim in the Stop-hook trace, so it must be
+    # a short directive — not a multi-paragraph blurb or leaked agent scaffolding.
+    assert "OpenRefinery" in message
     assert "open the local review" in message
-    assert "not now" in message
+    assert "agent-failure sessions" in message
+    assert "clawjournal hooks launch openrefinery-failures" in message
+    assert len(message) < 280
+    # No admin escape-hatch wording for an already-enrolled participant, and none
+    # of the old "surface a question to the user" scaffolding.
     assert "Pause" not in message
     assert "snooze" not in message.lower()
     assert "disable" not in message.lower()
-    # The reminder must explain what it is and reassure on privacy, not leak the
-    # agent-only scaffolding that used to surface verbatim to the user.
-    assert "OpenRefinery" in message
-    assert "nothing leaves your computer until you" in message
     assert "Surface ONE" not in message
 
 
@@ -290,7 +293,7 @@ def test_claude_hook_response_includes_additional_context(isolated_hook_env):
 
     assert "decision" not in payload
     assert payload["hookSpecificOutput"]["hookEventName"] == "Stop"
-    assert "OpenRefinery Agent Failure Sharing" in payload["hookSpecificOutput"]["additionalContext"]
+    assert "OpenRefinery" in payload["hookSpecificOutput"]["additionalContext"]
 
 
 def test_launch_share_flow_falls_back_to_cli_when_auto_web_unavailable(
