@@ -75,6 +75,13 @@ def normalize_excluded_project_names(names: list[str]) -> list[str]:
     return [_normalize_excluded_project_name(name) for name in names]
 
 
+def set_source_scope(config: ClawJournalConfig, source: str) -> None:
+    """Set export source and invalidate project confirmation when scope changes."""
+    if config.get("source") != source:
+        config["projects_confirmed"] = False
+    config["source"] = source
+
+
 def _normalize_excluded_project_name(name: str) -> str:
     if name.startswith(_KNOWN_PREFIXES):
         return name

@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any, Mapping, cast
 
 from .redaction.anonymizer import Anonymizer
-from .config import CONFIG_FILE, ClawJournalConfig, load_config, normalize_excluded_project_names, save_config
+from .config import (
+    CONFIG_FILE,
+    ClawJournalConfig,
+    load_config,
+    normalize_excluded_project_names,
+    save_config,
+    set_source_scope,
+)
 from .parsing.parser import CLAUDE_DIR, CODEX_DIR, COPILOT_DIR, CURSOR_DIR, CUSTOM_DIR, GEMINI_DIR, KIMI_DIR, LOCAL_AGENT_DIR, OPENCODE_DIR, OPENCLAW_DIR, discover_projects, parse_project_sessions
 from .scoring.backends import BACKEND_CHOICES, DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from .redaction.pii import apply_findings_to_session, load_findings, load_jsonl_sessions, review_session_pii, review_session_pii_hybrid, review_session_pii_with_agent, write_findings, write_jsonl_sessions
@@ -383,7 +390,7 @@ def configure(
     if repo is not None:
         config["repo"] = repo
     if source is not None:
-        config["source"] = source
+        set_source_scope(config, source)
     if scorer_backend is not None:
         if scorer_backend == "none":
             config.pop("scorer_backend", None)
