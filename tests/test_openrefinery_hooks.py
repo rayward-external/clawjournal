@@ -326,7 +326,7 @@ def test_launch_share_flow_starts_server_and_opens_browser(isolated_hook_env, mo
     monkeypatch.setattr(hooks, "_frontend_available", lambda: True)
     monkeypatch.setattr(hooks, "_port_is_open", lambda port: False)
     monkeypatch.setattr(hooks, "_start_detached_server", lambda port: Proc())
-    monkeypatch.setattr(hooks, "_wait_for_port", lambda port: True)
+    monkeypatch.setattr(hooks, "_wait_for_port", lambda port, timeout_seconds=3.0: True)
     monkeypatch.setattr(hooks, "_open_browser", lambda url: calls.append(url) or True)
 
     result = hooks.launch_share_flow(open_browser=True, port=8484)
@@ -336,6 +336,32 @@ def test_launch_share_flow_starts_server_and_opens_browser(isolated_hook_env, mo
     assert result["pid"] == 1234
     assert result["url"] == "http://localhost:8484/share"
     assert calls == ["http://localhost:8484/share"]
+
+
+def test_launch_share_flow_waits_longer_for_cold_started_server(isolated_hook_env, monkeypatch):
+    # A freshly started server gets a longer grace period than the default so a
+    # slow cold boot does not silently downgrade to the CLI (the first-"y" bug).
+    hooks.install_profile(agent="codex", ui="web", home=isolated_hook_env / "home")
+
+    class Proc:
+        pid = 1234
+
+    waited: dict = {}
+    monkeypatch.setattr(hooks, "_frontend_available", lambda: True)
+    monkeypatch.setattr(hooks, "_port_is_open", lambda port: False)
+    monkeypatch.setattr(hooks, "_start_detached_server", lambda port: Proc())
+    monkeypatch.setattr(hooks, "_open_browser", lambda url: True)
+
+    def fake_wait(port, timeout_seconds=3.0):
+        waited["timeout"] = timeout_seconds
+        return True
+
+    monkeypatch.setattr(hooks, "_wait_for_port", fake_wait)
+
+    result = hooks.launch_share_flow(open_browser=False, port=8484)
+
+    assert result["mode"] == "web"
+    assert waited["timeout"] >= 10.0
 
 
 def test_launch_share_flow_falls_back_when_frontend_missing(isolated_hook_env, monkeypatch):

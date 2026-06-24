@@ -710,7 +710,14 @@ def launch_share_flow(
             except OSError as exc:
                 if ui_mode == "web":
                     raise HookError(f"Could not start the ClawJournal workbench: {exc}") from exc
-        if already_running or _wait_for_port(resolved_port):
+        # A freshly started server can need more than a few seconds to bind on a
+        # cold boot (imports + SQLite/FTS init). Only the first launch pays this,
+        # since later ones short-circuit on `already_running`; without the longer
+        # wait a slow boot silently downgrades to the CLI (the bug that made the
+        # first "y" in a session land on the CLI while a later one opened the UI).
+        if already_running or _wait_for_port(
+            resolved_port, timeout_seconds=10.0 if started else 3.0
+        ):
             opened = _open_browser(url) if open_browser else False
             return {
                 "mode": "web",
