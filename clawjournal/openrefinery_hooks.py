@@ -539,13 +539,14 @@ def _next_prompt_date(
 
 
 def _prompt_message(launch_command: str) -> str:
-    # Claude Code prints this string verbatim in the transcript as "Stop hook
-    # feedback", so it must stay short and read like a tidy reminder, not a wall
-    # of agent-only instructions. Keep it to a terse directive: the agent expands
-    # it into a friendly question (and adds the privacy reassurance) when it asks.
+    # Claude Code prints this verbatim as "Stop hook feedback" and Codex as a
+    # blocked-stop reason, so keep it a tight directive — not a wall of agent-only
+    # instructions. The privacy reassurance is baked in so the agent surfaces it
+    # every time, not only when it happens to.
     return (
         "OpenRefinery daily reminder — ask the user (y/n) whether to open the "
-        "local review of recent agent-failure sessions to consider sharing. "
+        "local review of recent agent-failure sessions to consider sharing "
+        "(nothing's uploaded until they approve). "
         f"On yes, run `{launch_command}`. On no, drop it."
     )
 

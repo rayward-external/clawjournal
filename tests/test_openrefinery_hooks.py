@@ -262,6 +262,8 @@ def test_prompt_message_omits_pause_for_enrolled_participant(isolated_hook_env):
     assert "open the local review" in message
     assert "agent-failure sessions" in message
     assert "clawjournal hooks launch openrefinery-failures" in message
+    # Privacy reassurance is baked in so the agent surfaces it every time.
+    assert "uploaded" in message
     assert len(message) < 280
     # No admin escape-hatch wording for an already-enrolled participant, and none
     # of the old "surface a question to the user" scaffolding.

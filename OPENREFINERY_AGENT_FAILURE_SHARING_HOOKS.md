@@ -49,14 +49,16 @@ That command:
 
 When the hook fires, it injects a **terse directive** for the agent — not a
 script for the user. Claude Code prints a Stop hook's `additionalContext`
-verbatim in the transcript as "Stop hook feedback", so the injected text is kept
-short and reads like a tidy reminder; the agent expands it into a friendly
-question (and adds the privacy reassurance) when it actually asks the user:
+verbatim as "Stop hook feedback" (and Codex relays it as a blocked-stop reason),
+so the injected text is kept short and reads like a tidy reminder; the agent
+expands it into a friendly question when it actually asks the user. The privacy
+reassurance is baked into the directive so the agent surfaces it every time:
 
 ```text
 OpenRefinery daily reminder — ask the user (y/n) whether to open the local
-review of recent agent-failure sessions to consider sharing. On yes, run
-`clawjournal hooks launch openrefinery-failures`. On no, drop it.
+review of recent agent-failure sessions to consider sharing (nothing's uploaded
+until they approve). On yes, run `clawjournal hooks launch openrefinery-failures`.
+On no, drop it.
 ```
 
 The agent is told to wait for an explicit choice before running anything. To
