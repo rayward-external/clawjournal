@@ -82,6 +82,36 @@ def test_install_profile_writes_claude_and_codex_hooks(isolated_hook_env):
     )
 
 
+def test_install_profile_resets_project_confirmation_when_source_scope_changes(isolated_hook_env):
+    config_module.save_config({"source": "codex", "projects_confirmed": True})
+
+    result = hooks.install_profile(
+        agent="claude",
+        source_scope="both",
+        home=isolated_hook_env / "home",
+    )
+
+    config = config_module.load_config()
+    assert config["source"] == "both"
+    assert config["projects_confirmed"] is False
+    assert result["projects_confirmed"] is False
+
+
+def test_install_profile_preserves_project_confirmation_for_same_source_scope(isolated_hook_env):
+    config_module.save_config({"source": "both", "projects_confirmed": True})
+
+    result = hooks.install_profile(
+        agent="claude",
+        source_scope="both",
+        home=isolated_hook_env / "home",
+    )
+
+    config = config_module.load_config()
+    assert config["source"] == "both"
+    assert config["projects_confirmed"] is True
+    assert result["projects_confirmed"] is True
+
+
 def test_install_profile_updates_existing_openrefinery_hook(isolated_hook_env, monkeypatch):
     home = isolated_hook_env / "home"
     codex_hooks = home / ".codex" / "hooks.json"
@@ -303,7 +333,8 @@ def test_launch_share_flow_falls_back_to_cli_when_auto_web_unavailable(
 ):
     hooks.install_profile(agent="codex", ui="auto", home=isolated_hook_env / "home")
     monkeypatch.setattr(hooks, "_frontend_available", lambda: True)
-    monkeypatch.setattr(hooks, "_port_is_open", lambda port: False)
+    monkeypatch.setattr(hooks, "_workbench_responding", lambda port, timeout=1.0: False)
+    monkeypatch.setattr(hooks, "_wait_for_workbench", lambda port, timeout_seconds=3.0: False)
     monkeypatch.setattr(
         hooks,
         "_start_detached_server",
@@ -324,9 +355,9 @@ def test_launch_share_flow_starts_server_and_opens_browser(isolated_hook_env, mo
 
     calls: list[str] = []
     monkeypatch.setattr(hooks, "_frontend_available", lambda: True)
-    monkeypatch.setattr(hooks, "_port_is_open", lambda port: False)
+    monkeypatch.setattr(hooks, "_workbench_responding", lambda port, timeout=1.0: False)
     monkeypatch.setattr(hooks, "_start_detached_server", lambda port: Proc())
-    monkeypatch.setattr(hooks, "_wait_for_port", lambda port, timeout_seconds=3.0: True)
+    monkeypatch.setattr(hooks, "_wait_for_workbench", lambda port, timeout_seconds=3.0: True)
     monkeypatch.setattr(hooks, "_open_browser", lambda url: calls.append(url) or True)
 
     result = hooks.launch_share_flow(open_browser=True, port=8484)
@@ -348,7 +379,7 @@ def test_launch_share_flow_waits_longer_for_cold_started_server(isolated_hook_en
 
     waited: dict = {}
     monkeypatch.setattr(hooks, "_frontend_available", lambda: True)
-    monkeypatch.setattr(hooks, "_port_is_open", lambda port: False)
+    monkeypatch.setattr(hooks, "_workbench_responding", lambda port, timeout=1.0: False)
     monkeypatch.setattr(hooks, "_start_detached_server", lambda port: Proc())
     monkeypatch.setattr(hooks, "_open_browser", lambda url: True)
 
@@ -356,12 +387,43 @@ def test_launch_share_flow_waits_longer_for_cold_started_server(isolated_hook_en
         waited["timeout"] = timeout_seconds
         return True
 
-    monkeypatch.setattr(hooks, "_wait_for_port", fake_wait)
+    monkeypatch.setattr(hooks, "_wait_for_workbench", fake_wait)
 
     result = hooks.launch_share_flow(open_browser=False, port=8484)
 
     assert result["mode"] == "web"
     assert waited["timeout"] >= 10.0
+
+
+def test_launch_share_flow_reaps_server_when_workbench_never_answers(
+    isolated_hook_env, monkeypatch
+):
+    # If we start a server but our workbench never answers on the port (e.g. the
+    # port was held by something else and the daemon rebound to an ephemeral
+    # port), don't open the foreign service and don't leak the spawned process —
+    # reap it and fall back to the CLI.
+    hooks.install_profile(agent="codex", ui="auto", home=isolated_hook_env / "home")
+
+    terminated: dict = {"count": 0}
+
+    class Proc:
+        pid = 4321
+
+        def terminate(self):
+            terminated["count"] += 1
+
+    opened: list[str] = []
+    monkeypatch.setattr(hooks, "_frontend_available", lambda: True)
+    monkeypatch.setattr(hooks, "_workbench_responding", lambda port, timeout=1.0: False)
+    monkeypatch.setattr(hooks, "_start_detached_server", lambda port: Proc())
+    monkeypatch.setattr(hooks, "_wait_for_workbench", lambda port, timeout_seconds=3.0: False)
+    monkeypatch.setattr(hooks, "_open_browser", lambda url: opened.append(url) or True)
+
+    result = hooks.launch_share_flow(open_browser=True)
+
+    assert result["mode"] == "cli"
+    assert terminated["count"] == 1  # the orphaned server was reaped
+    assert opened == []  # never opened the foreign service holding the port
 
 
 def test_launch_share_flow_falls_back_when_frontend_missing(isolated_hook_env, monkeypatch):

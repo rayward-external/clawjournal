@@ -326,7 +326,7 @@ def install_profile(
 
     if source_scope:
         config = config_module.load_config()
-        config["source"] = source_scope
+        config_module.set_source_scope(config, source_scope)
         config_module.save_config(config)
 
     return {
@@ -619,14 +619,29 @@ def render_hook_response(result: HookRunResult, *, client: str, output_json: boo
     return json.dumps(payload)
 
 
-def _port_is_open(port: int) -> bool:
-    import socket
+def _workbench_responding(port: int, *, timeout: float = 1.0) -> bool:
+    """True only if *our* ClawJournal workbench answers on the port.
+
+    A bare TCP connect can't tell our daemon apart from an unrelated process
+    holding the same port. Trusting it would let us open the wrong
+    ``localhost:<port>`` page, or treat a foreign listener as "already running"
+    and then spawn a daemon that silently rebinds to an ephemeral port (a leaked,
+    unreachable process). So fetch the SPA shell and look for a ClawJournal
+    signature: the ``clawjournal_token`` cookie the daemon sets on HTML
+    responses, or the ``<title>ClawJournal</title>`` marker in the served index.
+    """
+    import urllib.error
+    import urllib.request
 
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-            return True
-    except OSError:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            cookie = resp.headers.get("Set-Cookie", "") or ""
+            body = resp.read(4096).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
         return False
+    return "clawjournal_token" in cookie or "ClawJournal" in body
 
 
 def _open_browser(url: str) -> bool:
@@ -668,13 +683,23 @@ def _start_detached_server(port: int) -> subprocess.Popen[Any]:
     )
 
 
-def _wait_for_port(port: int, *, timeout_seconds: float = 3.0) -> bool:
+def _terminate_proc(proc: subprocess.Popen[Any] | None) -> None:
+    """Best-effort reap of a server we started but can no longer reach."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+
+def _wait_for_workbench(port: int, *, timeout_seconds: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if _port_is_open(port):
+        if _workbench_responding(port, timeout=0.5):
             return True
-        time.sleep(0.1)
-    return _port_is_open(port)
+        time.sleep(0.25)
+    return _workbench_responding(port, timeout=0.5)
 
 
 def launch_share_flow(
@@ -699,9 +724,12 @@ def launch_share_flow(
                     "`./scripts/install.sh --with-frontend` or use `--ui cli`."
                 )
             return _cli_launch_result()
-        already_running = _port_is_open(resolved_port)
+        # Only treat the port as serving if *our* workbench actually answers — a
+        # foreign listener must not be opened or counted as already running.
+        already_running = _workbench_responding(resolved_port)
         started = False
         pid: int | None = None
+        proc: subprocess.Popen[Any] | None = None
         if not already_running:
             try:
                 proc = _start_detached_server(resolved_port)
@@ -715,7 +743,7 @@ def launch_share_flow(
         # since later ones short-circuit on `already_running`; without the longer
         # wait a slow boot silently downgrades to the CLI (the bug that made the
         # first "y" in a session land on the CLI while a later one opened the UI).
-        if already_running or _wait_for_port(
+        if already_running or _wait_for_workbench(
             resolved_port, timeout_seconds=10.0 if started else 3.0
         ):
             opened = _open_browser(url) if open_browser else False
@@ -728,6 +756,11 @@ def launch_share_flow(
                 "pid": pid,
                 "browser_opened": opened,
             }
+        # We started a server but our workbench never answered on resolved_port —
+        # e.g. the port was taken by something else and the daemon rebound to an
+        # ephemeral port. Reap the orphan rather than leaking it, and never open
+        # the foreign service that's holding the port.
+        _terminate_proc(proc)
         if ui_mode == "web":
             raise HookError("Started the ClawJournal workbench, but it did not become reachable.")
 
