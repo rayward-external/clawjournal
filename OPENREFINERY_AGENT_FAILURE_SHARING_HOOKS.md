@@ -1,0 +1,238 @@
+# OpenRefinery Agent Failure Sharing Hooks
+
+## Purpose
+
+OpenRefinery Agent Failure Sharing is an enrollment-only reminder workflow for
+participants who have already agreed to share agent failure traces for research.
+It gives Claude Code and Codex a daily nudge similar to the built-in Claude Code
+session-quality prompt, but routes the participant through ClawJournal's local
+review and redaction workflow instead of uploading anything directly.
+
+The hook is intentionally narrow:
+
+- It prompts at most once per local day (production cap: 1) and never twice
+  within the same reminder-extended turn. Developers can set
+  `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day for testing.
+- Because participants are already enrolled, the nudge offers only "review now"
+  or "later" — it does not advertise pausing or disabling reminders.
+- It can open the ClawJournal Share UI or point to the terminal Share wizard.
+- It never packages, submits, or uploads traces by itself.
+- It leaves ClawJournal's existing source/project confirmation, hold-state,
+  redaction, AI-PII opt-in, and TruffleHog gates as the only share path.
+
+## Participant Workflow
+
+For a new participant, the enrollment instructions should first install or
+update ClawJournal from the public GitHub source:
+
+```bash
+git clone https://github.com/rayward-external/clawjournal.git ~/clawjournal
+cd ~/clawjournal
+./scripts/install.sh --with-frontend
+```
+
+Once `clawjournal` is available, enroll the participant:
+
+```bash
+clawjournal enroll openrefinery --agent all --ui auto
+```
+
+That command:
+
+1. Runs the safe synchronous updater (`clawjournal selfupdate`) when the install
+   is an editable Git checkout.
+2. Installs Stop hooks for Claude Code and Codex.
+3. Enables the local `openrefinery-failures` state profile.
+4. Sets the source scope to `both` so Claude Code and Codex traces are in scope.
+5. Does not mark projects confirmed. The participant still reviews project
+   scope before sharing.
+
+When the hook fires, it injects a **terse directive** for the agent — not a
+script for the user. Claude Code prints a Stop hook's `additionalContext`
+verbatim as "Stop hook feedback" (and Codex relays it as a blocked-stop reason),
+so the injected text is kept short and reads like a tidy reminder; the agent
+expands it into a friendly question when it actually asks the user. The privacy
+reassurance is baked into the directive so the agent surfaces it every time:
+
+```text
+OpenRefinery daily reminder — ask the user (y/n) whether to open the local
+review of recent agent-failure sessions to consider sharing (nothing's uploaded
+until they approve). On yes, run `clawjournal hooks launch openrefinery-failures`.
+On no, drop it.
+```
+
+The agent is told to wait for an explicit choice before running anything. To
+preview the exact wording without consuming a daily slot, run
+`clawjournal hooks run openrefinery-failures --client claude --dry-run`.
+
+If the participant chooses `y`, the agent runs the launch command:
+
+```bash
+clawjournal hooks launch openrefinery-failures
+```
+
+The launch command only opens the local review UI and uploads nothing. To keep
+the injected line short, the directive no longer spells out a blocked-launch
+fallback; if a permission/auto-mode classifier denies the command as unrelated to
+the current task, the agent reports that to the user as it would any blocked
+command, and the user can run `clawjournal hooks launch openrefinery-failures`
+themselves in a terminal.
+
+The reminder no longer offers a pause/snooze choice — participants are already
+enrolled. `clawjournal hooks snooze` and `clawjournal hooks disable` remain
+available as administrative escape hatches (and `OPENREFINERY_SHARE_HOOK_DISABLE=1`
+/ `CLAWJOURNAL_DISABLE_SHARE_NUDGE=1` as env opt-outs), but the nudge itself does
+not advertise them.
+
+## Installed Files
+
+The hook installer writes only user-level agent config and ClawJournal state:
+
+| Path | Purpose |
+|---|---|
+| `~/.claude/settings.json` | Claude Code Stop hook definition |
+| `~/.codex/hooks.json` | Codex Stop hook definition |
+| `~/.clawjournal/hooks/openrefinery-failures.json` | Local profile state, daily prompt cap, prompt counts, snooze status |
+| `~/.clawjournal/config.json` | Existing ClawJournal config; enrollment sets `source` to `both` |
+
+The hook command installed into both agents is:
+
+```bash
+<python> -m clawjournal.cli hooks run openrefinery-failures --client <claude|codex>
+```
+
+Using the current Python executable keeps the hook tied to the installed
+ClawJournal environment rather than relying on whatever `clawjournal` binary
+happens to be first on `PATH`.
+
+## Commands
+
+| Command | Use |
+|---|---|
+| `clawjournal enroll openrefinery --agent all --ui auto` | Update if possible, install Claude+Codex hooks, enable the profile |
+| `clawjournal hooks install openrefinery-failures --agent all --ui auto` | Install or repair hooks without running selfupdate |
+| `clawjournal hooks status openrefinery-failures` | Show enabled state, installed agents, daily cap/count, next-prompt date, snooze state, and Share-scope readiness |
+| `clawjournal hooks launch openrefinery-failures` | Open Share UI or print terminal wizard fallback |
+| `clawjournal hooks snooze openrefinery-failures --days 30` | Pause daily reminders |
+| `clawjournal hooks disable openrefinery-failures` | Keep hook files but stop prompting |
+| `clawjournal hooks uninstall openrefinery-failures --agent all` | Remove hook definitions from agent config and disable if no agents remain |
+| `clawjournal hooks run openrefinery-failures --client codex --json` | Diagnostic hook invocation |
+| `clawjournal hooks run openrefinery-failures --client claude --dry-run` | Preview the reminder text without consuming a daily slot |
+
+## Hook Runtime Behavior
+
+The hook reads only local state and emits a response for the running agent.
+
+Prompt eligibility:
+
+1. The profile must be enabled.
+2. `CLAWJOURNAL_DISABLE_SHARE_NUDGE=1` and
+   `OPENREFINERY_SHARE_HOOK_DISABLE=1` must not be set.
+3. The Stop-hook input must not report `stop_hook_active` (this Stop already
+   followed a reminder), unless `--force` is used. This prevents a reminder from
+   re-firing within its own extended turn and draining the daily budget at once.
+4. The profile must not be snoozed through today.
+5. The profile must not have reached `max_prompts_per_day` for today's local
+   date unless `--force` is used.
+
+When eligible, the hook increments `prompt_counts_by_date[today]` and records
+`last_prompt_date` before returning the prompt. The production cap is 1 prompt
+per day; setting `OPENREFINERY_SHARE_HOOK_TEST=1` raises it to 10 for local
+testing. This cap is shared across Claude Code and Codex: if both agents are
+used on the same day, they draw from the same daily prompt budget. Re-running
+`clawjournal hooks install` (or `enroll`) rewrites the stored cap to the current
+default, so an upgraded participant is not left frozen at an old cadence.
+
+`--dry-run` renders the prompt the hook *would* return without incrementing the
+counter, recording state, or honoring the loop guard — useful for verifying the
+wording without spending a daily slot. `clawjournal hooks status
+openrefinery-failures` reports the per-day count, the next eligible date, snooze
+state, and whether the Share scope (source + project confirmation) is ready.
+
+## Agent-Specific Prompt Semantics
+
+Claude Code and Codex both support Stop hooks, but they present hook output
+differently.
+
+For Claude Code, the hook returns JSON with:
+
+- `hookSpecificOutput.hookEventName: "Stop"`
+- `hookSpecificOutput.additionalContext: <prompt text>`
+
+This is the non-blocking path: the current turn completes normally (the
+participant still sees the agent's real answer) and the reminder is delivered to
+Claude Code as a system reminder on its next model request. We deliberately avoid
+`decision: "block"` here because, on a Stop hook, `block` *suppresses* the
+agent's response and shows `reason` in its place — too disruptive for a nudge.
+
+For Codex, the hook returns:
+
+- `decision: "block"`
+- `reason: <prompt text>`
+
+Codex's Stop hook does not surface `additionalContext`, so `decision: "block"` +
+`reason` is the supported way to deliver the reminder there. Codex may also
+require the participant to review and trust the newly installed hook through
+`/hooks` before non-managed user hooks run.
+
+## Launch Behavior
+
+`clawjournal hooks launch openrefinery-failures` uses the enrolled UI preference:
+
+- `web`: require the browser workbench, start `clawjournal serve --no-browser`
+  detached when needed, then open `http://localhost:8384/share`.
+- `cli`: print `clawjournal share --interactive --weekly`.
+- `auto`: prefer the web path, but fall back to the CLI wizard if the frontend is
+  not built, the daemon cannot start, or the port does not become reachable.
+
+The detached server launcher intentionally starts only the existing
+ClawJournal daemon. It does not create a special upload path or bypass any
+Share workflow step.
+
+## Privacy and Safety Invariants
+
+The hook design preserves the existing local-first privacy model:
+
+- Source and project confirmation remain required before export/share.
+- `pending_review` and active `embargoed` sessions remain blocked from upload.
+- Only `auto_redacted` and `released` sessions can leave the machine.
+- Regex redaction runs at share time even if findings were already computed.
+- AI-assisted PII review remains optional and explicit.
+- TruffleHog remains mandatory after redaction and blocks missing-binary or
+  detected-secret cases.
+- The hook itself does not read session transcripts, package bundles, submit
+  HTTP requests, or call any AI backend.
+
+## Failure Modes
+
+| Failure | Behavior |
+|---|---|
+| ClawJournal is not installed yet | Enrollment cannot run; use the GitHub install path first |
+| Editable checkout is dirty, ahead, diverged, or not on `main` | `enroll openrefinery` reports the `selfupdate` status but still installs hooks |
+| Existing hook JSON is malformed | Installer fails with a user-actionable parse error |
+| Browser workbench frontend is missing | `--ui auto` falls back to CLI; `--ui web` errors with rebuild guidance |
+| Workbench port does not become reachable | `--ui auto` falls back to CLI; `--ui web` errors |
+| Participant wants quiet | `hooks snooze ... --days 30`, `hooks disable ...`, or env opt-out |
+| Codex hook is untrusted | Codex prompts for `/hooks` review before running the hook |
+
+## Tests
+
+The implementation is covered by `tests/test_openrefinery_hooks.py`:
+
+- Claude and Codex hook JSON installation.
+- Existing hook update without clobbering unrelated hooks.
+- Shared daily prompt cap (cadence-agnostic, keyed off the default).
+- Snooze suppression.
+- `--dry-run` previews without consuming a slot.
+- `stop_hook_active` loop guard suppresses (and `--force` overrides it).
+- `status` reports next-prompt date, snooze days left, and Share-scope readiness.
+- Claude-specific `additionalContext` response.
+- Web launch, CLI fallback, and missing-frontend fallback.
+- Uninstall removes only the OpenRefinery hook.
+
+The PR also keeps existing CLI and self-update coverage passing:
+
+```bash
+python -m pytest tests/test_cli.py tests/test_selfupdate.py tests/test_openrefinery_hooks.py -q
+python -m py_compile clawjournal/openrefinery_hooks.py clawjournal/cli.py tests/test_openrefinery_hooks.py
+```

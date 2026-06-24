@@ -324,6 +324,32 @@ class TestConfigure:
         configure(source="codex")
         assert saved["source"] == "codex"
 
+    def test_changing_source_resets_project_confirmation(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr(
+            "clawjournal.cli.load_config",
+            lambda: {"repo": None, "source": "codex", "projects_confirmed": True},
+        )
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(source="both")
+        assert saved["source"] == "both"
+        assert saved["projects_confirmed"] is False
+
+    def test_same_source_preserves_project_confirmation(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr(
+            "clawjournal.cli.load_config",
+            lambda: {"repo": None, "source": "codex", "projects_confirmed": True},
+        )
+        saved = {}
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.update(c))
+
+        configure(source="codex")
+        assert saved["source"] == "codex"
+        assert saved["projects_confirmed"] is True
+
     def test_sets_ai_pii_review_flag(self, tmp_config, monkeypatch, capsys):
         monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
         monkeypatch.setattr("clawjournal.cli.load_config", lambda: {"repo": None})

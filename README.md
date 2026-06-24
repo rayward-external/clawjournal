@@ -39,6 +39,24 @@ The AI detects your OS, installs what it needs (git, Python, Node.js), runs the 
 
 When it's done, your AI gives you a web address like `http://localhost:8384`. Copy it into your browser's address bar and press Enter — the workbench opens locally on your own computer; nothing is uploaded.
 
+## OpenRefinery enrollment hooks
+
+Research participants who are explicitly enrolled in OpenRefinery Agent Failure Sharing can install a daily reminder hook for Claude Code and Codex:
+
+```bash
+clawjournal enroll openrefinery --agent all --ui auto
+```
+
+The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one gentle nudge per day asking whether to review recent agent failures with ClawJournal — answer **y** to open local review or **n** for later (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). Developers testing the hook can set `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day. If the participant accepts, run:
+
+```bash
+clawjournal hooks launch openrefinery-failures
+```
+
+`launch` prefers the browser Share workflow at `http://localhost:8384/share`; if it cannot start or reach the local workbench in auto mode, it falls back to `clawjournal share --interactive --weekly`. The hook never uploads by itself. The Share flow still requires source/project confirmation, local redaction review, and the mandatory TruffleHog gate before anything leaves the machine. Codex may ask you to review/trust the newly installed hook with `/hooks` before it runs.
+
+Design details: [OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md](OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md).
+
 ## Your data stays local
 
 - `scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` all run on your own computer. The review UI opens on `localhost:8384` — no account, no cloud service.
@@ -361,6 +379,10 @@ clawjournal bundle-share <bundle_id>
 | `clawjournal config --scoring-warmup` / `--no-scoring-warmup` | Enable or decline the background AI auto-scorer |
 | `clawjournal list` / `clawjournal status` | List projects with exclusion status / show current stage (JSON) |
 | `clawjournal update-skill <agent>` | Install/update the clawjournal skill for an agent |
+| `clawjournal enroll openrefinery --agent all` | Install/update OpenRefinery Agent Failure Sharing hooks for enrolled participants |
+| `clawjournal hooks status openrefinery-failures` | Show enrollment hook state, daily cap, and installed agents |
+| `clawjournal hooks launch openrefinery-failures` | Open the Share workflow or print the CLI fallback command |
+| `clawjournal hooks snooze openrefinery-failures --days 30` / `disable` | Pause or disable the daily enrollment reminder |
 | `clawjournal selfupdate [--check] [--force]` | Fast-forward to latest from `rayward-external/clawjournal` |
 | `clawjournal trufflehog install [--force]` | Download the pinned, checksum-verified TruffleHog (share-gate dependency) into `~/.clawjournal/bin` |
 | `clawjournal trufflehog status [--json]` | Show which TruffleHog binary the share gate will use |
