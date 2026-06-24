@@ -487,10 +487,21 @@ def select_queue_rows(rows: list[dict], settings: dict, args, *, limit: bool = T
     return out[:args.limit] if limit else out
 
 
+def _effective_source_filter(settings: dict, requested_source: str | None):
+    allowed = settings.get("source_filter")
+    if not requested_source:
+        return allowed
+    if allowed is None:
+        return requested_source
+    allowed_values = set(allowed if isinstance(allowed, (list, tuple)) else [allowed])
+    return requested_source if requested_source in allowed_values else "__no_matching_source__"
+
+
 def step_queue(conn, settings, args) -> list[dict]:
     step(1, "Queue — select traces")
     # Fetch recent candidates (so time windows are accurate), then rank by value.
-    candidates = query_sessions(conn, status=args.status, source=args.source,
+    source_filter = _effective_source_filter(settings, args.source)
+    candidates = query_sessions(conn, status=args.status, source=source_filter,
                                 limit=5000, sort="end_time", order="desc")
 
     # By default (like the web), score the in-window unscored traces on open so
@@ -517,7 +528,7 @@ def step_queue(conn, settings, args) -> list[dict]:
                 r["session_id"] for r in query_unscored_sessions(
                     conn,
                     limit=5000,
-                    source=args.source,
+                    source=source_filter,
                     settle_seconds=SCORE_SETTLE_SECONDS,
                     include_stale_scored=True,
                 )

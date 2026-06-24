@@ -20,6 +20,7 @@ from .workbench.index import (
     create_share,
     get_share,
     release_gate_blockers,
+    source_scope_blockers,
 )
 
 # Wrapped daemon helpers — imported here so callers depend on share_flow, not on
@@ -214,7 +215,19 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
         {ok, share_id, export_dir, manifest, blocked_sessions, error}
     blocked_sessions is the list of sessions TruffleHog/PII blocked (for recovery).
     """
-    share_id = create_share(conn, session_ids, note=note)
+    source_blockers = source_scope_blockers(conn, session_ids, settings.get("source_filter"))
+    if source_blockers:
+        return {
+            "ok": False,
+            "error": "Share contains sessions outside the confirmed source scope",
+            "blockers": source_blockers,
+        }
+    share_id = create_share(
+        conn,
+        session_ids,
+        note=note,
+        source_filter=settings.get("source_filter"),
+    )
     share = get_share(conn, share_id)
     if share is None:
         return {"ok": False, "error": "Share row could not be loaded after creation."}

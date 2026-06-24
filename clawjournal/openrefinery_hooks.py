@@ -181,9 +181,9 @@ def _codex_hooks_path(home: Path | None = None) -> Path:
     return _home_dir(home) / ".codex" / "hooks.json"
 
 
-def _hook_command(client: AgentName) -> str:
-    pieces = [
-        shlex.quote(sys.executable),
+def _hook_argv(client: AgentName) -> list[str]:
+    return [
+        sys.executable,
         "-m",
         "clawjournal.cli",
         "hooks",
@@ -192,13 +192,21 @@ def _hook_command(client: AgentName) -> str:
         "--client",
         client,
     ]
-    return " ".join(pieces)
+
+
+def _hook_command(client: AgentName) -> str:
+    return shlex.join(_hook_argv(client))
+
+
+def _hook_command_windows(client: AgentName) -> str:
+    return subprocess.list2cmdline(_hook_argv(client))
 
 
 def _handler_for(client: AgentName) -> dict[str, Any]:
     return {
         "type": "command",
         "command": _hook_command(client),
+        "commandWindows": _hook_command_windows(client),
         "timeout": 30,
         "statusMessage": "Checking OpenRefinery failure-sharing reminder",
     }

@@ -1078,6 +1078,41 @@ class TestSharesAPI:
         status, data = _post(server, "/api/shares", {"session_ids": []})
         assert status == 400
 
+    def test_create_rejects_sessions_outside_configured_source_scope(self, server, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"source": "both", "projects_confirmed": True},
+        )
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": "gemini-out",
+                "project": "gemini:private",
+                "source": "gemini",
+                "model": "gemini-cli",
+                "start_time": "2025-01-04T00:00:00+00:00",
+                "end_time": "2025-01-04T00:10:00+00:00",
+                "messages": [{"role": "user", "content": "private", "tool_uses": []}],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 0,
+                    "tool_uses": 0,
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                },
+            }])
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0", "gemini-out"],
+            "note": "Source scope test",
+        })
+
+        assert status == 409
+        assert "source scope" in data["error"]
+        assert [b["session_id"] for b in data["blockers"]] == ["gemini-out"]
+
 
 class TestPoliciesAPI:
     def test_add_and_list(self, server):

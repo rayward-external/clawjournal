@@ -72,6 +72,7 @@ from .index import (
     remove_policy,
     search_fts,
     SCORE_SETTLE_SECONDS,
+    source_scope_blockers,
     update_session,
     upsert_sessions,
 )
@@ -1392,14 +1393,14 @@ def finalize_share_export_for_upload(
 
 
 def _redaction_settings_fingerprint(settings: dict[str, Any]) -> str:
-    """Stable hash of the redaction inputs that shape an exported bundle.
+    """Stable hash of the settings that shape an exported bundle.
 
     A finalized export is a point-in-time artifact, but it must only be reused
     while these inputs are unchanged. Editing the allowlist, custom redaction
-    strings/usernames, excluded projects, or blocked domains must force a
-    rebuild so a later seal/submit/download can never ship content redacted
-    under stale settings. `ai_pii` is intentionally excluded — it is gated
-    separately by ``_manifest_is_finalized_for_upload``.
+    strings/usernames, excluded projects, blocked domains, or confirmed source
+    scope must force a rebuild so a later seal/submit/download can never ship
+    content prepared under stale settings. `ai_pii` is intentionally excluded —
+    it is gated separately by ``_manifest_is_finalized_for_upload``.
 
     Order-independent: each list is normalized (handles str and dict entries)
     and sorted, so config/policy ordering differences do not change the hash.
@@ -1421,6 +1422,7 @@ def _redaction_settings_fingerprint(settings: dict[str, Any]) -> str:
         "excluded_projects": _norm(settings.get("excluded_projects")),
         "blocked_domains": _norm(settings.get("blocked_domains")),
         "allowlist_entries": _norm(settings.get("allowlist_entries")),
+        "source_filter": _norm(settings.get("source_filter")),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1483,8 +1485,8 @@ def _load_finalized_share_export(
         expected_fingerprint is not None
         and manifest.get("redaction_settings_fingerprint") != expected_fingerprint
     ):
-        # Redaction settings (allowlist / custom strings / excluded projects /
-        # blocked domains) changed since this export was sealed. Force a
+        # Settings (allowlist / custom strings / excluded projects / blocked
+        # domains / source scope) changed since this export was sealed. Force a
         # rebuild rather than reuse a stale-redacted artifact. Exports sealed
         # before this field existed have no fingerprint and so also rebuild once.
         return None
@@ -1505,6 +1507,14 @@ def _prepare_share_export_for_upload(
         if ai_pii_review_enabled is None
         else ai_pii_review_enabled
     )
+    session_ids = [s["session_id"] for s in share.get("sessions") or []]
+    source_blockers = source_scope_blockers(conn, session_ids, settings.get("source_filter"))
+    if source_blockers:
+        return None, {}, {
+            "error": "Share contains sessions outside the confirmed source scope",
+            "blockers": source_blockers,
+            "status": 409,
+        }
     settings_fingerprint = _redaction_settings_fingerprint(settings)
     if reuse_finalized:
         # Pass the RAW override (not effective_ai_pii) on purpose: a finalized
@@ -1563,6 +1573,7 @@ def upload_share_to_self_hosted_ingest(
     excluded_projects: list[str] | None = None,
     blocked_domains: list[str] | None = None,
     allowlist_entries: list[dict[str, Any]] | None = None,
+    source_filter: str | list[str] | tuple[str, ...] | None = None,
     ai_pii_review_enabled: bool = False,
 ) -> dict[str, Any]:
     """Upload a share to the legacy self-hosted ingest service.
@@ -1600,6 +1611,13 @@ def upload_share_to_self_hosted_ingest(
         return {
             "error": "Share contains sessions that are not released",
             "blockers": blockers,
+            "status": 409,
+        }
+    source_blockers = source_scope_blockers(conn, session_ids, source_filter)
+    if source_blockers:
+        return {
+            "error": "Share contains sessions outside the confirmed source scope",
+            "blockers": source_blockers,
             "status": 409,
         }
 
@@ -3225,6 +3243,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             stats = get_share_ready_stats(
                 conn,
                 excluded_projects=settings["excluded_projects"],
+                source_filter=settings.get("source_filter"),
                 include_unapproved=include_unapproved,
             )
             _json_response(self, stats)
@@ -3268,7 +3287,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "blockers": blockers,
                 }, 409)
                 return
-            share_id = create_share(conn, session_ids, note=note)
+            source_blockers = source_scope_blockers(conn, session_ids, settings.get("source_filter"))
+            if source_blockers:
+                _json_response(self, {
+                    "error": "Some selected sessions are outside the confirmed source scope.",
+                    "blockers": source_blockers,
+                }, 409)
+                return
+            share_id = create_share(
+                conn,
+                session_ids,
+                note=note,
+                source_filter=settings.get("source_filter"),
+            )
             share = get_share(conn, share_id)
             if share is None:
                 _json_response(self, {"error": "Share not found"}, 404)
@@ -3344,10 +3375,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         conn = open_index()
         try:
+            settings = get_effective_share_settings(conn, load_config())
+            source_blockers = source_scope_blockers(conn, session_ids, settings.get("source_filter"))
+            if source_blockers:
+                _json_response(self, {
+                    "error": "Some selected sessions are outside the confirmed source scope.",
+                    "blockers": source_blockers,
+                }, 409)
+                return
             share_id = create_share(
                 conn, session_ids,
                 attestation=body.get("attestation"),
                 note=body.get("note"),
+                source_filter=settings.get("source_filter"),
             )
             _json_response(self, {"share_id": share_id, "bundle_id": share_id}, 201)
         finally:
@@ -3464,6 +3504,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
 
             settings = get_effective_share_settings(conn, load_config())
+            source_blockers = source_scope_blockers(
+                conn,
+                [s["session_id"] for s in share.get("sessions") or []],
+                settings.get("source_filter"),
+            )
+            if source_blockers:
+                _json_response(self, {
+                    "error": "Share contains sessions outside the confirmed source scope",
+                    "blockers": source_blockers,
+                }, 409)
+                return
             export_dir, manifest = export_share_to_disk(
                 conn,
                 share_id,

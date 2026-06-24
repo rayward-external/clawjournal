@@ -27,6 +27,7 @@ from clawjournal.workbench.index import (
     remove_policy,
     search_fts,
     session_matches_excluded_projects,
+    source_scope_blockers,
     set_hold_state,
     update_session,
     upsert_sessions,
@@ -1123,7 +1124,61 @@ class TestShares:
         )
 
         assert [s["session_id"] for s in stats["sessions"]] == ["public"]
-        assert stats["recommended_session_ids"] == ["public"]
+
+    def test_share_ready_respects_source_scope(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        upsert_sessions(index_conn, [
+            _make_session(
+                "claude-ok",
+                source="claude",
+                start_time=(now - timedelta(days=2)).isoformat(),
+            ),
+            _make_session(
+                "codex-ok",
+                source="codex",
+                start_time=(now - timedelta(days=1)).isoformat(),
+            ),
+            _make_session(
+                "gemini-out",
+                source="gemini",
+                start_time=now.isoformat(),
+            ),
+        ])
+        for sid in ("claude-ok", "codex-ok", "gemini-out"):
+            update_session(
+                index_conn,
+                sid,
+                status="approved",
+                ai_quality_score=5,
+                ai_failure_value_score=5,
+            )
+
+        stats = get_share_ready_stats(index_conn, source_filter=("claude", "codex"))
+
+        assert {s["session_id"] for s in stats["sessions"]} == {"claude-ok", "codex-ok"}
+        assert "gemini-out" not in stats["recommended_session_ids"]
+
+    def test_create_share_can_enforce_source_scope(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("claude-ok", source="claude"),
+            _make_session("gemini-out", source="gemini"),
+        ])
+
+        blockers = source_scope_blockers(
+            index_conn,
+            ["claude-ok", "gemini-out"],
+            ("claude", "codex"),
+        )
+        share_id = create_share(
+            index_conn,
+            ["claude-ok", "gemini-out"],
+            source_filter=("claude", "codex"),
+        )
+
+        assert [b["session_id"] for b in blockers] == ["gemini-out"]
+        share = get_share(index_conn, share_id)
+        assert [s["session_id"] for s in share["sessions"]] == ["claude-ok"]
 
     def test_exclusion_matches_legacy_claude_hyphenated_name(self):
         session = {

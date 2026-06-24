@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 from ..redaction.secrets import redact_text
 from ..scoring.badges import compute_all_badges
-from ..config import CONFIG_DIR, load_config, normalize_excluded_project_names
+from ..config import CONFIG_DIR, load_config, normalize_excluded_project_names, source_scope_sources
 from ..paths import ensure_install_files
 from ..pricing import estimate_cost
 
@@ -1036,6 +1036,8 @@ def get_effective_share_settings(
         "excluded_projects": _dedupe_strings(excluded_projects),
         "blocked_domains": _dedupe_strings(blocked_domains),
         "ai_pii_review_enabled": bool(resolved.get("ai_pii_review_enabled", False)),
+        "source_scope": resolved.get("source"),
+        "source_filter": source_scope_sources(resolved.get("source")),
     }
 
 
@@ -3584,6 +3586,7 @@ def create_share(
     session_ids: list[str],
     attestation: str | None = None,
     note: str | None = None,
+    source_filter: str | list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Create a share linking the given sessions.
 
@@ -3596,9 +3599,20 @@ def create_share(
     found_ids: set[str] = set()
     if session_ids:
         placeholders = ", ".join("?" for _ in session_ids)
+        source_clause = ""
+        params: list[Any] = list(session_ids)
+        if source_filter is not None:
+            if isinstance(source_filter, (list, tuple)):
+                values = [s for s in source_filter if s]
+                if values:
+                    source_clause = f" AND source IN ({','.join('?' for _ in values)})"
+                    params.extend(values)
+            else:
+                source_clause = " AND source = ?"
+                params.append(source_filter)
         rows = conn.execute(
-            f"SELECT session_id FROM sessions WHERE session_id IN ({placeholders})",
-            session_ids,
+            f"SELECT session_id FROM sessions WHERE session_id IN ({placeholders}){source_clause}",
+            params,
         ).fetchall()
         found_ids = {row["session_id"] for row in rows}
 
@@ -3624,6 +3638,39 @@ def create_share(
     return share_id
 
 
+def source_scope_blockers(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+    source_filter: str | list[str] | tuple[str, ...] | None,
+) -> list[dict[str, Any]]:
+    """Return selected sessions outside the confirmed share source scope."""
+    if not session_ids or source_filter is None:
+        return []
+    placeholders = ", ".join("?" for _ in session_ids)
+    params: list[Any] = list(session_ids)
+    if isinstance(source_filter, (list, tuple)):
+        values = [s for s in source_filter if s]
+        if not values:
+            return []
+        source_clause = f"source NOT IN ({','.join('?' for _ in values)})"
+        params.extend(values)
+        allowed = ", ".join(values)
+    else:
+        source_clause = "source != ?"
+        params.append(source_filter)
+        allowed = str(source_filter)
+    rows = conn.execute(
+        "SELECT session_id, project, source, display_title "
+        f"FROM sessions WHERE session_id IN ({placeholders}) AND {source_clause} "
+        "ORDER BY source, project, session_id",
+        params,
+    ).fetchall()
+    blockers = [dict(row) for row in rows]
+    for blocker in blockers:
+        blocker["allowed_sources"] = allowed
+    return blockers
+
+
 def get_shares(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """List all shares ordered by creation time (newest first)."""
     rows = conn.execute(
@@ -3636,6 +3683,7 @@ def get_share_ready_stats(
     conn: sqlite3.Connection,
     *,
     excluded_projects: list[str] | None = None,
+    source_filter: str | list[str] | tuple[str, ...] | None = None,
     include_unapproved: bool = False,
 ) -> dict[str, Any]:
     """Return sessions that have not been shared before.
@@ -3646,7 +3694,21 @@ def get_share_ready_stats(
     ranked by failure value first so the share wizard starts with the best
     failure examples.
     """
-    where_status = "" if include_unapproved else " WHERE review_status = 'approved'"
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    if not include_unapproved:
+        where_clauses.append("review_status = 'approved'")
+    if source_filter is not None:
+        if isinstance(source_filter, (list, tuple)):
+            values = [s for s in source_filter if s]
+            if values:
+                where_clauses.append(f"source IN ({','.join('?' for _ in values)})")
+                params.extend(values)
+        else:
+            where_clauses.append("source = ?")
+            params.append(source_filter)
+    where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    and_sql = " AND" if where_clauses else " WHERE"
     rows = conn.execute(
         "SELECT session_id, project, model, source, display_title,"
         " ai_quality_score, ai_failure_value_score, ai_recovery_labels,"
@@ -3655,8 +3717,8 @@ def get_share_ready_stats(
         f" input_tokens, output_tokens, ({_OUTCOME_NORMALIZE_SQL}) as outcome_badge, client_origin,"
         " runtime_channel, start_time, review_status, hold_state, embargo_until"
         " FROM sessions"
-        f"{where_status}"
-        f"{' AND' if where_status else ' WHERE'} session_id NOT IN ("
+        f"{where_sql}"
+        f"{and_sql} session_id NOT IN ("
         "   SELECT DISTINCT session_id FROM ("
         "     SELECT s.session_id AS session_id"
         "     FROM sessions s"
@@ -3671,7 +3733,8 @@ def get_share_ready_stats(
         " )"
         " ORDER BY (ai_failure_value_score IS NULL),"
         " ai_failure_value_score DESC, start_time DESC,"
-        " (review_status = 'approved') DESC, ai_quality_score DESC"
+        " (review_status = 'approved') DESC, ai_quality_score DESC",
+        params,
     ).fetchall()
     cols = ["session_id", "project", "model", "source", "display_title",
             "ai_quality_score", "ai_failure_value_score", "ai_recovery_labels",
