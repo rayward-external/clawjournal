@@ -95,11 +95,14 @@ The hook installer writes only user-level agent config and ClawJournal state:
 | `~/.clawjournal/hooks/openrefinery-failures.json` | Local profile state, daily prompt cap, prompt counts, snooze status |
 | `~/.clawjournal/config.json` | Existing ClawJournal config; enrollment sets `source` to `both` |
 
-The hook command installed into both agents is:
+The POSIX hook command installed into both agents is:
 
 ```bash
 <python> -m clawjournal.cli hooks run openrefinery-failures --client <claude|codex>
 ```
+
+The Codex hook entry also includes a Windows-specific `commandWindows` value
+with native Windows command-line quoting for the same argv.
 
 Using the current Python executable keeps the hook tied to the installed
 ClawJournal environment rather than relying on whatever `clawjournal` binary

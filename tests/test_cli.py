@@ -429,6 +429,168 @@ class TestConfigure:
         assert "scoring_warmup_declined" not in load_config()
 
 
+class TestOpenRefineryCliDispatch:
+    def _skip_auto_update(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.cli._should_auto_update", lambda argv=None: False)
+
+    def test_enroll_openrefinery_dispatches_to_hook_installer(self, monkeypatch, capsys):
+        from clawjournal import openrefinery_hooks
+
+        self._skip_auto_update(monkeypatch)
+        seen = {}
+
+        def fake_enroll_openrefinery(**kwargs):
+            seen.update(kwargs)
+            return {
+                "profile": "openrefinery-failures",
+                "update": {"status": "skipped"},
+                "install": {
+                    "installed": [{"agent": "codex"}],
+                    "state_path": "/tmp/state.json",
+                    "projects_confirmed": False,
+                },
+                "next": {
+                    "review": "clawjournal hooks launch openrefinery-failures",
+                    "project_confirmation": "confirm projects",
+                },
+            }
+
+        monkeypatch.setattr(openrefinery_hooks, "enroll_openrefinery", fake_enroll_openrefinery)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "clawjournal",
+                "enroll",
+                "openrefinery",
+                "--agent",
+                "codex",
+                "--ui",
+                "cli",
+                "--skip-selfupdate",
+                "--json",
+            ],
+        )
+
+        main()
+
+        assert seen == {"agent": "codex", "ui": "cli", "skip_selfupdate": True}
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["profile"] == "openrefinery-failures"
+
+    @pytest.mark.parametrize(
+        ("argv_tail", "function_name", "result", "expected_kwargs"),
+        [
+            (
+                ["install", "openrefinery-failures", "--agent", "claude", "--ui", "web"],
+                "install_profile",
+                {"installed": [], "state_path": "/tmp/state.json"},
+                {"profile": "openrefinery-failures", "agent": "claude", "ui": "web"},
+            ),
+            (
+                ["status", "openrefinery-failures"],
+                "status",
+                {"enabled": True},
+                {"profile": "openrefinery-failures"},
+            ),
+            (
+                ["disable", "openrefinery-failures"],
+                "disable_profile",
+                {"enabled": False},
+                {"profile": "openrefinery-failures"},
+            ),
+            (
+                ["uninstall", "openrefinery-failures", "--agent", "codex"],
+                "uninstall_profile",
+                {"removed": [{"agent": "codex"}]},
+                {"profile": "openrefinery-failures", "agent": "codex"},
+            ),
+            (
+                ["snooze", "openrefinery-failures", "--days", "7"],
+                "snooze_profile",
+                {"snooze_until": "2026-07-01"},
+                {"profile": "openrefinery-failures", "days": 7},
+            ),
+            (
+                ["launch", "openrefinery-failures", "--ui", "cli", "--port", "9999", "--no-browser"],
+                "launch_share_flow",
+                {"mode": "cli", "message": "Run share"},
+                {"profile": "openrefinery-failures", "ui": "cli", "open_browser": False, "port": 9999},
+            ),
+        ],
+    )
+    def test_hooks_subcommands_dispatch_json(
+        self,
+        monkeypatch,
+        capsys,
+        argv_tail,
+        function_name,
+        result,
+        expected_kwargs,
+    ):
+        from clawjournal import openrefinery_hooks
+
+        self._skip_auto_update(monkeypatch)
+        seen = {}
+
+        def fake_command(**kwargs):
+            seen.update(kwargs)
+            return result
+
+        monkeypatch.setattr(openrefinery_hooks, function_name, fake_command)
+        monkeypatch.setattr(sys, "argv", ["clawjournal", "hooks", *argv_tail, "--json"])
+
+        main()
+
+        assert seen == expected_kwargs
+        assert json.loads(capsys.readouterr().out) == result
+
+    def test_hooks_run_dispatches_and_renders(self, monkeypatch, capsys):
+        from clawjournal import openrefinery_hooks
+
+        self._skip_auto_update(monkeypatch)
+        seen = {}
+
+        def fake_run_hook(**kwargs):
+            seen.update(kwargs)
+            return openrefinery_hooks.HookRunResult(True, "dry-run", "message")
+
+        def fake_render_hook_response(result, *, client, output_json):
+            assert result.reason == "dry-run"
+            assert client == "codex"
+            assert output_json is True
+            return '{"rendered": true}'
+
+        monkeypatch.setattr(openrefinery_hooks, "run_hook", fake_run_hook)
+        monkeypatch.setattr(openrefinery_hooks, "render_hook_response", fake_render_hook_response)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "clawjournal",
+                "hooks",
+                "run",
+                "openrefinery-failures",
+                "--client",
+                "codex",
+                "--force",
+                "--dry-run",
+                "--json",
+            ],
+        )
+
+        main()
+
+        assert seen == {
+            "profile": "openrefinery-failures",
+            "client": "codex",
+            "force": True,
+            "dry_run": True,
+            "stop_hook_active": False,
+        }
+        assert json.loads(capsys.readouterr().out) == {"rendered": True}
+
+
 # --- list_projects ---
 
 

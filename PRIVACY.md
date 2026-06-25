@@ -8,6 +8,7 @@ ClawJournal is designed to be usable without uploading anything.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
 - `bundle-export` writes files to disk. It does not contact a server.
 - If you never use the workbench Submit step, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
+- If you are explicitly enrolled in OpenRefinery Agent Failure Sharing, the optional agent hook only shows a local reminder and can open the existing Share workflow. The hook does not read transcripts, package bundles, or upload data by itself.
 
 ## Automatic redaction
 

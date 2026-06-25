@@ -52,6 +52,7 @@ DEFAULT_CONFIG: ClawJournalConfig = {
 
 
 _KNOWN_PREFIXES = ("claude:", "codex:", "gemini:", "opencode:", "openclaw:", "kimi:", "cline:", "custom:")
+_BOTH_SOURCES = ("claude", "codex")
 
 
 def load_config() -> ClawJournalConfig:
@@ -80,6 +81,21 @@ def set_source_scope(config: ClawJournalConfig, source: str) -> None:
     if config.get("source") != source:
         config["projects_confirmed"] = False
     config["source"] = source
+
+
+def source_scope_sources(source: str | None) -> tuple[str, ...] | None:
+    """Return allowed session sources for a confirmed source scope.
+
+    ``None`` means unrestricted/all sources. Legacy ``both`` means the
+    original Claude+Codex pair, while ``all`` intentionally means every
+    supported indexed source.
+    """
+    normalized = (source or "").strip().lower()
+    if normalized in ("", "auto", "all"):
+        return None
+    if normalized == "both":
+        return _BOTH_SOURCES
+    return (normalized,)
 
 
 def _normalize_excluded_project_name(name: str) -> str:

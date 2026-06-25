@@ -1386,24 +1386,45 @@ def _resolve_share_id(conn, prefix: str) -> str | None:
 
 def _run_bundle_create(args) -> None:
     """Create a bundle from session IDs or by review status."""
-    from .workbench.index import create_share, open_index, query_sessions
+    from .workbench.index import (
+        create_share,
+        get_effective_share_settings,
+        open_index,
+        query_sessions,
+        source_scope_blockers,
+    )
 
     conn = open_index()
     try:
+        settings = get_effective_share_settings(conn, load_config())
         session_ids = list(args.session_ids) if args.session_ids else []
 
         if args.status and not session_ids:
-            sessions = query_sessions(conn, status=args.status, limit=10000)
+            sessions = query_sessions(
+                conn,
+                status=args.status,
+                source=settings.get("source_filter"),
+                limit=10000,
+            )
             session_ids = [s["session_id"] for s in sessions]
 
         if not session_ids:
             print("No sessions to bundle. Provide session IDs or use --status approved.")
+            sys.exit(1)
+        source_blockers = source_scope_blockers(
+            conn,
+            session_ids,
+            settings.get("source_filter"),
+        )
+        if source_blockers:
+            print("Some selected sessions are outside the confirmed source scope.")
             sys.exit(1)
 
         share_id = create_share(
             conn, session_ids,
             attestation=args.attestation,
             note=args.note,
+            source_filter=settings.get("source_filter"),
         )
         # Get actual count from DB (create_share only links IDs that exist)
         from .workbench.index import get_share
@@ -1542,6 +1563,7 @@ def _run_bundle_export(args) -> None:
         get_effective_share_settings,
         get_share,
         open_index,
+        source_scope_blockers,
     )
 
     config = load_config()
@@ -1567,6 +1589,14 @@ def _run_bundle_export(args) -> None:
         share = get_share(conn, share_id)
         if share is None:
             print(f"Bundle not found: {share_id}")
+            sys.exit(1)
+        source_blockers = source_scope_blockers(
+            conn,
+            [s["session_id"] for s in share.get("sessions") or []],
+            settings.get("source_filter"),
+        )
+        if source_blockers:
+            print("Bundle contains sessions outside the confirmed source scope.")
             sys.exit(1)
 
         export_dir, manifest = export_share_to_disk(
@@ -1867,6 +1897,7 @@ def _run_bundle_share(args) -> None:
             excluded_projects=settings["excluded_projects"],
             blocked_domains=settings["blocked_domains"],
             allowlist_entries=settings["allowlist_entries"],
+            source_filter=settings.get("source_filter"),
             ai_pii_review_enabled=getattr(args, "ai_pii_review", False) is True,
         )
         if result.get("ok"):
@@ -1902,6 +1933,7 @@ def _run_share(args) -> None:
         open_index,
         query_sessions,
         session_matches_excluded_projects,
+        source_scope_blockers,
     )
 
     config = load_config()
@@ -1913,7 +1945,12 @@ def _run_share(args) -> None:
 
         # Query once, reuse for both ID collection and preview
         if args.status and not session_ids:
-            session_rows = query_sessions(conn, status=args.status, limit=10000)
+            session_rows = query_sessions(
+                conn,
+                status=args.status,
+                source=settings.get("source_filter"),
+                limit=10000,
+            )
             session_ids = [s["session_id"] for s in session_rows]
         elif session_ids:
             placeholders = ", ".join("?" for _ in session_ids)
@@ -1929,6 +1966,14 @@ def _run_share(args) -> None:
             session for session in session_rows
             if not session_matches_excluded_projects(session, settings["excluded_projects"])
         ]
+        source_blockers = source_scope_blockers(
+            conn,
+            [s["session_id"] for s in session_rows],
+            settings.get("source_filter"),
+        )
+        if source_blockers:
+            print("Some selected sessions are outside the confirmed source scope.")
+            sys.exit(1)
 
         if not session_ids or not session_rows:
             print("No sessions to share. Provide session IDs or use --status approved.")
@@ -1950,7 +1995,12 @@ def _run_share(args) -> None:
         from .workbench.daemon import _prepare_share_export_for_upload
 
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        share_id = create_share(conn, session_ids, note=args.note)
+        share_id = create_share(
+            conn,
+            session_ids,
+            note=args.note,
+            source_filter=settings.get("source_filter"),
+        )
         share = get_share(conn, share_id)
         if share is None:
             print("Share failed: newly created share could not be loaded.")
