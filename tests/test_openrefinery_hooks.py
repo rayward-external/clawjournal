@@ -169,6 +169,20 @@ def test_hook_handler_includes_windows_command_override(monkeypatch):
     assert " --client codex" in handler["commandWindows"]
 
 
+def test_claude_hook_handler_omits_codex_windows_override(monkeypatch):
+    monkeypatch.setattr(
+        hooks.sys,
+        "executable",
+        r"C:\Program Files\Python313\python.exe",
+    )
+
+    handler = hooks._handler_for("claude")
+
+    assert "commandWindows" not in handler
+    assert handler["command"].startswith("'C:\\Program Files\\Python313\\python.exe'")
+    assert " --client claude" in handler["command"]
+
+
 def test_daily_hook_prompts_until_daily_limit(isolated_hook_env, monkeypatch):
     hooks.install_profile(agent="codex", ui="cli", home=isolated_hook_env / "home")
     now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)

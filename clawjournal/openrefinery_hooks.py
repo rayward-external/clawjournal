@@ -203,13 +203,15 @@ def _hook_command_windows(client: AgentName) -> str:
 
 
 def _handler_for(client: AgentName) -> dict[str, Any]:
-    return {
+    handler = {
         "type": "command",
         "command": _hook_command(client),
-        "commandWindows": _hook_command_windows(client),
         "timeout": 30,
         "statusMessage": "Checking OpenRefinery failure-sharing reminder",
     }
+    if client == "codex":
+        handler["commandWindows"] = _hook_command_windows(client)
+    return handler
 
 
 def _handler_is_ours(handler: Any) -> bool:

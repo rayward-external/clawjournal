@@ -101,8 +101,8 @@ The POSIX hook command installed into both agents is:
 <python> -m clawjournal.cli hooks run openrefinery-failures --client <claude|codex>
 ```
 
-The hook entry also includes a Windows-specific `commandWindows` value with
-native Windows command-line quoting for the same argv.
+The Codex hook entry also includes a Windows-specific `commandWindows` value
+with native Windows command-line quoting for the same argv.
 
 Using the current Python executable keeps the hook tied to the installed
 ClawJournal environment rather than relying on whatever `clawjournal` binary
