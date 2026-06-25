@@ -122,7 +122,7 @@ def _extract_project_path_from_sessions(project_hash: str) -> str | None:
         return None
     for session_file in sorted(chats_dir.glob("session-*.json"), reverse=True):
         try:
-            data = json.loads(session_file.read_text())
+            data = json.loads(session_file.read_text(encoding="utf-8", errors="replace"))
         except (json.JSONDecodeError, OSError):
             continue
         for msg in data.get("messages", []):
@@ -164,7 +164,7 @@ def _resolve_gemini_hash(project_hash: str) -> str:
 
 def _iter_jsonl(filepath: Path):
     """Yield parsed JSON objects from a JSONL file, skipping blank/malformed lines."""
-    with open(filepath) as f:
+    with open(filepath, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -218,7 +218,7 @@ def _scan_workspace_dir(workspace_dir: Path, groups: dict[str, list[dict]]) -> N
             continue
 
         try:
-            wrapper = json.loads(entry.read_text())
+            wrapper = json.loads(entry.read_text(encoding="utf-8", errors="replace"))
         except (json.JSONDecodeError, OSError):
             continue
         if not isinstance(wrapper, dict):
@@ -558,7 +558,7 @@ def _load_kimi_work_dirs() -> dict[str, str]:
     if not KIMI_CONFIG_PATH.exists():
         return {}
     try:
-        data = json.loads(KIMI_CONFIG_PATH.read_text())
+        data = json.loads(KIMI_CONFIG_PATH.read_text(encoding="utf-8", errors="replace"))
         work_dirs = data.get("work_dirs", [])
         return {
             entry.get("path", ""): entry.get("path", "")
@@ -645,7 +645,11 @@ def _discover_custom_projects() -> list[dict]:
         for f in jsonl_files:
             total_size += f.stat().st_size
             try:
-                session_count += sum(1 for line in f.open() if line.strip())
+                session_count += sum(
+                    1
+                    for line in f.open(encoding="utf-8", errors="replace")
+                    if line.strip()
+                )
             except OSError:
                 pass
         if session_count == 0:
@@ -674,7 +678,10 @@ def _parse_custom_sessions(
     sessions = []
     for jsonl_file in sorted(project_path.glob("*.jsonl")):
         try:
-            for line_num, line in enumerate(jsonl_file.open(), 1):
+            for line_num, line in enumerate(
+                jsonl_file.open(encoding="utf-8", errors="replace"),
+                1,
+            ):
                 line = line.strip()
                 if not line:
                     continue
@@ -1324,7 +1331,7 @@ def _parse_gemini_session_file(
     filepath: Path, anonymizer: Anonymizer, include_thinking: bool = True
 ) -> dict | None:
     try:
-        with open(filepath) as f:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -2391,7 +2398,7 @@ def _build_openclaw_project_index() -> dict[str, list[Path]]:
 def _extract_openclaw_cwd(session_file: Path) -> str | None:
     """Read the first line (session header) of an OpenClaw JSONL file to extract cwd."""
     try:
-        with open(session_file) as f:
+        with open(session_file, encoding="utf-8", errors="replace") as f:
             first_line = f.readline().strip()
             if not first_line:
                 return None
@@ -2972,7 +2979,7 @@ def _discover_aider_projects() -> list[dict]:
             continue
         # Estimate session count from markdown headers
         try:
-            content = history_file.read_text(errors="replace")
+            content = history_file.read_text(encoding="utf-8", errors="replace")
             session_count = max(
                 1,
                 len(re.findall(r"^# aider chat started at .+$", content, flags=re.MULTILINE)),
@@ -3005,7 +3012,7 @@ def _parse_aider_history_file(
     are plain text.
     """
     try:
-        content = filepath.read_text(errors="replace")
+        content = filepath.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
 

@@ -16,6 +16,7 @@ from clawjournal.parsing.parser import (
     _extract_model_effort,
     _extract_user_content,
     _find_subagent_only_sessions,
+    _iter_jsonl,
     _normalize_timestamp,
     _parse_session_file,
     _parse_subagent_session,
@@ -28,6 +29,27 @@ from clawjournal.parsing.parser import (
     _parse_codex_session_file,
     _parse_openclaw_session_file,
 )
+
+
+def test_iter_jsonl_reads_utf8_explicitly(tmp_path, monkeypatch):
+    path = tmp_path / "session.jsonl"
+    payload = {"message": "research note with Cyrillic: с"}
+    path.write_bytes((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    import builtins
+
+    real_open = builtins.open
+    seen_encodings = []
+
+    def open_spy(file, *args, **kwargs):
+        if file == path:
+            seen_encodings.append(kwargs.get("encoding"))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", open_spy)
+
+    assert list(_iter_jsonl(path)) == [payload]
+    assert seen_encodings == ["utf-8"]
 
 
 class TestExtractModelEffort:
