@@ -1,0 +1,56 @@
+"""Candidate selection: failures (avoid) + successes/recoveries (do)."""
+
+from datetime import datetime, timezone
+
+from clawjournal.skill.select import select_skill_candidates
+
+NOW = datetime(2026, 5, 31, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_splits_avoid_and_do(index_conn, ins):
+    ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]',
+        learning="declared done before running tests")
+    ins(index_conn, "win", outcome="resolved", quality=5,
+        learning="wrote a failing repro first, then fixed")
+    ins(index_conn, "recovered", modes='["execution_error"]', recovery='["self_recovered"]',
+        learning="re-read the traceback and reproduced before editing")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert {c.session_id for c in corpus.failures} == {"fail"}
+    assert {c.session_id for c in corpus.successes} == {"win", "recovered"}
+
+
+def test_drops_unevidenced_failures(index_conn, ins):
+    ins(index_conn, "bare", fvs=4)                      # no learning/reason/modes -> dropped
+    ins(index_conn, "evidenced", fvs=4, reason="agent fabricated output")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert {c.session_id for c in corpus.failures} == {"evidenced"}
+
+
+def test_mode_recurrence_counts_all(index_conn, ins):
+    for i in range(3):
+        ins(index_conn, f"v{i}", fvs=4, modes='["verification_skipped"]', learning="x")
+    ins(index_conn, "other", fvs=4, modes='["reasoning_fabrication"]', learning="y")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert corpus.mode_recurrence["verification_skipped"] == 3
+    assert corpus.mode_recurrence["reasoning_fabrication"] == 1
+
+
+def test_excludes_bad_recovery_from_do(index_conn, ins):
+    ins(index_conn, "blocked", modes='["execution_error"]', recovery='["blocked"]', learning="z")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert not corpus.successes
+
+
+def test_hold_state_gate_excludes_pending(index_conn, ins):
+    ins(index_conn, "ok", fvs=5, learning="a", hold_state="auto_redacted")
+    ins(index_conn, "pending", fvs=5, learning="b", hold_state="pending_review")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert {c.session_id for c in corpus.failures} == {"ok"}
+
+
+def test_window_and_source_scope(index_conn, ins):
+    ins(index_conn, "recent", fvs=4, learning="x", start_time="2026-05-28T00:00:00+00:00")
+    ins(index_conn, "old", fvs=4, learning="x", start_time="2026-05-01T00:00:00+00:00")
+    ins(index_conn, "gem", fvs=4, learning="x", source="gemini")
+    corpus = select_skill_candidates(index_conn, now=NOW, window_days=7)
+    assert {c.session_id for c in corpus.failures} == {"recent"}  # old out-of-window, gemini out-of-scope

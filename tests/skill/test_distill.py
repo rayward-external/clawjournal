@@ -1,0 +1,53 @@
+"""Distill: one call through the seam, scrub-before-LLM, parse + cap + support."""
+
+from clawjournal.skill.distill import build_prompt, distill_skills
+from clawjournal.skill.select import SkillCandidate, SkillCorpus
+from clawjournal.redaction.anonymizer import Anonymizer
+
+
+def _corpus():
+    return SkillCorpus(
+        window_start="2026-05-24", window_end="2026-05-31",
+        failures=[SkillCandidate("s1", "proj", "codex", "avoid",
+                                 failure_modes=["verification_skipped"], learning_summary="declared done early")],
+        successes=[SkillCandidate("s2", "proj", "codex", "do", learning_summary="repro first")],
+        mode_recurrence={"verification_skipped": 4},
+        total_failures=1, total_successes=1,
+    )
+
+
+class FakeCaller:
+    def __init__(self, payload):
+        self.payload, self.calls = payload, []
+
+    def __call__(self, *, system_prompt, task_prompt):
+        self.calls.append((system_prompt, task_prompt))
+        return self.payload
+
+
+def test_single_call_and_parse():
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "before done", "guidance": "run tests first",
+         "why": "premature", "taxonomy": "verification_skipped"},
+        {"kind": "do", "trigger": "unfamiliar API", "guidance": "read source first", "why": "worked"},
+    ]})
+    rules = distill_skills(_corpus(), caller=fake)
+    assert len(fake.calls) == 1                       # Mode A == one distill call
+    assert [r.kind for r in rules] == ["avoid", "do"]
+    assert rules[0].support == 4                      # backfilled from recurrence
+
+
+def test_empty_corpus_no_call():
+    fake = FakeCaller({"rules": []})
+    empty = SkillCorpus(window_start="a", window_end="b")
+    assert distill_skills(empty, caller=fake) == []
+    assert fake.calls == []
+
+
+def test_prompt_is_scrubbed_before_llm():
+    # a candidate carrying a secret in its substrate must not reach the prompt raw
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         failures=[SkillCandidate("s1", "proj", "codex", "avoid",
+                                   learning_summary="leaked AKIAIOSFODNN7EXAMPLE in a config")])
+    prompt = build_prompt(corpus, Anonymizer())
+    assert "AKIAIOSFODNN7EXAMPLE" not in prompt

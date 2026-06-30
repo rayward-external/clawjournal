@@ -4197,6 +4197,19 @@ def main() -> None:
     bench_p.add_argument("--output", help="Output file path for --export")
     bench_p.add_argument("--json", action="store_true", help="Machine-readable output for --list")
 
+    # Self-improving skills (Mode A — fully local)
+    skill_p = sub.add_parser(
+        "skill", help="Distill + install a personal 'clawjournal-lessons' skill from your scored sessions")
+    skill_p.add_argument("--window-days", type=int, default=7,
+                         help="Scoring/selection window in days (default 7)")
+    skill_p.add_argument("--all", action="store_true", help="Use all history (recommended for the first run)")
+    skill_p.add_argument("--backend", default="auto", help="Distill backend (auto|claude|codex|...)")
+    skill_p.add_argument("--model", help="Optional model override (defaults to the backend's fast model)")
+    skill_p.add_argument("--target", action="append", choices=["claude", "codex"],
+                         help="Install target(s); repeatable (default: both claude + codex)")
+    skill_p.add_argument("--preview", action="store_true", help="Show the distilled skills but do not install")
+    skill_p.add_argument("--yes", action="store_true", help="Install without the confirmation prompt")
+
     # Findings review
     fnd_p = sub.add_parser("findings", help="List or decide findings for a session")
     fnd_p.add_argument("session_id")
@@ -4565,6 +4578,11 @@ def main() -> None:
     if command == "benchmark":
         from .cli_benchmark import run_benchmark
         run_benchmark(args)
+        return
+
+    if command == "skill":
+        from .cli_skill import run_skill
+        run_skill(args)
         return
 
     if command == "findings":

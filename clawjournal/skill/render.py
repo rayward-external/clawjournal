@@ -1,0 +1,117 @@
+"""Render <=5 SkillRules into the agent surfaces + the deterministic gate.
+
+Two render targets share one body:
+  - Claude Code: a full Agent Skill ``SKILL.md`` (name + description frontmatter).
+  - Codex: a markdown managed-region (no frontmatter) for ``AGENTS.md``.
+
+The gate has two deterministic layers (human review is the binding control on top):
+  - ``gate_rules`` drops any rule whose text trips the external/exec hard-deny;
+  - ``gate_rendered`` scans the final text for secrets/PII (and TruffleHog when
+    available) and reports findings so the caller blocks the write.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..redaction import pii, secrets, trufflehog
+from .schema import SkillRule, find_external_tokens
+
+SKILL_NAME = "clawjournal-lessons"
+SKILL_DESCRIPTION = (
+    "Personal coding lessons distilled from YOUR OWN past agent sessions. Load "
+    "before planning or executing a coding task to avoid recurring mistakes and "
+    "repeat what worked. Triggers on coding, debugging, refactoring, or "
+    "verification tasks."
+)
+
+
+def gate_rules(rules: list[SkillRule]) -> tuple[list[SkillRule], list[tuple[SkillRule, list[str]]]]:
+    """Split rules into (kept, blocked-with-reasons) via the hard-deny."""
+    kept: list[SkillRule] = []
+    blocked: list[tuple[SkillRule, list[str]]] = []
+    for r in rules:
+        reasons = find_external_tokens(r)
+        (blocked.append((r, reasons)) if reasons else kept.append(r))
+    return kept, blocked
+
+
+def gate_rendered(text: str) -> list[str]:
+    """Return deterministic secret/PII/TruffleHog findings in *text* (empty = clean)."""
+    issues: list[str] = []
+    try:
+        n = len(secrets.scan_text(text))
+        if n:
+            issues.append(f"secrets: {n} match(es)")
+    except Exception:  # pragma: no cover - defensive
+        pass
+    try:
+        n = len(pii.scan_text_for_pii(text))
+        if n:
+            issues.append(f"pii: {n} match(es)")
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        if not trufflehog.is_bypassed() and trufflehog.is_available():
+            report = trufflehog.scan_text(text)
+            findings = getattr(report, "findings", None) or []
+            if findings:
+                issues.append(f"trufflehog: {len(findings)} finding(s)")
+    except Exception:  # pragma: no cover
+        pass
+    return issues
+
+
+def _render_body(rules: list[SkillRule], meta: dict[str, Any]) -> str:
+    avoid = [r for r in rules if r.kind == "avoid"]
+    do = [r for r in rules if r.kind == "do"]
+    out: list[str] = [
+        "# Your coding lessons",
+        "",
+        "> Distilled by ClawJournal from your own scored sessions. Local-only; "
+        "regenerated as you keep working. Each is grounded in real sessions of yours.",
+        "",
+    ]
+
+    def block(r: SkillRule) -> list[str]:
+        lines = [f"### {r.guidance}"]
+        if r.trigger:
+            lines.append(f"- **When:** {r.trigger}")
+        if r.why:
+            lines.append(f"- **Why:** {r.why}")
+        tags = []
+        if r.taxonomy:
+            tags.append(r.taxonomy)
+        if r.support:
+            tags.append(f"seen ~{r.support}×")
+        if r.evidence_session_ids:
+            tags.append("e.g. " + ", ".join(r.evidence_session_ids[:3]))
+        if tags:
+            lines.append(f"- _{' · '.join(tags)}_")
+        return lines
+
+    if avoid:
+        out.append("## Avoid (recurring failures)")
+        out.append("")
+        for r in avoid:
+            out += block(r) + [""]
+    if do:
+        out.append("## Do (what worked)")
+        out.append("")
+        for r in do:
+            out += block(r) + [""]
+
+    prov = "; ".join(f"{k}={v}" for k, v in meta.items())
+    out.append(f"<!-- clawjournal-lessons: {prov} -->")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def render_skill_md(rules: list[SkillRule], meta: dict[str, Any]) -> str:
+    """Full Claude Agent Skill SKILL.md (frontmatter + body)."""
+    body = _render_body(rules, meta)
+    return f"---\nname: {SKILL_NAME}\ndescription: {SKILL_DESCRIPTION}\n---\n\n{body}"
+
+
+def render_agents_region(rules: list[SkillRule], meta: dict[str, Any]) -> str:
+    """Body markdown for the Codex AGENTS.md managed region (no frontmatter)."""
+    return _render_body(rules, meta)
