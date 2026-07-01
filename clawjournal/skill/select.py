@@ -60,6 +60,13 @@ class SkillCorpus:
     mode_recurrence: dict[str, int] = field(default_factory=dict)
     total_failures: int = 0
     total_successes: int = 0
+    eligible_scored: int = 0   # scored sessions in the window (rate denominator)
+
+    def mode_rates(self) -> dict[str, float]:
+        """Per-failure-mode incidence rate over eligible scored sessions."""
+        if self.eligible_scored <= 0:
+            return {}
+        return {m: n / self.eligible_scored for m, n in self.mode_recurrence.items()}
 
     @property
     def candidates(self) -> list[SkillCandidate]:
@@ -167,9 +174,16 @@ def select_skill_candidates(
             failures = [c for c in failures if c.session_id not in blocked]
             successes = [c for c in successes if c.session_id not in blocked]
 
+    eligible_scored = conn.execute(
+        f"SELECT COUNT(*) FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
+        f"{src_clause} AND (ai_failure_value_score IS NOT NULL OR ai_quality_score IS NOT NULL)",
+        [window_start, *src],
+    ).fetchone()[0]
+
     return SkillCorpus(
         window_start=window_start, window_end=window_end,
         failures=failures[:pool_cap], successes=successes[:pool_cap],
         mode_recurrence=dict(mode_counter.most_common()),
         total_failures=len(failures), total_successes=len(successes),
+        eligible_scored=int(eligible_scored or 0),
     )

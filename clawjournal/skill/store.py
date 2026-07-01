@@ -128,6 +128,40 @@ def mark_installed(conn: sqlite3.Connection, rules: list[SkillRule], *, now: str
     conn.commit()
 
 
+def _ensure_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS skill_mode_snapshots ("
+        "recorded_at TEXT, n INTEGER, rates_json TEXT)"
+    )
+    conn.commit()
+
+
+def save_mode_snapshot(conn: sqlite3.Connection, rates: dict[str, float], n: int,
+                       *, now: str | None = None) -> None:
+    """Record the window's per-mode incidence rates (for the week-over-week signal)."""
+    _ensure_snapshots(conn)
+    conn.execute(
+        "INSERT INTO skill_mode_snapshots (recorded_at, n, rates_json) VALUES (?,?,?)",
+        (now or now_iso(), int(n), json.dumps(rates)),
+    )
+    conn.commit()
+
+
+def last_mode_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, float]] | None:
+    """Return the most recent (recorded_at, n, rates) snapshot, or None."""
+    _ensure_snapshots(conn)
+    row = conn.execute(
+        "SELECT recorded_at, n, rates_json FROM skill_mode_snapshots ORDER BY recorded_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        rates = {str(k): float(v) for k, v in json.loads(row[2] or "{}").items()}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        rates = {}
+    return (row[0], int(row[1] or 0), rates)
+
+
 def reject(conn: sqlite3.Connection, fp: str, *, now: str | None = None) -> bool:
     ensure_table(conn)
     ts = now or now_iso()

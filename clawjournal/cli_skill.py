@@ -38,6 +38,8 @@ class SkillResult:
     meta: dict[str, Any]
     added_fps: set[str] = field(default_factory=set)
     dropped: list[SkillRule] = field(default_factory=list)
+    # week-over-week: {failure_mode: (prev_rate_or_None, current_rate)} for targeted modes
+    trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
 
 
 def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str]) -> list[SkillRule]:
@@ -94,7 +96,16 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
         region = _render.render_agents_region(rules, meta)
         gate_issues = _render.gate_rendered(skill_md)
 
-    return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta, added_fps, dropped)
+    # week-over-week recurrence signal (§9/D9): current vs last snapshot, for the
+    # failure modes the current "avoid" rules target. Directional, not powered.
+    cur_rates = corpus.mode_rates()
+    last = _store.last_mode_snapshot(conn)
+    prev_rates = last[2] if last else {}
+    targeted = {r.taxonomy for r in rules if r.kind == "avoid" and r.taxonomy}
+    trend = {m: (prev_rates.get(m), cur_rates.get(m, 0.0)) for m in sorted(targeted)}
+
+    return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta,
+                       added_fps, dropped, trend)
 
 
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
@@ -158,6 +169,18 @@ def _print_preview(res: SkillResult) -> None:
         print(f"\n  Dropping {len(res.dropped)} previously-installed rule(s) outranked this run:")
         for r in res.dropped:
             print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
+    if res.trend:
+        n = res.corpus.eligible_scored
+        print(f"\n  Recurrence of targeted failure modes (rate over {n} scored session(s) "
+              f"— directional, not a powered metric):")
+        for mode, (prev, cur) in res.trend.items():
+            if n < 10:
+                print(f"    - {mode}: {cur:.0%}  (insufficient data — n={n})")
+            elif prev is None:
+                print(f"    - {mode}: {cur:.0%}  (baseline; re-run next week to see the trend)")
+            else:
+                arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
+                print(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})")
     if res.blocked:
         print(f"\n  ({len(res.blocked)} rule(s) dropped by the safety hard-deny.)")
     if res.gate_issues:
@@ -229,6 +252,8 @@ def run_skill(args) -> None:
         if "codex" in targets:
             installed.append(str(_install.install_codex(res.region)))
         _store.mark_installed(conn, res.rules)
+        # record this run's per-mode rates for next week's trend (§9/D9)
+        _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
     finally:
         conn.close()
 
