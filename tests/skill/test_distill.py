@@ -37,6 +37,16 @@ def test_single_call_and_parse():
     assert rules[0].support == 4                      # backfilled from recurrence
 
 
+def test_evidence_ids_are_limited_to_selected_sessions():
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "before done", "guidance": "run tests first",
+         "why": "premature", "taxonomy": "verification_skipped",
+         "evidence_session_ids": ["s1", "https://evil.test/prompt"]},
+    ]})
+    rules = distill_skills(_corpus(), caller=fake)
+    assert rules[0].evidence_session_ids == ["case-01"]
+
+
 def test_empty_corpus_no_call():
     fake = FakeCaller({"rules": []})
     empty = SkillCorpus(window_start="a", window_end="b")
@@ -47,7 +57,9 @@ def test_empty_corpus_no_call():
 def test_prompt_is_scrubbed_before_llm():
     # a candidate carrying a secret in its substrate must not reach the prompt raw
     corpus = SkillCorpus(window_start="a", window_end="b",
-                         failures=[SkillCandidate("s1", "proj", "codex", "avoid",
+                         failures=[SkillCandidate("raw-/Users/kai/project", "proj", "codex", "avoid",
                                    learning_summary="leaked AKIAIOSFODNN7EXAMPLE in a config")])
     prompt = build_prompt(corpus, Anonymizer())
     assert "AKIAIOSFODNN7EXAMPLE" not in prompt
+    assert "raw-/Users/kai/project" not in prompt
+    assert "case-01" in prompt

@@ -19,6 +19,14 @@ def test_hard_deny_blocks_external_tokens():
     assert kept == [ok] and blocked[0][0] is bad and "url" in blocked[0][1]
 
 
+def test_hard_deny_scans_rendered_metadata_fields():
+    bad = _rule()
+    bad.evidence_session_ids = ["https://x.test/session"]
+    kept, blocked = render.gate_rules([bad])
+    assert kept == []
+    assert "url" in blocked[0][1]
+
+
 def test_render_frontmatter_and_sections():
     md = render.render_skill_md([_rule(), _rule(kind="do", guidance="read source first")], META)
     assert md.startswith("---\nname: clawjournal-lessons")
@@ -32,15 +40,54 @@ def test_gate_rendered_catches_planted_secret(monkeypatch):
     assert render.gate_rendered("key=AKIAIOSFODNN7EXAMPLE")  # secrets gate fires
 
 
+def test_gate_rendered_catches_planted_pii(monkeypatch):
+    monkeypatch.setenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", "1")
+    monkeypatch.setattr(render.secrets, "scan_text", lambda text: [])
+    issues = render.gate_rendered("contact person@example.com")
+    assert any(issue.startswith("pii:") for issue in issues)
+
+
+def test_gate_rendered_blocks_trufflehog_scan_errors(monkeypatch):
+    class Report:
+        blocking = True
+        block_reason = "trufflehog-error"
+        findings = []
+
+    monkeypatch.delenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", raising=False)
+    monkeypatch.setattr(render.trufflehog, "is_bypassed", lambda: False)
+    monkeypatch.setattr(render.trufflehog, "scan_text", lambda text: Report())
+    assert render.gate_rendered("ordinary text") == ["trufflehog: trufflehog-error"]
+
+
 def test_install_writes_and_overwrites(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     md = render.render_skill_md([_rule()], META)
     p = install.install_claude(md)
     assert p == tmp_path / ".claude" / "skills" / "clawjournal-lessons" / "SKILL.md"
     assert p.read_text().startswith("---\nname: clawjournal-lessons")
+    assert install.claude_skill_hash_path(p).exists()
     # weekly re-run overwrites cleanly (atomic)
     install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
     assert "updated rule" in p.read_text()
+
+
+def test_install_claude_refuses_hand_edited_managed_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = install.install_claude(render.render_skill_md([_rule()], META))
+    p.write_text(p.read_text() + "\nmanual edit\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="hand-edited"):
+        install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
+
+
+def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = install.claude_skill_path()
+    p.parent.mkdir(parents=True)
+    p.write_text("custom skill\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="non-ClawJournal"):
+        install.install_claude(render.render_skill_md([_rule()], META))
 
 
 def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypatch):

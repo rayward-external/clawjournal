@@ -28,9 +28,10 @@ from ..workbench.index import (
 )
 
 DEFAULT_WINDOW_DAYS = 7
-DEFAULT_POOL_CAP = 16          # representative sessions kept per pool for the prompt
+DEFAULT_POOL_CAP = 5           # Mode A hard cap on candidates/rules reviewed per run
 _CLEAN_RECOVERY = {"self_recovered", "user_corrected_recovery"}
 _BAD_RECOVERY = {"unrecovered", "blocked"}
+_RELEASE_GATE_CHUNK_SIZE = 500
 
 
 @dataclass
@@ -49,6 +50,10 @@ class SkillCandidate:
     summary: str | None = None
     title: str | None = None
     start_time: str | None = None
+    support_count: int = 1
+    impact: float = 0.0
+    recency: float = 0.0
+    rank_score: float = 0.0
 
 
 @dataclass
@@ -84,6 +89,50 @@ def _has_evidence(learning: str | None, reason: str | None, modes: list[str]) ->
     return bool((learning and learning.strip()) or (reason and reason.strip()) or modes)
 
 
+def _parse_start_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _recency_weight(start_time: str | None, *, now: datetime) -> float:
+    parsed = _parse_start_time(start_time)
+    if parsed is None:
+        return 0.01
+    age_days = max(0.0, (now - parsed).total_seconds() / 86400)
+    return 1.0 / (1.0 + age_days)
+
+
+def _candidate_rank(
+    *,
+    support: int,
+    impact: float,
+    recency: float,
+) -> float:
+    return max(1, support) * max(0.1, impact) * max(0.01, recency)
+
+
+def _release_blocked_ids(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+    *,
+    now: datetime,
+) -> set[str]:
+    """Return session ids that cannot feed the AI-bound skill corpus."""
+    blocked: set[str] = set()
+    deduped = list(dict.fromkeys(sid for sid in session_ids if sid))
+    for i in range(0, len(deduped), _RELEASE_GATE_CHUNK_SIZE):
+        chunk = deduped[i:i + _RELEASE_GATE_CHUNK_SIZE]
+        blocked.update(b["session_id"] for b in release_gate_blockers(conn, chunk, now=now))
+    return blocked
+
+
 def select_skill_candidates(
     conn: sqlite3.Connection,
     *,
@@ -109,33 +158,11 @@ def select_skill_candidates(
 
     # ---- failures pool (avoid) -------------------------------------------
     fail_sql = (
-        f"SELECT {cols} {base} AND (ai_failure_value_score >= 3 OR "
-        "(ai_failure_modes IS NOT NULL AND json_valid(ai_failure_modes) "
-        "AND json_array_length(ai_failure_modes) > 0)) "
+        f"SELECT {cols} {base} AND (ai_failure_value_score >= 3 "
+        "OR ai_outcome_badge IN ('failed','abandoned')) "
         "ORDER BY ai_failure_value_score DESC, start_time DESC"
     )
     fail_rows = conn.execute(fail_sql, [window_start, *src]).fetchall()
-
-    mode_counter: Counter[str] = Counter()
-    failures: list[SkillCandidate] = []
-    for row in fail_rows:
-        modes = _parse_json_list(row["ai_failure_modes"])
-        mode_counter.update(modes)
-        recovery = _parse_json_list(row["ai_recovery_labels"])
-        if _CLEAN_RECOVERY & set(recovery):
-            continue  # cleanly recovered -> teach it as a "do", not an "avoid"
-        if not _has_evidence(row["ai_learning_summary"], row["ai_score_reason"], modes):
-            continue  # never invent a confident rule from a bare low score
-        failures.append(SkillCandidate(
-            session_id=row["session_id"], project=row["project"], source=row["source"],
-            kind="avoid", failure_modes=modes, recovery_labels=recovery,
-            resolution=row["ai_outcome_badge"], failure_value=row["ai_failure_value_score"],
-            quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
-            score_reason=row["ai_score_reason"], summary=row["ai_summary"],
-            title=row["title"], start_time=row["start_time"],
-        ))
-
-    # ---- successes / recoveries pool (do) --------------------------------
     succ_sql = (
         f"SELECT {cols} {base} AND ("
         "(ai_outcome_badge IN ('resolved','trivial') AND ai_quality_score >= 4) "
@@ -146,8 +173,54 @@ def select_skill_candidates(
         ") ORDER BY ai_quality_score DESC, start_time DESC"
     )
     succ_rows = conn.execute(succ_sql, [window_start, *src]).fetchall()
+    candidate_ids = [row["session_id"] for row in list(fail_rows) + list(succ_rows)]
+    blocked_ids = _release_blocked_ids(conn, candidate_ids, now=clock)
+
+    mode_counter: Counter[str] = Counter()
+    recovery_counter: Counter[str] = Counter()
+    outcome_counter: Counter[str] = Counter()
+    _counted: set[str] = set()  # count each session once (a session can match both queries)
+    for row in list(fail_rows) + list(succ_rows):
+        sid = row["session_id"]
+        if sid in blocked_ids or sid in _counted:
+            continue
+        _counted.add(sid)
+        mode_counter.update(_parse_json_list(row["ai_failure_modes"]))
+        recovery_counter.update(_parse_json_list(row["ai_recovery_labels"]))
+        if row["ai_outcome_badge"]:
+            outcome_counter.update([row["ai_outcome_badge"]])
+
+    failures: list[SkillCandidate] = []
+    failure_ids: set[str] = set()  # a session lands in exactly one pool (avoid wins)
+    for row in fail_rows:
+        if row["session_id"] in blocked_ids:
+            continue
+        modes = _parse_json_list(row["ai_failure_modes"])
+        recovery = _parse_json_list(row["ai_recovery_labels"])
+        if _CLEAN_RECOVERY & set(recovery):
+            continue  # cleanly recovered -> teach it as a "do", not an "avoid"
+        if not _has_evidence(row["ai_learning_summary"], row["ai_score_reason"], modes):
+            continue  # never invent a confident rule from a bare low score
+        support = max([mode_counter[m] for m in modes] or [1])
+        impact = float(row["ai_failure_value_score"] or 3)
+        recency = _recency_weight(row["start_time"], now=clock)
+        failures.append(SkillCandidate(
+            session_id=row["session_id"], project=row["project"], source=row["source"],
+            kind="avoid", failure_modes=modes, recovery_labels=recovery,
+            resolution=row["ai_outcome_badge"], failure_value=row["ai_failure_value_score"],
+            quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
+            score_reason=row["ai_score_reason"], summary=row["ai_summary"],
+            title=row["title"], start_time=row["start_time"],
+            support_count=support, impact=impact, recency=recency,
+            rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
+        ))
+        failure_ids.add(row["session_id"])
+
+    # ---- successes / recoveries pool (do) --------------------------------
     successes: list[SkillCandidate] = []
     for row in succ_rows:
+        if row["session_id"] in blocked_ids or row["session_id"] in failure_ids:
+            continue  # already an "avoid" -> never double-book the same session
         recovery = _parse_json_list(row["ai_recovery_labels"])
         if _BAD_RECOVERY & set(recovery):
             continue  # not a clean "what worked"
@@ -157,6 +230,14 @@ def select_skill_candidates(
             _CLEAN_RECOVERY & set(recovery)
         ):
             continue
+        if modes:
+            support = max([mode_counter[m] for m in modes] or [1])
+        elif recovery:
+            support = max([recovery_counter[r] for r in recovery] or [1])
+        else:
+            support = outcome_counter[row["ai_outcome_badge"]] or 1
+        impact = float(row["ai_quality_score"] or 3)
+        recency = _recency_weight(row["start_time"], now=clock)
         successes.append(SkillCandidate(
             session_id=row["session_id"], project=row["project"], source=row["source"],
             kind="do", failure_modes=modes, recovery_labels=recovery,
@@ -164,26 +245,32 @@ def select_skill_candidates(
             quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
             score_reason=row["ai_score_reason"], summary=row["ai_summary"],
             title=row["title"], start_time=row["start_time"],
+            support_count=support, impact=impact, recency=recency,
+            rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
         ))
 
-    # ---- hold-state egress gate (only shareable sessions feed an AI call) -
-    all_ids = [c.session_id for c in failures + successes]
-    if all_ids:
-        blocked = {b["session_id"] for b in release_gate_blockers(conn, all_ids, now=clock)}
-        if blocked:
-            failures = [c for c in failures if c.session_id not in blocked]
-            successes = [c for c in successes if c.session_id not in blocked]
-
-    eligible_scored = conn.execute(
-        f"SELECT COUNT(*) FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
+    eligible_rows = conn.execute(
+        f"SELECT session_id FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
         f"{src_clause} AND (ai_failure_value_score IS NOT NULL OR ai_quality_score IS NOT NULL)",
         [window_start, *src],
-    ).fetchone()[0]
+    ).fetchall()
+    eligible_ids = [row["session_id"] for row in eligible_rows]
+    blocked_eligible = _release_blocked_ids(conn, eligible_ids, now=clock)
+    eligible_scored = len([sid for sid in eligible_ids if sid not in blocked_eligible])
+
+    ranked = sorted(
+        failures + successes,
+        key=lambda c: (c.rank_score, c.support_count, c.impact, c.start_time or ""),
+        reverse=True,
+    )
+    selected = ranked[:pool_cap] if pool_cap and pool_cap > 0 else ranked
+    selected_failures = [c for c in selected if c.kind == "avoid"]
+    selected_successes = [c for c in selected if c.kind == "do"]
 
     return SkillCorpus(
         window_start=window_start, window_end=window_end,
-        failures=failures[:pool_cap], successes=successes[:pool_cap],
+        failures=selected_failures, successes=selected_successes,
         mode_recurrence=dict(mode_counter.most_common()),
         total_failures=len(failures), total_successes=len(successes),
-        eligible_scored=int(eligible_scored or 0),
+        eligible_scored=eligible_scored,
     )

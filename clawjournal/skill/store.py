@@ -118,12 +118,21 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
 def mark_installed(conn: sqlite3.Connection, rules: list[SkillRule], *, now: str | None = None) -> None:
     ts = now or now_iso()
     ensure_table(conn)
+    selected_fps: list[str] = []
     for r in rules:
         fp = upsert_seen(conn, r, now=ts)
+        selected_fps.append(fp)
         conn.execute(
             "UPDATE skill_rules SET state = 'kept', installed_at = ?, last_seen_at = ?, "
             "approved_at = COALESCE(approved_at, ?) WHERE fingerprint = ? AND state != 'rejected'",
             (ts, ts, ts, fp),
+        )
+    if selected_fps:
+        placeholders = ",".join("?" for _ in selected_fps)
+        conn.execute(
+            "UPDATE skill_rules SET state = 'dropped', installed_at = NULL, last_seen_at = ? "
+            f"WHERE state IN ('proposed','kept') AND fingerprint NOT IN ({placeholders})",
+            (ts, *selected_fps),
         )
     conn.commit()
 

@@ -78,6 +78,13 @@ SKILL_DISTILL_SCHEMA: dict[str, Any] = {
 }
 
 
+def _coerce_support(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def parse_rules(data: dict[str, Any]) -> list[SkillRule]:
     """Validate + normalize the distill output into <=MAX_RULES SkillRules.
 
@@ -98,15 +105,18 @@ def parse_rules(data: dict[str, Any]) -> list[SkillRule]:
         if not trigger or not guidance:
             continue
         ev = item.get("evidence_session_ids") or []
-        ev = [str(x) for x in ev if x] if isinstance(ev, list) else []
+        ev = [str(x).strip() for x in ev if str(x).strip()] if isinstance(ev, list) else []
+        taxonomy = str(item.get("taxonomy", "")).strip()
+        if taxonomy not in FAILURE_MODES:
+            taxonomy = ""
         rules.append(SkillRule(
             kind=kind,
             trigger=trigger,
             guidance=guidance,
             why=str(item.get("why", "")).strip(),
             evidence_session_ids=ev,
-            taxonomy=str(item.get("taxonomy", "")).strip(),
-            support=int(item.get("support", 0) or 0),
+            taxonomy=taxonomy,
+            support=_coerce_support(item.get("support", 0)),
         ))
         if len(rules) >= MAX_RULES:
             break
@@ -148,7 +158,13 @@ def find_external_tokens(rule: SkillRule) -> list[str]:
     executable tokens. Ordinary in-repo references (``run the test suite``,
     ``src/foo.py``) do NOT match.
     """
-    text = "\n".join([rule.trigger, rule.guidance, rule.why])
+    text = "\n".join([
+        rule.trigger,
+        rule.guidance,
+        rule.why,
+        rule.taxonomy,
+        *rule.evidence_session_ids,
+    ])
     hits: list[str] = []
     for label, rx in _DENY:
         if rx.search(text):

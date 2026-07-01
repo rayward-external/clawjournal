@@ -26,6 +26,15 @@ def test_drops_unevidenced_failures(index_conn, ins):
     assert {c.session_id for c in corpus.failures} == {"evidenced"}
 
 
+def test_drops_low_impact_mode_only_failures(index_conn, ins):
+    ins(index_conn, "low", fvs=1, modes='["verification_skipped"]',
+        outcome="resolved", learning="minor wobble")
+    ins(index_conn, "failed", fvs=2, modes='["execution_error"]',
+        outcome="failed", learning="task did not finish")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert {c.session_id for c in corpus.failures} == {"failed"}
+
+
 def test_mode_recurrence_counts_all(index_conn, ins):
     for i in range(3):
         ins(index_conn, f"v{i}", fvs=4, modes='["verification_skipped"]', learning="x")
@@ -41,11 +50,33 @@ def test_excludes_bad_recovery_from_do(index_conn, ins):
     assert not corpus.successes
 
 
+def test_selection_caps_to_ranked_top_five(index_conn, ins):
+    for i, score in enumerate([3, 3, 3, 4, 5, 5]):
+        ins(index_conn, f"f{i}", fvs=score, modes='["verification_skipped"]',
+            learning=f"failure {i}")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    selected = {c.session_id for c in corpus.candidates}
+    assert len(corpus.candidates) == 5
+    assert corpus.total_failures == 6
+    assert {"f3", "f4", "f5"}.issubset(selected)
+    assert len({"f0", "f1", "f2"} - selected) == 1
+
+
 def test_hold_state_gate_excludes_pending(index_conn, ins):
     ins(index_conn, "ok", fvs=5, learning="a", hold_state="auto_redacted")
     ins(index_conn, "pending", fvs=5, learning="b", hold_state="pending_review")
     corpus = select_skill_candidates(index_conn, now=NOW)
     assert {c.session_id for c in corpus.failures} == {"ok"}
+
+
+def test_hold_state_gate_excludes_pending_from_rates(index_conn, ins):
+    ins(index_conn, "ok", fvs=5, modes='["verification_skipped"]',
+        learning="a", hold_state="auto_redacted")
+    ins(index_conn, "pending", fvs=5, modes='["safety_security"]',
+        learning="b", hold_state="pending_review")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert corpus.mode_recurrence == {"verification_skipped": 1}
+    assert corpus.eligible_scored == 1
 
 
 def test_window_and_source_scope(index_conn, ins):

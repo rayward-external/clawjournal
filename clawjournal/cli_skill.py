@@ -45,8 +45,10 @@ class SkillResult:
 def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str]) -> list[SkillRule]:
     """Merge existing + newly-distilled rules -> top-<=5 (replace the weakest).
 
-    Deduped by fingerprint; rejected fingerprints are dropped; ranked by support
-    (recurrence) then whether it recurred this run (recency). Cap = MAX_RULES.
+    Deduped by fingerprint; rejected fingerprints dropped; ranked by support then
+    recurred-this-run. **Interleaved across kinds** so the installed set keeps a
+    good+bad mix (D2) — otherwise 'do' rules (whose support signal is weaker than
+    'avoid' mode-recurrence) would be structurally crowded out over weeks.
     """
     new_fps = {_store.fingerprint(r) for r in new}
     pool: dict[str, SkillRule] = {}
@@ -56,14 +58,43 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
             continue
         if fp not in pool or r.support >= pool[fp].support:
             pool[fp] = r
-    ranked = sorted(pool.items(), key=lambda kv: (kv[1].support, kv[0] in new_fps), reverse=True)
-    return [r for _, r in ranked[:MAX_RULES]]
+
+    def _rank(rules: list[SkillRule]) -> list[SkillRule]:
+        return sorted(rules, key=lambda r: (r.support, _store.fingerprint(r) in new_fps), reverse=True)
+
+    avoid = _rank([r for r in pool.values() if r.kind == "avoid"])
+    do = _rank([r for r in pool.values() if r.kind == "do"])
+    out: list[SkillRule] = []
+    ai = di = 0
+    while len(out) < MAX_RULES and (ai < len(avoid) or di < len(do)):
+        if ai < len(avoid):
+            out.append(avoid[ai]); ai += 1
+        if len(out) < MAX_RULES and di < len(do):
+            out.append(do[di]); di += 1
+    return out
+
+
+def _config_sources() -> list[str] | None:
+    """The corpus source scope the user confirmed (§4.4). Falls back to the
+    coding-agent scope for 'all'/'both'/'auto'."""
+    from .config import load_config
+    src = load_config().get("source")
+    if not src or src in ("all", "both", "auto"):
+        return list(FAILURE_VALUE_SOURCE_SCOPE)
+    return [src]
+
+
+def _scan_source_filter() -> str | None:
+    from .config import load_config
+    src = load_config().get("source")
+    return None if (not src or src in ("all", "both", "auto")) else src
 
 
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
                    model: str | None = None, caller=None, now: datetime | None = None) -> SkillResult:
     """Pure pipeline: select -> distill -> merge(store) -> gate -> render. Read-only."""
-    corpus = _select.select_skill_candidates(conn, window_days=window_days, now=now)
+    corpus = _select.select_skill_candidates(conn, window_days=window_days, now=now,
+                                             sources=_config_sources())
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,
@@ -85,7 +116,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     rejected = _store.rejected_fingerprints(conn)
     existing = _store.load_kept(conn)
     prev_installed = _store.installed_fingerprints(conn)
-    rules = merge_rules(existing, fresh, rejected)
+    merged = merge_rules(existing, fresh, rejected)
+    # re-apply the external/exec hard-deny to the FULL install set (incl. store rules)
+    rules, merged_blocked = _render.gate_rules(merged)
+    blocked = blocked + merged_blocked
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
@@ -115,7 +149,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
     if do_scan:
         print("Indexing sessions…")
         from .cli import _run_scan
-        _run_scan(source_filter=None)
+        _run_scan(source_filter=_scan_source_filter())
     if not do_score:
         return
     from .cli import _score_single_session
@@ -125,7 +159,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
     conn = open_index()
     try:
         unscored = query_unscored_sessions(
-            conn, limit=score_limit, source=list(FAILURE_VALUE_SOURCE_SCOPE), since=since)
+            conn, limit=score_limit, source=_config_sources(), since=since)
         if unscored:
             print(f"Scoring {len(unscored)} unscored session(s) in the window "
                   f"(this uses your agent CLI)…")
@@ -192,6 +226,13 @@ def run_skill(args) -> None:
 
     backend = getattr(args, "backend", "auto")
     model = getattr(args, "model", None)
+    score_limit = getattr(args, "score_limit", DEFAULT_SCORE_LIMIT)
+    if score_limit < 0:
+        print("--score-limit must be >= 0")
+        sys.exit(2)
+    if not getattr(args, "all", False) and getattr(args, "window_days", 7) < 1:
+        print("--window-days must be >= 1")
+        sys.exit(2)
 
     # --reject <fingerprint>: mark rejected so it is never re-proposed, then stop.
     if getattr(args, "reject", None):
@@ -200,13 +241,14 @@ def run_skill(args) -> None:
             hit = _store.reject(conn, args.reject)
         finally:
             conn.close()
-        print(f"Rejected {args.reject}." if hit else f"No rule with fingerprint {args.reject}.")
+        print(f"Rejected {args.reject}; it will drop out on the next `clawjournal skill` run."
+              if hit else f"No rule with fingerprint {args.reject}.")
         return
 
     # 0. preflight (§7.0)
     if not getattr(args, "skip_preflight", False):
         from .skill.preflight import preflight
-        problems = preflight()
+        problems = preflight(backend=backend)
         if problems:
             print("Cannot generate skills yet:")
             for p in problems:
@@ -220,7 +262,7 @@ def run_skill(args) -> None:
         window_days,
         do_scan=not getattr(args, "no_scan", False),
         do_score=not getattr(args, "no_score", False),
-        score_limit=getattr(args, "score_limit", DEFAULT_SCORE_LIMIT),
+        score_limit=score_limit,
         backend=backend, model=model,
     )
 
@@ -228,10 +270,15 @@ def run_skill(args) -> None:
     conn = open_index()
     try:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model)
+        for rule in res.rules:
+            _store.upsert_seen(conn, rule)
         _print_preview(res)
-        if not res.rules or res.gate_issues:
+        if res.gate_issues:
             conn.close()
-            sys.exit(0 if res.rules else 1)
+            sys.exit(1)
+        if not res.rules:
+            conn.close()
+            sys.exit(1)
         if getattr(args, "preview", False):
             print("\n(preview only — not installed; re-run without --preview to install.)")
             return

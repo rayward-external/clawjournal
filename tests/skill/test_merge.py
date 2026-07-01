@@ -32,3 +32,15 @@ def test_replace_weakest():
     guides = {r.guidance for r in merged}
     assert "strong new" in guides
     assert sum(g.startswith("old ") for g in guides) == 4        # one weak one displaced
+
+
+def test_preserves_good_bad_mix():
+    # 'avoid' rules carry high mode-recurrence support; 'do' rules get support=0.
+    # A support-only merge would drop every 'do'; the interleave must keep both (D2).
+    avoid = [_r(f"avoid {i}", support=50, kind="avoid") for i in range(5)]
+    do = [_r("do X", support=0, kind="do"), _r("do Y", support=0, kind="do")]
+    merged = merge_rules([], avoid + do, set())
+    kinds = [r.kind for r in merged]
+    assert len(merged) == MAX_RULES
+    assert kinds.count("do") >= 1 and kinds.count("avoid") >= 1   # both kinds survive
+    assert kinds == ["avoid", "do", "avoid", "do", "avoid"]       # interleaved

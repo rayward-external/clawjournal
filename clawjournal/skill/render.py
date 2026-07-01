@@ -43,22 +43,25 @@ def gate_rendered(text: str) -> list[str]:
         n = len(secrets.scan_text(text))
         if n:
             issues.append(f"secrets: {n} match(es)")
-    except Exception:  # pragma: no cover - defensive
-        pass
+    except Exception as exc:  # pragma: no cover - defensive
+        issues.append(f"secrets: scan failed ({exc.__class__.__name__})")
     try:
         n = len(pii.scan_text_for_pii(text))
         if n:
             issues.append(f"pii: {n} match(es)")
-    except Exception:  # pragma: no cover
-        pass
+    except Exception as exc:  # pragma: no cover
+        issues.append(f"pii: scan failed ({exc.__class__.__name__})")
     try:
-        if not trufflehog.is_bypassed() and trufflehog.is_available():
+        if not trufflehog.is_bypassed():
             report = trufflehog.scan_text(text)
             findings = getattr(report, "findings", None) or []
-            if findings:
+            if getattr(report, "blocking", False):
+                reason = getattr(report, "block_reason", None) or "trufflehog-error"
                 issues.append(f"trufflehog: {len(findings)} finding(s)")
-    except Exception:  # pragma: no cover
-        pass
+                if not findings:
+                    issues[-1] = f"trufflehog: {reason}"
+    except Exception as exc:  # pragma: no cover
+        issues.append(f"trufflehog: scan failed ({exc.__class__.__name__})")
     return issues
 
 

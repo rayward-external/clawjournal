@@ -27,6 +27,18 @@ def test_blocks_when_no_backend(monkeypatch):
     assert any("backend" in p.lower() for p in pf.preflight())
 
 
+def test_blocks_when_explicit_backend_missing(monkeypatch):
+    _ok_env(monkeypatch, backends=("claude",))
+    monkeypatch.setattr(pf.shutil, "which", lambda cmd: None if cmd == "codex" else f"/bin/{cmd}")
+    assert any("codex backend" in p for p in pf.preflight(backend="codex"))
+
+
+def test_allows_explicit_backend_when_installed(monkeypatch):
+    _ok_env(monkeypatch, backends=("claude",))
+    monkeypatch.setattr(pf.shutil, "which", lambda cmd: f"/bin/{cmd}")
+    assert pf.preflight(backend="codex") == []
+
+
 def test_blocks_when_trufflehog_missing(monkeypatch):
     monkeypatch.delenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", raising=False)
     monkeypatch.setattr(pf, "load_config", lambda: {"source": "all", "projects_confirmed": True})

@@ -43,8 +43,8 @@ _SYSTEM = (
     "Pick the highest-value RECURRING, NONTRIVIAL patterns; ignore one-off or trivial "
     "wins. A success is not *caused* by a named habit — for 'do' rules, teach the "
     "specific fix/decision that turned a failure into a success (the delta), not a "
-    "coincidental routine. Ground each rule in the given sessions and list their ids "
-    "in evidence_session_ids. De-identify: never put a person's name, email, URL, "
+    "coincidental routine. Ground each rule in the given sessions and list their "
+    "case ids in evidence_session_ids. De-identify: never put a person's name, email, URL, "
     "home path, secret, or shell command into a rule — write portable guidance. "
     f"Failure taxonomy for the 'taxonomy' field: {', '.join(FAILURE_MODES)}."
 )
@@ -52,7 +52,7 @@ _SYSTEM = (
 _RULE_SHAPE = (
     'Return JSON: {"rules": [{"kind": "avoid"|"do", "trigger": "when this applies", '
     '"guidance": "the rule (avoid X / do Y instead)", "why": "one line, grounded", '
-    '"taxonomy": "<failure mode or empty>", "evidence_session_ids": ["..."]}]}'
+    '"taxonomy": "<failure mode or empty>", "evidence_session_ids": ["case-01"]}]}'
 )
 
 
@@ -65,15 +65,23 @@ def _scrub(value: Any, anon: Anonymizer) -> str:
     return redacted
 
 
+def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
+    return {c.session_id: f"case-{i:02d}" for i, c in enumerate(corpus.candidates, 1)}
+
+
 def _format_candidates(corpus: SkillCorpus, anon: Anonymizer) -> str:
     lines: list[str] = []
+    aliases = _candidate_aliases(corpus)
     if corpus.mode_recurrence:
         top = ", ".join(f"{m}×{n}" for m, n in list(corpus.mode_recurrence.items())[:8])
         lines.append(f"Recurring failure modes this window: {top}\n")
     for c in corpus.candidates:
         lines.append(
-            f"- session {c.session_id} [{c.kind}] source={c.source} "
+            f"- session {aliases[c.session_id]} [{c.kind}] source={c.source} "
             f"project={_scrub(c.project, anon)}\n"
+            f"  support_count={c.support_count} impact={c.impact:.2f} "
+            f"recency={c.recency:.3f} rank_score={c.rank_score:.3f} "
+            f"source_agents={[c.source]}\n"
             f"  failure_modes={c.failure_modes} recovery={c.recovery_labels} "
             f"resolution={c.resolution} failure_value={c.failure_value} quality={c.quality}\n"
             f"  title={_scrub(c.title, anon)}\n"
@@ -144,8 +152,17 @@ def distill_skills(
         except ValueError:
             return []
     rules = parse_rules(data)
+    aliases = _candidate_aliases(corpus)
+    allowed_aliases = set(aliases.values())
     # backfill support from recurrence where the rule named a mode
     for r in rules:
+        evidence: list[str] = []
+        for sid in r.evidence_session_ids:
+            if sid in aliases:
+                evidence.append(aliases[sid])
+            elif sid in allowed_aliases:
+                evidence.append(sid)
+        r.evidence_session_ids = list(dict.fromkeys(evidence))
         if r.taxonomy and r.taxonomy in corpus.mode_recurrence:
             r.support = max(r.support, corpus.mode_recurrence[r.taxonomy])
     return rules

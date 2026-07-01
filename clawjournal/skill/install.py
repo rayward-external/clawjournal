@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import hashlib
 from pathlib import Path
 
 from .render import SKILL_NAME
@@ -27,6 +28,14 @@ def claude_skill_path() -> Path:
 
 def codex_agents_path() -> Path:
     return Path.home() / ".codex" / "AGENTS.md"
+
+
+def claude_skill_hash_path(path: Path | None = None) -> Path:
+    return (path or claude_skill_path()).with_name("SKILL.md.sha256")
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -63,7 +72,21 @@ def upsert_region(existing: str, region_body: str) -> str:
 
 def install_claude(skill_md: str) -> Path:
     path = claude_skill_path()
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        hash_path = claude_skill_hash_path(path)
+        if hash_path.exists():
+            recorded = hash_path.read_text(encoding="utf-8").strip()
+            if recorded != _sha256_text(existing):
+                raise RuntimeError(
+                    f"Refusing to overwrite hand-edited Claude skill: {path}"
+                )
+        elif "<!-- clawjournal-lessons:" not in existing:
+            raise RuntimeError(
+                f"Refusing to overwrite existing non-ClawJournal Claude skill: {path}"
+            )
     _atomic_write(path, skill_md)
+    _atomic_write(claude_skill_hash_path(path), _sha256_text(skill_md) + "\n")
     return path
 
 

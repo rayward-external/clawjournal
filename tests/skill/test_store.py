@@ -40,3 +40,14 @@ def test_mark_installed_sets_state(index_conn):
     r = _r()
     store.mark_installed(index_conn, [r])
     assert store.fingerprint(r) in store.installed_fingerprints(index_conn)
+
+
+def test_mark_installed_drops_rules_not_in_new_set(index_conn):
+    old = _r("old weak rule")
+    keep = _r("kept strong rule")
+    store.mark_installed(index_conn, [old, keep])
+    store.mark_installed(index_conn, [keep])
+
+    kept_guidance = {r.guidance for r in store.load_kept(index_conn)}
+    assert kept_guidance == {"kept strong rule"}
+    assert store.fingerprint(old) not in store.installed_fingerprints(index_conn)
