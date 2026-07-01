@@ -36,6 +36,7 @@ def ensure_table(conn: sqlite3.Connection) -> None:
         """CREATE TABLE IF NOT EXISTS skill_rules (
             fingerprint  TEXT PRIMARY KEY,
             kind         TEXT NOT NULL,
+            title        TEXT,
             trigger      TEXT,
             guidance     TEXT NOT NULL,
             why          TEXT,
@@ -50,6 +51,10 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             last_seen_at TEXT
         )"""
     )
+    # migrate pre-title tables (the skill_rules table is new; no historical gate)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(skill_rules)")}
+    if "title" not in cols:
+        conn.execute("ALTER TABLE skill_rules ADD COLUMN title TEXT")
     conn.commit()
 
 
@@ -60,7 +65,8 @@ def _row_to_rule(row: sqlite3.Row) -> SkillRule:
         ev = []
     return SkillRule(
         kind=row["kind"], trigger=row["trigger"] or "", guidance=row["guidance"],
-        why=row["why"] or "", evidence_session_ids=[str(x) for x in ev],
+        why=row["why"] or "", title=(row["title"] or ""),
+        evidence_session_ids=[str(x) for x in ev],
         taxonomy=row["taxonomy"] or "", support=int(row["support"] or 0),
     )
 
@@ -99,17 +105,17 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
     ev = json.dumps(list(rule.evidence_session_ids))
     if existing is None:
         conn.execute(
-            "INSERT INTO skill_rules (fingerprint, kind, trigger, guidance, why, taxonomy, "
+            "INSERT INTO skill_rules (fingerprint, kind, title, trigger, guidance, why, taxonomy, "
             "support, evidence_json, state, created_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?,?, 'proposed', ?, ?)",
-            (fp, rule.kind, rule.trigger, rule.guidance, rule.why, rule.taxonomy,
+            "VALUES (?,?,?,?,?,?,?,?,?, 'proposed', ?, ?)",
+            (fp, rule.kind, rule.title, rule.trigger, rule.guidance, rule.why, rule.taxonomy,
              rule.support, ev, ts, ts),
         )
     elif existing["state"] != "rejected":
         conn.execute(
             "UPDATE skill_rules SET support = MAX(support, ?), evidence_json = ?, "
-            "why = ?, trigger = ?, taxonomy = ?, last_seen_at = ? WHERE fingerprint = ?",
-            (rule.support, ev, rule.why, rule.trigger, rule.taxonomy, ts, fp),
+            "why = ?, title = ?, trigger = ?, taxonomy = ?, last_seen_at = ? WHERE fingerprint = ?",
+            (rule.support, ev, rule.why, rule.title, rule.trigger, rule.taxonomy, ts, fp),
         )
     conn.commit()
     return fp

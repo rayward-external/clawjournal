@@ -77,7 +77,10 @@ def _render_body(rules: list[SkillRule], meta: dict[str, Any]) -> str:
     ]
 
     def block(r: SkillRule) -> list[str]:
-        lines = [f"### {r.guidance}"]
+        heading = r.display_title()
+        lines = [f"### {heading}"]
+        if r.guidance and r.guidance.strip() != heading:
+            lines.append(f"- **Rule:** {r.guidance}")
         if r.trigger:
             lines.append(f"- **When:** {r.trigger}")
         if r.why:

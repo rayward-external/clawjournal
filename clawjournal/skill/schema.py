@@ -38,14 +38,20 @@ class SkillRule:
     trigger: str            # when this applies ("when you are about to ...")
     guidance: str           # the rule itself ("don't X" / "do Y instead")
     why: str                # one line on why, grounded in the user's own sessions
+    title: str = ""         # short human name for the rule (the heading)
     evidence_session_ids: list[str] = field(default_factory=list)
     taxonomy: str = ""      # the failure mode it targets (avoid) or "" (do)
     support: int = 0        # how many sessions this pattern recurred in
 
+    def display_title(self) -> str:
+        """The heading to render; falls back to guidance when unnamed."""
+        return self.title.strip() or _derive_title(self.guidance)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind, "trigger": self.trigger, "guidance": self.guidance,
-            "why": self.why, "evidence_session_ids": list(self.evidence_session_ids),
+            "why": self.why, "title": self.title,
+            "evidence_session_ids": list(self.evidence_session_ids),
             "taxonomy": self.taxonomy, "support": self.support,
         }
 
@@ -63,9 +69,10 @@ SKILL_DISTILL_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["kind", "trigger", "guidance", "why"],
+                "required": ["kind", "title", "trigger", "guidance", "why"],
                 "properties": {
                     "kind": {"type": "string", "enum": list(VALID_KINDS)},
+                    "title": {"type": "string"},
                     "trigger": {"type": "string"},
                     "guidance": {"type": "string"},
                     "why": {"type": "string"},
@@ -83,6 +90,12 @@ def _coerce_support(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _derive_title(guidance: str) -> str:
+    """Fallback short name from the rule text when the model omits a title."""
+    words = re.split(r"\s+", (guidance or "").strip())
+    return " ".join(words[:8]).rstrip(".,;:—- ")
 
 
 def parse_rules(data: dict[str, Any]) -> list[SkillRule]:
@@ -109,11 +122,13 @@ def parse_rules(data: dict[str, Any]) -> list[SkillRule]:
         taxonomy = str(item.get("taxonomy", "")).strip()
         if taxonomy not in FAILURE_MODES:
             taxonomy = ""
+        title = str(item.get("title", "")).strip() or _derive_title(guidance)
         rules.append(SkillRule(
             kind=kind,
             trigger=trigger,
             guidance=guidance,
             why=str(item.get("why", "")).strip(),
+            title=title,
             evidence_session_ids=ev,
             taxonomy=taxonomy,
             support=_coerce_support(item.get("support", 0)),
@@ -159,6 +174,7 @@ def find_external_tokens(rule: SkillRule) -> list[str]:
     ``src/foo.py``) do NOT match.
     """
     text = "\n".join([
+        rule.title,
         rule.trigger,
         rule.guidance,
         rule.why,
