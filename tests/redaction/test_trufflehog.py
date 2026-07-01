@@ -851,11 +851,17 @@ class TestSubprocessHardening:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-mustnotleak")
         monkeypatch.setenv("PATH", "/usr/bin:/bin")
         monkeypatch.setenv("HOME", "/home/u")
+        monkeypatch.setenv("SystemRoot", r"C:\Windows")
+        monkeypatch.setenv("TEMP", r"C:\Users\u\AppData\Local\Temp")
         env = trufflehog._scrubbed_subprocess_env()
         assert "ANTHROPIC_API_KEY" not in env
         assert "OPENAI_API_KEY" not in env
         assert env.get("PATH") == "/usr/bin:/bin"
         assert env.get("HOME") == "/home/u"
+        # Windows needs SystemRoot in a replaced subprocess environment;
+        # without it TruffleHog can exit 1 before producing JSON.
+        assert env.get("SystemRoot") == r"C:\Windows"
+        assert env.get("TEMP") == r"C:\Users\u\AppData\Local\Temp"
 
     def test_payload_streams_via_stdin_not_tempfile(self, tmp_path, monkeypatch):
         monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
