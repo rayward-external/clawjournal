@@ -201,7 +201,9 @@ def _print_preview(res: SkillResult) -> None:
         fp = _store.fingerprint(r)
         state = "NEW " if fp in res.added_fps else "KEPT"
         tag = "AVOID" if r.kind == "avoid" else "DO"
-        print(f"  {i}. [{state}] [{tag}] {r.guidance}   ({fp})")
+        print(f"  {i}. [{state}] [{tag}] {r.display_title()}   ({fp})")
+        if r.guidance and r.guidance.strip() != r.display_title():
+            print(f"        rule: {r.guidance}")
         if r.trigger:
             print(f"        when: {r.trigger}")
         if r.why:
