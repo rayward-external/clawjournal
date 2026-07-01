@@ -38,3 +38,26 @@ def test_generate_empty_when_no_scored_sessions(index_conn, ins):
     assert res.corpus.is_empty()
     assert res.rules == []
     assert fake.calls == 0  # nothing to distill -> no LLM call
+
+
+def test_generate_merges_existing_and_skips_rejected(index_conn, ins):
+    from clawjournal.skill import store
+    from clawjournal.skill.schema import SkillRule
+
+    kept = SkillRule(kind="avoid", trigger="t", guidance="pre-existing kept rule", why="w", support=1)
+    store.mark_installed(index_conn, [kept])                      # already installed
+    banned = SkillRule(kind="do", trigger="t", guidance="rejected rule", why="w")
+    store.upsert_seen(index_conn, banned)
+    store.reject(index_conn, store.fingerprint(banned))
+
+    ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]', learning="said done early")
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "a", "guidance": "new fresh rule", "why": "w"},
+        {"kind": "do", "trigger": "b", "guidance": "rejected rule", "why": "w"},   # must be skipped
+    ]})
+    res = generate_skill(index_conn, window_days=3650, caller=fake, now=NOW)
+    guides = {r.guidance for r in res.rules}
+    assert "pre-existing kept rule" in guides       # existing merged in
+    assert "new fresh rule" in guides               # new added
+    assert "rejected rule" not in guides            # rejected fingerprint skipped
+    assert store.fingerprint(SkillRule(kind="avoid", trigger="a", guidance="new fresh rule", why="w")) in res.added_fps

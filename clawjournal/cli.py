@@ -4207,6 +4207,14 @@ def main() -> None:
     skill_p.add_argument("--model", help="Optional model override (defaults to the backend's fast model)")
     skill_p.add_argument("--target", action="append", choices=["claude", "codex"],
                          help="Install target(s); repeatable (default: both claude + codex)")
+    skill_p.add_argument("--no-scan", action="store_true", help="Skip indexing (use the DB as-is)")
+    skill_p.add_argument("--no-score", action="store_true", help="Skip scoring unscored sessions in the window")
+    skill_p.add_argument("--score-limit", type=int, default=25,
+                         help="Max unscored sessions to score this run (cost bound; default 25)")
+    skill_p.add_argument("--reject", metavar="FINGERPRINT",
+                         help="Reject a rule by fingerprint so it is never re-proposed")
+    skill_p.add_argument("--skip-preflight", action="store_true",
+                         help="Skip the source/project/backend/TruffleHog checks (dev)")
     skill_p.add_argument("--preview", action="store_true", help="Show the distilled skills but do not install")
     skill_p.add_argument("--yes", action="store_true", help="Install without the confirmation prompt")
 
