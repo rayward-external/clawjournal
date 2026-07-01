@@ -46,6 +46,9 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
 
     - ``PATH`` to exec helpers
     - ``HOME`` / ``TMPDIR`` for config + workspace
+    - Windows' ``SystemRoot`` / temp / profile vars; without
+      ``SystemRoot`` Go-built TruffleHog can exit before producing
+      JSON on Windows even for a clean scan
     - locale vars for UTF-8 decoding
     - **Network trust**: ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` so
       verification against provider APIs works on distros that rely
@@ -56,6 +59,8 @@ def _scrubbed_subprocess_env() -> dict[str, str]:
     """
     keep = (
         "PATH", "HOME", "TMPDIR",
+        "SystemRoot", "WINDIR", "TEMP", "TMP",
+        "USERPROFILE", "LOCALAPPDATA", "APPDATA",
         "LANG", "LC_ALL", "LC_CTYPE",
         "SSL_CERT_FILE", "SSL_CERT_DIR",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
