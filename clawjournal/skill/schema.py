@@ -95,7 +95,7 @@ def _coerce_support(value: Any) -> int:
 def _derive_title(guidance: str) -> str:
     """Fallback short name from the rule text when the model omits a title."""
     words = re.split(r"\s+", (guidance or "").strip())
-    return " ".join(words[:8]).rstrip(".,;:—- ")
+    return " ".join(words[:4]).rstrip(".,;:—- ")
 
 
 def parse_rules(data: dict[str, Any]) -> list[SkillRule]:

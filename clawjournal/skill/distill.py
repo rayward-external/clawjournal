@@ -55,10 +55,10 @@ _SYSTEM = (
     "recognizable situation the user will hit again; the 'guidance' is one concrete, "
     "checkable action. Ground each rule in the given sessions and list their case ids in "
     "evidence_session_ids. "
-    "Give each rule a 'title': a short imperative name of 3-6 words that reads like a "
-    "skill name (e.g. 'Validate config value type before deploy', 'Verify patch actually "
-    "applied', 'Recompute badge from final state'). No trailing period; not a full "
-    "sentence; distinct from the longer 'guidance'. "
+    "Give each rule a 'title': a very short name of 2-4 words (aim for 2-3) that reads "
+    "like a command/skill name (e.g. 'Validate config types', 'Verify patch applied', "
+    "'Recompute final badge', 'Guard script secrets'). Title Case, no trailing period, "
+    "not a sentence; distinct from the longer 'guidance'. "
     "De-identify PII ONLY — never emit a person's name, email, URL, "
     "home path, secret, or verbatim shell command — but KEEP technical specifics (repo and "
     "module names, failure surfaces, tool categories, architectural patterns). "
@@ -67,7 +67,7 @@ _SYSTEM = (
 
 _RULE_SHAPE = (
     'Return JSON: {"rules": [{"kind": "avoid"|"do", '
-    '"title": "3-6 word imperative name", "trigger": "when this applies", '
+    '"title": "2-4 word name", "trigger": "when this applies", '
     '"guidance": "the rule (avoid X / do Y instead)", "why": "one line, grounded", '
     '"taxonomy": "<failure mode or empty>", "evidence_session_ids": ["case-01"]}]}'
 )

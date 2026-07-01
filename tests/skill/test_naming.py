@@ -21,9 +21,17 @@ def test_title_is_the_heading_guidance_moves_to_body():
 
 
 def test_untitled_rule_falls_back_to_guidance_without_duplicate_rule_line():
-    md = render.render_skill_md([_rule(title="", guidance="run the smoke test suite")], META)
-    assert "### run the smoke test suite" in md
-    assert "- **Rule:** run the smoke test suite" not in md    # no redundant echo of the heading
+    # guidance <=4 words: the derived heading equals it, so no redundant Rule line
+    md = render.render_skill_md([_rule(title="", guidance="run smoke tests")], META)
+    assert "### run smoke tests" in md
+    assert "- **Rule:** run smoke tests" not in md    # no redundant echo of the heading
+
+
+def test_untitled_long_guidance_keeps_full_text_in_body():
+    # guidance >4 words: heading is truncated, full rule preserved in the Rule line
+    md = render.render_skill_md([_rule(title="", guidance="reset local state before each run")], META)
+    assert "### reset local state before" in md              # 4-word heading
+    assert "- **Rule:** reset local state before each run" in md  # full guidance not lost
 
 
 def test_parse_rules_reads_title_and_falls_back():
@@ -34,7 +42,7 @@ def test_parse_rules_reads_title_and_falls_back():
          "guidance": "don't trust an unverified diff before building on it", "why": "w"},
     ]})
     assert rules[0].title == "Verify patch applied"
-    assert rules[1].title == "don't trust an unverified diff before building on"  # first 8 words
+    assert rules[1].title == "don't trust an unverified"  # first 4 words
 
 
 def test_store_round_trips_title(index_conn):
