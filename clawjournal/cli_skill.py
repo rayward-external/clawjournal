@@ -91,10 +91,17 @@ def _scan_source_filter() -> str | None:
 
 
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
-                   model: str | None = None, caller=None, now: datetime | None = None) -> SkillResult:
-    """Pure pipeline: select -> distill -> merge(store) -> gate -> render. Read-only."""
-    corpus = _select.select_skill_candidates(conn, window_days=window_days, now=now,
-                                             sources=_config_sources())
+                   model: str | None = None, caller=None, now: datetime | None = None,
+                   sources: list[str] | None = None) -> SkillResult:
+    """Pure pipeline: select -> distill -> merge(store) -> gate -> render. Read-only.
+
+    ``sources`` is the confirmed source scope (``run_skill`` passes
+    ``_config_sources()``); defaults to the coding-agent scope so the core stays
+    independent of the on-disk config for tests.
+    """
+    corpus = _select.select_skill_candidates(
+        conn, window_days=window_days, now=now,
+        sources=sources if sources is not None else list(FAILURE_VALUE_SOURCE_SCOPE))
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,
@@ -269,7 +276,8 @@ def run_skill(args) -> None:
     # 3-6. select -> distill -> merge -> gate -> render
     conn = open_index()
     try:
-        res = generate_skill(conn, window_days=window_days, backend=backend, model=model)
+        res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
+                             sources=_config_sources())
         for rule in res.rules:
             _store.upsert_seen(conn, rule)
         _print_preview(res)
