@@ -65,7 +65,8 @@ def test_install_writes_and_overwrites(tmp_path, monkeypatch):
     p = install.install_claude(md)
     assert p == tmp_path / ".claude" / "skills" / "clawjournal-lessons" / "SKILL.md"
     assert p.read_text().startswith("---\nname: clawjournal-lessons")
-    assert install.claude_skill_hash_path(p).exists()
+    assert install.INTEGRITY_PREFIX in p.read_text()          # self-verifying, no sidecar
+    assert not install.claude_skill_hash_path(p).exists()     # legacy sidecar retired
     # weekly re-run overwrites cleanly (atomic)
     install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
     assert "updated rule" in p.read_text()
@@ -90,23 +91,26 @@ def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch)
         install.install_claude(render.render_skill_md([_rule()], META))
 
 
-def test_install_claude_recovers_from_stale_sidecar(tmp_path, monkeypatch):
-    # #1: the .sha256 sidecar write can be interrupted separately from SKILL.md,
-    # leaving a stale hash. A re-run must regenerate (SKILL.md untouched), not brick
-    # every future run with a false "hand-edited" error.
+def test_install_claude_detects_mid_body_edit(tmp_path, monkeypatch):
+    # #2: a mid-body edit (integrity line intact at the end) must still be caught —
+    # the embedded hash covers the whole body, not just the trailing marker.
     monkeypatch.setenv("HOME", str(tmp_path))
     p = install.install_claude(render.render_skill_md([_rule()], META))
-    install.claude_skill_hash_path(p).write_text("deadbeef\n", encoding="utf-8")  # stale hash
-    p2 = install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
-    assert "updated rule" in p2.read_text()          # regenerated, not refused
+    text = p.read_text()
+    p.write_text(text.replace("premature 4x", "REWORDED BY USER"), encoding="utf-8")  # body edit
+    with pytest.raises(RuntimeError, match="hand-edited"):
+        install.install_claude(render.render_skill_md([_rule(guidance="v2")], META))
 
 
-def test_install_claude_recovers_when_sidecar_missing(tmp_path, monkeypatch):
+def test_install_claude_migrates_pre_integrity_file(tmp_path, monkeypatch):
+    # #1: a managed file from before the embedded-hash change (provenance marker, no
+    # integrity line, possibly a stale/absent sidecar) must regenerate, not brick.
     monkeypatch.setenv("HOME", str(tmp_path))
-    p = install.install_claude(render.render_skill_md([_rule()], META))
-    install.claude_skill_hash_path(p).unlink()       # sidecar write never landed
+    p = install.claude_skill_path()
+    p.parent.mkdir(parents=True)
+    p.write_text(render.render_skill_md([_rule()], META), encoding="utf-8")  # no integrity line
     install.install_claude(render.render_skill_md([_rule(guidance="v2")], META))
-    assert "v2" in p.read_text()
+    assert "v2" in p.read_text() and install.INTEGRITY_PREFIX in p.read_text()
 
 
 def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypatch):

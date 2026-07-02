@@ -42,14 +42,39 @@ class SkillResult:
     trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
 
 
-def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str]) -> list[SkillRule]:
+_SUPPORT_HALFLIFE_DAYS = 30.0  # a rule's effective support halves every 30 idle days
+
+
+def _decayed_support(rule: SkillRule, now: datetime) -> float:
+    """Support weighted by recency so a once-frequent, now-idle rule actually decays.
+
+    A rule seen THIS run (``last_seen`` empty, or freshly re-proposed) keeps its full
+    support; a stored rule not seen in weeks decays toward 0 and can be outranked by
+    currently-relevant lessons. Without this, ``support = MAX(support, …)`` is a
+    monotonic peak and the set never decays despite the README's promise.
+    """
+    if not rule.last_seen:
+        return float(rule.support)
+    try:
+        seen = datetime.fromisoformat(rule.last_seen)
+    except ValueError:
+        return float(rule.support)
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (now - seen).total_seconds() / 86400)
+    return rule.support * (0.5 ** (age_days / _SUPPORT_HALFLIFE_DAYS))
+
+
+def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str],
+                *, now: datetime | None = None) -> list[SkillRule]:
     """Merge existing + newly-distilled rules -> top-<=5 (replace the weakest).
 
-    Deduped by fingerprint; rejected fingerprints dropped; ranked by support then
-    recurred-this-run. **Interleaved across kinds** so the installed set keeps a
-    good+bad mix (D2) — otherwise 'do' rules (whose support signal is weaker than
-    'avoid' mode-recurrence) would be structurally crowded out over weeks.
+    Deduped by fingerprint; rejected fingerprints dropped; ranked by RECENCY-WEIGHTED
+    support (so stale peaks decay) then recurred-this-run. **Interleaved across kinds**
+    so the installed set keeps a good+bad mix (D2) — otherwise 'do' rules (whose
+    support signal is weaker than 'avoid' mode-recurrence) would be crowded out.
     """
+    clock = now or datetime.now(timezone.utc)
     new_fps = {_store.fingerprint(r) for r in new}
     pool: dict[str, SkillRule] = {}
     for r in list(existing) + list(new):  # new last -> refreshes support on ties
@@ -60,7 +85,11 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
             pool[fp] = r
 
     def _rank(rules: list[SkillRule]) -> list[SkillRule]:
-        return sorted(rules, key=lambda r: (r.support, _store.fingerprint(r) in new_fps), reverse=True)
+        def key(r: SkillRule):
+            fresh = _store.fingerprint(r) in new_fps  # re-proposed this run -> no decay
+            weight = float(r.support) if fresh else _decayed_support(r, clock)
+            return (weight, fresh)
+        return sorted(rules, key=key, reverse=True)
 
     avoid = _rank([r for r in pool.values() if r.kind == "avoid"])
     do = _rank([r for r in pool.values() if r.kind == "do"])
@@ -90,23 +119,35 @@ def _config_sources() -> list[str] | None:
 
 
 def _scan_source_filter() -> str | None:
+    # Reuse the canonical mapper so this can't drift from _config_sources. The scan
+    # API takes ONE source filter, so a single-source scope maps cleanly; 'both'/'all'
+    # index broadly (None) and scoring/selection still narrow via _config_sources().
+    from .config import load_config, source_scope_sources
+    scope = source_scope_sources(load_config().get("source"))
+    return scope[0] if scope is not None and len(scope) == 1 else None
+
+
+def _config_excluded_projects() -> list[str]:
+    """Projects the user has --exclude'd (same egress gate as export/share)."""
     from .config import load_config
-    src = load_config().get("source")
-    return None if (not src or src in ("all", "both", "auto")) else src
+    return list(load_config().get("excluded_projects") or [])
 
 
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
                    model: str | None = None, caller=None, now: datetime | None = None,
-                   sources: list[str] | None = None) -> SkillResult:
+                   sources: list[str] | None = None,
+                   excluded_projects: list[str] | None = None) -> SkillResult:
     """Pure pipeline: select -> distill -> merge(store) -> gate -> render. Read-only.
 
     ``sources`` is the confirmed source scope (``run_skill`` passes
     ``_config_sources()``); defaults to the coding-agent scope so the core stays
-    independent of the on-disk config for tests.
+    independent of the on-disk config for tests. ``excluded_projects`` mirrors the
+    export egress gate.
     """
     corpus = _select.select_skill_candidates(
         conn, window_days=window_days, now=now,
-        sources=sources if sources is not None else list(FAILURE_VALUE_SOURCE_SCOPE))
+        sources=sources if sources is not None else list(FAILURE_VALUE_SOURCE_SCOPE),
+        excluded_projects=excluded_projects)
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,
@@ -128,7 +169,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     rejected = _store.rejected_fingerprints(conn)
     existing = _store.load_kept(conn)
     prev_installed = _store.installed_fingerprints(conn)
-    merged = merge_rules(existing, fresh, rejected)
+    merged = merge_rules(existing, fresh, rejected, now=now or datetime.now(timezone.utc))
     # re-apply the external/exec hard-deny to the FULL install set (incl. store rules)
     rules, merged_blocked = _render.gate_rules(merged)
     blocked = blocked + merged_blocked
@@ -193,10 +234,26 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
             f"SELECT session_id FROM sessions WHERE {held_where}", held_params).fetchall()]
         blocked = _select._release_blocked_ids(conn, held_candidates, now=now) if held_candidates else set()
 
-        # Over-fetch by the held count so >= score_limit shareable rows survive the filter.
+        # Excluded projects must never be scored (egress) either — mirror the export
+        # gate. Treat them like held: gather their ids in the window and skip them,
+        # over-fetching so they can't starve shareable rows. (Guarded: usually empty.)
+        excluded_projects = _config_excluded_projects()
+        excluded_ids: set[str] = set()
+        if excluded_projects:
+            from .workbench.index import session_matches_excluded_projects
+            win_where = "review_status != 'segmented'" + (" AND start_time >= ?" if since else "")
+            for r in conn.execute(
+                    f"SELECT session_id, project, source FROM sessions WHERE {win_where}",
+                    ([since] if since else [])).fetchall():
+                if session_matches_excluded_projects(
+                        {"project": r["project"], "source": r["source"]}, excluded_projects):
+                    excluded_ids.add(r["session_id"])
+        skip = blocked | excluded_ids
+
+        # Over-fetch by the skip count so >= score_limit shareable rows survive the filter.
         fetched = query_unscored_sessions(
-            conn, limit=score_limit + len(blocked), source=_config_sources(), since=since)
-        shareable = [s for s in fetched if s["session_id"] not in blocked]
+            conn, limit=score_limit + len(skip), source=_config_sources(), since=since)
+        shareable = [s for s in fetched if s["session_id"] not in skip]
         unscored = shareable[:score_limit]
         if unscored:
             print(f"Scoring {len(unscored)} unscored session(s) in the window "
@@ -329,7 +386,7 @@ def run_skill(args) -> None:
     conn = open_index()
     try:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
-                             sources=_config_sources())
+                             sources=_config_sources(), excluded_projects=_config_excluded_projects())
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and
@@ -358,30 +415,38 @@ def run_skill(args) -> None:
                 print("Not installed.")
                 return
 
-        # 7. install + persist state
+        # 7. install each target independently, then persist state for whatever
+        # actually landed on disk. If one target fails after another succeeded, the
+        # rules ARE installed for the survivor, so the store MUST record them — else
+        # the next run mislabels every rule [NEW] and the trend snapshot is lost.
         targets = getattr(args, "target", None) or ["claude", "codex"]
         installed: list[str] = []
-        try:
-            if "claude" in targets:
-                installed.append(str(_install.install_claude(res.skill_md)))
-            if "codex" in targets:
-                installed.append(str(_install.install_codex(res.region)))
-        except (RuntimeError, OSError) as exc:
-            print(f"\nInstall failed: {exc}")
-            if installed:
-                print("  partially written: " + ", ".join(installed))
-            print("  the skill set was not recorded; fix the issue and re-run.")
-            sys.exit(1)
-        # mark_installed upserts + marks 'kept' (one write per rule — no separate seen loop).
-        _store.mark_installed(conn, res.rules)
-        # record this run's per-mode rates for next week's trend (§9/D9)
-        _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+        failures: list[str] = []
+        for name, fn, payload in (("claude", _install.install_claude, res.skill_md),
+                                  ("codex", _install.install_codex, res.region)):
+            if name not in targets:
+                continue
+            try:
+                installed.append(str(fn(payload)))
+            except (RuntimeError, OSError) as exc:
+                failures.append(f"{name}: {exc}")
+        if installed:
+            _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'
+            _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+        else:
+            _persist_seen()  # nothing landed -> at least keep 'seen' state for next run
     finally:
         conn.close()
 
-    print("\nInstalled:")
-    for p in installed:
-        print(f"  - {p}")
-    print("\nNote: these lessons reach your model provider when your agent loads them "
-          "(that's how any skill/CLAUDE.md works) — nothing is uploaded to us.")
-    print("Re-run weekly (`clawjournal skill`) to keep them fresh.")
+    if installed:
+        print("\nInstalled:")
+        for p in installed:
+            print(f"  - {p}")
+        print("\nNote: these lessons reach your model provider when your agent loads them "
+              "(that's how any skill/CLAUDE.md works) — nothing is uploaded to us.")
+        print("Re-run weekly (`clawjournal skill`) to keep them fresh.")
+    if failures:
+        print("\nInstall problems (fix and re-run):")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)

@@ -26,6 +26,7 @@ from ..benchmark.select import _parse_json_list
 from ..workbench.index import (
     FAILURE_VALUE_SOURCE_SCOPE,
     release_gate_blockers,
+    session_matches_excluded_projects,
 )
 
 DEFAULT_WINDOW_DAYS = 7
@@ -150,9 +151,15 @@ def select_skill_candidates(
     window_days: int = DEFAULT_WINDOW_DAYS,
     now: datetime | None = None,
     sources: tuple[str, ...] | list[str] | None = FAILURE_VALUE_SOURCE_SCOPE,
+    excluded_projects: list[str] | None = None,
     pool_cap: int = DEFAULT_POOL_CAP,
 ) -> SkillCorpus:
-    """Return the window's avoid + do candidates, hold-state-gated, capped."""
+    """Return the window's avoid + do candidates, hold-state-gated, capped.
+
+    ``excluded_projects`` mirrors the export/share egress gate: a session whose
+    project the user has ``--exclude``d never becomes a candidate and is never
+    counted, so its content is not sent to the distill model or installed.
+    """
     clock = now or datetime.now(timezone.utc)
     window_start_dt = clock - timedelta(days=window_days)
     window_start = window_start_dt.isoformat()
@@ -171,6 +178,12 @@ def select_skill_candidates(
             return parsed >= window_start_dt
         return bool(start_time) and str(start_time) >= window_start  # unparseable: prior behavior
 
+    def _keep(row: Any) -> bool:
+        if not _in_window(row["start_time"]):
+            return False
+        return not session_matches_excluded_projects(
+            {"project": row["project"], "source": row["source"]}, excluded_projects)
+
     cols = (
         "session_id, project, source, ai_failure_value_score, ai_quality_score, "
         "ai_failure_modes, ai_recovery_labels, ai_outcome_badge, "
@@ -185,8 +198,7 @@ def select_skill_candidates(
         "OR ai_outcome_badge IN ('failed','abandoned')) "
         "ORDER BY ai_failure_value_score DESC, start_time DESC"
     )
-    fail_rows = [r for r in conn.execute(fail_sql, [window_floor, *src]).fetchall()
-                 if _in_window(r["start_time"])]
+    fail_rows = [r for r in conn.execute(fail_sql, [window_floor, *src]).fetchall() if _keep(r)]
     succ_sql = (
         f"SELECT {cols} {base} AND ("
         "(ai_outcome_badge IN ('resolved','trivial') AND ai_quality_score >= 4) "
@@ -197,19 +209,19 @@ def select_skill_candidates(
         "            WHERE value IN ('self_recovered','user_corrected_recovery')))"
         ") ORDER BY ai_quality_score DESC, start_time DESC"
     )
-    succ_rows = [r for r in conn.execute(succ_sql, [window_floor, *src]).fetchall()
-                 if _in_window(r["start_time"])]
+    succ_rows = [r for r in conn.execute(succ_sql, [window_floor, *src]).fetchall() if _keep(r)]
 
     # eligible = the rate denominator; a SUPERSET of every session that can feed
     # mode_counter (the numerator), else a rate can exceed 100%. A candidate qualifies
     # by score, by outcome badge, or by failure_modes+recovery — so count any judge verdict.
+    # Excluded projects are dropped here too (they're not candidates).
     eligible_sql = (
-        f"SELECT session_id, start_time {base} AND (ai_failure_value_score IS NOT NULL "
+        f"SELECT session_id, start_time, project, source {base} AND (ai_failure_value_score IS NOT NULL "
         "OR ai_quality_score IS NOT NULL OR ai_outcome_badge IS NOT NULL "
         "OR ai_failure_modes IS NOT NULL)"
     )
     eligible_ids = [r["session_id"] for r in conn.execute(eligible_sql, [window_floor, *src]).fetchall()
-                    if _in_window(r["start_time"])]
+                    if _keep(r)]
 
     candidate_ids = [row["session_id"] for row in list(fail_rows) + list(succ_rows)]
     # One hold-state gate pass over the union (candidates are a subset of eligible).

@@ -40,6 +40,16 @@ def test_badge_only_null_score_session_keeps_rate_within_one(index_conn, ins):
     assert all(r <= 1.0 for r in corpus.mode_rates().values())
 
 
+def test_excluded_projects_are_not_candidates(index_conn, ins):
+    # #0: a session in an --exclude'd project must never be a candidate (egress gate).
+    ins(index_conn, "keep", source="claude", project="app", fvs=5, learning="x")
+    ins(index_conn, "drop", source="claude", project="client-acme", fvs=5, learning="x")
+    corpus = select_skill_candidates(index_conn, now=NOW, excluded_projects=["claude:client-acme"])
+    ids = {c.session_id for c in corpus.candidates}
+    assert ids == {"keep"}                          # excluded project dropped
+    assert corpus.eligible_scored == 1              # and dropped from the denominator too
+
+
 def test_parse_start_time_handles_odd_fractional_seconds():
     # Python 3.10's fromisoformat accepts only 3 or 6 fractional digits; 1/2/4/5/7+
     # must still parse (else recent sessions collapse to recency 0.01 and get dropped).

@@ -23,6 +23,30 @@ HASH_SALT_BYTES = 32
 API_TOKEN_BYTES = 32
 
 
+def atomic_write_text(path: Path, text: str, *, parents: bool = False) -> None:
+    """Write *text* to *path* atomically (tmp in the same dir + fsync + os.replace).
+
+    One shared helper so the skill installer, bundle export, and other writers don't
+    each carry a private copy that can drift on a durability fix. ``parents=True``
+    creates the parent directory first.
+    """
+    if parents:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _atomic_ensure(path: Path, byte_count: int, *, token_hex: bool) -> bytes:
     """Create `path` with random bytes if missing; otherwise read existing.
 

@@ -34,6 +34,18 @@ def test_replace_weakest():
     assert sum(g.startswith("old ") for g in guides) == 4        # one weak one displaced
 
 
+def test_recency_decays_stale_support_below_fresh():
+    # #4: a once-frequent but idle rule must decay so a currently-relevant rule can
+    # outrank it — without decay, MAX(support) would pin the stale peak on top forever.
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    stale = _r("stale peak", support=50, kind="avoid")
+    stale.last_seen = (now - timedelta(days=120)).isoformat()   # ~4 half-lives -> 50/16
+    fresh = _r("fresh rule", support=10, kind="avoid")          # last_seen "" -> seen now
+    merged = merge_rules([stale], [fresh], set(), now=now)
+    assert [r.guidance for r in merged][0] == "fresh rule"      # fresh outranks the stale peak
+
+
 def test_preserves_good_bad_mix():
     # 'avoid' rules carry high mode-recurrence support; 'do' rules get support=0.
     # A support-only merge would drop every 'do'; the interleave must keep both (D2).

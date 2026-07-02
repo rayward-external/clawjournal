@@ -11,11 +11,10 @@ re-run can't leave a half-written skill. We never write into a repo ``cwd``.
 
 from __future__ import annotations
 
-import os
-import tempfile
 import hashlib
 from pathlib import Path
 
+from ..paths import atomic_write_text
 from .render import SKILL_NAME
 
 BEGIN_MARKER = "<!-- BEGIN clawjournal-lessons (managed by `clawjournal skill`) -->"
@@ -39,20 +38,7 @@ def _sha256_text(text: str) -> str:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, str(path))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, text, parents=True)
 
 
 def upsert_region(existing: str, region_body: str) -> str:
@@ -71,40 +57,56 @@ def upsert_region(existing: str, region_body: str) -> str:
 
 
 PROVENANCE_MARK = "<!-- clawjournal-lessons:"
+INTEGRITY_PREFIX = "<!-- clawjournal-integrity sha256:"
 
 
-def _is_unmodified_managed(existing: str) -> bool:
-    """True if *existing* is our own generated skill with nothing appended.
+def _with_integrity(skill_md: str) -> str:
+    """Append a trailing integrity comment so the file is self-verifying (one write)."""
+    body = skill_md.rstrip("\n") + "\n"
+    return f"{body}{INTEGRITY_PREFIX}{_sha256_text(body)} -->\n"
 
-    Our SKILL.md always ends with the ``<!-- clawjournal-lessons: … -->`` provenance
-    comment. If the file still ends there, it is our untouched output — even when the
-    .sha256 sidecar is missing or stale (its write can be interrupted separately from
-    the SKILL.md write). This lets a re-run regenerate instead of bricking on a false
-    "hand-edited" error, while text appended after the comment still reads as edited.
+
+def _verify_integrity(existing: str) -> bool | None:
+    """Whether *existing* still matches its embedded integrity hash.
+
+    Returns True (untouched ours), False (a body edit or trailing append — the hash
+    no longer matches / content follows the comment), or None (no integrity line at
+    all, i.e. a pre-integrity file). Because the hash lives INSIDE the single SKILL.md
+    write, there is no second sidecar file to desync — so this both detects mid-body
+    edits (which a separate .sha256 could too) AND can never brick on a partial write.
     """
-    idx = existing.rfind(PROVENANCE_MARK)
-    if idx == -1:
-        return False
-    tail = existing[idx:]
-    close = tail.find("-->")
-    return close != -1 and tail[close + 3:].strip() == ""
+    marker = existing.rfind(INTEGRITY_PREFIX)
+    if marker == -1:
+        return None
+    close = existing.find("-->", marker)
+    if close == -1 or existing[close + 3:].strip() != "":
+        return False  # malformed, or content appended after the integrity comment
+    line_start = existing.rfind("\n", 0, marker) + 1
+    body = existing[:line_start]
+    recorded = existing[marker + len(INTEGRITY_PREFIX):close].strip()
+    return _sha256_text(body) == recorded
 
 
 def install_claude(skill_md: str) -> Path:
     path = claude_skill_path()
     if path.exists():
         existing = path.read_text(encoding="utf-8")
-        hash_path = claude_skill_hash_path(path)
-        recorded = hash_path.read_text(encoding="utf-8").strip() if hash_path.exists() else None
-        verified = recorded is not None and recorded == _sha256_text(existing)
-        if verified or _is_unmodified_managed(existing):
-            pass  # our own file (hash-verified, or unmodified despite a stale/missing sidecar)
-        elif PROVENANCE_MARK in existing:
+        integ = _verify_integrity(existing)
+        if integ is True:
+            pass  # our own file, untouched
+        elif integ is False:
             raise RuntimeError(f"Refusing to overwrite hand-edited Claude skill: {path}")
+        elif PROVENANCE_MARK in existing:
+            pass  # pre-integrity managed file (or legacy sidecar era) -> migrate forward
         else:
             raise RuntimeError(f"Refusing to overwrite non-ClawJournal Claude skill: {path}")
-    _atomic_write(path, skill_md)
-    _atomic_write(claude_skill_hash_path(path), _sha256_text(skill_md) + "\n")
+    _atomic_write(path, _with_integrity(skill_md))
+    # Integrity now lives in the file; retire any legacy .sha256 sidecar.
+    sidecar = claude_skill_hash_path(path)
+    try:
+        sidecar.unlink()
+    except OSError:
+        pass
     return path
 
 

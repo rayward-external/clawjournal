@@ -68,6 +68,7 @@ def _row_to_rule(row: sqlite3.Row) -> SkillRule:
         why=row["why"] or "", title=(row["title"] or ""),
         evidence_session_ids=[str(x) for x in ev],
         taxonomy=row["taxonomy"] or "", support=int(row["support"] or 0),
+        last_seen=(row["last_seen_at"] or ""),
     )
 
 

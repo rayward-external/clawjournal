@@ -10,6 +10,7 @@ def _wire(monkeypatch, unscored, held=()):
     calls = {"scan": [], "unscored": [], "scored": [], "score_kw": []}
     monkeypatch.setattr(cli_skill, "_scan_source_filter", lambda: None)
     monkeypatch.setattr(cli_skill, "_config_sources", lambda: ["claude", "codex"])
+    monkeypatch.setattr(cli_skill, "_config_excluded_projects", lambda: [])
     monkeypatch.setattr("clawjournal.cli._run_scan",
                         lambda source_filter=None: calls["scan"].append(source_filter))
 

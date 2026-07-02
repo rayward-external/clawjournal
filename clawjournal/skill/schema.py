@@ -42,6 +42,7 @@ class SkillRule:
     evidence_session_ids: list[str] = field(default_factory=list)
     taxonomy: str = ""      # the failure mode it targets (avoid) or "" (do)
     support: int = 0        # how many sessions this pattern recurred in
+    last_seen: str = ""     # ISO ts a stored rule was last seen ("" = seen this run)
 
     def display_title(self) -> str:
         """The heading to render; falls back to guidance when unnamed."""
@@ -141,19 +142,21 @@ def parse_rules(data: dict[str, Any]) -> list[SkillRule]:
 # --- deterministic hard-deny (prompt-injection backstop) --------------------
 
 _URL_RE = re.compile(r"\b(?:https?|ftp)://\S+|\bwww\.\S+\.\w", re.I)
-# Out-of-repo absolute paths / sensitive locations (not ordinary in-repo refs).
+# Out-of-repo ABSOLUTE paths / specific credential files. NB: we deliberately do NOT
+# deny bare dotfile names (.env / .ssh) — a lesson like "keep secrets in .env, never
+# commit it" is legitimate advice, and the anonymizer already strips real home paths.
 _OUT_OF_REPO_PATH_RE = re.compile(
-    r"(?:^|\s)(?:/Users/|/home/|/etc/|/var/|/root/|~/\.|[A-Za-z]:\\)\S+|\b\.ssh\b|\.aws/credentials|\.env\b", re.I
+    r"(?:^|\s)(?:/Users/|/home/|/etc/|/var/|/root/|~/\.|[A-Za-z]:\\)\S+|\.aws/credentials", re.I
 )
-# Literal shell / exfil commands.
-_SHELL_RE = re.compile(
-    r"\b(?:curl|wget|ssh|scp|nc|netcat|base64\s+-d|eval|sudo|chmod|chown|"
-    r"rm\s+-rf|bash\s+-c|sh\s+-c|powershell|invoke-webrequest|certutil)\b", re.I
-)
-_SHELL_META_RE = re.compile(r"\$\([^)]+\)|`[^`]*`|\|\s*(?:sh|bash)\b|&&\s*\w+|;\s*(?:curl|wget|rm|nc)\b")
-# tool / MCP ids the agent could be steered to call.
-_TOOL_ID_RE = re.compile(r"\bmcp__\w+|\btool[_-]?call\b", re.I)
-# secret-like tokens (long hex/base64, common key prefixes).
+# EXECUTABLE shell syntax only — command substitution, backticks, pipe-to-shell.
+# We do NOT deny bare command NAMES (eval/sudo/rm -rf/curl): an advisory "avoid eval
+# on untrusted input" safety lesson names the command it warns about, and a rule is
+# inert text in agent context — only actionable injection syntax is a real risk.
+_SHELL_META_RE = re.compile(r"\$\([^)]+\)|`[^`]*`|\|\s*(?:sh|bash)\b")
+# tool / MCP ids the agent could be steered to call (not the phrase "tool call").
+_TOOL_ID_RE = re.compile(r"\bmcp__\w+", re.I)
+# secret-like tokens (long hex/base64, common key prefixes) — kept strict: a leaked
+# secret is the worst outcome, and _scrub already redacts these before distill.
 _SECRET_RE = re.compile(
     r"\b(?:AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|"
     r"[A-Fa-f0-9]{40,}|[A-Za-z0-9+/]{40,}={0,2})\b"
@@ -161,7 +164,7 @@ _SECRET_RE = re.compile(
 
 _DENY = [
     ("url", _URL_RE), ("out_of_repo_path", _OUT_OF_REPO_PATH_RE),
-    ("shell_command", _SHELL_RE), ("shell_meta", _SHELL_META_RE),
+    ("shell_meta", _SHELL_META_RE),
     ("tool_id", _TOOL_ID_RE), ("secret_like", _SECRET_RE),
 ]
 
