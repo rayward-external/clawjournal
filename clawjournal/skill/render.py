@@ -56,6 +56,17 @@ def gate_secret_pii_per_rule(
     return kept, blocked
 
 
+def gate_has_scanner_error(issues: list[str]) -> bool:
+    """True if any gate issue is a scanner INFRA error rather than a content finding.
+
+    Colocated with ``gate_rendered`` so the classification stays in lock-step with the
+    message format it emits (rather than the caller sniffing prose across a module
+    boundary): a CONTENT finding is always formatted with a "match(es)"/"finding(s)"
+    count; anything else (missing binary, timeout, crash, scan failure) is infra.
+    """
+    return any(("match(es)" not in i) and ("finding(s)" not in i) for i in issues)
+
+
 def gate_rendered(text: str, *, run_trufflehog: bool = True) -> list[str]:
     """Return deterministic secret/PII/TruffleHog findings in *text* (empty = clean)."""
     issues: list[str] = []
@@ -142,3 +153,14 @@ def render_skill_md(rules: list[SkillRule], meta: dict[str, Any]) -> str:
 def render_agents_region(rules: list[SkillRule], meta: dict[str, Any]) -> str:
     """Body markdown for the Codex AGENTS.md managed region (no frontmatter)."""
     return _render_body(rules, meta)
+
+
+def render_targets(rules: list[SkillRule], meta: dict[str, Any]) -> tuple[str, str]:
+    """Build the shared body ONCE and return (Claude SKILL.md, Codex region).
+
+    The Claude and Codex outputs share the identical body, so callers use this to avoid
+    assembling it twice (or four times on the TruffleHog-pinpoint re-render path).
+    """
+    body = _render_body(rules, meta)
+    skill_md = f"---\nname: {SKILL_NAME}\ndescription: {SKILL_DESCRIPTION}\n---\n\n{body}"
+    return skill_md, body

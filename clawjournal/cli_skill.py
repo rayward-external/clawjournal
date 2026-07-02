@@ -189,25 +189,21 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     blocked = blocked + merged_blocked + secret_blocked
 
     if rules:
-        skill_md = _render.render_skill_md(rules, meta)
-        region = _render.render_agents_region(rules, meta)
+        skill_md, region = _render.render_targets(rules, meta)  # body built once
         gate_issues = _render.gate_rendered(skill_md)   # whole-doc, incl. TruffleHog (1 call)
         if gate_issues:
             # A scanner INFRA failure (missing binary, timeout, crash, not-installed)
             # must fail closed AS-IS — never run the per-rule pinpoint, which would
             # misattribute the same error to every rule and silently drop the whole set.
-            # A CONTENT finding is always formatted "... N match(es)" / "... N finding(s)";
-            # anything else is an infra error, regardless of the specific reason string.
-            scanner_error = any(("match(es)" not in i) and ("finding(s)" not in i)
-                                for i in gate_issues)
+            # Classification lives with the message producer (render.gate_rendered).
+            scanner_error = _render.gate_has_scanner_error(gate_issues)
             if not scanner_error:
                 # Real content finding TruffleHog caught that the fast per-rule regex
                 # missed: attribute it to a rule and drop that rule.
                 rules, tf_blocked = _render.gate_secret_pii_per_rule(rules, run_trufflehog=True)
                 if tf_blocked:
                     blocked = blocked + tf_blocked
-                    skill_md = _render.render_skill_md(rules, meta) if rules else ""
-                    region = _render.render_agents_region(rules, meta) if rules else ""
+                    skill_md, region = _render.render_targets(rules, meta) if rules else ("", "")
                     # Re-run the FULL gate incl. TruffleHog: a residual detector-only
                     # finding in the reduced document that is NOT attributable to a single
                     # surviving rule must still fail closed — never write flagged content.
@@ -237,7 +233,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
 
 def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
-                   score_limit: int, cfg: dict | None = None) -> None:
+                   score_limit: int, score_all: bool = False, cfg: dict | None = None) -> None:
     from .config import load_config
     cfg = cfg if cfg is not None else load_config()  # thread the scope/scorer lookups
     if do_scan:
@@ -291,20 +287,25 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
                     excluded_ids.add(r["session_id"])
         skip = blocked | excluded_ids
 
-        # Over-fetch by the skip count (so >= score_limit shareable rows survive the
-        # filter) PLUS one, so `len(shareable) > score_limit` can actually detect that
-        # more unscored sessions remain and warn the user to re-run / raise the cap.
-        fetched = query_unscored_sessions(
-            conn, limit=score_limit + len(skip) + 1, source=_config_sources(cfg), since=since)
+        # `--all` (score_all) scores the WHOLE history in one run, as the README/design
+        # promise — no per-run cap. A windowed run over-fetches by the skip count PLUS one
+        # so `len(shareable) > score_limit` can detect that more remain and warn.
+        if score_all:
+            fetched = query_unscored_sessions(
+                conn, limit=10**9, source=_config_sources(cfg), since=since)
+        else:
+            fetched = query_unscored_sessions(
+                conn, limit=score_limit + len(skip) + 1, source=_config_sources(cfg), since=since)
         shareable = [s for s in fetched if s["session_id"] not in skip]
-        unscored = shareable[:score_limit]
+        unscored = shareable if score_all else shareable[:score_limit]
         # Scoring uses the CONFIGURED scorer backend, independent of the distill
         # `--backend` — that flag tunes distillation only and must not silently
         # re-route the scoring fleet.
         scorer_backend = cfg.get("scorer_backend") or "auto"
         if unscored:
-            print(f"Scoring {len(unscored)} unscored session(s) in the window "
-                  f"(this uses your agent CLI)…")
+            where = ("in your whole history (first run — this can take a while)"
+                     if score_all else "in the window")
+            print(f"Scoring {len(unscored)} unscored session(s) {where} (this uses your agent CLI)…")
             for i, s in enumerate(unscored, 1):
                 sid = s["session_id"]
                 print(f"  [{i}/{len(unscored)}] {sid}", flush=True)
@@ -315,7 +316,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
                     continue
                 if isinstance(res, dict) and res.get("error"):
                     print(f"      (skipped: {res['error']})")
-        if len(shareable) > score_limit:
+        if not score_all and len(shareable) > score_limit:
             print(f"  hit the per-run score cap ({score_limit}); re-run or raise "
                   f"--score-limit to score more.")
     finally:
@@ -437,6 +438,7 @@ def run_skill(args) -> None:
         do_scan=not getattr(args, "no_scan", False),
         do_score=not getattr(args, "no_score", False),
         score_limit=score_limit,
+        score_all=getattr(args, "all", False),  # --all scores the whole history, uncapped
         cfg=cfg,
     )
 

@@ -206,9 +206,11 @@ def select_skill_candidates(
     succ_sql = (
         f"SELECT {cols} {base} AND ("
         "(ai_outcome_badge IN ('resolved','trivial') AND ai_quality_score >= 4) "
-        "OR (ai_failure_modes IS NOT NULL AND json_valid(ai_failure_modes) "
-        "AND json_array_length(ai_failure_modes) > 0 AND ai_recovery_labels IS NOT NULL "
-        "AND json_valid(ai_recovery_labels) "
+        # A clean recovery ('self_recovered'/'user_corrected_recovery') is a "what
+        # worked" lesson regardless of whether ai_failure_modes is populated — the old
+        # `json_array_length(ai_failure_modes) > 0` requirement dropped such a session
+        # from BOTH pools (the failures loop moves clean recoveries out).
+        "OR (ai_recovery_labels IS NOT NULL AND json_valid(ai_recovery_labels) "
         "AND EXISTS (SELECT 1 FROM json_each(ai_recovery_labels) "
         "            WHERE value IN ('self_recovered','user_corrected_recovery')))"
         ") ORDER BY ai_quality_score DESC, start_time DESC"

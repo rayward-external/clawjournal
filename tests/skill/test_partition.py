@@ -50,6 +50,16 @@ def test_excluded_projects_are_not_candidates(index_conn, ins):
     assert corpus.eligible_scored == 1              # and dropped from the denominator too
 
 
+def test_clean_recovery_without_modes_is_a_success_candidate(index_conn, ins):
+    # #2: badge=failed + a clean recovery + empty failure_modes must land in the 'do'
+    # pool (the failures loop moves clean recoveries out) — not vanish from both.
+    ins(index_conn, "rec", outcome="failed", recovery='["self_recovered"]',
+        learning="recovered by reproducing from a clean clone")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert "rec" in {c.session_id for c in corpus.successes}
+    assert "rec" not in {c.session_id for c in corpus.failures}
+
+
 def test_unparseable_start_time_is_excluded(index_conn, ins):
     # #2: an unparseable start_time can't be placed in the window; a lexicographic
     # fallback ('not-a-date' >= '2026-...') wrongly pulled it in — it must be excluded.
