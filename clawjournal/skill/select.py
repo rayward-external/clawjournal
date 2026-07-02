@@ -160,6 +160,8 @@ def select_skill_candidates(
     counted, so its content is not sent to the distill model or installed.
     """
     clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:  # _parse_start_time is always aware; don't crash on a naive now
+        clock = clock.replace(tzinfo=timezone.utc)
     window_start_dt = clock - timedelta(days=window_days)
     window_start = window_start_dt.isoformat()
     window_end = clock.isoformat()

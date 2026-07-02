@@ -39,6 +39,16 @@ def test_allows_explicit_backend_when_installed(monkeypatch):
     assert pf.preflight(backend="codex") == []
 
 
+def test_blocks_when_configured_scorer_backend_missing(monkeypatch):
+    # #0: scoring uses the configured scorer_backend; a broken one must be caught here,
+    # not silently produce zero scores after preflight passes.
+    _ok_env(monkeypatch, backends=("claude",),
+            cfg={"source": "all", "projects_confirmed": True, "scorer_backend": "codex"})
+    monkeypatch.setattr(pf.shutil, "which", lambda cmd: None if cmd == "codex" else f"/bin/{cmd}")
+    assert any("scorer backend" in p and "codex" in p for p in pf.preflight())
+    assert pf.preflight(check_scorer=False) == []          # skipped when --no-score
+
+
 def test_blocks_when_trufflehog_missing(monkeypatch):
     monkeypatch.delenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", raising=False)
     monkeypatch.setattr(pf, "load_config", lambda: {"source": "all", "projects_confirmed": True})

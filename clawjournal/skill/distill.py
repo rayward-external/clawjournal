@@ -84,9 +84,8 @@ def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
     return {c.session_id: f"case-{i:02d}" for i, c in enumerate(corpus.candidates, 1)}
 
 
-def _format_candidates(corpus: SkillCorpus, anon: Anonymizer) -> str:
+def _format_candidates(corpus: SkillCorpus, anon: Anonymizer, aliases: dict[str, str]) -> str:
     lines: list[str] = []
-    aliases = _candidate_aliases(corpus)
     if corpus.mode_recurrence:
         top = ", ".join(f"{m}×{n}" for m, n in list(corpus.mode_recurrence.items())[:8])
         lines.append(f"Recurring failure modes this window: {top}\n")
@@ -95,8 +94,7 @@ def _format_candidates(corpus: SkillCorpus, anon: Anonymizer) -> str:
             f"- session {aliases[c.session_id]} [{c.kind}] source={c.source} "
             f"project={_scrub(c.project, anon)}\n"
             f"  support_count={c.support_count} impact={c.impact:.2f} "
-            f"recency={c.recency:.3f} rank_score={c.rank_score:.3f} "
-            f"source_agents={[c.source]}\n"
+            f"recency={c.recency:.3f} rank_score={c.rank_score:.3f}\n"
             f"  failure_modes={c.failure_modes} recovery={c.recovery_labels} "
             f"resolution={c.resolution} failure_value={c.failure_value} quality={c.quality}\n"
             f"  title={_scrub(c.title, anon)}\n"
@@ -106,10 +104,10 @@ def _format_candidates(corpus: SkillCorpus, anon: Anonymizer) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(corpus: SkillCorpus, anon: Anonymizer) -> str:
+def build_prompt(corpus: SkillCorpus, anon: Anonymizer, aliases: dict[str, str]) -> str:
     return (
         "# Distill up to 5 durable skills from this user's own scored sessions.\n\n"
-        f"{_format_candidates(corpus, anon)}\n\n{_RULE_SHAPE}"
+        f"{_format_candidates(corpus, anon, aliases)}\n\n{_RULE_SHAPE}"
     )
 
 
@@ -147,7 +145,8 @@ def distill_skills(
     if corpus.is_empty():
         return []
     anon = Anonymizer(extra_usernames=list(load_config().get("redact_usernames", []) or []))
-    task = build_prompt(corpus, anon)
+    aliases = _candidate_aliases(corpus)  # computed once, reused for evidence back-mapping
+    task = build_prompt(corpus, anon, aliases)
     try:
         # DefaultCaller() resolves the backend (a process/env lookup that can raise
         # when no backend is installed), so build it INSIDE the degrade-gracefully guard.
@@ -162,7 +161,6 @@ def distill_skills(
         except ValueError:
             return []
     rules = parse_rules(data)
-    aliases = _candidate_aliases(corpus)
     allowed_aliases = set(aliases.values())
     # backfill support from recurrence where the rule named a mode
     for r in rules:

@@ -18,7 +18,8 @@ def installed_backends() -> list[str]:
     return [b for b in AUTO_BACKEND_FALLBACK_ORDER if shutil.which(BACKEND_COMMANDS.get(b, b))]
 
 
-def preflight(*, require_trufflehog: bool = True, backend: str = "auto") -> list[str]:
+def preflight(*, require_trufflehog: bool = True, backend: str = "auto",
+              check_scorer: bool = True) -> list[str]:
     """Return a list of blocking problems (empty = good to go)."""
     problems: list[str] = []
     cfg = load_config()
@@ -35,6 +36,18 @@ def preflight(*, require_trufflehog: bool = True, backend: str = "auto") -> list
             problems.append(f"{requested} backend is not on PATH (missing `{command}`).")
     elif not installed_backends():
         problems.append("No agent backend found on PATH (need `claude` or `codex`).")
+    # Scoring uses the CONFIGURED scorer backend (not the distill `--backend`); validate
+    # it too, or a broken scorer passes preflight and then silently scores nothing.
+    if check_scorer:
+        scorer = (cfg.get("scorer_backend") or "").strip().lower()
+        if scorer and scorer not in ("none", "auto"):
+            cmd = BACKEND_COMMANDS.get(scorer)
+            if not cmd:
+                problems.append(f"Configured scorer backend is unsupported: {scorer}")
+            elif not shutil.which(cmd):
+                problems.append(
+                    f"Configured scorer backend `{scorer}` is not on PATH (missing `{cmd}`). "
+                    f"Fix: clawjournal config --scorer-backend <installed> (or run with --no-score).")
     if require_trufflehog and not trufflehog.is_bypassed() and not trufflehog.is_available():
         problems.append(
             "TruffleHog is not installed (the secret-scan gate). Run: "

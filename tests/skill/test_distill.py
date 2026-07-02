@@ -59,7 +59,8 @@ def test_prompt_is_scrubbed_before_llm():
     corpus = SkillCorpus(window_start="a", window_end="b",
                          failures=[SkillCandidate("raw-/Users/kai/project", "proj", "codex", "avoid",
                                    learning_summary="leaked AKIAIOSFODNN7EXAMPLE in a config")])
-    prompt = build_prompt(corpus, Anonymizer())
+    from clawjournal.skill.distill import _candidate_aliases
+    prompt = build_prompt(corpus, Anonymizer(), _candidate_aliases(corpus))
     assert "AKIAIOSFODNN7EXAMPLE" not in prompt
     assert "raw-/Users/kai/project" not in prompt
     assert "case-01" in prompt

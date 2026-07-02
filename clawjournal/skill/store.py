@@ -32,6 +32,12 @@ def fingerprint(rule: SkillRule) -> str:
 
 
 def ensure_table(conn: sqlite3.Connection) -> None:
+    # Fast path: PRAGMA is a cheap read (empty on a missing table). If the table already
+    # has the migrated column, return WITHOUT the CREATE/ALTER/commit — this runs at the
+    # top of every store call (incl. read-only ones), so skip the per-call write+commit.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(skill_rules)")}
+    if "title" in cols:
+        return
     conn.execute(
         """CREATE TABLE IF NOT EXISTS skill_rules (
             fingerprint  TEXT PRIMARY KEY,

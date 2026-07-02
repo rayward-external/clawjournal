@@ -110,34 +110,37 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
     return out
 
 
-def _config_sources() -> list[str] | None:
+def _config_sources(cfg: dict | None = None) -> list[str] | None:
     """The corpus source scope the user confirmed (§4.4).
 
     Delegates to the canonical ``config.source_scope_sources`` so legacy ``both``
     stays Claude+Codex (it must NOT widen to opencode/openclaw, which were never
     confirmed). ``all``/``auto``/unset map to None there → the coding-agent scope
-    the skill targets.
+    the skill targets. Pass ``cfg`` to reuse an already-loaded config.
     """
     from .config import load_config, source_scope_sources
-    scope = source_scope_sources(load_config().get("source"))
+    cfg = cfg if cfg is not None else load_config()
+    scope = source_scope_sources(cfg.get("source"))
     if scope is None:                       # all / auto / unset
         return list(FAILURE_VALUE_SOURCE_SCOPE)
     return list(scope)                      # 'both' -> claude+codex; else the single source
 
 
-def _scan_source_filter() -> str | None:
+def _scan_source_filter(cfg: dict | None = None) -> str | None:
     # Reuse the canonical mapper so this can't drift from _config_sources. The scan
     # API takes ONE source filter, so a single-source scope maps cleanly; 'both'/'all'
     # index broadly (None) and scoring/selection still narrow via _config_sources().
     from .config import load_config, source_scope_sources
-    scope = source_scope_sources(load_config().get("source"))
+    cfg = cfg if cfg is not None else load_config()
+    scope = source_scope_sources(cfg.get("source"))
     return scope[0] if scope is not None and len(scope) == 1 else None
 
 
-def _config_excluded_projects() -> list[str]:
+def _config_excluded_projects(cfg: dict | None = None) -> list[str]:
     """Projects the user has --exclude'd (same egress gate as export/share)."""
     from .config import load_config
-    return list(load_config().get("excluded_projects") or [])
+    cfg = cfg if cfg is not None else load_config()
+    return list(cfg.get("excluded_projects") or [])
 
 
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
@@ -184,14 +187,24 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     rules, secret_blocked = _render.gate_secret_pii_per_rule(rules)
     blocked = blocked + merged_blocked + secret_blocked
 
-    merged_fps = {_store.fingerprint(r) for r in rules}
-    added_fps = merged_fps - prev_installed
-    dropped = [r for r in existing if _store.fingerprint(r) in (prev_installed - merged_fps)]
-
     if rules:
         skill_md = _render.render_skill_md(rules, meta)
         region = _render.render_agents_region(rules, meta)
-        gate_issues = _render.gate_rendered(skill_md)
+        gate_issues = _render.gate_rendered(skill_md)   # whole-doc, incl. TruffleHog (1 call)
+        if gate_issues:
+            # TruffleHog caught something the fast per-rule regex missed (a detector-only
+            # key). Pinpoint + drop the offending rule(s) with a per-rule TruffleHog pass
+            # so we don't dead-end the whole install with no rejectable fingerprint.
+            rules, tf_blocked = _render.gate_secret_pii_per_rule(rules, run_trufflehog=True)
+            if tf_blocked:
+                blocked = blocked + tf_blocked
+                skill_md = _render.render_skill_md(rules, meta) if rules else ""
+                region = _render.render_agents_region(rules, meta) if rules else ""
+                gate_issues = _render.gate_rendered(skill_md) if rules else []
+
+    merged_fps = {_store.fingerprint(r) for r in rules}
+    added_fps = merged_fps - prev_installed
+    dropped = [r for r in existing if _store.fingerprint(r) in (prev_installed - merged_fps)]
 
     # week-over-week recurrence signal (§9/D9): current vs last snapshot, for the
     # failure modes the current "avoid" rules target. Directional, not powered.
@@ -209,10 +222,12 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
 def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
                    score_limit: int) -> None:
+    from .config import load_config
+    cfg = load_config()  # read once, thread through the scope/scorer lookups below
     if do_scan:
         print("Indexing sessions…")
         from .cli import _run_scan
-        _run_scan(source_filter=_scan_source_filter())
+        _run_scan(source_filter=_scan_source_filter(cfg))
     if not do_score:
         return
     from .cli import _score_single_session
@@ -247,7 +262,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
         # Excluded projects must never be scored (egress) either — mirror the export
         # gate. Treat them like held: gather their ids in the window and skip them,
         # over-fetching so they can't starve shareable rows. (Guarded: usually empty.)
-        excluded_projects = _config_excluded_projects()
+        excluded_projects = _config_excluded_projects(cfg)
         excluded_ids: set[str] = set()
         if excluded_projects:
             from .workbench.index import session_matches_excluded_projects
@@ -262,21 +277,24 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
 
         # Over-fetch by the skip count so >= score_limit shareable rows survive the filter.
         fetched = query_unscored_sessions(
-            conn, limit=score_limit + len(skip), source=_config_sources(), since=since)
+            conn, limit=score_limit + len(skip), source=_config_sources(cfg), since=since)
         shareable = [s for s in fetched if s["session_id"] not in skip]
         unscored = shareable[:score_limit]
         # Scoring uses the CONFIGURED scorer backend, independent of the distill
         # `--backend` — that flag tunes distillation only and must not silently
         # re-route the scoring fleet.
-        from .config import load_config
-        scorer_backend = load_config().get("scorer_backend") or "auto"
+        scorer_backend = cfg.get("scorer_backend") or "auto"
         if unscored:
             print(f"Scoring {len(unscored)} unscored session(s) in the window "
                   f"(this uses your agent CLI)…")
             for i, s in enumerate(unscored, 1):
                 sid = s["session_id"]
                 print(f"  [{i}/{len(unscored)}] {sid}", flush=True)
-                res = _score_single_session(conn, sid, backend=scorer_backend)
+                try:
+                    res = _score_single_session(conn, sid, backend=scorer_backend)
+                except Exception as exc:  # e.g. sqlite 'database is locked' vs the daemon
+                    print(f"      (skipped: {exc.__class__.__name__}: {exc})")
+                    continue
                 if isinstance(res, dict) and res.get("error"):
                     print(f"      (skipped: {res['error']})")
         if len(shareable) > score_limit:
@@ -381,7 +399,7 @@ def run_skill(args) -> None:
     # 0. preflight (§7.0)
     if not getattr(args, "skip_preflight", False):
         from .skill.preflight import preflight
-        problems = preflight(backend=backend)
+        problems = preflight(backend=backend, check_scorer=not getattr(args, "no_score", False))
         if problems:
             print("Cannot generate skills yet:")
             for p in problems:
@@ -401,8 +419,11 @@ def run_skill(args) -> None:
     # 3-6. select -> distill -> merge -> gate -> render
     conn = open_index()
     try:
+        from .config import load_config
+        run_cfg = load_config()  # one read for both scope lookups
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
-                             sources=_config_sources(), excluded_projects=_config_excluded_projects())
+                             sources=_config_sources(run_cfg),
+                             excluded_projects=_config_excluded_projects(run_cfg))
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and
