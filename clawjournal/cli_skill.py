@@ -192,10 +192,13 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
         region = _render.render_agents_region(rules, meta)
         gate_issues = _render.gate_rendered(skill_md)   # whole-doc, incl. TruffleHog (1 call)
         if gate_issues:
-            # A scanner INFRA failure (blocking with no finding: missing binary, timeout,
-            # crash) must fail closed AS-IS — never run the per-rule pinpoint, which would
+            # A scanner INFRA failure (missing binary, timeout, crash, not-installed)
+            # must fail closed AS-IS — never run the per-rule pinpoint, which would
             # misattribute the same error to every rule and silently drop the whole set.
-            scanner_error = any(("error" in i) or ("scan failed" in i) for i in gate_issues)
+            # A CONTENT finding is always formatted "... N match(es)" / "... N finding(s)";
+            # anything else is an infra error, regardless of the specific reason string.
+            scanner_error = any(("match(es)" not in i) and ("finding(s)" not in i)
+                                for i in gate_issues)
             if not scanner_error:
                 # Real content finding TruffleHog caught that the fast per-rule regex
                 # missed: attribute it to a rule and drop that rule.
@@ -231,9 +234,9 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
 
 def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
-                   score_limit: int) -> None:
+                   score_limit: int, cfg: dict | None = None) -> None:
     from .config import load_config
-    cfg = load_config()  # read once, thread through the scope/scorer lookups below
+    cfg = cfg if cfg is not None else load_config()  # thread the scope/scorer lookups
     if do_scan:
         print("Indexing sessions…")
         from .cli import _run_scan
@@ -410,10 +413,13 @@ def run_skill(args) -> None:
               if hit else f"No rule with fingerprint {args.reject}.")
         return
 
+    from .config import load_config
+    cfg = load_config()  # read the config ONCE and thread it through preflight/scan/select
+
     # 0. preflight (§7.0)
     if not getattr(args, "skip_preflight", False):
         from .skill.preflight import preflight
-        problems = preflight(backend=backend, check_scorer=not getattr(args, "no_score", False))
+        problems = preflight(backend=backend, check_scorer=not getattr(args, "no_score", False), cfg=cfg)
         if problems:
             print("Cannot generate skills yet:")
             for p in problems:
@@ -428,16 +434,15 @@ def run_skill(args) -> None:
         do_scan=not getattr(args, "no_scan", False),
         do_score=not getattr(args, "no_score", False),
         score_limit=score_limit,
+        cfg=cfg,
     )
 
     # 3-6. select -> distill -> merge -> gate -> render
     conn = open_index()
     try:
-        from .config import load_config
-        run_cfg = load_config()  # one read for both scope lookups
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
-                             sources=_config_sources(run_cfg),
-                             excluded_projects=_config_excluded_projects(run_cfg))
+                             sources=_config_sources(cfg),
+                             excluded_projects=_config_excluded_projects(cfg))
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and
@@ -460,7 +465,10 @@ def run_skill(args) -> None:
                 _persist_seen()
                 print("\nRe-run with --yes to install (or --preview to just look).")
                 return
-            ans = input(f"\nInstall these {len(res.rules)} rule(s) for Claude Code + Codex? [y/N] ")
+            try:
+                ans = input(f"\nInstall these {len(res.rules)} rule(s) for Claude Code + Codex? [y/N] ")
+            except EOFError:  # Ctrl-D / stdin closed -> treat as a graceful decline
+                ans = ""
             if ans.strip().lower() not in ("y", "yes"):
                 _persist_seen()
                 print("Not installed.")

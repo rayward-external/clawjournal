@@ -60,7 +60,9 @@ def test_scanner_error_fails_closed_without_per_rule_misattribution(index_conn, 
     def fake_per_rule(rules, **kw):
         calls["per_rule"] += 1
         return rules, []
-    monkeypatch.setattr(render, "gate_rendered", lambda text, **kw: ["trufflehog: trufflehog-error"])
+    # a missing binary reason ("trufflehog-not-installed") has no match(es)/finding(s)
+    # marker, so it must still be classified as an infra error (not a content finding).
+    monkeypatch.setattr(render, "gate_rendered", lambda text, **kw: ["trufflehog: trufflehog-not-installed"])
     monkeypatch.setattr(render, "gate_secret_pii_per_rule", fake_per_rule)
     res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
     assert res.gate_issues            # blocked (fail closed)

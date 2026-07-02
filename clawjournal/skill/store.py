@@ -69,6 +69,8 @@ def _row_to_rule(row: sqlite3.Row) -> SkillRule:
         ev = json.loads(row["evidence_json"] or "[]")
     except (TypeError, json.JSONDecodeError):
         ev = []
+    if not isinstance(ev, list):  # valid-JSON non-array (tampered/legacy) -> don't iterate
+        ev = []
     return SkillRule(
         kind=row["kind"], trigger=row["trigger"] or "", guidance=row["guidance"],
         why=row["why"] or "", title=(row["title"] or ""),
@@ -190,8 +192,10 @@ def last_mode_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, fl
     if not row:
         return None
     try:
-        rates = {str(k): float(v) for k, v in json.loads(row[2] or "{}").items()}
-    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = json.loads(row[2] or "{}")
+        # valid-JSON non-object (tampered/legacy) has no .items() -> AttributeError
+        rates = {str(k): float(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
         rates = {}
     return (row[0], int(row[1] or 0), rates)
 

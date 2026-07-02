@@ -160,19 +160,25 @@ def distill_skills(
         data = call(system_prompt=_SYSTEM, task_prompt=task)
     except Exception as exc:  # backend/timeout/parse failure -> degrade gracefully
         logger.warning("skill distill call failed: %s", exc)
-        # The frontier default (e.g. Opus) may be unavailable on the user's plan; before
-        # giving up, retry once on the backend's fast default so distill still works for
-        # users who could distill before this PR raised the default model.
-        if caller is None and model is None:
-            try:
-                resolved = resolve_backend(backend)
-                fb = DefaultCaller(backend=resolved, model=default_model_for_backend(resolved))
-                data = fb(system_prompt=_SYSTEM, task_prompt=task)
-                print(f"note: the frontier distill model was unavailable; fell back to "
-                      f"{fb.model}. Pass --model to pick one explicitly.")
-            except Exception:
-                return []
-        else:
+        # The frontier default (e.g. Opus) may be unavailable on the user's plan; retry
+        # once on the backend's fast default so distill still works. But ONLY if that is
+        # a DIFFERENT model — otherwise (e.g. Codex, whose distill default already IS the
+        # fast model) we would just re-run the identical ~240s call for nothing.
+        if caller is not None or model is not None:
+            return []
+        try:
+            resolved = resolve_backend(backend)
+        except Exception:
+            return []
+        frontier = default_distill_model_for_backend(resolved)  # what the 1st try used
+        fast = default_model_for_backend(resolved)
+        if not fast or fast == frontier:
+            return []
+        try:
+            data = DefaultCaller(backend=resolved, model=fast)(system_prompt=_SYSTEM, task_prompt=task)
+            print(f"note: the frontier distill model was unavailable; fell back to {fast}. "
+                  f"Pass --model to pick one explicitly.")
+        except Exception:
             return []
     if not isinstance(data, dict):
         try:

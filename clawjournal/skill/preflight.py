@@ -19,10 +19,10 @@ def installed_backends() -> list[str]:
 
 
 def preflight(*, require_trufflehog: bool = True, backend: str = "auto",
-              check_scorer: bool = True) -> list[str]:
+              check_scorer: bool = True, cfg: dict | None = None) -> list[str]:
     """Return a list of blocking problems (empty = good to go)."""
     problems: list[str] = []
-    cfg = load_config()
+    cfg = cfg if cfg is not None else load_config()
     if not cfg.get("source"):
         problems.append("Source scope is not set. Run: clawjournal config --source all")
     if not cfg.get("projects_confirmed"):

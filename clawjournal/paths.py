@@ -32,9 +32,12 @@ def atomic_write_text(path: Path, text: str, *, parents: bool = False) -> None:
     """
     if parents:
         path.parent.mkdir(parents=True, exist_ok=True)
-    # No leading dot: keep the temp name the same length as the target so a long but
-    # legal output filename can't tip mkstemp over the OS NAME_MAX limit.
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+    # mkstemp appends random chars + the suffix, so the temp name is always LONGER than
+    # the target. Cap the visible stem so a long-but-legal output filename can't tip
+    # mkstemp over the OS NAME_MAX (255 on most filesystems); ~200 leaves ample room for
+    # the random component and ".tmp".
+    stem = path.name[:200]
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{stem}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)

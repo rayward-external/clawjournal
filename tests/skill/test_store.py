@@ -26,6 +26,24 @@ def test_install_stamps_fresh_rule_last_seen_now(index_conn):
     assert row["last_seen_at"] == "2026-06-01T00:00:00+00:00"
 
 
+def test_load_kept_survives_non_array_evidence_json(index_conn):
+    # #4: a valid-JSON non-array evidence_json (tampered/legacy) must not crash load_kept.
+    store.mark_installed(index_conn, [_r("g")])
+    index_conn.execute("UPDATE skill_rules SET evidence_json = '5' WHERE guidance = 'g'")
+    index_conn.commit()
+    kept = store.load_kept(index_conn)            # must not raise TypeError
+    assert kept[0].evidence_session_ids == []
+
+
+def test_last_mode_snapshot_survives_non_object_rates(index_conn):
+    # #5: a valid-JSON non-object rates_json must not crash last_mode_snapshot (.items()).
+    store.save_mode_snapshot(index_conn, {"execution_error": 0.1}, 10)
+    index_conn.execute("UPDATE skill_mode_snapshots SET rates_json = '[1,2]'")
+    index_conn.commit()
+    snap = store.last_mode_snapshot(index_conn)   # must not raise AttributeError
+    assert snap is not None and snap[2] == {}
+
+
 def test_fingerprint_stable_and_distinct():
     assert store.fingerprint(_r("Run  the Test  Suite First")) == store.fingerprint(_r("run the test suite first"))
     assert store.fingerprint(_r()) != store.fingerprint(_r("do a thing", kind="do"))
