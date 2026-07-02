@@ -24,6 +24,14 @@ def _rule(**kw):
     return SkillRule(**base)
 
 
+def test_do_rule_never_carries_a_failure_taxonomy():
+    # #3: taxonomy names a FAILURE mode; a 'do' (success) rule must not keep one, or it
+    # renders under "Do (what worked)" tagged with a failure mode + inflated recurrence.
+    rules = parse_rules({"rules": [{"kind": "do", "title": "x", "trigger": "t",
+                                    "guidance": "g", "why": "w", "taxonomy": "execution_error"}]})
+    assert rules[0].kind == "do" and rules[0].taxonomy == ""
+
+
 def test_distill_schema_is_codex_strict():
     # #0: Codex --output-schema rejects an additionalProperties:false object unless
     # EVERY property is in `required`; otherwise the default Codex distill is a no-op.

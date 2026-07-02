@@ -127,6 +127,17 @@ def test_install_claude_migrates_pre_integrity_file(tmp_path, monkeypatch):
     assert "v2" in p.read_text() and install.INTEGRITY_PREFIX in p.read_text()
 
 
+def test_upsert_region_ignores_stray_end_marker_before_begin():
+    # #2: a stray END marker in the user's own notes (before any BEGIN) must not defeat
+    # replacement, or every run appends a fresh block and AGENTS.md grows unboundedly.
+    existing = f"my notes {install.END_MARKER} more notes\n"
+    once = install.upsert_region(existing, "BODY1")
+    twice = install.upsert_region(once, "BODY2")
+    assert twice.count(install.BEGIN_MARKER) == 1        # exactly one managed block
+    assert "BODY2" in twice and "BODY1" not in twice     # replaced, not duplicated
+    assert "my notes" in twice                            # user content preserved
+
+
 def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     agents = tmp_path / ".codex" / "AGENTS.md"

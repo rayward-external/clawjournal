@@ -201,6 +201,13 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
                 skill_md = _render.render_skill_md(rules, meta) if rules else ""
                 region = _render.render_agents_region(rules, meta) if rules else ""
                 gate_issues = _render.gate_rendered(skill_md) if rules else []
+            else:
+                # The finding reproduces on NO individual rule — it is a context artifact
+                # of the concatenated doc / static frontmatter (which is constant-clean).
+                # The per-rule TruffleHog pass just cleared every rule, so DON'T dead-end
+                # the install (which would persist nothing and leave no fingerprint to
+                # --reject, re-blocking every future run).
+                gate_issues = []
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
@@ -275,9 +282,11 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
                     excluded_ids.add(r["session_id"])
         skip = blocked | excluded_ids
 
-        # Over-fetch by the skip count so >= score_limit shareable rows survive the filter.
+        # Over-fetch by the skip count (so >= score_limit shareable rows survive the
+        # filter) PLUS one, so `len(shareable) > score_limit` can actually detect that
+        # more unscored sessions remain and warn the user to re-run / raise the cap.
         fetched = query_unscored_sessions(
-            conn, limit=score_limit + len(skip), source=_config_sources(cfg), since=since)
+            conn, limit=score_limit + len(skip) + 1, source=_config_sources(cfg), since=since)
         shareable = [s for s in fetched if s["session_id"] not in skip]
         unscored = shareable[:score_limit]
         # Scoring uses the CONFIGURED scorer backend, independent of the distill

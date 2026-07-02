@@ -254,7 +254,8 @@ def select_skill_candidates(
         if not _has_evidence(row["ai_learning_summary"], row["ai_score_reason"], modes):
             continue  # never invent a confident rule from a bare low score
         support = max([mode_counter[m] for m in modes] or [1])
-        impact = float(row["ai_failure_value_score"] or 3)
+        fv = row["ai_failure_value_score"]
+        impact = float(fv if fv is not None else 3)  # 0 is a real score, not "unscored"
         recency = _recency_weight(row["start_time"], now=clock)
         failures.append(SkillCandidate(
             session_id=row["session_id"], project=row["project"], source=row["source"],
@@ -288,7 +289,8 @@ def select_skill_candidates(
             support = max([recovery_counter[r] for r in recovery] or [1])
         else:
             support = outcome_counter[row["ai_outcome_badge"]] or 1
-        impact = float(row["ai_quality_score"] or 3)
+        q = row["ai_quality_score"]
+        impact = float(q if q is not None else 3)  # 0 is a real score, not "unscored"
         recency = _recency_weight(row["start_time"], now=clock)
         successes.append(SkillCandidate(
             session_id=row["session_id"], project=row["project"], source=row["source"],

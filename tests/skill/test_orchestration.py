@@ -41,7 +41,7 @@ def test_weekly_scans_and_scores_last_7_days(monkeypatch):
     _ensure_corpus(7, do_scan=True, do_score=True, score_limit=25)
     assert calls["scan"] == [None]                       # scan ran
     assert calls["unscored"][0]["since"] is not None     # bounded 7-day window
-    assert calls["unscored"][0]["limit"] == 25           # score cap honored (no held rows)
+    assert calls["unscored"][0]["limit"] == 26           # score_limit + 0 held + 1 probe
     assert calls["scored"] == ["a", "b"]                 # each unscored session scored
 
 
@@ -59,7 +59,7 @@ def test_held_sessions_are_not_scored(monkeypatch):
     calls = _wire(monkeypatch, [{"session_id": "ok"}, {"session_id": "held"}], held=["held"])
     _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25)
     assert calls["scored"] == ["ok"]                     # 'held' filtered out before scoring
-    assert calls["unscored"][0]["limit"] == 26           # over-fetch by the held count (25 + 1)
+    assert calls["unscored"][0]["limit"] == 27           # 25 + 1 held + 1 probe
 
 
 def test_held_rows_do_not_starve_shareable_ones(monkeypatch):
@@ -67,7 +67,7 @@ def test_held_rows_do_not_starve_shareable_ones(monkeypatch):
     page = [{"session_id": "h1"}, {"session_id": "h2"}, {"session_id": "ok"}]
     calls = _wire(monkeypatch, page, held=["h1", "h2"])
     _ensure_corpus(7, do_scan=False, do_score=True, score_limit=1)
-    assert calls["unscored"][0]["limit"] == 3            # 1 + 2 held over-fetched
+    assert calls["unscored"][0]["limit"] == 4            # 1 + 2 held + 1 probe
     assert calls["scored"] == ["ok"]                     # shareable row reached, not starved
 
 

@@ -32,6 +32,21 @@ def test_generate_end_to_end(index_conn, ins):
     assert res.corpus.total_failures == 1 and res.corpus.total_successes == 1
 
 
+def test_unattributable_whole_doc_gate_finding_does_not_dead_end(index_conn, ins, monkeypatch):
+    # #0: if the whole-doc gate flags something no individual rule reproduces (a context
+    # artifact), the install must NOT dead-end (which would persist nothing + leave no
+    # rejectable fingerprint, re-blocking every future run).
+    from clawjournal.skill import render
+    ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]', learning="said done early")
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "t", "guidance": "run the test suite first", "why": "w",
+         "taxonomy": "verification_skipped"}]})
+    monkeypatch.setattr(render, "gate_rendered", lambda text, **kw: ["trufflehog: 1 finding(s)"])
+    monkeypatch.setattr(render, "gate_secret_pii_per_rule", lambda rules, **kw: (rules, []))
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+    assert res.rules and res.gate_issues == []   # not dead-ended; install can proceed
+
+
 def test_generate_empty_when_no_scored_sessions(index_conn, ins):
     fake = FakeCaller({"rules": []})
     res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)

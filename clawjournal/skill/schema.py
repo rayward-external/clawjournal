@@ -127,6 +127,9 @@ def parse_rules(data: dict[str, Any]) -> list[SkillRule]:
         taxonomy = str(item.get("taxonomy", "")).strip()
         if taxonomy not in FAILURE_MODES:
             taxonomy = ""
+        if kind == "do":
+            taxonomy = ""  # taxonomy names a FAILURE mode; only 'avoid' rules carry one
+            # (else a success renders under "Do" tagged with a failure mode + its count)
         title = str(item.get("title", "")).strip() or _derive_title(guidance)
         rules.append(SkillRule(
             kind=kind,

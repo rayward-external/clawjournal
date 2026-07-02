@@ -18,6 +18,7 @@ from ..redaction.anonymizer import Anonymizer
 from ..redaction.secrets import redact_text
 from ..scoring.backends import (
     default_distill_model_for_backend,
+    default_model_for_backend,
     resolve_backend,
 )
 from .schema import FAILURE_MODES, MAX_RULES, SkillRule, parse_rules
@@ -154,7 +155,20 @@ def distill_skills(
         data = call(system_prompt=_SYSTEM, task_prompt=task)
     except Exception as exc:  # backend/timeout/parse failure -> degrade gracefully
         logger.warning("skill distill call failed: %s", exc)
-        return []
+        # The frontier default (e.g. Opus) may be unavailable on the user's plan; before
+        # giving up, retry once on the backend's fast default so distill still works for
+        # users who could distill before this PR raised the default model.
+        if caller is None and model is None:
+            try:
+                resolved = resolve_backend(backend)
+                fb = DefaultCaller(backend=resolved, model=default_model_for_backend(resolved))
+                data = fb(system_prompt=_SYSTEM, task_prompt=task)
+                print(f"note: the frontier distill model was unavailable; fell back to "
+                      f"{fb.model}. Pass --model to pick one explicitly.")
+            except Exception:
+                return []
+        else:
+            return []
     if not isinstance(data, dict):
         try:
             data = _extract_json_object(str(data))

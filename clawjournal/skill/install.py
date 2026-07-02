@@ -45,11 +45,15 @@ def upsert_region(existing: str, region_body: str) -> str:
     """Return *existing* with the managed region replaced (or appended)."""
     block = f"{BEGIN_MARKER}\n{region_body.rstrip()}\n{END_MARKER}\n"
     start = existing.find(BEGIN_MARKER)
-    end = existing.find(END_MARKER)
-    if start != -1 and end != -1 and end > start:
-        end_full = end + len(END_MARKER)
+    if start != -1:
+        # Find the END that CLOSES this BEGIN (search AFTER it): a stray END marker in
+        # the user's own notes before BEGIN must not defeat replacement, or every run
+        # appends a fresh block and AGENTS.md grows unboundedly. If BEGIN has no closing
+        # END (truncated), replace through end-of-file rather than duplicating.
+        end = existing.find(END_MARKER, start)
+        end_full = end + len(END_MARKER) if end != -1 else len(existing)
         # consume a single trailing newline so re-runs don't accumulate blanks
-        if end_full < len(existing) and existing[end_full] == "\n":
+        if end != -1 and end_full < len(existing) and existing[end_full] == "\n":
             end_full += 1
         return existing[:start] + block + existing[end_full:]
     sep = "" if not existing or existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
