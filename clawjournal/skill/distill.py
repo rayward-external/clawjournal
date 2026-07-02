@@ -158,8 +158,10 @@ def distill_skills(
         return []
     anon = Anonymizer(extra_usernames=list(load_config().get("redact_usernames", []) or []))
     task = build_prompt(corpus, anon)
-    call = caller or DefaultCaller(backend=backend, model=model)
     try:
+        # DefaultCaller() resolves the backend (a process/env lookup that can raise
+        # when no backend is installed), so build it INSIDE the degrade-gracefully guard.
+        call = caller or DefaultCaller(backend=backend, model=model)
         data = call(system_prompt=_SYSTEM, task_prompt=task)
     except Exception as exc:  # backend/timeout/parse failure -> degrade gracefully
         logger.warning("skill distill call failed: %s", exc)

@@ -6,8 +6,8 @@ from clawjournal import cli_skill
 from clawjournal.cli_skill import ALL_HISTORY_DAYS, _ensure_corpus
 
 
-def _wire(monkeypatch, unscored):
-    calls = {"scan": [], "unscored": [], "scored": []}
+def _wire(monkeypatch, unscored, blocked=()):
+    calls = {"scan": [], "unscored": [], "scored": [], "score_kw": []}
     monkeypatch.setattr(cli_skill, "_scan_source_filter", lambda: None)
     monkeypatch.setattr(cli_skill, "_config_sources", lambda: ["claude", "codex"])
     monkeypatch.setattr("clawjournal.cli._run_scan",
@@ -18,31 +18,52 @@ def _wire(monkeypatch, unscored):
         calls["unscored"].append({"limit": limit, "source": source, "since": since})
         return list(unscored)
     monkeypatch.setattr("clawjournal.workbench.index.query_unscored_sessions", fake_unscored)
-    monkeypatch.setattr("clawjournal.cli._score_single_session",
-                        lambda conn, sid, **kw: calls["scored"].append(sid) or {})
+    monkeypatch.setattr("clawjournal.workbench.index.release_gate_blockers",
+                        lambda conn, ids, **kw: [{"session_id": s} for s in blocked])
+
+    def fake_score(conn, sid, **kw):
+        calls["scored"].append(sid)
+        calls["score_kw"].append(kw)
+        return {}
+    monkeypatch.setattr("clawjournal.cli._score_single_session", fake_score)
     return calls
 
 
 def test_weekly_scans_and_scores_last_7_days(monkeypatch):
     calls = _wire(monkeypatch, [{"session_id": "a"}, {"session_id": "b"}])
-    _ensure_corpus(7, do_scan=True, do_score=True, score_limit=25, backend="auto", model=None)
+    _ensure_corpus(7, do_scan=True, do_score=True, score_limit=25, backend="auto")
     assert calls["scan"] == [None]                       # scan ran
     assert calls["unscored"][0]["since"] is not None     # bounded 7-day window
     assert calls["unscored"][0]["limit"] == 25           # score cap honored
     assert calls["scored"] == ["a", "b"]                 # each unscored session scored
 
 
+def test_scoring_never_uses_the_distill_model(monkeypatch):
+    # fix #4: `--model` tunes the distill call only; scoring must fall back to its own
+    # (fast) default, never the frontier distill model.
+    calls = _wire(monkeypatch, [{"session_id": "a"}])
+    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25, backend="auto")
+    assert calls["scored"] == ["a"]
+    assert all("model" not in kw for kw in calls["score_kw"])   # no distill model leaked in
+
+
+def test_held_sessions_are_not_scored(monkeypatch):
+    # fix #3: an egress-blocked (held/embargoed) session must not be sent to the model to score.
+    calls = _wire(monkeypatch, [{"session_id": "ok"}, {"session_id": "held"}], blocked=["held"])
+    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25, backend="auto")
+    assert calls["scored"] == ["ok"]                     # 'held' filtered out before scoring
+
+
 def test_first_run_all_history_uses_no_since(monkeypatch):
     calls = _wire(monkeypatch, [])
-    _ensure_corpus(ALL_HISTORY_DAYS, do_scan=False, do_score=True,
-                   score_limit=25, backend="auto", model=None)
+    _ensure_corpus(ALL_HISTORY_DAYS, do_scan=False, do_score=True, score_limit=25, backend="auto")
     assert calls["scan"] == []                           # --no-scan honored
     assert calls["unscored"][0]["since"] is None         # all history
 
 
 def test_no_score_flag_skips_scoring(monkeypatch):
     calls = _wire(monkeypatch, [{"session_id": "a"}])
-    _ensure_corpus(7, do_scan=True, do_score=False, score_limit=25, backend="auto", model=None)
+    _ensure_corpus(7, do_scan=True, do_score=False, score_limit=25, backend="auto")
     assert calls["scan"] == [None]
     assert calls["unscored"] == [] and calls["scored"] == []
 

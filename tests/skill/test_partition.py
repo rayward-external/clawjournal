@@ -29,3 +29,22 @@ def test_respects_configured_source_scope(index_conn, ins):
     ins(index_conn, "x", source="codex", fvs=5, learning="x")
     only_claude = select_skill_candidates(index_conn, now=NOW, sources=["claude"])
     assert {c.session_id for c in only_claude.candidates} == {"c"}
+
+
+def test_badge_only_null_score_session_keeps_rate_within_one(index_conn, ins):
+    # a failed-badge session with NULL scores counts into mode_recurrence (numerator);
+    # it must ALSO land in the eligible denominator, else the rate exceeds 100%.
+    ins(index_conn, "badge", outcome="failed", modes='["execution_error"]', learning="x")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    assert corpus.eligible_scored >= 1
+    assert all(r <= 1.0 for r in corpus.mode_rates().values())
+
+
+def test_malformed_recovery_labels_does_not_crash(index_conn, ins):
+    # a corrupt/legacy ai_recovery_labels must not crash the run: json_each is guarded
+    # by json_valid (parallel to the ai_failure_modes clause). outcome='failed' forces
+    # the success query's json_each branch to be evaluated.
+    ins(index_conn, "m", outcome="failed", modes='["verification_skipped"]',
+        recovery="not-json", learning="x")
+    corpus = select_skill_candidates(index_conn, now=NOW)   # must not raise OperationalError
+    assert "m" in {c.session_id for c in corpus.candidates}

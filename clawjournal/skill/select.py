@@ -168,7 +168,8 @@ def select_skill_candidates(
         "(ai_outcome_badge IN ('resolved','trivial') AND ai_quality_score >= 4) "
         "OR (ai_failure_modes IS NOT NULL AND json_valid(ai_failure_modes) "
         "AND json_array_length(ai_failure_modes) > 0 AND ai_recovery_labels IS NOT NULL "
-        "AND EXISTS (SELECT 1 FROM json_each(COALESCE(ai_recovery_labels,'[]')) "
+        "AND json_valid(ai_recovery_labels) "
+        "AND EXISTS (SELECT 1 FROM json_each(ai_recovery_labels) "
         "            WHERE value IN ('self_recovered','user_corrected_recovery')))"
         ") ORDER BY ai_quality_score DESC, start_time DESC"
     )
@@ -249,9 +250,14 @@ def select_skill_candidates(
             rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
         ))
 
+    # Denominator must be a SUPERSET of every session that can feed mode_counter
+    # (the numerator), or a rate can exceed 100%. Candidates can qualify by score,
+    # by outcome badge (failed/abandoned), or by failure_modes+recovery — so the
+    # eligible set counts any session carrying a judge verdict, not just a score.
     eligible_rows = conn.execute(
         f"SELECT session_id FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
-        f"{src_clause} AND (ai_failure_value_score IS NOT NULL OR ai_quality_score IS NOT NULL)",
+        f"{src_clause} AND (ai_failure_value_score IS NOT NULL OR ai_quality_score IS NOT NULL "
+        f"OR ai_outcome_badge IS NOT NULL OR ai_failure_modes IS NOT NULL)",
         [window_start, *src],
     ).fetchall()
     eligible_ids = [row["session_id"] for row in eligible_rows]

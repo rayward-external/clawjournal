@@ -152,7 +152,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
 
 def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
-                   score_limit: int, backend: str, model: str | None) -> None:
+                   score_limit: int, backend: str) -> None:
     if do_scan:
         print("Indexing sessions…")
         from .cli import _run_scan
@@ -160,25 +160,35 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
     if not do_score:
         return
     from .cli import _score_single_session
-    from .workbench.index import open_index, query_unscored_sessions
+    from .workbench.index import open_index, query_unscored_sessions, release_gate_blockers
     since = (None if window_days >= ALL_HISTORY_DAYS
              else (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat())
     conn = open_index()
     try:
+        # NB: scoring uses the configured scoring backend's own default model, NOT
+        # the distill `--model` — a frontier distill model must not silently re-price
+        # the scoring fleet.
         unscored = query_unscored_sessions(
             conn, limit=score_limit, source=_config_sources(), since=since)
+        capped = len(unscored) >= score_limit
+        if unscored:
+            # Never score (=> model-provider egress) a held/embargoed session — mirror
+            # the distill egress gate, which excludes them from the corpus anyway.
+            blocked = {b["session_id"] for b in release_gate_blockers(
+                conn, [s["session_id"] for s in unscored], now=datetime.now(timezone.utc))}
+            unscored = [s for s in unscored if s["session_id"] not in blocked]
         if unscored:
             print(f"Scoring {len(unscored)} unscored session(s) in the window "
                   f"(this uses your agent CLI)…")
             for i, s in enumerate(unscored, 1):
                 sid = s["session_id"]
                 print(f"  [{i}/{len(unscored)}] {sid}", flush=True)
-                res = _score_single_session(conn, sid, backend=backend, model=model)
+                res = _score_single_session(conn, sid, backend=backend)
                 if isinstance(res, dict) and res.get("error"):
                     print(f"      (skipped: {res['error']})")
-            if len(unscored) >= score_limit:
-                print(f"  scored {score_limit} (the per-run cap); re-run to score more "
-                      f"or raise --score-limit.")
+        if capped:
+            print(f"  hit the per-run score cap ({score_limit}); re-run or raise "
+                  f"--score-limit to score more.")
     finally:
         conn.close()
 
@@ -272,7 +282,7 @@ def run_skill(args) -> None:
         do_scan=not getattr(args, "no_scan", False),
         do_score=not getattr(args, "no_score", False),
         score_limit=score_limit,
-        backend=backend, model=model,
+        backend=backend,
     )
 
     # 3-6. select -> distill -> merge -> gate -> render
@@ -280,34 +290,49 @@ def run_skill(args) -> None:
     try:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
                              sources=_config_sources())
-        for rule in res.rules:
-            _store.upsert_seen(conn, rule)
         _print_preview(res)
+        # Persist NOTHING when the gate fails: a rule the render-time gate flags would
+        # otherwise be stored as 'proposed', reloaded by load_kept every run, and
+        # re-block the install forever.
         if res.gate_issues:
-            conn.close()
             sys.exit(1)
         if not res.rules:
-            conn.close()
             sys.exit(1)
+
+        def _persist_seen() -> None:
+            for rule in res.rules:
+                _store.upsert_seen(conn, rule)
+
         if getattr(args, "preview", False):
+            _persist_seen()
             print("\n(preview only — not installed; re-run without --preview to install.)")
             return
         if not getattr(args, "yes", False):
             if not sys.stdin.isatty():
+                _persist_seen()
                 print("\nRe-run with --yes to install (or --preview to just look).")
                 return
             ans = input(f"\nInstall these {len(res.rules)} rule(s) for Claude Code + Codex? [y/N] ")
             if ans.strip().lower() not in ("y", "yes"):
+                _persist_seen()
                 print("Not installed.")
                 return
 
         # 7. install + persist state
         targets = getattr(args, "target", None) or ["claude", "codex"]
         installed: list[str] = []
-        if "claude" in targets:
-            installed.append(str(_install.install_claude(res.skill_md)))
-        if "codex" in targets:
-            installed.append(str(_install.install_codex(res.region)))
+        try:
+            if "claude" in targets:
+                installed.append(str(_install.install_claude(res.skill_md)))
+            if "codex" in targets:
+                installed.append(str(_install.install_codex(res.region)))
+        except (RuntimeError, OSError) as exc:
+            print(f"\nInstall failed: {exc}")
+            if installed:
+                print("  partially written: " + ", ".join(installed))
+            print("  the skill set was not recorded; fix the issue and re-run.")
+            sys.exit(1)
+        # mark_installed upserts + marks 'kept' (one write per rule — no separate seen loop).
         _store.mark_installed(conn, res.rules)
         # record this run's per-mode rates for next week's trend (§9/D9)
         _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)

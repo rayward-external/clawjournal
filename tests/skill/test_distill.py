@@ -73,3 +73,15 @@ def test_distill_defaults_to_frontier_model(monkeypatch):
     assert d.DefaultCaller(backend="claude").model == "opus"
     assert d.DefaultCaller(backend="codex").model == "gpt-5.4"
     assert d.DefaultCaller(backend="claude", model="sonnet").model == "sonnet"
+
+
+def test_distill_degrades_when_backend_resolution_fails(monkeypatch):
+    # fix #6: DefaultCaller() resolves the backend and can raise when none is installed;
+    # that must degrade to [] inside distill_skills, not escape as a traceback.
+    import clawjournal.skill.distill as d
+
+    def boom(_backend):
+        raise RuntimeError("Could not detect a supported scoring backend")
+
+    monkeypatch.setattr(d, "resolve_backend", boom)
+    assert distill_skills(_corpus(), backend="auto") == []
