@@ -49,12 +49,14 @@ def gate_secret_pii_per_rule(
     blocked: list[tuple[SkillRule, list[str]]] = []
     for r in rules:
         text = "\n".join([r.title, r.trigger, r.guidance, r.why, *r.evidence_session_ids])
-        issues = gate_rendered(text)
+        # Fast per-rule regex scan only (no TruffleHog subprocess per rule); the whole-doc
+        # gate_rendered runs TruffleHog ONCE as the final backstop.
+        issues = gate_rendered(text, run_trufflehog=False)
         (blocked.append((r, issues)) if issues else kept.append(r))
     return kept, blocked
 
 
-def gate_rendered(text: str) -> list[str]:
+def gate_rendered(text: str, *, run_trufflehog: bool = True) -> list[str]:
     """Return deterministic secret/PII/TruffleHog findings in *text* (empty = clean)."""
     issues: list[str] = []
     try:
@@ -70,7 +72,7 @@ def gate_rendered(text: str) -> list[str]:
     except Exception as exc:  # pragma: no cover
         issues.append(f"pii: scan failed ({exc.__class__.__name__})")
     try:
-        if not trufflehog.is_bypassed():
+        if run_trufflehog and not trufflehog.is_bypassed():
             report = trufflehog.scan_text(text)
             findings = getattr(report, "findings", None) or []
             if getattr(report, "blocking", False):

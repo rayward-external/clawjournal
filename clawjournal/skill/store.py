@@ -104,13 +104,18 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
     ensure_table(conn)
     existing = conn.execute("SELECT state, support, created_at FROM skill_rules WHERE fingerprint = ?", (fp,)).fetchone()
     ev = json.dumps(list(rule.evidence_session_ids))
+    # last_seen tracks when the rule was last SEEN in distillation, NOT when it was
+    # installed: a carried-over rule (rule.last_seen already set, not re-distilled this
+    # run) keeps its original timestamp so _decayed_support can actually age it out.
+    # A freshly distilled rule has last_seen == "" -> stamped now.
+    seen_ts = rule.last_seen or ts
     if existing is None:
         conn.execute(
             "INSERT INTO skill_rules (fingerprint, kind, title, trigger, guidance, why, taxonomy, "
             "support, evidence_json, state, created_at, last_seen_at) "
             "VALUES (?,?,?,?,?,?,?,?,?, 'proposed', ?, ?)",
             (fp, rule.kind, rule.title, rule.trigger, rule.guidance, rule.why, rule.taxonomy,
-             rule.support, ev, ts, ts),
+             rule.support, ev, ts, seen_ts),
         )
     elif existing["state"] != "rejected":
         # Refresh content + support, and revive a previously-'dropped' fingerprint back
@@ -121,7 +126,7 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
             "why = ?, title = ?, trigger = ?, taxonomy = ?, last_seen_at = ?, "
             "state = CASE WHEN state = 'dropped' THEN 'proposed' ELSE state END "
             "WHERE fingerprint = ?",
-            (rule.support, ev, rule.why, rule.title, rule.trigger, rule.taxonomy, ts, fp),
+            (rule.support, ev, rule.why, rule.title, rule.trigger, rule.taxonomy, seen_ts, fp),
         )
     conn.commit()
     return fp
@@ -134,10 +139,12 @@ def mark_installed(conn: sqlite3.Connection, rules: list[SkillRule], *, now: str
     for r in rules:
         fp = upsert_seen(conn, r, now=ts)
         selected_fps.append(fp)
+        # NB: do NOT touch last_seen_at here — installation is not a "sighting". upsert_seen
+        # already set it (now for fresh, preserved for carried) so decay keeps working.
         conn.execute(
-            "UPDATE skill_rules SET state = 'kept', installed_at = ?, last_seen_at = ?, "
+            "UPDATE skill_rules SET state = 'kept', installed_at = ?, "
             "approved_at = COALESCE(approved_at, ?) WHERE fingerprint = ? AND state != 'rejected'",
-            (ts, ts, ts, fp),
+            (ts, ts, fp),
         )
     if selected_fps:
         placeholders = ",".join("?" for _ in selected_fps)

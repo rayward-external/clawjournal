@@ -75,6 +75,8 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
     support signal is weaker than 'avoid' mode-recurrence) would be crowded out.
     """
     clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:  # a naive caller must not crash the aware-vs-naive subtraction
+        clock = clock.replace(tzinfo=timezone.utc)
     new_fps = {_store.fingerprint(r) for r in new}
     pool: dict[str, SkillRule] = {}
     for r in existing:
@@ -446,7 +448,11 @@ def run_skill(args) -> None:
                 failures.append(f"{name}: {exc}")
         if installed:
             _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'
-            _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+            # Only snapshot when the window actually had scored sessions — an idle-week
+            # run (empty corpus but kept rules re-proposed) must NOT overwrite the last
+            # real snapshot with an empty one, which would reset the week-over-week trend.
+            if res.corpus.eligible_scored > 0:
+                _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
         else:
             _persist_seen()  # nothing landed -> at least keep 'seen' state for next run
     finally:

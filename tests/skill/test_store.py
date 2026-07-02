@@ -9,6 +9,23 @@ def _r(g="run the test suite first", kind="avoid", support=0):
                      evidence_session_ids=["s1"])
 
 
+def test_install_preserves_carried_rule_last_seen(index_conn):
+    # #0: installing a carried-over rule (last_seen already set, not re-distilled this
+    # run) must NOT reset its decay clock, or a stale rule pins itself in forever.
+    carried = _r("carried", support=5)
+    carried.last_seen = "2026-01-01T00:00:00+00:00"
+    store.mark_installed(index_conn, [carried], now="2026-06-01T00:00:00+00:00")
+    row = index_conn.execute("SELECT last_seen_at FROM skill_rules WHERE guidance='carried'").fetchone()
+    assert row["last_seen_at"] == "2026-01-01T00:00:00+00:00"     # preserved, not bumped to now
+
+
+def test_install_stamps_fresh_rule_last_seen_now(index_conn):
+    fresh = _r("fresh", support=3)                                # last_seen == "" -> seen now
+    store.mark_installed(index_conn, [fresh], now="2026-06-01T00:00:00+00:00")
+    row = index_conn.execute("SELECT last_seen_at FROM skill_rules WHERE guidance='fresh'").fetchone()
+    assert row["last_seen_at"] == "2026-06-01T00:00:00+00:00"
+
+
 def test_fingerprint_stable_and_distinct():
     assert store.fingerprint(_r("Run  the Test  Suite First")) == store.fingerprint(_r("run the test suite first"))
     assert store.fingerprint(_r()) != store.fingerprint(_r("do a thing", kind="do"))

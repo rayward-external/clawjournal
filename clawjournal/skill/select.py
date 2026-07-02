@@ -49,7 +49,6 @@ class SkillCandidate:
     quality: int | None = None
     learning_summary: str | None = None
     score_reason: str | None = None
-    summary: str | None = None
     title: str | None = None
     start_time: str | None = None
     support_count: int = 1
@@ -187,7 +186,7 @@ def select_skill_candidates(
     cols = (
         "session_id, project, source, ai_failure_value_score, ai_quality_score, "
         "ai_failure_modes, ai_recovery_labels, ai_outcome_badge, "
-        "ai_learning_summary, ai_score_reason, ai_summary, "
+        "ai_learning_summary, ai_score_reason, "
         "COALESCE(ai_display_title, display_title) AS title, start_time"
     )
     base = f"FROM sessions WHERE start_time >= ? AND review_status != 'segmented'{src_clause}"
@@ -260,7 +259,7 @@ def select_skill_candidates(
             kind="avoid", failure_modes=modes, recovery_labels=recovery,
             resolution=row["ai_outcome_badge"], failure_value=row["ai_failure_value_score"],
             quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
-            score_reason=row["ai_score_reason"], summary=row["ai_summary"],
+            score_reason=row["ai_score_reason"],
             title=row["title"], start_time=row["start_time"],
             support_count=support, impact=impact, recency=recency,
             rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
@@ -294,7 +293,7 @@ def select_skill_candidates(
             kind="do", failure_modes=modes, recovery_labels=recovery,
             resolution=row["ai_outcome_badge"], failure_value=row["ai_failure_value_score"],
             quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
-            score_reason=row["ai_score_reason"], summary=row["ai_summary"],
+            score_reason=row["ai_score_reason"],
             title=row["title"], start_time=row["start_time"],
             support_count=support, impact=impact, recency=recency,
             rank_score=_candidate_rank(support=support, impact=impact, recency=recency),

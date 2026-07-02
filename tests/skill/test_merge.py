@@ -46,6 +46,14 @@ def test_recency_decays_stale_support_below_fresh():
     assert [r.guidance for r in merged][0] == "fresh rule"      # fresh outranks the stale peak
 
 
+def test_merge_rules_tolerates_naive_now():
+    # a naive `now` must not crash the aware-vs-naive subtraction in _decayed_support.
+    from datetime import datetime
+    stale = _r("s", support=5)
+    stale.last_seen = "2026-01-01T00:00:00+00:00"
+    merge_rules([stale], [_r("f", support=1)], set(), now=datetime(2026, 6, 1))  # no raise
+
+
 def test_preserves_good_bad_mix():
     # 'avoid' rules carry high mode-recurrence support; 'do' rules get support=0.
     # A support-only merge would drop every 'do'; the interleave must keep both (D2).
