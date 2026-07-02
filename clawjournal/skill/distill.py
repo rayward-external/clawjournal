@@ -10,17 +10,15 @@ default mirrors the benchmark's ``AgentBackendCaller``.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from ..benchmark.generate import _extract_json_object, _read_agent_output
+from ..benchmark.generate import _extract_json_object, run_agent_json_call
 from ..config import load_config
 from ..redaction.anonymizer import Anonymizer
 from ..redaction.secrets import redact_text
 from ..scoring.backends import (
     default_distill_model_for_backend,
     resolve_backend,
-    run_default_agent_task,
 )
 from .schema import FAILURE_MODES, MAX_RULES, SkillRule, parse_rules
 from .select import SkillCorpus
@@ -126,21 +124,13 @@ class DefaultCaller:
         self.timeout_seconds = timeout_seconds
 
     def __call__(self, *, system_prompt: str, task_prompt: str) -> dict[str, Any]:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp)
-            sys_file = cwd / "system.md"
-            sys_file.write_text(system_prompt, encoding="utf-8")
-            task = task_prompt if self.resolved == "claude" else f"{system_prompt}\n\n{task_prompt}"
-            from .schema import SKILL_DISTILL_SCHEMA
-            result = run_default_agent_task(
-                backend=self.resolved, cwd=cwd, system_prompt_file=sys_file,
-                task_prompt=task, model=self.model, timeout_seconds=self.timeout_seconds,
-                codex_sandbox="read-only", codex_output_schema=SKILL_DISTILL_SCHEMA,
-                codex_output_file="out.json", openclaw_message=task,
-            )
-            return _read_agent_output(self.resolved, result.stdout, cwd / "out.json")
+        from .schema import SKILL_DISTILL_SCHEMA
+        return run_agent_json_call(
+            resolved=self.resolved, model=self.model,
+            system_prompt=system_prompt, task_prompt=task_prompt,
+            timeout_seconds=self.timeout_seconds,
+            codex_output_schema=SKILL_DISTILL_SCHEMA,
+        )
 
 
 def distill_skills(

@@ -15,6 +15,7 @@ column — it is derived from ``ai_outcome_badge`` via ``_OUTCOME_NORMALIZE_SQL`
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
@@ -89,11 +90,17 @@ def _has_evidence(learning: str | None, reason: str | None, modes: list[str]) ->
     return bool((learning and learning.strip()) or (reason and reason.strip()) or modes)
 
 
+_SUBSECOND_RE = re.compile(r"(\.\d{6})\d+")  # >6 fractional digits: Python 3.10 rejects them
+
+
 def _parse_start_time(value: str | None) -> datetime | None:
     if not value:
         return None
+    # Truncate sub-microsecond precision before parsing — datetime.fromisoformat on
+    # Python 3.10 (a CI target) rejects 7-/9-digit fractional seconds outright.
+    text = _SUBSECOND_RE.sub(r"\1", str(value).strip().replace("Z", "+00:00"))
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
     if parsed.tzinfo is None:
@@ -143,10 +150,22 @@ def select_skill_candidates(
 ) -> SkillCorpus:
     """Return the window's avoid + do candidates, hold-state-gated, capped."""
     clock = now or datetime.now(timezone.utc)
-    window_start = (clock - timedelta(days=window_days)).isoformat()
+    window_start_dt = clock - timedelta(days=window_days)
+    window_start = window_start_dt.isoformat()
     window_end = clock.isoformat()
+    # start_time is stored as an ISO string with a source-dependent offset, so a raw
+    # `start_time >= window_start` lexicographic compare mis-filters mixed offsets. Use
+    # a widened string prefilter (2 days > the 14h max offset skew) that can't exclude an
+    # in-window row, then filter precisely on the parsed instant in Python.
+    window_floor = (window_start_dt - timedelta(days=2)).isoformat()
     src = [s for s in (sources or []) if s]
     src_clause = f" AND source IN ({','.join('?' for _ in src)})" if src else ""
+
+    def _in_window(start_time: str | None) -> bool:
+        parsed = _parse_start_time(start_time)
+        if parsed is not None:
+            return parsed >= window_start_dt
+        return bool(start_time) and str(start_time) >= window_start  # unparseable: prior behavior
 
     cols = (
         "session_id, project, source, ai_failure_value_score, ai_quality_score, "
@@ -162,7 +181,8 @@ def select_skill_candidates(
         "OR ai_outcome_badge IN ('failed','abandoned')) "
         "ORDER BY ai_failure_value_score DESC, start_time DESC"
     )
-    fail_rows = conn.execute(fail_sql, [window_start, *src]).fetchall()
+    fail_rows = [r for r in conn.execute(fail_sql, [window_floor, *src]).fetchall()
+                 if _in_window(r["start_time"])]
     succ_sql = (
         f"SELECT {cols} {base} AND ("
         "(ai_outcome_badge IN ('resolved','trivial') AND ai_quality_score >= 4) "
@@ -173,9 +193,23 @@ def select_skill_candidates(
         "            WHERE value IN ('self_recovered','user_corrected_recovery')))"
         ") ORDER BY ai_quality_score DESC, start_time DESC"
     )
-    succ_rows = conn.execute(succ_sql, [window_start, *src]).fetchall()
+    succ_rows = [r for r in conn.execute(succ_sql, [window_floor, *src]).fetchall()
+                 if _in_window(r["start_time"])]
+
+    # eligible = the rate denominator; a SUPERSET of every session that can feed
+    # mode_counter (the numerator), else a rate can exceed 100%. A candidate qualifies
+    # by score, by outcome badge, or by failure_modes+recovery — so count any judge verdict.
+    eligible_sql = (
+        f"SELECT session_id, start_time {base} AND (ai_failure_value_score IS NOT NULL "
+        "OR ai_quality_score IS NOT NULL OR ai_outcome_badge IS NOT NULL "
+        "OR ai_failure_modes IS NOT NULL)"
+    )
+    eligible_ids = [r["session_id"] for r in conn.execute(eligible_sql, [window_floor, *src]).fetchall()
+                    if _in_window(r["start_time"])]
+
     candidate_ids = [row["session_id"] for row in list(fail_rows) + list(succ_rows)]
-    blocked_ids = _release_blocked_ids(conn, candidate_ids, now=clock)
+    # One hold-state gate pass over the union (candidates are a subset of eligible).
+    blocked_ids = _release_blocked_ids(conn, candidate_ids + eligible_ids, now=clock)
 
     mode_counter: Counter[str] = Counter()
     recovery_counter: Counter[str] = Counter()
@@ -250,19 +284,8 @@ def select_skill_candidates(
             rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
         ))
 
-    # Denominator must be a SUPERSET of every session that can feed mode_counter
-    # (the numerator), or a rate can exceed 100%. Candidates can qualify by score,
-    # by outcome badge (failed/abandoned), or by failure_modes+recovery — so the
-    # eligible set counts any session carrying a judge verdict, not just a score.
-    eligible_rows = conn.execute(
-        f"SELECT session_id FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
-        f"{src_clause} AND (ai_failure_value_score IS NOT NULL OR ai_quality_score IS NOT NULL "
-        f"OR ai_outcome_badge IS NOT NULL OR ai_failure_modes IS NOT NULL)",
-        [window_start, *src],
-    ).fetchall()
-    eligible_ids = [row["session_id"] for row in eligible_rows]
-    blocked_eligible = _release_blocked_ids(conn, eligible_ids, now=clock)
-    eligible_scored = len([sid for sid in eligible_ids if sid not in blocked_eligible])
+    # eligible_ids computed above; reuse the single blocked_ids pass (no second gate query).
+    eligible_scored = len([sid for sid in eligible_ids if sid not in blocked_ids])
 
     ranked = sorted(
         failures + successes,

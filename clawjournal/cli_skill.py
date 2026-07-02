@@ -75,13 +75,18 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
 
 
 def _config_sources() -> list[str] | None:
-    """The corpus source scope the user confirmed (§4.4). Falls back to the
-    coding-agent scope for 'all'/'both'/'auto'."""
-    from .config import load_config
-    src = load_config().get("source")
-    if not src or src in ("all", "both", "auto"):
+    """The corpus source scope the user confirmed (§4.4).
+
+    Delegates to the canonical ``config.source_scope_sources`` so legacy ``both``
+    stays Claude+Codex (it must NOT widen to opencode/openclaw, which were never
+    confirmed). ``all``/``auto``/unset map to None there → the coding-agent scope
+    the skill targets.
+    """
+    from .config import load_config, source_scope_sources
+    scope = source_scope_sources(load_config().get("source"))
+    if scope is None:                       # all / auto / unset
         return list(FAILURE_VALUE_SOURCE_SCOPE)
-    return [src]
+    return list(scope)                      # 'both' -> claude+codex; else the single source
 
 
 def _scan_source_filter() -> str | None:
@@ -165,18 +170,31 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
              else (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat())
     conn = open_index()
     try:
-        # NB: scoring uses the configured scoring backend's own default model, NOT
-        # the distill `--model` — a frontier distill model must not silently re-price
-        # the scoring fleet.
-        unscored = query_unscored_sessions(
-            conn, limit=score_limit, source=_config_sources(), since=since)
-        capped = len(unscored) >= score_limit
-        if unscored:
-            # Never score (=> model-provider egress) a held/embargoed session — mirror
-            # the distill egress gate, which excludes them from the corpus anyway.
-            blocked = {b["session_id"] for b in release_gate_blockers(
-                conn, [s["session_id"] for s in unscored], now=datetime.now(timezone.utc))}
-            unscored = [s for s in unscored if s["session_id"] not in blocked]
+        # Scoring uses the configured scoring backend's own default model, NOT the
+        # distill `--model` — a frontier distill model must not re-price the fleet.
+        #
+        # Determine the window's egress-blocked (held/embargoed) sessions FIRST and
+        # cap AFTER filtering: a page full of held rows must not starve older
+        # shareable ones, and never score (=> model-provider egress) a held session.
+        # release_gate_blockers is the canonical gate (it resolves expired embargoes
+        # back to shareable), so we only feed it the not-obviously-shareable rows.
+        held_where = ("review_status != 'segmented' AND "
+                      "(hold_state IS NULL OR hold_state NOT IN ('auto_redacted','released'))")
+        held_params: list = []
+        if since:
+            held_where += " AND start_time >= ?"
+            held_params.append(since)
+        held_candidates = [r["session_id"] for r in conn.execute(
+            f"SELECT session_id FROM sessions WHERE {held_where}", held_params).fetchall()]
+        blocked = ({b["session_id"] for b in release_gate_blockers(
+            conn, held_candidates, now=datetime.now(timezone.utc))}
+            if held_candidates else set())
+
+        # Over-fetch by the held count so >= score_limit shareable rows survive the filter.
+        fetched = query_unscored_sessions(
+            conn, limit=score_limit + len(blocked), source=_config_sources(), since=since)
+        shareable = [s for s in fetched if s["session_id"] not in blocked]
+        unscored = shareable[:score_limit]
         if unscored:
             print(f"Scoring {len(unscored)} unscored session(s) in the window "
                   f"(this uses your agent CLI)…")
@@ -186,7 +204,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
                 res = _score_single_session(conn, sid, backend=backend)
                 if isinstance(res, dict) and res.get("error"):
                     print(f"      (skipped: {res['error']})")
-        if capped:
+        if len(shareable) > score_limit:
             print(f"  hit the per-run score cap ({score_limit}); re-run or raise "
                   f"--score-limit to score more.")
     finally:
@@ -194,6 +212,18 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
 
 
 # --- IO / CLI ---------------------------------------------------------------
+
+def _ascii_safe(text: str) -> str:
+    """Downgrade the glyphs we print when the console can't encode them (e.g. cp1252)."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(enc)
+        return text
+    except (UnicodeEncodeError, LookupError):
+        for uni, asc in (("↓", "v"), ("↑", "^"), ("→", "->"), ("⚠", "!"), ("—", "-")):
+            text = text.replace(uni, asc)
+        return text
+
 
 def _print_preview(res: SkillResult) -> None:
     c = res.corpus
@@ -224,24 +254,31 @@ def _print_preview(res: SkillResult) -> None:
             print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
     if res.trend:
         n = res.corpus.eligible_scored
-        print(f"\n  Recurrence of targeted failure modes (rate over {n} scored session(s) "
-              f"— directional, not a powered metric):")
+        print(_ascii_safe(f"\n  Recurrence of targeted failure modes (rate over {n} scored session(s) "
+                          f"— directional, not a powered metric):"))
         for mode, (prev, cur) in res.trend.items():
             if n < 10:
-                print(f"    - {mode}: {cur:.0%}  (insufficient data — n={n})")
+                print(_ascii_safe(f"    - {mode}: {cur:.0%}  (insufficient data — n={n})"))
             elif prev is None:
                 print(f"    - {mode}: {cur:.0%}  (baseline; re-run next week to see the trend)")
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
-                print(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})")
+                print(_ascii_safe(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})"))
     if res.blocked:
         print(f"\n  ({len(res.blocked)} rule(s) dropped by the safety hard-deny.)")
     if res.gate_issues:
-        print(f"\n  ⚠ render-time gate found: {', '.join(res.gate_issues)} — install blocked.")
+        print(_ascii_safe(f"\n  ⚠ render-time gate found: {', '.join(res.gate_issues)} — install blocked."))
 
 
 def run_skill(args) -> None:
     from .workbench.index import open_index
+
+    # Never let a non-ASCII glyph (rule text, trend arrows) crash the preview on a
+    # non-UTF-8 console; _ascii_safe handles the ones we emit, this covers the rest.
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError, OSError):
+        pass
 
     backend = getattr(args, "backend", "auto")
     model = getattr(args, "model", None)
