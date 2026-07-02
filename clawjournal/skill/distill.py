@@ -17,6 +17,7 @@ from ..config import load_config
 from ..redaction.anonymizer import Anonymizer
 from ..redaction.secrets import redact_text
 from ..scoring.backends import (
+    default_distill_effort_for_backend,
     default_distill_model_for_backend,
     default_model_for_backend,
     resolve_backend,
@@ -116,24 +117,32 @@ class DefaultCaller:
     """Production caller over ``run_default_agent_task`` (one call, no CI)."""
 
     def __init__(self, backend: str = "auto", model: str | None = None,
-                 timeout_seconds: int = DISTILL_TIMEOUT) -> None:
+                 effort: str | None = None,
+                 timeout_seconds: int = DISTILL_TIMEOUT,
+                 use_default_distill_effort: bool = True) -> None:
         self.resolved = resolve_backend(backend)
-        # Distill defaults to a frontier model (Opus / strong Codex); `--model` overrides.
+        # Distill defaults to a frontier model and higher effort; explicit CLI
+        # overrides still win. Scoring defaults live in scoring.backends.
         self.model = model or default_distill_model_for_backend(self.resolved)
+        self.effort = (
+            effort if effort is not None
+            else (default_distill_effort_for_backend(self.resolved)
+                  if use_default_distill_effort else None)
+        )
         self.timeout_seconds = timeout_seconds
 
     def __call__(self, *, system_prompt: str, task_prompt: str) -> dict[str, Any]:
         from .schema import SKILL_DISTILL_SCHEMA
-        # claude_bare -> Claude Code runs WITHOUT auto-loading the installed
-        # clawjournal-lessons skill / user CLAUDE.md, so distillation is grounded only
-        # in the passed corpus and can't re-emit/reinforce already-installed or
-        # --rejected rules (which would inflate support and defeat decay).
+        # claude_safe_mode -> Claude Code runs WITHOUT auto-loading the installed
+        # clawjournal-lessons skill / user CLAUDE.md, while still using normal auth.
+        # That keeps distillation grounded only in the passed corpus and prevents
+        # already-installed or --rejected rules from being re-emitted/reinforced.
         return run_agent_json_call(
-            resolved=self.resolved, model=self.model,
+            resolved=self.resolved, model=self.model, effort=self.effort,
             system_prompt=system_prompt, task_prompt=task_prompt,
             timeout_seconds=self.timeout_seconds,
             codex_output_schema=SKILL_DISTILL_SCHEMA,
-            claude_bare=True,
+            claude_safe_mode=True,
         )
 
 
@@ -142,6 +151,7 @@ def distill_skills(
     *,
     backend: str = "auto",
     model: str | None = None,
+    effort: str | None = None,
     caller: Caller | None = None,
     cfg: dict | None = None,
 ) -> list[SkillRule]:
@@ -159,7 +169,7 @@ def distill_skills(
     try:
         # DefaultCaller() resolves the backend (a process/env lookup that can raise
         # when no backend is installed), so build it INSIDE the degrade-gracefully guard.
-        call = caller or DefaultCaller(backend=backend, model=model)
+        call = caller or DefaultCaller(backend=backend, model=model, effort=effort)
         data = call(system_prompt=_SYSTEM, task_prompt=task)
     except Exception as exc:  # backend/timeout/parse failure -> degrade gracefully
         logger.warning("skill distill call failed: %s", exc)
@@ -167,7 +177,7 @@ def distill_skills(
         # once on the backend's fast default so distill still works. But ONLY if that is
         # a DIFFERENT model — otherwise (e.g. Codex, whose distill default already IS the
         # fast model) we would just re-run the identical ~240s call for nothing.
-        if caller is not None or model is not None:
+        if caller is not None or model is not None or effort is not None:
             return []
         try:
             resolved = resolve_backend(backend)
@@ -178,7 +188,11 @@ def distill_skills(
         if not fast or fast == frontier:
             return []
         try:
-            data = DefaultCaller(backend=resolved, model=fast)(system_prompt=_SYSTEM, task_prompt=task)
+            data = DefaultCaller(
+                backend=resolved,
+                model=fast,
+                use_default_distill_effort=False,
+            )(system_prompt=_SYSTEM, task_prompt=task)
             print(f"note: the frontier distill model was unavailable; fell back to {fast}. "
                   f"Pass --model to pick one explicitly.")
         except Exception:

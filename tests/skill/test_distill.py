@@ -72,8 +72,27 @@ def test_distill_defaults_to_frontier_model(monkeypatch):
     import clawjournal.skill.distill as d
     monkeypatch.setattr(d, "resolve_backend", lambda b: b if b in ("claude", "codex") else "claude")
     assert d.DefaultCaller(backend="claude").model == "opus"
-    assert d.DefaultCaller(backend="codex").model == "gpt-5.4-mini"  # known-good fast default
+    assert d.DefaultCaller(backend="claude").effort == "xhigh"
+    assert d.DefaultCaller(backend="codex").model == "gpt-5.5"
+    assert d.DefaultCaller(backend="codex").effort == "xhigh"
     assert d.DefaultCaller(backend="claude", model="sonnet").model == "sonnet"
+    assert d.DefaultCaller(backend="claude", effort="max").effort == "max"
+
+
+def test_default_caller_isolates_claude_with_safe_mode(monkeypatch):
+    import clawjournal.skill.distill as d
+
+    captured = {}
+    monkeypatch.setattr(d, "resolve_backend", lambda _backend: "claude")
+
+    def fake_json_call(**kwargs):
+        captured.update(kwargs)
+        return {"rules": []}
+
+    monkeypatch.setattr(d, "run_agent_json_call", fake_json_call)
+    d.DefaultCaller(backend="claude")(system_prompt="sys", task_prompt="task")
+    assert captured["claude_safe_mode"] is True
+    assert "claude_bare" not in captured
 
 
 def test_distill_degrades_when_backend_resolution_fails(monkeypatch):

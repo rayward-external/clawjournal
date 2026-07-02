@@ -144,7 +144,8 @@ def _config_excluded_projects(cfg: dict | None = None) -> list[str]:
 
 
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
-                   model: str | None = None, caller=None, now: datetime | None = None,
+                   model: str | None = None, effort: str | None = None,
+                   caller=None, now: datetime | None = None,
                    sources: list[str] | None = None,
                    excluded_projects: list[str] | None = None,
                    cfg: dict | None = None) -> SkillResult:
@@ -173,7 +174,8 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     distilled: list[SkillRule] = []
     if not corpus.is_empty():
-        distilled = _distill.distill_skills(corpus, backend=backend, model=model, caller=caller, cfg=cfg)
+        distilled = _distill.distill_skills(
+            corpus, backend=backend, model=model, effort=effort, caller=caller, cfg=cfg)
     fresh, blocked = _render.gate_rules(distilled)
 
     # merge with durable state (skip rejected, replace weakest)
@@ -398,6 +400,7 @@ def run_skill(args) -> None:
 
     backend = getattr(args, "backend", "auto")
     model = getattr(args, "model", None)
+    effort = getattr(args, "effort", None)
     score_limit = getattr(args, "score_limit", DEFAULT_SCORE_LIMIT)
     if score_limit < 0:
         print("--score-limit must be >= 0")
@@ -405,6 +408,13 @@ def run_skill(args) -> None:
     if not getattr(args, "all", False) and getattr(args, "window_days", 7) < 1:
         print("--window-days must be >= 1")
         sys.exit(2)
+    if effort:
+        from .scoring.backends import resolve_backend, validate_effort_for_backend
+        try:
+            validate_effort_for_backend(resolve_backend(backend), effort)
+        except RuntimeError as exc:
+            print(str(exc))
+            sys.exit(2)
 
     # --reject <fingerprint>: mark rejected so it is never re-proposed, then stop.
     if getattr(args, "reject", None):
@@ -445,7 +455,7 @@ def run_skill(args) -> None:
     # 3-6. select -> distill -> merge -> gate -> render
     conn = open_index()
     try:
-        res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
+        res = generate_skill(conn, window_days=window_days, backend=backend, model=model, effort=effort,
                              sources=_config_sources(cfg),
                              excluded_projects=_config_excluded_projects(cfg), cfg=cfg)
         _print_preview(res)

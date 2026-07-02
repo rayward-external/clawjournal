@@ -14,6 +14,7 @@ def _args(**overrides):
     values = {
         "backend": "auto",
         "model": None,
+        "effort": None,
         "reject": None,
         "skip_preflight": True,
         "all": False,
@@ -41,6 +42,14 @@ def test_rejects_nonpositive_window(capsys):
         run_skill(_args(window_days=0))
     assert exc.value.code == 2
     assert "--window-days" in capsys.readouterr().out
+
+
+def test_rejects_invalid_distill_effort(monkeypatch, capsys):
+    monkeypatch.setattr("clawjournal.scoring.backends.resolve_backend", lambda _backend: "codex")
+    with pytest.raises(SystemExit) as exc:
+        run_skill(_args(effort="max"))
+    assert exc.value.code == 2
+    assert "Unsupported effort for codex" in capsys.readouterr().out
 
 
 def test_gate_issues_exit_nonzero(monkeypatch):

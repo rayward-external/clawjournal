@@ -140,10 +140,12 @@ def _read_agent_output(resolved: str, stdout: str, out_file: Path) -> dict[str, 
     return _extract_json_object(stdout)
 
 
-def run_agent_json_call(*, resolved: str, model: str | None, system_prompt: str,
+def run_agent_json_call(*, resolved: str, model: str | None, effort: str | None = None,
+                        system_prompt: str,
                         task_prompt: str, timeout_seconds: int,
                         codex_output_schema: dict[str, Any] | None = None,
-                        claude_bare: bool = False) -> dict[str, Any]:
+                        claude_bare: bool = False,
+                        claude_safe_mode: bool = False) -> dict[str, Any]:
     """Run one structured agent call in a throwaway cwd and return the parsed dict.
 
     Shared by the benchmark generator and the skill distiller: Claude consumes the
@@ -163,12 +165,14 @@ def run_agent_json_call(*, resolved: str, model: str | None, system_prompt: str,
             system_prompt_file=sys_file,
             task_prompt=task,
             model=model,
+            effort=effort,
             timeout_seconds=timeout_seconds,
             codex_sandbox="read-only",
             codex_output_schema=codex_output_schema,
             codex_output_file="out.json",
             openclaw_message=task,
             claude_bare=claude_bare,
+            claude_safe_mode=claude_safe_mode,
         )
         return _read_agent_output(resolved, result.stdout, cwd / "out.json")
 
