@@ -1085,19 +1085,8 @@ def _resolve_output_path(
 
 def _atomic_write(path: Path, text: str) -> None:
     """Write `text` to `path` atomically (tmp + fsync + rename)."""
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    from ...paths import atomic_write_text
+    atomic_write_text(path, text)
 
 
 def _serialize_bundle(bundle: dict[str, Any], *, pretty: bool) -> str:
