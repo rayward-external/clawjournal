@@ -4204,7 +4204,7 @@ def main() -> None:
                          help="Scoring/selection window in days (default 7)")
     skill_p.add_argument("--all", action="store_true", help="Use all history (recommended for the first run)")
     skill_p.add_argument("--backend", default="auto", help="Distill backend (auto|claude|codex|...)")
-    skill_p.add_argument("--model", help="Optional model override (defaults to the backend's fast model)")
+    skill_p.add_argument("--model", help="Optional model override (distill defaults to a frontier model: Opus for Claude, gpt-5.4 for Codex)")
     skill_p.add_argument("--target", action="append", choices=["claude", "codex"],
                          help="Install target(s); repeatable (default: both claude + codex)")
     skill_p.add_argument("--no-scan", action="store_true", help="Skip indexing (use the DB as-is)")

@@ -18,7 +18,7 @@ from ..config import load_config
 from ..redaction.anonymizer import Anonymizer
 from ..redaction.secrets import redact_text
 from ..scoring.backends import (
-    default_model_for_backend,
+    default_distill_model_for_backend,
     resolve_backend,
     run_default_agent_task,
 )
@@ -121,7 +121,8 @@ class DefaultCaller:
     def __init__(self, backend: str = "auto", model: str | None = None,
                  timeout_seconds: int = DISTILL_TIMEOUT) -> None:
         self.resolved = resolve_backend(backend)
-        self.model = model or default_model_for_backend(self.resolved)
+        # Distill defaults to a frontier model (Opus / strong Codex); `--model` overrides.
+        self.model = model or default_distill_model_for_backend(self.resolved)
         self.timeout_seconds = timeout_seconds
 
     def __call__(self, *, system_prompt: str, task_prompt: str) -> dict[str, Any]:

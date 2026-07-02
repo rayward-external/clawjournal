@@ -102,6 +102,21 @@ def default_model_for_backend(backend: str) -> str | None:
     return DEFAULT_BACKEND_MODELS.get(backend)
 
 
+# Distill runs a SINGLE call per `clawjournal skill` run (unlike the 25-call
+# scoring fleet), so it defaults to a frontier model for quality: Opus for
+# Claude, the strong (non-mini) tier for Codex. Scoring stays on
+# DEFAULT_BACKEND_MODELS. `--model` still overrides.
+DEFAULT_DISTILL_MODELS: dict[str, str] = {
+    "claude": "opus",
+    "codex": "gpt-5.4",
+}
+
+
+def default_distill_model_for_backend(backend: str) -> str | None:
+    """Frontier model for the one-shot skill-distill call (not scoring)."""
+    return DEFAULT_DISTILL_MODELS.get(backend) or default_model_for_backend(backend)
+
+
 def resolve_model_for_backend(backend: str, model: str | None) -> str | None:
     """Use an explicit model when provided, otherwise the backend fast default."""
     return model if model else default_model_for_backend(backend)
