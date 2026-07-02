@@ -103,12 +103,12 @@ def default_model_for_backend(backend: str) -> str | None:
 
 
 # Distill runs a SINGLE call per `clawjournal skill` run (unlike the 25-call
-# scoring fleet), so it defaults to a frontier model for quality: Opus for
-# Claude, the strong (non-mini) tier for Codex. Scoring stays on
-# DEFAULT_BACKEND_MODELS. `--model` still overrides.
+# scoring fleet), so Claude distill defaults to a frontier model (Opus) for quality.
+# Codex intentionally falls through to its normal fast default rather than a guessed
+# stronger id: forcing an unrecognized `--model` would hard-fail the default Codex
+# path. `--model` still overrides; scoring stays on DEFAULT_BACKEND_MODELS.
 DEFAULT_DISTILL_MODELS: dict[str, str] = {
     "claude": "opus",
-    "codex": "gpt-5.4",
 }
 
 

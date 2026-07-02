@@ -92,14 +92,18 @@ def install_claude(skill_md: str) -> Path:
     if path.exists():
         existing = path.read_text(encoding="utf-8")
         integ = _verify_integrity(existing)
-        if integ is True:
-            pass  # our own file, untouched
-        elif integ is False:
-            raise RuntimeError(f"Refusing to overwrite hand-edited Claude skill: {path}")
-        elif PROVENANCE_MARK in existing:
-            pass  # pre-integrity managed file (or legacy sidecar era) -> migrate forward
-        else:
+        if integ is False:
+            # Ours, but changed externally. This file is a weekly-regenerated artifact,
+            # so a benign touch (an editor's final-newline, git EOL normalization, a
+            # manual tweak) must NOT permanently block the refresh. Preserve the user's
+            # copy and regenerate — never hard-refuse our own managed file.
+            backup = path.with_name(path.name + ".local.bak")
+            _atomic_write(backup, existing)
+            print(f"note: {path.name} was modified externally; saved your copy to "
+                  f"{backup.name} and regenerated it.")
+        elif integ is None and PROVENANCE_MARK not in existing:
             raise RuntimeError(f"Refusing to overwrite non-ClawJournal Claude skill: {path}")
+        # integ True, or pre-integrity file with our marker -> overwrite in place.
     _atomic_write(path, _with_integrity(skill_md))
     # Integrity now lives in the file; retire any legacy .sha256 sidecar.
     sidecar = claude_skill_hash_path(path)

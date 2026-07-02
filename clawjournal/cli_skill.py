@@ -77,12 +77,17 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
     clock = now or datetime.now(timezone.utc)
     new_fps = {_store.fingerprint(r) for r in new}
     pool: dict[str, SkillRule] = {}
-    for r in list(existing) + list(new):  # new last -> refreshes support on ties
+    for r in existing:
+        fp = _store.fingerprint(r)
+        if fp not in rejected:
+            pool[fp] = r
+    for r in new:  # a re-distilled rule wins: keep its FRESH why/trigger/title/evidence
         fp = _store.fingerprint(r)
         if fp in rejected:
             continue
-        if fp not in pool or r.support >= pool[fp].support:
-            pool[fp] = r
+        if fp in pool:
+            r.support = max(r.support, pool[fp].support)  # but carry the peak support forward
+        pool[fp] = r
 
     def _rank(rules: list[SkillRule]) -> list[SkillRule]:
         def key(r: SkillRule):
@@ -172,7 +177,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     merged = merge_rules(existing, fresh, rejected, now=now or datetime.now(timezone.utc))
     # re-apply the external/exec hard-deny to the FULL install set (incl. store rules)
     rules, merged_blocked = _render.gate_rules(merged)
-    blocked = blocked + merged_blocked
+    # then drop any single rule the secret/PII/TruffleHog scan flags, PER RULE — so a
+    # dirty rule can't dead-end the whole install with no rejectable fingerprint.
+    rules, secret_blocked = _render.gate_secret_pii_per_rule(rules)
+    blocked = blocked + merged_blocked + secret_blocked
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
@@ -198,7 +206,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
 
 def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
-                   score_limit: int, backend: str) -> None:
+                   score_limit: int) -> None:
     if do_scan:
         print("Indexing sessions…")
         from .cli import _run_scan
@@ -255,13 +263,18 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
             conn, limit=score_limit + len(skip), source=_config_sources(), since=since)
         shareable = [s for s in fetched if s["session_id"] not in skip]
         unscored = shareable[:score_limit]
+        # Scoring uses the CONFIGURED scorer backend, independent of the distill
+        # `--backend` — that flag tunes distillation only and must not silently
+        # re-route the scoring fleet.
+        from .config import load_config
+        scorer_backend = load_config().get("scorer_backend") or "auto"
         if unscored:
             print(f"Scoring {len(unscored)} unscored session(s) in the window "
                   f"(this uses your agent CLI)…")
             for i, s in enumerate(unscored, 1):
                 sid = s["session_id"]
                 print(f"  [{i}/{len(unscored)}] {sid}", flush=True)
-                res = _score_single_session(conn, sid, backend=backend)
+                res = _score_single_session(conn, sid, backend=scorer_backend)
                 if isinstance(res, dict) and res.get("error"):
                     print(f"      (skipped: {res['error']})")
         if len(shareable) > score_limit:
@@ -325,7 +338,9 @@ def _print_preview(res: SkillResult) -> None:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})"))
     if res.blocked:
-        print(f"\n  ({len(res.blocked)} rule(s) dropped by the safety hard-deny.)")
+        print(f"\n  {len(res.blocked)} rule(s) dropped by the safety gate:")
+        for r, reasons in res.blocked:
+            print(f"    - {r.display_title()}  ({', '.join(reasons)})")
     if res.gate_issues:
         print(_ascii_safe(f"\n  ⚠ render-time gate found: {', '.join(res.gate_issues)} — install blocked."))
 
@@ -379,7 +394,6 @@ def run_skill(args) -> None:
         do_scan=not getattr(args, "no_scan", False),
         do_score=not getattr(args, "no_score", False),
         score_limit=score_limit,
-        backend=backend,
     )
 
     # 3-6. select -> distill -> merge -> gate -> render
@@ -428,7 +442,7 @@ def run_skill(args) -> None:
                 continue
             try:
                 installed.append(str(fn(payload)))
-            except (RuntimeError, OSError) as exc:
+            except (RuntimeError, OSError, UnicodeDecodeError) as exc:
                 failures.append(f"{name}: {exc}")
         if installed:
             _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'

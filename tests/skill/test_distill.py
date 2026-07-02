@@ -71,7 +71,7 @@ def test_distill_defaults_to_frontier_model(monkeypatch):
     import clawjournal.skill.distill as d
     monkeypatch.setattr(d, "resolve_backend", lambda b: b if b in ("claude", "codex") else "claude")
     assert d.DefaultCaller(backend="claude").model == "opus"
-    assert d.DefaultCaller(backend="codex").model == "gpt-5.4"
+    assert d.DefaultCaller(backend="codex").model == "gpt-5.4-mini"  # known-good fast default
     assert d.DefaultCaller(backend="claude", model="sonnet").model == "sonnet"
 
 

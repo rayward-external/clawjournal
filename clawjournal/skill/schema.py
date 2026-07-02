@@ -70,7 +70,11 @@ SKILL_DISTILL_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["kind", "title", "trigger", "guidance", "why"],
+                # Codex strict --output-schema requires EVERY property of an
+                # additionalProperties:false object to be listed here, or it rejects
+                # the schema and the default Codex distill silently returns nothing.
+                "required": ["kind", "title", "trigger", "guidance", "why",
+                             "taxonomy", "evidence_session_ids"],
                 "properties": {
                     "kind": {"type": "string", "enum": list(VALID_KINDS)},
                     "title": {"type": "string"},
@@ -148,18 +152,20 @@ _URL_RE = re.compile(r"\b(?:https?|ftp)://\S+|\bwww\.\S+\.\w", re.I)
 _OUT_OF_REPO_PATH_RE = re.compile(
     r"(?:^|\s)(?:/Users/|/home/|/etc/|/var/|/root/|~/\.|[A-Za-z]:\\)\S+|\.aws/credentials", re.I
 )
-# EXECUTABLE shell syntax only — command substitution, backticks, pipe-to-shell.
-# We do NOT deny bare command NAMES (eval/sudo/rm -rf/curl): an advisory "avoid eval
-# on untrusted input" safety lesson names the command it warns about, and a rule is
+# EXECUTABLE shell syntax only — command substitution ($(...)) and pipe-to-shell.
+# We do NOT deny bare command NAMES (eval/sudo/rm -rf/curl) or markdown backtick code
+# spans (`rg`, `npm run build`): those are advisory formatting/mentions, and a rule is
 # inert text in agent context — only actionable injection syntax is a real risk.
-_SHELL_META_RE = re.compile(r"\$\([^)]+\)|`[^`]*`|\|\s*(?:sh|bash)\b")
+_SHELL_META_RE = re.compile(r"\$\([^)]+\)|\|\s*(?:sh|bash)\b")
 # tool / MCP ids the agent could be steered to call (not the phrase "tool call").
 _TOOL_ID_RE = re.compile(r"\bmcp__\w+", re.I)
-# secret-like tokens (long hex/base64, common key prefixes) — kept strict: a leaked
-# secret is the worst outcome, and _scrub already redacts these before distill.
+# High-confidence secret PREFIXES only. Bare 40-hex / 40-base64 runs are dropped from
+# this per-rule deny because they false-positive on git commit SHAs and hashes that
+# grounded lessons legitimately cite; real high-entropy secrets are caught upstream by
+# _scrub (before distill) and by the render-time secrets/TruffleHog gate.
 _SECRET_RE = re.compile(
     r"\b(?:AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|"
-    r"[A-Fa-f0-9]{40,}|[A-Za-z0-9+/]{40,}={0,2})\b"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_\-]{20,})\b"
 )
 
 _DENY = [

@@ -32,7 +32,9 @@ def atomic_write_text(path: Path, text: str, *, parents: bool = False) -> None:
     """
     if parents:
         path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    # No leading dot: keep the temp name the same length as the target so a long but
+    # legal output filename can't tip mkstemp over the OS NAME_MAX limit.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)

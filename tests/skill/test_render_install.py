@@ -34,6 +34,16 @@ def test_render_frontmatter_and_sections():
     assert "<!-- clawjournal-lessons:" in md
 
 
+def test_gate_secret_pii_per_rule_drops_only_the_dirty_rule(monkeypatch):
+    # #1: a secret in one rule must drop THAT rule, not dead-end the whole install.
+    monkeypatch.setenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", "1")
+    clean = _rule(kind="do", guidance="run the test suite before merging")
+    dirty = _rule(kind="do", guidance="set key=AKIAIOSFODNN7EXAMPLE in the env")
+    kept, blocked = render.gate_secret_pii_per_rule([clean, dirty])
+    assert [r.guidance for r in kept] == ["run the test suite before merging"]
+    assert len(blocked) == 1 and blocked[0][0] is dirty
+
+
 def test_gate_rendered_catches_planted_secret(monkeypatch):
     monkeypatch.setenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", "1")  # autouse already does; explicit here
     assert render.gate_rendered("nothing sensitive here, run tests") == []
@@ -72,13 +82,16 @@ def test_install_writes_and_overwrites(tmp_path, monkeypatch):
     assert "updated rule" in p.read_text()
 
 
-def test_install_claude_refuses_hand_edited_managed_file(tmp_path, monkeypatch):
+def test_install_claude_backs_up_external_edit_and_regenerates(tmp_path, monkeypatch):
+    # #8: a weekly-regenerated artifact must not brick on an external touch — the edit
+    # is preserved in a .bak and the file is regenerated (not a hard refusal).
     monkeypatch.setenv("HOME", str(tmp_path))
     p = install.install_claude(render.render_skill_md([_rule()], META))
-    p.write_text(p.read_text() + "\nmanual edit\n", encoding="utf-8")
-
-    with pytest.raises(RuntimeError, match="hand-edited"):
-        install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
+    p.write_text(p.read_text() + "\nmanual edit\n", encoding="utf-8")     # external touch (append)
+    install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
+    assert "updated rule" in p.read_text()                                # regenerated
+    bak = p.with_name(p.name + ".local.bak")
+    assert bak.exists() and "manual edit" in bak.read_text()              # user's copy preserved
 
 
 def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch):
@@ -91,15 +104,16 @@ def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch)
         install.install_claude(render.render_skill_md([_rule()], META))
 
 
-def test_install_claude_detects_mid_body_edit(tmp_path, monkeypatch):
-    # #2: a mid-body edit (integrity line intact at the end) must still be caught —
-    # the embedded hash covers the whole body, not just the trailing marker.
+def test_install_claude_backs_up_mid_body_edit(tmp_path, monkeypatch):
+    # #2 + #8: a mid-body edit (integrity line intact at the end) is still detected by
+    # the embedded hash — and preserved in .bak, not silently overwritten or refused.
     monkeypatch.setenv("HOME", str(tmp_path))
     p = install.install_claude(render.render_skill_md([_rule()], META))
-    text = p.read_text()
-    p.write_text(text.replace("premature 4x", "REWORDED BY USER"), encoding="utf-8")  # body edit
-    with pytest.raises(RuntimeError, match="hand-edited"):
-        install.install_claude(render.render_skill_md([_rule(guidance="v2")], META))
+    p.write_text(p.read_text().replace("premature 4x", "REWORDED BY USER"), encoding="utf-8")
+    install.install_claude(render.render_skill_md([_rule(guidance="v2")], META))
+    assert "v2" in p.read_text()
+    bak = p.with_name(p.name + ".local.bak")
+    assert bak.exists() and "REWORDED BY USER" in bak.read_text()
 
 
 def test_install_claude_migrates_pre_integrity_file(tmp_path, monkeypatch):

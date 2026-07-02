@@ -38,7 +38,7 @@ def _wire(monkeypatch, unscored, held=()):
 
 def test_weekly_scans_and_scores_last_7_days(monkeypatch):
     calls = _wire(monkeypatch, [{"session_id": "a"}, {"session_id": "b"}])
-    _ensure_corpus(7, do_scan=True, do_score=True, score_limit=25, backend="auto")
+    _ensure_corpus(7, do_scan=True, do_score=True, score_limit=25)
     assert calls["scan"] == [None]                       # scan ran
     assert calls["unscored"][0]["since"] is not None     # bounded 7-day window
     assert calls["unscored"][0]["limit"] == 25           # score cap honored (no held rows)
@@ -49,7 +49,7 @@ def test_scoring_never_uses_the_distill_model(monkeypatch):
     # fix #4: `--model` tunes the distill call only; scoring must fall back to its own
     # (fast) default, never the frontier distill model.
     calls = _wire(monkeypatch, [{"session_id": "a"}])
-    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25, backend="auto")
+    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25)
     assert calls["scored"] == ["a"]
     assert all("model" not in kw for kw in calls["score_kw"])   # no distill model leaked in
 
@@ -57,7 +57,7 @@ def test_scoring_never_uses_the_distill_model(monkeypatch):
 def test_held_sessions_are_not_scored(monkeypatch):
     # fix #3: an egress-blocked (held/embargoed) session must not be sent to the model.
     calls = _wire(monkeypatch, [{"session_id": "ok"}, {"session_id": "held"}], held=["held"])
-    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25, backend="auto")
+    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25)
     assert calls["scored"] == ["ok"]                     # 'held' filtered out before scoring
     assert calls["unscored"][0]["limit"] == 26           # over-fetch by the held count (25 + 1)
 
@@ -66,21 +66,21 @@ def test_held_rows_do_not_starve_shareable_ones(monkeypatch):
     # a page whose head is all held must still let shareable rows through (over-fetch + cap).
     page = [{"session_id": "h1"}, {"session_id": "h2"}, {"session_id": "ok"}]
     calls = _wire(monkeypatch, page, held=["h1", "h2"])
-    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=1, backend="auto")
+    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=1)
     assert calls["unscored"][0]["limit"] == 3            # 1 + 2 held over-fetched
     assert calls["scored"] == ["ok"]                     # shareable row reached, not starved
 
 
 def test_first_run_all_history_uses_no_since(monkeypatch):
     calls = _wire(monkeypatch, [])
-    _ensure_corpus(ALL_HISTORY_DAYS, do_scan=False, do_score=True, score_limit=25, backend="auto")
+    _ensure_corpus(ALL_HISTORY_DAYS, do_scan=False, do_score=True, score_limit=25)
     assert calls["scan"] == []                           # --no-scan honored
     assert calls["unscored"][0]["since"] is None         # all history
 
 
 def test_no_score_flag_skips_scoring(monkeypatch):
     calls = _wire(monkeypatch, [{"session_id": "a"}])
-    _ensure_corpus(7, do_scan=True, do_score=False, score_limit=25, backend="auto")
+    _ensure_corpus(7, do_scan=True, do_score=False, score_limit=25)
     assert calls["scan"] == [None]
     assert calls["unscored"] == [] and calls["scored"] == []
 

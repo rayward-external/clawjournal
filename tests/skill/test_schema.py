@@ -24,6 +24,15 @@ def _rule(**kw):
     return SkillRule(**base)
 
 
+def test_distill_schema_is_codex_strict():
+    # #0: Codex --output-schema rejects an additionalProperties:false object unless
+    # EVERY property is in `required`; otherwise the default Codex distill is a no-op.
+    from clawjournal.skill.schema import SKILL_DISTILL_SCHEMA
+    item = SKILL_DISTILL_SCHEMA["properties"]["rules"]["items"]
+    assert item["additionalProperties"] is False
+    assert set(item["required"]) == set(item["properties"])   # all properties required
+
+
 def test_advisory_safety_lessons_are_not_hard_denied():
     # #1: a lesson that NAMES the dangerous command it warns about must install.
     from clawjournal.skill.schema import find_external_tokens

@@ -113,9 +113,14 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
              rule.support, ev, ts, ts),
         )
     elif existing["state"] != "rejected":
+        # Refresh content + support, and revive a previously-'dropped' fingerprint back
+        # to 'proposed' so a re-distilled rule reloads via load_kept next run instead of
+        # being re-distilled from scratch every time.
         conn.execute(
             "UPDATE skill_rules SET support = MAX(support, ?), evidence_json = ?, "
-            "why = ?, title = ?, trigger = ?, taxonomy = ?, last_seen_at = ? WHERE fingerprint = ?",
+            "why = ?, title = ?, trigger = ?, taxonomy = ?, last_seen_at = ?, "
+            "state = CASE WHEN state = 'dropped' THEN 'proposed' ELSE state END "
+            "WHERE fingerprint = ?",
             (rule.support, ev, rule.why, rule.title, rule.trigger, rule.taxonomy, ts, fp),
         )
     conn.commit()

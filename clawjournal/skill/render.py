@@ -36,6 +36,24 @@ def gate_rules(rules: list[SkillRule]) -> tuple[list[SkillRule], list[tuple[Skil
     return kept, blocked
 
 
+def gate_secret_pii_per_rule(
+    rules: list[SkillRule],
+) -> tuple[list[SkillRule], list[tuple[SkillRule, list[str]]]]:
+    """Split rules by the secret/PII/TruffleHog scan applied PER RULE.
+
+    A single dirty rule is DROPPED (moved to blocked-with-reasons) rather than left to
+    fail the whole-document ``gate_rendered`` — which would dead-end the install with a
+    fingerprint the user can't ``--reject`` (gate-failed runs persist nothing).
+    """
+    kept: list[SkillRule] = []
+    blocked: list[tuple[SkillRule, list[str]]] = []
+    for r in rules:
+        text = "\n".join([r.title, r.trigger, r.guidance, r.why, *r.evidence_session_ids])
+        issues = gate_rendered(text)
+        (blocked.append((r, issues)) if issues else kept.append(r))
+    return kept, blocked
+
+
 def gate_rendered(text: str) -> list[str]:
     """Return deterministic secret/PII/TruffleHog findings in *text* (empty = clean)."""
     issues: list[str] = []
