@@ -32,19 +32,41 @@ def test_generate_end_to_end(index_conn, ins):
     assert res.corpus.total_failures == 1 and res.corpus.total_successes == 1
 
 
-def test_unattributable_whole_doc_gate_finding_does_not_dead_end(index_conn, ins, monkeypatch):
-    # #0: if the whole-doc gate flags something no individual rule reproduces (a context
-    # artifact), the install must NOT dead-end (which would persist nothing + leave no
-    # rejectable fingerprint, re-blocking every future run).
-    from clawjournal.skill import render
+def _one_avoid_fake_and_seed(index_conn, ins):
     ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]', learning="said done early")
-    fake = FakeCaller({"rules": [
+    return FakeCaller({"rules": [
         {"kind": "avoid", "trigger": "t", "guidance": "run the test suite first", "why": "w",
          "taxonomy": "verification_skipped"}]})
+
+
+def test_unattributable_whole_doc_finding_fails_closed(index_conn, ins, monkeypatch):
+    # #0 (security): a real whole-doc secret/PII/TruffleHog finding NOT attributable to
+    # any single rule must FAIL CLOSED (block), never silently install flagged content.
+    from clawjournal.skill import render
+    fake = _one_avoid_fake_and_seed(index_conn, ins)
     monkeypatch.setattr(render, "gate_rendered", lambda text, **kw: ["trufflehog: 1 finding(s)"])
     monkeypatch.setattr(render, "gate_secret_pii_per_rule", lambda rules, **kw: (rules, []))
     res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
-    assert res.rules and res.gate_issues == []   # not dead-ended; install can proceed
+    assert res.gate_issues   # blocked, not silently cleared
+
+
+def test_scanner_error_fails_closed_without_per_rule_misattribution(index_conn, ins, monkeypatch):
+    # #1: a TruffleHog scan error (blocking, no finding) must fail closed AS-IS, not be
+    # misattributed to every rule by the per-rule pinpoint pass.
+    from clawjournal.skill import render
+    fake = _one_avoid_fake_and_seed(index_conn, ins)
+    calls = {"per_rule": 0}
+
+    def fake_per_rule(rules, **kw):
+        calls["per_rule"] += 1
+        return rules, []
+    monkeypatch.setattr(render, "gate_rendered", lambda text, **kw: ["trufflehog: trufflehog-error"])
+    monkeypatch.setattr(render, "gate_secret_pii_per_rule", fake_per_rule)
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+    assert res.gate_issues            # blocked (fail closed)
+    # the ONLY allowed per-rule call is the initial fast regex pass; the TruffleHog
+    # pinpoint pass must be skipped for a scanner error (no misattribution).
+    assert calls["per_rule"] == 1
 
 
 def test_generate_empty_when_no_scored_sessions(index_conn, ins):

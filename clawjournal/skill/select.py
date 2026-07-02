@@ -176,7 +176,7 @@ def select_skill_candidates(
     def _in_window(start_time: str | None) -> bool:
         parsed = _parse_start_time(start_time)
         if parsed is not None:
-            return parsed >= window_start_dt
+            return window_start_dt <= parsed <= clock  # bound both ends (drop future-dated)
         return bool(start_time) and str(start_time) >= window_start  # unparseable: prior behavior
 
     def _keep(row: Any) -> bool:

@@ -48,14 +48,6 @@ class SkillRule:
         """The heading to render; falls back to guidance when unnamed."""
         return self.title.strip() or _derive_title(self.guidance)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind, "trigger": self.trigger, "guidance": self.guidance,
-            "why": self.why, "title": self.title,
-            "evidence_session_ids": list(self.evidence_session_ids),
-            "taxonomy": self.taxonomy, "support": self.support,
-        }
-
 
 # JSON schema handed to the agent CLI (Codex --output-schema; also documents the
 # shape for Claude). Kept small and strict.

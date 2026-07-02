@@ -38,7 +38,7 @@ class SkillResult:
     meta: dict[str, Any]
     added_fps: set[str] = field(default_factory=set)
     dropped: list[SkillRule] = field(default_factory=list)
-    # week-over-week: {failure_mode: (prev_rate_or_None, current_rate)} for targeted modes
+    # run-over-run: {failure_mode: (prev_rate_or_None, current_rate)} for targeted modes
     trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
 
 
@@ -192,29 +192,32 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
         region = _render.render_agents_region(rules, meta)
         gate_issues = _render.gate_rendered(skill_md)   # whole-doc, incl. TruffleHog (1 call)
         if gate_issues:
-            # TruffleHog caught something the fast per-rule regex missed (a detector-only
-            # key). Pinpoint + drop the offending rule(s) with a per-rule TruffleHog pass
-            # so we don't dead-end the whole install with no rejectable fingerprint.
-            rules, tf_blocked = _render.gate_secret_pii_per_rule(rules, run_trufflehog=True)
-            if tf_blocked:
-                blocked = blocked + tf_blocked
-                skill_md = _render.render_skill_md(rules, meta) if rules else ""
-                region = _render.render_agents_region(rules, meta) if rules else ""
-                gate_issues = _render.gate_rendered(skill_md) if rules else []
-            else:
-                # The finding reproduces on NO individual rule — it is a context artifact
-                # of the concatenated doc / static frontmatter (which is constant-clean).
-                # The per-rule TruffleHog pass just cleared every rule, so DON'T dead-end
-                # the install (which would persist nothing and leave no fingerprint to
-                # --reject, re-blocking every future run).
-                gate_issues = []
+            # A scanner INFRA failure (blocking with no finding: missing binary, timeout,
+            # crash) must fail closed AS-IS — never run the per-rule pinpoint, which would
+            # misattribute the same error to every rule and silently drop the whole set.
+            scanner_error = any(("error" in i) or ("scan failed" in i) for i in gate_issues)
+            if not scanner_error:
+                # Real content finding TruffleHog caught that the fast per-rule regex
+                # missed: attribute it to a rule and drop that rule.
+                rules, tf_blocked = _render.gate_secret_pii_per_rule(rules, run_trufflehog=True)
+                if tf_blocked:
+                    blocked = blocked + tf_blocked
+                    skill_md = _render.render_skill_md(rules, meta) if rules else ""
+                    region = _render.render_agents_region(rules, meta) if rules else ""
+                    # surviving rules already passed the per-rule TruffleHog scan
+                    gate_issues = _render.gate_rendered(skill_md, run_trufflehog=False) if rules else []
+                # else: a real finding NOT attributable to any single rule (spans rule
+                # boundaries / rendered structure). FAIL CLOSED — keep gate_issues so the
+                # install is blocked; NEVER silently write flagged content to the skill
+                # files. ('any TruffleHog finding blocks' is a hard invariant.)
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
     dropped = [r for r in existing if _store.fingerprint(r) in (prev_installed - merged_fps)]
 
-    # week-over-week recurrence signal (§9/D9): current vs last snapshot, for the
-    # failure modes the current "avoid" rules target. Directional, not powered.
+    # run-over-run recurrence signal (§9/D9): current vs the LAST saved snapshot (which
+    # is per-run, not calendar-weekly), for the failure modes the current "avoid" rules
+    # target. Directional, not powered — labeled "vs your last run", not "week-over-week".
     cur_rates = corpus.mode_rates()
     last = _store.last_mode_snapshot(conn)
     prev_rates = last[2] if last else {}
@@ -356,13 +359,13 @@ def _print_preview(res: SkillResult) -> None:
             print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
     if res.trend:
         n = res.corpus.eligible_scored
-        print(_ascii_safe(f"\n  Recurrence of targeted failure modes (rate over {n} scored session(s) "
-                          f"— directional, not a powered metric):"))
+        print(_ascii_safe(f"\n  Recurrence of targeted failure modes vs your last run "
+                          f"(rate over {n} scored session(s) — directional, not a powered metric):"))
         for mode, (prev, cur) in res.trend.items():
             if n < 10:
                 print(_ascii_safe(f"    - {mode}: {cur:.0%}  (insufficient data — n={n})"))
             elif prev is None:
-                print(f"    - {mode}: {cur:.0%}  (baseline; re-run next week to see the trend)")
+                print(f"    - {mode}: {cur:.0%}  (baseline; re-run later to see the trend)")
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})"))
@@ -371,7 +374,9 @@ def _print_preview(res: SkillResult) -> None:
         for r, reasons in res.blocked:
             print(f"    - {r.display_title()}  ({', '.join(reasons)})")
     if res.gate_issues:
-        print(_ascii_safe(f"\n  ⚠ render-time gate found: {', '.join(res.gate_issues)} — install blocked."))
+        print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {', '.join(res.gate_issues)}"))
+        print("    (fail-closed — nothing was written. If the scanner itself errored, re-run; "
+              "otherwise the flagged lesson spans rules — inspect the source sessions.)")
 
 
 def run_skill(args) -> None:
@@ -480,7 +485,7 @@ def run_skill(args) -> None:
             _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'
             # Only snapshot when the window actually had scored sessions — an idle-week
             # run (empty corpus but kept rules re-proposed) must NOT overwrite the last
-            # real snapshot with an empty one, which would reset the week-over-week trend.
+            # real snapshot with an empty one, which would reset the run-over-run trend.
             if res.corpus.eligible_scored > 0:
                 _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
         else:

@@ -124,11 +124,16 @@ class DefaultCaller:
 
     def __call__(self, *, system_prompt: str, task_prompt: str) -> dict[str, Any]:
         from .schema import SKILL_DISTILL_SCHEMA
+        # claude_bare -> Claude Code runs WITHOUT auto-loading the installed
+        # clawjournal-lessons skill / user CLAUDE.md, so distillation is grounded only
+        # in the passed corpus and can't re-emit/reinforce already-installed or
+        # --rejected rules (which would inflate support and defeat decay).
         return run_agent_json_call(
             resolved=self.resolved, model=self.model,
             system_prompt=system_prompt, task_prompt=task_prompt,
             timeout_seconds=self.timeout_seconds,
             codex_output_schema=SKILL_DISTILL_SCHEMA,
+            claude_bare=True,
         )
 
 

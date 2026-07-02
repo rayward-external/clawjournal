@@ -110,8 +110,9 @@ def _render_body(rules: list[SkillRule], meta: dict[str, Any]) -> str:
             tags.append(r.taxonomy)
         if r.support:
             tags.append(f"seen ~{r.support}×")
-        if r.evidence_session_ids:
-            tags.append("e.g. " + ", ".join(r.evidence_session_ids[:3]))
+        # NB: we deliberately do NOT render evidence_session_ids — they are ephemeral
+        # per-run 'case-NN' aliases, and a carried-over rule would cite case ids that map
+        # to unrelated sessions this run (misleading provenance in the installed file).
         if tags:
             lines.append(f"- _{' · '.join(tags)}_")
         return lines
