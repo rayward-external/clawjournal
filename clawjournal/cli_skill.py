@@ -165,30 +165,33 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
     if not do_score:
         return
     from .cli import _score_single_session
-    from .workbench.index import open_index, query_unscored_sessions, release_gate_blockers
+    from .workbench.index import open_index, query_unscored_sessions
+    now = datetime.now(timezone.utc)
+    # Widen the SQL lower bound by 2 days (> the 14h max UTC-offset skew) so a
+    # mixed-offset start_time string can't exclude an in-window session — the same
+    # reason select.py widens. Scoring a few just-out-of-window sessions is harmless;
+    # the corpus is filtered on the precise instant there.
     since = (None if window_days >= ALL_HISTORY_DAYS
-             else (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat())
+             else (now - timedelta(days=window_days + 2)).isoformat())
     conn = open_index()
     try:
         # Scoring uses the configured scoring backend's own default model, NOT the
         # distill `--model` — a frontier distill model must not re-price the fleet.
         #
-        # Determine the window's egress-blocked (held/embargoed) sessions FIRST and
-        # cap AFTER filtering: a page full of held rows must not starve older
-        # shareable ones, and never score (=> model-provider egress) a held session.
-        # release_gate_blockers is the canonical gate (it resolves expired embargoes
-        # back to shareable), so we only feed it the not-obviously-shareable rows.
-        held_where = ("review_status != 'segmented' AND "
-                      "(hold_state IS NULL OR hold_state NOT IN ('auto_redacted','released'))")
+        # Determine the window's egress-blocked (explicitly held/embargoed) sessions
+        # FIRST and cap AFTER filtering: a page of held rows must not starve older
+        # shareable ones, and a held session must never be scored (=> egress). Rows
+        # default to the shareable 'auto_redacted', so this set is small;
+        # _release_blocked_ids chunks the gate query (SQLite variable limit) and
+        # resolves expired embargoes back to shareable.
+        held_where = "review_status != 'segmented' AND hold_state NOT IN ('auto_redacted','released')"
         held_params: list = []
         if since:
             held_where += " AND start_time >= ?"
             held_params.append(since)
         held_candidates = [r["session_id"] for r in conn.execute(
             f"SELECT session_id FROM sessions WHERE {held_where}", held_params).fetchall()]
-        blocked = ({b["session_id"] for b in release_gate_blockers(
-            conn, held_candidates, now=datetime.now(timezone.utc))}
-            if held_candidates else set())
+        blocked = _select._release_blocked_ids(conn, held_candidates, now=now) if held_candidates else set()
 
         # Over-fetch by the held count so >= score_limit shareable rows survive the filter.
         fetched = query_unscored_sessions(

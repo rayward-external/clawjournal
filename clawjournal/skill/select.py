@@ -90,15 +90,19 @@ def _has_evidence(learning: str | None, reason: str | None, modes: list[str]) ->
     return bool((learning and learning.strip()) or (reason and reason.strip()) or modes)
 
 
-_SUBSECOND_RE = re.compile(r"(\.\d{6})\d+")  # >6 fractional digits: Python 3.10 rejects them
+_FRACTION_RE = re.compile(r"\.(\d+)")  # fractional seconds only ('.' appears nowhere else in ISO)
+
+
+def _pad_fraction(m: re.Match) -> str:
+    # Python 3.10's fromisoformat accepts ONLY 3 or 6 fractional digits; normalize any
+    # count (1/2/4/5/7+) to exactly 6 so it always parses.
+    return "." + m.group(1)[:6].ljust(6, "0")
 
 
 def _parse_start_time(value: str | None) -> datetime | None:
     if not value:
         return None
-    # Truncate sub-microsecond precision before parsing — datetime.fromisoformat on
-    # Python 3.10 (a CI target) rejects 7-/9-digit fractional seconds outright.
-    text = _SUBSECOND_RE.sub(r"\1", str(value).strip().replace("Z", "+00:00"))
+    text = _FRACTION_RE.sub(_pad_fraction, str(value).strip().replace("Z", "+00:00"))
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:

@@ -90,6 +90,25 @@ def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch)
         install.install_claude(render.render_skill_md([_rule()], META))
 
 
+def test_install_claude_recovers_from_stale_sidecar(tmp_path, monkeypatch):
+    # #1: the .sha256 sidecar write can be interrupted separately from SKILL.md,
+    # leaving a stale hash. A re-run must regenerate (SKILL.md untouched), not brick
+    # every future run with a false "hand-edited" error.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = install.install_claude(render.render_skill_md([_rule()], META))
+    install.claude_skill_hash_path(p).write_text("deadbeef\n", encoding="utf-8")  # stale hash
+    p2 = install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
+    assert "updated rule" in p2.read_text()          # regenerated, not refused
+
+
+def test_install_claude_recovers_when_sidecar_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = install.install_claude(render.render_skill_md([_rule()], META))
+    install.claude_skill_hash_path(p).unlink()       # sidecar write never landed
+    install.install_claude(render.render_skill_md([_rule(guidance="v2")], META))
+    assert "v2" in p.read_text()
+
+
 def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     agents = tmp_path / ".codex" / "AGENTS.md"

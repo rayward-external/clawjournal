@@ -40,6 +40,17 @@ def test_badge_only_null_score_session_keeps_rate_within_one(index_conn, ins):
     assert all(r <= 1.0 for r in corpus.mode_rates().values())
 
 
+def test_parse_start_time_handles_odd_fractional_seconds():
+    # Python 3.10's fromisoformat accepts only 3 or 6 fractional digits; 1/2/4/5/7+
+    # must still parse (else recent sessions collapse to recency 0.01 and get dropped).
+    from clawjournal.skill.select import _parse_start_time
+    for ts in ("2026-06-30T10:00:00.1234+00:00",   # 4 digits
+               "2026-06-30T10:00:00.1Z",            # 1 digit + Z
+               "2026-06-30T10:00:00.12345+00:00",   # 5 digits
+               "2026-06-30T10:00:00.123456789+00:00"):  # 9 digits
+        assert _parse_start_time(ts) is not None
+
+
 def test_malformed_recovery_labels_does_not_crash(index_conn, ins):
     # a corrupt/legacy ai_recovery_labels must not crash the run: json_each is guarded
     # by json_valid (parallel to the ai_failure_modes clause). outcome='failed' forces

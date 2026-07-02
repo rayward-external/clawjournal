@@ -22,7 +22,9 @@ def _wire(monkeypatch, unscored, held=()):
         calls["unscored"].append({"limit": limit, "source": source, "since": since})
         return list(unscored)
     monkeypatch.setattr("clawjournal.workbench.index.query_unscored_sessions", fake_unscored)
-    monkeypatch.setattr("clawjournal.workbench.index.release_gate_blockers",
+    # blocking flows through _select._release_blocked_ids, which uses select's own
+    # module-level release_gate_blockers reference — patch there.
+    monkeypatch.setattr("clawjournal.skill.select.release_gate_blockers",
                         lambda conn, ids, **kw: [{"session_id": s} for s in ids if s in held])
 
     def fake_score(conn, sid, **kw):

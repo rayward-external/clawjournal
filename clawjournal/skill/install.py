@@ -70,21 +70,39 @@ def upsert_region(existing: str, region_body: str) -> str:
     return f"{existing}{sep}{block}" if existing.strip() else block
 
 
+PROVENANCE_MARK = "<!-- clawjournal-lessons:"
+
+
+def _is_unmodified_managed(existing: str) -> bool:
+    """True if *existing* is our own generated skill with nothing appended.
+
+    Our SKILL.md always ends with the ``<!-- clawjournal-lessons: … -->`` provenance
+    comment. If the file still ends there, it is our untouched output — even when the
+    .sha256 sidecar is missing or stale (its write can be interrupted separately from
+    the SKILL.md write). This lets a re-run regenerate instead of bricking on a false
+    "hand-edited" error, while text appended after the comment still reads as edited.
+    """
+    idx = existing.rfind(PROVENANCE_MARK)
+    if idx == -1:
+        return False
+    tail = existing[idx:]
+    close = tail.find("-->")
+    return close != -1 and tail[close + 3:].strip() == ""
+
+
 def install_claude(skill_md: str) -> Path:
     path = claude_skill_path()
     if path.exists():
         existing = path.read_text(encoding="utf-8")
         hash_path = claude_skill_hash_path(path)
-        if hash_path.exists():
-            recorded = hash_path.read_text(encoding="utf-8").strip()
-            if recorded != _sha256_text(existing):
-                raise RuntimeError(
-                    f"Refusing to overwrite hand-edited Claude skill: {path}"
-                )
-        elif "<!-- clawjournal-lessons:" not in existing:
-            raise RuntimeError(
-                f"Refusing to overwrite existing non-ClawJournal Claude skill: {path}"
-            )
+        recorded = hash_path.read_text(encoding="utf-8").strip() if hash_path.exists() else None
+        verified = recorded is not None and recorded == _sha256_text(existing)
+        if verified or _is_unmodified_managed(existing):
+            pass  # our own file (hash-verified, or unmodified despite a stale/missing sidecar)
+        elif PROVENANCE_MARK in existing:
+            raise RuntimeError(f"Refusing to overwrite hand-edited Claude skill: {path}")
+        else:
+            raise RuntimeError(f"Refusing to overwrite non-ClawJournal Claude skill: {path}")
     _atomic_write(path, skill_md)
     _atomic_write(claude_skill_hash_path(path), _sha256_text(skill_md) + "\n")
     return path
