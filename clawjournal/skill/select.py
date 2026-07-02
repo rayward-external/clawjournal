@@ -177,7 +177,10 @@ def select_skill_candidates(
         parsed = _parse_start_time(start_time)
         if parsed is not None:
             return window_start_dt <= parsed <= clock  # bound both ends (drop future-dated)
-        return bool(start_time) and str(start_time) >= window_start  # unparseable: prior behavior
+        # Unparseable timestamp: its true age is unknown, and a lexicographic compare
+        # (e.g. 'unknown' >= '2026-...') wrongly pulls it into the window. Exclude it —
+        # _parse_start_time already handles Z / offsets / odd fractional seconds.
+        return False
 
     def _keep(row: Any) -> bool:
         if not _in_window(row["start_time"]):

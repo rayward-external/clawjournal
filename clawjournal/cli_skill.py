@@ -146,7 +146,8 @@ def _config_excluded_projects(cfg: dict | None = None) -> list[str]:
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
                    model: str | None = None, caller=None, now: datetime | None = None,
                    sources: list[str] | None = None,
-                   excluded_projects: list[str] | None = None) -> SkillResult:
+                   excluded_projects: list[str] | None = None,
+                   cfg: dict | None = None) -> SkillResult:
     """Pure pipeline: select -> distill -> merge(store) -> gate -> render. Read-only.
 
     ``sources`` is the confirmed source scope (``run_skill`` passes
@@ -172,7 +173,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     distilled: list[SkillRule] = []
     if not corpus.is_empty():
-        distilled = _distill.distill_skills(corpus, backend=backend, model=model, caller=caller)
+        distilled = _distill.distill_skills(corpus, backend=backend, model=model, caller=caller, cfg=cfg)
     fresh, blocked = _render.gate_rules(distilled)
 
     # merge with durable state (skip rejected, replace weakest)
@@ -207,8 +208,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
                     blocked = blocked + tf_blocked
                     skill_md = _render.render_skill_md(rules, meta) if rules else ""
                     region = _render.render_agents_region(rules, meta) if rules else ""
-                    # surviving rules already passed the per-rule TruffleHog scan
-                    gate_issues = _render.gate_rendered(skill_md, run_trufflehog=False) if rules else []
+                    # Re-run the FULL gate incl. TruffleHog: a residual detector-only
+                    # finding in the reduced document that is NOT attributable to a single
+                    # surviving rule must still fail closed — never write flagged content.
+                    gate_issues = _render.gate_rendered(skill_md) if rules else []
                 # else: a real finding NOT attributable to any single rule (spans rule
                 # boundaries / rendered structure). FAIL CLOSED — keep gate_issues so the
                 # install is blocked; NEVER silently write flagged content to the skill
@@ -442,7 +445,7 @@ def run_skill(args) -> None:
     try:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model,
                              sources=_config_sources(cfg),
-                             excluded_projects=_config_excluded_projects(cfg))
+                             excluded_projects=_config_excluded_projects(cfg), cfg=cfg)
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and
@@ -490,12 +493,19 @@ def run_skill(args) -> None:
             except (RuntimeError, OSError, UnicodeDecodeError) as exc:
                 failures.append(f"{name}: {exc}")
         if installed:
-            _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'
-            # Only snapshot when the window actually had scored sessions — an idle-week
-            # run (empty corpus but kept rules re-proposed) must NOT overwrite the last
-            # real snapshot with an empty one, which would reset the run-over-run trend.
-            if res.corpus.eligible_scored > 0:
-                _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+            # The skill is ALREADY on disk; a durable-store write failure (e.g. sqlite
+            # lock vs the daemon) must NOT crash with a traceback — warn and continue.
+            # Worst case the next run re-labels these rules [NEW]; the install is safe.
+            try:
+                _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'
+                # Only snapshot when the window actually had scored sessions — an idle
+                # run (empty corpus but kept rules re-proposed) must NOT overwrite the
+                # last real snapshot with an empty one (would reset the run-over-run trend).
+                if res.corpus.eligible_scored > 0:
+                    _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+            except Exception as exc:
+                print(f"note: installed to disk, but failed to record state "
+                      f"({exc.__class__.__name__}); the next run may re-propose these rules.")
         else:
             _persist_seen()  # nothing landed -> at least keep 'seen' state for next run
     finally:

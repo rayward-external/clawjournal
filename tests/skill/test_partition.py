@@ -50,6 +50,16 @@ def test_excluded_projects_are_not_candidates(index_conn, ins):
     assert corpus.eligible_scored == 1              # and dropped from the denominator too
 
 
+def test_unparseable_start_time_is_excluded(index_conn, ins):
+    # #2: an unparseable start_time can't be placed in the window; a lexicographic
+    # fallback ('not-a-date' >= '2026-...') wrongly pulled it in — it must be excluded.
+    ins(index_conn, "bad", start_time="not-a-date", fvs=5, learning="x")
+    ins(index_conn, "good", start_time="2026-05-28T00:00:00+00:00", fvs=5, learning="x")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    ids = {c.session_id for c in corpus.candidates}
+    assert "bad" not in ids and "good" in ids
+
+
 def test_parse_start_time_handles_odd_fractional_seconds():
     # Python 3.10's fromisoformat accepts only 3 or 6 fractional digits; 1/2/4/5/7+
     # must still parse (else recent sessions collapse to recency 0.01 and get dropped).

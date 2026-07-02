@@ -143,14 +143,17 @@ def distill_skills(
     backend: str = "auto",
     model: str | None = None,
     caller: Caller | None = None,
+    cfg: dict | None = None,
 ) -> list[SkillRule]:
     """Run the single distill call and return <=MAX_RULES validated SkillRules.
 
-    ``caller`` is injected in tests; default hits the user's own agent CLI.
+    ``caller`` is injected in tests; default hits the user's own agent CLI. ``cfg``
+    reuses an already-loaded config (for redact_usernames) instead of re-reading it.
     """
     if corpus.is_empty():
         return []
-    anon = Anonymizer(extra_usernames=list(load_config().get("redact_usernames", []) or []))
+    cfg = cfg if cfg is not None else load_config()
+    anon = Anonymizer(extra_usernames=list(cfg.get("redact_usernames", []) or []))
     aliases = _candidate_aliases(corpus)  # computed once, reused for evidence back-mapping
     task = build_prompt(corpus, anon, aliases)
     try:
