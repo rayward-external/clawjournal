@@ -38,13 +38,23 @@ def test_semantic_dedup_refreshes_carried_last_seen():
     assert len(kept) == 1 and kept[0].last_seen == ""   # refreshed, won't age out
 
 
-def test_semantic_dedup_keeps_distinct_lessons_in_same_mode():
+def test_taxonomy_collapse_merges_same_mode_avoid_rules():
+    # same failure MODE => same lesson for the 5-rule budget (breadth over depth), even
+    # when the two rewrites share almost no vocabulary (word-overlap alone would miss it).
     a = _tr("run the full regression suite before claiming a fix is done",
             taxonomy="verification_skipped", support=5)
     b = _tr("confirm an issue is reproducible on a clean clone before debugging",
             taxonomy="verification_skipped", support=4)
     merged = merge_rules([], [a, b], set())
-    assert len(merged) == 2   # same mode but distinct lessons (low overlap) -> both survive
+    assert len(merged) == 1 and merged[0].taxonomy == "verification_skipped"
+
+
+def test_distinct_do_rules_survive():
+    # 'do' rules carry no taxonomy; only genuine paraphrases (high overlap) collapse.
+    a = _tr("write a failing regression test that reproduces the bug before fixing", kind="do")
+    b = _tr("probe environment constraints and shell version before running a script", kind="do")
+    merged = merge_rules([], [a, b], set())
+    assert len(merged) == 2   # different topics, low overlap -> both kept
 
 
 def _r(g, support=0, kind="avoid"):

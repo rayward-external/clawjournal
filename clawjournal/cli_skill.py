@@ -97,16 +97,19 @@ def _guidance_overlap(a: str, b: str) -> float:
 def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     """True if two rules teach the SAME lesson (a paraphrase fingerprint dedup misses).
 
-    Same failure mode (taxonomy) needs only moderate word overlap to count as the same
-    lesson; otherwise a strong paraphrase overlap is required so genuinely distinct
-    lessons (even within one mode) are preserved.
+    Same failure MODE (taxonomy) => same lesson, full stop: for a 5-rule budget, covering
+    5 DISTINCT modes beats two rules on one mode, and LLM paraphrases of one lesson share
+    little vocabulary (word-overlap alone reliably MISSES them — e.g. 'answer the actual
+    question' vs 'close with a recommendation' overlap ~0.1 yet are the same
+    communication_error lesson), so taxonomy is the trustworthy signal. Rules without a
+    shared mode (e.g. 'do' rules, which carry no taxonomy) fall back to word overlap at a
+    lowered threshold so real rewrites still collapse.
     """
     if a.kind != b.kind:
         return False
-    overlap = _guidance_overlap(a.guidance, b.guidance)
     if a.taxonomy and a.taxonomy == b.taxonomy:
-        return overlap >= 0.25
-    return overlap >= 0.5
+        return True
+    return _guidance_overlap(a.guidance, b.guidance) >= 0.3
 
 
 def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRule]:
