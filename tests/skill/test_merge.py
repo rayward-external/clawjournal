@@ -49,6 +49,18 @@ def test_taxonomy_collapse_merges_same_mode_avoid_rules():
     assert len(merged) == 1 and merged[0].taxonomy == "verification_skipped"
 
 
+def test_cross_kind_same_title_collapses():
+    # the distiller emits one lesson as BOTH a 'do' and an 'avoid' with the same title;
+    # they must collapse to one even though the kinds differ.
+    avoid = SkillRule(kind="avoid", trigger="t", guidance="don't trust a green harness as done",
+                      why="w", title="Verify Beyond Green Tests", taxonomy="verification_skipped",
+                      support=9)
+    do = SkillRule(kind="do", trigger="t", guidance="adversarially self-review before finishing",
+                   why="w", title="Verify Beyond Green Tests", support=4)
+    merged = merge_rules([do], [avoid], set())
+    assert sum(r.title == "Verify Beyond Green Tests" for r in merged) == 1
+
+
 def test_distinct_do_rules_survive():
     # 'do' rules carry no taxonomy; only genuine paraphrases (high overlap) collapse.
     a = _tr("write a failing regression test that reproduces the bug before fixing", kind="do")

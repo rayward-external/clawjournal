@@ -105,11 +105,18 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     shared mode (e.g. 'do' rules, which carry no taxonomy) fall back to word overlap at a
     lowered threshold so real rewrites still collapse.
     """
-    if a.kind != b.kind:
-        return False
-    if a.taxonomy and a.taxonomy == b.taxonomy:
+    # An identical title => the same lesson even ACROSS kinds — the distiller often emits
+    # one lesson as both 'do X' and 'avoid not-X' (e.g. "Verify Beyond Green Tests" as
+    # both), which a within-kind check never compares.
+    ta, tb = a.title.strip().lower(), b.title.strip().lower()
+    if ta and ta == tb:
         return True
-    return _guidance_overlap(a.guidance, b.guidance) >= 0.3
+    if a.kind == b.kind:
+        if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson
+            return True
+        return _guidance_overlap(a.guidance, b.guidance) >= 0.3
+    # cross-kind (do vs avoid) with different titles: require strong word overlap
+    return _guidance_overlap(a.guidance, b.guidance) >= 0.45
 
 
 def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRule]:
@@ -162,10 +169,12 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
             return (weight, fresh)
         return sorted(rules, key=key, reverse=True)
 
-    # rank, then collapse paraphrase clusters so a reworded lesson can't duplicate an
-    # installed one and crowd out a distinct rule.
-    avoid = _semantic_dedup(_rank([r for r in pool.values() if r.kind == "avoid"]), new_fps)
-    do = _semantic_dedup(_rank([r for r in pool.values() if r.kind == "do"]), new_fps)
+    # rank the FULL pool, then collapse paraphrase clusters ACROSS kinds (so a lesson
+    # framed as both a 'do' and an 'avoid' can't install twice), then split for the
+    # good+bad interleave — the dedup preserves rank order, so each list stays ranked.
+    deduped = _semantic_dedup(_rank(list(pool.values())), new_fps)
+    avoid = [r for r in deduped if r.kind == "avoid"]
+    do = [r for r in deduped if r.kind == "do"]
     out: list[SkillRule] = []
     ai = di = 0
     while len(out) < MAX_RULES and (ai < len(avoid) or di < len(do)):
