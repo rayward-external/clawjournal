@@ -9,6 +9,7 @@ fake caller and is read-only on the store; ``run_skill`` owns scan/score/IO.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -65,6 +66,65 @@ def _decayed_support(rule: SkillRule, now: datetime) -> float:
     return rule.support * (0.5 ** (age_days / _SUPPORT_HALFLIFE_DAYS))
 
 
+# --- semantic dedup (paraphrase collapse) -----------------------------------
+# Fingerprint dedup keys on kind + normalized guidance, so a REWORDING of an existing
+# lesson (same meaning, different words -> different fingerprint) survives as a separate
+# rule. Left unchecked, the distiller re-emits paraphrases of installed lessons every run
+# (esp. now that distill runs bare and can't see the installed set), wasting the 5-rule
+# budget on duplicates and dropping distinct lessons. Collapse them here.
+
+_DUP_STOPWORDS = frozenset(
+    "the a an to of in on and or for with is are be that this it its your you not never "
+    "always before after when so than then them they into from by at as if do dont use "
+    "using ensure make sure any all each every rather instead only".split()
+)
+
+
+def _guidance_keywords(text: str) -> set[str]:
+    """Significant word stems in a rule's guidance (crude singular/plural fold)."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return {(w[:-1] if w.endswith("s") and len(w) > 3 else w)
+            for w in words if len(w) > 2 and w not in _DUP_STOPWORDS}
+
+
+def _guidance_overlap(a: str, b: str) -> float:
+    ka, kb = _guidance_keywords(a), _guidance_keywords(b)
+    if not ka or not kb:
+        return 0.0
+    return len(ka & kb) / len(ka | kb)
+
+
+def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
+    """True if two rules teach the SAME lesson (a paraphrase fingerprint dedup misses).
+
+    Same failure mode (taxonomy) needs only moderate word overlap to count as the same
+    lesson; otherwise a strong paraphrase overlap is required so genuinely distinct
+    lessons (even within one mode) are preserved.
+    """
+    if a.kind != b.kind:
+        return False
+    overlap = _guidance_overlap(a.guidance, b.guidance)
+    if a.taxonomy and a.taxonomy == b.taxonomy:
+        return overlap >= 0.25
+    return overlap >= 0.5
+
+
+def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRule]:
+    """Collapse paraphrase clusters in a rank-ordered list, keeping ONE lesson each.
+
+    Within a cluster, prefer the already-installed (carried) rule over a fresh
+    paraphrase — stability beats re-wording the user's skill file every run.
+    """
+    kept: list[SkillRule] = []
+    for r in ranked:
+        dup = next((i for i, k in enumerate(kept) if _same_lesson(r, k)), None)
+        if dup is None:
+            kept.append(r)
+        elif (_store.fingerprint(kept[dup]) in new_fps) and (_store.fingerprint(r) not in new_fps):
+            kept[dup] = r  # replace a fresh paraphrase with the carried original (no churn)
+    return kept
+
+
 def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str],
                 *, now: datetime | None = None) -> list[SkillRule]:
     """Merge existing + newly-distilled rules -> top-<=5 (replace the weakest).
@@ -98,8 +158,10 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
             return (weight, fresh)
         return sorted(rules, key=key, reverse=True)
 
-    avoid = _rank([r for r in pool.values() if r.kind == "avoid"])
-    do = _rank([r for r in pool.values() if r.kind == "do"])
+    # rank, then collapse paraphrase clusters so a reworded lesson can't duplicate an
+    # installed one and crowd out a distinct rule.
+    avoid = _semantic_dedup(_rank([r for r in pool.values() if r.kind == "avoid"]), new_fps)
+    do = _semantic_dedup(_rank([r for r in pool.values() if r.kind == "do"]), new_fps)
     out: list[SkillRule] = []
     ai = di = 0
     while len(out) < MAX_RULES and (ai < len(avoid) or di < len(do)):

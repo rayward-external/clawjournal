@@ -30,7 +30,9 @@ from ..workbench.index import (
 )
 
 DEFAULT_WINDOW_DAYS = 7
-DEFAULT_POOL_CAP = 5           # Mode A hard cap on candidates/rules reviewed per run
+DEFAULT_POOL_CAP = 15          # candidates handed to the distiller (it still emits <=5 rules);
+                               # a wider, recurrence-ranked pool gives it diverse modes to
+                               # synthesize broadly-applicable habits from, not one incident
 _CLEAN_RECOVERY = {"self_recovered", "user_corrected_recovery"}
 _BAD_RECOVERY = {"unrecovered", "blocked"}
 _RELEASE_GATE_CHUNK_SIZE = 500
@@ -126,7 +128,14 @@ def _candidate_rank(
     impact: float,
     recency: float,
 ) -> float:
-    return max(1, support) * max(0.1, impact) * max(0.01, recency)
+    # Favor RECURRING, broadly-applicable patterns (daily-useful habits) over rare-but-
+    # severe one-offs: recurrence (frequency) dominates; severity and recency are gentle
+    # multipliers so a single severe or very-recent incident can't outrank a habit the
+    # user hits often.
+    freq = max(1, support)
+    severity = 1.0 + max(0.0, impact) / 5.0                 # 1.0-2.0 gentle tie-breaker
+    recency_w = 0.5 + 0.5 * max(0.0, min(1.0, recency))     # 0.5-1.0 (don't kill older habits)
+    return (freq ** 1.5) * severity * recency_w
 
 
 def _release_blocked_ids(

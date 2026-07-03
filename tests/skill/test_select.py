@@ -50,11 +50,12 @@ def test_excludes_bad_recovery_from_do(index_conn, ins):
     assert not corpus.successes
 
 
-def test_selection_caps_to_ranked_top_five(index_conn, ins):
+def test_selection_caps_to_ranked_top_pool(index_conn, ins):
+    # explicit pool_cap so this exercises the cap mechanism regardless of the default
     for i, score in enumerate([3, 3, 3, 4, 5, 5]):
         ins(index_conn, f"f{i}", fvs=score, modes='["verification_skipped"]',
             learning=f"failure {i}")
-    corpus = select_skill_candidates(index_conn, now=NOW)
+    corpus = select_skill_candidates(index_conn, now=NOW, pool_cap=5)
     selected = {c.session_id for c in corpus.candidates}
     assert len(corpus.candidates) == 5
     assert corpus.total_failures == 6
