@@ -57,6 +57,9 @@ class SkillCandidate:
     impact: float = 0.0
     recency: float = 0.0
     rank_score: float = 0.0
+    # pivotal user-correction excerpts (skill.turns.TurnExcerpt), attached post-selection
+    # by enrich_corpus_with_turns; raw here, scrubbed at prompt-format time.
+    pivotal_excerpts: list[Any] = field(default_factory=list)
 
 
 @dataclass

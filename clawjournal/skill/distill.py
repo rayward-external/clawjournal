@@ -79,6 +79,13 @@ _SYSTEM = (
     "like a command/skill name (e.g. 'Validate config types', 'Verify patch applied', "
     "'Recompute final badge', 'Guard script secrets'). Title Case, no trailing period, "
     "not a sentence; distinct from the longer 'guidance'. "
+    "Some sessions include pivotal_turn excerpts: the agent's claim right before a user "
+    "correction (agent_before), the user's actual redirect (user_correction), and the "
+    "agent's fix (agent_after). These are the HIGHEST-SIGNAL evidence — prefer rules "
+    "grounded in that mistake→correction→fix pattern (a rule that would have made the "
+    "correction unnecessary) over rules restated from summaries, and pull the concrete "
+    "trigger/mechanism from the excerpt itself. Never quote user text verbatim in the "
+    "output; state the lesson in your own words. "
     "De-identify PII ONLY — never emit a person's name, email, URL, "
     "home path, secret, or verbatim shell command — but KEEP technical specifics (repo and "
     "module names, failure surfaces, tool categories, architectural patterns). "
@@ -123,6 +130,13 @@ def _format_candidates(corpus: SkillCorpus, anon: Anonymizer, aliases: dict[str,
             f"  learning_summary={_scrub(c.learning_summary, anon)}\n"
             f"  score_reason={_scrub(c.score_reason, anon)}"
         )
+        for i, t in enumerate(getattr(c, "pivotal_excerpts", []) or [], 1):
+            lines.append(
+                f"  pivotal_turn_{i}:\n"
+                f"    agent_before: {_scrub(t.before, anon)}\n"
+                f"    user_correction: {_scrub(t.correction, anon)}\n"
+                f"    agent_after: {_scrub(t.after, anon)}"
+            )
     return "\n".join(lines)
 
 

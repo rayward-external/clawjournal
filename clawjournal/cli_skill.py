@@ -20,6 +20,7 @@ from .skill import install as _install
 from .skill import render as _render
 from .skill import select as _select
 from .skill import store as _store
+from .skill import turns as _turns
 from .skill.schema import MAX_RULES, SkillRule
 from .workbench.index import FAILURE_VALUE_SOURCE_SCOPE
 
@@ -257,6 +258,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     distilled: list[SkillRule] = []
     if not corpus.is_empty():
+        # ground the distiller in the actual mistake→correction→fix turns, not just
+        # session summaries (corpus is already hold-state/exclusion gated; excerpts
+        # are scrubbed at prompt-format time like every other field)
+        _turns.enrich_corpus_with_turns(conn, corpus)
         distilled = _distill.distill_skills(
             corpus, backend=backend, model=model, effort=effort, caller=caller, cfg=cfg)
     fresh, blocked = _render.gate_rules(distilled)
