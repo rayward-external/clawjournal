@@ -374,12 +374,14 @@ def _build_claude_cmd(
     system_prompt_file: Path | None,
     model: str | None,
     effort: str | None = None,
+    permission_mode: str = "bypassPermissions",
+    tools: str | None = None,
     bare: bool = False,
     safe_mode: bool = False,
 ) -> list[str]:
     cmd = [
         command, "-p",
-        "--permission-mode", "bypassPermissions",
+        "--permission-mode", permission_mode,
         "--no-session-persistence",
     ]
     if bare:
@@ -390,6 +392,8 @@ def _build_claude_cmd(
         cmd += ["--model", model]
     if effort:
         cmd += ["--effort", effort]
+    if tools is not None:
+        cmd += ["--tools", tools]
     if system_prompt_file is not None:
         if not system_prompt_file.exists():
             raise FileNotFoundError(
@@ -501,6 +505,8 @@ def run_default_agent_task(
     openclaw_message: str | None = None,
     claude_bare: bool = False,
     claude_safe_mode: bool = False,
+    claude_permission_mode: str = "bypassPermissions",
+    claude_tools: str | None = None,
 ) -> AgentResult:
     """Spawn an agent CLI subprocess and return the result.
 
@@ -538,6 +544,11 @@ def run_default_agent_task(
         claude_safe_mode: If True, pass ``--safe-mode`` to Claude Code so it
             skips customizations (including CLAUDE.md and skills) while
             preserving normal auth/model behavior.
+        claude_permission_mode: Claude Code permission mode. Defaults to the
+            historical bypassPermissions for scoring; distillation can lower it
+            because it should not need tools.
+        claude_tools: Optional ``--tools`` value for Claude Code. Use an empty
+            string to disable built-in tools for untrusted distillation input.
     """
     resolved = resolve_backend(backend)
     check_backend_runtime(resolved)
@@ -557,6 +568,8 @@ def run_default_agent_task(
             system_prompt_file=system_prompt_file,
             model=effective_model,
             effort=effective_effort,
+            permission_mode=claude_permission_mode,
+            tools=claude_tools,
             bare=claude_bare,
             safe_mode=claude_safe_mode,
         )

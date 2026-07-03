@@ -41,8 +41,18 @@ def _atomic_write(path: Path, text: str) -> None:
     atomic_write_text(path, text, parents=True)
 
 
+def _escape_region_markers(text: str) -> str:
+    """Prevent generated content from spoofing the Codex managed-region markers."""
+    return (
+        text
+        .replace(BEGIN_MARKER, "<!-- clawjournal BEGIN marker escaped -->")
+        .replace(END_MARKER, "<!-- clawjournal END marker escaped -->")
+    )
+
+
 def upsert_region(existing: str, region_body: str) -> str:
     """Return *existing* with the managed region replaced (or appended)."""
+    region_body = _escape_region_markers(region_body)
     block = f"{BEGIN_MARKER}\n{region_body.rstrip()}\n{END_MARKER}\n"
     start = existing.find(BEGIN_MARKER)
     if start != -1:

@@ -19,8 +19,13 @@ def _wire(monkeypatch, unscored, held=()):
     mock_conn.execute.return_value.fetchall.return_value = [{"session_id": h} for h in held]
     monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: mock_conn)
 
-    def fake_unscored(conn, *, limit, source, since):
-        calls["unscored"].append({"limit": limit, "source": source, "since": since})
+    def fake_unscored(conn, *, limit, source, since, **kwargs):
+        calls["unscored"].append({
+            "limit": limit,
+            "source": source,
+            "since": since,
+            **kwargs,
+        })
         return list(unscored)
     monkeypatch.setattr("clawjournal.workbench.index.query_unscored_sessions", fake_unscored)
     # blocking flows through _select._release_blocked_ids, which uses select's own
@@ -42,6 +47,8 @@ def test_weekly_scans_and_scores_last_7_days(monkeypatch):
     assert calls["scan"] == [None]                       # scan ran
     assert calls["unscored"][0]["since"] is not None     # bounded 7-day window
     assert calls["unscored"][0]["limit"] == 26           # score_limit + 0 held + 1 probe
+    assert calls["unscored"][0]["include_stale_scored"] is True
+    assert calls["unscored"][0]["settle_seconds"] > 0
     assert calls["scored"] == ["a", "b"]                 # each unscored session scored
 
 
@@ -52,6 +59,20 @@ def test_scoring_never_uses_the_distill_model(monkeypatch):
     _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25)
     assert calls["scored"] == ["a"]
     assert all("model" not in kw for kw in calls["score_kw"])   # no distill model leaked in
+
+
+def test_skill_scoring_passes_effective_redaction_settings(monkeypatch):
+    calls = _wire(monkeypatch, [{"session_id": "a"}])
+    monkeypatch.setattr(
+        "clawjournal.cli_skill._effective_share_settings",
+        lambda conn, cfg=None: {
+            "custom_strings": ["ClientName"],
+            "extra_usernames": ["kai"],
+            "blocked_domains": ["api.internal"],
+        },
+    )
+    _ensure_corpus(7, do_scan=False, do_score=True, score_limit=25)
+    assert calls["score_kw"][0]["redaction_settings"]["custom_strings"] == ["ClientName"]
 
 
 def test_held_sessions_are_not_scored(monkeypatch):

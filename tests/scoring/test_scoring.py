@@ -29,6 +29,7 @@ from clawjournal.scoring.scoring import (
     ScoringResult,
     Step,
     _SCORER_PROMPT_FILE,
+    _anonymize_for_scoring,
     _extract_judge_result_from_value,
     _read_scoring_output,
     _validate_judge_result,
@@ -102,6 +103,33 @@ class TestGetMessageText:
     def test_empty(self):
         assert get_message_text({}) == ""
         assert get_message_text({"content": []}) == ""
+
+
+def test_anonymize_for_scoring_applies_custom_redactions():
+    detail = {
+        "display_title": "ClientName task",
+        "project": "ClientName",
+        "git_branch": "main",
+    }
+    messages = [{
+        "role": "user",
+        "content": "ClientName uses api.internal",
+        "tool_uses": [{"input": {"note": "ClientName"}, "output": "api.internal"}],
+    }]
+    redacted_detail, redacted_messages = _anonymize_for_scoring(
+        detail,
+        messages,
+        {
+            "custom_strings": ["ClientName"],
+            "extra_usernames": [],
+            "blocked_domains": ["api.internal"],
+        },
+    )
+    blob = json.dumps({"detail": redacted_detail, "messages": redacted_messages})
+    assert "ClientName" not in blob
+    assert "api.internal" not in blob
+    assert "[REDACTED_CUSTOM]" in blob
+    assert "[REDACTED_DOMAIN]" in blob
 
 
 # ---------------------------------------------------------------------------

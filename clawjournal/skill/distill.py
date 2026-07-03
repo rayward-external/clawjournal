@@ -16,12 +16,11 @@ from typing import Any, Callable, Protocol
 from ..benchmark.generate import _extract_json_object, run_agent_json_call
 from ..config import load_config
 from ..redaction.anonymizer import Anonymizer
-from ..redaction.secrets import redact_text
+from ..redaction.secrets import redact_custom_strings, redact_text
 from ..scoring.backends import (
     default_distill_effort_for_backend,
     default_distill_model_for_backend,
     default_model_for_backend,
-    is_backend_unavailable_error,
     resolve_backend,
 )
 from .schema import FAILURE_MODES, MAX_RULES, SkillRule, parse_rules
@@ -33,10 +32,29 @@ _DISTILL_FLAG_ERROR_RE = re.compile(
     r"safe-?mode|--effort|unknown (?:option|flag|argument)|unrecognized|unexpected argument",
     re.I,
 )
+_PLAN_UNAVAILABLE_RE = re.compile(
+    r"(?:model|slug|alias).*(?:not available|unavailable|not found|unknown|unsupported)|"
+    r"(?:not available|unavailable|not found|unknown|unsupported).*(?:model|slug|alias)|"
+    r"does not have access to (?:model|.*opus|.*gpt)|"
+    r"access to .* model .* denied|"
+    r"model .* requires .* plan|"
+    r"not included in .* plan",
+    re.I,
+)
+_TRANSIENT_DISTILL_ERROR_RE = re.compile(
+    r"\b429\b|rate[-\s]?limit|usage[-\s]?limit|quota|out of credits|"
+    r"timeout|timed out|temporar|overloaded|try again",
+    re.I,
+)
 
 
 def _distill_flag_unsupported(message: str) -> bool:
     return bool(_DISTILL_FLAG_ERROR_RE.search(message or ""))
+
+
+def _distill_plan_unavailable(message: str) -> bool:
+    msg = message or ""
+    return not _TRANSIENT_DISTILL_ERROR_RE.search(msg) and bool(_PLAN_UNAVAILABLE_RE.search(msg))
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +118,30 @@ _RULE_SHAPE = (
 )
 
 
-def _scrub(value: Any, anon: Anonymizer) -> str:
-    """Anonymize home/username then deterministically redact secrets."""
+def _redact_blocked_domains(text: str, blocked_domains: list[str]) -> str:
+    if not text or not blocked_domains:
+        return text
+    try:
+        from ..workbench.index import _compile_blocked_domain_pattern
+    except Exception:
+        return text
+    for domain in blocked_domains:
+        pattern = _compile_blocked_domain_pattern(domain)
+        if pattern is not None:
+            text = pattern.sub("[REDACTED_DOMAIN]", text)
+    return text
+
+
+def _scrub(value: Any, anon: Anonymizer, settings: dict[str, Any] | None = None) -> str:
+    """Anonymize home/username, apply custom policy redactions, then redact secrets."""
     if not value:
         return ""
     text = anon.text(str(value))
+    if settings:
+        custom_strings = list(settings.get("custom_strings", []) or [])
+        blocked_domains = list(settings.get("blocked_domains", []) or [])
+        text, _count = redact_custom_strings(text, custom_strings)
+        text = _redact_blocked_domains(text, blocked_domains)
     redacted, _, _ = redact_text(text)
     return redacted
 
@@ -113,7 +150,12 @@ def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
     return {c.session_id: f"case-{i:02d}" for i, c in enumerate(corpus.candidates, 1)}
 
 
-def _format_candidates(corpus: SkillCorpus, anon: Anonymizer, aliases: dict[str, str]) -> str:
+def _format_candidates(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None = None,
+) -> str:
     lines: list[str] = []
     if corpus.mode_recurrence:
         top = ", ".join(f"{m}×{n}" for m, n in list(corpus.mode_recurrence.items())[:8])
@@ -121,29 +163,34 @@ def _format_candidates(corpus: SkillCorpus, anon: Anonymizer, aliases: dict[str,
     for c in corpus.candidates:
         lines.append(
             f"- session {aliases[c.session_id]} [{c.kind}] source={c.source} "
-            f"project={_scrub(c.project, anon)}\n"
+            f"project={_scrub(c.project, anon, settings)}\n"
             f"  support_count={c.support_count} impact={c.impact:.2f} "
             f"recency={c.recency:.3f} rank_score={c.rank_score:.3f}\n"
             f"  failure_modes={c.failure_modes} recovery={c.recovery_labels} "
             f"resolution={c.resolution} failure_value={c.failure_value} quality={c.quality}\n"
-            f"  title={_scrub(c.title, anon)}\n"
-            f"  learning_summary={_scrub(c.learning_summary, anon)}\n"
-            f"  score_reason={_scrub(c.score_reason, anon)}"
+            f"  title={_scrub(c.title, anon, settings)}\n"
+            f"  learning_summary={_scrub(c.learning_summary, anon, settings)}\n"
+            f"  score_reason={_scrub(c.score_reason, anon, settings)}"
         )
         for i, t in enumerate(getattr(c, "pivotal_excerpts", []) or [], 1):
             lines.append(
                 f"  pivotal_turn_{i}:\n"
-                f"    agent_before: {_scrub(t.before, anon)}\n"
-                f"    user_correction: {_scrub(t.correction, anon)}\n"
-                f"    agent_after: {_scrub(t.after, anon)}"
+                f"    agent_before: {_scrub(t.before, anon, settings)}\n"
+                f"    user_correction: {_scrub(t.correction, anon, settings)}\n"
+                f"    agent_after: {_scrub(t.after, anon, settings)}"
             )
     return "\n".join(lines)
 
 
-def build_prompt(corpus: SkillCorpus, anon: Anonymizer, aliases: dict[str, str]) -> str:
+def build_prompt(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None = None,
+) -> str:
     return (
         "# Distill up to 5 durable skills from this user's own scored sessions.\n\n"
-        f"{_format_candidates(corpus, anon, aliases)}\n\n{_RULE_SHAPE}"
+        f"{_format_candidates(corpus, anon, aliases, settings)}\n\n{_RULE_SHAPE}"
     )
 
 
@@ -179,6 +226,8 @@ class DefaultCaller:
             timeout_seconds=self.timeout_seconds,
             codex_output_schema=SKILL_DISTILL_SCHEMA,
             claude_safe_mode=self.claude_safe_mode,
+            claude_permission_mode="default",
+            claude_tools="",
         )
 
 
@@ -190,6 +239,7 @@ def distill_skills(
     effort: str | None = None,
     caller: Caller | None = None,
     cfg: dict | None = None,
+    redaction_settings: dict[str, Any] | None = None,
 ) -> list[SkillRule]:
     """Run the single distill call and return <=MAX_RULES validated SkillRules.
 
@@ -199,9 +249,14 @@ def distill_skills(
     if corpus.is_empty():
         return []
     cfg = cfg if cfg is not None else load_config()
-    anon = Anonymizer(extra_usernames=list(cfg.get("redact_usernames", []) or []))
+    settings = redaction_settings or {
+        "custom_strings": list(cfg.get("redact_strings", []) or []),
+        "extra_usernames": list(cfg.get("redact_usernames", []) or []),
+        "blocked_domains": [],
+    }
+    anon = Anonymizer(extra_usernames=list(settings.get("extra_usernames", []) or []))
     aliases = _candidate_aliases(corpus)  # computed once, reused for evidence back-mapping
-    task = build_prompt(corpus, anon, aliases)
+    task = build_prompt(corpus, anon, aliases, settings)
     try:
         # DefaultCaller() resolves the backend (a process/env lookup that can raise
         # when no backend is installed), so build it INSIDE the degrade-gracefully guard.
@@ -214,11 +269,11 @@ def distill_skills(
         # for a graceful retry.
         if caller is not None or model is not None or effort is not None:
             return []
-        plan_issue = is_backend_unavailable_error(msg)  # frontier model unavailable on the plan
-        flag_issue = _distill_flag_unsupported(msg)      # old CLI rejects --safe-mode/--effort
+        plan_issue = _distill_plan_unavailable(msg)      # frontier model unavailable on the plan
+        effort_issue = "--effort" in msg and _distill_flag_unsupported(msg)
         # A TRANSIENT failure (timeout/network/parse) must NOT silently downgrade the
         # model+effort with a misleading "model unavailable" message — degrade to [].
-        if not (plan_issue or flag_issue):
+        if not (plan_issue or effort_issue):
             return []
         try:
             resolved = resolve_backend(backend)
@@ -227,19 +282,19 @@ def distill_skills(
         frontier = default_distill_model_for_backend(resolved)  # what the 1st try used
         fast = default_model_for_backend(resolved)
         can_downgrade = plan_issue and fast and fast != frontier
-        if not (can_downgrade or flag_issue):
+        if not (can_downgrade or effort_issue):
             return []  # nothing to relax (e.g. Codex plan issue where fast IS the frontier)
         try:
-            # plan issue -> drop to the fast model; flag issue -> keep the frontier model
-            # but relax the newer --safe-mode/--effort flags an old CLI can't parse.
+            # plan issue -> drop to the fast model; effort issue -> keep the frontier model
+            # but relax only the newer --effort flag an old CLI can't parse. Never relax
+            # Claude tool/permission isolation for untrusted trace excerpts.
             data = DefaultCaller(
                 backend=resolved,
                 model=(fast if can_downgrade else None),
-                use_default_distill_effort=not flag_issue,
-                claude_safe_mode=not flag_issue,
+                use_default_distill_effort=not effort_issue,
             )(system_prompt=_SYSTEM, task_prompt=task)
             why = ("the frontier distill model is unavailable on your plan" if plan_issue
-                   else "your agent CLI rejected the newer distill flags")
+                   else "your agent CLI rejected the distill effort flag")
             where = f" on {fast}" if can_downgrade else ""
             print(f"note: {why}; retried with a compatible config{where}. "
                   f"Pass --model / --effort to control it.")

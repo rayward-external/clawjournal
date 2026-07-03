@@ -138,9 +138,21 @@ def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRul
         dup = next((i for i, k in enumerate(kept) if _same_lesson(r, k)), None)
         if dup is None:
             kept.append(r)
-        elif (_store.fingerprint(kept[dup]) in new_fps) and (_store.fingerprint(r) not in new_fps):
-            r.last_seen = ""  # distiller re-taught this lesson (reworded) -> keep it fresh, don't decay out
-            kept[dup] = r     # replace a fresh paraphrase with the carried original (no churn)
+            continue
+        kept_rule = kept[dup]
+        kept_fresh = _store.fingerprint(kept_rule) in new_fps
+        r_fresh = _store.fingerprint(r) in new_fps
+        if kept_fresh and not r_fresh:
+            # Replace a fresh paraphrase with the carried original (no churn), but
+            # mark it seen-this-run and preserve the fresh support signal.
+            r.last_seen = ""
+            r.support = max(r.support, kept_rule.support)
+            kept[dup] = r
+        elif (not kept_fresh) and r_fresh:
+            # The carried original ranked before the fresh paraphrase; keep its
+            # stable wording but refresh its recency/support.
+            kept_rule.last_seen = ""
+            kept_rule.support = max(kept_rule.support, r.support)
     return kept
 
 
@@ -234,6 +246,12 @@ def _config_excluded_projects(cfg: dict | None = None, conn=None) -> list[str]:
     return list(normalize_excluded_project_names(cfg.get("excluded_projects") or []))
 
 
+def _effective_share_settings(conn, cfg: dict | None = None) -> dict[str, Any]:
+    from .config import load_config
+    from .workbench.index import get_effective_share_settings
+    return get_effective_share_settings(conn, cfg if cfg is not None else load_config())
+
+
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
                    model: str | None = None, effort: str | None = None,
                    caller=None, now: datetime | None = None,
@@ -247,6 +265,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     independent of the on-disk config for tests. ``excluded_projects`` mirrors the
     export egress gate.
     """
+    redaction_settings = _effective_share_settings(conn, cfg)
     corpus = _select.select_skill_candidates(
         conn, window_days=window_days, now=now,
         sources=sources if sources is not None else list(FAILURE_VALUE_SOURCE_SCOPE),
@@ -270,7 +289,14 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     distilled: list[SkillRule] = []
     if not corpus.is_empty():
         distilled = _distill.distill_skills(
-            corpus, backend=backend, model=model, effort=effort, caller=caller, cfg=cfg)
+            corpus,
+            backend=backend,
+            model=model,
+            effort=effort,
+            caller=caller,
+            cfg=cfg,
+            redaction_settings=redaction_settings,
+        )
     fresh, blocked = _render.gate_rules(distilled)
 
     # merge with durable state (skip rejected, replace weakest)
@@ -340,7 +366,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
     if not do_score:
         return
     from .cli import _score_single_session
-    from .workbench.index import open_index, query_unscored_sessions
+    from .workbench.index import SCORE_SETTLE_SECONDS, open_index, query_unscored_sessions
     now = datetime.now(timezone.utc)
     # Widen the SQL lower bound by 2 days (> the 14h max UTC-offset skew) so a
     # mixed-offset start_time string can't exclude an in-window session — the same
@@ -350,6 +376,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
              else (now - timedelta(days=window_days + 2)).isoformat())
     conn = open_index()
     try:
+        redaction_settings = _effective_share_settings(conn, cfg)
         # Scoring uses the configured scoring backend's own default model, NOT the
         # distill `--model` — a frontier distill model must not re-price the fleet.
         #
@@ -389,10 +416,12 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
         # so `len(shareable) > score_limit` can detect that more remain and warn.
         if score_all:
             fetched = query_unscored_sessions(
-                conn, limit=10**9, source=_config_sources(cfg), since=since)
+                conn, limit=10**9, source=_config_sources(cfg), since=since,
+                include_stale_scored=True, settle_seconds=SCORE_SETTLE_SECONDS, now=now)
         else:
             fetched = query_unscored_sessions(
-                conn, limit=score_limit + len(skip) + 1, source=_config_sources(cfg), since=since)
+                conn, limit=score_limit + len(skip) + 1, source=_config_sources(cfg), since=since,
+                include_stale_scored=True, settle_seconds=SCORE_SETTLE_SECONDS, now=now)
         shareable = [s for s in fetched if s["session_id"] not in skip]
         unscored = shareable if score_all else shareable[:score_limit]
         # Scoring uses the CONFIGURED scorer backend, independent of the distill
@@ -407,7 +436,12 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
                 sid = s["session_id"]
                 print(f"  [{i}/{len(unscored)}] {sid}", flush=True)
                 try:
-                    res = _score_single_session(conn, sid, backend=scorer_backend)
+                    res = _score_single_session(
+                        conn,
+                        sid,
+                        backend=scorer_backend,
+                        redaction_settings=redaction_settings,
+                    )
                 except Exception as exc:  # e.g. sqlite 'database is locked' vs the daemon
                     print(f"      (skipped: {exc.__class__.__name__}: {exc})")
                     continue

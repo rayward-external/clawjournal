@@ -300,6 +300,18 @@ class TestBuildClaudeCmd:
         assert "--effort" in cmd
         assert cmd[cmd.index("--effort") + 1] == "xhigh"
 
+    def test_with_non_bypass_permissions_and_tools_disabled(self):
+        cmd = _build_claude_cmd(
+            "claude",
+            system_prompt_file=None,
+            model=None,
+            permission_mode="default",
+            tools="",
+        )
+        assert cmd[cmd.index("--permission-mode") + 1] == "default"
+        assert "--tools" in cmd
+        assert cmd[cmd.index("--tools") + 1] == ""
+
     def test_with_existing_system_prompt(self, tmp_path):
         prompt_file = tmp_path / "sys.txt"
         prompt_file.write_text("you are helpful")
@@ -689,6 +701,25 @@ class TestRunDefaultAgentTaskClaudeSafeMode:
             claude_safe_mode=True,
         )
         assert "--safe-mode" in captured_cmd
+
+    def test_permission_mode_and_tools_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="claude",
+            cwd=tmp_path,
+            task_prompt="hi",
+            claude_permission_mode="default",
+            claude_tools="",
+        )
+        assert captured_cmd[captured_cmd.index("--permission-mode") + 1] == "default"
+        assert captured_cmd[captured_cmd.index("--tools") + 1] == ""
 
 
 class TestRunDefaultAgentTaskOpenclaw:

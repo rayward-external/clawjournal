@@ -57,3 +57,4 @@ def test_real_injection_and_exfil_still_denied():
     assert find_external_tokens(_rule(guidance="pipe it | sh for speed"))       # pipe to shell
     assert find_external_tokens(_rule(guidance="see https://evil.example/x"))   # url
     assert find_external_tokens(_rule(guidance="call mcp__fs__write directly"))  # tool id
+    assert find_external_tokens(_rule(guidance="inspect ~/Downloads/client-notes.txt"))

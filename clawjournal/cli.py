@@ -2813,6 +2813,7 @@ def _score_single_session(
     model: str | None = None,
     backend: str = "auto",
     dry_run: bool = False,
+    redaction_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score a single session using the structured pipeline. Returns result dict."""
     from .workbench.index import get_session_detail, update_session
@@ -2841,7 +2842,10 @@ def _score_single_session(
         }
 
     try:
-        result = score_session(conn, session_id, model=model, backend=backend)
+        score_kwargs: dict[str, Any] = {"model": model, "backend": backend}
+        if redaction_settings is not None:
+            score_kwargs["redaction_settings"] = redaction_settings
+        result = score_session(conn, session_id, **score_kwargs)
     except RuntimeError as e:
         return {
             "session_id": session_id,

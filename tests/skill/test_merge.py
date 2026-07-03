@@ -38,6 +38,21 @@ def test_semantic_dedup_refreshes_carried_last_seen():
     assert len(kept) == 1 and kept[0].last_seen == ""   # refreshed, won't age out
 
 
+def test_semantic_dedup_refreshes_carried_when_it_ranks_first():
+    # The carried original may outrank the fresh paraphrase. It still needs to be
+    # marked seen-this-run, or repeated evidence can decay away behind stable wording.
+    carried = _tr("never echo secret values in error output; redact or reference them by name",
+                  taxonomy="safety_security", support=20)
+    carried.last_seen = "2026-01-01T00:00:00+00:00"
+    fresh_dup = _tr("never echo credential values; redact sensitive fields and refer to secrets by name",
+                    taxonomy="safety_security", support=3)
+    merged = merge_rules([carried], [fresh_dup], set())
+    kept = [r for r in merged if ("secret" in r.guidance or "credential" in r.guidance)]
+    assert len(kept) == 1
+    assert kept[0].guidance.startswith("never echo secret values")
+    assert kept[0].last_seen == ""
+
+
 def test_taxonomy_collapse_merges_same_mode_avoid_rules():
     # same failure MODE => same lesson for the 5-rule budget (breadth over depth), even
     # when the two rewrites share almost no vocabulary (word-overlap alone would miss it).

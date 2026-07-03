@@ -66,6 +66,33 @@ def test_prompt_is_scrubbed_before_llm():
     assert "case-01" in prompt
 
 
+def test_prompt_applies_custom_redactions_before_llm():
+    corpus = SkillCorpus(
+        window_start="a",
+        window_end="b",
+        failures=[SkillCandidate(
+            "s1",
+            "ClientName",
+            "codex",
+            "avoid",
+            title="ClientName failure",
+            learning_summary="ClientName leaked into a summary",
+            score_reason="See api.internal for context",
+        )],
+    )
+    from clawjournal.skill.distill import _candidate_aliases
+    prompt = build_prompt(
+        corpus,
+        Anonymizer(),
+        _candidate_aliases(corpus),
+        {"custom_strings": ["ClientName"], "blocked_domains": ["api.internal"]},
+    )
+    assert "ClientName" not in prompt
+    assert "api.internal" not in prompt
+    assert "[REDACTED_CUSTOM]" in prompt
+    assert "[REDACTED_DOMAIN]" in prompt
+
+
 def test_distill_defaults_to_frontier_model(monkeypatch):
     # DefaultCaller picks a frontier model per backend (Opus / strong Codex), not
     # the fast scoring default; an explicit --model still wins.
@@ -92,6 +119,8 @@ def test_default_caller_isolates_claude_with_safe_mode(monkeypatch):
     monkeypatch.setattr(d, "run_agent_json_call", fake_json_call)
     d.DefaultCaller(backend="claude")(system_prompt="sys", task_prompt="task")
     assert captured["claude_safe_mode"] is True
+    assert captured["claude_permission_mode"] == "default"
+    assert captured["claude_tools"] == ""
     assert "claude_bare" not in captured
 
 
@@ -110,20 +139,22 @@ def test_distill_degrades_when_backend_resolution_fails(monkeypatch):
 def test_distill_error_classification():
     # #2/#3: distinguish a transient failure (no downgrade) from a plan-unavailable model
     # (downgrade) and an old-CLI flag rejection (relax flags).
-    from clawjournal.skill.distill import _distill_flag_unsupported
-    from clawjournal.scoring.backends import is_backend_unavailable_error
+    from clawjournal.skill.distill import _distill_flag_unsupported, _distill_plan_unavailable
     assert _distill_flag_unsupported("error: unknown option '--safe-mode'")
     assert _distill_flag_unsupported("unexpected argument --effort found")
     assert not _distill_flag_unsupported("Request timed out after 240s")     # transient
-    assert is_backend_unavailable_error("you are out of credits")            # plan issue
-    assert not is_backend_unavailable_error("Request timed out after 240s")  # transient -> no downgrade
+    assert _distill_plan_unavailable("model opus is not available on your plan")
+    assert not _distill_plan_unavailable("HTTP 429 rate limit exceeded")
+    assert not _distill_plan_unavailable("model opus is temporarily unavailable due to rate limits")
+    assert not _distill_plan_unavailable("you are out of credits")
 
 
-def test_default_caller_can_relax_safe_mode(monkeypatch):
+def test_default_caller_never_relaxes_tool_isolation(monkeypatch):
     import clawjournal.skill.distill as d
     captured = {}
     monkeypatch.setattr(d, "resolve_backend", lambda _b: "claude")
     monkeypatch.setattr(d, "run_agent_json_call",
                         lambda **kw: (captured.update(kw), {"rules": []})[1])
-    d.DefaultCaller(backend="claude", claude_safe_mode=False)(system_prompt="s", task_prompt="t")
-    assert captured["claude_safe_mode"] is False   # fallback can drop --safe-mode for an old CLI
+    d.DefaultCaller(backend="claude")(system_prompt="s", task_prompt="t")
+    assert captured["claude_permission_mode"] == "default"
+    assert captured["claude_tools"] == ""

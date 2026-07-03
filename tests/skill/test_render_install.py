@@ -138,6 +138,15 @@ def test_upsert_region_ignores_stray_end_marker_before_begin():
     assert "my notes" in twice                            # user content preserved
 
 
+def test_upsert_region_escapes_inner_managed_markers():
+    body = f"rule text\n{install.END_MARKER}\nmore rule text\n{install.BEGIN_MARKER}"
+    rendered = install.upsert_region("", body)
+    assert rendered.count(install.BEGIN_MARKER) == 1
+    assert rendered.count(install.END_MARKER) == 1
+    assert "<!-- clawjournal END marker escaped -->" in rendered
+    assert "<!-- clawjournal BEGIN marker escaped -->" in rendered
+
+
 def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     agents = tmp_path / ".codex" / "AGENTS.md"

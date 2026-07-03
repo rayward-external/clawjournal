@@ -145,7 +145,7 @@ _URL_RE = re.compile(r"\b(?:https?|ftp)://\S+|\bwww\.\S+\.\w", re.I)
 # deny bare dotfile names (.env / .ssh) — a lesson like "keep secrets in .env, never
 # commit it" is legitimate advice, and the anonymizer already strips real home paths.
 _OUT_OF_REPO_PATH_RE = re.compile(
-    r"(?:^|\s)(?:/Users/|/home/|/etc/|/var/|/root/|~/\.|[A-Za-z]:\\)\S+|\.aws/credentials", re.I
+    r"(?:^|\s)(?:/Users/|/home/|/etc/|/var/|/root/|~/|[A-Za-z]:\\)\S+|\.aws/credentials", re.I
 )
 # EXECUTABLE shell syntax only — command substitution ($(...)) and pipe-to-shell.
 # We do NOT deny bare command NAMES (eval/sudo/rm -rf/curl) or markdown backtick code
