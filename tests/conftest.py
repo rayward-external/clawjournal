@@ -68,9 +68,16 @@ def mock_anonymizer(monkeypatch):
     return Anonymizer()
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def tmp_config(tmp_path, monkeypatch):
-    """Monkeypatch CONFIG_FILE and CONFIG_DIR to tmp_path."""
+    """Monkeypatch CONFIG_FILE and CONFIG_DIR to tmp_path — for EVERY test.
+
+    Autouse because this has burned us for real: a test that mocks ``load_config``
+    but exercises a code path that calls the real ``save_config`` (e.g. the share
+    path's ``_clear_stored_upload_token``) silently OVERWRITES the developer's own
+    ``~/.clawjournal/config.json`` with fixture data. The real functions must never
+    see the real home config under pytest.
+    """
     config_dir = tmp_path / ".clawjournal"
     config_file = config_dir / "config.json"
     monkeypatch.setattr("clawjournal.config.CONFIG_DIR", config_dir)
