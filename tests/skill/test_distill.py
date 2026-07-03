@@ -105,3 +105,25 @@ def test_distill_degrades_when_backend_resolution_fails(monkeypatch):
 
     monkeypatch.setattr(d, "resolve_backend", boom)
     assert distill_skills(_corpus(), backend="auto") == []
+
+
+def test_distill_error_classification():
+    # #2/#3: distinguish a transient failure (no downgrade) from a plan-unavailable model
+    # (downgrade) and an old-CLI flag rejection (relax flags).
+    from clawjournal.skill.distill import _distill_flag_unsupported
+    from clawjournal.scoring.backends import is_backend_unavailable_error
+    assert _distill_flag_unsupported("error: unknown option '--safe-mode'")
+    assert _distill_flag_unsupported("unexpected argument --effort found")
+    assert not _distill_flag_unsupported("Request timed out after 240s")     # transient
+    assert is_backend_unavailable_error("you are out of credits")            # plan issue
+    assert not is_backend_unavailable_error("Request timed out after 240s")  # transient -> no downgrade
+
+
+def test_default_caller_can_relax_safe_mode(monkeypatch):
+    import clawjournal.skill.distill as d
+    captured = {}
+    monkeypatch.setattr(d, "resolve_backend", lambda _b: "claude")
+    monkeypatch.setattr(d, "run_agent_json_call",
+                        lambda **kw: (captured.update(kw), {"rules": []})[1])
+    d.DefaultCaller(backend="claude", claude_safe_mode=False)(system_prompt="s", task_prompt="t")
+    assert captured["claude_safe_mode"] is False   # fallback can drop --safe-mode for an old CLI

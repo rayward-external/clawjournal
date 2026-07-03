@@ -25,6 +25,19 @@ def test_semantic_dedup_collapses_paraphrase_prefers_carried():
     assert any("probe environment constraints" in g for g in guides)             # distinct preserved
 
 
+def test_semantic_dedup_refreshes_carried_last_seen():
+    # when the carried rule wins over a fresh paraphrase, mark it seen-this-run so a
+    # lesson the distiller keeps re-teaching (reworded) doesn't decay out.
+    carried = _tr("never echo secret values in error output; redact or reference them by name",
+                  taxonomy="safety_security", support=5)
+    carried.last_seen = "2026-01-01T00:00:00+00:00"   # old -> would decay
+    fresh_dup = _tr("never echo credential values; redact sensitive fields and refer to secrets by name",
+                    taxonomy="safety_security", support=9)
+    merged = merge_rules([carried], [fresh_dup], set())
+    kept = [r for r in merged if ("secret" in r.guidance or "credential" in r.guidance)]
+    assert len(kept) == 1 and kept[0].last_seen == ""   # refreshed, won't age out
+
+
 def test_semantic_dedup_keeps_distinct_lessons_in_same_mode():
     a = _tr("run the full regression suite before claiming a fix is done",
             taxonomy="verification_skipped", support=5)

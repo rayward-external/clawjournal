@@ -70,6 +70,7 @@ def test_gate_issues_exit_nonzero(monkeypatch):
         trend = {}
 
     monkeypatch.setattr("clawjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
+    monkeypatch.setattr("clawjournal.cli_skill._config_excluded_projects", lambda *a, **k: [])
     monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: Conn())
     monkeypatch.setattr("clawjournal.cli_skill.generate_skill", lambda *a, **k: Result())
     monkeypatch.setattr("clawjournal.cli_skill._store.upsert_seen", lambda *a, **k: "fp")

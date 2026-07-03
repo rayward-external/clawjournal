@@ -121,7 +121,8 @@ def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRul
         if dup is None:
             kept.append(r)
         elif (_store.fingerprint(kept[dup]) in new_fps) and (_store.fingerprint(r) not in new_fps):
-            kept[dup] = r  # replace a fresh paraphrase with the carried original (no churn)
+            r.last_seen = ""  # distiller re-taught this lesson (reworded) -> keep it fresh, don't decay out
+            kept[dup] = r     # replace a fresh paraphrase with the carried original (no churn)
     return kept
 
 
@@ -198,11 +199,19 @@ def _scan_source_filter(cfg: dict | None = None) -> str | None:
     return scope[0] if scope is not None and len(scope) == 1 else None
 
 
-def _config_excluded_projects(cfg: dict | None = None) -> list[str]:
-    """Projects the user has --exclude'd (same egress gate as export/share)."""
-    from .config import load_config
+def _config_excluded_projects(cfg: dict | None = None, conn=None) -> list[str]:
+    """The EFFECTIVE excluded-project set — the SAME egress gate as export/share.
+
+    That means config ``--exclude`` PLUS workbench DB ``exclude_project`` policies
+    (stored by the Policies UI, not config.json), merged via
+    ``get_effective_share_settings``. Without a DB connection, fall back to config-only.
+    """
+    from .config import load_config, normalize_excluded_project_names
     cfg = cfg if cfg is not None else load_config()
-    return list(cfg.get("excluded_projects") or [])
+    if conn is not None:
+        from .workbench.index import get_effective_share_settings
+        return list(get_effective_share_settings(conn, cfg).get("excluded_projects") or [])
+    return list(normalize_excluded_project_names(cfg.get("excluded_projects") or []))
 
 
 def generate_skill(conn, *, window_days: int, backend: str = "auto",
@@ -338,7 +347,7 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
         # Excluded projects must never be scored (egress) either — mirror the export
         # gate. Treat them like held: gather their ids in the window and skip them,
         # over-fetching so they can't starve shareable rows. (Guarded: usually empty.)
-        excluded_projects = _config_excluded_projects(cfg)
+        excluded_projects = _config_excluded_projects(cfg, conn)
         excluded_ids: set[str] = set()
         if excluded_projects:
             from .workbench.index import session_matches_excluded_projects
@@ -519,7 +528,7 @@ def run_skill(args) -> None:
     try:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model, effort=effort,
                              sources=_config_sources(cfg),
-                             excluded_projects=_config_excluded_projects(cfg), cfg=cfg)
+                             excluded_projects=_config_excluded_projects(cfg, conn), cfg=cfg)
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and

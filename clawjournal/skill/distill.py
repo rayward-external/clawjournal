@@ -10,6 +10,7 @@ default mirrors the benchmark's ``AgentBackendCaller``.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Callable, Protocol
 
 from ..benchmark.generate import _extract_json_object, run_agent_json_call
@@ -20,10 +21,22 @@ from ..scoring.backends import (
     default_distill_effort_for_backend,
     default_distill_model_for_backend,
     default_model_for_backend,
+    is_backend_unavailable_error,
     resolve_backend,
 )
 from .schema import FAILURE_MODES, MAX_RULES, SkillRule, parse_rules
 from .select import SkillCorpus
+
+# A distill failure caused by an OLD agent CLI that doesn't recognize the newer
+# --safe-mode / --effort flags (vs a transient timeout or a plan-unavailable model).
+_DISTILL_FLAG_ERROR_RE = re.compile(
+    r"safe-?mode|--effort|unknown (?:option|flag|argument)|unrecognized|unexpected argument",
+    re.I,
+)
+
+
+def _distill_flag_unsupported(message: str) -> bool:
+    return bool(_DISTILL_FLAG_ERROR_RE.search(message or ""))
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +139,10 @@ class DefaultCaller:
     def __init__(self, backend: str = "auto", model: str | None = None,
                  effort: str | None = None,
                  timeout_seconds: int = DISTILL_TIMEOUT,
-                 use_default_distill_effort: bool = True) -> None:
+                 use_default_distill_effort: bool = True,
+                 claude_safe_mode: bool = True) -> None:
         self.resolved = resolve_backend(backend)
+        self.claude_safe_mode = claude_safe_mode
         # Distill defaults to a frontier model and higher effort; explicit CLI
         # overrides still win. Scoring defaults live in scoring.backends.
         self.model = model or default_distill_model_for_backend(self.resolved)
@@ -149,7 +164,7 @@ class DefaultCaller:
             system_prompt=system_prompt, task_prompt=task_prompt,
             timeout_seconds=self.timeout_seconds,
             codex_output_schema=SKILL_DISTILL_SCHEMA,
-            claude_safe_mode=True,
+            claude_safe_mode=self.claude_safe_mode,
         )
 
 
@@ -179,12 +194,17 @@ def distill_skills(
         call = caller or DefaultCaller(backend=backend, model=model, effort=effort)
         data = call(system_prompt=_SYSTEM, task_prompt=task)
     except Exception as exc:  # backend/timeout/parse failure -> degrade gracefully
+        msg = str(exc)
         logger.warning("skill distill call failed: %s", exc)
-        # The frontier default (e.g. Opus) may be unavailable on the user's plan; retry
-        # once on the backend's fast default so distill still works. But ONLY if that is
-        # a DIFFERENT model — otherwise (e.g. Codex, whose distill default already IS the
-        # fast model) we would just re-run the identical ~240s call for nothing.
+        # Only a default (caller-less, no explicit model/effort) frontier run is eligible
+        # for a graceful retry.
         if caller is not None or model is not None or effort is not None:
+            return []
+        plan_issue = is_backend_unavailable_error(msg)  # frontier model unavailable on the plan
+        flag_issue = _distill_flag_unsupported(msg)      # old CLI rejects --safe-mode/--effort
+        # A TRANSIENT failure (timeout/network/parse) must NOT silently downgrade the
+        # model+effort with a misleading "model unavailable" message — degrade to [].
+        if not (plan_issue or flag_issue):
             return []
         try:
             resolved = resolve_backend(backend)
@@ -192,16 +212,23 @@ def distill_skills(
             return []
         frontier = default_distill_model_for_backend(resolved)  # what the 1st try used
         fast = default_model_for_backend(resolved)
-        if not fast or fast == frontier:
-            return []
+        can_downgrade = plan_issue and fast and fast != frontier
+        if not (can_downgrade or flag_issue):
+            return []  # nothing to relax (e.g. Codex plan issue where fast IS the frontier)
         try:
+            # plan issue -> drop to the fast model; flag issue -> keep the frontier model
+            # but relax the newer --safe-mode/--effort flags an old CLI can't parse.
             data = DefaultCaller(
                 backend=resolved,
-                model=fast,
-                use_default_distill_effort=False,
+                model=(fast if can_downgrade else None),
+                use_default_distill_effort=not flag_issue,
+                claude_safe_mode=not flag_issue,
             )(system_prompt=_SYSTEM, task_prompt=task)
-            print(f"note: the frontier distill model was unavailable; fell back to {fast}. "
-                  f"Pass --model to pick one explicitly.")
+            why = ("the frontier distill model is unavailable on your plan" if plan_issue
+                   else "your agent CLI rejected the newer distill flags")
+            where = f" on {fast}" if can_downgrade else ""
+            print(f"note: {why}; retried with a compatible config{where}. "
+                  f"Pass --model / --effort to control it.")
         except Exception:
             return []
     if not isinstance(data, dict):

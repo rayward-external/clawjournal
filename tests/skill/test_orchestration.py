@@ -10,7 +10,7 @@ def _wire(monkeypatch, unscored, held=()):
     calls = {"scan": [], "unscored": [], "scored": [], "score_kw": []}
     monkeypatch.setattr(cli_skill, "_scan_source_filter", lambda cfg=None: None)
     monkeypatch.setattr(cli_skill, "_config_sources", lambda cfg=None: ["claude", "codex"])
-    monkeypatch.setattr(cli_skill, "_config_excluded_projects", lambda cfg=None: [])
+    monkeypatch.setattr(cli_skill, "_config_excluded_projects", lambda cfg=None, conn=None: [])
     monkeypatch.setattr("clawjournal.cli._run_scan",
                         lambda source_filter=None: calls["scan"].append(source_filter))
 
@@ -83,6 +83,17 @@ def test_no_score_flag_skips_scoring(monkeypatch):
     _ensure_corpus(7, do_scan=True, do_score=False, score_limit=25)
     assert calls["scan"] == [None]
     assert calls["unscored"] == [] and calls["scored"] == []
+
+
+def test_excluded_projects_honor_db_policies(index_conn):
+    # #1: a workbench DB exclude_project policy (not config.json) must be gated out of
+    # the skill path too — the same effective egress set as export/share.
+    from clawjournal.cli_skill import _config_excluded_projects
+    from clawjournal.workbench.index import add_policy
+    assert _config_excluded_projects({"excluded_projects": []}, index_conn) == []
+    add_policy(index_conn, "exclude_project", "client-acme")
+    eff = _config_excluded_projects({"excluded_projects": []}, index_conn)
+    assert any("client-acme" in p for p in eff)   # DB policy merged in
 
 
 def test_config_source_scope_mapping(monkeypatch):
