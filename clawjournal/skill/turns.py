@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..scoring.scoring import extract_tool_uses, get_message_text
-from .select import SkillCorpus
 
 logger = logging.getLogger(__name__)
 
@@ -143,27 +142,27 @@ def extract_correction_turns(
     return excerpts
 
 
-def enrich_corpus_with_turns(
+def excerpts_for_session(
     conn: Any,
-    corpus: SkillCorpus,
+    session_id: str,
     *,
-    max_per_session: int = MAX_EXCERPTS_PER_SESSION,
+    max_excerpts: int = MAX_EXCERPTS_PER_SESSION,
     loader: Callable[[Any, str], dict | None] | None = None,
-) -> None:
-    """Attach pivotal-turn excerpts to each candidate, in place. Best-effort.
+) -> list[TurnExcerpt]:
+    """Best-effort pivotal-turn excerpts for one session (empty on any failure).
 
-    Only runs over the ALREADY-gated corpus (hold-state + excluded-project checks
-    happened in selection), so nothing new can leak into the distill prompt.
+    Injected into ``select_skill_candidates`` as its ``excerpt_loader`` so a captured
+    correction both boosts the candidate's rank and rides along to the distill prompt.
+    Callers must only pass ALREADY-gated session ids (hold-state + excluded-project
+    checks happen in selection), so nothing new can leak into that prompt.
     """
     if loader is None:
         from ..workbench.index import get_session_detail
         loader = get_session_detail
-    for c in corpus.candidates:
-        try:
-            detail = loader(conn, c.session_id)
-            messages = (detail or {}).get("messages") or []
-            c.pivotal_excerpts = extract_correction_turns(
-                messages, max_excerpts=max_per_session)
-        except Exception as exc:  # a bad blob must never sink the whole run
-            logger.warning("turn extraction failed for %s: %s", c.session_id, exc)
-            c.pivotal_excerpts = []
+    try:
+        detail = loader(conn, session_id)
+        messages = (detail or {}).get("messages") or []
+        return extract_correction_turns(messages, max_excerpts=max_excerpts)
+    except Exception as exc:  # a bad blob must never sink the run
+        logger.warning("turn extraction failed for %s: %s", session_id, exc)
+        return []

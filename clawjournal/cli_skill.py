@@ -243,7 +243,11 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     corpus = _select.select_skill_candidates(
         conn, window_days=window_days, now=now,
         sources=sources if sources is not None else list(FAILURE_VALUE_SOURCE_SCOPE),
-        excluded_projects=excluded_projects)
+        excluded_projects=excluded_projects,
+        # captured user-corrections are a SELECTION signal: they boost the session's
+        # rank into the pool and ride along to the distill prompt (scrubbed at
+        # prompt-format time like every other field)
+        excerpt_loader=lambda sid: _turns.excerpts_for_session(conn, sid))
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,
@@ -258,10 +262,6 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     distilled: list[SkillRule] = []
     if not corpus.is_empty():
-        # ground the distiller in the actual mistake→correction→fix turns, not just
-        # session summaries (corpus is already hold-state/exclusion gated; excerpts
-        # are scrubbed at prompt-format time like every other field)
-        _turns.enrich_corpus_with_turns(conn, corpus)
         distilled = _distill.distill_skills(
             corpus, backend=backend, model=model, effort=effort, caller=caller, cfg=cfg)
     fresh, blocked = _render.gate_rules(distilled)

@@ -3,7 +3,7 @@
 from clawjournal.skill.select import SkillCandidate, SkillCorpus
 from clawjournal.skill.turns import (
     TurnExcerpt,
-    enrich_corpus_with_turns,
+    excerpts_for_session,
     extract_correction_turns,
     is_correction,
 )
@@ -92,12 +92,7 @@ def test_correction_with_no_prior_agent_activity_is_dropped():
     assert extract_correction_turns(msgs) == []
 
 
-def test_enrich_populates_candidates_and_survives_bad_blobs():
-    ok = SkillCandidate(session_id="s1", project="p", source="claude", kind="avoid")
-    bad = SkillCandidate(session_id="s2", project="p", source="claude", kind="do")
-    corpus = SkillCorpus(window_start="a", window_end="b",
-                         failures=[ok], successes=[bad])
-
+def test_excerpts_for_session_extracts_and_survives_bad_blobs():
     def loader(conn, sid):
         if sid == "s2":
             raise OSError("blob unreadable")
@@ -106,10 +101,9 @@ def test_enrich_populates_candidates_and_survives_bad_blobs():
             _u("no — fix it in the image build instead"), _a("Moved into the Dockerfile."),
         ]}
 
-    enrich_corpus_with_turns(None, corpus, loader=loader)
-    assert len(ok.pivotal_excerpts) == 1
-    assert "image build" in ok.pivotal_excerpts[0].correction
-    assert bad.pivotal_excerpts == []                 # bad blob degraded, not fatal
+    got = excerpts_for_session(None, "s1", loader=loader)
+    assert len(got) == 1 and "image build" in got[0].correction
+    assert excerpts_for_session(None, "s2", loader=loader) == []   # degraded, not fatal
 
 
 def test_excerpts_reach_prompt_scrubbed():

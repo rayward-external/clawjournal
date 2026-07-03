@@ -86,3 +86,30 @@ def test_window_and_source_scope(index_conn, ins):
     ins(index_conn, "gem", fvs=4, learning="x", source="gemini")
     corpus = select_skill_candidates(index_conn, now=NOW, window_days=7)
     assert {c.session_id for c in corpus.failures} == {"recent"}  # old out-of-window, gemini out-of-scope
+
+
+def test_corrections_boost_rank_into_pool(index_conn, ins):
+    # a captured user-correction is direct teachable evidence: with equal support, the
+    # corrected session must win the pool slot over a higher-severity summary-only peer.
+    from clawjournal.skill.turns import TurnExcerpt
+    ins(index_conn, "summary_only", fvs=5, modes='["verification_skipped"]', learning="a")
+    ins(index_conn, "corrected", fvs=3, modes='["reasoning_fabrication"]', learning="b")
+    excerpts = {"corrected": [TurnExcerpt(before="done!", correction="no, wrong", after="fixed"),
+                              TurnExcerpt(before="done!!", correction="still wrong", after="ok")]}
+    corpus = select_skill_candidates(
+        index_conn, now=NOW, pool_cap=1,
+        excerpt_loader=lambda sid: excerpts.get(sid, []))
+    (kept,) = corpus.candidates
+    assert kept.session_id == "corrected"          # 2.0x grounding beats severity 2.0 vs 1.6
+    assert len(kept.pivotal_excerpts) == 2         # excerpts ride along to the distiller
+
+
+def test_broken_excerpt_loader_degrades_not_fatal(index_conn, ins):
+    ins(index_conn, "f1", fvs=4, modes='["verification_skipped"]', learning="a")
+
+    def boom(sid):
+        raise RuntimeError("loader broke")
+
+    corpus = select_skill_candidates(index_conn, now=NOW, excerpt_loader=boom)
+    (kept,) = corpus.failures
+    assert kept.session_id == "f1" and kept.pivotal_excerpts == []

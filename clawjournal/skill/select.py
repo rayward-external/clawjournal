@@ -20,7 +20,7 @@ import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ..benchmark.select import _parse_json_list
 from ..workbench.index import (
@@ -130,6 +130,7 @@ def _candidate_rank(
     support: int,
     impact: float,
     recency: float,
+    corrections: int = 0,
 ) -> float:
     # Favor RECURRING, broadly-applicable patterns (daily-useful habits) over rare-but-
     # severe one-offs: recurrence (frequency) dominates; severity and recency are gentle
@@ -138,7 +139,11 @@ def _candidate_rank(
     freq = max(1, support)
     severity = 1.0 + max(0.0, impact) / 5.0                 # 1.0-2.0 gentle tie-breaker
     recency_w = 0.5 + 0.5 * max(0.0, min(1.0, recency))     # 0.5-1.0 (don't kill older habits)
-    return (freq ** 1.5) * severity * recency_w
+    # A captured user-correction turn is direct, teachable evidence (the distiller can
+    # ground a rule in the actual mistake→correction→fix exchange) — prefer those
+    # sessions over summary-only peers. Capped so excerpt count can't dominate frequency.
+    grounding = 1.0 + 0.5 * min(max(0, corrections), 2)     # 1.0/1.5/2.0
+    return (freq ** 1.5) * severity * recency_w * grounding
 
 
 def _release_blocked_ids(
@@ -164,12 +169,18 @@ def select_skill_candidates(
     sources: tuple[str, ...] | list[str] | None = FAILURE_VALUE_SOURCE_SCOPE,
     excluded_projects: list[str] | None = None,
     pool_cap: int = DEFAULT_POOL_CAP,
+    excerpt_loader: Callable[[str], list[Any]] | None = None,
 ) -> SkillCorpus:
     """Return the window's avoid + do candidates, hold-state-gated, capped.
 
     ``excluded_projects`` mirrors the export/share egress gate: a session whose
     project the user has ``--exclude``d never becomes a candidate and is never
     counted, so its content is not sent to the distill model or installed.
+
+    ``excerpt_loader`` (session_id -> pivotal-turn excerpts, see ``skill.turns``)
+    makes captured user-corrections a SELECTION signal: excerpts attach to the
+    candidate and boost its rank, so correction-rich sessions win pool slots over
+    summary-only peers. Only called for rows that already passed every egress gate.
     """
     clock = now or datetime.now(timezone.utc)
     if clock.tzinfo is None:  # _parse_start_time is always aware; don't crash on a naive now
@@ -259,6 +270,14 @@ def select_skill_candidates(
         if row["ai_outcome_badge"]:
             outcome_counter.update([row["ai_outcome_badge"]])
 
+    def _excerpts(session_id: str) -> list[Any]:
+        if excerpt_loader is None:
+            return []
+        try:
+            return list(excerpt_loader(session_id) or [])
+        except Exception:  # a broken loader must never sink selection
+            return []
+
     failures: list[SkillCandidate] = []
     failure_ids: set[str] = set()  # a session lands in exactly one pool (avoid wins)
     for row in fail_rows:
@@ -274,6 +293,7 @@ def select_skill_candidates(
         fv = row["ai_failure_value_score"]
         impact = float(fv if fv is not None else 3)  # 0 is a real score, not "unscored"
         recency = _recency_weight(row["start_time"], now=clock)
+        excerpts = _excerpts(row["session_id"])
         failures.append(SkillCandidate(
             session_id=row["session_id"], project=row["project"], source=row["source"],
             kind="avoid", failure_modes=modes, recovery_labels=recovery,
@@ -282,7 +302,9 @@ def select_skill_candidates(
             score_reason=row["ai_score_reason"],
             title=row["title"], start_time=row["start_time"],
             support_count=support, impact=impact, recency=recency,
-            rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
+            rank_score=_candidate_rank(support=support, impact=impact, recency=recency,
+                                       corrections=len(excerpts)),
+            pivotal_excerpts=excerpts,
         ))
         failure_ids.add(row["session_id"])
 
@@ -309,6 +331,7 @@ def select_skill_candidates(
         q = row["ai_quality_score"]
         impact = float(q if q is not None else 3)  # 0 is a real score, not "unscored"
         recency = _recency_weight(row["start_time"], now=clock)
+        excerpts = _excerpts(row["session_id"])
         successes.append(SkillCandidate(
             session_id=row["session_id"], project=row["project"], source=row["source"],
             kind="do", failure_modes=modes, recovery_labels=recovery,
@@ -317,7 +340,9 @@ def select_skill_candidates(
             score_reason=row["ai_score_reason"],
             title=row["title"], start_time=row["start_time"],
             support_count=support, impact=impact, recency=recency,
-            rank_score=_candidate_rank(support=support, impact=impact, recency=recency),
+            rank_score=_candidate_rank(support=support, impact=impact, recency=recency,
+                                       corrections=len(excerpts)),
+            pivotal_excerpts=excerpts,
         ))
 
     # eligible_ids computed above; reuse the single blocked_ids pass (no second gate query).
