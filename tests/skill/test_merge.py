@@ -129,3 +129,31 @@ def test_preserves_good_bad_mix():
     assert len(merged) == MAX_RULES
     assert kinds.count("do") >= 1 and kinds.count("avoid") >= 1   # both kinds survive
     assert kinds == ["avoid", "do", "avoid", "do", "avoid"]       # interleaved
+
+
+def test_cross_kind_title_extension_collapses():
+    # the distiller decorated a carried title ("Fix Root Cause" -> "Fix Root Cause
+    # Durably") and flipped the kind; guidance overlap is far below the cross-kind
+    # threshold, so the title-subset check must catch it.
+    avoid = SkillRule(kind="avoid", trigger="t", title="Fix Root Cause",
+                      guidance="don't stop at the temporary manual workaround that turns "
+                               "the test green — fix the root cause in the image build",
+                      why="w", taxonomy="revision_failure", support=7)
+    do = SkillRule(kind="do", trigger="t", title="Fix Root Cause Durably",
+                   guidance="land the permanent fix in the durable artifact and re-verify "
+                            "with the same harness that found it",
+                   why="w", support=4)
+    merged = merge_rules([avoid], [do], set())
+    assert sum("root cause" in (r.title or "").lower() for r in merged) == 1
+    assert merged[0].kind == "avoid"                    # carried rule preferred (no churn)
+
+
+def test_short_shared_title_words_do_not_collapse():
+    # two-word overlap gate: distinct lessons sharing ONE title keyword must survive.
+    a = SkillRule(kind="avoid", trigger="t", title="Verify Deploy Order",
+                  guidance="check migration ordering before deploying dependent code",
+                  why="w", taxonomy="execution_error", support=3)
+    b = SkillRule(kind="do", trigger="t", title="Verify Primary Data",
+                  guidance="re-derive counts from the raw source records before concluding",
+                  why="w", support=2)
+    assert len(merge_rules([a], [b], set())) == 2

@@ -112,6 +112,13 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     ta, tb = a.title.strip().lower(), b.title.strip().lower()
     if ta and ta == tb:
         return True
+    # One title EXTENDING the other is the same lesson too: the distiller decorates a
+    # carried title instead of reusing it verbatim ("Fix Root Cause" came back as
+    # "Fix Root Cause Durably" [do] beside the carried [avoid], guidance overlap only
+    # 0.25). Require >=2 shared keywords so one-word titles can't match everything.
+    tka, tkb = _guidance_keywords(ta), _guidance_keywords(tb)
+    if len(tka & tkb) >= 2 and (tka <= tkb or tkb <= tka):
+        return True
     if a.kind == b.kind:
         if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson
             return True
