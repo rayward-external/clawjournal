@@ -278,6 +278,9 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     # window's (gated) sessions becomes an avoid-candidate whose support_count is
     # the REAL session count — evidence the judge can't fabricate
     _turns.add_env_candidates(conn, corpus, now=now)
+    # human-rejection feedback: reject-button hits + permission/classifier denials
+    # become one avoid-candidate (support = distinct sessions with a rejection)
+    _turns.add_rejection_candidate(conn, corpus, now=now)
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,

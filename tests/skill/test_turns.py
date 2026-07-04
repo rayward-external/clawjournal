@@ -245,3 +245,63 @@ def test_error_signature_skips_traceback_preamble():
                    '  File "/app/x.py", line 3, in <module>\n'
                    "KeyError: 'partResults'"}
     assert error_signature(out) == "keyerror: 'partresults'"   # the informative line
+
+
+# --- human-rejection channel + precision fixes -------------------------------
+
+def test_questions_weighing_options_are_not_corrections():
+    # interrogative "instead" = weighing an option, not redirecting the agent
+    assert not is_correction("another question: can we just use gpt 5.5 as the judge "
+                             "instead of both gpt 5.5 and opus 4.8?")
+    assert not is_correction("can you use the default Claude headless md instead of API key?")
+    assert not is_correction("what's the impact of using opus 4.8 high instead of xhigh?")
+    # declarative "instead" is still a redirect
+    assert is_correction("let's ground by all these extracted raw traces instead")
+    assert is_correction("I don't want the swe-bench-style tasks, instead let's synthesize")
+
+
+def test_teammate_relays_are_not_corrections():
+    relay = ('Another Claude session sent a message: <teammate-message teammate_id="b">'
+             "no, that's wrong — revert it</teammate-message>")
+    msgs = [_u("task"), _a("Working on it."), _u(relay)]
+    assert extract_correction_turns(msgs) == []
+
+
+def test_add_rejection_candidate_clusters_across_sessions():
+    from clawjournal.skill.turns import add_rejection_candidate
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         eligible_session_ids=["s1", "s2", "s3"])
+    denials = {
+        "s1": "The user doesn't want to take this action right now. STOP what you are doing.",
+        "s2": ("Permission for this action was denied by the Claude Code auto mode "
+               "classifier. Reason: [Git Destructive] Deleting remote branch `x`."),
+        "s3": "Permission to use Bash with command git push origin main has been denied.",
+    }
+
+    def loader(conn, sid):
+        return {"project": "p", "source": "claude",
+                "start_time": "2026-07-01T00:00:00+00:00",
+                "messages": [_at(_tu("Bash", "git push origin main", status="error",
+                                     output=denials[sid]))]}
+
+    add_rejection_candidate(None, corpus, loader=loader)
+    (c,) = corpus.failures
+    assert c.title == "User-Rejected Actions" and c.support_count == 3
+    assert "3 distinct sessions" in c.learning_summary
+    assert "Git Destructive" in c.learning_summary          # classifier class surfaced
+    assert len(c.pivotal_excerpts) == 3
+    assert c.pivotal_excerpts[0].before.startswith("attempted: Bash: git push")
+    assert c.pivotal_excerpts[0].correction.startswith("rejected: ")
+
+
+def test_add_rejection_candidate_requires_min_recurrence():
+    from clawjournal.skill.turns import add_rejection_candidate
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         eligible_session_ids=["s1", "s2"])
+
+    def loader(conn, sid):
+        return {"messages": [_at(_tu("Bash", "rm -rf x", status="error",
+                                     output="The user doesn't want to take this action right now."))]}
+
+    add_rejection_candidate(None, corpus, loader=loader)   # 2 sessions < min 3
+    assert corpus.failures == []

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -42,13 +43,22 @@ _STRONG_RE = re.compile(
     r"that'?s not|that is not|not what i (?:asked|meant|want)|i asked (?:for|you)|"
     r"you (?:missed|forgot|didn'?t|should have)|still (?:fail|break|broken|wrong|not work)"
     r"|(?:doesn'?t|didn'?t|does not|did not) work|\brevert\b|undo (?:that|this)|"
-    r"\bwrong\b|\binstead\b|re-?read|fix it in|"
+    r"\bwrong\b|re-?read|fix it in|"
     r"fix (?:it|this|that) (?:properly|correctly|right|again)|try again|\bredo\b",
     re.I,
 )
 # Weaker signals that only count when they OPEN the message.
 _LEAD_RE = re.compile(
     r"^(?:no\b|nope\b|wait\b|stop\b|actually\b|hmm+,? no|don'?t\b|not\b|wrong\b)",
+    re.I,
+)
+# "…instead…" is a redirect in a DECLARATIVE message ("let's ground by raw traces
+# instead") but just an option being weighed in a QUESTION ("can we use gpt as the
+# judge instead?") — real-corpus false positives were all interrogative.
+_INSTEAD_RE = re.compile(r"\binstead\b", re.I)
+_QUESTION_HEAD_RE = re.compile(
+    r"^(?:another question|how\b|what\b|can (?:we|you|i)\b|could\b|should\b|would\b|"
+    r"is\b|are\b|do\b|does\b|did\b|why\b|when\b|where\b|which\b|who\b)",
     re.I,
 )
 
@@ -61,7 +71,8 @@ _NOISE_PREFIXES = ("<command-", "<local-command", "<task-notification", "Caveat:
 # phrasing ("do X instead") reads as a correction but isn't the human talking.
 _INJECTED_RE = re.compile(
     r"^Invoke: |<command-name>|^Base directory for this skill|"
-    r"^This session is being continued from a previous conversation",
+    r"^This session is being continued from a previous conversation|"
+    r"<teammate-message",   # relayed from ANOTHER agent session, not this session's human
     re.M,
 )
 
@@ -82,7 +93,9 @@ def _clean_user_text(msg: dict) -> str:
 
 def is_correction(text: str) -> bool:
     head = text[:_SIGNAL_SCAN_CHARS]
-    return bool(_LEAD_RE.match(head) or _STRONG_RE.search(head))
+    if _LEAD_RE.match(head) or _STRONG_RE.search(head):
+        return True
+    return bool(_INSTEAD_RE.search(head)) and not _QUESTION_HEAD_RE.match(head)
 
 
 def _head(text: str, limit: int) -> str:
@@ -372,3 +385,100 @@ def add_env_candidates(
             pivotal_excerpts=[excerpt],
         ))
         corpus.total_failures += 1
+
+
+# --- human-rejection candidate (permission denials / reject button) ----------
+
+MIN_REJECTION_SESSIONS = 3
+
+_REJECT_TAG_RE = re.compile(r"reason: \[([^\]]{4,60})\]", re.I)   # [Git Destructive]
+_REJECT_FREE_RE = re.compile(r"reason: ([^\n]{4,60})", re.I)
+
+
+def _rejection_reason(err: str) -> str:
+    m = _REJECT_TAG_RE.search(err) or _REJECT_FREE_RE.search(err)
+    if m:
+        return m.group(1).strip()
+    if "doesn't want to take this action" in err.lower():
+        return "user pressed reject"
+    return "permission denied"
+
+
+def add_rejection_candidate(
+    conn: Any,
+    corpus: Any,
+    *,
+    min_sessions: int = MIN_REJECTION_SESSIONS,
+    loader: Callable[[Any, str], dict | None] | None = None,
+    now: Any = None,
+) -> None:
+    """Append ONE avoid-candidate summarizing HUMAN-rejection feedback.
+
+    The reject button, classifier denials, and permission denials are the user
+    (or their configured gate) saying no to a specific attempted action — direct
+    human feedback the correction heuristic never sees. ``support_count`` is the
+    number of distinct sessions containing at least one rejection (a real count).
+    Excerpts render as pivotal_turns: agent_before = the attempted action,
+    user_correction = the rejection reason. Scans only the gated session ids.
+    """
+    from .select import SkillCandidate, _candidate_rank, _recency_weight
+
+    if loader is None:
+        from ..workbench.index import get_session_detail
+        loader = get_session_detail
+    sessions: list[str] = []
+    reasons: Counter[str] = Counter()
+    excerpts: list[TurnExcerpt] = []
+    last_detail: dict[str, Any] = {}
+    for sid in getattr(corpus, "eligible_session_ids", []) or []:
+        try:
+            detail = loader(conn, sid) or {}
+            messages = detail.get("messages") or []
+        except Exception as exc:
+            logger.warning("rejection scan failed for %s: %s", sid, exc)
+            continue
+        found_here = False
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            for tu in extract_tool_uses(m):
+                if tu.get("status") != "error":
+                    continue
+                err = _error_text(tu.get("output"))
+                if not _HUMAN_REJECTION_RE.search(err):
+                    continue
+                reason = _rejection_reason(err)
+                reasons[reason] += 1
+                if not found_here:
+                    found_here = True
+                    sessions.append(sid)
+                    last_detail = detail
+                    if len(excerpts) < 3:   # sample from distinct sessions only
+                        excerpts.append(TurnExcerpt(
+                            before=f"attempted: {_head(_action_desc(tu), _ACTION_CHARS)}",
+                            correction=f"rejected: {_head(err, _ERROR_CHARS)}",
+                            after="",
+                        ))
+    n = len(sessions)
+    if n < min_sessions:
+        return
+    clock = now or datetime.now(timezone.utc)
+    recency = _recency_weight(last_detail.get("start_time"), now=clock)
+    top = ", ".join(f"{r}×{k}" for r, k in reasons.most_common(4))
+    corpus.failures.append(SkillCandidate(
+        session_id=sessions[-1],
+        project=last_detail.get("project") or "", source=last_detail.get("source") or "",
+        kind="avoid",
+        learning_summary=(
+            f"Human rejection feedback: the user or their permission gate declined "
+            f"{sum(reasons.values())} attempted actions across {n} distinct sessions "
+            f"(support_count is that session count — ground truth). "
+            f"Recurring rejection classes: {top}. Teach the habit of proposing or "
+            f"asking first for this class of action instead of attempting it."),
+        title="User-Rejected Actions",
+        support_count=n, impact=2.0, recency=recency,
+        rank_score=_candidate_rank(support=n, impact=2.0, recency=recency,
+                                   corrections=len(excerpts)),
+        pivotal_excerpts=excerpts,
+    ))
+    corpus.total_failures += 1
