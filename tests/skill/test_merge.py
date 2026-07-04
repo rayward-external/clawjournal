@@ -172,3 +172,22 @@ def test_short_shared_title_words_do_not_collapse():
                   guidance="re-derive counts from the raw source records before concluding",
                   why="w", support=2)
     assert len(merge_rules([a], [b], set())) == 2
+
+
+def test_cross_kind_restated_guidance_collapses():
+    # the distiller's THIRD dedup escape (real pair from the 2026-07-04 run): a carried
+    # avoid restated as a fresh 'do' — different title words (no subset), overlap 0.44.
+    # Suffix folding (flagging/flag, waiting/wait) + the 0.40 cross-kind gate catch it.
+    avoid = SkillRule(kind="avoid", trigger="t", title="Pair Flags With Fixes", why="w",
+                      taxonomy="collaboration_error", support=9,
+                      guidance="Don't just flag the issues and wait; in the same turn "
+                               "attach a concrete correction or proposed next step for "
+                               "each problem so the loop isn't left in an unresolved "
+                               "state depending on a user reply that may never come.")
+    do = SkillRule(kind="do", trigger="t", title="Propose Fixes Not Flags", why="w",
+                   support=4,
+                   guidance="In the same turn, supply the concrete correction and a "
+                            "proposed next step rather than only flagging the issue "
+                            "and waiting for the user.")
+    merged = merge_rules([avoid], [do], set())
+    assert len(merged) == 1 and merged[0].kind == "avoid"   # carried wording kept

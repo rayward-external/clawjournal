@@ -81,11 +81,27 @@ _DUP_STOPWORDS = frozenset(
 )
 
 
+def _stem(w: str) -> str:
+    """Crude suffix fold so rewrites match ('flagging'/'flag', 'waited'/'wait').
+
+    Deliberately conservative: 'ing' only off longer words so 'string'/'timing'
+    survive; the trailing double consonant collapses so 'flagg' -> 'flag'.
+    """
+    if w.endswith("s") and len(w) > 3:
+        w = w[:-1]
+    if w.endswith("ing") and len(w) > 6:
+        w = w[:-3]
+    elif w.endswith("ed") and len(w) > 4:
+        w = w[:-2]
+    if len(w) > 3 and w[-1] == w[-2] and w[-1] not in "aeiou":
+        w = w[:-1]
+    return w
+
+
 def _guidance_keywords(text: str) -> set[str]:
-    """Significant word stems in a rule's guidance (crude singular/plural fold)."""
+    """Significant word stems in a rule's guidance."""
     words = re.findall(r"[a-z0-9]+", (text or "").lower())
-    return {(w[:-1] if w.endswith("s") and len(w) > 3 else w)
-            for w in words if len(w) > 2 and w not in _DUP_STOPWORDS}
+    return {_stem(w) for w in words if len(w) > 2 and w not in _DUP_STOPWORDS}
 
 
 def _guidance_overlap(a: str, b: str) -> float:
@@ -123,8 +139,11 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
         if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson
             return True
         return _guidance_overlap(a.guidance, b.guidance) >= 0.3
-    # cross-kind (do vs avoid) with different titles: require strong word overlap
-    return _guidance_overlap(a.guidance, b.guidance) >= 0.45
+    # cross-kind (do vs avoid) with different titles: require strong word overlap.
+    # 0.40 (not higher): the distiller restates a carried avoid as a fresh 'do' with
+    # ~0.4 overlap ("Pair Flags With Fixes" -> "Propose Fixes Not Flags"); genuinely
+    # distinct cross-kind lessons measure far lower (<0.2).
+    return _guidance_overlap(a.guidance, b.guidance) >= 0.40
 
 
 def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRule]:
