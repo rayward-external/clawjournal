@@ -102,6 +102,51 @@ def default_model_for_backend(backend: str) -> str | None:
     return DEFAULT_BACKEND_MODELS.get(backend)
 
 
+# Distill runs a SINGLE call per `clawjournal skill` run (unlike the 25-call
+# scoring fleet), so it defaults to frontier models and higher effort. `--model`
+# still overrides; scoring stays on DEFAULT_BACKEND_MODELS.
+DEFAULT_DISTILL_MODELS: dict[str, str] = {
+    "claude": "opus",
+    "codex": "gpt-5.5",
+}
+DEFAULT_DISTILL_EFFORTS: dict[str, str] = {
+    "claude": "xhigh",
+    "codex": "xhigh",
+}
+SUPPORTED_EFFORTS: dict[str, tuple[str, ...]] = {
+    "claude": ("low", "medium", "high", "xhigh", "max"),
+    "codex": ("low", "medium", "high", "xhigh"),
+}
+
+
+def default_distill_model_for_backend(backend: str) -> str | None:
+    """Frontier model for the one-shot skill-distill call (not scoring)."""
+    return DEFAULT_DISTILL_MODELS.get(backend) or default_model_for_backend(backend)
+
+
+def default_distill_effort_for_backend(backend: str) -> str | None:
+    """Higher effort for the one-shot skill-distill call (not scoring)."""
+    return DEFAULT_DISTILL_EFFORTS.get(backend)
+
+
+def validate_effort_for_backend(backend: str, effort: str | None) -> str | None:
+    """Validate an optional effort override for a resolved backend."""
+    if effort is None:
+        return None
+    normalized = effort.strip().lower()
+    if not normalized:
+        return None
+    allowed = SUPPORTED_EFFORTS.get(backend)
+    if not allowed:
+        raise RuntimeError(f"{backend} backend does not support --effort override from clawjournal")
+    if normalized not in allowed:
+        raise RuntimeError(
+            f"Unsupported effort for {backend}: {effort}. "
+            f"Use one of: {', '.join(allowed)}."
+        )
+    return normalized
+
+
 def resolve_model_for_backend(backend: str, model: str | None) -> str | None:
     """Use an explicit model when provided, otherwise the backend fast default."""
     return model if model else default_model_for_backend(backend)
@@ -328,17 +373,27 @@ def _build_claude_cmd(
     *,
     system_prompt_file: Path | None,
     model: str | None,
+    effort: str | None = None,
+    permission_mode: str = "bypassPermissions",
+    tools: str | None = None,
     bare: bool = False,
+    safe_mode: bool = False,
 ) -> list[str]:
     cmd = [
         command, "-p",
-        "--permission-mode", "bypassPermissions",
+        "--permission-mode", permission_mode,
         "--no-session-persistence",
     ]
     if bare:
         cmd += ["--bare"]
+    if safe_mode:
+        cmd += ["--safe-mode"]
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ["--effort", effort]
+    if tools is not None:
+        cmd += ["--tools", tools]
     if system_prompt_file is not None:
         if not system_prompt_file.exists():
             raise FileNotFoundError(
@@ -353,15 +408,17 @@ def _build_codex_cmd(
     *,
     cwd: Path,
     model: str | None,
+    effort: str | None = None,
     sandbox: str | None,
     output_schema_path: Path | None,
     output_file_path: Path | None,
 ) -> list[str]:
+    reasoning_effort = effort or DEFAULT_CODEX_REASONING_EFFORT
     cmd = [
         command, "exec",
         "-c", "analytics.enabled=false",
-        # Keep reasoning low for predictable scoring latency on large traces.
-        "-c", f'model_reasoning_effort="{DEFAULT_CODEX_REASONING_EFFORT}"',
+        # Default to low effort for scoring latency; distill can override this.
+        "-c", f'model_reasoning_effort="{reasoning_effort}"',
         "--skip-git-repo-check",
         "--ephemeral",
         "--color", "never",
@@ -440,12 +497,16 @@ def run_default_agent_task(
     system_prompt_file: Path | None = None,
     task_prompt: str,
     model: str | None = None,
+    effort: str | None = None,
     timeout_seconds: int = 120,
     codex_sandbox: str | None = "read-only",
     codex_output_schema: dict | None = None,
     codex_output_file: str | None = None,
     openclaw_message: str | None = None,
     claude_bare: bool = False,
+    claude_safe_mode: bool = False,
+    claude_permission_mode: str = "bypassPermissions",
+    claude_tools: str | None = None,
 ) -> AgentResult:
     """Spawn an agent CLI subprocess and return the result.
 
@@ -465,6 +526,8 @@ def run_default_agent_task(
         model: Optional model override for Claude/Codex. Claude and Codex use
             fast backend-specific defaults when not provided; other backends
             keep their agent CLI default.
+        effort: Optional reasoning/effort override for Claude/Codex. Codex
+            defaults to low effort for scoring latency when this is not provided.
         timeout_seconds: Subprocess timeout.
         codex_sandbox: Codex sandbox mode ("read-only" or None for
             full access). Ignored by other backends.
@@ -478,12 +541,21 @@ def run_default_agent_task(
         claude_bare: If True, pass ``--bare`` to Claude Code so it
             skips CLAUDE.md auto-discovery and hooks. Use when *cwd*
             points to an untrusted directory.
+        claude_safe_mode: If True, pass ``--safe-mode`` to Claude Code so it
+            skips customizations (including CLAUDE.md and skills) while
+            preserving normal auth/model behavior.
+        claude_permission_mode: Claude Code permission mode. Defaults to the
+            historical bypassPermissions for scoring; distillation can lower it
+            because it should not need tools.
+        claude_tools: Optional ``--tools`` value for Claude Code. Use an empty
+            string to disable built-in tools for untrusted distillation input.
     """
     resolved = resolve_backend(backend)
     check_backend_runtime(resolved)
     command = require_backend_command(resolved)
     agent_env = _agent_subprocess_env()
     effective_model = resolve_model_for_backend(resolved, model)
+    effective_effort = validate_effort_for_backend(resolved, effort)
 
     if codex_output_file and ("/" in codex_output_file or "\\" in codex_output_file):
         raise ValueError(
@@ -495,7 +567,11 @@ def run_default_agent_task(
             command,
             system_prompt_file=system_prompt_file,
             model=effective_model,
+            effort=effective_effort,
+            permission_mode=claude_permission_mode,
+            tools=claude_tools,
             bare=claude_bare,
+            safe_mode=claude_safe_mode,
         )
         try:
             proc = subprocess.run(
@@ -535,6 +611,7 @@ def run_default_agent_task(
             command,
             cwd=cwd,
             model=effective_model,
+            effort=effective_effort,
             sandbox=codex_sandbox,
             output_schema_path=schema_path,
             output_file_path=output_path,

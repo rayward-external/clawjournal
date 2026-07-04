@@ -1199,26 +1199,86 @@ def _validate_judge_result(result: dict) -> dict:
 # Top-level: score_session
 # ---------------------------------------------------------------------------
 
+def _redact_blocked_domains(text: str, blocked_domains: list[str]) -> str:
+    """Apply the same simple domain-blocking semantics used by share/export."""
+    if not text or not blocked_domains:
+        return text
+    try:
+        from ..workbench.index import _compile_blocked_domain_pattern
+    except Exception:
+        return text
+    redacted = text
+    for domain in blocked_domains:
+        pattern = _compile_blocked_domain_pattern(domain)
+        if pattern is not None:
+            redacted = pattern.sub("[REDACTED_DOMAIN]", redacted)
+    return redacted
+
+
+def _redact_custom_for_scoring(
+    value: Any,
+    *,
+    custom_strings: list[str],
+    blocked_domains: list[str],
+) -> Any:
+    if isinstance(value, str):
+        from ..redaction.secrets import redact_custom_strings
+        redacted, _count = redact_custom_strings(value, custom_strings)
+        return _redact_blocked_domains(redacted, blocked_domains)
+    if isinstance(value, list):
+        return [
+            _redact_custom_for_scoring(
+                v, custom_strings=custom_strings, blocked_domains=blocked_domains)
+            for v in value
+        ]
+    if isinstance(value, dict):
+        return {
+            k: _redact_custom_for_scoring(
+                v, custom_strings=custom_strings, blocked_domains=blocked_domains)
+            for k, v in value.items()
+        }
+    return value
+
+
 def _anonymize_for_scoring(
-    detail: dict[str, Any], messages: list[dict[str, Any]]
+    detail: dict[str, Any], messages: list[dict[str, Any]],
+    redaction_settings: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Scrub home-dir paths and usernames from a session before it is sent
-    to the judge. Returns a fresh detail dict and the scrubbed message list
-    so callers can't accidentally mutate the DB-backed copy."""
+    """Scrub locally configured sensitive strings before sending to the judge.
+
+    Home paths/usernames are always anonymized. Callers that have a DB handle can
+    pass the same effective share/export settings (config + workbench policies)
+    so custom redactions and blocked-domain policies apply to scoring egress too.
+    Returns fresh objects so callers can't mutate the DB-backed copy.
+    """
     from ..config import load_config
     from ..redaction.anonymizer import Anonymizer
 
-    try:
-        config = load_config()
-        extra = config.get("redact_usernames", []) if isinstance(config, dict) else []
-    except Exception:
-        extra = []
+    if redaction_settings is None:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        extra = list(config.get("redact_usernames", []) or [])
+        custom_strings = list(config.get("redact_strings", []) or [])
+        blocked_domains: list[str] = []
+    else:
+        extra = list(redaction_settings.get("extra_usernames", []) or [])
+        custom_strings = list(redaction_settings.get("custom_strings", []) or [])
+        blocked_domains = list(redaction_settings.get("blocked_domains", []) or [])
 
     anonymizer = Anonymizer(extra_usernames=extra)
 
     def scrub(value: Any) -> Any:
         if isinstance(value, str):
-            return anonymizer.text(value)
+            anonymized = anonymizer.text(value)
+            return _redact_custom_for_scoring(
+                anonymized,
+                custom_strings=custom_strings,
+                blocked_domains=blocked_domains,
+            )
         if isinstance(value, list):
             return [scrub(v) for v in value]
         if isinstance(value, dict):
@@ -1229,7 +1289,7 @@ def _anonymize_for_scoring(
     for field in ("display_title", "project", "git_branch"):
         val = new_detail.get(field)
         if isinstance(val, str):
-            new_detail[field] = anonymizer.text(val)
+            new_detail[field] = scrub(val)
 
     new_messages: list[dict[str, Any]] = []
     for msg in messages:
@@ -1240,7 +1300,7 @@ def _anonymize_for_scoring(
         for text_field in ("content", "thinking"):
             v = m.get(text_field)
             if isinstance(v, str):
-                m[text_field] = anonymizer.text(v)
+                m[text_field] = scrub(v)
         if isinstance(m.get("tool_uses"), list):
             m["tool_uses"] = [
                 {**tu, **{f: scrub(tu.get(f)) for f in ("input", "output") if f in tu}}
@@ -1260,6 +1320,7 @@ def score_session(
     *,
     model: str | None = None,
     backend: str = "auto",
+    redaction_settings: dict[str, Any] | None = None,
 ) -> ScoringResult:
     """Score a session: format → judge → store. No aggregation formulas."""
     from ..workbench.index import BLOBS_DIR, get_session_detail
@@ -1307,7 +1368,7 @@ def score_session(
     # Blobs hold raw content since the security refactor. Anonymize
     # home-dir paths and usernames before handing anything to the judge —
     # the judge may be a cloud backend (Anthropic API / Codex / etc.).
-    detail, messages = _anonymize_for_scoring(detail, messages)
+    detail, messages = _anonymize_for_scoring(detail, messages, redaction_settings)
 
     # Format: parse into turns
     segments = segment_session(messages)

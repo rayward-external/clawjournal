@@ -140,6 +140,47 @@ def _read_agent_output(resolved: str, stdout: str, out_file: Path) -> dict[str, 
     return _extract_json_object(stdout)
 
 
+def run_agent_json_call(*, resolved: str, model: str | None, effort: str | None = None,
+                        system_prompt: str,
+                        task_prompt: str, timeout_seconds: int,
+                        codex_output_schema: dict[str, Any] | None = None,
+                        claude_bare: bool = False,
+                        claude_safe_mode: bool = False,
+                        claude_permission_mode: str = "bypassPermissions",
+                        claude_tools: str | None = None) -> dict[str, Any]:
+    """Run one structured agent call in a throwaway cwd and return the parsed dict.
+
+    Shared by the benchmark generator and the skill distiller: Claude consumes the
+    system prompt from a file, other backends get it prepended to the task; the
+    backend runs read-only and out.json / stdout is parsed back to a dict.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        sys_file = cwd / "system.md"
+        sys_file.write_text(system_prompt, encoding="utf-8")
+        task = task_prompt if resolved == "claude" else f"{system_prompt}\n\n{task_prompt}"
+        result = run_default_agent_task(
+            backend=resolved,
+            cwd=cwd,
+            system_prompt_file=sys_file,
+            task_prompt=task,
+            model=model,
+            effort=effort,
+            timeout_seconds=timeout_seconds,
+            codex_sandbox="read-only",
+            codex_output_schema=codex_output_schema,
+            codex_output_file="out.json",
+            openclaw_message=task,
+            claude_bare=claude_bare,
+            claude_safe_mode=claude_safe_mode,
+            claude_permission_mode=claude_permission_mode,
+            claude_tools=claude_tools,
+        )
+        return _read_agent_output(resolved, result.stdout, cwd / "out.json")
+
+
 @dataclass
 class AgentBackendCaller:
     """Production :class:`BackendCaller` over ``run_default_agent_task``.
@@ -159,27 +200,11 @@ class AgentBackendCaller:
             self.model = default_model_for_backend(self.resolved)
 
     def __call__(self, *, stage: str, system_prompt: str, task_prompt: str) -> dict[str, Any]:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp)
-            sys_file = cwd / "system.md"
-            sys_file.write_text(system_prompt, encoding="utf-8")
-            # Claude consumes the system prompt via file; other backends get it
-            # prepended to the task message.
-            task = task_prompt if self.resolved == "claude" else f"{system_prompt}\n\n{task_prompt}"
-            result = run_default_agent_task(
-                backend=self.resolved,
-                cwd=cwd,
-                system_prompt_file=sys_file,
-                task_prompt=task,
-                model=self.model,
-                timeout_seconds=_STAGE_TIMEOUTS.get(stage, self.timeout_seconds),
-                codex_sandbox="read-only",
-                codex_output_file="out.json",
-                openclaw_message=task,
-            )
-            return _read_agent_output(self.resolved, result.stdout, cwd / "out.json")
+        return run_agent_json_call(
+            resolved=self.resolved, model=self.model,
+            system_prompt=system_prompt, task_prompt=task_prompt,
+            timeout_seconds=_STAGE_TIMEOUTS.get(stage, self.timeout_seconds),
+        )
 
 
 # ---------------------------------------------------------------------------

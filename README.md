@@ -339,6 +339,19 @@ clawjournal bundle-share <bundle_id>
 | `clawjournal set-score <id> --failure-value <1-5>` | Set failure-value score (4–5 requires `--failure-evidence`) |
 | `clawjournal set-score <id> --quality <1-5>` | Set the legacy productivity score |
 
+### Personal skills
+
+Distill a small `clawjournal-lessons` skill from your own scored sessions and install it for Claude Code (`~/.claude/skills/`) and Codex (`~/.codex/AGENTS.md`). Local-only — the distilled rules are anonymized, secret/PII-gated, and never uploaded. Requires a confirmed source scope + projects (same gate as export). The single distill call defaults to a stronger model/effort than batch scoring; `--model` and `--effort` override distillation only.
+
+| Command | Description |
+|---------|-------------|
+| `clawjournal skill --all` | First run: scan + score all history, then distill + install the top-5 lessons |
+| `clawjournal skill` | Weekly re-run over the last 7 days; merges/decays against the installed set |
+| `clawjournal skill --preview` | Show the proposed lessons without installing |
+| `clawjournal skill --target claude` | Install for one agent only (`claude` or `codex`; default both) |
+| `clawjournal skill --model <model> --effort <level>` | Override only the distill call (Claude effort: `low`/`medium`/`high`/`xhigh`/`max`; Codex: `low`/`medium`/`high`/`xhigh`) |
+| `clawjournal skill --reject <fingerprint>` | Never re-propose a lesson (fingerprint shown in the preview) |
+
 ### Hold-state gate
 
 | Command | Description |

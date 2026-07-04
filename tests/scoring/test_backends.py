@@ -12,6 +12,8 @@ from clawjournal.scoring.backends import (
     BACKEND_CHOICES,
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
+    DEFAULT_DISTILL_EFFORTS,
+    DEFAULT_DISTILL_MODELS,
     SUPPORTED_BACKENDS,
     _agent_subprocess_env,
     _build_claude_cmd,
@@ -23,6 +25,8 @@ from clawjournal.scoring.backends import (
     _detect_current_agent_from_process_tree,
     _get_process_field,
     check_backend_runtime,
+    default_distill_effort_for_backend,
+    default_distill_model_for_backend,
     default_model_for_backend,
     detect_available_backend,
     format_codex_runtime_error,
@@ -33,6 +37,7 @@ from clawjournal.scoring.backends import (
     resolve_model_for_backend,
     run_default_agent_task,
     summarize_process_error,
+    validate_effort_for_backend,
 )
 
 
@@ -53,6 +58,25 @@ class TestConstants:
         assert resolve_model_for_backend("claude", None) == DEFAULT_CLAUDE_MODEL
         assert resolve_model_for_backend("codex", None) == DEFAULT_CODEX_MODEL
         assert resolve_model_for_backend("claude", "opus") == "opus"
+
+    def test_distill_defaults_are_frontier_only(self):
+        assert DEFAULT_DISTILL_MODELS == {"claude": "opus", "codex": "gpt-5.5"}
+        assert DEFAULT_DISTILL_EFFORTS == {"claude": "xhigh", "codex": "xhigh"}
+        assert default_distill_model_for_backend("claude") == "opus"
+        assert default_distill_model_for_backend("codex") == "gpt-5.5"
+        assert default_distill_effort_for_backend("claude") == "xhigh"
+        assert default_distill_effort_for_backend("codex") == "xhigh"
+        assert default_distill_model_for_backend("hermes") is None
+        assert default_distill_effort_for_backend("hermes") is None
+
+    def test_validate_effort_for_backend(self):
+        assert validate_effort_for_backend("codex", "xhigh") == "xhigh"
+        assert validate_effort_for_backend("claude", "MAX") == "max"
+        assert validate_effort_for_backend("codex", "") is None
+        with pytest.raises(RuntimeError, match="Unsupported effort for codex"):
+            validate_effort_for_backend("codex", "max")
+        with pytest.raises(RuntimeError, match="does not support --effort"):
+            validate_effort_for_backend("hermes", "high")
 
 
 class TestBackendFallbackHelpers:
@@ -271,6 +295,23 @@ class TestBuildClaudeCmd:
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "opus"
 
+    def test_with_effort(self):
+        cmd = _build_claude_cmd("claude", system_prompt_file=None, model=None, effort="xhigh")
+        assert "--effort" in cmd
+        assert cmd[cmd.index("--effort") + 1] == "xhigh"
+
+    def test_with_non_bypass_permissions_and_tools_disabled(self):
+        cmd = _build_claude_cmd(
+            "claude",
+            system_prompt_file=None,
+            model=None,
+            permission_mode="default",
+            tools="",
+        )
+        assert cmd[cmd.index("--permission-mode") + 1] == "default"
+        assert "--tools" in cmd
+        assert cmd[cmd.index("--tools") + 1] == ""
+
     def test_with_existing_system_prompt(self, tmp_path):
         prompt_file = tmp_path / "sys.txt"
         prompt_file.write_text("you are helpful")
@@ -290,6 +331,10 @@ class TestBuildClaudeCmd:
     def test_bare_flag_off_by_default(self):
         cmd = _build_claude_cmd("claude", system_prompt_file=None, model=None)
         assert "--bare" not in cmd
+
+    def test_safe_mode_flag(self):
+        cmd = _build_claude_cmd("claude", system_prompt_file=None, model=None, safe_mode=True)
+        assert "--safe-mode" in cmd
 
 
 class TestBuildCodexCmd:
@@ -314,6 +359,13 @@ class TestBuildCodexCmd:
         assert cmd[cmd.index("--model") + 1] == "gpt-4"
         assert cmd[cmd.index("--output-schema") + 1] == str(schema)
         assert cmd[cmd.index("--output-last-message") + 1] == str(output)
+
+    def test_with_effort(self, tmp_path):
+        cmd = _build_codex_cmd(
+            "codex", cwd=tmp_path, model=None, effort="xhigh", sandbox=None,
+            output_schema_path=None, output_file_path=None,
+        )
+        assert 'model_reasoning_effort="xhigh"' in cmd
 
 
 class TestBuildOpenclawCmd:
@@ -440,6 +492,20 @@ class TestRunDefaultAgentTaskClaude:
         )
         assert captured_cmd[captured_cmd.index("--model") + 1] == "opus"
 
+    def test_explicit_effort_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="claude", cwd=tmp_path, task_prompt="score this", effort="xhigh",
+        )
+        assert captured_cmd[captured_cmd.index("--effort") + 1] == "xhigh"
+
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)
         _stub_subprocess(monkeypatch, returncode=1, stderr="error: bad prompt")
@@ -512,6 +578,23 @@ class TestRunDefaultAgentTaskCodex:
         monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
         run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review")
         assert 'model_reasoning_effort="low"' in captured_cmd
+
+    def test_explicit_reasoning_effort_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review", effort="xhigh")
+        assert 'model_reasoning_effort="xhigh"' in captured_cmd
+
+    def test_codex_rejects_max_effort(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        with pytest.raises(RuntimeError, match="Unsupported effort for codex"):
+            run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review", effort="max")
 
     def test_stdin_closed_to_avoid_hang(self, monkeypatch, tmp_path):
         """codex exec reads stdin in addition to the prompt arg; we must give it
@@ -600,6 +683,43 @@ class TestRunDefaultAgentTaskClaude_Bare:
             claude_bare=True,
         )
         assert "--bare" in captured_cmd
+
+
+class TestRunDefaultAgentTaskClaudeSafeMode:
+    def test_safe_mode_flag_forwarded(self, monkeypatch, tmp_path):
+        """claude_safe_mode=True adds --safe-mode to the spawned command."""
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="claude", cwd=tmp_path, task_prompt="hi",
+            claude_safe_mode=True,
+        )
+        assert "--safe-mode" in captured_cmd
+
+    def test_permission_mode_and_tools_forwarded(self, monkeypatch, tmp_path):
+        _stub_which(monkeypatch)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(
+            backend="claude",
+            cwd=tmp_path,
+            task_prompt="hi",
+            claude_permission_mode="default",
+            claude_tools="",
+        )
+        assert captured_cmd[captured_cmd.index("--permission-mode") + 1] == "default"
+        assert captured_cmd[captured_cmd.index("--tools") + 1] == ""
 
 
 class TestRunDefaultAgentTaskOpenclaw:
