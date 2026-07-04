@@ -1,14 +1,19 @@
-"""Turn-grounding: extract pivotal user-correction turns from raw session traces.
+"""Turn-grounding: extract pivotal feedback turns from raw session traces.
 
-Summary-grounded distillation produces generic lessons; the actual mistake →
-user-correction → fix exchange is the highest-signal evidence a trace holds.
-This module finds those moments heuristically (no LLM) and attaches compact
-excerpts to the already-selected, already-egress-gated candidates so the one
-distill call can ground its rules in what really happened.
+Summary-grounded distillation produces generic lessons; the highest-signal
+evidence a trace holds is OBJECTIVE feedback, not the judge's opinion:
+
+- HUMAN feedback — the mistake → user-correction → fix exchange;
+- ENVIRONMENT feedback — a tool call that errored, and the changed call that
+  then worked (plus the same error signature recurring across many sessions).
+
+This module finds both heuristically (no LLM) and attaches compact excerpts to
+the already-selected, already-egress-gated candidates so the one distill call
+can ground its rules in what really happened.
 
 Excerpts are extracted RAW here (local-only); they pass through the same
-``_scrub`` (anonymize + deterministic secret redaction) as every other field
-when ``distill._format_candidates`` builds the prompt.
+``_scrub`` (anonymize + custom redactions + deterministic secret redaction) as
+every other field when ``distill._format_candidates`` builds the prompt.
 """
 
 from __future__ import annotations
@@ -16,13 +21,16 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..scoring.scoring import extract_tool_uses, get_message_text
 
 logger = logging.getLogger(__name__)
 
-MAX_EXCERPTS_PER_SESSION = 2
+MAX_EXCERPTS_PER_SESSION = 2       # user-correction excerpts per session
+MAX_ENV_EXCERPTS_PER_SESSION = 2   # error->recovery excerpts per session
+MAX_EXCERPTS_TOTAL = 3             # combined cap fed to the distill prompt
 _BEFORE_CHARS = 350   # tail of the agent's last claim (the claim sits at the end)
 _CORRECTION_CHARS = 350
 _AFTER_CHARS = 250
@@ -142,17 +150,125 @@ def extract_correction_turns(
     return excerpts
 
 
+# --- environment feedback (tool errors + recoveries) ------------------------
+
+@dataclass
+class EnvExcerpt:
+    action: str      # the failing tool call (tool + input head)
+    error: str       # what the environment said
+    recovery: str    # the changed call that then worked ("" if it never did)
+
+
+_ACTION_CHARS = 160
+_ERROR_CHARS = 240
+
+_PATH_RE = re.compile(r"(/[\w.\-]+){2,}")
+_HEX_RE = re.compile(r"\b[0-9a-f]{7,}\b")
+_NUM_RE = re.compile(r"\d+")
+
+# Routine navigation/probing errors — grepping a path that may not exist is normal
+# work, not a lesson.
+_BENIGN_ERROR_RE = re.compile(
+    r"no matches found|file does not exist|is a directory\b|eisdir|"
+    r"shorter than the provided offset",
+    re.I,
+)
+# Human rejections arrive AS tool errors (permission denials, interrupts). They are
+# human feedback, not environment feedback — never teach them as an env pitfall.
+_HUMAN_REJECTION_RE = re.compile(
+    r"permission (?:to use|for this action)|denied by the|"
+    r"doesn'?t want to take this action|request interrupted|rejected the tool",
+    re.I,
+)
+
+
+def _error_text(output: Any) -> str:
+    if isinstance(output, dict):
+        return str(output.get("text", "") or "")
+    return str(output or "")
+
+
+def error_signature(output: Any) -> str:
+    """Normalized first INFORMATIVE line of an error output, for cross-session
+    clustering (paths/hex/numbers collapsed). '' if nothing distinctive enough —
+    a bare 'exit code 1' aggregates unrelated failures and must not cluster."""
+    for line in _error_text(output).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        norm = _NUM_RE.sub("#", _HEX_RE.sub("<hex>", _PATH_RE.sub("<path>", line))).lower()
+        if norm in ("exit code #", "error", "error:", "failed") or len(norm) < 8:
+            continue  # too generic; try the next line
+        # traceback preambles/frames aggregate ALL python errors into one cluster;
+        # the informative line (e.g. `KeyError: 'x'`) comes after them.
+        if norm.startswith(("traceback (most recent call last)", 'file "')):
+            continue
+        return norm[:110]
+    return ""
+
+
+def _teachable_error(tu: dict) -> str:
+    """The error signature if this failed tool call is worth learning from."""
+    err = _error_text(tu.get("output"))
+    if _HUMAN_REJECTION_RE.search(err) or _BENIGN_ERROR_RE.search(err):
+        return ""
+    return error_signature(tu.get("output"))
+
+
+def _action_desc(tu: dict) -> str:
+    inp = tu.get("input")
+    arg = ""
+    if isinstance(inp, dict):
+        for v in inp.values():
+            if isinstance(v, str) and v.strip():
+                arg = v.strip()
+                break
+    elif isinstance(inp, str):
+        arg = inp.strip()
+    tool = tu.get("tool", "?")
+    return f"{tool}: {arg}" if arg else tool
+
+
+def extract_error_recoveries(
+    messages: list[dict],
+    *,
+    max_excerpts: int = MAX_ENV_EXCERPTS_PER_SESSION,
+) -> list[EnvExcerpt]:
+    """Error -> later success on the SAME tool: the objective 'what worked' delta."""
+    pending: dict[str, dict] = {}   # tool -> latest teachable failing call
+    out: list[EnvExcerpt] = []
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tu in extract_tool_uses(m):
+            tool = tu.get("tool", "")
+            if tu.get("status") == "error":
+                if _teachable_error(tu):
+                    pending[tool] = tu
+            elif tool in pending:
+                failing = pending.pop(tool)
+                out.append(EnvExcerpt(
+                    action=_head(_action_desc(failing), _ACTION_CHARS),
+                    error=_head(_error_text(failing.get("output")), _ERROR_CHARS),
+                    recovery=_head(_action_desc(tu), _ACTION_CHARS),
+                ))
+                if len(out) >= max_excerpts:
+                    return out
+    return out
+
+
 def excerpts_for_session(
     conn: Any,
     session_id: str,
     *,
-    max_excerpts: int = MAX_EXCERPTS_PER_SESSION,
+    max_excerpts: int = MAX_EXCERPTS_TOTAL,
     loader: Callable[[Any, str], dict | None] | None = None,
-) -> list[TurnExcerpt]:
-    """Best-effort pivotal-turn excerpts for one session (empty on any failure).
+) -> list[Any]:
+    """Best-effort pivotal excerpts for one session (empty on any failure).
 
-    Injected into ``select_skill_candidates`` as its ``excerpt_loader`` so a captured
-    correction both boosts the candidate's rank and rides along to the distill prompt.
+    User corrections first (highest signal), then error->recovery pairs. Injected
+    into ``select_skill_candidates`` as its ``excerpt_loader`` so objective feedback
+    both boosts the candidate's rank and rides along to the distill prompt.
     Callers must only pass ALREADY-gated session ids (hold-state + excluded-project
     checks happen in selection), so nothing new can leak into that prompt.
     """
@@ -162,7 +278,97 @@ def excerpts_for_session(
     try:
         detail = loader(conn, session_id)
         messages = (detail or {}).get("messages") or []
-        return extract_correction_turns(messages, max_excerpts=max_excerpts)
+        corrections = extract_correction_turns(messages)
+        env = extract_error_recoveries(messages)
+        return (corrections + env)[:max_excerpts]
     except Exception as exc:  # a bad blob must never sink the run
         logger.warning("turn extraction failed for %s: %s", session_id, exc)
         return []
+
+
+# --- cross-session error-signature candidates (objective support) ------------
+
+MIN_SIGNATURE_SESSIONS = 3   # a signature must hit this many sessions to teach
+MAX_ENV_CANDIDATES = 3       # appended on top of the ranked pool
+
+
+def add_env_candidates(
+    conn: Any,
+    corpus: Any,
+    *,
+    min_sessions: int = MIN_SIGNATURE_SESSIONS,
+    max_candidates: int = MAX_ENV_CANDIDATES,
+    loader: Callable[[Any, str], dict | None] | None = None,
+    now: Any = None,
+) -> None:
+    """Append avoid-candidates for tool-error signatures recurring across sessions.
+
+    This is the judge-free evidence path: ``support_count`` is the number of
+    DISTINCT sessions that hit the same normalized tool error — a real count the
+    user can verify, not an AI-inferred failure mode. Scans only
+    ``corpus.eligible_session_ids`` (already hold-state + exclusion gated), so the
+    egress surface is identical to the rest of the corpus. Best-effort per session.
+    """
+    from .select import SkillCandidate, _candidate_rank, _recency_weight
+
+    if loader is None:
+        from ..workbench.index import get_session_detail
+        loader = get_session_detail
+    hits: dict[str, dict[str, Any]] = {}
+    for sid in getattr(corpus, "eligible_session_ids", []) or []:
+        try:
+            detail = loader(conn, sid) or {}
+            messages = detail.get("messages") or []
+        except Exception as exc:
+            logger.warning("env-signature scan failed for %s: %s", sid, exc)
+            continue
+        pending_sig: dict[str, str] = {}   # tool -> signature of its latest error
+        for m in messages:
+            if m.get("role") != "assistant":
+                continue
+            for tu in extract_tool_uses(m):
+                tool = tu.get("tool", "")
+                sig = _teachable_error(tu) if tu.get("status") == "error" else ""
+                if sig:
+                    entry = hits.setdefault(sig, {
+                        "sessions": [], "tool": tool,
+                        "action": _head(_action_desc(tu), _ACTION_CHARS),
+                        "error": _head(_error_text(tu.get("output")), _ERROR_CHARS),
+                        "recovery": "",
+                    })
+                    if sid not in entry["sessions"]:   # count each session ONCE
+                        entry["sessions"].append(sid)
+                        entry["project"] = detail.get("project") or ""
+                        entry["source"] = detail.get("source") or ""
+                        entry["start_time"] = detail.get("start_time")
+                    pending_sig[tool] = sig
+                elif tu.get("status") != "error" and tool in pending_sig:
+                    entry = hits.get(pending_sig.pop(tool))
+                    if entry is not None and not entry["recovery"]:
+                        entry["recovery"] = _head(_action_desc(tu), _ACTION_CHARS)
+
+    clock = now or datetime.now(timezone.utc)
+    recurring = sorted(
+        (item for item in hits.items() if len(item[1]["sessions"]) >= min_sessions),
+        key=lambda item: -len(item[1]["sessions"]),
+    )[:max_candidates]
+    for sig, info in recurring:
+        n = len(info["sessions"])
+        recency = _recency_weight(info.get("start_time"), now=clock)
+        excerpt = EnvExcerpt(action=info["action"], error=info["error"],
+                             recovery=info["recovery"])
+        corpus.failures.append(SkillCandidate(
+            session_id=info["sessions"][-1],
+            project=info.get("project", ""), source=info.get("source", ""),
+            kind="avoid",
+            learning_summary=(
+                f"Objective environment feedback: the tool error '{sig}' recurred in "
+                f"{n} distinct sessions this window (support_count is that session "
+                f"count — ground truth, not judge-inferred)."),
+            title=f"Recurring {info['tool'] or 'tool'} error",
+            support_count=n, impact=2.0, recency=recency,
+            rank_score=_candidate_rank(support=n, impact=2.0, recency=recency,
+                                       corrections=1),
+            pivotal_excerpts=[excerpt],
+        ))
+        corpus.total_failures += 1

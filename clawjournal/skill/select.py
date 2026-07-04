@@ -72,6 +72,9 @@ class SkillCorpus:
     total_failures: int = 0
     total_successes: int = 0
     eligible_scored: int = 0   # scored sessions in the window (rate denominator)
+    # every gated (hold-state + exclusion checked) scored session in the window —
+    # the scan universe for cross-session env-signature candidates (skill.turns)
+    eligible_session_ids: list[str] = field(default_factory=list)
 
     def mode_rates(self) -> dict[str, float]:
         """Per-failure-mode incidence rate over eligible scored sessions."""
@@ -346,7 +349,8 @@ def select_skill_candidates(
         ))
 
     # eligible_ids computed above; reuse the single blocked_ids pass (no second gate query).
-    eligible_scored = len([sid for sid in eligible_ids if sid not in blocked_ids])
+    gated_eligible = [sid for sid in eligible_ids if sid not in blocked_ids]
+    eligible_scored = len(gated_eligible)
 
     ranked = sorted(
         failures + successes,
@@ -363,4 +367,5 @@ def select_skill_candidates(
         mode_recurrence=dict(mode_counter.most_common()),
         total_failures=len(failures), total_successes=len(successes),
         eligible_scored=eligible_scored,
+        eligible_session_ids=gated_eligible,
     )

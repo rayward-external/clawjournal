@@ -104,6 +104,13 @@ _SYSTEM = (
     "correction unnecessary) over rules restated from summaries, and pull the concrete "
     "trigger/mechanism from the excerpt itself. Never quote user text verbatim in the "
     "output; state the lesson in your own words. "
+    "Sessions may also include env_recovery excerpts (OBJECTIVE environment feedback): "
+    "a tool call that failed, the environment's error, and the changed call that then "
+    "worked. Candidates marked 'Objective environment feedback' cluster ONE recurring "
+    "tool error across many sessions — their support_count is the verified number of "
+    "sessions that hit it, ground truth rather than judge opinion. For these, teach the "
+    "mechanical habit that avoids the error (or the failed→working delta), stated "
+    "generally (no session-specific paths/values). "
     "De-identify PII ONLY — never emit a person's name, email, URL, "
     "home path, secret, or verbatim shell command — but KEEP technical specifics (repo and "
     "module names, failure surfaces, tool categories, architectural patterns). "
@@ -173,12 +180,21 @@ def _format_candidates(
             f"  score_reason={_scrub(c.score_reason, anon, settings)}"
         )
         for i, t in enumerate(getattr(c, "pivotal_excerpts", []) or [], 1):
-            lines.append(
-                f"  pivotal_turn_{i}:\n"
-                f"    agent_before: {_scrub(t.before, anon, settings)}\n"
-                f"    user_correction: {_scrub(t.correction, anon, settings)}\n"
-                f"    agent_after: {_scrub(t.after, anon, settings)}"
-            )
+            if hasattr(t, "correction"):        # human feedback (TurnExcerpt)
+                lines.append(
+                    f"  pivotal_turn_{i}:\n"
+                    f"    agent_before: {_scrub(t.before, anon, settings)}\n"
+                    f"    user_correction: {_scrub(t.correction, anon, settings)}\n"
+                    f"    agent_after: {_scrub(t.after, anon, settings)}"
+                )
+            else:                               # environment feedback (EnvExcerpt)
+                recovered = _scrub(t.recovery, anon, settings)
+                lines.append(
+                    f"  env_recovery_{i}:\n"
+                    f"    failed_action: {_scrub(t.action, anon, settings)}\n"
+                    f"    error: {_scrub(t.error, anon, settings)}\n"
+                    f"    working_action: {recovered or '(not recovered in-session)'}"
+                )
     return "\n".join(lines)
 
 

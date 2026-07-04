@@ -121,3 +121,127 @@ def test_excerpts_reach_prompt_scrubbed():
     assert "pivotal_turn_1" in prompt and "user_correction" in prompt
     assert "rotate it" in prompt                      # substance kept
     assert "AKIAIOSFODNN7EXAMPLEKEYXX" not in prompt  # secret scrubbed pre-egress
+
+
+# --- environment feedback ----------------------------------------------------
+
+def _tu(tool, arg, status="success", output=""):
+    return {"tool": tool, "input": {"arg": arg}, "status": status,
+            "output": {"text": output} if output else {}}
+
+
+def _at(*tool_uses):
+    return {"role": "assistant", "content": "", "tool_uses": list(tool_uses)}
+
+
+def test_error_recovery_excerpt_extracted():
+    from clawjournal.skill.turns import extract_error_recoveries
+    msgs = [
+        _u("fix the config"),
+        _at(_tu("Edit", "old text", status="error",
+                output="String to replace not found in file.")),
+        _at(_tu("Edit", "corrected exact text", status="success")),
+    ]
+    (ex,) = extract_error_recoveries(msgs)
+    assert ex.action.startswith("Edit: old text")
+    assert "not found in file" in ex.error
+    assert "corrected exact text" in ex.recovery
+
+
+def test_benign_and_human_rejection_errors_skipped():
+    from clawjournal.skill.turns import extract_error_recoveries
+    msgs = [
+        _at(_tu("Grep", "needle", status="error", output="No matches found")),
+        _at(_tu("Grep", "needle2", status="success")),
+        _at(_tu("Bash", "rm -rf /tmp/x", status="error",
+                output="Permission to use Bash with command rm -rf has been denied.")),
+        _at(_tu("Bash", "ls", status="success")),
+    ]
+    assert extract_error_recoveries(msgs) == []   # probing + human rejection: not env lessons
+
+
+def test_error_signature_normalizes_and_rejects_generic():
+    from clawjournal.skill.turns import error_signature
+    a = error_signature({"text": "Error at /Users/kai/proj/file.py line 42: bad frobnicate"})
+    b = error_signature({"text": "Error at /home/other/app/main.py line 7: bad frobnicate"})
+    assert a == b                                  # paths + numbers collapsed -> same cluster
+    assert error_signature({"text": "Exit code 1"}) == ""   # too generic to cluster
+    assert error_signature({"text": "Exit code 1\npytest: 3 tests failed in module x"}) != ""
+
+
+def test_excerpts_for_session_puts_corrections_first_and_caps():
+    def loader(conn, sid):
+        return {"messages": [
+            _u("task"),
+            _at(_tu("Bash", "pytest -q", status="error",
+                    output="ImportError: cannot import name frobnicate")),
+            _at(_tu("Bash", "pip install -e . && pytest -q", status="success")),
+            _a("All green now."),
+            _u("no, that's not what I asked — revert the dep change"),
+            _a("Reverted."),
+        ]}
+    got = excerpts_for_session(None, "s1", loader=loader)
+    assert hasattr(got[0], "correction")           # human feedback leads
+    assert any(hasattr(t, "recovery") for t in got)  # env recovery rides along
+    assert len(got) <= 3
+
+
+def test_add_env_candidates_clusters_across_sessions():
+    from clawjournal.skill.turns import add_env_candidates
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         eligible_session_ids=["s1", "s2", "s3"])
+
+    def loader(conn, sid):
+        return {"project": "p", "source": "claude", "start_time": "2026-07-01T00:00:00+00:00",
+                "messages": [
+                    _at(_tu("Write", f"/tmp/{sid}.py", status="error",
+                            output="File has not been read yet. Read it first before writing to it.")),
+                    _at(_tu("Write", f"/tmp/{sid}.py", status="success")),
+                ]}
+
+    add_env_candidates(None, corpus, loader=loader)
+    (c,) = corpus.failures
+    assert c.kind == "avoid" and c.support_count == 3      # REAL session count
+    assert "3 distinct sessions" in c.learning_summary
+    (ex,) = c.pivotal_excerpts
+    assert "not been read yet" in ex.error and ex.recovery  # recovery example captured
+    assert corpus.total_failures == 1
+
+
+def test_add_env_candidates_requires_min_recurrence():
+    from clawjournal.skill.turns import add_env_candidates
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         eligible_session_ids=["s1", "s2"])
+
+    def loader(conn, sid):
+        return {"messages": [_at(_tu("Edit", "x", status="error",
+                                     output="String to replace not found in file."))]}
+
+    add_env_candidates(None, corpus, loader=loader)        # only 2 sessions < min 3
+    assert corpus.failures == []
+
+
+def test_env_excerpts_render_scrubbed_in_prompt():
+    from clawjournal.redaction.anonymizer import Anonymizer
+    from clawjournal.skill.distill import _candidate_aliases, build_prompt
+    from clawjournal.skill.turns import EnvExcerpt
+
+    c = SkillCandidate(session_id="s1", project="p", source="claude", kind="avoid")
+    c.pivotal_excerpts = [EnvExcerpt(
+        action="Bash: export TOKEN=ghp_9f8AexampleSECRETtokenValue123456 && ./deploy",
+        error="401 unauthorized from registry",
+        recovery="Bash: read token from env file, then ./deploy",
+    )]
+    corpus = SkillCorpus(window_start="a", window_end="b", failures=[c])
+    prompt = build_prompt(corpus, Anonymizer(), _candidate_aliases(corpus))
+    assert "env_recovery_1" in prompt and "failed_action" in prompt
+    assert "401 unauthorized" in prompt
+    assert "ghp_9f8AexampleSECRETtokenValue123456" not in prompt   # secret scrubbed pre-egress
+
+
+def test_error_signature_skips_traceback_preamble():
+    from clawjournal.skill.turns import error_signature
+    out = {"text": "Exit code 1\nTraceback (most recent call last):\n"
+                   '  File "/app/x.py", line 3, in <module>\n'
+                   "KeyError: 'partResults'"}
+    assert error_signature(out) == "keyerror: 'partresults'"   # the informative line

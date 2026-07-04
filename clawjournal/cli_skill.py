@@ -270,10 +270,14 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
         conn, window_days=window_days, now=now,
         sources=sources if sources is not None else list(FAILURE_VALUE_SOURCE_SCOPE),
         excluded_projects=excluded_projects,
-        # captured user-corrections are a SELECTION signal: they boost the session's
-        # rank into the pool and ride along to the distill prompt (scrubbed at
-        # prompt-format time like every other field)
+        # captured user-corrections and error->recovery pairs are a SELECTION signal:
+        # they boost the session's rank into the pool and ride along to the distill
+        # prompt (scrubbed at prompt-format time like every other field)
         excerpt_loader=lambda sid: _turns.excerpts_for_session(conn, sid))
+    # objective environment feedback: a tool-error signature recurring across the
+    # window's (gated) sessions becomes an avoid-candidate whose support_count is
+    # the REAL session count — evidence the judge can't fabricate
+    _turns.add_env_candidates(conn, corpus, now=now)
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,
