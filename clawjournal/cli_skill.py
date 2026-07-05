@@ -21,7 +21,7 @@ from .skill import render as _render
 from .skill import select as _select
 from .skill import store as _store
 from .skill import turns as _turns
-from .skill.schema import MAX_RULES, SkillRule
+from .skill.schema import MAX_INSTALLED_RULES, SkillRule
 from .workbench.index import FAILURE_VALUE_SOURCE_SCOPE
 
 # A wide window approximates "all history" for the first run.
@@ -31,7 +31,7 @@ DEFAULT_SCORE_LIMIT = 25
 
 @dataclass
 class SkillResult:
-    rules: list[SkillRule]          # the merged top-<=5 to install
+    rules: list[SkillRule]          # the merged top-<=MAX_INSTALLED_RULES to install
     skill_md: str
     region: str
     blocked: list[tuple[SkillRule, list[str]]]
@@ -177,7 +177,7 @@ def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRul
 
 def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str],
                 *, now: datetime | None = None) -> list[SkillRule]:
-    """Merge existing + newly-distilled rules -> top-<=5 (replace the weakest).
+    """Merge existing + newly-distilled rules -> top-<=10 installed (replace the weakest).
 
     Deduped by fingerprint; rejected fingerprints dropped; ranked by RECENCY-WEIGHTED
     support (so stale peaks decay) then recurred-this-run. **Interleaved across kinds**
@@ -216,10 +216,10 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
     do = [r for r in deduped if r.kind == "do"]
     out: list[SkillRule] = []
     ai = di = 0
-    while len(out) < MAX_RULES and (ai < len(avoid) or di < len(do)):
+    while len(out) < MAX_INSTALLED_RULES and (ai < len(avoid) or di < len(do)):
         if ai < len(avoid):
             out.append(avoid[ai]); ai += 1
-        if len(out) < MAX_RULES and di < len(do):
+        if len(out) < MAX_INSTALLED_RULES and di < len(do):
             out.append(do[di]); di += 1
     return out
 

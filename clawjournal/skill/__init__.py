@@ -10,6 +10,6 @@ distill call -> render <=5 rules -> deterministic gate -> preview -> install a
 See ``docs/self-improving-skills/plan.md`` (Mode A) for the design.
 """
 
-from .schema import MAX_RULES, SkillRule
+from .schema import MAX_INSTALLED_RULES, MAX_RULES, SkillRule
 
-__all__ = ["MAX_RULES", "SkillRule"]
+__all__ = ["MAX_INSTALLED_RULES", "MAX_RULES", "SkillRule"]

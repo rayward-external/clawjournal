@@ -17,8 +17,15 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-# Hard cap. Too many skills are unmanageable; 5 keeps review/use/maintenance sane.
+# Per-DISTILL cap: each run's single LLM call proposes at most this many fresh
+# rules — a small ask keeps the distiller focused on the window's strongest lessons.
 MAX_RULES = 5
+
+# INSTALLED-set cap: the durable merged set the user's agents load. Wider than the
+# per-run cap so lessons accumulate across weekly runs instead of churning — a rule
+# only leaves when decayed support ranks it below a newer lesson, not because one
+# run's 5 slots filled up. 10 rules ≈ a screen of text; still reviewable.
+MAX_INSTALLED_RULES = 10
 
 VALID_KINDS = ("avoid", "do")
 
