@@ -331,3 +331,40 @@ def test_synthetic_candidates_get_noncolliding_ids():
     ids = [c.session_id for c in corpus.failures]
     assert len(ids) == len(set(ids))                    # all distinct
     assert not any(i in {"s1", "s2", "s3"} for i in ids)  # none is a real session id
+
+
+def test_objective_recurrence_populated_for_trend():
+    from clawjournal.skill.turns import add_env_candidates, add_rejection_candidate
+    corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
+                         eligible_session_ids=["s1", "s2", "s3"])
+
+    def loader(conn, sid):
+        return {"project": "p", "source": "claude", "start_time": "2026-07-01T00:00:00+00:00",
+                "messages": [
+                    _at(_tu("Edit", "x", status="error",
+                            output="String to replace not found in file.")),
+                    _at(_tu("Bash", "git push", status="error",
+                            output="The user doesn't want to take this action right now.")),
+                ]}
+
+    add_env_candidates(None, corpus, loader=loader)
+    add_rejection_candidate(None, corpus, loader=loader)
+    assert corpus.objective_recurrence["string to replace not found in file"] == 3
+    assert corpus.objective_recurrence["user-rejected actions"] == 3
+    assert abs(corpus.objective_rates()["user-rejected actions"] - 0.3) < 1e-9   # 3/10
+
+
+def test_objective_recurrence_records_below_teach_bar():
+    # a signal at 2 sessions is RECORDED (so a later drop shows an improving trend)
+    # but must NOT become a taught candidate (bar is 3).
+    from clawjournal.skill.turns import add_env_candidates
+    corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
+                         eligible_session_ids=["s1", "s2"])
+
+    def loader(conn, sid):
+        return {"messages": [_at(_tu("Edit", "x", status="error",
+                                     output="String to replace not found in file."))]}
+
+    add_env_candidates(None, corpus, loader=loader)
+    assert corpus.objective_recurrence.get("string to replace not found in file") == 2
+    assert corpus.failures == []   # below the teach bar

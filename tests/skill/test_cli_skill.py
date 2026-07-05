@@ -68,6 +68,7 @@ def test_gate_issues_exit_nonzero(monkeypatch):
         added_fps = set()
         dropped = []
         trend = {}
+        objective_trend = {}
 
     monkeypatch.setattr("clawjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
     monkeypatch.setattr("clawjournal.cli_skill._config_excluded_projects", lambda *a, **k: [])
@@ -101,6 +102,7 @@ def test_preview_persists_proposed_rules_for_rejection(monkeypatch, index_conn):
         added_fps = {store.fingerprint(rule)}
         dropped = []
         trend = {}
+        objective_trend = {}
 
     monkeypatch.setattr("clawjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
     monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: ConnProxy())
