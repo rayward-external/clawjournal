@@ -169,6 +169,12 @@ def _ensure_snapshots(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS skill_mode_snapshots ("
         "recorded_at TEXT, n INTEGER, rates_json TEXT)"
     )
+    # Separate table (not an ALTER) so an older DB with no objective column can't break;
+    # same shape as the mode snapshot, holding objective-signal rates instead.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS skill_objective_snapshots ("
+        "recorded_at TEXT, n INTEGER, rates_json TEXT)"
+    )
     conn.commit()
 
 
@@ -183,11 +189,10 @@ def save_mode_snapshot(conn: sqlite3.Connection, rates: dict[str, float], n: int
     conn.commit()
 
 
-def last_mode_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, float]] | None:
-    """Return the most recent (recorded_at, n, rates) snapshot, or None."""
+def _read_last_snapshot(conn: sqlite3.Connection, table: str) -> tuple[str, int, dict[str, float]] | None:
     _ensure_snapshots(conn)
     row = conn.execute(
-        "SELECT recorded_at, n, rates_json FROM skill_mode_snapshots ORDER BY recorded_at DESC LIMIT 1"
+        f"SELECT recorded_at, n, rates_json FROM {table} ORDER BY recorded_at DESC LIMIT 1"
     ).fetchone()
     if not row:
         return None
@@ -198,6 +203,27 @@ def last_mode_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, fl
     except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
         rates = {}
     return (row[0], int(row[1] or 0), rates)
+
+
+def last_mode_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, float]] | None:
+    """Return the most recent (recorded_at, n, rates) mode snapshot, or None."""
+    return _read_last_snapshot(conn, "skill_mode_snapshots")
+
+
+def save_objective_snapshot(conn: sqlite3.Connection, rates: dict[str, float], n: int,
+                            *, now: str | None = None) -> None:
+    """Record the window's objective-signal incidence rates (run-over-run trend)."""
+    _ensure_snapshots(conn)
+    conn.execute(
+        "INSERT INTO skill_objective_snapshots (recorded_at, n, rates_json) VALUES (?,?,?)",
+        (now or now_iso(), int(n), json.dumps(rates)),
+    )
+    conn.commit()
+
+
+def last_objective_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, float]] | None:
+    """Return the most recent (recorded_at, n, rates) objective snapshot, or None."""
+    return _read_last_snapshot(conn, "skill_objective_snapshots")
 
 
 def reject(conn: sqlite3.Connection, fp: str, *, now: str | None = None) -> bool:

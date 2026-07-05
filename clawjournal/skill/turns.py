@@ -301,8 +301,16 @@ def excerpts_for_session(
 
 # --- cross-session error-signature candidates (objective support) ------------
 
-MIN_SIGNATURE_SESSIONS = 3   # a signature must hit this many sessions to teach
+MIN_SIGNATURE_SESSIONS = 3   # a signature must hit this many sessions to TEACH a rule
+MIN_SIGNATURE_RECORD = 2     # ...but record recurrence >=2 so a signal falling below the
+                             # teach bar (e.g. 4 -> 2 sessions) still shows an improving trend
 MAX_ENV_CANDIDATES = 3       # appended on top of the ranked pool
+
+
+def _signal_label(sig: str) -> str:
+    """A short, stable, readable key for an error signature (drops the wrapper tags)."""
+    text = re.sub(r"</?tool_use_error>", "", sig).strip(" .:")
+    return (text[:60] + "…") if len(text) > 60 else text
 
 
 def add_env_candidates(
@@ -361,6 +369,11 @@ def add_env_candidates(
                         entry["recovery"] = _head(_action_desc(tu), _ACTION_CHARS)
 
     clock = now or datetime.now(timezone.utc)
+    # record recurrence for the run-over-run objective trend (broader than the teach bar)
+    for sig, info in hits.items():
+        c = len(info["sessions"])
+        if c >= MIN_SIGNATURE_RECORD:
+            corpus.objective_recurrence[_signal_label(sig)] = c
     recurring = sorted(
         (item for item in hits.items() if len(item[1]["sessions"]) >= min_sessions),
         key=lambda item: -len(item[1]["sessions"]),
@@ -463,6 +476,8 @@ def add_rejection_candidate(
                             after="",
                         ))
     n = len(sessions)
+    if n >= MIN_SIGNATURE_RECORD:   # record for the trend even below the teach bar
+        corpus.objective_recurrence["user-rejected actions"] = n
     if n < min_sessions:
         return
     clock = now or datetime.now(timezone.utc)

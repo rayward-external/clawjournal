@@ -42,6 +42,8 @@ class SkillResult:
     dropped: list[SkillRule] = field(default_factory=list)
     # run-over-run: {failure_mode: (prev_rate_or_None, current_rate)} for targeted modes
     trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
+    # run-over-run for OBJECTIVE signals: {signal: (prev_rate_or_None, current_rate)}
+    objective_trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
 
 
 _SUPPORT_HALFLIFE_DAYS = 30.0  # a rule's effective support halves every 30 idle days
@@ -375,8 +377,17 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     targeted = {r.taxonomy for r in rules if r.kind == "avoid" and r.taxonomy}
     trend = {m: (prev_rates.get(m), cur_rates.get(m, 0.0)) for m in sorted(targeted)}
 
+    # OBJECTIVE-signal trend: judge-free ground truth (tool-error signatures, rejections).
+    # Union of what recurs now with what was tracked last run, so a signal that fell
+    # below the teach bar still shows as improved rather than silently vanishing.
+    cur_obj = corpus.objective_rates()
+    last_obj = _store.last_objective_snapshot(conn)
+    prev_obj = last_obj[2] if last_obj else {}
+    obj_keys = set(cur_obj) | set(prev_obj)
+    objective_trend = {k: (prev_obj.get(k), cur_obj.get(k, 0.0)) for k in sorted(obj_keys)}
+
     return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta,
-                       added_fps, dropped, trend)
+                       added_fps, dropped, trend, objective_trend)
 
 
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
@@ -533,6 +544,21 @@ def _print_preview(res: SkillResult) -> None:
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})"))
+    if res.objective_trend:
+        n = res.corpus.eligible_scored
+        print(_ascii_safe("\n  Objective feedback recurrence vs your last run "
+                          "(tool errors + rejections per scored session — verifiable, not judge-inferred):"))
+        # most-recurrent first; cap so a long tail of rare signatures doesn't flood output
+        ordered = sorted(res.objective_trend.items(),
+                         key=lambda kv: -max(kv[1][0] or 0.0, kv[1][1]))[:6]
+        for sig, (prev, cur) in ordered:
+            if n < 10:
+                print(_ascii_safe(f"    - {sig}: {cur:.0%}  (insufficient data — n={n})"))
+            elif prev is None:
+                print(_ascii_safe(f"    - {sig}: {cur:.0%}  (baseline; re-run later to see the trend)"))
+            else:
+                arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
+                print(_ascii_safe(f"    - {sig}: {prev:.0%} → {cur:.0%}  ({arrow})"))
     if res.blocked:
         print(f"\n  {len(res.blocked)} rule(s) dropped by the safety gate:")
         for r, reasons in res.blocked:
@@ -670,6 +696,8 @@ def run_skill(args) -> None:
                 # last real snapshot with an empty one (would reset the run-over-run trend).
                 if res.corpus.eligible_scored > 0:
                     _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+                    _store.save_objective_snapshot(conn, res.corpus.objective_rates(),
+                                                   res.corpus.eligible_scored)
             except Exception as exc:
                 print(f"note: installed to disk, but failed to record state "
                       f"({exc.__class__.__name__}); the next run may re-propose these rules.")

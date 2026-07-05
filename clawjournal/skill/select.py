@@ -75,12 +75,22 @@ class SkillCorpus:
     # every gated (hold-state + exclusion checked) scored session in the window —
     # the scan universe for cross-session env-signature candidates (skill.turns)
     eligible_session_ids: list[str] = field(default_factory=list)
+    # OBJECTIVE feedback recurrence: {readable signal key -> distinct-session count}
+    # for tool-error signatures + human rejections (skill.turns populates it). Judge-
+    # free ground truth; snapshotted run-over-run for a verifiable improvement trend.
+    objective_recurrence: dict[str, int] = field(default_factory=dict)
 
     def mode_rates(self) -> dict[str, float]:
         """Per-failure-mode incidence rate over eligible scored sessions."""
         if self.eligible_scored <= 0:
             return {}
         return {m: n / self.eligible_scored for m, n in self.mode_recurrence.items()}
+
+    def objective_rates(self) -> dict[str, float]:
+        """Per-objective-signal incidence rate over eligible scored sessions."""
+        if self.eligible_scored <= 0:
+            return {}
+        return {k: n / self.eligible_scored for k, n in self.objective_recurrence.items()}
 
     @property
     def candidates(self) -> list[SkillCandidate]:

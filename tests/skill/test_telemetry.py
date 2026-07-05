@@ -49,3 +49,28 @@ def test_generate_reports_week_over_week_trend(index_conn, ins):
     prev, cur = res.trend["verification_skipped"]
     assert prev == 0.90                       # from last week's snapshot
     assert abs(cur - 3 / 12) < 1e-9           # this window: 3 of 12 scored
+
+
+def test_objective_snapshot_round_trip(index_conn):
+    store.save_objective_snapshot(index_conn, {"user-rejected actions": 0.2}, 15)
+    last = store.last_objective_snapshot(index_conn)
+    assert last is not None
+    _, n, rates = last
+    assert n == 15 and abs(rates["user-rejected actions"] - 0.2) < 1e-9
+
+
+def test_generate_reports_objective_trend(index_conn, ins, monkeypatch):
+    store.save_objective_snapshot(index_conn, {"user-rejected actions": 0.40}, 20)   # prior run
+    for i in range(12):
+        ins(index_conn, f"ok{i}", quality=5, outcome="resolved", learning="y")
+    # `ins` seeds no message blobs, so inject a known objective signal directly
+    def fake_env(conn, corpus, **kw):
+        corpus.objective_recurrence["user-rejected actions"] = 3   # 3 of 12 scored = 25%
+    monkeypatch.setattr("clawjournal.cli_skill._turns.add_env_candidates", fake_env)
+    monkeypatch.setattr("clawjournal.cli_skill._turns.add_rejection_candidate", lambda *a, **k: None)
+    fake = FakeCaller({"rules": [
+        {"kind": "do", "trigger": "t", "guidance": "read source first", "why": "w"}]})
+    res = generate_skill(index_conn, window_days=3650, caller=fake, now=NOW)
+    assert "user-rejected actions" in res.objective_trend
+    prev, cur = res.objective_trend["user-rejected actions"]
+    assert prev == 0.40 and abs(cur - 3 / 12) < 1e-9
