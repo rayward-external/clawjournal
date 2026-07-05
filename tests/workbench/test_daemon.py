@@ -394,6 +394,64 @@ class TestSessionsAPI:
         assert data["session_id"] == "sess-0"
         assert "messages" in data
 
+    def test_encoded_session_id_routes(self, server, monkeypatch):
+        from urllib.parse import quote
+
+        session_id = "claude-science:org-1:frame-1"
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": session_id,
+                "project": "claude-science:lab",
+                "source": "claude-science",
+                "model": "claude-science",
+                "messages": [
+                    {"role": "user", "content": "Inspect the trace", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 0,
+                    "tool_uses": 0,
+                    "input_tokens": 1,
+                    "output_tokens": 0,
+                },
+            }])
+        finally:
+            conn.close()
+
+        encoded = quote(session_id, safe="")
+        status, data = _get(server, f"/api/sessions/{encoded}")
+        assert status == 200
+        assert data["session_id"] == session_id
+
+        status, data = _post(server, f"/api/sessions/{encoded}", {"status": "approved"})
+        assert status == 200
+        assert data["ok"] is True
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session",
+            lambda conn, sid, model=None, backend="auto": SimpleNamespace(
+                quality=4,
+                reason=f"scored {sid}",
+                detail_json='{"substance": 4}',
+                task_type="analysis",
+                outcome_label="completed",
+                value_labels=[],
+                risk_level=[],
+                display_title="Encoded route scored",
+                effort_estimate=1.0,
+                summary="Scored through encoded API route",
+            ),
+        )
+        status, data = _post(server, f"/api/sessions/{encoded}/score")
+        assert status == 200
+        assert data["ok"] is True
+
+        status, detail = _get(server, f"/api/sessions/{encoded}")
+        assert status == 200
+        assert detail["review_status"] == "approved"
+        assert detail["ai_summary"] == "Scored through encoded API route"
+
     def test_get_session_not_found(self, server):
         status, data = _get(server, "/api/sessions/nonexistent")
         assert status == 404

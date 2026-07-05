@@ -565,6 +565,8 @@ class TestDiscoverProjects:
     def _disable_codex(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude-projects")
         monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
         monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
@@ -1255,6 +1257,8 @@ class TestDiscoverSubagentProjects:
 
     def _disable_codex(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
         monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
@@ -1958,6 +1962,8 @@ class TestDiscoverOpenclawProjects:
     def _disable_others(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude")
         monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
         monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
@@ -2047,10 +2053,237 @@ class TestDiscoverOpenclawProjects:
         assert projects[0]["session_count"] == 2
 
 
+class TestDiscoverClaudeScienceProjects:
+    def _disable_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude")
+        monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
+        monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
+        monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.GEMINI_DIR", tmp_path / "no-gemini")
+        monkeypatch.setattr("clawjournal.parsing.parser.OPENCODE_DB_PATH", tmp_path / "no-opencode.db")
+        monkeypatch.setattr("clawjournal.parsing.parser._OPENCODE_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
+        monkeypatch.setattr("clawjournal.parsing.parser._OPENCLAW_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("clawjournal.parsing.parser.CUSTOM_DIR", tmp_path / "no-custom")
+        monkeypatch.setattr("clawjournal.parsing.parser.CURSOR_DIR", tmp_path / "no-cursor")
+        monkeypatch.setattr("clawjournal.parsing.parser._CURSOR_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
+        monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+
+    def _write_db(self, db_path, *, with_execution=False, hidden_frame=False):
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE projects ("
+            "id TEXT PRIMARY KEY, name TEXT, description TEXT, context TEXT, "
+            "created_at INTEGER, updated_at INTEGER, user_id TEXT, "
+            "uploads_frame_id TEXT, memory_enabled INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE frames ("
+            "id TEXT PRIMARY KEY, parent_frame_id TEXT, root_frame_id TEXT, "
+            "agent_name TEXT, status TEXT, input_data TEXT, output_data TEXT, "
+            "context_data TEXT, model TEXT, effort TEXT, input_tokens INTEGER, "
+            "output_tokens INTEGER, total_cost REAL, created_at INTEGER, "
+            "updated_at INTEGER, completed_at INTEGER, project_id TEXT, name TEXT, "
+            "conversation_type TEXT, artifact_id TEXT, task_summary TEXT, "
+            "mentioned_artifact_ids TEXT, specialists_used TEXT, is_hidden INTEGER, "
+            "status_description TEXT, compute_enabled TEXT, delegate_name TEXT, "
+            "cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+            "last_user_message_at INTEGER, last_extract_msg_idx INTEGER, root_seq INTEGER, "
+            "aux_input_tokens INTEGER, aux_output_tokens INTEGER, "
+            "aux_cache_read_tokens INTEGER, aux_cache_write_tokens INTEGER, "
+            "aux_cost REAL, token_class_usage TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE frame_messages (frame_id TEXT, idx INTEGER, msg_json TEXT, PRIMARY KEY(frame_id, idx))"
+        )
+        conn.execute(
+            "CREATE TABLE execution_log ("
+            "id TEXT PRIMARY KEY, frame_id TEXT, cell_index INTEGER, kernel_id TEXT, "
+            "conda_env TEXT, language TEXT, source TEXT, stdout TEXT, stderr TEXT, "
+            "exit_status TEXT, created_at INTEGER, files_written TEXT, error_lineno INTEGER, "
+            "kernel_kind TEXT, origin TEXT, detection TEXT, files_read TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE host_call_log ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, execution_log_id TEXT, seq INTEGER, "
+            "method TEXT, args_json TEXT, derivable INTEGER, data_inline TEXT, data_ref TEXT, "
+            "error TEXT, bytes INTEGER, created_at INTEGER)"
+        )
+        conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            ("proj-1", "Physics Lab", 1782883193508, 1782883193508),
+        )
+        conn.execute(
+            "INSERT INTO frames ("
+            "id, parent_frame_id, root_frame_id, agent_name, status, model, effort, "
+            "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+            "created_at, updated_at, completed_at, project_id, name, conversation_type, "
+            "is_hidden, aux_input_tokens, aux_output_tokens, aux_cache_read_tokens, "
+            "aux_cache_write_tokens) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "frame-1", None, "frame-1", "Claude Science", "completed",
+                "claude-sonnet-4", "high", 100, 50, 10, 5,
+                1782883193508, 1782883200000, 1782883205000,
+                "proj-1", "Density task", "agent", 0, 3, 2, 1, 1,
+            ),
+        )
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Measure density"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will run the calculation."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "python",
+                        "input": {"code": "print('ok')", "working_dir": "/Users/testuser/project"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "ok",
+                    }
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        ]
+        for idx, msg in enumerate(messages):
+            conn.execute(
+                "INSERT INTO frame_messages (frame_id, idx, msg_json) VALUES (?, ?, ?)",
+                ("frame-1", idx, json.dumps(msg)),
+            )
+        if hidden_frame:
+            conn.execute(
+                "INSERT INTO frames ("
+                "id, parent_frame_id, root_frame_id, agent_name, status, model, effort, "
+                "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+                "created_at, updated_at, completed_at, project_id, name, conversation_type, "
+                "is_hidden, aux_input_tokens, aux_output_tokens, aux_cache_read_tokens, "
+                "aux_cache_write_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "frame-2", "frame-1", "frame-1", "Claude Science", "completed",
+                    "claude-sonnet-4", "high", 20, 10, 0, 0,
+                    1782883210000, 1782883215000, 1782883216000,
+                    "proj-1", "Hidden specialist", "agent", 1, 0, 0, 0, 0,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO frame_messages (frame_id, idx, msg_json) VALUES (?, ?, ?)",
+                (
+                    "frame-2", 0,
+                    json.dumps({"role": "assistant", "content": [{"type": "text", "text": "Specialist note"}]}),
+                ),
+            )
+        if with_execution:
+            conn.execute(
+                "INSERT INTO execution_log ("
+                "id, frame_id, cell_index, kernel_id, conda_env, language, source, "
+                "stdout, stderr, exit_status, created_at, files_written, files_read, "
+                "kernel_kind, origin) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "exec-1", "frame-1", 0, "kernel-1", "science-env", "python",
+                    "print('ok')", "ok\n", "", "ok", 1782883201000,
+                    json.dumps(["/Users/testuser/project/result.csv"]),
+                    json.dumps(["/Users/testuser/project/input.csv"]),
+                    "python", "agent",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO host_call_log (execution_log_id, seq, method, args_json, derivable, bytes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "exec-1", 0, "artifact_path",
+                    json.dumps({"path": "/Users/testuser/project/result.csv"}),
+                    1, 128, 1782883201500,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_discover_claude_science_projects(self, tmp_path, monkeypatch):
+        self._disable_others(tmp_path, monkeypatch)
+        root = tmp_path / "claude-science"
+        self._write_db(root / "orgs" / "org-1" / "operon-cli.db")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", root)
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
+
+        projects = discover_projects(source_filter="claude-science")
+
+        assert len(projects) == 1
+        assert projects[0]["source"] == "claude-science"
+        assert projects[0]["dir_name"] == "org-1:proj-1"
+        assert projects[0]["display_name"] == "claude-science:Physics Lab"
+        assert projects[0]["session_count"] == 1
+
+    def test_discover_claude_science_includes_hidden_message_frames(self, tmp_path, monkeypatch):
+        self._disable_others(tmp_path, monkeypatch)
+        root = tmp_path / "claude-science"
+        self._write_db(root / "orgs" / "org-1" / "operon-cli.db", hidden_frame=True)
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", root)
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
+
+        projects = discover_projects(source_filter="claude-science")
+
+        assert len(projects) == 1
+        assert projects[0]["session_count"] == 2
+
+    def test_parse_claude_science_project_sessions(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        root = tmp_path / "claude-science"
+        self._write_db(root / "orgs" / "org-1" / "operon-cli.db", with_execution=True)
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", root)
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
+
+        sessions = parse_project_sessions(
+            "org-1:proj-1", mock_anonymizer, source="claude-science"
+        )
+
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session["session_id"] == "claude-science:org-1:frame-1"
+        assert session["project"] == "claude-science:Physics Lab"
+        assert session["source"] == "claude-science"
+        assert session["model"] == "claude-sonnet-4"
+        assert session["model_effort"] == "high"
+        assert session["segment_title"] == "Density task"
+        assert session["end_time"] == "2026-07-01T05:20:05+00:00"
+        assert session["stats"]["input_tokens"] == 103
+        assert session["stats"]["output_tokens"] == 52
+        assert session["stats"]["cache_read_tokens"] == 11
+        assert session["stats"]["cache_creation_tokens"] == 6
+        assert session["messages"][0]["content"] == "Measure density"
+        tool_use = session["messages"][1]["tool_uses"][0]
+        assert tool_use["tool"] == "python"
+        assert tool_use["output"]["text"] == "ok"
+        execution_tool = session["messages"][-1]["tool_uses"][0]
+        assert execution_tool["tool"] == "python"
+        assert execution_tool["output"]["stdout"] == "ok\n"
+        assert execution_tool["output"]["host_calls"][0]["method"] == "artifact_path"
+        assert session["client_origin"] == "desktop"
+        assert session["runtime_channel"] == "claude-science"
+        assert session["raw_source_path"].endswith("operon-cli.db#frame=frame-1")
+
+
 class TestDiscoverKimiProjects:
     def _disable_others(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude")
         monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
         monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
@@ -2141,6 +2374,8 @@ class TestDiscoverCustomProjects:
     def _disable_others(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude")
         monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
         monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
@@ -2410,6 +2645,8 @@ class TestScanLocalAgentSessions:
 
 class TestDiscoverClaudeProjectsWithLocalAgent:
     def _disable_other_sources(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
         monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
         monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})

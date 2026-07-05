@@ -47,6 +47,7 @@ VERDICT_UNKNOWN_SCHEMA = "unknown-schema"
 # probing makes no sense.
 _FS_PROBES: tuple[tuple[str, str], ...] = (
     ("claude", "CLAUDE_DIR"),
+    ("claude-science", "CLAUDE_SCIENCE_DIR"),
     ("codex", "CODEX_DIR"),
     ("openclaw", "OPENCLAW_DIR"),
     ("gemini", "GEMINI_DIR"),

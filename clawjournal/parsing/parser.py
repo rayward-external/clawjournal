@@ -1,4 +1,4 @@
-"""Parse Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw session data into conversations."""
+"""Parse Claude Code, Claude Science, Codex, Gemini CLI, OpenCode, and OpenClaw session data into conversations."""
 
 import dataclasses
 import hashlib
@@ -17,6 +17,7 @@ from ..redaction.secrets import redact_text
 logger = logging.getLogger(__name__)
 
 CLAUDE_SOURCE = "claude"
+CLAUDE_SCIENCE_SOURCE = "claude-science"
 CODEX_SOURCE = "codex"
 GEMINI_SOURCE = "gemini"
 OPENCODE_SOURCE = "opencode"
@@ -29,6 +30,8 @@ CUSTOM_SOURCE = "custom"
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+CLAUDE_SCIENCE_DIR = Path.home() / ".claude-science"
+CLAUDE_SCIENCE_DB_NAME = "operon-cli.db"
 
 CODEX_DIR = Path.home() / ".codex"
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
@@ -68,7 +71,7 @@ _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 # --- Field classification for tool input anonymization ---
 # Fields containing filesystem paths -> anonymizer.path()
 _PATH_FIELDS = frozenset({
-    "file_path", "path", "workdir", "dir_path",
+    "file_path", "path", "workdir", "working_dir", "dir_path",
 })
 # Fields containing shell commands or search patterns -> redact_text() + anonymizer.text()
 _COMMAND_FIELDS = frozenset({
@@ -81,7 +84,7 @@ _TEXT_FIELDS = frozenset({
 })
 # Fields containing lists of paths -> anonymizer.path() per element
 _PATH_LIST_FIELDS = frozenset({
-    "paths",
+    "paths", "files",
 })
 # Fields containing lists of text strings -> anonymizer.text() per element
 _TEXT_LIST_FIELDS = frozenset({
@@ -89,6 +92,7 @@ _TEXT_LIST_FIELDS = frozenset({
 })
 
 _CODEX_PROJECT_INDEX: dict[str, list[Path]] = {}
+_CLAUDE_SCIENCE_PROJECT_INDEX: dict[str, list[dict[str, Any]]] = {}
 _GEMINI_HASH_MAP: dict[str, str] = {}
 _OPENCODE_PROJECT_INDEX: dict[str, list[str]] = {}
 _OPENCLAW_PROJECT_INDEX: dict[str, list[Path]] = {}
@@ -368,6 +372,7 @@ def discover_projects(source_filter: str | None = None) -> list[dict]:
     """Discover supported source projects with optional source filtering."""
     discovery_by_source = {
         CLAUDE_SOURCE: _discover_claude_projects,
+        CLAUDE_SCIENCE_SOURCE: _discover_claude_science_projects,
         CODEX_SOURCE: _discover_codex_projects,
         GEMINI_SOURCE: _discover_gemini_projects,
         OPENCODE_SOURCE: _discover_opencode_projects,
@@ -466,6 +471,140 @@ def _discover_claude_projects() -> list[dict]:
             }
 
     return [p for p in canonical.values() if p["session_count"] > 0]
+
+
+def _connect_sqlite_readonly(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _iter_claude_science_dbs() -> list[tuple[str, Path]]:
+    orgs_dir = CLAUDE_SCIENCE_DIR / "orgs"
+    if not orgs_dir.exists():
+        return []
+    dbs: list[tuple[str, Path]] = []
+    try:
+        for org_dir in sorted(orgs_dir.iterdir()):
+            if not org_dir.is_dir():
+                continue
+            db_path = org_dir / CLAUDE_SCIENCE_DB_NAME
+            if db_path.exists():
+                dbs.append((org_dir.name, db_path))
+    except OSError:
+        return []
+    return dbs
+
+
+def _claude_science_project_key(org_id: str, project_id: Any) -> str:
+    project = project_id if isinstance(project_id, str) and project_id.strip() else "unknown"
+    return f"{org_id}:{project}"
+
+
+def _split_claude_science_project_key(project_key: str) -> tuple[str, str]:
+    org_id, sep, project_id = project_key.partition(":")
+    return org_id, project_id if sep else "unknown"
+
+
+def _claude_science_session_id(org_id: str, frame_id: str) -> str:
+    return f"{CLAUDE_SCIENCE_SOURCE}:{org_id}:{frame_id}"
+
+
+def _get_claude_science_project_index(refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    global _CLAUDE_SCIENCE_PROJECT_INDEX
+    if refresh or not _CLAUDE_SCIENCE_PROJECT_INDEX:
+        _CLAUDE_SCIENCE_PROJECT_INDEX = _build_claude_science_project_index()
+    return _CLAUDE_SCIENCE_PROJECT_INDEX
+
+
+def _build_claude_science_project_index() -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    for org_id, db_path in _iter_claude_science_dbs():
+        try:
+            db_size = db_path.stat().st_size
+        except OSError:
+            db_size = 0
+        try:
+            with _connect_sqlite_readonly(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        f.id, f.parent_frame_id, f.root_frame_id,
+                        f.agent_name, f.status, f.model, f.effort,
+                        f.input_tokens, f.output_tokens,
+                        f.cache_read_tokens, f.cache_write_tokens,
+                        f.aux_input_tokens, f.aux_output_tokens,
+                        f.aux_cache_read_tokens, f.aux_cache_write_tokens,
+                        f.created_at, f.updated_at, f.completed_at,
+                        f.project_id, f.name, f.conversation_type,
+                        f.task_summary, f.status_description, f.is_hidden,
+                        p.name AS project_name,
+                        (SELECT COUNT(*) FROM frame_messages fm WHERE fm.frame_id = f.id) AS message_count,
+                        (SELECT COALESCE(SUM(LENGTH(fm.msg_json)), 0) FROM frame_messages fm WHERE fm.frame_id = f.id) AS message_bytes,
+                        (SELECT COUNT(*) FROM execution_log el WHERE el.frame_id = f.id) AS execution_count
+                      FROM frames f
+                      LEFT JOIN projects p ON p.id = f.project_id
+                     ORDER BY COALESCE(f.completed_at, f.updated_at, f.created_at) DESC, f.id DESC
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            logger.warning("Failed to scan Claude Science database %s", db_path)
+            continue
+
+        for row in rows:
+            message_count = _safe_int(row["message_count"])
+            execution_count = _safe_int(row["execution_count"])
+            if message_count == 0 and execution_count == 0:
+                continue
+            project_key = _claude_science_project_key(org_id, row["project_id"])
+            frame = dict(row)
+            frame["org_id"] = org_id
+            frame["db_path"] = db_path
+            frame["message_count"] = message_count
+            frame["execution_count"] = execution_count
+            message_bytes = _safe_int(row["message_bytes"])
+            frame["size_bytes"] = message_bytes if message_bytes > 0 else db_size // max(len(rows), 1)
+            index.setdefault(project_key, []).append(frame)
+    return index
+
+
+def _build_claude_science_project_name(project_key: str, frames: list[dict[str, Any]]) -> str:
+    for frame in frames:
+        project_name = frame.get("project_name")
+        if isinstance(project_name, str) and project_name.strip():
+            return f"{CLAUDE_SCIENCE_SOURCE}:{project_name.strip()}"
+    _org_id, project_id = _split_claude_science_project_key(project_key)
+    label = project_id[:12] if project_id and project_id != "unknown" else "unknown"
+    return f"{CLAUDE_SCIENCE_SOURCE}:{label}"
+
+
+def _claude_science_frame_title(frame: dict[str, Any], anonymizer: Anonymizer) -> str | None:
+    for key in ("name", "status_description", "task_summary"):
+        value = frame.get(key)
+        if not isinstance(value, str):
+            continue
+        title = re.sub(r"\s+", " ", value).strip()
+        if title:
+            return anonymizer.text(title)
+    return None
+
+
+def _discover_claude_science_projects() -> list[dict]:
+    index = _get_claude_science_project_index(refresh=True)
+    projects = []
+    for project_key, frames in sorted(index.items()):
+        if not frames:
+            continue
+        projects.append(
+            {
+                "dir_name": project_key,
+                "display_name": _build_claude_science_project_name(project_key, frames),
+                "session_count": len(frames),
+                "total_size_bytes": sum(_safe_int(frame.get("size_bytes")) for frame in frames),
+                "source": CLAUDE_SCIENCE_SOURCE,
+            }
+        )
+    return projects
 
 
 def _discover_codex_projects() -> list[dict]:
@@ -719,6 +858,326 @@ def _parse_custom_sessions(
     return sessions
 
 
+def _parse_claude_science_project_sessions(
+    project_dir_name: str,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> list[dict]:
+    index = _get_claude_science_project_index()
+    frames = index.get(project_dir_name, [])
+    if not frames:
+        return []
+    project_name = _build_claude_science_project_name(project_dir_name, frames)
+    sessions = []
+    for frame in frames:
+        parsed = _parse_claude_science_frame(frame, anonymizer, include_thinking)
+        if not parsed or not parsed["messages"]:
+            continue
+        org_id = frame.get("org_id")
+        frame_id = frame.get("id")
+        if not isinstance(org_id, str) or not isinstance(frame_id, str):
+            continue
+        parsed["project"] = project_name
+        parsed["source"] = CLAUDE_SCIENCE_SOURCE
+        parsed["raw_source_path"] = f"{frame.get('db_path')}#frame={frame_id}"
+        parsed["client_origin"] = "desktop"
+        parsed["runtime_channel"] = "claude-science"
+        parent_frame_id = frame.get("parent_frame_id")
+        if isinstance(parent_frame_id, str) and parent_frame_id:
+            parsed["parent_session_id"] = _claude_science_session_id(org_id, parent_frame_id)
+        root_frame_id = frame.get("root_frame_id")
+        if isinstance(root_frame_id, str) and root_frame_id and root_frame_id != frame_id:
+            parsed["outer_session_id"] = _claude_science_session_id(org_id, root_frame_id)
+        sessions.append(parsed)
+    return sessions
+
+
+def _parse_claude_science_frame(
+    frame: dict[str, Any],
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> dict | None:
+    db_path = frame.get("db_path")
+    frame_id = frame.get("id")
+    org_id = frame.get("org_id")
+    if not isinstance(db_path, Path) or not isinstance(frame_id, str) or not isinstance(org_id, str):
+        return None
+
+    metadata: dict[str, Any] = {
+        "session_id": _claude_science_session_id(org_id, frame_id),
+        "cwd": None,
+        "git_branch": None,
+        "model": frame.get("model") or "claude-science",
+        "model_effort": frame.get("effort") if isinstance(frame.get("effort"), str) else None,
+        "start_time": _normalize_timestamp(frame.get("created_at")),
+        "end_time": _normalize_timestamp(frame.get("completed_at") or frame.get("updated_at")),
+        "segment_title": _claude_science_frame_title(frame, anonymizer),
+    }
+    stats = _make_stats()
+    stats["input_tokens"] = _safe_int(frame.get("input_tokens")) + _safe_int(frame.get("aux_input_tokens"))
+    stats["output_tokens"] = _safe_int(frame.get("output_tokens")) + _safe_int(frame.get("aux_output_tokens"))
+    stats["cache_read_tokens"] = (
+        _safe_int(frame.get("cache_read_tokens")) + _safe_int(frame.get("aux_cache_read_tokens"))
+    )
+    stats["cache_creation_tokens"] = (
+        _safe_int(frame.get("cache_write_tokens")) + _safe_int(frame.get("aux_cache_write_tokens"))
+    )
+
+    messages: list[dict[str, Any]] = []
+    try:
+        with _connect_sqlite_readonly(db_path) as conn:
+            rows = conn.execute(
+                "SELECT idx, msg_json FROM frame_messages WHERE frame_id = ? ORDER BY idx",
+                (frame_id,),
+            ).fetchall()
+            entries = _load_claude_science_message_entries(rows)
+            tool_result_map = _build_tool_result_map(entries, anonymizer)
+            for entry in entries:
+                _process_claude_science_entry(
+                    entry, messages, metadata, stats, anonymizer, include_thinking, tool_result_map,
+                )
+            _append_claude_science_execution_messages(conn, frame_id, messages, metadata, stats, anonymizer)
+    except sqlite3.Error:
+        logger.warning("Failed to parse Claude Science frame %s in %s", frame_id, db_path)
+        return None
+
+    result = _make_session_result(metadata, messages, stats)
+    if result is None:
+        return None
+    for key in ("agent_name", "conversation_type", "status"):
+        value = frame.get(key)
+        if isinstance(value, str) and value:
+            result[key] = value
+    return result
+
+
+def _load_claude_science_message_entries(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            msg_data = json.loads(row["msg_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(msg_data, dict):
+            continue
+        role = msg_data.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        entries.append({"type": role, "message": msg_data, "idx": row["idx"]})
+    return entries
+
+
+def _process_claude_science_entry(
+    entry: dict[str, Any],
+    messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    stats: dict[str, int],
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+    tool_result_map: dict[str, dict],
+) -> None:
+    role = entry.get("type")
+    msg_data = entry.get("message", {})
+    if not isinstance(msg_data, dict):
+        return
+
+    if role == "user":
+        content = _extract_claude_science_user_content(msg_data, anonymizer)
+        if content is not None:
+            messages.append({"role": "user", "content": content, "timestamp": None})
+            stats["user_messages"] += 1
+        return
+
+    if role != "assistant":
+        return
+
+    if metadata["model"] in (None, "claude-science"):
+        model = msg_data.get("model")
+        if isinstance(model, str) and model.strip():
+            metadata["model"] = model
+    if metadata.get("model_effort") is None:
+        metadata["model_effort"] = _extract_model_effort(msg_data)
+
+    msg = _extract_assistant_content(
+        {"message": msg_data}, anonymizer, include_thinking, tool_result_map,
+    )
+    if msg:
+        msg["timestamp"] = None
+        messages.append(msg)
+        stats["assistant_messages"] += 1
+        stats["tool_uses"] += len(msg.get("tool_uses", []))
+
+
+def _extract_claude_science_user_content(msg_data: dict[str, Any], anonymizer: Anonymizer) -> str | None:
+    content = msg_data.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+        return anonymizer.text(text) if text else None
+    if not isinstance(content, list):
+        return None
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(anonymizer.text(text.strip()))
+        elif block_type in ("image", "document"):
+            label = _claude_science_attachment_label(block_type, block, anonymizer)
+            if label:
+                parts.append(label)
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def _claude_science_attachment_label(
+    block_type: str, block: dict[str, Any], anonymizer: Anonymizer,
+) -> str | None:
+    filename = block.get("_filename")
+    if isinstance(filename, str) and filename.strip():
+        return f"[{block_type}: {anonymizer.path(filename.strip())}]"
+    return f"[{block_type}]"
+
+
+def _append_claude_science_execution_messages(
+    conn: sqlite3.Connection,
+    frame_id: str,
+    messages: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    stats: dict[str, int],
+    anonymizer: Anonymizer,
+) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, cell_index, conda_env, language, source, stdout, stderr,
+               exit_status, created_at, files_written, files_read, error_lineno,
+               kernel_kind, origin, detection
+          FROM execution_log
+         WHERE frame_id = ?
+         ORDER BY created_at, cell_index, id
+        """,
+        (frame_id,),
+    ).fetchall()
+    for row in rows:
+        tool_use = _parse_claude_science_execution_tool(conn, row, anonymizer)
+        timestamp = _normalize_timestamp(row["created_at"])
+        messages.append({"role": "assistant", "tool_uses": [tool_use], "timestamp": timestamp})
+        stats["assistant_messages"] += 1
+        stats["tool_uses"] += 1
+
+
+def _parse_claude_science_execution_tool(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    anonymizer: Anonymizer,
+) -> dict[str, Any]:
+    language = row["language"] if isinstance(row["language"], str) and row["language"] else "execution"
+    tool_name = "bash" if language in ("bash", "shell", "sh", "zsh") else language
+    source = row["source"] if isinstance(row["source"], str) else ""
+    if tool_name == "bash":
+        input_data: dict[str, Any] = {"command": source}
+    else:
+        input_data = {"code": source, "language": language}
+    input_data["cell_index"] = row["cell_index"]
+    if isinstance(row["conda_env"], str) and row["conda_env"]:
+        input_data["environment"] = row["conda_env"]
+    if isinstance(row["kernel_kind"], str) and row["kernel_kind"]:
+        input_data["kernel_kind"] = row["kernel_kind"]
+
+    output: dict[str, Any] = {"exit_status": row["exit_status"]}
+    if isinstance(row["stdout"], str) and row["stdout"]:
+        output["stdout"] = anonymizer.text(row["stdout"])
+    if isinstance(row["stderr"], str) and row["stderr"]:
+        output["stderr"] = anonymizer.text(row["stderr"])
+    for key in ("files_written", "files_read", "detection"):
+        parsed = _json_loads_maybe(row[key])
+        if parsed:
+            output[key] = _anonymize_claude_science_value(parsed, anonymizer, key)
+    if row["error_lineno"] is not None:
+        output["error_lineno"] = row["error_lineno"]
+
+    host_calls = _load_claude_science_host_calls(conn, row["id"], anonymizer)
+    if host_calls:
+        output["host_calls"] = host_calls
+
+    status = "success" if row["exit_status"] in ("ok", "success", "0", 0, None) else "error"
+    return {
+        "tool": tool_name,
+        "input": _parse_tool_input(tool_name, input_data, anonymizer),
+        "output": output,
+        "status": status,
+    }
+
+
+def _load_claude_science_host_calls(
+    conn: sqlite3.Connection,
+    execution_log_id: str,
+    anonymizer: Anonymizer,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT seq, method, args_json, derivable, data_ref, error, bytes, created_at
+          FROM host_call_log
+         WHERE execution_log_id = ?
+         ORDER BY seq, id
+        """,
+        (execution_log_id,),
+    ).fetchall()
+    calls: list[dict[str, Any]] = []
+    for row in rows:
+        method = row["method"] if isinstance(row["method"], str) and row["method"] else "host_call"
+        args = _json_loads_maybe(row["args_json"])
+        call: dict[str, Any] = {
+            "seq": row["seq"],
+            "method": method,
+            "args": _parse_tool_input(method, args if isinstance(args, dict) else {}, anonymizer),
+            "bytes": row["bytes"],
+            "derivable": bool(row["derivable"]),
+        }
+        if isinstance(row["data_ref"], str) and row["data_ref"]:
+            call["data_ref"] = anonymizer.path(row["data_ref"])
+        if isinstance(row["error"], str) and row["error"]:
+            call["error"] = anonymizer.text(row["error"])
+        timestamp = _normalize_timestamp(row["created_at"])
+        if timestamp:
+            call["timestamp"] = timestamp
+        calls.append(call)
+    return calls
+
+
+def _json_loads_maybe(value: Any) -> Any:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    if not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _anonymize_claude_science_value(value: Any, anonymizer: Anonymizer, key: str = "") -> Any:
+    if isinstance(value, dict):
+        return {
+            k: _anonymize_claude_science_value(v, anonymizer, str(k))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_anonymize_claude_science_value(item, anonymizer, key) for item in value]
+    if isinstance(value, str):
+        key_l = key.lower()
+        if "path" in key_l or "file" in key_l or key_l in {"cwd", "working_dir", "data_ref"}:
+            return anonymizer.path(value)
+        return anonymizer.text(value)
+    return value
+
+
 def parse_project_sessions(
     project_dir_name: str,
     anonymizer: Anonymizer,
@@ -727,6 +1186,11 @@ def parse_project_sessions(
     locator: dict | None = None,
 ) -> list[dict]:
     """Parse all sessions for a project into structured dicts."""
+    if source == CLAUDE_SCIENCE_SOURCE:
+        return _parse_claude_science_project_sessions(
+            project_dir_name, anonymizer, include_thinking,
+        )
+
     if source == CUSTOM_SOURCE:
         return _parse_custom_sessions(project_dir_name, anonymizer)
 
@@ -1104,7 +1568,7 @@ def _make_session_result(
         "stats": stats,
     }
     # Pass through optional provenance fields from metadata
-    for key in ("entrypoint", "originator", "codex_source", "model_effort"):
+    for key in ("entrypoint", "originator", "codex_source", "model_effort", "segment_title"):
         val = metadata.get(key)
         if val is not None:
             result[key] = val

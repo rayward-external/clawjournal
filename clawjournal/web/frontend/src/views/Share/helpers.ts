@@ -37,6 +37,7 @@ export function sourceFullLabel(s: { source: string; client_origin?: string | nu
     if (s.client_origin === 'desktop' || s.runtime_channel === 'local-agent') return { label: 'Claude Desktop', color: '#7c3aed' };
     return { label: 'Claude Code', color: '#d97706' };
   }
+  if (s.source === 'claude-science') return { label: 'Claude Science', color: '#9333ea' };
   if (s.source === 'openclaw') return { label: 'OpenClaw', color: '#6b7280' };
   return { label: s.source, color: '#6b7280' };
 }
