@@ -1,8 +1,8 @@
-"""Merge loop (§9): cap-5, dedupe, replace-weakest, skip-rejected."""
+"""Merge loop (§9): installed cap, dedupe, replace-weakest, skip-rejected."""
 
 from clawjournal.cli_skill import merge_rules
 from clawjournal.skill import store
-from clawjournal.skill.schema import MAX_RULES, SkillRule
+from clawjournal.skill.schema import MAX_INSTALLED_RULES, SkillRule
 
 
 def _tr(g, *, taxonomy="", support=0, kind="avoid"):
@@ -88,11 +88,11 @@ def _r(g, support=0, kind="avoid"):
     return SkillRule(kind=kind, trigger="t", guidance=g, why="w", support=support)
 
 
-def test_caps_at_five_by_support():
+def test_caps_installed_set_by_support():
     # distinct wording per rule so the paraphrase dedup doesn't collapse them
-    merged = merge_rules([], [_r(f"topic{i} action{i} lesson", support=i) for i in range(8)], set())
-    assert len(merged) == MAX_RULES
-    assert [r.support for r in merged] == [7, 6, 5, 4, 3]
+    merged = merge_rules([], [_r(f"topic{i} action{i} lesson", support=i) for i in range(13)], set())
+    assert len(merged) == MAX_INSTALLED_RULES
+    assert [r.support for r in merged] == list(range(12, 2, -1))   # top 10 by support
 
 
 def test_dedupe_prefers_higher_support():
@@ -106,12 +106,12 @@ def test_rejected_excluded():
 
 
 def test_replace_weakest():
-    existing = [_r(f"weak{i} old{i} habit", support=1) for i in range(5)]   # 5 distinct weak
+    existing = [_r(f"weak{i} old{i} habit", support=1) for i in range(MAX_INSTALLED_RULES)]
     merged = merge_rules(existing, [_r("strong brandnew distinct lesson", support=10)], set())
-    assert len(merged) == MAX_RULES
+    assert len(merged) == MAX_INSTALLED_RULES
     guides = {r.guidance for r in merged}
     assert "strong brandnew distinct lesson" in guides
-    assert sum(g.startswith("weak") for g in guides) == 4        # one weak one displaced
+    assert sum(g.startswith("weak") for g in guides) == MAX_INSTALLED_RULES - 1  # one displaced
 
 
 def test_recency_decays_stale_support_below_fresh():
@@ -137,13 +137,13 @@ def test_merge_rules_tolerates_naive_now():
 def test_preserves_good_bad_mix():
     # 'avoid' rules carry high mode-recurrence support; 'do' rules get support=0.
     # A support-only merge would drop every 'do'; the interleave must keep both (D2).
-    avoid = [_r(f"badhabit{i} mistake{i} pitfall", support=50, kind="avoid") for i in range(5)]
+    avoid = [_r(f"badhabit{i} mistake{i} pitfall", support=50, kind="avoid") for i in range(9)]
     do = [_r("alpha task workflow", support=0, kind="do"), _r("bravo chore routine", support=0, kind="do")]
     merged = merge_rules([], avoid + do, set())
     kinds = [r.kind for r in merged]
-    assert len(merged) == MAX_RULES
-    assert kinds.count("do") >= 1 and kinds.count("avoid") >= 1   # both kinds survive
-    assert kinds == ["avoid", "do", "avoid", "do", "avoid"]       # interleaved
+    assert len(merged) == MAX_INSTALLED_RULES                     # 9 avoid + 2 do -> capped
+    assert kinds.count("do") == 2 and kinds.count("avoid") == 8   # both kinds survive
+    assert kinds[:4] == ["avoid", "do", "avoid", "do"]            # interleaved head
 
 
 def test_cross_kind_title_extension_collapses():
