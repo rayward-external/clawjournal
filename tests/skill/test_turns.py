@@ -368,3 +368,25 @@ def test_objective_recurrence_records_below_teach_bar():
     add_env_candidates(None, corpus, loader=loader)
     assert corpus.objective_recurrence.get("string to replace not found in file") == 2
     assert corpus.failures == []   # below the teach bar
+
+
+def test_newer_rejection_phrasing_is_human_not_env():
+    # "doesn't want to proceed with this tool use" (newer agent phrasing) must be
+    # counted as a rejection AND kept out of the env-signature channel.
+    from clawjournal.skill.turns import (add_env_candidates, add_rejection_candidate,
+                                         _teachable_error)
+    msg = "The user doesn't want to proceed with this tool use. The tool use will be skipped."
+    assert _teachable_error({"output": {"text": msg}}) == ""   # not an env signal
+
+    corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
+                         eligible_session_ids=["s1", "s2", "s3"])
+
+    def loader(conn, sid):
+        return {"project": "p", "source": "codex", "start_time": "2026-07-01T00:00:00+00:00",
+                "messages": [_at(_tu("Bash", "rm x", status="error", output=msg))]}
+
+    add_env_candidates(None, corpus, loader=loader)
+    add_rejection_candidate(None, corpus, loader=loader)
+    # exactly one candidate, and it's the rejection one (no env leak)
+    assert [c.title for c in corpus.failures] == ["User-Rejected Actions"]
+    assert corpus.objective_recurrence == {"user-rejected actions": 3}

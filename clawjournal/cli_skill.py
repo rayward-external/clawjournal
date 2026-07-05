@@ -295,6 +295,9 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
         # they boost the session's rank into the pool and ride along to the distill
         # prompt (scrubbed at prompt-format time like every other field)
         excerpt_loader=lambda sid: _turns.excerpts_for_session(conn, sid))
+    # count the REAL source sessions before appending synthetic env/rejection candidates
+    # (whose ids are placeholders, not sessions) so the "sources=N" footer isn't inflated
+    n_source_sessions = len({c.session_id for c in corpus.candidates})
     # objective environment feedback: a tool-error signature recurring across the
     # window's (gated) sessions becomes an avoid-candidate whose support_count is
     # the REAL session count — evidence the judge can't fabricate
@@ -305,7 +308,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     meta: dict[str, Any] = {
         "generated_at": (now or datetime.now(timezone.utc)).date().isoformat(),
         "window_days": window_days,
-        "sources": len(corpus.session_ids),
+        "sources": n_source_sessions,
     }
     rules: list[SkillRule] = []
     blocked: list[tuple[SkillRule, list[str]]] = []
