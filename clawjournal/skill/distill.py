@@ -323,7 +323,18 @@ def distill_skills(
             return []
     rules = parse_rules(data)
     allowed_aliases = set(aliases.values())
-    # backfill support from recurrence where the rule named a mode
+    # A candidate's real support keyed by its rendered alias, so a rule inherits the
+    # recurrence of whatever it cites as evidence. This is the ONLY path that carries a
+    # synthetic env/rejection candidate's OBJECTIVE session count (e.g. 12 sessions of
+    # "file not read yet", 8 sessions of rejected actions) onto the emitted rule — those
+    # candidates carry no taxonomy, so the mode-recurrence backfill below can't see them,
+    # and the rule would otherwise display a coincidental judge count (or ~0). Max over
+    # colliding aliases: a synthetic candidate may reuse a real pool session id.
+    support_by_alias: dict[str, int] = {}
+    for c in corpus.candidates:
+        alias = aliases.get(c.session_id)
+        if alias is not None:
+            support_by_alias[alias] = max(support_by_alias.get(alias, 0), int(c.support_count or 0))
     for r in rules:
         evidence: list[str] = []
         for sid in r.evidence_session_ids:
@@ -332,6 +343,11 @@ def distill_skills(
             elif sid in allowed_aliases:
                 evidence.append(sid)
         r.evidence_session_ids = list(dict.fromkeys(evidence))
+        # backfill support from recurrence where the rule named a mode...
         if r.taxonomy and r.taxonomy in corpus.mode_recurrence:
             r.support = max(r.support, corpus.mode_recurrence[r.taxonomy])
+        # ...and from the real support of any candidate the rule cites as evidence.
+        cited = [support_by_alias[a] for a in r.evidence_session_ids if a in support_by_alias]
+        if cited:
+            r.support = max(r.support, max(cited))
     return rules

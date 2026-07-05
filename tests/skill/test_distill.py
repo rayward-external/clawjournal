@@ -47,6 +47,31 @@ def test_evidence_ids_are_limited_to_selected_sessions():
     assert rules[0].evidence_session_ids == ["case-01"]
 
 
+def test_rule_inherits_cited_candidate_support():
+    # a synthetic env/rejection candidate carries its OBJECTIVE session count in
+    # support_count and NO taxonomy; a rule that cites it must inherit that count
+    # (the taxonomy backfill can't, so the badge would otherwise be ~0 / coincidental).
+    env = SkillCandidate("s_env", "proj", "claude", "avoid",
+                         title="Recurring Edit error", support_count=12)   # 12 sessions, no taxonomy
+    corpus = SkillCorpus(window_start="a", window_end="b", failures=[env])  # -> case-01
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "before editing", "guidance": "read the file first",
+         "why": "recurring tool error", "taxonomy": "", "evidence_session_ids": ["case-01"]},
+    ]})
+    (rule,) = distill_skills(corpus, caller=fake)
+    assert rule.support == 12                          # objective count reached the rule
+
+
+def test_uncited_rule_keeps_taxonomy_support():
+    # the evidence path must not regress the mode-recurrence backfill for rules that
+    # name a taxonomy but cite no case.
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "before done", "guidance": "run tests first",
+         "why": "premature", "taxonomy": "verification_skipped"},   # no evidence_session_ids
+    ]})
+    assert distill_skills(_corpus(), caller=fake)[0].support == 4   # still backfilled from mode
+
+
 def test_empty_corpus_no_call():
     fake = FakeCaller({"rules": []})
     empty = SkillCorpus(window_start="a", window_end="b")
