@@ -48,6 +48,7 @@ export function FilterBar({ filters, onChange }: FilterBarProps) {
       >
         <option value="">All sources</option>
         <option value="claude">Claude Code</option>
+        <option value="claude-science">Claude Science</option>
         <option value="codex">Codex</option>
         <option value="openclaw">OpenClaw</option>
       </select>

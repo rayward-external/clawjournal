@@ -1,6 +1,6 @@
 # ClawJournal
 
-Review and curate your coding-agent session traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
+Review and curate your coding-agent session traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
 ## Copy-paste prompts
 
@@ -173,7 +173,7 @@ Tell ClawJournal which agents to scan and what to exclude or redact.
 <summary><b>Show shell commands</b></summary>
 
 ```bash
-clawjournal config --source all                   # claude | codex | gemini | opencode | openclaw | kimi | custom | all
+clawjournal config --source all                   # claude | claude-science | codex | gemini | opencode | openclaw | kimi | custom | all
 clawjournal list                                  # see discovered projects
 clawjournal config --exclude "project1,project2"  # optional (appends)
 clawjournal config --redact "string1,string2"     # optional custom redactions (appends)
@@ -416,7 +416,7 @@ Each line of the exported JSONL is one session: `session_id`, `project`, `model`
 
 ## Supported agents
 
-Claude Code, Claude Desktop, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline.
+Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline.
 
 ## Project docs
 

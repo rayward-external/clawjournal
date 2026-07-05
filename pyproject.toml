@@ -13,7 +13,7 @@ readme = "README.md"
 authors = [
     {name = "rayward-external"},
 ]
-keywords = ["claude-code", "codex", "gemini-cli", "opencode", "openclaw", "dataset", "conversations"]
+keywords = ["claude-code", "claude-science", "codex", "gemini-cli", "opencode", "openclaw", "dataset", "conversations"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

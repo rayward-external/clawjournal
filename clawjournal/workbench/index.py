@@ -34,7 +34,7 @@ WIDENED_MESSAGE_SCHEMA_VERSION = 4
 HOSTED_SUBMISSION_SCHEMA_VERSION = 5
 WORKBENCH_SCHEMA_VERSION = HOSTED_SUBMISSION_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
-FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw")
 SHARE_RECOMMENDATION_LIMIT = 10
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
@@ -3126,6 +3126,7 @@ def get_dashboard_analytics(
         "SELECT CASE "
         "  WHEN source = 'claude' AND (client_origin = 'desktop' OR runtime_channel = 'local-agent') THEN 'Claude Desktop' "
         "  WHEN source = 'claude' THEN 'Claude Code' "
+        "  WHEN source = 'claude-science' THEN 'Claude Science' "
         "  WHEN source = 'codex' AND client_origin = 'desktop' THEN 'Codex Desktop' "
         "  WHEN source = 'codex' THEN 'Codex' "
         "  WHEN source = 'openclaw' THEN 'OpenClaw' "

@@ -6,7 +6,7 @@ import { colors } from '../../theme.ts';
 import { SessionDrawer } from '../../components/SessionDrawer.tsx';
 import { TraceCard } from '../../components/TraceCard.tsx';
 import type { ReadySession, ShareReadyStats } from './types.ts';
-import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip, sessionTotalTokens } from './helpers.ts';
+import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip, sessionTotalTokens, sourceFullLabel } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
 
@@ -107,7 +107,7 @@ export function QueueStep(p: QueueStepProps) {
           <select value={p.sourceFilter} onChange={e => p.setSourceFilter(e.target.value)} aria-label="Filter by source"
             style={{ padding: '6px 8px', fontSize: 12, border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white }}>
             <option value="">All sources</option>
-            {sources.map(src => <option key={src} value={src}>{src}</option>)}
+            {sources.map(src => <option key={src} value={src}>{sourceFullLabel({ source: src }).label}</option>)}
           </select>
         )}
         {projects.length > 1 && (

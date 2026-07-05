@@ -21,7 +21,22 @@ from .config import (
     save_config,
     set_source_scope,
 )
-from .parsing.parser import CLAUDE_DIR, CODEX_DIR, COPILOT_DIR, CURSOR_DIR, CUSTOM_DIR, GEMINI_DIR, KIMI_DIR, LOCAL_AGENT_DIR, OPENCODE_DIR, OPENCLAW_DIR, discover_projects, parse_project_sessions
+from .parsing.parser import (
+    CLAUDE_DIR,
+    CLAUDE_SCIENCE_DIR,
+    CLAUDE_SCIENCE_SOURCE,
+    CODEX_DIR,
+    COPILOT_DIR,
+    CURSOR_DIR,
+    CUSTOM_DIR,
+    GEMINI_DIR,
+    KIMI_DIR,
+    LOCAL_AGENT_DIR,
+    OPENCODE_DIR,
+    OPENCLAW_DIR,
+    discover_projects,
+    parse_project_sessions,
+)
 from .scoring.backends import BACKEND_CHOICES, DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
 from .redaction.pii import apply_findings_to_session, load_findings, load_jsonl_sessions, review_session_pii, review_session_pii_hybrid, review_session_pii_with_agent, write_findings, write_jsonl_sessions
 from .scoring.scoring import SCORING_BACKEND_CHOICES
@@ -61,18 +76,18 @@ EXPORT_REVIEW_PUBLISH_STEPS = [
 
 SETUP_TO_PUBLISH_STEPS = [
     "Step 1/5: Run prep/list to review project scope: clawjournal prep && clawjournal list",
-    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|codex|gemini|all>",
+    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|claude-science|codex|gemini|all>",
     "Step 3/5: Configure exclusions/redactions and confirm projects: clawjournal config ...",
     "Step 4/5: Export locally: clawjournal export --output /tmp/clawjournal_export.jsonl",
     "Step 5/5: Review and confirm: clawjournal confirm ...",
 ]
 
-EXPLICIT_SOURCE_CHOICES = {"claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
-SOURCE_CHOICES = ["auto", "claude", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"]
-WORKBENCH_SOURCE_CHOICES = ["claude", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "gemini", "kimi"]
+EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
+SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"]
+WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "gemini", "kimi"]
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
-FAILURE_VALUE_SOURCE_SCOPE = ("claude", "codex", "opencode", "openclaw")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw")
 SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-corpus", "failure-v1", "all", "auto", "both"}
 
 
@@ -144,6 +159,8 @@ def _source_label(source_filter: str) -> str:
         return "Claude Code and Codex"
     if source_filter == "claude":
         return "Claude Code"
+    if source_filter == CLAUDE_SCIENCE_SOURCE:
+        return "Claude Science"
     if source_filter == "codex":
         return "Codex"
     if source_filter == "gemini":
@@ -162,7 +179,7 @@ def _source_label(source_filter: str) -> str:
         return "Aider"
     if source_filter == "custom":
         return "Custom"
-    return "Claude Code, Codex, Cursor, Copilot CLI, Aider, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
+    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
 
 
 def _normalize_source_filter(source_filter: str) -> str:
@@ -198,6 +215,8 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
     source_filter = _normalize_source_filter(source_filter)
     if source_filter == "claude":
         return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists()
+    if source_filter == CLAUDE_SCIENCE_SOURCE:
+        return CLAUDE_SCIENCE_DIR.exists()
     if source_filter == "codex":
         return CODEX_DIR.exists()
     if source_filter == "both":
@@ -219,7 +238,7 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
     if source_filter == "aider":
         from .parsing.parser import _get_aider_project_index
         return bool(_get_aider_project_index())
-    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists()
+    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists()
 
 
 def _filter_projects_by_source(projects: list[dict], source_filter: str) -> list[dict]:
@@ -280,14 +299,14 @@ def _build_status_next_steps(
         steps = []
         if not source_confirmed:
             steps.append(
-                "Ask the user to explicitly choose export source scope: Claude Code, Codex, Gemini, or all. "
-                "Then set it: clawjournal config --source <claude|codex|gemini|all>. "
+                "Ask the user to explicitly choose export source scope: Claude Code, Claude Science, Codex, Gemini, or all. "
+                "Then set it: clawjournal config --source <claude|claude-science|codex|gemini|all>. "
                 "Do not run export until source scope is explicitly confirmed."
             )
         else:
             steps.append(
                 f"Source scope is currently set to '{configured_source}'. "
-                "If the user wants a different scope, run: clawjournal config --source <claude|codex|gemini|all>."
+                "If the user wants a different scope, run: clawjournal config --source <claude|claude-science|codex|gemini|all>."
             )
         if not projects_confirmed:
             steps.append(
@@ -1140,13 +1159,15 @@ def prep(source_filter: str = "auto") -> None:
     if not _has_session_sources(effective_source_filter):
         if effective_source_filter == "claude":
             err = "~/.claude was not found."
+        elif effective_source_filter == CLAUDE_SCIENCE_SOURCE:
+            err = "~/.claude-science was not found."
         elif effective_source_filter == "codex":
             err = "~/.codex was not found."
         elif effective_source_filter == "gemini":
             from .parsing.parser import GEMINI_DIR
             err = f"{GEMINI_DIR} was not found."
         else:
-            err = "None of ~/.claude, ~/.codex, or ~/.gemini/tmp were found."
+            err = "None of ~/.claude, ~/.claude-science, ~/.codex, or ~/.gemini/tmp were found."
         print(json.dumps({"error": err}))
         sys.exit(1)
 
@@ -3826,7 +3847,7 @@ def main() -> None:
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
-                     help="Set export source scope explicitly: claude, codex, gemini, or all")
+                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, or all")
     cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
                      help="Confirm the AI scoring backend for automatic workbench scoring")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
@@ -6525,12 +6546,12 @@ def _run_export(args) -> None:
             "error": "Source scope is not confirmed yet.",
             "hint": (
                 "Explicitly choose one source scope before exporting: "
-                "`claude`, `codex`, `gemini`, or `all`."
+                "`claude`, `claude-science`, `codex`, `gemini`, or `all`."
             ),
             "required_action": (
-                "Ask the user whether to export Claude Code, Codex, Gemini, or all. "
-                "Then run `clawjournal config --source <claude|codex|gemini|all>` "
-                "or pass `--source <claude|codex|gemini|all>` on the export command."
+                "Ask the user whether to export Claude Code, Claude Science, Codex, Gemini, or all. "
+                "Then run `clawjournal config --source <claude|claude-science|codex|gemini|all>` "
+                "or pass `--source <claude|claude-science|codex|gemini|all>` on the export command."
             ),
             "allowed_sources": sorted(EXPLICIT_SOURCE_CHOICES),
             "blocked_on_step": "Step 2/5",
@@ -6546,13 +6567,15 @@ def _run_export(args) -> None:
     if not _has_session_sources(source_filter):
         if source_filter == "claude":
             print(f"Error: {CLAUDE_DIR} not found.", file=sys.stderr)
+        elif source_filter == CLAUDE_SCIENCE_SOURCE:
+            print(f"Error: {CLAUDE_SCIENCE_DIR} not found.", file=sys.stderr)
         elif source_filter == "codex":
             print(f"Error: {CODEX_DIR} not found.", file=sys.stderr)
         elif source_filter == "gemini":
             from .parsing.parser import GEMINI_DIR
             print(f"Error: {GEMINI_DIR} not found.", file=sys.stderr)
         else:
-            print("Error: none of ~/.claude, ~/.codex, or ~/.gemini/tmp were found.", file=sys.stderr)
+            print("Error: none of ~/.claude, ~/.claude-science, ~/.codex, or ~/.gemini/tmp were found.", file=sys.stderr)
         sys.exit(1)
 
     projects = discover_projects(source_filter=source_filter)

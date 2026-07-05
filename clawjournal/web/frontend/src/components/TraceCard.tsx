@@ -6,6 +6,7 @@ import { api } from '../api.ts';
 
 const SOURCE_ICONS: Record<string, string> = {
   claude: 'CC',
+  'claude-science': 'CS',
   codex: 'CX',
   openclaw: 'OC',
 };

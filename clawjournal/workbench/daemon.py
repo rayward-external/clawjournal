@@ -85,6 +85,7 @@ from .timeline import (
 from ..parsing.parser import (
     AIDER_SOURCE,
     CLAUDE_SOURCE,
+    CLAUDE_SCIENCE_SOURCE,
     CODEX_SOURCE,
     COPILOT_SOURCE,
     CURSOR_SOURCE,
@@ -130,7 +131,7 @@ _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 
 # Sources supported in the workbench (scientist-facing subset)
 WORKBENCH_SOURCES = {
-    CLAUDE_SOURCE, CODEX_SOURCE, OPENCLAW_SOURCE,
+    CLAUDE_SOURCE, CLAUDE_SCIENCE_SOURCE, CODEX_SOURCE, OPENCLAW_SOURCE,
     CURSOR_SOURCE, COPILOT_SOURCE, AIDER_SOURCE,
     GEMINI_SOURCE, OPENCODE_SOURCE, KIMI_SOURCE,
 }
@@ -563,6 +564,14 @@ def _parse_cookie_token(cookie_header: str | None) -> str | None:
     if morsel is None:
         return None
     return morsel.value or None
+
+
+def _api_session_id(path: str, *, suffix: str = "") -> str:
+    """Extract and decode a session id from a `/api/sessions/<id>` route."""
+    session_id = path[len("/api/sessions/"):]
+    if suffix:
+        session_id = session_id[:-len(suffix)]
+    return unquote(session_id)
 
 
 def _api_token_cookie_header(token: str) -> str:
@@ -2077,20 +2086,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             self._handle_list_sessions(params)
         elif path.startswith("/api/sessions/") and path.endswith("/redaction-report"):
-            session_id = path[len("/api/sessions/"):-len("/redaction-report")]
+            session_id = _api_session_id(path, suffix="/redaction-report")
             ai_pii = params.get("ai_pii", [""])[0] == "1"
             self._handle_redaction_report(session_id, ai_pii=ai_pii)
         elif path.startswith("/api/sessions/") and path.endswith("/findings"):
-            session_id = path[len("/api/sessions/"):-len("/findings")]
+            session_id = _api_session_id(path, suffix="/findings")
             self._handle_list_session_findings(session_id, params)
         elif path.startswith("/api/sessions/") and path.endswith("/hold-history"):
-            session_id = path[len("/api/sessions/"):-len("/hold-history")]
+            session_id = _api_session_id(path, suffix="/hold-history")
             self._handle_hold_history(session_id)
         elif path.startswith("/api/sessions/") and path.endswith("/redacted"):
-            session_id = path[len("/api/sessions/"):-len("/redacted")]
+            session_id = _api_session_id(path, suffix="/redacted")
             self._handle_session_redacted(session_id)
         elif path.startswith("/api/sessions/"):
-            session_id = path[len("/api/sessions/"):]
+            session_id = _api_session_id(path)
             self._handle_get_session(session_id)
         elif path == "/api/search":
             self._handle_search(params)
@@ -2175,13 +2184,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
 
         if path.startswith("/api/sessions/") and path.endswith("/score"):
-            session_id = path[len("/api/sessions/"):-len("/score")]
+            session_id = _api_session_id(path, suffix="/score")
             self._handle_score_session(session_id)
         elif path.startswith("/api/sessions/") and path.endswith("/scan"):
-            session_id = path[len("/api/sessions/"):-len("/scan")]
+            session_id = _api_session_id(path, suffix="/scan")
             self._handle_force_scan_session(session_id)
         elif path.startswith("/api/sessions/"):
-            session_id = path[len("/api/sessions/"):]
+            session_id = _api_session_id(path)
             self._handle_update_session(session_id)
         elif path == "/api/quick-share":
             self._handle_quick_share()

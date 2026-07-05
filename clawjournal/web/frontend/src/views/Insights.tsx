@@ -221,6 +221,7 @@ function shortDuration(seconds: number | null | undefined): string {
 
 function sourceLabel(source: string | null | undefined): string {
   if (!source) return '';
+  if (source === 'claude-science') return 'Claude Science';
   return source.charAt(0).toUpperCase() + source.slice(1);
 }
 
