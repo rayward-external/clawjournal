@@ -305,3 +305,29 @@ def test_add_rejection_candidate_requires_min_recurrence():
 
     add_rejection_candidate(None, corpus, loader=loader)   # 2 sessions < min 3
     assert corpus.failures == []
+
+
+def test_synthetic_candidates_get_noncolliding_ids():
+    # synthetic env/rejection candidates must NOT reuse a real session id, or they
+    # collide with that session's own pool candidate in _candidate_aliases and bleed
+    # support across the shared alias.
+    from clawjournal.skill.turns import add_env_candidates, add_rejection_candidate
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         eligible_session_ids=["s1", "s2", "s3"])
+
+    def loader(conn, sid):
+        return {"project": "p", "source": "claude", "start_time": "2026-07-01T00:00:00+00:00",
+                "messages": [
+                    _at(_tu("Edit", "x", status="error",
+                            output="String to replace not found in file.")),
+                    _at(_tu("Write", "y", status="error",
+                            output="File has not been read yet. Read it first before writing to it.")),
+                    _at(_tu("Bash", "git push", status="error",
+                            output="The user doesn't want to take this action right now.")),
+                ]}
+
+    add_env_candidates(None, corpus, loader=loader)
+    add_rejection_candidate(None, corpus, loader=loader)
+    ids = [c.session_id for c in corpus.failures]
+    assert len(ids) == len(set(ids))                    # all distinct
+    assert not any(i in {"s1", "s2", "s3"} for i in ids)  # none is a real session id

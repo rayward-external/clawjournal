@@ -365,13 +365,16 @@ def add_env_candidates(
         (item for item in hits.items() if len(item[1]["sessions"]) >= min_sessions),
         key=lambda item: -len(item[1]["sessions"]),
     )[:max_candidates]
-    for sig, info in recurring:
+    for idx, (sig, info) in enumerate(recurring):
         n = len(info["sessions"])
         recency = _recency_weight(info.get("start_time"), now=clock)
         excerpt = EnvExcerpt(action=info["action"], error=info["error"],
                              recovery=info["recovery"])
         corpus.failures.append(SkillCandidate(
-            session_id=info["sessions"][-1],
+            # a SYNTHETIC id (not a real session): these clusters summarize many
+            # sessions, and reusing a member's real id would collide with that session's
+            # own pool candidate in _candidate_aliases — bleeding support across the alias.
+            session_id=f"env-signature-{idx}",
             project=info.get("project", ""), source=info.get("source", ""),
             kind="avoid",
             learning_summary=(
@@ -466,7 +469,7 @@ def add_rejection_candidate(
     recency = _recency_weight(last_detail.get("start_time"), now=clock)
     top = ", ".join(f"{r}×{k}" for r, k in reasons.most_common(4))
     corpus.failures.append(SkillCandidate(
-        session_id=sessions[-1],
+        session_id="human-rejection",   # synthetic id: summarizes many sessions (see add_env_candidates)
         project=last_detail.get("project") or "", source=last_detail.get("source") or "",
         kind="avoid",
         learning_summary=(
