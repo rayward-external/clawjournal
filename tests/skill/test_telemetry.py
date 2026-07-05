@@ -74,3 +74,20 @@ def test_generate_reports_objective_trend(index_conn, ins, monkeypatch):
     assert "user-rejected actions" in res.objective_trend
     prev, cur = res.objective_trend["user-rejected actions"]
     assert prev == 0.40 and abs(cur - 3 / 12) < 1e-9
+
+
+def test_sources_count_excludes_synthetic_candidates(index_conn, ins, monkeypatch):
+    # the "sources=N" footer counts REAL source sessions, not the synthetic env/rejection
+    # candidate placeholders appended after selection.
+    from clawjournal.skill.select import SkillCandidate
+    for i in range(3):
+        ins(index_conn, f"ok{i}", quality=5, outcome="resolved", learning="y")
+
+    def fake_env(conn, corpus, **kw):
+        corpus.failures.append(SkillCandidate("env-signature-0", "p", "claude", "avoid",
+                                              support_count=5))
+    monkeypatch.setattr("clawjournal.cli_skill._turns.add_env_candidates", fake_env)
+    monkeypatch.setattr("clawjournal.cli_skill._turns.add_rejection_candidate", lambda *a, **k: None)
+    fake = FakeCaller({"rules": []})
+    res = generate_skill(index_conn, window_days=3650, caller=fake, now=NOW)
+    assert res.meta["sources"] == 3      # 3 real sessions, not 4 (synthetic excluded)

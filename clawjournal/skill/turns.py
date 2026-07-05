@@ -187,10 +187,14 @@ _BENIGN_ERROR_RE = re.compile(
     re.I,
 )
 # Human rejections arrive AS tool errors (permission denials, interrupts). They are
-# human feedback, not environment feedback — never teach them as an env pitfall.
+# human feedback, not environment feedback — never teach them as an env pitfall, and
+# never miss one (an unmatched rejection LEAKS into the env-signature channel). Cover
+# both agent phrasings: Claude's "doesn't want to take this action" and the newer
+# "doesn't want to proceed with this tool use".
 _HUMAN_REJECTION_RE = re.compile(
     r"permission (?:to use|for this action)|denied by the|"
-    r"doesn'?t want to take this action|request interrupted|rejected the tool",
+    r"doesn'?t want to (?:take this action|proceed)|"
+    r"request interrupted|rejected the tool|tool use will be skipped",
     re.I,
 )
 
