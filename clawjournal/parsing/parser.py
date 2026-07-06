@@ -4,9 +4,11 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import platform
 import re
 import sqlite3
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ KIMI_SOURCE = "kimi"
 CURSOR_SOURCE = "cursor"
 COPILOT_SOURCE = "copilot"
 AIDER_SOURCE = "aider"
+WORKBUDDY_SOURCE = "workbuddy"
 CUSTOM_SOURCE = "custom"
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -56,6 +59,12 @@ UNKNOWN_KIMI_CWD = "<unknown-cwd>"
 CURSOR_DIR = Path.home() / ".cursor"
 COPILOT_DIR = Path.home() / ".copilot" / "session-state"
 AIDER_HISTORY_FILENAME = ".aider.chat.history.md"
+WORKBUDDY_DIR = Path.home() / "WorkBuddy"
+WORKBUDDY_IMPORT_DIR = Path.home() / ".clawjournal" / "workbuddy"
+WORKBUDDY_MAX_FILE_BYTES = 100 * 1024 * 1024
+WORKBUDDY_MAX_ZIP_MEMBER_BYTES = 25 * 1024 * 1024
+WORKBUDDY_TRACE_SUFFIXES = {".json", ".jsonl", ".ndjson", ".log"}
+WORKBUDDY_ARCHIVE_SUFFIXES = {".zip"}
 
 CUSTOM_DIR = Path.home() / ".clawjournal" / "custom"
 
@@ -99,6 +108,7 @@ _OPENCLAW_PROJECT_INDEX: dict[str, list[Path]] = {}
 _KIMI_PROJECT_INDEX: dict[str, list[Path]] = {}
 _CURSOR_PROJECT_INDEX: dict[str, list[Path]] = {}
 _AIDER_PROJECT_INDEX: dict[str, Path] = {}
+_WORKBUDDY_PROJECT_INDEX: dict[str, list[Path]] = {}
 
 
 def _build_gemini_hash_map() -> dict[str, str]:
@@ -381,6 +391,7 @@ def discover_projects(source_filter: str | None = None) -> list[dict]:
         CURSOR_SOURCE: _discover_cursor_projects,
         COPILOT_SOURCE: _discover_copilot_projects,
         AIDER_SOURCE: _discover_aider_projects,
+        WORKBUDDY_SOURCE: _discover_workbuddy_projects,
         CUSTOM_SOURCE: _discover_custom_projects,
     }
 
@@ -766,6 +777,612 @@ def _build_kimi_project_name(cwd: str, hash_to_path: dict[str, str] | None = Non
     if cwd == UNKNOWN_KIMI_CWD:
         return "kimi:unknown"
     return f"kimi:{Path(cwd).name or cwd}"
+
+
+def _workbuddy_env_dir(name: str, fallback: Path) -> Path:
+    value = os.environ.get(name)
+    return Path(value) if value else fallback
+
+
+def _iter_existing_workbuddy_roots() -> list[tuple[Path, str]]:
+    """Return WorkBuddy locations we can scan without product internals.
+
+    Official docs expose logs through the in-app Help menu, so the manual
+    import directory is first. The other roots are known user/workspace/cache
+    locations; nonexistent paths are ignored.
+    """
+    roots: list[tuple[Path, str]] = [
+        (WORKBUDDY_IMPORT_DIR, "manual"),
+        (WORKBUDDY_DIR, "workspace"),
+    ]
+    if platform.system() == "Darwin":
+        roots.extend(
+            [
+                (Path.home() / "Library" / "Application Support" / "WorkBuddy", "support"),
+                (Path.home() / "Library" / "Caches" / "WorkBuddy", "logs"),
+                (Path.home() / "Library" / "Caches" / "com.tencent.WorkBuddy", "logs"),
+                (Path.home() / "Library" / "Logs" / "WorkBuddy", "logs"),
+            ]
+        )
+    else:
+        appdata = _workbuddy_env_dir(
+            "APPDATA", Path.home() / "AppData" / "Roaming"
+        )
+        localappdata = _workbuddy_env_dir(
+            "LOCALAPPDATA", Path.home() / "AppData" / "Local"
+        )
+        roots.extend(
+            [
+                (appdata / "Tencent" / "WorkBuddy", "support"),
+                (appdata / "Tencent" / "WorkBuddy" / "Logs", "logs"),
+                (appdata / "WorkBuddy", "support"),
+                (localappdata / "Tencent" / "WorkBuddy", "support"),
+                (localappdata / "Tencent" / "WorkBuddy" / "Logs", "logs"),
+                (localappdata / "WorkBuddy", "support"),
+            ]
+        )
+
+    seen: set[Path] = set()
+    existing: list[tuple[Path, str]] = []
+    for root, kind in roots:
+        try:
+            resolved = root.expanduser().resolve()
+        except OSError:
+            resolved = root.expanduser()
+        if resolved in seen or not root.exists():
+            continue
+        seen.add(resolved)
+        existing.append((root, kind))
+    return existing
+
+
+def _iter_workbuddy_candidate_files(root: Path, kind: str) -> list[Path]:
+    suffixes = WORKBUDDY_TRACE_SUFFIXES | WORKBUDDY_ARCHIVE_SUFFIXES
+    candidates: list[Path] = []
+    try:
+        if kind == "workspace":
+            workspace_dirs = [d for d in root.iterdir() if d.is_dir()]
+            for workspace in sorted(workspace_dirs):
+                wb_dir = workspace / ".workbuddy"
+                scan_roots = [wb_dir] if wb_dir.is_dir() else []
+                for scan_root in scan_roots:
+                    candidates.extend(
+                        p for p in scan_root.rglob("*")
+                        if p.is_file() and p.suffix.lower() in suffixes
+                    )
+            candidates.extend(
+                p for p in root.glob("*.zip") if p.is_file()
+            )
+        else:
+            candidates.extend(
+                p for p in root.rglob("*")
+                if p.is_file() and p.suffix.lower() in suffixes
+            )
+    except OSError:
+        return []
+    return [p for p in sorted(candidates) if _workbuddy_file_size_ok(p)]
+
+
+def _workbuddy_file_size_ok(path: Path) -> bool:
+    try:
+        return path.stat().st_size <= WORKBUDDY_MAX_FILE_BYTES
+    except OSError:
+        return False
+
+
+def _workbuddy_project_key(path: Path, root: Path, kind: str) -> str:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        rel = Path(path.name)
+    if kind == "manual":
+        return rel.parts[0] if len(rel.parts) > 1 else "manual"
+    if kind == "workspace":
+        return rel.parts[0] if rel.parts else "workspace"
+    return kind
+
+
+def _get_workbuddy_project_index(refresh: bool = False) -> dict[str, list[Path]]:
+    global _WORKBUDDY_PROJECT_INDEX
+    if refresh or not _WORKBUDDY_PROJECT_INDEX:
+        index: dict[str, list[Path]] = {}
+        for root, kind in _iter_existing_workbuddy_roots():
+            for path in _iter_workbuddy_candidate_files(root, kind):
+                key = _workbuddy_project_key(path, root, kind)
+                index.setdefault(key, []).append(path)
+        _WORKBUDDY_PROJECT_INDEX = {
+            key: sorted(paths) for key, paths in sorted(index.items())
+        }
+    return _WORKBUDDY_PROJECT_INDEX
+
+
+def _discover_workbuddy_projects() -> list[dict]:
+    index = _get_workbuddy_project_index(refresh=True)
+    projects: list[dict[str, Any]] = []
+    anonymizer = Anonymizer(enabled=False)
+    for key, files in sorted(index.items()):
+        sessions = []
+        total_size = 0
+        for path in files:
+            try:
+                total_size += path.stat().st_size
+            except OSError:
+                pass
+            sessions.extend(_parse_workbuddy_trace_file(path, anonymizer))
+        if not sessions:
+            continue
+        projects.append(
+            {
+                "dir_name": key,
+                "display_name": _build_workbuddy_project_name(key),
+                "session_count": len(sessions),
+                "total_size_bytes": total_size,
+                "source": WORKBUDDY_SOURCE,
+            }
+        )
+    return projects
+
+
+def _parse_workbuddy_project_sessions(
+    project_dir_name: str,
+    anonymizer: Anonymizer,
+    include_thinking: bool = True,
+) -> list[dict]:
+    index = _get_workbuddy_project_index()
+    sessions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for path in index.get(project_dir_name, []):
+        for session in _parse_workbuddy_trace_file(path, anonymizer, include_thinking):
+            if not session.get("messages"):
+                continue
+            session["project"] = _build_workbuddy_project_name(project_dir_name)
+            session["source"] = WORKBUDDY_SOURCE
+            sid = str(session.get("session_id") or "")
+            if sid in seen_ids:
+                session["session_id"] = hashlib.sha256(
+                    f"{sid}:{session.get('raw_source_path', path)}".encode()
+                ).hexdigest()[:16]
+            seen_ids.add(str(session["session_id"]))
+            sessions.append(session)
+    return sessions
+
+
+def _parse_workbuddy_trace_file(
+    path: Path,
+    anonymizer: Anonymizer,
+    include_thinking: bool = True,
+) -> list[dict]:
+    suffix = path.suffix.lower()
+    if suffix in WORKBUDDY_ARCHIVE_SUFFIXES:
+        return _parse_workbuddy_zip(path, anonymizer, include_thinking)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return _parse_workbuddy_text(
+        text,
+        anonymizer=anonymizer,
+        include_thinking=include_thinking,
+        raw_source_path=str(path),
+    )
+
+
+def _parse_workbuddy_zip(
+    path: Path,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> list[dict]:
+    sessions: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for info in sorted(archive.infolist(), key=lambda i: i.filename):
+                if info.is_dir() or info.file_size > WORKBUDDY_MAX_ZIP_MEMBER_BYTES:
+                    continue
+                suffix = Path(info.filename).suffix.lower()
+                if suffix not in WORKBUDDY_TRACE_SUFFIXES:
+                    continue
+                try:
+                    data = archive.read(info)
+                except (KeyError, RuntimeError, zipfile.BadZipFile):
+                    continue
+                text = data.decode("utf-8", errors="replace")
+                sessions.extend(
+                    _parse_workbuddy_text(
+                        text,
+                        anonymizer=anonymizer,
+                        include_thinking=include_thinking,
+                        raw_source_path=f"{path}#{info.filename}",
+                    )
+                )
+    except (OSError, zipfile.BadZipFile):
+        return []
+    return sessions
+
+
+def _parse_workbuddy_text(
+    text: str,
+    *,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+    raw_source_path: str,
+) -> list[dict]:
+    values = _load_workbuddy_json_values(text)
+    if not values:
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    message_groups: dict[str, list[dict[str, Any]]] = {}
+    for value in values:
+        extracted = _extract_workbuddy_sessions(
+            value,
+            anonymizer=anonymizer,
+            include_thinking=include_thinking,
+            raw_source_path=raw_source_path,
+        )
+        if extracted:
+            sessions.extend(extracted)
+            continue
+        if isinstance(value, dict) and _is_workbuddy_message_like(value):
+            group_key = _workbuddy_group_id(value, raw_source_path)
+            message_groups.setdefault(group_key, []).append(value)
+
+    for group_id, rows in message_groups.items():
+        parsed = _build_workbuddy_session_from_messages(
+            rows,
+            anonymizer=anonymizer,
+            include_thinking=include_thinking,
+            raw_source_path=raw_source_path,
+            fallback_session_id=group_id,
+            metadata={},
+        )
+        if parsed:
+            sessions.append(parsed)
+
+    return _dedupe_workbuddy_sessions(sessions, raw_source_path)
+
+
+def _load_workbuddy_json_values(text: str) -> list[Any]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        return [json.loads(stripped)]
+    except json.JSONDecodeError:
+        pass
+
+    values: list[Any] = []
+    for line in text.splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parsed = _parse_workbuddy_json_fragment(row)
+        if parsed is not None:
+            values.append(parsed)
+    return values
+
+
+def _parse_workbuddy_json_fragment(row: str) -> Any | None:
+    candidates = [row]
+    if not row.startswith(("{", "[")):
+        start = min(
+            (idx for idx in (row.find("{"), row.find("[")) if idx >= 0),
+            default=-1,
+        )
+        if start >= 0:
+            candidates.append(row[start:])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+_WORKBUDDY_MESSAGE_KEYS = (
+    "messages", "messageList", "chatMessages", "conversation", "history",
+    "records", "dialogue", "turns",
+)
+_WORKBUDDY_SESSION_LIST_KEYS = (
+    "sessions", "conversations", "tasks", "items", "data", "list",
+)
+
+
+def _extract_workbuddy_sessions(
+    value: Any,
+    *,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+    raw_source_path: str,
+) -> list[dict]:
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) and _is_workbuddy_message_like(item) for item in value):
+            parsed = _build_workbuddy_session_from_messages(
+                value,
+                anonymizer=anonymizer,
+                include_thinking=include_thinking,
+                raw_source_path=raw_source_path,
+                fallback_session_id=_workbuddy_hash_id(raw_source_path, "list"),
+                metadata={},
+            )
+            return [parsed] if parsed else []
+        sessions: list[dict[str, Any]] = []
+        for item in value:
+            sessions.extend(
+                _extract_workbuddy_sessions(
+                    item,
+                    anonymizer=anonymizer,
+                    include_thinking=include_thinking,
+                    raw_source_path=raw_source_path,
+                )
+            )
+        return sessions
+
+    if not isinstance(value, dict):
+        return []
+
+    for key in _WORKBUDDY_MESSAGE_KEYS:
+        raw_messages = value.get(key)
+        if isinstance(raw_messages, list) and raw_messages:
+            parsed = _build_workbuddy_session_from_messages(
+                raw_messages,
+                anonymizer=anonymizer,
+                include_thinking=include_thinking,
+                raw_source_path=raw_source_path,
+                fallback_session_id=_workbuddy_session_id(value, raw_source_path),
+                metadata=value,
+            )
+            return [parsed] if parsed else []
+
+    for key in _WORKBUDDY_SESSION_LIST_KEYS:
+        nested = value.get(key)
+        if isinstance(nested, list) and nested:
+            sessions: list[dict[str, Any]] = []
+            for item in nested:
+                sessions.extend(
+                    _extract_workbuddy_sessions(
+                        item,
+                        anonymizer=anonymizer,
+                        include_thinking=include_thinking,
+                        raw_source_path=raw_source_path,
+                    )
+                )
+            if sessions:
+                return sessions
+
+    return []
+
+
+def _build_workbuddy_session_from_messages(
+    raw_messages: list[Any],
+    *,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+    raw_source_path: str,
+    fallback_session_id: str,
+    metadata: dict[str, Any],
+) -> dict | None:
+    messages: list[dict[str, Any]] = []
+    stats = _make_stats()
+    session_meta = {
+        "session_id": _workbuddy_session_id(metadata, raw_source_path, fallback_session_id),
+        "cwd": _first_str(metadata, ("cwd", "workspace", "workspacePath", "workdir")),
+        "git_branch": _first_str(metadata, ("git_branch", "gitBranch", "branch")),
+        "model": _first_str(metadata, ("model", "modelName", "model_id", "modelId")) or "workbuddy-unknown",
+        "model_effort": _extract_model_effort(metadata),
+        "start_time": _normalize_timestamp(
+            _first_present(metadata, ("start_time", "startTime", "createdAt", "created_at", "timeCreated"))
+        ),
+        "end_time": _normalize_timestamp(
+            _first_present(metadata, ("end_time", "endTime", "updatedAt", "finishedAt", "lastActivityAt"))
+        ),
+    }
+
+    for raw in raw_messages:
+        if not isinstance(raw, dict):
+            continue
+        msg = _workbuddy_message(raw, anonymizer, include_thinking)
+        if not msg:
+            continue
+        timestamp = msg.get("timestamp")
+        if session_meta["start_time"] is None and timestamp:
+            session_meta["start_time"] = timestamp
+        if timestamp:
+            session_meta["end_time"] = timestamp
+        model = _first_str(raw, ("model", "modelName", "model_id", "modelId"))
+        if model and session_meta["model"] == "workbuddy-unknown":
+            session_meta["model"] = model
+        effort = _extract_model_effort(raw)
+        if effort and session_meta["model_effort"] is None:
+            session_meta["model_effort"] = effort
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else raw
+        stats["input_tokens"] += _safe_int(
+            _first_present(usage, ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens"))
+        )
+        stats["output_tokens"] += _safe_int(
+            _first_present(usage, ("output_tokens", "outputTokens", "completion_tokens", "completionTokens"))
+        )
+        messages.append(msg)
+        if msg.get("role") == "user":
+            stats["user_messages"] += 1
+        elif msg.get("role") == "assistant":
+            stats["assistant_messages"] += 1
+        stats["tool_uses"] += len(msg.get("tool_uses", []))
+
+    result = _make_session_result(session_meta, messages, stats)
+    if result:
+        result["raw_source_path"] = raw_source_path
+    return result
+
+
+def _workbuddy_message(
+    raw: dict[str, Any],
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> dict[str, Any] | None:
+    role = _workbuddy_role(raw)
+    text = _workbuddy_text(raw)
+    tool_uses = _workbuddy_tool_uses(raw, anonymizer)
+    if role is None and tool_uses:
+        role = "assistant"
+    if role is None:
+        return None
+
+    msg: dict[str, Any] = {"role": role}
+    timestamp = _normalize_timestamp(
+        _first_present(raw, ("timestamp", "createdAt", "created_at", "time", "timeCreated"))
+    )
+    if timestamp:
+        msg["timestamp"] = timestamp
+    if text:
+        redacted, _, _ = redact_text(text)
+        msg["content"] = anonymizer.text(redacted)
+    thinking = _first_str(raw, ("thinking", "reasoning", "thought", "plan"))
+    if include_thinking and thinking:
+        redacted, _, _ = redact_text(thinking)
+        msg["thinking"] = anonymizer.text(redacted)
+    if tool_uses:
+        msg["tool_uses"] = tool_uses
+    if not msg.get("content") and not msg.get("thinking") and not tool_uses:
+        return None
+    return msg
+
+
+def _workbuddy_tool_uses(raw: dict[str, Any], anonymizer: Anonymizer) -> list[dict[str, Any]]:
+    entries = []
+    for key in ("tool_uses", "toolUses", "tool_calls", "toolCalls", "tools"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            entries.extend(item for item in value if isinstance(item, dict))
+    if not entries and (
+        any(k in raw for k in ("tool", "toolName", "functionName"))
+        or ("name" in raw and any(k in raw for k in ("input", "arguments", "args", "parameters")))
+    ):
+        entries.append(raw)
+
+    tool_uses: list[dict[str, Any]] = []
+    for item in entries:
+        name = _first_str(item, ("tool", "toolName", "name", "functionName")) or "tool"
+        input_data = (
+            item.get("input")
+            if "input" in item
+            else item.get("arguments", item.get("args", item.get("parameters", {})))
+        )
+        tool_uses.append(
+            {
+                "tool": name,
+                "input": _parse_tool_input(name, input_data, anonymizer),
+            }
+        )
+    return tool_uses
+
+
+def _is_workbuddy_message_like(value: dict[str, Any]) -> bool:
+    return _workbuddy_role(value) is not None or any(
+        key in value for key in ("content", "text", "message", "prompt", "answer", "response")
+    )
+
+
+def _workbuddy_role(value: dict[str, Any]) -> str | None:
+    raw = _first_str(value, ("role", "author", "sender", "type", "event"))
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"user", "human", "customer", "client", "request", "user_message"}:
+        return "user"
+    if normalized in {
+        "assistant", "ai", "agent", "bot", "workbuddy", "answer",
+        "assistant_message", "model",
+    }:
+        return "assistant"
+    if "user" in normalized:
+        return "user"
+    if any(token in normalized for token in ("assistant", "agent", "bot", "reply", "answer")):
+        return "assistant"
+    return None
+
+
+def _workbuddy_text(value: dict[str, Any]) -> str | None:
+    for key in ("content", "text", "message", "prompt", "answer", "response", "output", "result"):
+        if key not in value:
+            continue
+        text = _stringify_workbuddy_content(value.get(key))
+        if text:
+            return text
+    return None
+
+
+def _stringify_workbuddy_content(value: Any) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, dict):
+        for key in ("text", "content", "markdown", "value", "body"):
+            text = _stringify_workbuddy_content(value.get(key))
+            if text:
+                return text
+        return None
+    if isinstance(value, list):
+        parts = [
+            text for item in value
+            if (text := _stringify_workbuddy_content(item))
+        ]
+        return "\n\n".join(parts).strip() or None
+    return None
+
+
+def _workbuddy_group_id(value: dict[str, Any], raw_source_path: str) -> str:
+    for key in ("session_id", "sessionId", "conversation_id", "conversationId", "task_id", "taskId", "threadId"):
+        val = value.get(key)
+        if isinstance(val, (str, int)) and str(val).strip():
+            return str(val).strip()
+    return _workbuddy_hash_id(raw_source_path, "events")
+
+
+def _workbuddy_session_id(
+    metadata: dict[str, Any],
+    raw_source_path: str,
+    fallback: str | None = None,
+) -> str:
+    for key in ("session_id", "sessionId", "conversation_id", "conversationId", "task_id", "taskId", "id", "uuid"):
+        val = metadata.get(key)
+        if isinstance(val, (str, int)) and str(val).strip():
+            return str(val).strip()
+    return fallback or _workbuddy_hash_id(raw_source_path, "session")
+
+
+def _workbuddy_hash_id(raw_source_path: str, salt: str) -> str:
+    return hashlib.sha256(f"workbuddy:{raw_source_path}:{salt}".encode()).hexdigest()[:16]
+
+
+def _dedupe_workbuddy_sessions(sessions: list[dict], raw_source_path: str) -> list[dict]:
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for index, session in enumerate(sessions):
+        sid = str(session.get("session_id") or "")
+        if sid in seen:
+            sid = _workbuddy_hash_id(raw_source_path, f"{sid}:{index}")
+            session["session_id"] = sid
+        seen.add(sid)
+        deduped.append(session)
+    return deduped
+
+
+def _first_present(data: Any, keys: tuple[str, ...]) -> Any:
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            return data[key]
+    return None
+
+
+def _first_str(data: Any, keys: tuple[str, ...]) -> str | None:
+    value = _first_present(data, keys)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, int):
+        return str(value)
+    return None
 
 
 def _discover_custom_projects() -> list[dict]:
@@ -1193,6 +1810,11 @@ def parse_project_sessions(
 
     if source == CUSTOM_SOURCE:
         return _parse_custom_sessions(project_dir_name, anonymizer)
+
+    if source == WORKBUDDY_SOURCE:
+        return _parse_workbuddy_project_sessions(
+            project_dir_name, anonymizer, include_thinking,
+        )
 
     if source == KIMI_SOURCE:
         project_hash = _get_kimi_project_hash(project_dir_name)
@@ -2705,6 +3327,10 @@ def _build_gemini_project_name(project_hash: str) -> str:
 
 def _build_custom_project_name(dir_name: str) -> str:
     return f"custom:{dir_name}"
+
+
+def _build_workbuddy_project_name(dir_name: str) -> str:
+    return f"workbuddy:{Path(dir_name).name or dir_name}"
 
 
 def _get_opencode_project_index(refresh: bool = False) -> dict[str, list[str]]:

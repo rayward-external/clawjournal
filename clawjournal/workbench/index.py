@@ -34,7 +34,7 @@ WIDENED_MESSAGE_SCHEMA_VERSION = 4
 HOSTED_SUBMISSION_SCHEMA_VERSION = 5
 WORKBENCH_SCHEMA_VERSION = HOSTED_SUBMISSION_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
-FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SHARE_RECOMMENDATION_LIMIT = 10
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary

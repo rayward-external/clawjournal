@@ -614,7 +614,7 @@ class TestListProjects:
         monkeypatch.setattr("clawjournal.cli.discover_projects", lambda source_filter=None: [])
         list_projects()
         captured = capsys.readouterr()
-        assert "No Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom sessions" in captured.out
+        assert "No Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom sessions" in captured.out
 
     def test_source_filter_codex(self, monkeypatch, capsys):
         monkeypatch.setattr(
@@ -794,7 +794,7 @@ class TestWorkflowGateMessages:
         assert payload["error"] == "Source scope is not confirmed yet."
         assert payload["blocked_on_step"] == "Step 2/5"
         assert len(payload["process_steps"]) == 5
-        assert payload["allowed_sources"] == ["aider", "all", "both", "claude", "claude-science", "codex", "copilot", "cursor", "custom", "gemini", "kimi", "openclaw", "opencode"]
+        assert payload["allowed_sources"] == ["aider", "all", "both", "claude", "claude-science", "codex", "copilot", "cursor", "custom", "gemini", "kimi", "openclaw", "opencode", "workbuddy"]
         assert payload["next_command"] == "clawjournal config --source all"
 
     def test_configure_next_steps_require_full_folder_presentation(self):

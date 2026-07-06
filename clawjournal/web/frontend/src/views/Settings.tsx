@@ -93,7 +93,7 @@ export function Settings() {
         >
           <option value="" disabled>Select a source…</option>
           {cfg.source_choices.map(s => (
-            <option key={s} value={s}>{s === 'all' ? 'All agents' : s === 'claude-science' ? 'Claude Science' : s}</option>
+            <option key={s} value={s}>{s === 'all' ? 'All agents' : s === 'claude-science' ? 'Claude Science' : s === 'workbuddy' ? 'WorkBuddy' : s}</option>
           ))}
         </select>
       </div>

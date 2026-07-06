@@ -3,6 +3,7 @@
 import hashlib
 import json
 import sqlite3
+import zipfile
 
 import pytest
 
@@ -582,6 +583,9 @@ class TestDiscoverProjects:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def _write_opencode_db(self, db_path):
         conn = sqlite3.connect(db_path)
@@ -1274,6 +1278,9 @@ class TestDiscoverSubagentProjects:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def test_discover_includes_subagent_sessions(self, tmp_path, monkeypatch, mock_anonymizer):
         self._disable_codex(tmp_path, monkeypatch)
@@ -1978,6 +1985,9 @@ class TestDiscoverOpenclawProjects:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def test_discover_openclaw_projects(self, tmp_path, monkeypatch, mock_anonymizer):
         self._disable_others(tmp_path, monkeypatch)
@@ -2072,6 +2082,9 @@ class TestDiscoverClaudeScienceProjects:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def _write_db(self, db_path, *, with_execution=False, hidden_frame=False):
         db_path.parent.mkdir(parents=True)
@@ -2298,6 +2311,9 @@ class TestDiscoverKimiProjects:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     @staticmethod
     def _write_kimi_context(session_dir):
@@ -2370,6 +2386,126 @@ class TestDiscoverAiderProjects:
         assert projects[0]["session_count"] == 2
 
 
+class TestDiscoverWorkBuddyProjects:
+    def _disable_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude")
+        monkeypatch.setattr("clawjournal.parsing.parser.LOCAL_AGENT_DIR", tmp_path / "no-local-agent")
+        monkeypatch.setattr("clawjournal.parsing.parser.CLAUDE_SCIENCE_DIR", tmp_path / "no-claude-science")
+        monkeypatch.setattr("clawjournal.parsing.parser._CLAUDE_SCIENCE_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.CODEX_SESSIONS_DIR", tmp_path / "no-codex-sessions")
+        monkeypatch.setattr("clawjournal.parsing.parser.CODEX_ARCHIVED_DIR", tmp_path / "no-codex-archived")
+        monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.GEMINI_DIR", tmp_path / "no-gemini")
+        monkeypatch.setattr("clawjournal.parsing.parser.OPENCODE_DB_PATH", tmp_path / "no-opencode.db")
+        monkeypatch.setattr("clawjournal.parsing.parser._OPENCODE_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.OPENCLAW_AGENTS_DIR", tmp_path / "no-openclaw-agents")
+        monkeypatch.setattr("clawjournal.parsing.parser._OPENCLAW_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.KIMI_SESSIONS_DIR", tmp_path / "no-kimi-sessions")
+        monkeypatch.setattr("clawjournal.parsing.parser.CURSOR_DIR", tmp_path / "no-cursor")
+        monkeypatch.setattr("clawjournal.parsing.parser._CURSOR_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
+        monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
+        monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.CUSTOM_DIR", tmp_path / "no-custom")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
+
+    def _workbuddy_session(self, *, session_id="wb-task-1", content="Summarize the report"):
+        return {
+            "taskId": session_id,
+            "modelName": "hunyuan-t1",
+            "workspacePath": "/Users/alice/WorkBuddy/task",
+            "createdAt": "2026-07-01T10:00:00+00:00",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                    "createdAt": "2026-07-01T10:00:01+00:00",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Drafted a summary.",
+                    "createdAt": "2026-07-01T10:00:02+00:00",
+                    "usage": {"inputTokens": 12, "outputTokens": 5},
+                },
+            ],
+        }
+
+    def test_discovers_workspace_workbuddy_trace(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        workbuddy_dir = tmp_path / "WorkBuddy"
+        trace_dir = workbuddy_dir / "20260701100000" / ".workbuddy"
+        trace_dir.mkdir(parents=True)
+        trace_file = trace_dir / "conversation.json"
+        trace_file.write_text(json.dumps(self._workbuddy_session()), encoding="utf-8")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", workbuddy_dir)
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-import")
+
+        projects = discover_projects(source_filter="workbuddy")
+
+        assert len(projects) == 1
+        assert projects[0]["display_name"] == "workbuddy:20260701100000"
+        assert projects[0]["session_count"] == 1
+        assert projects[0]["source"] == "workbuddy"
+
+        sessions = parse_project_sessions(
+            "20260701100000", mock_anonymizer, source="workbuddy"
+        )
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "wb-task-1"
+        assert sessions[0]["model"] == "hunyuan-t1"
+        assert sessions[0]["source"] == "workbuddy"
+        assert sessions[0]["project"] == "workbuddy:20260701100000"
+        assert sessions[0]["raw_source_path"] == str(trace_file)
+        assert sessions[0]["stats"]["input_tokens"] == 12
+        assert sessions[0]["messages"][0]["content"] == "Summarize the report"
+
+    def test_parses_manual_jsonl_events_by_conversation(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        import_dir = tmp_path / "manual" / "research-task"
+        import_dir.mkdir(parents=True)
+        events = [
+            {"conversationId": "conv-1", "role": "user", "text": "Find the source file", "timestamp": "2026-07-02T10:00:00Z"},
+            {"conversationId": "conv-1", "role": "assistant", "text": "The logs are in Help.", "timestamp": "2026-07-02T10:00:01Z"},
+        ]
+        (import_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "manual")
+
+        projects = discover_projects(source_filter="workbuddy")
+        sessions = parse_project_sessions("research-task", mock_anonymizer, source="workbuddy")
+
+        assert projects[0]["display_name"] == "workbuddy:research-task"
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "conv-1"
+        assert sessions[0]["stats"]["user_messages"] == 1
+        assert sessions[0]["stats"]["assistant_messages"] == 1
+
+    def test_parses_manual_workbuddy_support_zip(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        import_dir = tmp_path / "manual" / "support-export"
+        import_dir.mkdir(parents=True)
+        zip_path = import_dir / "workbuddy-log.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr(
+                "logs/conversation.json",
+                json.dumps({"sessions": [self._workbuddy_session(session_id="zip-1")]}),
+            )
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "manual")
+
+        projects = discover_projects(source_filter="workbuddy")
+        sessions = parse_project_sessions("support-export", mock_anonymizer, source="workbuddy")
+
+        assert len(projects) == 1
+        assert projects[0]["session_count"] == 1
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "zip-1"
+        assert sessions[0]["raw_source_path"].endswith("workbuddy-log.zip#logs/conversation.json")
+
+
 class TestDiscoverCustomProjects:
     def _disable_others(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "no-claude")
@@ -2390,6 +2526,9 @@ class TestDiscoverCustomProjects:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def _make_valid_session(self, session_id="s1", model="gpt-4", content="hello"):
         return json.dumps({
@@ -2662,6 +2801,9 @@ class TestDiscoverClaudeProjectsWithLocalAgent:
         monkeypatch.setattr("clawjournal.parsing.parser.COPILOT_DIR", tmp_path / "no-copilot")
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-workbuddy-import")
+        monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def test_la_only_project_with_host_path(self, tmp_path, monkeypatch):
         """Local-agent session with userSelectedFolders gets proper display name."""
