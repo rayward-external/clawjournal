@@ -388,6 +388,19 @@ class TestSessionsAPI:
         assert status == 200
         assert len(data) == 2
 
+    def test_list_sessions_with_multiple_statuses(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {"status": "shortlisted"})
+        assert status == 200
+        assert data["ok"] is True
+
+        status, data = _post(server, "/api/sessions/sess-1", {"status": "blocked"})
+        assert status == 200
+        assert data["ok"] is True
+
+        status, data = _get(server, "/api/sessions?status=new&status=shortlisted")
+        assert status == 200
+        assert {s["session_id"] for s in data} == {"sess-0", "sess-2"}
+
     def test_get_session_detail(self, server):
         status, data = _get(server, "/api/sessions/sess-0")
         assert status == 200
@@ -509,6 +522,43 @@ class TestSessionsAPI:
         # Verify it persisted
         status, detail = _get(server, "/api/sessions/sess-0")
         assert detail["review_status"] == "approved"
+
+    def test_skipped_session_stays_out_of_new_queue_after_reindex(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {"status": "blocked"})
+        assert status == 200
+        assert data["ok"] is True
+
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": "sess-0",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "start_time": "2025-01-01T00:00:00+00:00",
+                "end_time": "2025-01-01T00:10:00+00:00",
+                "messages": [
+                    {"role": "user", "content": "Task 0: fix the bug", "tool_uses": []},
+                    {"role": "assistant", "content": "Done.", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 1,
+                    "tool_uses": 0,
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                },
+            }])
+        finally:
+            conn.close()
+
+        status, queue = _get(server, "/api/sessions?status=new")
+        assert status == 200
+        assert {s["session_id"] for s in queue} == {"sess-1", "sess-2"}
+
+        status, detail = _get(server, "/api/sessions/sess-0")
+        assert status == 200
+        assert detail["review_status"] == "blocked"
 
     def test_update_session_requires_evidence_for_high_failure_value(self, server):
         status, data = _post(server, "/api/sessions/sess-0", {"ai_failure_value_score": 4})
