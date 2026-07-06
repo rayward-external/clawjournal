@@ -86,9 +86,10 @@ class TestUpsertSessions:
         new_count = upsert_sessions(index_conn, sessions)
         assert new_count == 2
 
-    def test_upsert_preserves_review_status(self, index_conn):
+    @pytest.mark.parametrize("status", ["approved", "blocked"])
+    def test_upsert_preserves_review_status(self, index_conn, status):
         upsert_sessions(index_conn, [_make_session()])
-        update_session(index_conn, "sess-1", status="approved")
+        update_session(index_conn, "sess-1", status=status)
 
         # Re-index same session
         upsert_sessions(index_conn, [_make_session()])
@@ -96,7 +97,7 @@ class TestUpsertSessions:
         row = index_conn.execute(
             "SELECT review_status FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
-        assert row["review_status"] == "approved"
+        assert row["review_status"] == status
 
     def test_upsert_preserves_manual_review_metadata(self, index_conn):
         upsert_sessions(index_conn, [_make_session()])
