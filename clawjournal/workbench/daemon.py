@@ -2278,11 +2278,24 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     # --- API handlers ---
 
     def _handle_list_sessions(self, params: dict[str, list[str]]) -> None:
+        status_values = [
+            value.strip()
+            for raw in params.get("status", [])
+            for value in raw.split(",")
+            if value.strip()
+        ]
+        status_filter: str | list[str] | None
+        if len(status_values) == 1:
+            status_filter = status_values[0]
+        elif status_values:
+            status_filter = status_values
+        else:
+            status_filter = None
         conn = open_index()
         try:
             result = query_sessions(
                 conn,
-                status=params.get("status", [None])[0],
+                status=status_filter,
                 source=params.get("source", [None])[0],
                 project=params.get("project", [None])[0],
                 task_type=params.get("task_type", [None])[0],

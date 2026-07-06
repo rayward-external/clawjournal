@@ -388,6 +388,19 @@ class TestSessionsAPI:
         assert status == 200
         assert len(data) == 2
 
+    def test_list_sessions_with_multiple_statuses(self, server):
+        status, data = _post(server, "/api/sessions/sess-0", {"status": "shortlisted"})
+        assert status == 200
+        assert data["ok"] is True
+
+        status, data = _post(server, "/api/sessions/sess-1", {"status": "blocked"})
+        assert status == 200
+        assert data["ok"] is True
+
+        status, data = _get(server, "/api/sessions?status=new&status=shortlisted")
+        assert status == 200
+        assert {s["session_id"] for s in data} == {"sess-0", "sess-2"}
+
     def test_get_session_detail(self, server):
         status, data = _get(server, "/api/sessions/sess-0")
         assert status == 200

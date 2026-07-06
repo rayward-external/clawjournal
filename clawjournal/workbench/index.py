@@ -2082,7 +2082,7 @@ def _build_start_time_where(
 def query_sessions(
     conn: sqlite3.Connection,
     *,
-    status: str | None = None,
+    status: str | list[str] | tuple[str, ...] | None = None,
     source: str | list[str] | tuple[str, ...] | None = None,
     project: str | None = None,
     task_type: str | None = None,
@@ -2129,8 +2129,15 @@ def query_sessions(
         base = "SELECT * FROM sessions s WHERE 1=1"
 
     if status is not None:
-        where_clauses.append("s.review_status = ?")
-        params.append(status)
+        if isinstance(status, (list, tuple)):
+            values = [s for s in status if s]
+            if values:
+                placeholders = ",".join("?" for _ in values)
+                where_clauses.append(f"s.review_status IN ({placeholders})")
+                params.extend(values)
+        else:
+            where_clauses.append("s.review_status = ?")
+            params.append(status)
     if source is not None:
         if isinstance(source, (list, tuple)):
             values = [s for s in source if s]

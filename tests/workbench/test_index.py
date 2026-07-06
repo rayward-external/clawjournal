@@ -421,6 +421,19 @@ class TestQuerySessions:
         assert len(results) == 1
         assert results[0]["session_id"] == "s1"
 
+    def test_filter_by_multiple_statuses(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("s1"),
+            _make_session("s2"),
+            _make_session("s3"),
+        ])
+        update_session(index_conn, "s1", status="shortlisted")
+        update_session(index_conn, "s2", status="blocked")
+
+        results = query_sessions(index_conn, status=["new", "shortlisted"])
+
+        assert {row["session_id"] for row in results} == {"s1", "s3"}
+
     def test_filter_by_source(self, index_conn):
         upsert_sessions(index_conn, [
             _make_session("s1", source="claude"),
