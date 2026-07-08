@@ -69,9 +69,11 @@ from .index import (
     open_index,
     query_sessions,
     query_unscored_sessions,
+    release_gate_blockers,
     remove_policy,
     search_fts,
     SCORE_SETTLE_SECONDS,
+    session_matches_excluded_projects,
     source_scope_blockers,
     update_session,
     upsert_sessions,
@@ -279,6 +281,76 @@ def trigger_scoring_warmup(
     return scanner.trigger_auto_score(limit=limit, backend=backend)
 
 
+def _score_redaction_settings(settings: dict[str, Any]) -> dict[str, Any] | None:
+    """Return only the policy fields that affect scoring-prompt redaction."""
+    scoped = {
+        "custom_strings": list(settings.get("custom_strings", []) or []),
+        "extra_usernames": list(settings.get("extra_usernames", []) or []),
+        "blocked_domains": list(settings.get("blocked_domains", []) or []),
+    }
+    return scoped if any(scoped.values()) else None
+
+
+def _filter_scoreable_warmup_sessions(
+    conn: sqlite3.Connection,
+    sessions: list[dict[str, Any]],
+    *,
+    excluded_projects: list[str],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the same egress gates before background AI scoring."""
+    if not sessions:
+        return []
+    blocker_ids = {
+        b["session_id"]
+        for b in release_gate_blockers(
+            conn,
+            [s["session_id"] for s in sessions],
+            now=now,
+        )
+    }
+    return [
+        s for s in sessions
+        if s["session_id"] not in blocker_ids
+        and not session_matches_excluded_projects(s, excluded_projects)
+    ]
+
+
+def _query_scoreable_warmup_sessions(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    since: str | None,
+    excluded_projects: list[str],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return latest scorable warmup rows without letting gated rows starve them."""
+    if limit <= 0:
+        return []
+
+    fetch_limit = limit
+    max_fetch = 10_000
+    while True:
+        fetched = query_unscored_sessions(
+            conn,
+            limit=fetch_limit,
+            source=FAILURE_VALUE_SOURCE_SCOPE,
+            since=since,
+            include_stale_scored=True,
+            settle_seconds=SCORE_SETTLE_SECONDS,
+            now=now,
+        )
+        scoreable = _filter_scoreable_warmup_sessions(
+            conn,
+            fetched,
+            excluded_projects=excluded_projects,
+            now=now,
+        )
+        if len(scoreable) >= limit or len(fetched) < fetch_limit or fetch_limit >= max_fetch:
+            return scoreable[:limit]
+        fetch_limit = min(max_fetch, max(fetch_limit * 2, fetch_limit + 1))
+
+
 def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
     """Create `notes/{session_id}.md` if it does not already exist.
 
@@ -401,6 +473,9 @@ class Scanner:
         try:
             conn = open_index()
             try:
+                effective_settings = get_effective_share_settings(conn, load_config())
+                excluded_projects = list(effective_settings.get("excluded_projects") or [])
+                redaction_settings = _score_redaction_settings(effective_settings)
                 # Warmup deliberately scores the latest `limit` unscored
                 # failure-corpus traces ordered by start_time DESC with no
                 # age cap (`since` is None for the background path). The
@@ -411,13 +486,11 @@ class Scanner:
                 # graded mid-flight and then grew (end_time advanced past
                 # ai_scored_at); `settle_seconds` defers sessions that are still
                 # active so we don't grade them prematurely in the first place.
-                sessions = query_unscored_sessions(
+                sessions = _query_scoreable_warmup_sessions(
                     conn,
                     limit=limit,
-                    source=FAILURE_VALUE_SOURCE_SCOPE,
                     since=since,
-                    include_stale_scored=True,
-                    settle_seconds=SCORE_SETTLE_SECONDS,
+                    excluded_projects=excluded_projects,
                 )
                 if not sessions:
                     return 0
@@ -454,7 +527,10 @@ class Scanner:
                                         self._auto_score_disabled_reason)
                             break
                         try:
-                            result = score_session(conn, sid, backend=active)
+                            score_kwargs: dict[str, Any] = {"backend": active}
+                            if redaction_settings is not None:
+                                score_kwargs["redaction_settings"] = redaction_settings
+                            result = score_session(conn, sid, **score_kwargs)
                         except RuntimeError as exc:
                             message = str(exc)
                             backend_dead = is_backend_unavailable_error(message) or any(

@@ -25,7 +25,7 @@ from clawjournal.workbench.daemon import (
     _warn_if_frontend_stale,
     trigger_scoring_warmup,
 )
-from clawjournal.workbench.index import open_index, upsert_sessions
+from clawjournal.workbench.index import add_policy, open_index, set_hold_state, upsert_sessions
 
 
 @pytest.fixture
@@ -934,6 +934,71 @@ class TestScanner:
         scanner = Scanner(source_filter="cursor")
         assert scanner.score_unscored_once(limit=5) == 1
         assert scored_ids == ["codex-sess"]
+
+    def test_score_unscored_once_skips_held_and_excluded_without_starving(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        held = self._settled_session("held", now)
+        held["start_time"] = (now - timedelta(minutes=20)).isoformat()
+        held["end_time"] = (now - timedelta(minutes=10)).isoformat()
+        excluded = self._settled_session("excluded", now)
+        excluded["project"] = "claude:private-repo"
+        excluded["start_time"] = (now - timedelta(minutes=21)).isoformat()
+        excluded["end_time"] = (now - timedelta(minutes=11)).isoformat()
+        ok = self._settled_session("ok", now)
+        ok["start_time"] = (now - timedelta(minutes=22)).isoformat()
+        ok["end_time"] = (now - timedelta(minutes=12)).isoformat()
+
+        conn = open_index()
+        upsert_sessions(conn, [held, excluded, ok])
+        set_hold_state(conn, "held", "pending_review", changed_by="test", reason="test")
+        add_policy(conn, "exclude_project", "private-repo")
+        conn.close()
+
+        scored_ids = []
+
+        def fake_score(conn, session_id, **kwargs):
+            scored_ids.append(session_id)
+            return self._ok_result(now)
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=1) == 1
+        assert scored_ids == ["ok"]
+
+    def test_score_unscored_once_passes_policy_redaction_settings(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [self._settled_session("redact-me", now)])
+        add_policy(conn, "redact_string", "SecretProject")
+        add_policy(conn, "redact_username", "kai")
+        add_policy(conn, "block_domain", "api.internal")
+        conn.close()
+
+        seen_kwargs = []
+
+        def fake_score(conn, session_id, **kwargs):
+            seen_kwargs.append(kwargs)
+            return self._ok_result(now)
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=1) == 1
+        settings = seen_kwargs[0]["redaction_settings"]
+        assert settings["custom_strings"] == ["SecretProject"]
+        assert settings["extra_usernames"] == ["kai"]
+        assert settings["blocked_domains"] == ["api.internal"]
 
 
 class TestScoringWarmupAPI:

@@ -7,9 +7,9 @@ student opens the local workbench, the daemon starts a background scoring warmup
 for the latest 20 unscored `failure-corpus` sessions. The UI remains usable
 while scoring runs.
 
-`failure-corpus` is the public scoring source preset for `claude`, `codex`,
-`opencode`, and `openclaw`. The older `failure-v1` alias remains accepted for
-backward compatibility.
+`failure-corpus` is the public scoring source preset for `claude`,
+`claude-science`, `codex`, `opencode`, and `openclaw`. The older `failure-v1`
+alias remains accepted for backward compatibility.
 
 ## Behavior
 
@@ -20,6 +20,10 @@ backward compatibility.
   reloaded.
 - Warmup scores the latest 20 unscored `failure-corpus` sessions by
   `start_time DESC`.
+- Warmup applies the same AI-egress gates as the skill/share path before
+  scoring: held or active-embargo sessions are skipped, excluded-project
+  policies are skipped, and configured redaction strings/usernames/domains are
+  applied to the scoring prompt.
 - Warmup uses the existing scorer lock, so repeated browser reloads cannot
   start duplicate scoring jobs.
 - Share-ready recommendations continue to require `ai_failure_value_score`.
@@ -64,3 +68,11 @@ clawjournal score --batch --source failure-corpus --limit 20
 clawjournal score --batch --source failure-corpus --window 7d --limit 50
 clawjournal rescore --source failure-corpus --window 7d --limit 50
 ```
+
+## Self-Improving Skills
+
+Automatic warmup is the feeder, not the installer. It keeps recent
+failure-corpus traces scored so `clawjournal skill --preview` and
+`clawjournal skill` have fresh local evidence to distill. Writing the generated
+`clawjournal-lessons` skill to Claude Code or Codex remains an explicit
+preview/approval step.
