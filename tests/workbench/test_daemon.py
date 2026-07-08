@@ -608,6 +608,33 @@ class TestSessionsAPI:
         assert detail["ai_quality_score"] == 4
         assert detail["ai_summary"] == "Good progress"
 
+    def test_score_session_endpoint_applies_policy_redaction(self, server, monkeypatch):
+        """Manual scoring threads workbench-policy redaction into the prompt."""
+        conn = open_index()
+        add_policy(conn, "redact_string", "SecretProject")
+        add_policy(conn, "redact_username", "kai")
+        add_policy(conn, "block_domain", "api.internal")
+        conn.close()
+
+        seen_kwargs = {}
+
+        def fake_score(conn, session_id, **kwargs):
+            seen_kwargs.update(kwargs)
+            return SimpleNamespace(
+                quality=4, reason="ok", detail_json="{}", task_type="t",
+                outcome_label="resolved", value_labels=[], risk_level=[],
+                display_title="T", effort_estimate=0.5, summary="s",
+            )
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        status, data = _post(server, "/api/sessions/sess-0/score", {"backend": "auto"})
+        assert status == 200
+        settings = seen_kwargs["redaction_settings"]
+        assert settings["custom_strings"] == ["SecretProject"]
+        assert settings["extra_usernames"] == ["kai"]
+        assert settings["blocked_domains"] == ["api.internal"]
+
     def test_score_session_endpoint_rejects_missing_transcript_blob(self, server, index_setup):
         (index_setup / "blobs" / "sess-0.json").unlink()
 

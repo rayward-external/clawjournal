@@ -2673,8 +2673,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         conn = open_index()
         try:
+            # Manual scoring is AI egress too: scrub configured redaction
+            # strings/usernames/blocked-domains before the prompt leaves the
+            # machine, matching the background warmup path. Unlike warmup we do
+            # not gate on hold/embargo/excluded-project here — scoring a
+            # specific session is an explicit user request for that session.
+            redaction_settings = _score_redaction_settings(
+                get_effective_share_settings(conn, load_config())
+            )
+            score_kwargs: dict[str, Any] = {"model": model, "backend": backend}
+            if redaction_settings is not None:
+                score_kwargs["redaction_settings"] = redaction_settings
             try:
-                result = score_session(conn, session_id, model=model, backend=backend)
+                result = score_session(conn, session_id, **score_kwargs)
             except RuntimeError as e:
                 _json_response(self, {"error": str(e)}, 503)
                 return
