@@ -32,6 +32,14 @@ from clawjournal.parsing.parser import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_workbuddy_ai_projects(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "clawjournal.parsing.parser.WORKBUDDY_AI_PROJECTS_DIR",
+        tmp_path / "no-workbuddy-ai-projects",
+    )
+
+
 def test_iter_jsonl_reads_utf8_explicitly(tmp_path, monkeypatch):
     path = tmp_path / "session.jsonl"
     payload = {"message": "research note with Cyrillic: с"}
@@ -2407,6 +2415,7 @@ class TestDiscoverWorkBuddyProjects:
         monkeypatch.setattr("clawjournal.parsing.parser._AIDER_PROJECT_INDEX", {})
         monkeypatch.setattr("clawjournal.parsing.parser._get_aider_project_index", lambda refresh=False: {})
         monkeypatch.setattr("clawjournal.parsing.parser.CUSTOM_DIR", tmp_path / "no-custom")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_AI_PROJECTS_DIR", tmp_path / "no-workbuddy-ai-projects")
         monkeypatch.setattr("clawjournal.parsing.parser._WORKBUDDY_PROJECT_INDEX", {})
 
     def _workbuddy_session(self, *, session_id="wb-task-1", content="Summarize the report"):
@@ -2482,6 +2491,38 @@ class TestDiscoverWorkBuddyProjects:
         assert sessions[0]["session_id"] == "conv-1"
         assert sessions[0]["stats"]["user_messages"] == 1
         assert sessions[0]["stats"]["assistant_messages"] == 1
+
+    def test_discovers_workbuddy_ai_project_tree_trace(self, tmp_path, monkeypatch, mock_anonymizer):
+        self._disable_others(tmp_path, monkeypatch)
+        projects_dir = tmp_path / ".workbuddy-ai" / "projects"
+        project_dir = projects_dir / "Users-alice-WorkBuddy AI-2026-07-09-06-28-50"
+        project_dir.mkdir(parents=True)
+        trace_file = project_dir / "97f35c9a-9794-4978-a61a-edcc67be2058.jsonl"
+        events = [
+            {"conversationId": "conv-1", "role": "user", "text": "Check the test trace", "timestamp": "2026-07-09T10:00:00Z"},
+            {"conversationId": "conv-1", "role": "assistant", "text": "Found it.", "timestamp": "2026-07-09T10:00:01Z"},
+        ]
+        trace_file.write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_DIR", tmp_path / "no-workbuddy")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_IMPORT_DIR", tmp_path / "no-manual")
+        monkeypatch.setattr("clawjournal.parsing.parser.WORKBUDDY_AI_PROJECTS_DIR", projects_dir)
+
+        projects = discover_projects(source_filter="workbuddy")
+        sessions = parse_project_sessions(
+            "Users-alice-WorkBuddy AI-2026-07-09-06-28-50",
+            mock_anonymizer,
+            source="workbuddy",
+        )
+
+        assert len(projects) == 1
+        assert projects[0]["display_name"] == "workbuddy:Users-alice-WorkBuddy AI-2026-07-09-06-28-50"
+        assert projects[0]["session_count"] == 1
+        assert len(sessions) == 1
+        assert sessions[0]["session_id"] == "conv-1"
+        assert sessions[0]["raw_source_path"] == str(trace_file)
 
     def test_parses_manual_workbuddy_support_zip(self, tmp_path, monkeypatch, mock_anonymizer):
         self._disable_others(tmp_path, monkeypatch)

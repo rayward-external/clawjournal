@@ -60,6 +60,7 @@ CURSOR_DIR = Path.home() / ".cursor"
 COPILOT_DIR = Path.home() / ".copilot" / "session-state"
 AIDER_HISTORY_FILENAME = ".aider.chat.history.md"
 WORKBUDDY_DIR = Path.home() / "WorkBuddy"
+WORKBUDDY_AI_PROJECTS_DIR = Path.home() / ".workbuddy-ai" / "projects"
 WORKBUDDY_IMPORT_DIR = Path.home() / ".clawjournal" / "workbuddy"
 WORKBUDDY_MAX_FILE_BYTES = 100 * 1024 * 1024
 WORKBUDDY_MAX_ZIP_MEMBER_BYTES = 25 * 1024 * 1024
@@ -794,6 +795,7 @@ def _iter_existing_workbuddy_roots() -> list[tuple[Path, str]]:
     roots: list[tuple[Path, str]] = [
         (WORKBUDDY_IMPORT_DIR, "manual"),
         (WORKBUDDY_DIR, "workspace"),
+        (WORKBUDDY_AI_PROJECTS_DIR, "project-tree"),
     ]
     if platform.system() == "Darwin":
         roots.extend(
@@ -853,6 +855,11 @@ def _iter_workbuddy_candidate_files(root: Path, kind: str) -> list[Path]:
             candidates.extend(
                 p for p in root.glob("*.zip") if p.is_file()
             )
+        elif kind == "project-tree":
+            candidates.extend(
+                p for p in root.rglob("*")
+                if p.is_file() and p.suffix.lower() in suffixes
+            )
         else:
             candidates.extend(
                 p for p in root.rglob("*")
@@ -877,6 +884,8 @@ def _workbuddy_project_key(path: Path, root: Path, kind: str) -> str:
         rel = Path(path.name)
     if kind == "manual":
         return rel.parts[0] if len(rel.parts) > 1 else "manual"
+    if kind == "project-tree":
+        return rel.parts[0] if len(rel.parts) > 1 else "workbuddy-ai"
     if kind == "workspace":
         return rel.parts[0] if rel.parts else "workspace"
     return kind
