@@ -962,6 +962,65 @@ class TestScanner:
         assert scanner.score_unscored_once(limit=5) == 1
         assert scored_ids == ["codex-sess"]
 
+    def test_score_unscored_once_respects_confirmed_source_scope(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {"source": "claude"})
+
+        now = datetime.now(timezone.utc)
+        claude = self._settled_session("claude-sess", now)
+        codex = {
+            **self._settled_session("codex-sess", now),
+            "source": "codex",
+            "model": "gpt-5",
+            "start_time": (now - timedelta(minutes=5)).isoformat(),
+            "end_time": (now - timedelta(minutes=4)).isoformat(),
+        }
+        conn = open_index()
+        upsert_sessions(conn, [claude, codex])
+        conn.close()
+
+        scored_ids = []
+
+        def fake_score(conn, session_id, **kwargs):
+            scored_ids.append(session_id)
+            return self._ok_result(now)
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner()
+        assert scanner.score_unscored_once(limit=5) == 1
+        assert scored_ids == ["claude-sess"]
+
+    def test_score_unscored_once_does_not_widen_unsupported_confirmed_source(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {"source": "gemini"})
+
+        now = datetime.now(timezone.utc)
+        codex = {
+            **self._settled_session("codex-sess", now),
+            "source": "codex",
+            "model": "gpt-5",
+        }
+        conn = open_index()
+        upsert_sessions(conn, [codex])
+        conn.close()
+
+        def fake_score(*args, **kwargs):
+            raise AssertionError("codex must not be scored under a gemini source scope")
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        scanner = Scanner()
+        assert scanner.score_unscored_once(limit=5) == 0
+
     def test_score_unscored_once_skips_held_and_excluded_without_starving(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
         monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")

@@ -104,6 +104,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
 AUTO_SCORE_BATCH_SIZE = 20
+_NO_MATCHING_WARMUP_SOURCE = "__clawjournal_no_matching_warmup_source__"
 SCORING_DISPLAY_NAMES = {
     "claude": "Claude Code",
     "codex": "Codex",
@@ -291,6 +292,24 @@ def _score_redaction_settings(settings: dict[str, Any]) -> dict[str, Any] | None
     return scoped if any(scoped.values()) else None
 
 
+def _warmup_source_filter(settings: dict[str, Any]) -> str | tuple[str, ...]:
+    """Return the sources background scoring may egress.
+
+    Warmup scoring is a background AI call, so it must honor the same confirmed
+    source scope that share/skill paths use. Keep the unrestricted case on the
+    failure-value corpus, because not every indexed source has a scoring rollout.
+    """
+    allowed = settings.get("source_filter")
+    if allowed is None:
+        return FAILURE_VALUE_SOURCE_SCOPE
+    if isinstance(allowed, str):
+        allowed_values = {allowed}
+    else:
+        allowed_values = {str(source) for source in allowed if source}
+    scoped = tuple(source for source in FAILURE_VALUE_SOURCE_SCOPE if source in allowed_values)
+    return scoped or _NO_MATCHING_WARMUP_SOURCE
+
+
 def _filter_scoreable_warmup_sessions(
     conn: sqlite3.Connection,
     sessions: list[dict[str, Any]],
@@ -321,6 +340,7 @@ def _query_scoreable_warmup_sessions(
     *,
     limit: int,
     since: str | None,
+    source_filter: str | tuple[str, ...],
     excluded_projects: list[str],
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -334,7 +354,7 @@ def _query_scoreable_warmup_sessions(
         fetched = query_unscored_sessions(
             conn,
             limit=fetch_limit,
-            source=FAILURE_VALUE_SOURCE_SCOPE,
+            source=source_filter,
             since=since,
             include_stale_scored=True,
             settle_seconds=SCORE_SETTLE_SECONDS,
@@ -490,6 +510,7 @@ class Scanner:
                     conn,
                     limit=limit,
                     since=since,
+                    source_filter=_warmup_source_filter(effective_settings),
                     excluded_projects=excluded_projects,
                 )
                 if not sessions:

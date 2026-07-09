@@ -19,11 +19,12 @@ alias remains accepted for backward compatibility.
   already-running daemon can start scoring when the browser is opened or
   reloaded.
 - Warmup scores the latest 20 unscored `failure-corpus` sessions by
-  `start_time DESC`.
+  `start_time DESC`, narrowed by the user's confirmed source scope when one is
+  configured.
 - Warmup applies the same AI-egress gates as the skill/share path before
-  scoring: held or active-embargo sessions are skipped, excluded-project
-  policies are skipped, and configured redaction strings/usernames/domains are
-  applied to the scoring prompt.
+  scoring: unconfirmed sources, held or active-embargo sessions, and
+  excluded-project policies are skipped, and configured redaction
+  strings/usernames/domains are applied to the scoring prompt.
 - Warmup uses the existing scorer lock, so repeated browser reloads cannot
   start duplicate scoring jobs.
 - Share-ready recommendations continue to require `ai_failure_value_score`.
