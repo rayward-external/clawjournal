@@ -95,6 +95,7 @@ from ..parsing.parser import (
     KIMI_SOURCE,
     OPENCODE_SOURCE,
     OPENCLAW_SOURCE,
+    WORKBUDDY_SOURCE,
     discover_projects,
     parse_project_sessions,
 )
@@ -136,7 +137,7 @@ _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 WORKBENCH_SOURCES = {
     CLAUDE_SOURCE, CLAUDE_SCIENCE_SOURCE, CODEX_SOURCE, OPENCLAW_SOURCE,
     CURSOR_SOURCE, COPILOT_SOURCE, AIDER_SOURCE,
-    GEMINI_SOURCE, OPENCODE_SOURCE, KIMI_SOURCE,
+    GEMINI_SOURCE, OPENCODE_SOURCE, KIMI_SOURCE, WORKBUDDY_SOURCE,
 }
 
 # Path to the built frontend dist directory.

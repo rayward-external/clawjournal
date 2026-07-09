@@ -34,6 +34,8 @@ from .parsing.parser import (
     LOCAL_AGENT_DIR,
     OPENCODE_DIR,
     OPENCLAW_DIR,
+    WORKBUDDY_DIR,
+    WORKBUDDY_IMPORT_DIR,
     discover_projects,
     parse_project_sessions,
 )
@@ -76,18 +78,18 @@ EXPORT_REVIEW_PUBLISH_STEPS = [
 
 SETUP_TO_PUBLISH_STEPS = [
     "Step 1/5: Run prep/list to review project scope: clawjournal prep && clawjournal list",
-    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|claude-science|codex|gemini|all>",
+    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>",
     "Step 3/5: Configure exclusions/redactions and confirm projects: clawjournal config ...",
     "Step 4/5: Export locally: clawjournal export --output /tmp/clawjournal_export.jsonl",
     "Step 5/5: Review and confirm: clawjournal confirm ...",
 ]
 
-EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
-SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"]
-WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "gemini", "kimi"]
+EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"}
+SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"]
+WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "gemini", "kimi"]
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
-FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-corpus", "failure-v1", "all", "auto", "both"}
 
 
@@ -117,7 +119,7 @@ def _normalize_score_source_filter(raw: str | None) -> str | list[str] | None:
     if value == "both":
         print(
             "Warning: --source both is deprecated for scoring; use "
-            "--source failure-corpus or --source claude,claude-science,codex,opencode,openclaw.",
+            "--source failure-corpus or --source claude,claude-science,codex,opencode,openclaw,workbuddy.",
             file=sys.stderr,
         )
         return ["claude", "codex"]
@@ -177,9 +179,11 @@ def _source_label(source_filter: str) -> str:
         return "Copilot CLI"
     if source_filter == "aider":
         return "Aider"
+    if source_filter == "workbuddy":
+        return "WorkBuddy"
     if source_filter == "custom":
         return "Custom"
-    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
+    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
 
 
 def _normalize_source_filter(source_filter: str) -> str:
@@ -238,7 +242,9 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
     if source_filter == "aider":
         from .parsing.parser import _get_aider_project_index
         return bool(_get_aider_project_index())
-    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists()
+    if source_filter == "workbuddy":
+        return WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
+    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists() or WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
 
 
 def _filter_projects_by_source(projects: list[dict], source_filter: str) -> list[dict]:
@@ -299,14 +305,14 @@ def _build_status_next_steps(
         steps = []
         if not source_confirmed:
             steps.append(
-                "Ask the user to explicitly choose export source scope: Claude Code, Claude Science, Codex, Gemini, or all. "
-                "Then set it: clawjournal config --source <claude|claude-science|codex|gemini|all>. "
+                "Ask the user to explicitly choose export source scope: Claude Code, Claude Science, Codex, Gemini, WorkBuddy, or all. "
+                "Then set it: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>. "
                 "Do not run export until source scope is explicitly confirmed."
             )
         else:
             steps.append(
                 f"Source scope is currently set to '{configured_source}'. "
-                "If the user wants a different scope, run: clawjournal config --source <claude|claude-science|codex|gemini|all>."
+                "If the user wants a different scope, run: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>."
             )
         if not projects_confirmed:
             steps.append(
@@ -1167,7 +1173,7 @@ def prep(source_filter: str = "auto") -> None:
             from .parsing.parser import GEMINI_DIR
             err = f"{GEMINI_DIR} was not found."
         else:
-            err = "None of ~/.claude, ~/.claude-science, ~/.codex, or ~/.gemini/tmp were found."
+            err = "None of ~/.claude, ~/.claude-science, ~/.codex, ~/.gemini/tmp, ~/WorkBuddy, or ~/.clawjournal/workbuddy were found."
         print(json.dumps({"error": err}))
         sys.exit(1)
 
@@ -3847,7 +3853,7 @@ def main() -> None:
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
-                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, or all")
+                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, workbuddy, or all")
     cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
                      help="Confirm the AI scoring backend for automatic workbench scoring")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
@@ -6546,12 +6552,12 @@ def _run_export(args) -> None:
             "error": "Source scope is not confirmed yet.",
             "hint": (
                 "Explicitly choose one source scope before exporting: "
-                "`claude`, `claude-science`, `codex`, `gemini`, or `all`."
+                "`claude`, `claude-science`, `codex`, `gemini`, `workbuddy`, or `all`."
             ),
             "required_action": (
-                "Ask the user whether to export Claude Code, Claude Science, Codex, Gemini, or all. "
-                "Then run `clawjournal config --source <claude|claude-science|codex|gemini|all>` "
-                "or pass `--source <claude|claude-science|codex|gemini|all>` on the export command."
+                "Ask the user whether to export Claude Code, Claude Science, Codex, Gemini, WorkBuddy, or all. "
+                "Then run `clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>` "
+                "or pass `--source <claude|claude-science|codex|gemini|workbuddy|all>` on the export command."
             ),
             "allowed_sources": sorted(EXPLICIT_SOURCE_CHOICES),
             "blocked_on_step": "Step 2/5",
@@ -6575,7 +6581,7 @@ def _run_export(args) -> None:
             from .parsing.parser import GEMINI_DIR
             print(f"Error: {GEMINI_DIR} not found.", file=sys.stderr)
         else:
-            print("Error: none of ~/.claude, ~/.claude-science, ~/.codex, or ~/.gemini/tmp were found.", file=sys.stderr)
+            print("Error: none of ~/.claude, ~/.claude-science, ~/.codex, ~/.gemini/tmp, ~/WorkBuddy, or ~/.clawjournal/workbuddy were found.", file=sys.stderr)
         sys.exit(1)
 
     projects = discover_projects(source_filter=source_filter)

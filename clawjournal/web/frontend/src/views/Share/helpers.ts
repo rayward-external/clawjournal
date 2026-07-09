@@ -39,6 +39,7 @@ export function sourceFullLabel(s: { source: string; client_origin?: string | nu
   }
   if (s.source === 'claude-science') return { label: 'Claude Science', color: '#9333ea' };
   if (s.source === 'openclaw') return { label: 'OpenClaw', color: '#6b7280' };
+  if (s.source === 'workbuddy') return { label: 'WorkBuddy', color: '#0f766e' };
   return { label: s.source, color: '#6b7280' };
 }
 
