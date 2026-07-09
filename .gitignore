@@ -21,7 +21,17 @@ node_modules/
 .desloppify/
 .worktrees/
 .claude/
-/docs/
+
+# docs/ is local-only planning material by default. `/docs/*` (not `/docs/`) so git
+# still descends into it — a blanket directory exclude cannot be re-included below.
+# The self-improving-skills design set is versioned explicitly, file by file.
+/docs/*
+!/docs/self-improving-skills/
+/docs/self-improving-skills/*
+!/docs/self-improving-skills/plan.md
+!/docs/self-improving-skills/competitor-comparison.md
+!/docs/self-improving-skills/validation-design.md
+!/docs/self-improving-skills/validation-design-critique.md
 
 # PII review artifacts
 *.pii_findings.json
