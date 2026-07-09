@@ -70,10 +70,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
-function qs(params: Record<string, string | number | null | undefined>): string {
+function qs(params: Record<string, string | number | string[] | number[] | null | undefined>): string {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
-    if (v != null && v !== '') p.set(k, String(v));
+    if (Array.isArray(v)) {
+      v.forEach(item => {
+        if (item != null && item !== '') p.append(k, String(item));
+      });
+    } else if (v != null && v !== '') {
+      p.set(k, String(v));
+    }
   }
   const s = p.toString();
   return s ? `?${s}` : '';
@@ -82,7 +88,7 @@ function qs(params: Record<string, string | number | null | undefined>): string 
 export const api = {
   sessions: {
     list(params: {
-      status?: string | null;
+      status?: string | string[] | null;
       source?: string | null;
       project?: string | null;
       task_type?: string | null;

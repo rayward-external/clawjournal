@@ -1,6 +1,7 @@
 """Tests for the daemon config endpoints and the scoring-warmup decline gate."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from pathlib import Path
 from threading import Thread
@@ -10,7 +11,7 @@ import pytest
 from clawjournal.config import load_config, save_config
 from clawjournal.workbench import daemon as dmod
 from clawjournal.workbench.daemon import WorkbenchHandler
-from clawjournal.workbench.index import open_index
+from clawjournal.workbench.index import open_index, upsert_sessions
 
 
 @pytest.fixture
@@ -161,7 +162,22 @@ class TestScoringBatchCancel:
         cfg_dir = tmp_path / ".clawjournal"
         monkeypatch.setattr("clawjournal.config.CONFIG_DIR", cfg_dir)
         monkeypatch.setattr("clawjournal.config.CONFIG_FILE", cfg_dir / "config.json")
-        open_index().close()
+        now = datetime.now(timezone.utc)
+        conn = open_index()
+        upsert_sessions(conn, [
+            {
+                "session_id": f"s{i}",
+                "project": "test-project",
+                "source": "claude",
+                "model": "m",
+                "start_time": (now - timedelta(minutes=20 + i)).isoformat(),
+                "end_time": (now - timedelta(minutes=10 + i)).isoformat(),
+                "messages": [{"role": "user", "content": "Fix it"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            }
+            for i in range(3)
+        ])
+        conn.close()
 
         fake_sessions = [{"session_id": f"s{i}"} for i in range(3)]
         monkeypatch.setattr(dmod, "query_unscored_sessions", lambda *a, **k: fake_sessions)

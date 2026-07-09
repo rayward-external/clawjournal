@@ -213,7 +213,7 @@ export function Inbox() {
     const [sortField, sortOrder] = sort.split(':');
     try {
       const data = await api.sessions.list({
-        status: null,
+        status: ['new', 'shortlisted'],
         source: sourceFilter,
         project: projectFilter,
         task_type: typeFilter,

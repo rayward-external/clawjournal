@@ -86,9 +86,10 @@ class TestUpsertSessions:
         new_count = upsert_sessions(index_conn, sessions)
         assert new_count == 2
 
-    def test_upsert_preserves_review_status(self, index_conn):
+    @pytest.mark.parametrize("status", ["approved", "blocked"])
+    def test_upsert_preserves_review_status(self, index_conn, status):
         upsert_sessions(index_conn, [_make_session()])
-        update_session(index_conn, "sess-1", status="approved")
+        update_session(index_conn, "sess-1", status=status)
 
         # Re-index same session
         upsert_sessions(index_conn, [_make_session()])
@@ -96,7 +97,7 @@ class TestUpsertSessions:
         row = index_conn.execute(
             "SELECT review_status FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
-        assert row["review_status"] == "approved"
+        assert row["review_status"] == status
 
     def test_upsert_preserves_manual_review_metadata(self, index_conn):
         upsert_sessions(index_conn, [_make_session()])
@@ -419,6 +420,19 @@ class TestQuerySessions:
         results = query_sessions(index_conn, status="approved")
         assert len(results) == 1
         assert results[0]["session_id"] == "s1"
+
+    def test_filter_by_multiple_statuses(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("s1"),
+            _make_session("s2"),
+            _make_session("s3"),
+        ])
+        update_session(index_conn, "s1", status="shortlisted")
+        update_session(index_conn, "s2", status="blocked")
+
+        results = query_sessions(index_conn, status=["new", "shortlisted"])
+
+        assert {row["session_id"] for row in results} == {"s1", "s3"}
 
     def test_filter_by_source(self, index_conn):
         upsert_sessions(index_conn, [

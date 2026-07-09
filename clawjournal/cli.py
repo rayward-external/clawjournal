@@ -119,7 +119,7 @@ def _normalize_score_source_filter(raw: str | None) -> str | list[str] | None:
     if value == "both":
         print(
             "Warning: --source both is deprecated for scoring; use "
-            "--source failure-corpus or --source claude,codex,opencode,openclaw,workbuddy.",
+            "--source failure-corpus or --source claude,claude-science,codex,opencode,openclaw,workbuddy.",
             file=sys.stderr,
         )
         return ["claude", "codex"]

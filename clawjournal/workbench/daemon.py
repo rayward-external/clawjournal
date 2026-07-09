@@ -69,9 +69,11 @@ from .index import (
     open_index,
     query_sessions,
     query_unscored_sessions,
+    release_gate_blockers,
     remove_policy,
     search_fts,
     SCORE_SETTLE_SECONDS,
+    session_matches_excluded_projects,
     source_scope_blockers,
     update_session,
     upsert_sessions,
@@ -103,6 +105,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
 AUTO_SCORE_BATCH_SIZE = 20
+_NO_MATCHING_WARMUP_SOURCE = "__clawjournal_no_matching_warmup_source__"
 SCORING_DISPLAY_NAMES = {
     "claude": "Claude Code",
     "codex": "Codex",
@@ -280,6 +283,95 @@ def trigger_scoring_warmup(
     return scanner.trigger_auto_score(limit=limit, backend=backend)
 
 
+def _score_redaction_settings(settings: dict[str, Any]) -> dict[str, Any] | None:
+    """Return only the policy fields that affect scoring-prompt redaction."""
+    scoped = {
+        "custom_strings": list(settings.get("custom_strings", []) or []),
+        "extra_usernames": list(settings.get("extra_usernames", []) or []),
+        "blocked_domains": list(settings.get("blocked_domains", []) or []),
+    }
+    return scoped if any(scoped.values()) else None
+
+
+def _warmup_source_filter(settings: dict[str, Any]) -> str | tuple[str, ...]:
+    """Return the sources background scoring may egress.
+
+    Warmup scoring is a background AI call, so it must honor the same confirmed
+    source scope that share/skill paths use. Keep the unrestricted case on the
+    failure-value corpus, because not every indexed source has a scoring rollout.
+    """
+    allowed = settings.get("source_filter")
+    if allowed is None:
+        return FAILURE_VALUE_SOURCE_SCOPE
+    if isinstance(allowed, str):
+        allowed_values = {allowed}
+    else:
+        allowed_values = {str(source) for source in allowed if source}
+    scoped = tuple(source for source in FAILURE_VALUE_SOURCE_SCOPE if source in allowed_values)
+    return scoped or _NO_MATCHING_WARMUP_SOURCE
+
+
+def _filter_scoreable_warmup_sessions(
+    conn: sqlite3.Connection,
+    sessions: list[dict[str, Any]],
+    *,
+    excluded_projects: list[str],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the same egress gates before background AI scoring."""
+    if not sessions:
+        return []
+    blocker_ids = {
+        b["session_id"]
+        for b in release_gate_blockers(
+            conn,
+            [s["session_id"] for s in sessions],
+            now=now,
+        )
+    }
+    return [
+        s for s in sessions
+        if s["session_id"] not in blocker_ids
+        and not session_matches_excluded_projects(s, excluded_projects)
+    ]
+
+
+def _query_scoreable_warmup_sessions(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    since: str | None,
+    source_filter: str | tuple[str, ...],
+    excluded_projects: list[str],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Return latest scorable warmup rows without letting gated rows starve them."""
+    if limit <= 0:
+        return []
+
+    fetch_limit = limit
+    max_fetch = 10_000
+    while True:
+        fetched = query_unscored_sessions(
+            conn,
+            limit=fetch_limit,
+            source=source_filter,
+            since=since,
+            include_stale_scored=True,
+            settle_seconds=SCORE_SETTLE_SECONDS,
+            now=now,
+        )
+        scoreable = _filter_scoreable_warmup_sessions(
+            conn,
+            fetched,
+            excluded_projects=excluded_projects,
+            now=now,
+        )
+        if len(scoreable) >= limit or len(fetched) < fetch_limit or fetch_limit >= max_fetch:
+            return scoreable[:limit]
+        fetch_limit = min(max_fetch, max(fetch_limit * 2, fetch_limit + 1))
+
+
 def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
     """Create `notes/{session_id}.md` if it does not already exist.
 
@@ -402,6 +494,9 @@ class Scanner:
         try:
             conn = open_index()
             try:
+                effective_settings = get_effective_share_settings(conn, load_config())
+                excluded_projects = list(effective_settings.get("excluded_projects") or [])
+                redaction_settings = _score_redaction_settings(effective_settings)
                 # Warmup deliberately scores the latest `limit` unscored
                 # failure-corpus traces ordered by start_time DESC with no
                 # age cap (`since` is None for the background path). The
@@ -412,13 +507,12 @@ class Scanner:
                 # graded mid-flight and then grew (end_time advanced past
                 # ai_scored_at); `settle_seconds` defers sessions that are still
                 # active so we don't grade them prematurely in the first place.
-                sessions = query_unscored_sessions(
+                sessions = _query_scoreable_warmup_sessions(
                     conn,
                     limit=limit,
-                    source=FAILURE_VALUE_SOURCE_SCOPE,
                     since=since,
-                    include_stale_scored=True,
-                    settle_seconds=SCORE_SETTLE_SECONDS,
+                    source_filter=_warmup_source_filter(effective_settings),
+                    excluded_projects=excluded_projects,
                 )
                 if not sessions:
                     return 0
@@ -455,7 +549,10 @@ class Scanner:
                                         self._auto_score_disabled_reason)
                             break
                         try:
-                            result = score_session(conn, sid, backend=active)
+                            score_kwargs: dict[str, Any] = {"backend": active}
+                            if redaction_settings is not None:
+                                score_kwargs["redaction_settings"] = redaction_settings
+                            result = score_session(conn, sid, **score_kwargs)
                         except RuntimeError as exc:
                             message = str(exc)
                             backend_dead = is_backend_unavailable_error(message) or any(
@@ -2279,11 +2376,24 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     # --- API handlers ---
 
     def _handle_list_sessions(self, params: dict[str, list[str]]) -> None:
+        status_values = [
+            value.strip()
+            for raw in params.get("status", [])
+            for value in raw.split(",")
+            if value.strip()
+        ]
+        status_filter: str | list[str] | None
+        if len(status_values) == 1:
+            status_filter = status_values[0]
+        elif status_values:
+            status_filter = status_values
+        else:
+            status_filter = None
         conn = open_index()
         try:
             result = query_sessions(
                 conn,
-                status=params.get("status", [None])[0],
+                status=status_filter,
                 source=params.get("source", [None])[0],
                 project=params.get("project", [None])[0],
                 task_type=params.get("task_type", [None])[0],
@@ -2585,8 +2695,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         conn = open_index()
         try:
+            # Manual scoring is AI egress too: scrub configured redaction
+            # strings/usernames/blocked-domains before the prompt leaves the
+            # machine, matching the background warmup path. Unlike warmup we do
+            # not gate on hold/embargo/excluded-project here — scoring a
+            # specific session is an explicit user request for that session.
+            redaction_settings = _score_redaction_settings(
+                get_effective_share_settings(conn, load_config())
+            )
+            score_kwargs: dict[str, Any] = {"model": model, "backend": backend}
+            if redaction_settings is not None:
+                score_kwargs["redaction_settings"] = redaction_settings
             try:
-                result = score_session(conn, session_id, model=model, backend=backend)
+                result = score_session(conn, session_id, **score_kwargs)
             except RuntimeError as e:
                 _json_response(self, {"error": str(e)}, 503)
                 return
