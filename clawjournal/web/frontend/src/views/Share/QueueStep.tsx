@@ -43,6 +43,25 @@ export interface QueueStepProps {
   toast: (msg: string, kind?: 'success' | 'error') => void;
 }
 
+function UpdatedSinceShareBadge({ session }: { session: ReadySession }) {
+  if (!session.updated_since_last_share) return null;
+
+  return (
+    <span
+      title="This trace has new content since its most recent successful share."
+      style={{
+        display: 'inline-flex', alignItems: 'center', flexShrink: 0,
+        padding: '1px 6px', borderRadius: 999,
+        background: colors.primary50, border: `1px solid ${colors.primary200}`,
+        color: colors.primary700, fontSize: 10.5, fontWeight: 600,
+        lineHeight: '16px', whiteSpace: 'nowrap',
+      }}
+    >
+      Updated since last share
+    </span>
+  );
+}
+
 export function QueueStep(p: QueueStepProps) {
   const [dragId, setDragId] = useState<string | null>(null);
 
@@ -144,11 +163,14 @@ export function QueueStep(p: QueueStepProps) {
             borderBottom: i < available.length - 1 ? `1px solid ${colors.gray100}` : 'none',
           }}>
             <div style={{ minWidth: 0 }}>
-              <div style={{
-                fontSize: 13, color: colors.gray900, fontWeight: 500,
-                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-              }}>
-                {s.display_title || 'Untitled'}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                <span style={{
+                  minWidth: 0, fontSize: 13, color: colors.gray900, fontWeight: 500,
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {s.display_title || 'Untitled'}
+                </span>
+                <UpdatedSinceShareBadge session={s} />
               </div>
               <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
                 <SourceBadge s={s} />
@@ -334,11 +356,14 @@ export function QueueStep(p: QueueStepProps) {
                     <Icon name="grip" size={14} />
                   </div>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{
-                      fontSize: 13.5, color: colors.gray900, fontWeight: 500,
-                      whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                    }}>
-                      {s.display_title || 'Untitled'}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                      <span style={{
+                        minWidth: 0, fontSize: 13.5, color: colors.gray900, fontWeight: 500,
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                      }}>
+                        {s.display_title || 'Untitled'}
+                      </span>
+                      <UpdatedSinceShareBadge session={s} />
                     </div>
                     {/* Row 1: source · project · tokens · tools */}
                     <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2, flexWrap: 'nowrap', overflow: 'hidden' }}>

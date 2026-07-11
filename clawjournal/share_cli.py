@@ -42,6 +42,7 @@ from .workbench.index import (
     SHAREABLE_HOLD_STATES,
     effective_hold_state,
     get_effective_share_settings,
+    get_share_ready_stats,
     get_session_detail,
     open_index,
     query_sessions,
@@ -503,6 +504,27 @@ def step_queue(conn, settings, args) -> list[dict]:
     source_filter = _effective_source_filter(settings, args.source)
     candidates = query_sessions(conn, status=args.status, source=source_filter,
                                 limit=5000, sort="end_time", order="desc")
+    # Use the same revision-aware eligibility as the web queue. A stable
+    # session ID is shareable again only when its current content revision
+    # differs from the latest successful upload; drafts and failed uploads do
+    # not suppress it. The metadata merge also lets terminal presentation and
+    # future filters distinguish extended traces without duplicating SQL here.
+    ready = get_share_ready_stats(
+        conn,
+        excluded_projects=settings["excluded_projects"],
+        source_filter=source_filter,
+        include_unapproved=True,
+    )
+    ready_by_id = {row["session_id"]: row for row in ready["sessions"]}
+    candidates = [row for row in candidates if row["session_id"] in ready_by_id]
+    for row in candidates:
+        eligible = ready_by_id[row["session_id"]]
+        for field in (
+            "revision_hash",
+            "last_shared_revision_hash",
+            "updated_since_last_share",
+        ):
+            row[field] = eligible.get(field)
 
     # By default (like the web), score the in-window unscored traces on open so
     # the queue shows real failure values instead of "—". Skip with --no-score.
@@ -813,7 +835,19 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
             die("Resolve hold/embargo state (e.g. `clawjournal release <id>`) and retry.")
 
         print(f"  {DIM}sealing… (redact → TruffleHog → PII pass → re-scan){RST}")
-        res = share_flow.package(conn, session_ids, settings, ai_pii=package_ai, note=args.note)
+        expected_revisions = {
+            s["row"]["session_id"]: s["row"]["revision_hash"]
+            for s in recs
+            if s["row"].get("revision_hash")
+        }
+        res = share_flow.package(
+            conn,
+            session_ids,
+            settings,
+            ai_pii=package_ai,
+            note=args.note,
+            expected_revisions=expected_revisions or None,
+        )
         if res["ok"]:
             export_dir, manifest, share_id = res["export_dir"], res["manifest"], res["share_id"]
             try:
@@ -1108,13 +1142,14 @@ def add_share_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     return parser
 
 
-def refresh_index(source_filter: str | None = None) -> int:
+def refresh_index(source_filter: str | None = None) -> tuple[int, int]:
     """One-shot incremental scan (same as `clawjournal scan` / the daemon's
     initial scan), so the wizard sees fresh traces without a running
-    `clawjournal serve`. Returns the number of newly indexed sessions."""
+    `clawjournal serve`. Returns ``(new_sessions, updated_traces)``."""
     from .workbench.daemon import Scanner
-    results = Scanner(source_filter=source_filter).scan_once()
-    return sum(results.values())
+    scanner = Scanner(source_filter=source_filter)
+    results = scanner.scan_once()
+    return sum(results.values()), scanner.last_updated_count
 
 
 def _normalize_indices(args):
@@ -1138,9 +1173,14 @@ def run(args) -> None:
     if not getattr(args, "no_refresh", False):
         print(f"{DIM}Refreshing trace index…{RST}")
         try:
-            n = refresh_index(args.source)
-            print(f"{DIM}{('Indexed %d new session(s).' % n) if n else 'Index already up to date.'}"
-                  f"{RST}")
+            new_count, updated_count = refresh_index(args.source)
+            if new_count or updated_count:
+                print(
+                    f"{DIM}Indexed {new_count} new session(s); updated "
+                    f"{updated_count} existing trace(s).{RST}"
+                )
+            else:
+                print(f"{DIM}Index already up to date.{RST}")
         except Exception as exc:  # noqa: BLE001
             print(f"{YEL}Index refresh skipped: {exc}{RST}")
     config = load_config()

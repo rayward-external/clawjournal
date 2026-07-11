@@ -1238,13 +1238,29 @@ def _run_scan(source_filter: str | None = None) -> None:
     results = scanner.scan_once()
 
     total_new = sum(results.values())
-    if total_new:
-        print(f"Indexed {total_new} new sessions:")
-        for source, count in sorted(results.items()):
-            if count > 0:
-                print(f"  {source}: {count}")
+    total_updated = scanner.last_updated_count
+    if total_new or total_updated:
+        new_label = "session" if total_new == 1 else "sessions"
+        updated_label = "trace" if total_updated == 1 else "traces"
+        print(
+            f"Indexed {total_new} new {new_label}; "
+            f"updated {total_updated} existing {updated_label}:"
+        )
+        sources = set(results) | set(scanner.last_updated_by_source)
+        for source in sorted(sources):
+            parts = []
+            new_count = results.get(source, 0)
+            updated_count = scanner.last_updated_by_source.get(source, 0)
+            if new_count:
+                label = "new session" if new_count == 1 else "new sessions"
+                parts.append(f"{new_count} {label}")
+            if updated_count:
+                label = "updated trace" if updated_count == 1 else "updated traces"
+                parts.append(f"{updated_count} {label}")
+            if parts:
+                print(f"  {source}: {', '.join(parts)}")
     else:
-        print("No new sessions found.")
+        print("No new or updated sessions found.")
 
     conn = open_index()
     try:
@@ -1414,10 +1430,14 @@ def _resolve_share_id(conn, prefix: str) -> str | None:
 def _run_bundle_create(args) -> None:
     """Create a bundle from session IDs or by review status."""
     from .workbench.index import (
+        already_shared_revision_blockers,
         create_share,
         get_effective_share_settings,
+        get_share_ready_stats,
         open_index,
         query_sessions,
+        RevisionConflictError,
+        revision_review_blockers,
         source_scope_blockers,
     )
 
@@ -1425,6 +1445,7 @@ def _run_bundle_create(args) -> None:
     try:
         settings = get_effective_share_settings(conn, load_config())
         session_ids = list(args.session_ids) if args.session_ids else []
+        explicitly_selected = bool(session_ids)
 
         if args.status and not session_ids:
             sessions = query_sessions(
@@ -1434,6 +1455,24 @@ def _run_bundle_create(args) -> None:
                 limit=10000,
             )
             session_ids = [s["session_id"] for s in sessions]
+
+        ready = get_share_ready_stats(
+            conn,
+            excluded_projects=settings["excluded_projects"],
+            source_filter=settings.get("source_filter"),
+            include_unapproved=True,
+        )
+        ready_ids = {session["session_id"] for session in ready["sessions"]}
+        ineligible_ids = [sid for sid in session_ids if sid not in ready_ids]
+        if explicitly_selected and ineligible_ids:
+            print(
+                "Selected sessions are not eligible to bundle. They may already "
+                "be shared at this revision, require fresh approval, or be missing: "
+                + ", ".join(ineligible_ids)
+            )
+            sys.exit(1)
+        if not explicitly_selected:
+            session_ids = [sid for sid in session_ids if sid in ready_ids]
 
         if not session_ids:
             print("No sessions to bundle. Provide session IDs or use --status approved.")
@@ -1446,13 +1485,36 @@ def _run_bundle_create(args) -> None:
         if source_blockers:
             print("Some selected sessions are outside the confirmed source scope.")
             sys.exit(1)
+        review_blockers = revision_review_blockers(conn, session_ids)
+        if review_blockers:
+            print("Updated traces require fresh approval before re-upload.")
+            sys.exit(1)
+        duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
+        if duplicate_blockers:
+            print("One or more selected trace revisions were already shared.")
+            sys.exit(1)
 
-        share_id = create_share(
-            conn, session_ids,
-            attestation=args.attestation,
-            note=args.note,
-            source_filter=settings.get("source_filter"),
-        )
+        placeholders = ", ".join("?" for _ in session_ids)
+        revision_rows = conn.execute(
+            f"SELECT session_id, content_revision FROM sessions "
+            f"WHERE session_id IN ({placeholders})",
+            session_ids,
+        ).fetchall()
+        expected_revisions = {
+            row["session_id"]: row["content_revision"] for row in revision_rows
+        }
+
+        try:
+            share_id = create_share(
+                conn, session_ids,
+                attestation=args.attestation,
+                note=args.note,
+                source_filter=settings.get("source_filter"),
+                expected_revisions=expected_revisions,
+            )
+        except RevisionConflictError:
+            print("A selected trace changed while the bundle was being created. Review it and retry.")
+            sys.exit(1)
         # Get actual count from DB (create_share only links IDs that exist)
         from .workbench.index import get_share
         share = get_share(conn, share_id)
@@ -1957,8 +2019,10 @@ def _run_share(args) -> None:
         create_share,
         get_effective_share_settings,
         get_share,
+        get_share_ready_stats,
         open_index,
         query_sessions,
+        RevisionConflictError,
         session_matches_excluded_projects,
         source_scope_blockers,
     )
@@ -1969,6 +2033,7 @@ def _run_share(args) -> None:
     try:
         settings = get_effective_share_settings(conn, config)
         session_ids = list(args.session_ids) if args.session_ids else []
+        explicitly_selected = bool(session_ids)
 
         # Query once, reuse for both ID collection and preview
         if args.status and not session_ids:
@@ -1993,6 +2058,34 @@ def _run_share(args) -> None:
             session for session in session_rows
             if not session_matches_excluded_projects(session, settings["excluded_projects"])
         ]
+        ready = get_share_ready_stats(
+            conn,
+            excluded_projects=settings["excluded_projects"],
+            source_filter=settings.get("source_filter"),
+            include_unapproved=True,
+        )
+        ready_by_id = {row["session_id"]: row for row in ready["sessions"]}
+        ineligible_ids = [sid for sid in session_ids if sid not in ready_by_id]
+        if explicitly_selected and ineligible_ids:
+            print(
+                "Selected sessions are not eligible to share. They may already "
+                "be uploaded at this revision or require fresh approval: "
+                + ", ".join(ineligible_ids)
+            )
+            sys.exit(1)
+        session_rows = [
+            session for session in session_rows
+            if session["session_id"] in ready_by_id
+        ]
+        for session in session_rows:
+            session.update({
+                key: ready_by_id[session["session_id"]].get(key)
+                for key in (
+                    "revision_hash",
+                    "last_shared_revision_hash",
+                    "updated_since_last_share",
+                )
+            })
         source_blockers = source_scope_blockers(
             conn,
             [s["session_id"] for s in session_rows],
@@ -2022,12 +2115,21 @@ def _run_share(args) -> None:
         from .workbench.daemon import _prepare_share_export_for_upload
 
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        share_id = create_share(
-            conn,
-            session_ids,
-            note=args.note,
-            source_filter=settings.get("source_filter"),
-        )
+        try:
+            share_id = create_share(
+                conn,
+                session_ids,
+                note=args.note,
+                source_filter=settings.get("source_filter"),
+                expected_revisions={
+                    session["session_id"]: session["revision_hash"]
+                    for session in session_rows
+                    if session.get("revision_hash")
+                },
+            )
+        except RevisionConflictError:
+            print("A selected trace changed after review. Review it again and retry.")
+            sys.exit(1)
         share = get_share(conn, share_id)
         if share is None:
             print("Share failed: newly created share could not be loaded.")

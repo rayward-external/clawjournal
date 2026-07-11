@@ -271,6 +271,8 @@ clawjournal share --interactive --weekly
 
 It lists shareable traces, prioritizes AI-scored high-failure-value sessions, shows the redacted preview, asks for consent, then uploads when hosted submission is available or saves a ZIP for manual upload. Useful filters: `--all`, `--source codex`, `--source claude`, `--search "text"`, and `--ai-pii-review` for the optional AI PII pass.
 
+**Continuing an already-shared trace is supported.** A later `clawjournal scan` reports the existing trace as updated without creating a duplicate ID. Because the new content has not been reviewed, ClawJournal resets that trace to `new` and clears its old AI score. Approve it again in the Inbox; it will then reappear in Share with an **Updated since last share** label. The next bundle keeps the same trace identity and records which earlier revision it replaces.
+
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
 > *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.*

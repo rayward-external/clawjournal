@@ -49,6 +49,12 @@ export interface ReadySession {
   runtime_channel?: string | null;
   start_time?: string | null;
   review_status?: string;
+  /** Current normalized trace-content revision. */
+  revision_hash?: string | null;
+  /** Revision included in the latest successful share, when one exists. */
+  last_shared_revision_hash?: string | null;
+  /** True when this stable trace has new content after its latest successful share. */
+  updated_since_last_share?: boolean;
 }
 
 export interface ShareReadyStats {

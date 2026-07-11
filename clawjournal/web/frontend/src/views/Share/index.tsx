@@ -645,7 +645,17 @@ export function Share() {
 
     try {
       const ids = approvedList.map((s) => s.session_id);
-      const { share_id } = await api.shares.create(ids, note || undefined);
+      const expectedRevisions = Object.fromEntries(
+        approvedList
+          .filter((s): s is ReadySession & { revision_hash: string } => Boolean(s.revision_hash))
+          .map((s) => [s.session_id, s.revision_hash]),
+      );
+      const { share_id } = await api.shares.create(
+        ids,
+        note || undefined,
+        undefined,
+        expectedRevisions,
+      );
 
       // Finish the animation cleanly before exposing the share id — the
       // `packageProgress >= 100 && packagedShareId` combination triggers the
