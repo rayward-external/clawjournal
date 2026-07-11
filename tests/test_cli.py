@@ -1034,6 +1034,43 @@ class TestBundleCreate:
         with pytest.raises(SystemExit):
             _run_bundle_create(args)
 
+    def test_create_by_status_filters_already_shared_revision(
+        self, bundle_index, capsys
+    ):
+        from clawjournal.cli import _run_bundle_create
+        from clawjournal.workbench.index import create_share, open_index
+
+        conn = open_index()
+        try:
+            shared_id = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", shared_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        args = MagicMock(
+            session_ids=[], status="approved", note=None, attestation=None, json=True
+        )
+        _run_bundle_create(args)
+
+        output = json.loads(capsys.readouterr().out)
+        assert output["session_count"] == 2
+
+    def test_create_explicit_missing_id_exits_cleanly(self, bundle_index, capsys):
+        from clawjournal.cli import _run_bundle_create
+
+        args = MagicMock(
+            session_ids=["missing"], status=None, note=None,
+            attestation=None, json=False,
+        )
+        with pytest.raises(SystemExit):
+            _run_bundle_create(args)
+
+        assert "not eligible to bundle" in capsys.readouterr().out
+
 
 class TestBundleList:
     def test_list_empty(self, bundle_index, capsys):
@@ -1332,6 +1369,70 @@ class TestSearch:
         _run_search(args)
         out = capsys.readouterr().out
         assert "No results" in out
+
+
+class TestScanOutput:
+    @staticmethod
+    def _patch_scan_dependencies(monkeypatch, scanner_cls):
+        class FakeConnection:
+            def close(self):
+                pass
+
+        monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda: None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.Scanner", scanner_cls)
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.open_index", lambda: FakeConnection()
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.get_stats",
+            lambda conn: {"total": 27, "by_status": {}, "by_source": {}},
+        )
+
+    def test_reports_updated_trace_when_no_new_session(self, monkeypatch, capsys):
+        class FakeScanner:
+            last_updated_count = 1
+            last_updated_by_source = {"codex": 1}
+            last_linked_count = 0
+
+            def __init__(self, source_filter=None):
+                pass
+
+            def scan_once(self):
+                return {"codex": 0}
+
+        self._patch_scan_dependencies(monkeypatch, FakeScanner)
+
+        from clawjournal.cli import _run_scan
+
+        _run_scan()
+        output = capsys.readouterr().out
+
+        assert "Indexed 0 new sessions; updated 1 existing trace:" in output
+        assert "codex: 1 updated trace" in output
+        assert "No new sessions found" not in output
+
+    def test_reports_no_changes_only_when_new_and_updated_are_zero(
+        self, monkeypatch, capsys
+    ):
+        class FakeScanner:
+            last_updated_count = 0
+            last_updated_by_source = {}
+            last_linked_count = 0
+
+            def __init__(self, source_filter=None):
+                pass
+
+            def scan_once(self):
+                return {"codex": 0}
+
+        self._patch_scan_dependencies(monkeypatch, FakeScanner)
+
+        from clawjournal.cli import _run_scan
+
+        _run_scan()
+        output = capsys.readouterr().out
+
+        assert "No new or updated sessions found." in output
 
 
 class TestWorkbenchSourceChoices:
@@ -1952,6 +2053,28 @@ class TestShare:
         assert captured.get("ai_pii_review_enabled") is True
         output = json.loads(capsys.readouterr().out)
         assert output["workbench_url"].endswith("&ai_pii=1")
+
+    def test_share_revision_race_exits_cleanly(
+        self, bundle_index, capsys, monkeypatch
+    ):
+        from clawjournal.cli import _run_share
+        from clawjournal.workbench.index import RevisionConflictError
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.create_share",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RevisionConflictError([{"session_id": "sess-0"}])
+            ),
+        )
+        args = MagicMock(
+            session_ids=[], status="approved", note=None,
+            force=False, json=False, preview=False,
+        )
+
+        with pytest.raises(SystemExit):
+            _run_share(args)
+
+        assert "changed after review" in capsys.readouterr().out
 
 
 class TestVerifyEmail:

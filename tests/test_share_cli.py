@@ -171,7 +171,9 @@ def test_blocked_recovery_removes_and_retries(monkeypatch):
     monkeypatch.setattr(share_cli, "build_zip", lambda d: b"zip")
     calls = []
 
-    def _package(conn, session_ids, settings, *, ai_pii, note=None):
+    def _package(
+        conn, session_ids, settings, *, ai_pii, note=None, expected_revisions=None
+    ):
         calls.append(list(session_ids))
         if "bad" in session_ids:  # first attempt: block "bad"
             return {"ok": False, "blocked_sessions": ["bad"], "error": "blocked"}
@@ -191,7 +193,9 @@ def test_blocked_recovery_removes_and_retries(monkeypatch):
 def test_blocked_all_blocked_aborts(monkeypatch):
     monkeypatch.setattr(share_cli, "gate_blockers", lambda conn, ids: [])
 
-    def _package(conn, session_ids, settings, *, ai_pii, note=None):
+    def _package(
+        conn, session_ids, settings, *, ai_pii, note=None, expected_revisions=None
+    ):
         return {"ok": False, "blocked_sessions": list(session_ids), "error": "blocked"}
     monkeypatch.setattr(share_cli.share_flow, "package", _package)
 
@@ -277,6 +281,16 @@ def test_step_queue_scores_only_settled_unscored_candidates(monkeypatch):
     scored_ids = []
 
     monkeypatch.setattr(share_cli, "query_sessions", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        share_cli,
+        "get_share_ready_stats",
+        lambda *a, **k: {
+            "sessions": [
+                {"session_id": row["session_id"], "revision_hash": f"rev-{row['session_id']}"}
+                for row in rows
+            ]
+        },
+    )
     monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: "codex")
 
     def fake_unscored(conn, **kwargs):
@@ -385,13 +399,14 @@ def test_refresh_index_counts_new_sessions(monkeypatch):
     class FakeScanner:
         def __init__(self, source_filter=None):
             self.source_filter = source_filter
+            self.last_updated_count = 2
 
         def scan_once(self):
             return {"claude": 2, "codex": 1}
 
     monkeypatch.setattr(d, "Scanner", FakeScanner)
-    assert share_cli.refresh_index() == 3
-    assert share_cli.refresh_index("codex") == 3
+    assert share_cli.refresh_index() == (3, 2)
+    assert share_cli.refresh_index("codex") == (3, 2)
 
 
 # ---- queue selection input ('all') ------------------------------------------

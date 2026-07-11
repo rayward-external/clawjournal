@@ -205,7 +205,7 @@ export const api = {
     return request('/projects');
   },
 
-  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; ai_failure_value_score: number | null; ai_recovery_labels: string[]; ai_failure_attribution: string | null; ai_failure_modes: string[]; ai_learning_summary: string | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string }> }> {
+  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; ai_failure_value_score: number | null; ai_recovery_labels: string[]; ai_failure_attribution: string | null; ai_failure_modes: string[]; ai_learning_summary: string | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string; revision_hash?: string | null; last_shared_revision_hash?: string | null; updated_since_last_share?: boolean }> }> {
     const q = opts?.includeUnapproved ? '?include_unapproved=1' : '';
     return request(`/share-ready${q}`);
   },
@@ -304,11 +304,21 @@ export const api = {
       return request(`/shares/${encodeURIComponent(id)}`);
     },
 
-    create(sessionIds: string[], note?: string, attestation?: string): Promise<{ share_id: string }> {
+    create(
+      sessionIds: string[],
+      note?: string,
+      attestation?: string,
+      expectedRevisions?: Record<string, string>,
+    ): Promise<{ share_id: string }> {
       return request('/shares', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_ids: sessionIds, note, attestation }),
+        body: JSON.stringify({
+          session_ids: sessionIds,
+          note,
+          attestation,
+          expected_revisions: expectedRevisions,
+        }),
       });
     },
 
@@ -446,7 +456,7 @@ export const api = {
     return request(`/advisor${qs(params)}`);
   },
 
-  scan(opts: { force?: boolean } = {}): Promise<{ ok: boolean; new_sessions: Record<string, number>; force_rescan?: { processed: number; errored: { session_id: string; error: string }[] } }> {
+  scan(opts: { force?: boolean } = {}): Promise<{ ok: boolean; new_sessions: Record<string, number>; updated_sessions?: Record<string, number>; unchanged_sessions?: Record<string, number>; force_rescan?: { processed: number; errored: { session_id: string; error: string }[] } }> {
     const path = opts.force ? '/scan?force=true' : '/scan';
     return request(path, { method: 'POST' });
   },

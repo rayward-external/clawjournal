@@ -76,4 +76,15 @@ Optional self-hosted path:
 
 The default configuration is local-first and does not require any hosted backend.
 
+### Trace revision contract
+
+`session_id` is the stable identity of a source trace, including traces that continue growing after an upload. Each normalized message snapshot also carries:
+
+- `revision_hash`: `sha256:<hex>` over the canonical normalized `messages` array.
+- `replaces_revision_hash`: the last successfully uploaded revision for that `session_id`, or `null` for its first upload.
+
+Both fields appear on the exported JSONL row and its manifest session entry. A receiver must upsert by `session_id`, treat an identical `revision_hash` as idempotent, replace only when `replaces_revision_hash` matches its current revision, and reject a stale predecessor instead of overwriting newer content.
+
+Schema-v6 migration gives an unreadable pre-v6 blob an opaque `legacy:<hex>` baseline and assigns the same value to its historical successful share. Receivers must compare this value exactly; they should not attempt to derive or validate legacy content from it.
+
 See [PRIVACY.md](PRIVACY.md) for the full redaction and upload model.
