@@ -31,7 +31,7 @@ DEFAULT_SCORE_LIMIT = 25
 
 @dataclass
 class SkillResult:
-    rules: list[SkillRule]          # the merged top-<=MAX_INSTALLED_RULES to install
+    rules: list[SkillRule]          # the merged active top-<=MAX_INSTALLED_RULES to install
     skill_md: str
     region: str
     blocked: list[tuple[SkillRule, list[str]]]
@@ -179,7 +179,7 @@ def _semantic_dedup(ranked: list[SkillRule], new_fps: set[str]) -> list[SkillRul
 
 def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[str],
                 *, now: datetime | None = None) -> list[SkillRule]:
-    """Merge existing + newly-distilled rules -> top-<=10 installed (replace the weakest).
+    """Merge existing + newly-distilled rules -> active top-<=5 installed (replace the weakest).
 
     Deduped by fingerprint; rejected fingerprints dropped; ranked by RECENCY-WEIGHTED
     support (so stale peaks decay) then recurred-this-run. **Interleaved across kinds**

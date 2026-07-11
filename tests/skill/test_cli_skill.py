@@ -113,3 +113,69 @@ def test_preview_persists_proposed_rules_for_rejection(monkeypatch, index_conn):
     assert fp in {store.fingerprint(r) for r in store.load_kept(index_conn)}
     assert store.reject(index_conn, fp)
     assert fp in store.rejected_fingerprints(index_conn)
+
+
+def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path, capsys):
+    class ConnProxy:
+        def __getattr__(self, name):
+            return getattr(index_conn, name)
+
+        def close(self):
+            pass
+
+    class InteractiveStdin:
+        @staticmethod
+        def isatty():
+            return True
+
+    rule = SkillRule(
+        kind="avoid",
+        title="Inspect Runtime First",
+        trigger="before explaining project-specific agent behavior",
+        guidance="inspect the runtime implementation and tool schema before concluding",
+        why="the same assumption caused repeated incorrect explanations",
+        taxonomy="context_handling",
+        support=2,
+    )
+
+    class Result:
+        rules = [rule]
+        skill_md = "unused for a Codex-only install"
+        region = "# Your coding lessons\n\n### Inspect Runtime First\n"
+        blocked = []
+        gate_issues = []
+        corpus = SkillCorpus(window_start="a", window_end="b", total_failures=2)
+        meta = {}
+        added_fps = {store.fingerprint(rule)}
+        dropped = []
+        trend = {}
+        objective_trend = {}
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("clawjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
+    monkeypatch.setattr("clawjournal.cli_skill._config_excluded_projects", lambda *a, **k: [])
+    monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: ConnProxy())
+    monkeypatch.setattr("clawjournal.cli_skill.generate_skill", lambda *a, **k: Result())
+    monkeypatch.setattr("clawjournal.cli_skill.sys.stdin", InteractiveStdin())
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+
+    args = _args(preview=False, target=["codex"])
+    run_skill(args)
+
+    agents_path = tmp_path / ".codex" / "AGENTS.md"
+    assert agents_path.exists()
+    assert "Inspect Runtime First" in agents_path.read_text(encoding="utf-8")
+    assert not (tmp_path / ".claude" / "skills" / "clawjournal-lessons" / "SKILL.md").exists()
+
+    row = index_conn.execute(
+        "SELECT state, installed_at FROM skill_rules WHERE fingerprint = ?",
+        (store.fingerprint(rule),),
+    ).fetchone()
+    assert row["state"] == "kept"
+    assert row["installed_at"] is not None
+
+    run_skill(args)
+    installed_text = agents_path.read_text(encoding="utf-8")
+    from clawjournal.skill import install
+    assert installed_text.count(install.BEGIN_MARKER) == 1
+    assert capsys.readouterr().out.count("Installed:") == 2

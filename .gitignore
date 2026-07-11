@@ -32,6 +32,7 @@ node_modules/
 !/docs/self-improving-skills/competitor-comparison.md
 !/docs/self-improving-skills/validation-design.md
 !/docs/self-improving-skills/validation-design-critique.md
+!/docs/self-improving-skills/review-notes.md
 
 # PII review artifacts
 *.pii_findings.json

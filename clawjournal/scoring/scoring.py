@@ -453,7 +453,7 @@ def load_scoring_rubric() -> str:
     """Load the scoring rubric from the canonical prompt copy."""
     for path in _RUBRIC_SEARCH_PATHS:
         if path.exists():
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             if text.startswith("---"):
                 try:
                     end = text.index("---", 3)
@@ -746,6 +746,8 @@ def _rubric_revision(rubric: str) -> str:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except Exception:
@@ -1352,7 +1354,7 @@ def score_session(
     # do not persist a false 1/5 score for broken index state.
     if not messages:
         try:
-            blob_data = json.loads(blob_path.read_text())
+            blob_data = json.loads(blob_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             raise RuntimeError(
                 "Session transcript is unreadable. Re-run `clawjournal scan` to rebuild the index."
