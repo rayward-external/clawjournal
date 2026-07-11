@@ -1,5 +1,6 @@
 """Local SQLite + FTS5 index for the scientist workbench."""
 
+import hashlib
 import json
 import logging
 import os
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     blob_path          TEXT,
     raw_source_path    TEXT,
     session_key        TEXT,
+    content_fingerprint TEXT,
     indexed_at         TEXT NOT NULL,
     updated_at         TEXT,
     share_id           TEXT REFERENCES shares(share_id),
@@ -134,6 +136,8 @@ CREATE TABLE IF NOT EXISTS share_sessions (
     share_id     TEXT NOT NULL REFERENCES shares(share_id),
     session_id   TEXT NOT NULL REFERENCES sessions(session_id),
     added_at     TEXT NOT NULL,
+    exported_content_fingerprint TEXT,
+    submitted_content_fingerprint TEXT,
     PRIMARY KEY (share_id, session_id)
 );
 
@@ -364,6 +368,10 @@ def open_index() -> sqlite3.Connection:
         # them the Token Usage chart under-counts Claude input by ~50x.
         ("cache_read_tokens", "INTEGER DEFAULT 0"),
         ("cache_creation_tokens", "INTEGER DEFAULT 0"),
+        # Stable digest of the trace payload.  Timestamps such as updated_at
+        # deliberately do not participate, so routine rescans do not make a
+        # previously shared trace look new.
+        ("content_fingerprint", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -379,6 +387,17 @@ def open_index() -> sqlite3.Connection:
     ]:
         try:
             conn.execute(f"ALTER TABLE shares ADD COLUMN {col} {col_type}")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+
+    for col, col_type in [
+        ("exported_content_fingerprint", "TEXT"),
+        ("submitted_content_fingerprint", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE share_sessions ADD COLUMN {col} {col_type}")
             conn.commit()
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e):
@@ -1741,6 +1760,25 @@ def recompute_estimated_costs(conn: sqlite3.Connection) -> int:
     return changed
 
 
+def session_content_fingerprint(session: dict[str, Any]) -> str:
+    """Return a stable digest of the parsed conversation payload.
+
+    Index timestamps, paths, and derived scores are deliberately excluded so
+    a routine rescan does not make an already submitted trace look new.
+    """
+    messages = session.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    canonical = json.dumps(
+        messages,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) -> int:
     """Index parsed sessions into the database.
 
@@ -1773,6 +1811,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         session_key = _derive_session_key_from_source(
             source, session.get("raw_source_path")
         )
+        content_fingerprint = session_content_fingerprint(session)
         stats = session.get("stats", {})
         duration = _compute_duration(session)
 
@@ -1801,7 +1840,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
             "ai_value_badges, ai_risk_badges, "
             "ai_effort_estimate, ai_summary, "
             "share_id, session_key, parent_session_id, subagent_session_ids, "
-            "estimated_cost_usd, end_time "
+            "estimated_cost_usd, end_time, content_fingerprint "
             "FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -1878,6 +1917,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 files_touched, commands_run,
                 blob_path, raw_source_path,
                 session_key,
+                content_fingerprint,
                 indexed_at, updated_at,
                 review_status,
                 selection_reason, reviewer_notes, reviewed_at,
@@ -1906,6 +1946,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 ?, ?,
                 ?, ?,
                 ?, ?,
+                ?,
                 ?,
                 ?, ?, ?, ?,
                 ?, ?, ?,
@@ -1948,6 +1989,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 blob_path = excluded.blob_path,
                 raw_source_path = excluded.raw_source_path,
                 session_key = COALESCE(excluded.session_key, session_key),
+                content_fingerprint = excluded.content_fingerprint,
                 updated_at = excluded.updated_at,
                 parent_session_id = COALESCE(excluded.parent_session_id, parent_session_id),
                 segment_index = excluded.segment_index,
@@ -1983,6 +2025,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 str(blob_path),
                 session.get("raw_source_path"),
                 session_key or preserved_session_key,
+                content_fingerprint,
                 preserved_indexed_at,
                 now,
                 preserved_status,
@@ -3694,7 +3737,7 @@ def get_share_ready_stats(
     source_filter: str | list[str] | tuple[str, ...] | None = None,
     include_unapproved: bool = False,
 ) -> dict[str, Any]:
-    """Return sessions that have not been shared before.
+    """Return sessions that have not been submitted at their current revision.
 
     By default returns only `review_status='approved'` sessions; pass
     `include_unapproved=True` to widen the pool so the Preview UI can
@@ -3726,18 +3769,16 @@ def get_share_ready_stats(
         " runtime_channel, start_time, review_status, hold_state, embargo_until"
         " FROM sessions"
         f"{where_sql}"
-        f"{and_sql} session_id NOT IN ("
-        "   SELECT DISTINCT session_id FROM ("
-        "     SELECT s.session_id AS session_id"
-        "     FROM sessions s"
-        "     JOIN shares b ON s.share_id = b.share_id"
-        "     WHERE b.shared_at IS NOT NULL"
-        "     UNION"
-        "     SELECT bs.session_id AS session_id"
-        "     FROM share_sessions bs"
-        "     JOIN shares b ON bs.share_id = b.share_id"
-        "     WHERE b.shared_at IS NOT NULL"
-        "   )"
+        f"{and_sql} NOT EXISTS ("
+        "   SELECT 1 FROM share_sessions ss"
+        "   JOIN shares sh ON sh.share_id = ss.share_id"
+        "   WHERE ss.session_id = sessions.session_id"
+        "     AND sh.shared_at IS NOT NULL"
+        # A NULL snapshot is a legacy submission made before revision
+        # tracking. Keep it excluded rather than accidentally offering a
+        # duplicate; new submissions always receive a concrete fingerprint.
+        "     AND (ss.submitted_content_fingerprint IS NULL"
+        "          OR ss.submitted_content_fingerprint = sessions.content_fingerprint)"
         " )"
         " ORDER BY (ai_failure_value_score IS NULL),"
         " ai_failure_value_score DESC, start_time DESC,"
@@ -3862,6 +3903,59 @@ def get_share(
     return result
 
 
+def record_share_export_revisions(
+    conn: sqlite3.Connection,
+    share_id: str,
+    revisions: dict[str, str],
+) -> None:
+    """Record the trace revisions placed in this share's local export.
+
+    The values never leave the local database.  On a successful upload they
+    become the submission baseline, allowing a future scan to distinguish a
+    routine reparse from new conversation activity in the same session.
+    """
+    conn.execute(
+        "UPDATE share_sessions SET exported_content_fingerprint = NULL WHERE share_id = ?",
+        (share_id,),
+    )
+    conn.executemany(
+        "UPDATE share_sessions SET exported_content_fingerprint = ? "
+        "WHERE share_id = ? AND session_id = ?",
+        [(fingerprint, share_id, session_id) for session_id, fingerprint in revisions.items()],
+    )
+
+
+def mark_share_revisions_submitted(conn: sqlite3.Connection, share_id: str) -> None:
+    """Promote the exact exported revisions to the submission baseline."""
+    conn.execute(
+        "UPDATE share_sessions "
+        "SET submitted_content_fingerprint = exported_content_fingerprint "
+        "WHERE share_id = ? AND exported_content_fingerprint IS NOT NULL",
+        (share_id,),
+    )
+
+
+def seed_legacy_submission_revisions(
+    conn: sqlite3.Connection,
+    prior_revisions: dict[str, str],
+) -> None:
+    """Backfill a legacy submission baseline only after a real trace change.
+
+    Versions prior to revision tracking did not retain a content fingerprint
+    at upload time.  The scanner calls this with the indexed revision it saw
+    *before* a changed parse replaces it.  That lets an old uploaded trace
+    re-enter the share queue for the newly observed activity without making
+    every historical submission eligible again after an upgrade.
+    """
+    for session_id, fingerprint in prior_revisions.items():
+        conn.execute(
+            "UPDATE share_sessions SET submitted_content_fingerprint = ? "
+            "WHERE session_id = ? AND submitted_content_fingerprint IS NULL "
+            "AND share_id IN (SELECT share_id FROM shares WHERE shared_at IS NOT NULL)",
+            (fingerprint, session_id),
+        )
+
+
 EXPORT_FIELDS = {
     "session_id", "project", "source", "model",
     "start_time", "end_time", "duration_seconds",
@@ -3972,6 +4066,7 @@ def export_share_to_disk(
 
     total_redactions = 0
     redaction_types: dict[str, int] = {}
+    exported_revisions: dict[str, str] = {}
 
     try:
         with open(tmp_sessions_file, "w") as f:
@@ -3999,6 +4094,9 @@ def export_share_to_disk(
                         redaction_types["custom"] = redaction_types.get("custom", 0) + custom_count
                     clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
                     f.write(json.dumps(clean, default=str) + "\n")
+                    fingerprint = detail.get("content_fingerprint")
+                    if isinstance(fingerprint, str) and fingerprint:
+                        exported_revisions[s["session_id"]] = fingerprint
                     manifest["sessions"].append({
                         "session_id": clean.get("session_id") or s["session_id"],
                         "project": clean.get("project"),
@@ -4017,6 +4115,7 @@ def export_share_to_disk(
 
     # Update count to match actually exported sessions (some may have missing blobs)
     manifest["session_count"] = len(manifest["sessions"])
+    record_share_export_revisions(conn, share_id, exported_revisions)
     manifest["redaction_summary"] = {
         "total_redactions": total_redactions,
         "by_type": redaction_types,

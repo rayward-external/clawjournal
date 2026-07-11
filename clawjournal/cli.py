@@ -1238,6 +1238,7 @@ def _run_scan(source_filter: str | None = None) -> None:
     results = scanner.scan_once()
 
     total_new = sum(results.values())
+    updated = scanner.last_updated_count
     if total_new:
         print(f"Indexed {total_new} new sessions:")
         for source, count in sorted(results.items()):
@@ -1245,6 +1246,12 @@ def _run_scan(source_filter: str | None = None) -> None:
                 print(f"  {source}: {count}")
     else:
         print("No new sessions found.")
+    if updated:
+        noun = "trace" if updated == 1 else "traces"
+        print(
+            f"Detected new activity in {updated} existing {noun}; "
+            "they are available to share again."
+        )
 
     conn = open_index()
     try:

@@ -25,7 +25,15 @@ from clawjournal.workbench.daemon import (
     _warn_if_frontend_stale,
     trigger_scoring_warmup,
 )
-from clawjournal.workbench.index import add_policy, open_index, set_hold_state, upsert_sessions
+from clawjournal.workbench.index import (
+    add_policy,
+    create_share,
+    get_share_ready_stats,
+    open_index,
+    set_hold_state,
+    update_session,
+    upsert_sessions,
+)
 
 
 @pytest.fixture
@@ -653,6 +661,59 @@ class TestStatsAPI:
 
 
 class TestScanner:
+    def test_scan_once_reports_new_activity_in_existing_trace(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [{"dir_name": "demo", "source": "claude"}],
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.run_findings_pipeline", lambda *args, **kwargs: None)
+
+        session = {
+            "session_id": "continued-session",
+            "project": "demo",
+            "source": "claude",
+            "messages": [{"role": "user", "content": "Investigate", "tool_uses": []}],
+            "stats": {},
+        }
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.parse_project_sessions",
+            lambda *args, **kwargs: [session],
+        )
+
+        scanner = Scanner()
+        assert scanner.scan_once() == {"claude": 1}
+        assert scanner.last_updated_count == 0
+
+        conn = open_index()
+        try:
+            update_session(conn, "continued-session", status="approved")
+            legacy_share = create_share(conn, ["continued-session"])
+            conn.execute(
+                "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+                ("2026-07-11T12:00:00+00:00", legacy_share),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        session["messages"].append(
+            {"role": "assistant", "content": "Found new evidence", "tool_uses": []}
+        )
+        assert scanner.scan_once() == {"claude": 0}
+        assert scanner.last_updated_count == 1
+
+        conn = open_index()
+        try:
+            assert [s["session_id"] for s in get_share_ready_stats(conn)["sessions"]] == [
+                "continued-session"
+            ]
+        finally:
+            conn.close()
+
     def test_scan_once_links_subagent_hierarchy(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
         monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")

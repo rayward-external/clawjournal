@@ -14,6 +14,8 @@ from clawjournal.workbench.index import (
     get_dashboard_analytics,
     get_share,
     get_shares,
+    mark_share_revisions_submitted,
+    record_share_export_revisions,
     get_policies,
     get_share_ready_stats,
     get_session_detail,
@@ -910,6 +912,51 @@ class TestShares:
         assert [s["session_id"] for s in stats["sessions"]] == ["s3", "s2"]
         # Recommendation is the same ordered list (recent high failure value, capped 5).
         assert stats["recommended_session_ids"] == ["s3", "s2"]
+
+    def test_share_ready_reoffers_trace_when_its_content_changes(self, index_conn):
+        """A continued session is eligible again, but not on a routine rescan."""
+        upsert_sessions(index_conn, [_make_session("continued", content="Initial investigation")])
+        update_session(index_conn, "continued", status="approved", ai_quality_score=5)
+
+        first_share = create_share(index_conn, ["continued"])
+        first_revision = index_conn.execute(
+            "SELECT content_fingerprint FROM sessions WHERE session_id = ?",
+            ("continued",),
+        ).fetchone()["content_fingerprint"]
+        record_share_export_revisions(index_conn, first_share, {"continued": first_revision})
+        mark_share_revisions_submitted(index_conn, first_share)
+        index_conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+            ("2026-07-11T12:00:00+00:00", first_share),
+        )
+        index_conn.commit()
+
+        assert get_share_ready_stats(index_conn)["sessions"] == []
+
+        # The same parsed content should remain excluded after a normal scan.
+        upsert_sessions(index_conn, [_make_session("continued", content="Initial investigation")])
+        assert get_share_ready_stats(index_conn)["sessions"] == []
+
+        # Appended work produces a new content revision for the same session ID.
+        upsert_sessions(index_conn, [_make_session("continued", content="Initial investigation\nFound the root cause")])
+        ready = get_share_ready_stats(index_conn)["sessions"]
+        assert [session["session_id"] for session in ready] == ["continued"]
+
+        # Once the new revision is submitted it is again excluded.
+        second_share = create_share(index_conn, ["continued"])
+        second_revision = index_conn.execute(
+            "SELECT content_fingerprint FROM sessions WHERE session_id = ?",
+            ("continued",),
+        ).fetchone()["content_fingerprint"]
+        record_share_export_revisions(index_conn, second_share, {"continued": second_revision})
+        mark_share_revisions_submitted(index_conn, second_share)
+        index_conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+            ("2026-07-11T12:10:00+00:00", second_share),
+        )
+        index_conn.commit()
+
+        assert get_share_ready_stats(index_conn)["sessions"] == []
 
     def test_share_ready_does_not_recommend_legacy_productivity_only_scores(self, index_conn):
         from datetime import datetime, timedelta, timezone

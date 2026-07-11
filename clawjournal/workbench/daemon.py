@@ -66,17 +66,20 @@ from .index import (
     get_share_ready_stats,
     get_stats,
     link_subagent_hierarchy,
+    mark_share_revisions_submitted,
     open_index,
     query_sessions,
     query_unscored_sessions,
     release_gate_blockers,
     remove_policy,
     search_fts,
+    seed_legacy_submission_revisions,
     SCORE_SETTLE_SECONDS,
     session_matches_excluded_projects,
     source_scope_blockers,
     update_session,
     upsert_sessions,
+    session_content_fingerprint,
 )
 from .timeline import (
     canonical_session_path,
@@ -407,6 +410,7 @@ class Scanner:
         self._thread: threading.Thread | None = None
         self._last_scan_mtimes: dict[str, float] = {}
         self.last_linked_count = 0
+        self.last_updated_count = 0
         self.last_scored_count = 0
         self._score_thread: threading.Thread | None = None
         self._score_lock = threading.Lock()
@@ -425,6 +429,7 @@ class Scanner:
         """Run a single scan pass. Returns {source: new_session_count}."""
         conn = open_index()
         try:
+            self.last_updated_count = 0
             config = load_config()
             # Ingest stores raw content; anonymization happens at egress
             # (apply_share_redactions, score_session).
@@ -454,6 +459,28 @@ class Scanner:
                         locator=project.get("locator"),
                     )
                     if sessions:
+                        session_ids = [s.get("session_id") for s in sessions if s.get("session_id")]
+                        previous_revisions: dict[str, str | None] = {}
+                        if session_ids:
+                            placeholders = ",".join("?" for _ in session_ids)
+                            rows = conn.execute(
+                                "SELECT session_id, content_fingerprint FROM sessions "
+                                f"WHERE session_id IN ({placeholders})",
+                                session_ids,
+                            ).fetchall()
+                            previous_revisions = {
+                                row["session_id"]: row["content_fingerprint"] for row in rows
+                            }
+                        changed_prior_revisions = {
+                            session["session_id"]: previous_revisions[session["session_id"]]
+                            for session in sessions
+                            if session.get("session_id") in previous_revisions
+                            and previous_revisions[session["session_id"]] is not None
+                            and previous_revisions[session["session_id"]]
+                            != session_content_fingerprint(session)
+                        }
+                        self.last_updated_count += len(changed_prior_revisions)
+                        seed_legacy_submission_revisions(conn, changed_prior_revisions)
                         new_count = upsert_sessions(conn, sessions)
                         results[source] = results.get(source, 0) + new_count
                         # Drive each freshly-upserted session through the
@@ -1827,6 +1854,7 @@ def upload_share_to_self_hosted_ingest(
         "UPDATE shares SET status = 'shared', shared_at = ?, gcs_uri = ?, bundle_hash = ? WHERE share_id = ?",
         (shared_at, gcs_uri, bundle_hash, share_id),
     )
+    mark_share_revisions_submitted(conn, share_id)
     conn.commit()
 
     redaction_summary = manifest.get("redaction_summary", {}) if manifest else {}
@@ -2070,6 +2098,7 @@ def submit_share_to_hosted(
             share_id,
         ),
     )
+    mark_share_revisions_submitted(conn, share_id)
     conn.commit()
 
     _clear_stored_upload_token()
