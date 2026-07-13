@@ -4,7 +4,7 @@ from argparse import Namespace
 
 import pytest
 
-from clawjournal.cli_skill import run_skill
+from clawjournal.cli_skill import _format_install_targets, run_skill
 from clawjournal.skill import store
 from clawjournal.skill.schema import SkillRule
 from clawjournal.skill.select import SkillCorpus
@@ -50,6 +50,19 @@ def test_rejects_invalid_distill_effort(monkeypatch, capsys):
         run_skill(_args(effort="max"))
     assert exc.value.code == 2
     assert "Unsupported effort for codex" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("targets", "label"),
+    [
+        (["codex"], "Codex"),
+        (["claude"], "Claude Code"),
+        (["claude", "codex"], "Claude Code + Codex"),
+        (["workbuddy", "future-agent"], "WorkBuddy + Future Agent"),
+    ],
+)
+def test_format_install_targets(targets, label):
+    assert _format_install_targets(targets) == label
 
 
 def test_gate_issues_exit_nonzero(monkeypatch):
@@ -157,10 +170,17 @@ def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path
     monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: ConnProxy())
     monkeypatch.setattr("clawjournal.cli_skill.generate_skill", lambda *a, **k: Result())
     monkeypatch.setattr("clawjournal.cli_skill.sys.stdin", InteractiveStdin())
-    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    prompts = []
+
+    def confirm(prompt):
+        prompts.append(prompt)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", confirm)
 
     args = _args(preview=False, target=["codex"])
     run_skill(args)
+    assert prompts == ["\nInstall these 1 rule(s) for Codex? [y/N] "]
 
     agents_path = tmp_path / ".codex" / "AGENTS.md"
     assert agents_path.exists()
@@ -175,6 +195,7 @@ def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path
     assert row["installed_at"] is not None
 
     run_skill(args)
+    assert prompts[-1] == "\nInstall these 1 rule(s) for Codex? [y/N] "
     installed_text = agents_path.read_text(encoding="utf-8")
     from clawjournal.skill import install
     assert installed_text.count(install.BEGIN_MARKER) == 1

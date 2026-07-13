@@ -508,6 +508,26 @@ def _ascii_safe(text: str) -> str:
         return text
 
 
+_INSTALL_TARGET_LABELS = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "workbuddy": "WorkBuddy",
+}
+
+
+def _format_install_targets(targets: list[str]) -> str:
+    """Return a human-readable label for current and future install targets."""
+    labels = [
+        _INSTALL_TARGET_LABELS.get(target, target.replace("-", " ").title())
+        for target in dict.fromkeys(targets)
+    ]
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return " + ".join(labels)
+    return ", ".join(labels[:-1]) + f" + {labels[-1]}"
+
+
 def _print_preview(res: SkillResult) -> None:
     c = res.corpus
     print(f"\nWindow: {c.total_failures} failure + {c.total_successes} success/recovery "
@@ -659,13 +679,15 @@ def run_skill(args) -> None:
             _persist_seen()
             print("\n(preview only — not installed; re-run without --preview to install.)")
             return
+        targets = getattr(args, "target", None) or ["claude", "codex"]
         if not getattr(args, "yes", False):
             if not sys.stdin.isatty():
                 _persist_seen()
                 print("\nRe-run with --yes to install (or --preview to just look).")
                 return
             try:
-                ans = input(f"\nInstall these {len(res.rules)} rule(s) for Claude Code + Codex? [y/N] ")
+                target_label = _format_install_targets(targets)
+                ans = input(f"\nInstall these {len(res.rules)} rule(s) for {target_label}? [y/N] ")
             except EOFError:  # Ctrl-D / stdin closed -> treat as a graceful decline
                 ans = ""
             if ans.strip().lower() not in ("y", "yes"):
@@ -677,7 +699,6 @@ def run_skill(args) -> None:
         # actually landed on disk. If one target fails after another succeeded, the
         # rules ARE installed for the survivor, so the store MUST record them — else
         # the next run mislabels every rule [NEW] and the trend snapshot is lost.
-        targets = getattr(args, "target", None) or ["claude", "codex"]
         installed: list[str] = []
         failures: list[str] = []
         for name, fn, payload in (("claude", _install.install_claude, res.skill_md),
