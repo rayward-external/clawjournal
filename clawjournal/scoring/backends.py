@@ -520,8 +520,8 @@ def run_default_agent_task(
         cwd: Working directory for the subprocess.
         system_prompt_file: Path to system prompt (used by Claude's
             ``--system-prompt-file``; ignored by other backends).
-        task_prompt: The task instruction. Delivered via stdin (Claude),
-            positional arg (Codex), scripted one-shot (Hermes), or
+        task_prompt: The task instruction. Delivered via stdin (Claude/Codex),
+            scripted one-shot (Hermes), or
             ``--message`` (OpenClaw).
         model: Optional model override for Claude/Codex. Claude and Codex use
             fast backend-specific defaults when not provided; other backends
@@ -616,20 +616,20 @@ def run_default_agent_task(
             output_schema_path=schema_path,
             output_file_path=output_path,
         )
-        cmd.append(task_prompt)
+        # Read the prompt from stdin instead of putting it in argv. Windows limits
+        # command lines to roughly 32K characters, while scoring and distillation
+        # prompts can legitimately exceed that. An explicit ``-`` tells Codex to
+        # consume stdin without entering interactive input mode.
+        cmd.append("-")
 
         try:
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
+                input=task_prompt,
                 text=True,
                 env=agent_env,
                 timeout=timeout_seconds,
-                # codex exec reads stdin in addition to the prompt arg; without an
-                # explicit EOF it blocks ("Reading additional input from stdin…")
-                # whenever stdin isn't a closed/empty stream (daemon, pipelines,
-                # background jobs), hanging until the timeout. DEVNULL gives EOF.
-                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Timed out waiting for codex ({timeout_seconds}s)")

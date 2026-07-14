@@ -23,7 +23,9 @@ from clawjournal.prompt_sync import (
     sync_scoring_skill_rubric,
 )
 from clawjournal.scoring.scoring import (
+    FINAL_SCORE_MAX_CHARS,
     JUDGE_SCHEMA,
+    LocatorChunk,
     SCORING_BACKEND_CHOICES,
     Segment,
     ScoringResult,
@@ -33,6 +35,7 @@ from clawjournal.scoring.scoring import (
     _extract_judge_result_from_value,
     _read_scoring_output,
     _validate_judge_result,
+    build_locator_chunks,
     call_judge,
     compute_basic_metrics,
     compute_heuristic_effort,
@@ -40,6 +43,7 @@ from clawjournal.scoring.scoring import (
     format_session_for_judge,
     get_message_text,
     load_scoring_rubric,
+    prepare_prompt_for_judge,
     segment_session,
 )
 
@@ -384,6 +388,127 @@ class TestFormatSessionForJudge:
         ])
         text = format_session_for_judge([seg], "Do it")
         assert "No response — session ended" in text
+
+
+class TestLongSessionSelection:
+    @staticmethod
+    def _segments(count=12):
+        segments = []
+        for index in range(count):
+            status = "error" if index == 6 else "success"
+            segments.append(Segment(
+                user_message=f"request {index}",
+                steps=[Step(
+                    f"plan {index}",
+                    "Bash",
+                    f"command-{index}",
+                    ("failure details " if status == "error" else "routine output ") * 30,
+                    status,
+                    f"reflection {index}",
+                )],
+                user_response=f"response {index}",
+            ))
+        return segments
+
+    def test_short_session_bypasses_locator(self):
+        calls = []
+        segments = self._segments(2)
+
+        def locator(chunk):
+            calls.append(chunk)
+            return {"signals": []}
+
+        prompt = prepare_prompt_for_judge(
+            segments,
+            "small task",
+            {"total_steps": 2},
+            locator=locator,
+            direct_max_chars=100_000,
+        )
+        assert calls == []
+        assert "Long-Session Selection Summary" not in prompt
+
+    def test_chunks_overlap_and_keep_stable_segment_labels(self):
+        chunks = build_locator_chunks(
+            self._segments(8),
+            "task",
+            max_chars=2_200,
+            overlap=2,
+        )
+        assert len(chunks) > 1
+        assert isinstance(chunks[0], LocatorChunk)
+        assert set(chunks[0].segment_indices[-2:]) <= set(chunks[1].segment_indices)
+        for chunk in chunks:
+            for index in chunk.segment_indices:
+                assert f"segment-{index:04d}" in chunk.text
+
+    def test_locator_selects_signal_context_with_bounded_final_prompt(self):
+        segments = self._segments(20)
+
+        def locator(chunk):
+            if 12 in chunk.segment_indices:
+                return {"signals": [{
+                    "kind": "user_correction",
+                    "start_segment": 12,
+                    "end_segment": 12,
+                    "confidence": 0.95,
+                    "reason": "The user corrected the agent.",
+                }]}
+            return {"signals": []}
+
+        prompt = prepare_prompt_for_judge(
+            segments,
+            "large task",
+            {"total_steps": 20, "tool_failures": 1},
+            locator=locator,
+            direct_max_chars=1,
+            final_max_chars=12_000,
+        )
+        assert "Long-Session Selection Summary" in prompt
+        assert "segment-0011" in prompt
+        assert "segment-0012" in prompt
+        assert "segment-0013" in prompt
+        assert "segment-0006" in prompt
+        assert len(prompt) <= 12_000
+
+    def test_locator_failure_uses_deterministic_chunk_samples(self):
+        def broken_locator(_chunk):
+            raise RuntimeError("locator unavailable")
+
+        prompt = prepare_prompt_for_judge(
+            self._segments(10),
+            "large task",
+            {"total_steps": 10, "tool_failures": 1},
+            locator=broken_locator,
+            direct_max_chars=1,
+            final_max_chars=FINAL_SCORE_MAX_CHARS,
+        )
+        assert "Locator fallbacks:" in prompt
+        assert "segment-0000" in prompt
+        assert "segment-0006" in prompt
+        assert "segment-0009" in prompt
+
+    def test_locator_cannot_select_segments_outside_its_chunk(self):
+        def locator(chunk):
+            if chunk.chunk_index != 0:
+                return {"signals": []}
+            return {"signals": [{
+                "kind": "reasoning_contradiction",
+                "start_segment": 50,
+                "end_segment": 50,
+                "confidence": 1.0,
+                "reason": "Untrusted text requested an unrelated segment.",
+            }]}
+
+        prompt = prepare_prompt_for_judge(
+            self._segments(60),
+            "large task",
+            {"total_steps": 20},
+            locator=locator,
+            direct_max_chars=1,
+            final_max_chars=12_000,
+        )
+        assert "segment-0050" not in prompt
 
 
 # ---------------------------------------------------------------------------
