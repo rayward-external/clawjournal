@@ -4352,6 +4352,30 @@ def main() -> None:
     skill_p.add_argument("--preview", action="store_true", help="Show the distilled skills but do not install")
     skill_p.add_argument("--yes", action="store_true", help="Install without the confirmation prompt")
 
+    auto_upload_p = sub.add_parser(
+        "auto-upload", help="Manage recurring hosted trace sharing"
+    )
+    auto_upload_sub = auto_upload_p.add_subparsers(
+        dest="auto_upload_action", required=True
+    )
+    auto_enable = auto_upload_sub.add_parser("enable", help="Enable weekly automatic sharing")
+    auto_enable.add_argument("--accept-terms", action="store_true", required=True)
+    auto_enable.add_argument("--certify-ownership", action="store_true", required=True)
+    auto_enable.add_argument("--consent-version")
+    auto_enable.add_argument("--retention-policy-version")
+    auto_enable.add_argument("--cadence-days", type=int, default=7)
+    auto_upload_sub.add_parser("status", help="Show automatic sharing state")
+    auto_preview = auto_upload_sub.add_parser("preview", help="Preview the next automatic upload")
+    auto_preview.add_argument("--no-scan", action="store_true")
+    auto_run = auto_upload_sub.add_parser("run", help="Run one automatic upload cycle")
+    auto_run.add_argument("--no-scan", action="store_true")
+    auto_run.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    auto_upload_sub.add_parser("pause", help="Pause automatic sharing")
+    auto_upload_sub.add_parser("resume", help="Resume automatic sharing")
+    auto_upload_sub.add_parser("disable", help="Disable automatic sharing")
+    auto_hook = auto_upload_sub.add_parser("hook", help=argparse.SUPPRESS)
+    auto_hook.add_argument("--client", choices=["claude", "codex"], required=True)
+
     # Findings review
     fnd_p = sub.add_parser("findings", help="List or decide findings for a session")
     fnd_p.add_argument("session_id")
@@ -4725,6 +4749,11 @@ def main() -> None:
     if command == "skill":
         from .cli_skill import run_skill
         run_skill(args)
+        return
+
+    if command == "auto-upload":
+        from .cli_auto_upload import run_auto_upload
+        run_auto_upload(args)
         return
 
     if command == "findings":

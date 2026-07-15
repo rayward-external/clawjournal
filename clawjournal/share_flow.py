@@ -219,6 +219,13 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
         {ok, share_id, export_dir, manifest, blocked_sessions, error}
     blocked_sessions is the list of sessions TruffleHog/PII blocked (for recovery).
     """
+    release_blockers = release_gate_blockers(conn, session_ids)
+    if release_blockers:
+        return {
+            "ok": False,
+            "error": "Share contains sessions that are not released",
+            "blockers": release_blockers,
+        }
     source_blockers = source_scope_blockers(conn, session_ids, settings.get("source_filter"))
     if source_blockers:
         return {
@@ -271,6 +278,9 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
                 "error": manifest.get("block_message") or manifest.get("block_reason")
                 or "Bundle marked blocked.",
                 "blocked_sessions": manifest.get("blocked_sessions") or []}
+    coverage_ok, coverage_error = verify_coverage(manifest, ai_pii)
+    if not coverage_ok:
+        return {"ok": False, "share_id": share_id, "error": coverage_error}
     return {"ok": True, "share_id": share_id, "export_dir": export_dir, "manifest": manifest,
             "blocked_sessions": []}
 
@@ -350,12 +360,15 @@ def build_zip(export_dir: Path) -> bytes:
 
 def submit(conn, share_id: str, *, accept_terms: bool, ownership_certification: bool,
            consent_version: str, retention_policy_version: str, settings: dict,
-           ai_pii: bool) -> dict:
+           ai_pii: bool, upload_token_override: str | None = None,
+           **recurring: Any) -> dict:
     return submit_share_to_hosted(
         conn, share_id,
         accept_terms=accept_terms, ownership_certification=ownership_certification,
         consent_version=consent_version, retention_policy_version=retention_policy_version,
         settings=settings, ai_pii_review_enabled=ai_pii,
+        upload_token_override=upload_token_override,
+        **recurring,
     )
 
 

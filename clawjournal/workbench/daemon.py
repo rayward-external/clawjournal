@@ -78,6 +78,7 @@ from .index import (
     SCORE_SETTLE_SECONDS,
     session_matches_excluded_projects,
     share_predecessor_blockers,
+    share_revision_blockers,
     source_scope_blockers,
     update_session,
     upsert_sessions,
@@ -415,6 +416,7 @@ class Scanner:
         self.last_unchanged_count = 0
         self.last_updated_by_source: dict[str, int] = {}
         self.last_unchanged_by_source: dict[str, int] = {}
+        self.last_scan_errors: list[dict[str, str]] = []
         self.last_scored_count = 0
         self._score_thread: threading.Thread | None = None
         self._score_lock = threading.Lock()
@@ -440,6 +442,7 @@ class Scanner:
         self.last_unchanged_count = 0
         self.last_updated_by_source = {}
         self.last_unchanged_by_source = {}
+        self.last_scan_errors = []
         conn = open_index()
         try:
             config = load_config()
@@ -497,6 +500,10 @@ class Scanner:
                             except Exception:
                                 logger.exception("Findings pipeline failed for %s", sid)
                 except Exception:
+                    self.last_scan_errors.append({
+                        "source": source,
+                        "project": str(project.get("dir_name") or ""),
+                    })
                     logger.exception("Error parsing project %s", project["dir_name"])
 
             self.last_linked_count = link_subagent_hierarchy(conn)
@@ -1587,6 +1594,9 @@ def _manifest_is_finalized_for_upload(
         return False
     if ai_pii is not None and pii_review.get("ai_enabled") is not ai_pii:
         return False
+    coverage = pii_review.get("coverage") or summary.get("coverage") or {}
+    if pii_review.get("ai_enabled") is True and coverage.get("rules_only", 0) != 0:
+        return False
     return (
         post_pii_scan.get("findings") == 0
         and post_pii_scan.get("bypassed") is False
@@ -1776,6 +1786,13 @@ def upload_share_to_self_hosted_ingest(
             "blockers": predecessor_blockers,
             "status": 409,
         }
+    revision_blockers = share_revision_blockers(conn, share_id)
+    if revision_blockers:
+        return {
+            "error": "Share revisions changed after packaging",
+            "blockers": revision_blockers,
+            "status": 409,
+        }
 
     # Reuse the immutable artifact the user reviewed whenever one exists.
     # Re-exporting live blobs here could silently include appended content that
@@ -1951,6 +1968,13 @@ def submit_share_to_hosted(
     settings: dict[str, Any],
     ai_pii_review_enabled: bool | None = None,
     force: bool = False,
+    upload_token_override: str | None = None,
+    artifact_path: str | None = None,
+    client_submission_id: str | None = None,
+    recurring_enrollment_id: str | None = None,
+    authorization_revision: str | None = None,
+    revision_keys: list[str] | None = None,
+    expected_enrollment_generation: int | None = None,
 ) -> dict[str, Any]:
     """Submit a finalized share zip to the hosted research API."""
     # The HTTP handler already checks for missing keys; these checks keep
@@ -2014,10 +2038,13 @@ def submit_share_to_hosted(
             "status": 409,
         }
 
-    try:
-        _verified_email, upload_token = _ensure_hosted_upload_token()
-    except RuntimeError as exc:
-        return {"error": str(exc), "status": 403}
+    if upload_token_override:
+        upload_token = upload_token_override
+    else:
+        try:
+            _verified_email, upload_token = _ensure_hosted_upload_token()
+        except RuntimeError as exc:
+            return {"error": str(exc), "status": 403}
 
     try:
         capabilities = _fetch_hosted_share_capabilities()
@@ -2044,7 +2071,7 @@ def submit_share_to_hosted(
         return {"error": "Failed to prepare upload zip", "status": 500}
 
     try:
-        zip_bytes = _build_share_zip(export_dir)
+        zip_bytes = Path(artifact_path).read_bytes() if artifact_path else _build_share_zip(export_dir)
     except OSError as exc:
         return {"error": f"Failed to build upload zip: {exc}", "status": 500}
 
@@ -2069,14 +2096,52 @@ def submit_share_to_hosted(
             sha.update(chunk)
     bundle_hash = sha.hexdigest()
 
-    upload_body, content_type = _build_multipart_body(
-        fields={
+    final_blockers = release_gate_blockers(conn, session_ids)
+    final_blockers += source_scope_blockers(conn, session_ids, settings.get("source_filter"))
+    final_blockers += revision_review_blockers(conn, session_ids)
+    final_blockers += share_revision_blockers(conn, share_id)
+    if final_blockers:
+        return {
+            "error": "Share authority changed before egress",
+            "blockers": final_blockers,
+            "status": 409,
+        }
+    if expected_enrollment_generation is not None:
+        generation_row = conn.execute(
+            "SELECT state, generation FROM auto_upload_enrollment WHERE enrollment_id = 1"
+        ).fetchone()
+        if (
+            generation_row is None
+            or generation_row["state"] != "enabled"
+            or int(generation_row["generation"]) != expected_enrollment_generation
+        ):
+            return {
+                "error": "Automatic sharing was paused, disabled, or changed before egress",
+                "status": 409,
+            }
+
+    fields = {
             "upload_token": upload_token,
             "consent_version": consent_version,
             "retention_policy_version": retention_policy_version,
             "accept_terms": "true" if accept_terms else "false",
             "ownership_certification": "true" if ownership_certification else "false",
-        },
+        }
+    endpoint = "/api/submissions"
+    if client_submission_id:
+        if not recurring_enrollment_id or not authorization_revision or not revision_keys:
+            return {"error": "Recurring submission identity is incomplete.", "status": 400}
+        if len(revision_keys) > 5:
+            return {"error": "Recurring submissions are capped at five traces.", "status": 400}
+        endpoint = "/api/recurring-upload/submissions"
+        fields.update({
+            "client_submission_id": client_submission_id,
+            "enrollment_id": recurring_enrollment_id,
+            "authorization_revision": authorization_revision,
+            "revision_keys": json.dumps(revision_keys, separators=(",", ":")),
+        })
+    upload_body, content_type = _build_multipart_body(
+        fields=fields,
         files={
             "bundle": (
                 f"clawjournal-share-{share_id[:8]}.zip",
@@ -2086,7 +2151,7 @@ def submit_share_to_hosted(
         },
     )
     req = urllib.request.Request(
-        f"{_hosted_api_base()}/api/submissions",
+        f"{_hosted_api_base()}{endpoint}",
         data=upload_body,
         headers={
             "Content-Type": content_type,
@@ -2146,7 +2211,8 @@ def submit_share_to_hosted(
     )
     conn.commit()
 
-    _clear_stored_upload_token()
+    if not upload_token_override:
+        _clear_stored_upload_token()
     redaction_summary = manifest.get("redaction_summary", {}) if manifest else {}
     return {
         "ok": True,
@@ -2295,6 +2361,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_consent()
         elif path == "/api/share/upload-status":
             self._handle_share_upload_status()
+        elif path == "/api/auto-upload/status":
+            self._handle_auto_upload_status()
+        elif path == "/api/auto-upload/terms":
+            self._handle_auto_upload_terms()
+        elif path == "/api/auto-upload/preview":
+            self._handle_auto_upload_preview()
         elif path == "/api/scoring/backend":
             self._handle_scoring_backend()
         elif path == "/api/bundles":
@@ -2370,6 +2442,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_verify_email()
         elif path == "/api/share/verify-confirm":
             self._handle_share_verify_confirm()
+        elif path == "/api/auto-upload/enable":
+            self._handle_auto_upload_enable()
+        elif path == "/api/auto-upload/run":
+            self._handle_auto_upload_run()
+        elif path == "/api/auto-upload/pause":
+            self._handle_auto_upload_pause()
+        elif path == "/api/auto-upload/resume":
+            self._handle_auto_upload_resume()
+        elif path == "/api/auto-upload/disable":
+            self._handle_auto_upload_disable()
         elif path == "/api/bundles":
             self._handle_create_share()
         elif path.startswith("/api/bundles/") and path.endswith("/export"):
@@ -3433,6 +3515,135 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_share_upload_status(self) -> None:
         _json_response(self, hosted_upload_status())
+
+    def _handle_auto_upload_status(self) -> None:
+        from ..auto_upload import enrollment_status
+
+        conn = open_index()
+        try:
+            _json_response(self, enrollment_status(conn))
+        finally:
+            conn.close()
+
+    def _handle_auto_upload_terms(self) -> None:
+        from ..auto_upload import recurring_terms
+        try:
+            _json_response(self, recurring_terms())
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
+            _json_response(self, {"error": str(exc)}, 409)
+
+    def _handle_auto_upload_preview(self) -> None:
+        from ..auto_upload import candidate_report, get_enrollment
+
+        conn = open_index()
+        try:
+            enrollment = get_enrollment(conn)
+            if enrollment is None:
+                _json_response(self, {
+                    "state": "off", "count": 0, "sessions": [],
+                    "error": "Automatic sharing is not enrolled.",
+                }, 409)
+                return
+            report = candidate_report(conn, enrollment)
+            sessions = report["sessions"]
+            _json_response(self, {
+                "state": enrollment["state"],
+                "count": len(sessions),
+                "sessions": sessions,
+                "deferred_count": report["deferred_count"],
+                "limit": report["limit"],
+                "order": report["order"],
+                "eligibility": report["eligibility"],
+            })
+        finally:
+            conn.close()
+
+    def _handle_auto_upload_enable(self) -> None:
+        from ..auto_upload import enable_enrollment, enrollment_status
+        from ..auto_upload_scheduler import install as install_scheduler
+
+        body = _read_body(self) or {}
+        if not body.get("accept_terms") or not body.get("ownership_certification"):
+            _json_response(self, {
+                "error": "Accept the terms and certify ownership before enabling automatic sharing."
+            }, 400)
+            return
+        consent_version = str(body.get("consent_version") or "").strip()
+        retention_version = str(body.get("retention_policy_version") or "").strip()
+        if not consent_version or not retention_version:
+            _json_response(self, {
+                "error": "Consent and retention policy versions are required."
+            }, 400)
+            return
+        conn = open_index()
+        try:
+            enable_enrollment(
+                conn,
+                consent_version=consent_version,
+                retention_policy_version=retention_version,
+                cadence_days=int(body.get("cadence_days") or 7),
+            )
+            scheduler = install_scheduler()
+            result = enrollment_status(conn)
+            result["scheduler"] = scheduler
+            _json_response(self, result)
+        except (OSError, RuntimeError, ValueError) as exc:
+            _json_response(self, {"error": str(exc)}, 400)
+        finally:
+            conn.close()
+
+    def _handle_auto_upload_run(self) -> None:
+        from ..auto_upload import run_once
+
+        body = _read_body(self) or {}
+        try:
+            result = run_once(force=True, scan=not bool(body.get("no_scan")))
+        except (OSError, RuntimeError, ValueError) as exc:
+            _json_response(self, {"error": str(exc)}, 500)
+            return
+        _json_response(self, result, 200 if result.get("ok") else 409)
+
+    def _handle_auto_upload_pause(self) -> None:
+        from ..auto_upload import enrollment_status, set_enrollment_state
+
+        conn = open_index()
+        try:
+            set_enrollment_state(conn, "paused")
+            _json_response(self, enrollment_status(conn))
+        except ValueError as exc:
+            _json_response(self, {"error": str(exc)}, 409)
+        finally:
+            conn.close()
+
+    def _handle_auto_upload_resume(self) -> None:
+        from ..auto_upload import enrollment_status, set_enrollment_state
+        from ..auto_upload_scheduler import install as install_scheduler
+
+        conn = open_index()
+        try:
+            set_enrollment_state(conn, "enabled")
+            install_scheduler()
+            _json_response(self, enrollment_status(conn))
+        except (OSError, RuntimeError, ValueError) as exc:
+            _json_response(self, {"error": str(exc)}, 409)
+        finally:
+            conn.close()
+
+    def _handle_auto_upload_disable(self) -> None:
+        from ..auto_upload import enrollment_status, set_enrollment_state
+        from ..auto_upload_scheduler import remove as remove_scheduler
+
+        conn = open_index()
+        try:
+            set_enrollment_state(conn, "off")
+            scheduler = remove_scheduler()
+            result = enrollment_status(conn)
+            result["scheduler"] = scheduler
+            _json_response(self, result)
+        except (OSError, RuntimeError, ValueError) as exc:
+            _json_response(self, {"error": str(exc)}, 409)
+        finally:
+            conn.close()
 
     def _handle_share_ready(self, params: dict[str, list[str]]) -> None:
         """Return stats for sessions ready to share.

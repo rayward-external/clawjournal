@@ -29,14 +29,17 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 # version 4 marks the workbench as widened-message-aware (parser path
 # now produces messages with optional `invocations` / `snippets` /
 # `extra` / `author` fields, all routed through redaction), version 5
-# stores hosted-submission receipts, and version 6 tracks immutable
-# content revisions for re-sharing traces that continue to grow.
+# stores hosted-submission receipts, version 6 tracks immutable
+# content revisions for re-sharing traces that continue to grow, and
+# version 7 stored the original recurring-upload prototype; version 8
+# implements the capability-gated SessionStart V1 contract.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
 HOSTED_SUBMISSION_SCHEMA_VERSION = 5
 REVISION_TRACKING_SCHEMA_VERSION = 6
-WORKBENCH_SCHEMA_VERSION = REVISION_TRACKING_SCHEMA_VERSION
+AUTO_UPLOAD_SCHEMA_VERSION = 8
+WORKBENCH_SCHEMA_VERSION = AUTO_UPLOAD_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SHARE_RECOMMENDATION_LIMIT = 10
@@ -169,6 +172,57 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time);
 CREATE INDEX IF NOT EXISTS idx_share_sessions_session_id ON share_sessions(session_id);
+
+CREATE TABLE IF NOT EXISTS auto_upload_enrollment (
+    enrollment_id            INTEGER PRIMARY KEY CHECK (enrollment_id = 1),
+    state                    TEXT NOT NULL CHECK (state IN ('enabled', 'paused', 'off')),
+    consent_version          TEXT NOT NULL,
+    retention_policy_version TEXT NOT NULL,
+    source_scope             TEXT NOT NULL,
+    excluded_projects        TEXT NOT NULL,
+    cadence_days             INTEGER NOT NULL DEFAULT 7 CHECK (cadence_days > 0),
+    enrolled_at              TEXT NOT NULL,
+    baseline_at              TEXT NOT NULL,
+    updated_at               TEXT NOT NULL,
+    next_due_at              TEXT,
+    last_attempt_at          TEXT,
+    last_success_at          TEXT,
+    last_trace_count         INTEGER NOT NULL DEFAULT 0,
+    last_share_id            TEXT REFERENCES shares(share_id),
+    last_receipt_id          TEXT,
+    pending_share_id         TEXT REFERENCES shares(share_id),
+    last_error               TEXT,
+    required_action          TEXT
+    ,client_enrollment_id    TEXT
+    ,server_enrollment_id    TEXT
+    ,authorization_revision  TEXT
+    ,recurring_auth_version  TEXT
+    ,included_projects       TEXT NOT NULL DEFAULT '[]'
+    ,profile_hash            TEXT
+    ,server_accepted_at      TEXT
+    ,generation              INTEGER NOT NULL DEFAULT 1
+    ,health                  TEXT NOT NULL DEFAULT 'ready'
+    ,revocation_pending      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS auto_upload_runs (
+    run_id        TEXT PRIMARY KEY,
+    started_at    TEXT NOT NULL,
+    finished_at   TEXT,
+    status        TEXT NOT NULL,
+    due_at        TEXT,
+    share_id      TEXT REFERENCES shares(share_id),
+    trace_count   INTEGER NOT NULL DEFAULT 0,
+    receipt_id    TEXT,
+    error         TEXT
+    ,client_submission_id TEXT
+    ,artifact_path TEXT
+    ,artifact_sha256 TEXT
+    ,revisions_json TEXT
+    ,generation INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_auto_upload_runs_started_at
+    ON auto_upload_runs(started_at DESC);
 
 CREATE TABLE IF NOT EXISTS findings (
     finding_id         TEXT PRIMARY KEY,
@@ -481,6 +535,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_widened_message_model(conn)
     _migrate_hosted_submission_receipts(conn)
     _migrate_revision_tracking(conn)
+    _migrate_auto_upload(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -495,6 +550,106 @@ def open_index() -> sqlite3.Connection:
     conn.commit()
 
     return conn
+
+
+def _migrate_auto_upload(conn: sqlite3.Connection) -> None:
+    """Add recurring-upload state and advance the current V1 schema."""
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= AUTO_UPLOAD_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS auto_upload_enrollment (
+                enrollment_id INTEGER PRIMARY KEY CHECK (enrollment_id = 1),
+                state TEXT NOT NULL CHECK (state IN ('enabled', 'paused', 'off')),
+                consent_version TEXT NOT NULL,
+                retention_policy_version TEXT NOT NULL,
+                source_scope TEXT NOT NULL,
+                excluded_projects TEXT NOT NULL,
+                cadence_days INTEGER NOT NULL DEFAULT 7 CHECK (cadence_days > 0),
+                enrolled_at TEXT NOT NULL,
+                baseline_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                next_due_at TEXT,
+                last_attempt_at TEXT,
+                last_success_at TEXT,
+                last_trace_count INTEGER NOT NULL DEFAULT 0,
+                last_share_id TEXT REFERENCES shares(share_id),
+                last_receipt_id TEXT,
+                pending_share_id TEXT REFERENCES shares(share_id),
+                last_error TEXT,
+                required_action TEXT
+                ,client_enrollment_id TEXT
+                ,server_enrollment_id TEXT
+                ,authorization_revision TEXT
+                ,recurring_auth_version TEXT
+                ,included_projects TEXT NOT NULL DEFAULT '[]'
+                ,profile_hash TEXT
+                ,server_accepted_at TEXT
+                ,generation INTEGER NOT NULL DEFAULT 1
+                ,health TEXT NOT NULL DEFAULT 'ready'
+                ,revocation_pending INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS auto_upload_runs (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                due_at TEXT,
+                share_id TEXT REFERENCES shares(share_id),
+                trace_count INTEGER NOT NULL DEFAULT 0,
+                receipt_id TEXT,
+                error TEXT
+                ,client_submission_id TEXT
+                ,artifact_path TEXT
+                ,artifact_sha256 TEXT
+                ,revisions_json TEXT
+                ,generation INTEGER
+            )"""
+        )
+        for column, definition in (
+            ("client_enrollment_id", "TEXT"),
+            ("server_enrollment_id", "TEXT"),
+            ("authorization_revision", "TEXT"),
+            ("recurring_auth_version", "TEXT"),
+            ("included_projects", "TEXT NOT NULL DEFAULT '[]'"),
+            ("profile_hash", "TEXT"),
+            ("server_accepted_at", "TEXT"),
+            ("generation", "INTEGER NOT NULL DEFAULT 1"),
+            ("health", "TEXT NOT NULL DEFAULT 'ready'"),
+            ("revocation_pending", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE auto_upload_enrollment ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+        for column, definition in (
+            ("client_submission_id", "TEXT"),
+            ("artifact_path", "TEXT"),
+            ("artifact_sha256", "TEXT"),
+            ("revisions_json", "TEXT"),
+            ("generation", "INTEGER"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE auto_upload_runs ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_upload_runs_started_at "
+            "ON auto_upload_runs(started_at DESC)"
+        )
+        conn.execute(f"PRAGMA user_version = {AUTO_UPLOAD_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _migrate_security_refactor(conn: sqlite3.Connection) -> None:

@@ -31,6 +31,9 @@ class ClawJournalConfig(TypedDict, total=False):
     verified_email: str | None
     verified_email_token: str | None
     verified_email_token_expires_at: str | int | float | None
+    recurring_upload_token: str | None
+    recurring_upload_token_expires_at: str | int | float | None
+    recurring_upload_recovery_token: str | None
     pending_verification_id: str | None
     pending_verification_email: str | None
     pending_verification_expires_at: str | int | None
