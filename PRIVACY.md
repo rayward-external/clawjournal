@@ -8,6 +8,7 @@ ClawJournal is designed to be usable without uploading anything.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
 - `bundle-export` writes files to disk. It does not contact a server.
 - If you never use the workbench Submit step, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
+- Weekly automatic sharing remains off unless you explicitly enroll after a hosted submission or in Settings/CLI. Once enrolled, due background runs can upload without another prompt until you pause or disable the service.
 - If you are explicitly enrolled in OpenRefinery Agent Failure Sharing, the optional agent hook only shows a local reminder and can open the existing Share workflow. The hook does not read transcripts, package bundles, or upload data by itself.
 
 ## Automatic redaction
@@ -113,6 +114,12 @@ clawjournal verify-email you@university.edu --code <CODE>
 ```
 
 The academic email is used for verification and short-lived upload authorization. It is not included in the exported bundle itself, and the upload token stays in the local daemon rather than browser JavaScript.
+
+### Automatic weekly sharing
+
+Automatic sharing is a separate, persistent opt-in available only after one successful hosted manual share. Enrollment records separately versioned recurring consent, the exact included source/project snapshot, cadence, server enrollment identity, authorization revision, run state, and receipts. The server returns distinct opaque active and recovery credentials. The active credential can upload; the recovery credential can only revoke enrollment and look up receipts. Neither is exposed to browser JavaScript or embedded in agent hook commands.
+
+The first automatic checkpoint is the server-accepted enrollment time. Each due cycle selects at most five future eligible revisions from the exact snapshot. Stored scores only order candidates; no synchronous scoring occurs. Append-only traces must be unchanged for 24 hours unless their source provides a tested close marker. Local anonymization and deterministic redaction remain independent of optional AI-PII review, and both mandatory TruffleHog scans still gate upload. Settings and `clawjournal auto-upload preview` show the next capped set; `pause` retains enrollment, while `disable` immediately removes hooks and active upload authority and keeps recovery authority only while revocation or receipt reconciliation remains pending.
 
 ## Practical guidance
 

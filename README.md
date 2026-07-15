@@ -273,6 +273,24 @@ It lists shareable traces, prioritizes AI-scored high-failure-value sessions, sh
 
 **Continuing an already-shared trace is supported.** A later `clawjournal scan` reports the existing trace as updated without creating a duplicate ID. Because the new content has not been reviewed, ClawJournal resets that trace to `new` and clears its old AI score. Approve it again in the Inbox; it will then reappear in Share with an **Updated since last share** label. The next bundle keeps the same trace identity and records which earlier revision it replaces.
 
+### Automatic weekly sharing
+
+After a successful hosted submission, the workbench can create a separately versioned recurring authorization. Enrollment snapshots the exact included sources and projects and begins at the server-accepted enrollment time, so older history and newly discovered projects never drain automatically. Seven days later, the next supported Claude Code or Codex `SessionStart` launches one detached cycle. A cycle selects at most five stable eligible revisions; stored failure-value scores order them, but automatic runs never score synchronously. Append-only traces without a trusted close marker must remain unchanged for 24 hours.
+
+Manage it in **Settings → Automatic weekly sharing**, or from the terminal:
+
+```bash
+clawjournal auto-upload enable --accept-terms --certify-ownership
+clawjournal auto-upload status
+clawjournal auto-upload preview
+clawjournal auto-upload run
+clawjournal auto-upload pause
+clawjournal auto-upload resume
+clawjournal auto-upload disable
+```
+
+`enable` preserves existing agent configuration and adds one `SessionStart` hook to Claude Code and Codex. The hook exits quickly and spawns detached work only when due. Before egress, ClawJournal repeats the complete release/revision gate, seals and hashes the exact ZIP, and persists its submission identity and revisions. Retryable failures retain those exact bytes; ambiguous requests reconcile by client submission ID before any retry. Pause and disable win before the atomic submitting boundary, and disable removes active upload authority plus both hooks.
+
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
 > *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.*

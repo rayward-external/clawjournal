@@ -170,6 +170,76 @@ def _delete(port, path, *, skip_auth=False):
     return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
 
 
+def test_auto_upload_status_and_enable_api(server, monkeypatch):
+    status, body = _get(server, "/api/auto-upload/status")
+    assert status == 200
+    assert body["state"] == "off"
+    assert body["enrolled"] is False
+    assert body["capability_available"] is False
+    assert body["manual_share_completed"] is False
+
+    conn = open_index()
+    conn.execute(
+        "INSERT INTO shares (share_id, created_at, status, hosted_receipt_id) "
+        "VALUES ('manual-share', '2026-07-01T00:00:00Z', 'shared', 'manual-receipt')"
+    )
+    conn.commit()
+    conn.close()
+
+    config = {
+        "source": "all",
+        "excluded_projects": ["secret-project"],
+        "projects_confirmed": True,
+        "verified_email_token": "verified-one-shot-token",
+    }
+    monkeypatch.setattr("clawjournal.auto_upload.load_config", lambda: config)
+    monkeypatch.setattr("clawjournal.auto_upload.save_config", lambda updated: None)
+    monkeypatch.setattr(
+        "clawjournal.auto_upload_scheduler.install",
+        lambda: {"scheduler": "test", "state": "installed"},
+    )
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon._fetch_hosted_share_capabilities",
+        lambda **kwargs: {
+            "recurring_upload_api_version": 1,
+            "recurring_upload_max_sessions": 5,
+            "share_page_url": "https://hosted.example/share",
+        },
+    )
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon._json_request",
+        lambda *args, **kwargs: {
+            "active_token": "active-token",
+            "recovery_token": "recovery-token",
+            "enrollment_id": "server-enrollment",
+            "authorization_revision": "revision-1",
+            "accepted_at": "2026-07-02T00:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon._hosted_api_base",
+        lambda: "https://hosted.example",
+    )
+    status, body = _post(server, "/api/auto-upload/enable", {
+        "accept_terms": True,
+        "ownership_certification": True,
+        "consent_version": "consent-v1",
+        "retention_policy_version": "retention-v1",
+    })
+    assert status == 200
+    assert body["state"] == "enabled"
+    assert body["source_scope"] == "all"
+    assert body["sources"] is None
+    assert body["excluded_projects"] == ["secret-project"]
+    assert body["scheduler"]["state"] == "installed"
+
+
+def test_auto_upload_enable_api_requires_explicit_consent(server):
+    status, body = _post(server, "/api/auto-upload/enable", {})
+    assert status == 400
+    assert "Accept the terms" in body["error"]
+
+
 def _seed_timeline(index_setup):
     from urllib.parse import quote
 
@@ -2666,6 +2736,38 @@ class TestShareAPI:
         assert data["ok"] is True
         assert "verified_email_token" not in saved
         assert "verified_email_token_expires_at" not in saved
+
+    def test_manual_share_does_not_accept_recurring_authorization(self, server, monkeypatch):
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        config = _share_config()
+        saved = []
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: config)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.save_config",
+            lambda updated: saved.append(dict(updated)),
+        )
+        upload_response = {
+            "receipt_id": "rcpt-test-123",
+            "status": "received",
+            "recurring_upload_token": "recurring-123",
+            "recurring_upload_token_expires_at": "2027-01-01T00:00:00Z",
+        }
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_response=upload_response),
+        ):
+            status, data = _post(
+                server, f"/api/shares/{share_id}/upload", self._consent_body()
+            )
+
+        assert status == 200
+        assert data["ok"] is True
+        final_config = saved[-1]
+        assert "recurring_upload_token" not in final_config
+        assert "recurring_upload_token_expires_at" not in final_config
+        assert "verified_email_token" not in final_config
 
     def test_share_rate_limiting(self, server, monkeypatch):
         """Two shares within cooldown → second gets 429."""

@@ -1,5 +1,11 @@
 # Architecture
 
+## Recurring hosted sharing
+
+Recurring sharing is capability-gated and remains unavailable by default. A successful manual hosted receipt is a prerequisite, but its bundle-specific credential is never reused. Enrollment exchanges a fresh verified identity for a server enrollment, authorization revision, and separate active/recovery credentials while snapshotting exact sources, projects, privacy profile, terms, and a future-only server timestamp.
+
+Claude Code and Codex `SessionStart` hooks only perform a local due check and detach the one-shot runner. The runner owns an OS-released lock, strictly refreshes enrolled sources, and selects at most five stable revisions through the same candidate service used by status and preview. Packaging reuses `shares`/`share_sessions`, repeats release and revision gates before AI and egress, applies both TruffleHog gates, then persists and fsyncs the exact ZIP, SHA-256, submission ID, generation, and pseudonymous revision keys before networking. Retries reuse identical bytes and identity; ambiguous requests use the recovery credential for receipt lookup. Pause/disable increment generation so changes before the submitting boundary win.
+
 ClawJournal is a local-first Python application for reviewing, scoring, redacting, and exporting coding-agent conversation traces.
 
 ## High-Level Layout
