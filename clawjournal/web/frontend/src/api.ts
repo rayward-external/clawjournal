@@ -23,6 +23,8 @@ import type {
   BenchmarkTrend,
   Features,
   WorkbenchConfig,
+  AutoUploadStatus,
+  AutoUploadPreview,
 } from './types.ts';
 
 const BASE = '/api';
@@ -262,6 +264,58 @@ export const api = {
       pending_email: string | null;
     }> {
       return request('/share/upload-status');
+    },
+  },
+
+  autoUpload: {
+    terms(): Promise<{
+      consent_text: string;
+      retention_text: string;
+      consent_version: string;
+      retention_policy_version: string;
+    }> {
+      return request('/auto-upload/terms');
+    },
+    status(): Promise<AutoUploadStatus> {
+      return request('/auto-upload/status');
+    },
+
+    preview(): Promise<AutoUploadPreview> {
+      return request('/auto-upload/preview');
+    },
+
+    enable(body: {
+      accept_terms: boolean;
+      ownership_certification: boolean;
+      consent_version: string;
+      retention_policy_version: string;
+      cadence_days?: number;
+    }): Promise<AutoUploadStatus> {
+      return request('/auto-upload/enable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+
+    run(): Promise<Record<string, unknown>> {
+      return request('/auto-upload/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+    },
+
+    pause(): Promise<AutoUploadStatus> {
+      return request('/auto-upload/pause', { method: 'POST' });
+    },
+
+    resume(): Promise<AutoUploadStatus> {
+      return request('/auto-upload/resume', { method: 'POST' });
+    },
+
+    disable(): Promise<AutoUploadStatus> {
+      return request('/auto-upload/disable', { method: 'POST' });
     },
   },
 

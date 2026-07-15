@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.ts';
-import type { WorkbenchConfig } from '../types.ts';
+import type { AutoUploadPreview, AutoUploadStatus, WorkbenchConfig } from '../types.ts';
 import { useToast } from '../components/Toast.tsx';
 import { colors, selectStyle, btnPrimary } from '../theme.ts';
 
@@ -35,12 +35,110 @@ export function Settings() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [autoUpload, setAutoUpload] = useState<AutoUploadStatus | null>(null);
+  const [autoPreview, setAutoPreview] = useState<AutoUploadPreview | null>(null);
+  const [autoBusy, setAutoBusy] = useState(false);
 
   useEffect(() => {
     api.config.get()
       .then(setCfg)
       .catch(e => setError(e instanceof Error ? e.message : 'Could not load settings'));
+    api.autoUpload.status()
+      .then(setAutoUpload)
+      .catch(e => toast(e instanceof Error ? e.message : 'Could not load automatic sharing status', 'error'));
   }, []);
+
+  async function refreshAutoUpload() {
+    setAutoUpload(await api.autoUpload.status());
+  }
+
+  async function enableAutoUpload() {
+    setAutoBusy(true);
+    try {
+      const terms = await api.autoUpload.terms();
+      const accepted = window.confirm(
+        `Enable automatic weekly sharing?\n\nAt most five future eligible traces from the exact sources and projects shown here may upload without per-bundle review. Append-only traces must remain unchanged for 24 hours. Due work starts in the background on a supported Claude Code or Codex SessionStart; Run now starts one extra capped cycle and resets the seven-day clock. Local anonymization, redaction, findings, optional AI-PII processing, and both TruffleHog gates still apply. You can preview, hold, pause, or disable this at any time.\n\n${terms.consent_text}\n\n${terms.retention_text}\n\nBy continuing, you accept these recurring terms and certify that you are authorized to share traces from this exact scope.`
+      );
+      if (!accepted) return;
+      const status = await api.autoUpload.enable({
+        accept_terms: true,
+        ownership_certification: true,
+        consent_version: terms.consent_version,
+        retention_policy_version: terms.retention_policy_version,
+      });
+      setAutoUpload(status);
+      setAutoPreview(null);
+      toast('Automatic weekly sharing enabled', 'success');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Could not enable automatic sharing', 'error');
+    } finally {
+      setAutoBusy(false);
+    }
+  }
+
+  async function previewAutoUpload() {
+    setAutoBusy(true);
+    try {
+      setAutoPreview(await api.autoUpload.preview());
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Could not preview automatic sharing', 'error');
+    } finally {
+      setAutoBusy(false);
+    }
+  }
+
+  async function runAutoUpload() {
+    setAutoBusy(true);
+    try {
+      const result = await api.autoUpload.run();
+      await refreshAutoUpload();
+      setAutoPreview(null);
+      toast(result.status === 'no_work' ? 'No eligible traces to share' : 'Automatic share completed', 'success');
+    } catch (e) {
+      await refreshAutoUpload().catch(() => undefined);
+      toast(e instanceof Error ? e.message : 'Automatic share failed', 'error');
+    } finally {
+      setAutoBusy(false);
+    }
+  }
+
+  async function pauseAutoUpload() {
+    setAutoBusy(true);
+    try {
+      setAutoUpload(await api.autoUpload.pause());
+      toast('Automatic sharing paused', 'success');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Could not pause automatic sharing', 'error');
+    } finally {
+      setAutoBusy(false);
+    }
+  }
+
+  async function resumeAutoUpload() {
+    setAutoBusy(true);
+    try {
+      setAutoUpload(await api.autoUpload.resume());
+      toast('Automatic sharing resumed', 'success');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Could not resume automatic sharing', 'error');
+    } finally {
+      setAutoBusy(false);
+    }
+  }
+
+  async function disableAutoUpload() {
+    if (!window.confirm('Disable automatic sharing and remove its system scheduler?')) return;
+    setAutoBusy(true);
+    try {
+      setAutoUpload(await api.autoUpload.disable());
+      setAutoPreview(null);
+      toast('Automatic sharing disabled', 'success');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Could not disable automatic sharing', 'error');
+    } finally {
+      setAutoBusy(false);
+    }
+  }
 
   async function save(patch: ConfigPatch) {
     setSaving(true);
@@ -135,6 +233,66 @@ export function Settings() {
           />
           Default AI-PII review on for new shares
         </label>
+      </div>
+
+      <div style={cardStyle}>
+        <h3 style={titleStyle}>Automatic weekly sharing</h3>
+        <p style={helpStyle}>
+          Once enabled, a supported Claude Code or Codex SessionStart checks whether seven days
+          have elapsed. One cycle selects at most five future eligible traces from the enrolled
+          scope. Stored failure-value scores only order candidates; automatic runs never score.
+        </p>
+        {!autoUpload ? (
+          <span style={{ fontSize: 13, color: colors.gray500 }}>Loading status...</span>
+        ) : (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, fontSize: 12.5, color: colors.gray600, marginBottom: 12 }}>
+              <div><strong style={{ color: colors.gray800 }}>State:</strong> {autoUpload.state}</div>
+              <div><strong style={{ color: colors.gray800 }}>Pending:</strong> {autoUpload.pending_count}</div>
+              <div><strong style={{ color: colors.gray800 }}>Sources:</strong> {autoUpload.source_scope === 'all' ? 'all agents' : autoUpload.sources?.join(', ') || 'not enrolled'}</div>
+              <div><strong style={{ color: colors.gray800 }}>Projects:</strong> {autoUpload.included_projects?.join(', ') || 'not enrolled'}</div>
+              <div><strong style={{ color: colors.gray800 }}>Next run:</strong> {autoUpload.next_due_at ? new Date(autoUpload.next_due_at).toLocaleString() : 'not scheduled'}</div>
+              <div><strong style={{ color: colors.gray800 }}>Last success:</strong> {autoUpload.last_success_at ? new Date(autoUpload.last_success_at).toLocaleString() : 'never'}</div>
+              <div><strong style={{ color: colors.gray800 }}>Last upload:</strong> {autoUpload.last_trace_count ?? 0} traces</div>
+            </div>
+            {autoUpload.last_error && (
+              <div style={{ marginBottom: 12, padding: '9px 10px', background: colors.yellow50, border: `1px solid ${colors.yellow200}`, borderRadius: 7, color: colors.yellow700, fontSize: 12.5 }}>
+                {autoUpload.last_error}{autoUpload.required_action ? ` Action: ${autoUpload.required_action}.` : ''}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {autoUpload.state === 'off' && autoUpload.capability_available && autoUpload.manual_share_completed && (
+                <button style={{ ...btnPrimary, fontWeight: 600 }} disabled={autoBusy} onClick={enableAutoUpload}>
+                  Enable
+                </button>
+              )}
+              {autoUpload.state === 'paused' && (
+                <button style={{ ...btnPrimary, fontWeight: 600 }} disabled={autoBusy} onClick={resumeAutoUpload}>Resume</button>
+              )}
+              {autoUpload.state === 'enabled' && (
+                <>
+                  <button style={{ ...btnPrimary, fontWeight: 600 }} disabled={autoBusy} onClick={previewAutoUpload}>Preview</button>
+                  <button style={{ ...btnPrimary, fontWeight: 600 }} disabled={autoBusy} onClick={runAutoUpload}>Run now</button>
+                  <button style={{ ...btnPrimary, background: colors.gray600, fontWeight: 600 }} disabled={autoBusy} onClick={pauseAutoUpload}>Pause</button>
+                </>
+              )}
+              {autoUpload.enrolled && autoUpload.state !== 'off' && (
+                <button style={{ ...btnPrimary, background: colors.red700, fontWeight: 600 }} disabled={autoBusy} onClick={disableAutoUpload}>Disable</button>
+              )}
+            </div>
+            {autoPreview && (
+              <div style={{ marginTop: 14, borderTop: `1px solid ${colors.gray200}`, paddingTop: 12 }}>
+                <strong style={{ fontSize: 12.5, color: colors.gray800 }}>{autoPreview.count} trace(s) would be uploaded</strong>
+                {autoPreview.sessions.slice(0, 10).map(session => (
+                  <div key={session.session_id} style={{ fontSize: 12, color: colors.gray600, marginTop: 6 }}>
+                    {session.source} / {session.project}: {session.display_title}
+                  </div>
+                ))}
+                {autoPreview.count > 10 && <div style={{ fontSize: 12, color: colors.gray500, marginTop: 6 }}>And {autoPreview.count - 10} more.</div>}
+              </div>
+            )}
+          </>
+        )}
       </div>
 
       {/* Advanced — scoring + UI toggles most users never change. Collapsed by

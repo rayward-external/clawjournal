@@ -4,6 +4,7 @@ import type { ShareDestination } from './types.ts';
 import { formatShareDestination } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost } from './styles.tsx';
 import { Icon } from './shared.tsx';
+import type { AutoUploadStatus } from '../../types.ts';
 
 export interface DoneStepProps {
   stepperHeader: React.ReactNode;
@@ -18,6 +19,9 @@ export interface DoneStepProps {
   destinationLoading: boolean;
   destinationFailed: boolean;
   onRetryDestination: () => void;
+  autoUploadStatus: AutoUploadStatus | null;
+  autoUploadBusy: boolean;
+  onEnableAutoUpload: () => void;
 }
 
 export function DoneStep(p: DoneStepProps) {
@@ -250,6 +254,33 @@ export function DoneStep(p: DoneStepProps) {
             Start a new bundle
           </button>
         </div>
+
+        {submitted && p.autoUploadStatus?.state === 'off' && p.autoUploadStatus.capability_available && (
+          <div style={{
+            margin: '22px auto 0', maxWidth: 480, padding: '16px 18px',
+            background: colors.white, border: `1px solid ${colors.gray200}`,
+            borderRadius: 8, textAlign: 'left' as const,
+          }}>
+            <strong style={{ display: 'block', color: colors.gray900, fontSize: 14, marginBottom: 6 }}>
+              Keep sharing automatically?
+            </strong>
+            <p style={{ margin: '0 0 12px', color: colors.gray600, fontSize: 12.5, lineHeight: 1.55 }}>
+              ClawJournal can share up to five future eligible traces per due SessionStart cycle.
+              Local privacy gates still apply; stored scores only determine ordering.
+            </p>
+            <button
+              onClick={p.onEnableAutoUpload}
+              disabled={p.autoUploadBusy}
+              style={{
+                padding: '9px 14px', background: colors.primary500, color: colors.white,
+                border: 0, borderRadius: 7, fontSize: 13, fontWeight: 600,
+                cursor: p.autoUploadBusy ? 'wait' : 'pointer',
+              }}
+            >
+              {p.autoUploadBusy ? 'Enabling...' : 'Enable weekly sharing'}
+            </button>
+          </div>
+        )}
 
         <div style={{
           margin: '28px auto 0', padding: '14px 16px', maxWidth: 480,

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
-import type { Session, Share as ShareType } from '../../types.ts';
+import type { AutoUploadStatus, Session, Share as ShareType } from '../../types.ts';
 import { api } from '../../api.ts';
 import { useToast } from '../../components/Toast.tsx';
 import { Spinner } from '../../components/Spinner.tsx';
@@ -107,6 +107,8 @@ export function Share() {
   const [receiptId, setReceiptId] = useState<string | null>(null);
   const [hostedStatus, setHostedStatus] = useState<string | null>(null);
   const [supportContact, setSupportContact] = useState<string | null>(null);
+  const [autoUploadStatus, setAutoUploadStatus] = useState<AutoUploadStatus | null>(null);
+  const [autoUploadBusy, setAutoUploadBusy] = useState(false);
 
   // Candidates (empty queue hint)
   const [candidates, setCandidates] = useState<Session[]>([]);
@@ -144,6 +146,7 @@ export function Share() {
     // it independently so it never blocks the page or its failure poisons the
     // whole initial load.
     loadShareDestination();
+    api.autoUpload.status().then(setAutoUploadStatus).catch(() => undefined);
     Promise.all([
       api.shareReady({ includeUnapproved: true }),
       api.shares.list(),
@@ -814,6 +817,29 @@ export function Share() {
     try { reload(); } catch { /* ignore */ }
   };
 
+  const handleEnableAutoUpload = async () => {
+    setAutoUploadBusy(true);
+    try {
+      const terms = await api.autoUpload.terms();
+      const accepted = window.confirm(
+        `Automatically share future eligible traces?\n\nEach due Claude Code or Codex SessionStart cycle selects at most five future traces from the exact enrolled scope. Append-only traces must be unchanged for 24 hours. Upload can occur without per-bundle review; local redaction, findings, optional AI-PII processing, and both TruffleHog gates still apply. Preview, hold, pause, Run now, and disable remain available in Settings.\n\n${terms.consent_text}\n\n${terms.retention_text}\n\nContinue to accept these recurring terms and certify authorization for the enrolled scope.`
+      );
+      if (!accepted) return;
+      const next = await api.autoUpload.enable({
+        accept_terms: true,
+        ownership_certification: true,
+        consent_version: terms.consent_version,
+        retention_policy_version: terms.retention_policy_version,
+      });
+      setAutoUploadStatus(next);
+      toast('Automatic weekly sharing enabled', 'success');
+    } catch (err: unknown) {
+      toast(err instanceof Error ? err.message : 'Could not enable automatic sharing', 'error');
+    } finally {
+      setAutoUploadBusy(false);
+    }
+  };
+
   // =================================================
   // Render
   // =================================================
@@ -995,6 +1021,9 @@ export function Share() {
         destinationLoading={destinationLoading}
         destinationFailed={destinationFailed}
         onRetryDestination={loadShareDestination}
+        autoUploadStatus={autoUploadStatus}
+        autoUploadBusy={autoUploadBusy}
+        onEnableAutoUpload={handleEnableAutoUpload}
       />
     );
   }

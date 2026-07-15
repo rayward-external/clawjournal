@@ -196,6 +196,41 @@ export interface SharePreview {
   sessions: SharePreviewSession[];
 }
 
+export interface AutoUploadStatus {
+  state: 'enabled' | 'paused' | 'off';
+  enrolled: boolean;
+  pending_count: number;
+  due: boolean;
+  sources?: string[];
+  source_scope?: string;
+  excluded_projects?: string[];
+  included_projects?: string[];
+  cadence_days?: number;
+  enrolled_at?: string;
+  next_due_at?: string;
+  last_attempt_at?: string | null;
+  last_success_at?: string | null;
+  last_trace_count?: number;
+  last_receipt_id?: string | null;
+  last_error?: string | null;
+  required_action?: string | null;
+  capability_available?: boolean;
+  manual_share_completed?: boolean;
+}
+
+export interface AutoUploadPreview {
+  state: 'enabled' | 'paused' | 'off';
+  count: number;
+  sessions: Array<{
+    session_id: string;
+    source: string;
+    project: string;
+    display_title: string;
+    revision_hash?: string | null;
+    updated_since_last_share?: boolean;
+  }>;
+}
+
 export interface Policy {
   policy_id: string;
   policy_type: string;
