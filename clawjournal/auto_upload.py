@@ -232,7 +232,10 @@ def enable_enrollment(
     existing = get_enrollment(conn)
     enrolled_at = existing["enrolled_at"] if existing else stamp
     baseline_at = str(server_accepted_at)
-    next_due = _iso(clock + timedelta(days=cadence_days))
+    accepted_clock = _parse_iso(server_accepted_at)
+    if accepted_clock is None:
+        raise ValueError("Hosted enrollment returned an invalid accepted_at timestamp.")
+    next_due = _iso(accepted_clock + timedelta(days=cadence_days))
     conn.execute(
         """INSERT INTO auto_upload_enrollment (
             enrollment_id, state, consent_version, retention_policy_version,

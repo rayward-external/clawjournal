@@ -62,7 +62,7 @@ def _insert_session(conn, session_id, *, activity, project="codex:project", revi
     conn.commit()
 
 
-def _enroll(conn, *, source="all"):
+def _enroll(conn, *, source="all", accepted_at=NOW):
     _configure(source=source)
     if conn.execute("SELECT 1 FROM sessions WHERE project = 'codex:project'").fetchone() is None:
         _insert_session(conn, "scope-seed", activity=NOW - timedelta(days=2))
@@ -87,7 +87,7 @@ def _enroll(conn, *, source="all"):
             "recovery_token": "recovery-token",
             "enrollment_id": "server-enrollment",
             "authorization_revision": "auth-rev-1",
-            "accepted_at": NOW.isoformat(),
+            "accepted_at": accepted_at.isoformat(),
         },
     )
 
@@ -101,6 +101,13 @@ def test_enrollment_snapshots_scope_and_can_pause(auto_db):
 
     paused = auto_upload.set_enrollment_state(auto_db, "paused", now=NOW)
     assert paused["state"] == "paused"
+
+
+def test_first_cycle_uses_server_accepted_time(auto_db):
+    accepted_at = NOW + timedelta(hours=3)
+    enrollment = _enroll(auto_db, accepted_at=accepted_at)
+    assert enrollment["server_accepted_at"] == accepted_at.isoformat()
+    assert enrollment["next_due_at"] == (accepted_at + timedelta(days=7)).isoformat()
 
 
 def test_enrollment_requires_manual_receipt_and_recurring_capability(auto_db):
