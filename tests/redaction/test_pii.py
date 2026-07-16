@@ -1,5 +1,6 @@
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -334,6 +335,59 @@ def test_review_session_pii_hybrid_passes_agent_timeout(monkeypatch):
 
     assert findings == []
     assert captured["timeout_seconds"] == 37
+
+
+def test_gated_hybrid_review_rechecks_before_every_serial_provider_call(
+    monkeypatch,
+):
+    from clawjournal.redaction import pii as pii_module
+
+    original_split = pii_module._split_into_batches
+    monkeypatch.setattr(
+        pii_module,
+        "_split_into_batches",
+        lambda items: original_split(items, char_limit=8),
+    )
+    monkeypatch.setattr(pii_module, "resolve_backend", lambda _backend: "codex")
+    provider_calls: list[str] = []
+    monkeypatch.setattr(
+        pii_module,
+        "run_default_agent_task",
+        lambda **_kwargs: (
+            provider_calls.append("provider")
+            or SimpleNamespace(stdout="[]")
+        ),
+    )
+
+    class ControlChangedDuringFirstCall(RuntimeError):
+        pass
+
+    gate_calls = 0
+
+    def gate() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 2:
+            raise ControlChangedDuringFirstCall("generation changed")
+
+    session = {
+        "session_id": "multi-batch",
+        "messages": [
+            {"content": "first batch"},
+            {"content": "second batch"},
+        ],
+    }
+
+    with pytest.raises(ControlChangedDuringFirstCall, match="generation changed"):
+        review_session_pii_hybrid(
+            session,
+            backend="codex",
+            ignore_llm_errors=True,
+            before_agent_call=gate,
+        )
+
+    assert gate_calls == 2
+    assert provider_calls == ["provider"]
 
 
 def test_content_findings_github_url():

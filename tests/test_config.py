@@ -124,6 +124,7 @@ class TestSaveConfig:
             raise OSError("Permission denied")
 
         monkeypatch.setattr(type(tmp_config.parent), "mkdir", failing_mkdir)
-        save_config({"repo": "test"})
+        result = save_config({"repo": "test"})
         captured = capsys.readouterr()
+        assert result is False
         assert "Warning" in captured.err

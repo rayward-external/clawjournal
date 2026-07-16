@@ -20,6 +20,7 @@ from clawjournal.parsing.parser import (
     _iter_jsonl,
     _normalize_timestamp,
     _parse_session_file,
+    _parse_claude_session_file,
     _parse_subagent_session,
     _parse_tool_input,
     _path_to_dir_name,
@@ -30,6 +31,30 @@ from clawjournal.parsing.parser import (
     _parse_codex_session_file,
     _parse_openclaw_session_file,
 )
+
+
+@pytest.mark.parametrize("parser_kind", ["claude", "codex"])
+def test_strict_jsonl_parser_rejects_malformed_nonblank_line(
+    tmp_path, mock_anonymizer, parser_kind
+):
+    path = tmp_path / f"{parser_kind}-session.jsonl"
+    path.write_text('{"type":"valid"}\n{"truncated":', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="malformed JSONL input"):
+        if parser_kind == "claude":
+            _parse_claude_session_file(
+                path,
+                mock_anonymizer,
+                strict_jsonl=True,
+            )
+        else:
+            _parse_codex_session_file(
+                path,
+                mock_anonymizer,
+                include_thinking=True,
+                target_cwd=str(tmp_path),
+                strict_jsonl=True,
+            )
 
 
 @pytest.fixture(autouse=True)

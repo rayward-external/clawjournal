@@ -287,6 +287,21 @@ class TestExportToJsonl:
 
 
 class TestConfigure:
+    def test_does_not_report_success_when_persistence_fails(
+        self, tmp_config, monkeypatch, capsys
+    ):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr(
+            "clawjournal.cli.load_config",
+            lambda: {"source": "claude", "projects_confirmed": True},
+        )
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda _config: False)
+
+        with pytest.raises(RuntimeError, match="persistence could not be confirmed"):
+            configure(source="codex")
+
+        assert "Config saved" not in capsys.readouterr().out
+
     def test_sets_repo(self, tmp_config, monkeypatch, capsys):
         # Also monkeypatch the cli module's references
         monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)

@@ -177,8 +177,43 @@ def _resolve_gemini_hash(project_hash: str) -> str:
     return project_hash[:8]
 
 
-def _iter_jsonl(filepath: Path):
-    """Yield parsed JSON objects from a JSONL file, skipping blank/malformed lines."""
+def _iter_jsonl_bytes(data: bytes, *, filepath: Path):
+    """Yield every nonblank JSONL object from one exact byte snapshot."""
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid UTF-8 JSONL input: {filepath.name}") from exc
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"malformed JSONL input at line {line_number}: {filepath.name}"
+            ) from exc
+
+
+def _iter_jsonl(
+    filepath: Path,
+    *,
+    strict: bool = False,
+    snapshot_out: dict[str, Any] | None = None,
+):
+    """Yield JSONL objects, with an exact fail-closed mode for auto-upload."""
+
+    if strict:
+        from ..raw_sources import read_raw_source_snapshot
+
+        snapshots, fingerprint = read_raw_source_snapshot(filepath)
+        if len(snapshots) != 1:
+            raise ValueError("file JSONL source resolved to multiple parser inputs")
+        if snapshot_out is not None:
+            snapshot_out["fingerprint"] = fingerprint
+        yield from _iter_jsonl_bytes(snapshots[0][1], filepath=filepath)
+        return
     with open(filepath, encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -1810,6 +1845,7 @@ def parse_project_sessions(
     include_thinking: bool = True,
     source: str = CLAUDE_SOURCE,
     locator: dict | None = None,
+    strict_jsonl: bool = False,
 ) -> list[dict]:
     """Parse all sessions for a project into structured dicts."""
     if source == CLAUDE_SCIENCE_SOURCE:
@@ -1903,6 +1939,7 @@ def parse_project_sessions(
                 anonymizer=anonymizer,
                 include_thinking=include_thinking,
                 target_cwd=project_dir_name,
+                strict_jsonl=strict_jsonl,
             )
             if parsed and parsed["messages"]:
                 parsed["project"] = _build_codex_project_name(project_dir_name)
@@ -1970,7 +2007,12 @@ def parse_project_sessions(
 
     if native_dir and native_dir.exists():
         for session_file in sorted(native_dir.glob("*.jsonl")):
-            parsed = _parse_claude_session_file(session_file, anonymizer, include_thinking)
+            parsed = _parse_claude_session_file(
+                session_file,
+                anonymizer,
+                include_thinking,
+                strict_jsonl=strict_jsonl,
+            )
             if parsed and parsed["messages"]:
                 parsed["project"] = project_name
                 parsed["source"] = CLAUDE_SOURCE
@@ -1989,7 +2031,12 @@ def parse_project_sessions(
                 seen_session_ids.add(session_file.stem)
 
         for session_dir in _find_subagent_only_sessions(native_dir):
-            parsed = _parse_subagent_session(session_dir, anonymizer, include_thinking)
+            parsed = _parse_subagent_session(
+                session_dir,
+                anonymizer,
+                include_thinking,
+                strict_jsonl=strict_jsonl,
+            )
             if parsed and parsed["messages"]:
                 parsed["project"] = project_name
                 parsed["source"] = CLAUDE_SOURCE
@@ -2015,7 +2062,12 @@ def parse_project_sessions(
             if not jsonl_path:
                 continue
 
-            parsed = _parse_claude_session_file(jsonl_path, anonymizer, include_thinking)
+            parsed = _parse_claude_session_file(
+                jsonl_path,
+                anonymizer,
+                include_thinking,
+                strict_jsonl=strict_jsonl,
+            )
             if parsed and parsed["messages"]:
                 parsed.pop("entrypoint", None)
                 parsed["project"] = project_name
@@ -2235,7 +2287,11 @@ def _build_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer
 
 
 def _parse_claude_session_file(
-    filepath: Path, anonymizer: Anonymizer, include_thinking: bool = True
+    filepath: Path,
+    anonymizer: Anonymizer,
+    include_thinking: bool = True,
+    *,
+    strict_jsonl: bool = False,
 ) -> dict | None:
     messages: list[dict[str, Any]] = []
     metadata = {
@@ -2251,16 +2307,28 @@ def _parse_claude_session_file(
     }
     stats = _make_stats()
 
+    snapshot: dict[str, Any] = {}
     try:
-        entries = list(_iter_jsonl(filepath))
+        entries = list(
+            _iter_jsonl(
+                filepath,
+                strict=strict_jsonl,
+                snapshot_out=snapshot,
+            )
+        )
     except OSError:
+        if strict_jsonl:
+            raise
         return None
 
     tool_result_map = _build_tool_result_map(entries, anonymizer)
     for entry in entries:
         _process_entry(entry, messages, metadata, stats, anonymizer, include_thinking, tool_result_map)
 
-    return _make_session_result(metadata, messages, stats)
+    result = _make_session_result(metadata, messages, stats)
+    if result is not None and strict_jsonl:
+        result["_raw_source_fingerprint"] = snapshot.get("fingerprint")
+    return result
 
 
 def _parse_session_file(
@@ -2290,7 +2358,11 @@ def _find_subagent_only_sessions(project_dir: Path) -> list[Path]:
 
 
 def _parse_subagent_session(
-    session_dir: Path, anonymizer: Anonymizer, include_thinking: bool = True,
+    session_dir: Path,
+    anonymizer: Anonymizer,
+    include_thinking: bool = True,
+    *,
+    strict_jsonl: bool = False,
 ) -> dict | None:
     """Merge subagent JSONL files into a single session and parse it.
 
@@ -2304,8 +2376,23 @@ def _parse_subagent_session(
 
     # Collect all entries with their timestamps for sorting.
     timed_entries: list[tuple[str, dict[str, Any]]] = []
-    for sa_file in sorted(subagent_dir.glob("agent-*.jsonl")):
-        for entry in _iter_jsonl(sa_file):
+    snapshot_fingerprint = None
+    if strict_jsonl:
+        from ..raw_sources import read_raw_source_snapshot
+
+        source_snapshots, snapshot_fingerprint = read_raw_source_snapshot(session_dir)
+    else:
+        source_snapshots = [
+            (sa_file, None)
+            for sa_file in sorted(subagent_dir.glob("agent-*.jsonl"))
+        ]
+    for sa_file, snapshot_bytes in source_snapshots:
+        entries = (
+            _iter_jsonl_bytes(snapshot_bytes, filepath=sa_file)
+            if snapshot_bytes is not None
+            else _iter_jsonl(sa_file)
+        )
+        for entry in entries:
             ts = entry.get("timestamp", "")
             timed_entries.append((ts if isinstance(ts, str) else "", entry))
 
@@ -2332,7 +2419,10 @@ def _parse_subagent_session(
     for entry in entries:
         _process_entry(entry, messages, metadata, stats, anonymizer, include_thinking, tool_result_map)
 
-    return _make_session_result(metadata, messages, stats)
+    result = _make_session_result(metadata, messages, stats)
+    if result is not None and strict_jsonl:
+        result["_raw_source_fingerprint"] = snapshot_fingerprint
+    return result
 
 
 def _parse_gemini_tool_call(tc: dict, anonymizer: Anonymizer) -> dict:
@@ -2853,6 +2943,7 @@ def _parse_codex_session_file(
     anonymizer: Anonymizer,
     include_thinking: bool,
     target_cwd: str,
+    strict_jsonl: bool = False,
 ) -> dict | None:
     state = _CodexParseState(
         metadata={
@@ -2872,9 +2963,18 @@ def _parse_codex_session_file(
         },
     )
 
+    snapshot: dict[str, Any] = {}
     try:
-        entries = list(_iter_jsonl(filepath))
+        entries = list(
+            _iter_jsonl(
+                filepath,
+                strict=strict_jsonl,
+                snapshot_out=snapshot,
+            )
+        )
     except OSError:
+        if strict_jsonl:
+            raise
         return None
 
     state.tool_result_map = _build_codex_tool_result_map(entries, anonymizer)
@@ -2922,7 +3022,10 @@ def _parse_codex_session_file(
         else:
             state.metadata["model"] = "codex-unknown"
 
-    return _make_session_result(state.metadata, state.messages, state.stats)
+    result = _make_session_result(state.metadata, state.messages, state.stats)
+    if result is not None and strict_jsonl:
+        result["_raw_source_fingerprint"] = snapshot.get("fingerprint")
+    return result
 
 
 def _handle_codex_session_meta(

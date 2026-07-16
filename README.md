@@ -249,7 +249,7 @@ Scoring uses the current agent's automation CLI by default (`codex exec` in Code
 
 ### 6. Package & Share
 
-Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploading is a **separate, opt-in step**. Only sessions you explicitly add and confirm are ever uploaded; `pending_review` and active `embargoed` sessions are blocked, while `auto_redacted` (default) and `released` are allowed. Redaction (your strings, paths, usernames, secrets) is applied to everything in the bundle — traces *and* `manifest.json`.
+Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploading is a **separate, opt-in step**. Manual Share uploads only sessions you explicitly add and confirm; the separately authorized automatic option below is limited to its exact future scope. `pending_review` and active `embargoed` sessions are blocked in both paths, while `auto_redacted` (default) and `released` are allowed. Redaction (your strings, paths, usernames, secrets) is applied to everything in the bundle — traces *and* `manifest.json`.
 
 > *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
@@ -272,6 +272,25 @@ clawjournal share --interactive --weekly
 It lists shareable traces, prioritizes AI-scored high-failure-value sessions, shows the redacted preview, asks for consent, then uploads when hosted submission is available or saves a ZIP for manual upload. Useful filters: `--all`, `--source codex`, `--source claude`, `--search "text"`, and `--ai-pii-review` for the optional AI PII pass.
 
 **Continuing an already-shared trace is supported.** A later `clawjournal scan` reports the existing trace as updated without creating a duplicate ID. Because the new content has not been reviewed, ClawJournal resets that trace to `new` and clears its old AI score. Approve it again in the Inbox; it will then reappear in Share with an **Updated since last share** label. The next bundle keeps the same trace identity and records which earlier revision it replaces.
+
+### Optional automatic weekly sharing
+
+After one successful hosted manual share, the workbench may offer **Automatic uploads** when the hosted recurring-upload capability is open. It is off by default. V1 enrollment supports confirmed **Claude Code** and/or **Codex** source scopes only; other sources remain available for manual review and Share. Enabling it shows separate recurring authorization and retention text, the exact local source/project scope, resolved AI-PII provider (if enabled), destination, seven-day activity-triggered cadence, and five-trace cap. Fresh email verification is required before recurring credentials are issued.
+
+An automatic cycle runs on the next selected Claude Code or Codex `SessionStart` after it is due. It chooses at most five eligible future traces using stored failure-value scores and a deterministic fallback; it never runs scoring synchronously. Only traces completed after the server enrollment time qualify. Append-only sources must have the same revision for at least 24 hours (the eligibility contract also defines an `explicit_close` completion mode, but no supported source uses it yet — Claude Code and Codex both use the 24-hour stable-revision rule), holds/embargoes and findings still block egress, changed traces require fresh approval, and every cycle repeats the normal anonymization, deterministic redaction, optional AI-PII, and mandatory TruffleHog gates. Manual Share is unchanged.
+
+Manage it in **Settings → Automatic uploads** or from the terminal:
+
+```bash
+clawjournal auto-upload status
+clawjournal auto-upload preview --refresh
+clawjournal auto-upload run       # one extra capped cycle; resets the next due date on success
+clawjournal auto-upload pause
+clawjournal auto-upload resume
+clawjournal auto-upload disable   # removes upload authority; prior uploads are not deleted
+```
+
+`disable` removes local active upload authority before revoking the server enrollment. A request already past the atomic submitting boundary may still finish; ClawJournal retains recovery-only authority until its receipt/revocation is definite. Recurring credentials are kept in a private credential file, never `config.json`.
 
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
@@ -382,6 +401,10 @@ Distill a small `clawjournal-lessons` skill from your own scored sessions and in
 | `clawjournal share --preview --status approved` | Preview what would be packaged |
 | `clawjournal share --status approved [--ai-pii-review]` | Package locally + print the Share URL; hosted upload happens in the browser |
 | `clawjournal share --interactive --weekly` / `clawshare --weekly` | Terminal Share wizard for remote/SSH sessions; review redactions, consent, upload or save ZIP |
+| `clawjournal auto-upload enable [--agent claude\|codex\|all]` | Review exact recurring terms/scope and enable future capped sharing |
+| `clawjournal auto-upload status` / `preview [--refresh]` | Read local recurring state / inspect the shared candidate contract |
+| `clawjournal auto-upload run` | Run one extra capped cycle now; all safety gates still apply |
+| `clawjournal auto-upload pause` / `resume` / `disable` | Control or revoke recurring sharing |
 | `clawjournal card <id> [--depth workflow\|full]` | Generate a share card (`workflow` is safe for public channels) |
 
 ### Configuration & maintenance

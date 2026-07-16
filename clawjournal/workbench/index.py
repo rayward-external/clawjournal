@@ -9,14 +9,20 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 from ..redaction.secrets import redact_text
 from ..scoring.badges import compute_all_badges
-from ..config import CONFIG_DIR, load_config, normalize_excluded_project_names, source_scope_sources
+from ..config import (
+    CONFIG_DIR,
+    load_config,
+    mark_auto_upload_profile_changed,
+    normalize_excluded_project_names,
+    source_scope_sources,
+)
 from ..paths import ensure_install_files
 from ..pricing import estimate_cost
 
@@ -29,17 +35,24 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 # version 4 marks the workbench as widened-message-aware (parser path
 # now produces messages with optional `invocations` / `snippets` /
 # `extra` / `author` fields, all routed through redaction), version 5
-# stores hosted-submission receipts, and version 6 tracks immutable
-# content revisions for re-sharing traces that continue to grow.
+# stores hosted-submission receipts, version 6 tracks immutable
+# content revisions for re-sharing traces that continue to grow, and
+# version 7 adds the local automatic-upload enrollment/candidate foundation,
+# and version 8 adds durable per-agent hook observations plus the raw-source
+# fingerprint snapshot needed to recover a sealed artifact safely.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
 HOSTED_SUBMISSION_SCHEMA_VERSION = 5
 REVISION_TRACKING_SCHEMA_VERSION = 6
-WORKBENCH_SCHEMA_VERSION = REVISION_TRACKING_SCHEMA_VERSION
+AUTO_UPLOAD_FOUNDATION_SCHEMA_VERSION = 7
+AUTO_UPLOAD_SCHEMA_VERSION = 8
+WORKBENCH_SCHEMA_VERSION = AUTO_UPLOAD_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SHARE_RECOMMENDATION_LIMIT = 10
+AUTO_UPLOAD_CANDIDATE_LIMIT = 5
+AUTO_UPLOAD_STABILITY_HOURS = 24
 
 
 class RevisionConflictError(ValueError):
@@ -128,7 +141,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     ai_scorer_model        TEXT,
     ai_rubric_git_sha      TEXT,
     ai_scored_at           TEXT,
-    content_revision       TEXT
+    content_revision       TEXT,
+    revision_stable_since  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shares (
@@ -144,7 +158,15 @@ CREATE TABLE IF NOT EXISTS shares (
     gcs_uri         TEXT,
     hosted_receipt_id TEXT,
     hosted_status     TEXT,
-    hosted_submission_url TEXT
+    hosted_submission_url TEXT,
+    submission_channel    TEXT,
+    enrollment_id         TEXT,
+    client_submission_id  TEXT,
+    authorization_revision INTEGER,
+    submission_state      TEXT,
+    sealed_artifact_sha256 TEXT,
+    sealed_artifact_path   TEXT,
+    sealed_raw_fingerprints TEXT
 );
 
 CREATE TABLE IF NOT EXISTS share_sessions (
@@ -169,6 +191,35 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_start_time ON sessions(start_time);
 CREATE INDEX IF NOT EXISTS idx_share_sessions_session_id ON share_sessions(session_id);
+
+CREATE TABLE IF NOT EXISTS auto_upload_enrollment (
+    singleton_id                    INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    mode                            TEXT NOT NULL CHECK (mode IN ('off', 'enabled', 'paused')),
+    health                          TEXT NOT NULL CHECK (health IN ('ready', 'action_required', 'retrying')),
+    generation                      INTEGER NOT NULL CHECK (generation >= 1),
+    enrolled_at                     TEXT NOT NULL,
+    client_enrollment_id            TEXT NOT NULL,
+    enrolled_sources_json           TEXT NOT NULL,
+    enrolled_projects_json          TEXT NOT NULL,
+    server_enrollment_id            TEXT,
+    authorization_revision          INTEGER,
+    recurring_authorization_version TEXT,
+    retention_version               TEXT,
+    egress_profile_hash             TEXT,
+    hook_targets_json               TEXT NOT NULL DEFAULT '[]',
+    claude_hook_observed_at         TEXT,
+    codex_hook_observed_at          TEXT,
+    last_completed_at               TEXT,
+    next_retry_at                   TEXT,
+    consecutive_failures            INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+    last_result_code                TEXT,
+    last_result_count               INTEGER,
+    last_receipt_reference          TEXT,
+    current_run_id                  TEXT,
+    current_run_stage               TEXT,
+    revocation_pending              INTEGER NOT NULL DEFAULT 0 CHECK (revocation_pending IN (0, 1)),
+    updated_at                      TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS findings (
     finding_id         TEXT PRIMARY KEY,
@@ -481,6 +532,8 @@ def open_index() -> sqlite3.Connection:
     _migrate_widened_message_model(conn)
     _migrate_hosted_submission_receipts(conn)
     _migrate_revision_tracking(conn)
+    _migrate_auto_upload_foundation(conn)
+    _migrate_auto_upload_recovery_metadata(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -739,6 +792,124 @@ def _migrate_revision_tracking(conn: sqlite3.Connection) -> None:
             "WHERE ss.content_revision IS NULL"
         )
         conn.execute(f"PRAGMA user_version = {REVISION_TRACKING_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_auto_upload_foundation(conn: sqlite3.Connection) -> None:
+    """Add automatic-upload state and advance the workbench schema v6 -> v7.
+
+    Existing revisions start their 24-hour stability clock at migration time.
+    This deliberately prevents an old append-only trace from becoming eligible
+    immediately merely because it was indexed before stability was tracked.
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= AUTO_UPLOAD_FOUNDATION_SCHEMA_VERSION:
+        return
+
+    now = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, col, col_type in [
+            ("sessions", "revision_stable_since", "TEXT"),
+            ("shares", "submission_channel", "TEXT"),
+            ("shares", "enrollment_id", "TEXT"),
+            ("shares", "client_submission_id", "TEXT"),
+            ("shares", "authorization_revision", "INTEGER"),
+            ("shares", "submission_state", "TEXT"),
+            ("shares", "sealed_artifact_sha256", "TEXT"),
+            ("shares", "sealed_artifact_path", "TEXT"),
+            ("shares", "sealed_raw_fingerprints", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+
+        conn.execute(
+            "UPDATE sessions SET revision_stable_since = ? "
+            "WHERE revision_stable_since IS NULL",
+            (now,),
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS auto_upload_enrollment (
+                singleton_id                    INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                mode                            TEXT NOT NULL CHECK (mode IN ('off', 'enabled', 'paused')),
+                health                          TEXT NOT NULL CHECK (health IN ('ready', 'action_required', 'retrying')),
+                generation                      INTEGER NOT NULL CHECK (generation >= 1),
+                enrolled_at                     TEXT NOT NULL,
+                client_enrollment_id            TEXT NOT NULL,
+                enrolled_sources_json           TEXT NOT NULL,
+                enrolled_projects_json          TEXT NOT NULL,
+                server_enrollment_id            TEXT,
+                authorization_revision          INTEGER,
+                recurring_authorization_version TEXT,
+                retention_version               TEXT,
+                egress_profile_hash             TEXT,
+                hook_targets_json               TEXT NOT NULL DEFAULT '[]',
+                claude_hook_observed_at         TEXT,
+                codex_hook_observed_at          TEXT,
+                last_completed_at               TEXT,
+                next_retry_at                   TEXT,
+                consecutive_failures            INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+                last_result_code                TEXT,
+                last_result_count               INTEGER,
+                last_receipt_reference          TEXT,
+                current_run_id                  TEXT,
+                current_run_stage               TEXT,
+                revocation_pending              INTEGER NOT NULL DEFAULT 0 CHECK (revocation_pending IN (0, 1)),
+                updated_at                      TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_shares_client_submission_id "
+            "ON shares(client_submission_id) "
+            "WHERE client_submission_id IS NOT NULL"
+        )
+        conn.execute(
+            f"PRAGMA user_version = {AUTO_UPLOAD_FOUNDATION_SCHEMA_VERSION}"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_auto_upload_recovery_metadata(conn: sqlite3.Connection) -> None:
+    """Advance v7 -> v8 with hook observations and sealed raw fingerprints.
+
+    The current fresh-install schema already contains these columns. Keeping
+    this as a separately gated migration also upgrades indexes created by an
+    earlier v7 build, where ``CREATE TABLE IF NOT EXISTS`` cannot add columns
+    to existing tables.
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= AUTO_UPLOAD_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for column in ("claude_hook_observed_at", "codex_hook_observed_at"):
+            try:
+                conn.execute(
+                    f"ALTER TABLE auto_upload_enrollment ADD COLUMN {column} TEXT"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+        try:
+            conn.execute(
+                "ALTER TABLE shares ADD COLUMN sealed_raw_fingerprints TEXT"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc):
+                raise
+        conn.execute(f"PRAGMA user_version = {AUTO_UPLOAD_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1827,7 +1998,11 @@ def _write_blob(session_id: str, session: dict[str, Any]) -> Path:
     return blob_path
 
 
-def read_blob(session_id: str) -> dict[str, Any] | None:
+def read_blob(
+    session_id: str,
+    *,
+    log_errors: bool = True,
+) -> dict[str, Any] | None:
     """Return the stored session blob as a dict, or None if missing/unreadable.
 
     Used by the findings backfill drain and share-time apply — they
@@ -1841,7 +2016,8 @@ def read_blob(session_id: str) -> dict[str, Any] | None:
         with open(blob_path) as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
-        logger.warning("Could not read blob for session %s", session_id)
+        if log_errors:
+            logger.warning("Could not read blob for session %s", session_id)
         return None
 
 
@@ -2102,7 +2278,7 @@ def upsert_sessions(
                 client_origin, runtime_channel, outer_session_id,
                 estimated_cost_usd,
                 tool_counts, user_interrupts,
-                hold_state, content_revision
+                hold_state, content_revision, revision_stable_since
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?,
@@ -2129,7 +2305,7 @@ def upsert_sessions(
                 ?, ?, ?,
                 ?,
                 ?, ?,
-                'auto_redacted', ?
+                'auto_redacted', ?, ?
             )
             ON CONFLICT(session_id) DO UPDATE SET
                 project = excluded.project,
@@ -2252,6 +2428,10 @@ def upsert_sessions(
                 estimated_cost_usd = excluded.estimated_cost_usd,
                 tool_counts = excluded.tool_counts,
                 user_interrupts = excluded.user_interrupts,
+                revision_stable_since = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN excluded.revision_stable_since
+                    ELSE sessions.revision_stable_since END,
                 content_revision = excluded.content_revision
             """,
             (
@@ -2306,6 +2486,7 @@ def upsert_sessions(
                 json.dumps(badges.get("tool_counts", {})) or None,
                 session_stats.get("user_interrupts", 0),
                 content_revision,
+                now,
             ),
         )
 
@@ -4074,6 +4255,296 @@ def get_shares(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [_with_legacy_bundle_alias(dict(row)) for row in rows]
 
 
+_AUTO_UPLOAD_MODES = frozenset({"off", "enabled", "paused"})
+_AUTO_UPLOAD_HEALTH_VALUES = frozenset({"ready", "action_required", "retrying"})
+_AUTO_UPLOAD_LIST_FIELDS = {
+    "enrolled_sources": "enrolled_sources_json",
+    "enrolled_projects": "enrolled_projects_json",
+    "hook_targets": "hook_targets_json",
+}
+
+
+def _canonical_auto_upload_strings(
+    values: Iterable[str],
+    *,
+    field: str,
+    allow_empty: bool = False,
+) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{field} must be a collection of strings")
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} must contain only non-empty strings")
+        normalized.add(value.strip())
+    if not normalized and not allow_empty:
+        raise ValueError(f"{field} must not be empty")
+    return sorted(normalized)
+
+
+def _parse_auto_upload_timestamp(value: str, *, field: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be an ISO 8601 timestamp")
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _decode_auto_upload_enrollment(row: sqlite3.Row) -> dict[str, Any]:
+    enrollment = dict(row)
+    for public_name, stored_name in _AUTO_UPLOAD_LIST_FIELDS.items():
+        raw = enrollment.pop(stored_name)
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"corrupt automatic-upload field: {stored_name}") from exc
+        enrollment[public_name] = _canonical_auto_upload_strings(
+            decoded,
+            field=public_name,
+            allow_empty=(public_name == "hook_targets"),
+        )
+    enrollment["revocation_pending"] = bool(enrollment["revocation_pending"])
+    enrollment.pop("singleton_id", None)
+    return enrollment
+
+
+def get_auto_upload_enrollment(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """Return the singleton local enrollment, decoding its exact scope."""
+    row = conn.execute(
+        "SELECT * FROM auto_upload_enrollment WHERE singleton_id = 1"
+    ).fetchone()
+    return _decode_auto_upload_enrollment(row) if row is not None else None
+
+
+def save_auto_upload_enrollment(
+    conn: sqlite3.Connection,
+    *,
+    mode: str,
+    health: str,
+    generation: int,
+    enrolled_at: str,
+    client_enrollment_id: str,
+    enrolled_sources: Iterable[str],
+    enrolled_projects: Iterable[str],
+    server_enrollment_id: str | None = None,
+    authorization_revision: int | None = None,
+    recurring_authorization_version: str | None = None,
+    retention_version: str | None = None,
+    egress_profile_hash: str | None = None,
+    hook_targets: Iterable[str] = (),
+    claude_hook_observed_at: str | None = None,
+    codex_hook_observed_at: str | None = None,
+    last_completed_at: str | None = None,
+    next_retry_at: str | None = None,
+    consecutive_failures: int = 0,
+    last_result_code: str | None = None,
+    last_result_count: int | None = None,
+    last_receipt_reference: str | None = None,
+    current_run_id: str | None = None,
+    current_run_stage: str | None = None,
+    revocation_pending: bool = False,
+) -> dict[str, Any]:
+    """Atomically create or replace the one authoritative local enrollment."""
+    if mode not in _AUTO_UPLOAD_MODES:
+        raise ValueError(f"invalid automatic-upload mode: {mode!r}")
+    if health not in _AUTO_UPLOAD_HEALTH_VALUES:
+        raise ValueError(f"invalid automatic-upload health: {health!r}")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ValueError("generation must be a positive integer")
+    _parse_auto_upload_timestamp(enrolled_at, field="enrolled_at")
+    for field_name, timestamp in (
+        ("last_completed_at", last_completed_at),
+        ("next_retry_at", next_retry_at),
+        ("claude_hook_observed_at", claude_hook_observed_at),
+        ("codex_hook_observed_at", codex_hook_observed_at),
+    ):
+        if timestamp is not None:
+            _parse_auto_upload_timestamp(timestamp, field=field_name)
+    if not isinstance(client_enrollment_id, str) or not client_enrollment_id.strip():
+        raise ValueError("client_enrollment_id must be a non-empty string")
+    if (
+        authorization_revision is not None
+        and (
+            not isinstance(authorization_revision, int)
+            or isinstance(authorization_revision, bool)
+            or authorization_revision < 1
+        )
+    ):
+        raise ValueError("authorization_revision must be a positive integer")
+    if (
+        not isinstance(consecutive_failures, int)
+        or isinstance(consecutive_failures, bool)
+        or consecutive_failures < 0
+    ):
+        raise ValueError("consecutive_failures must be a non-negative integer")
+    if (
+        last_result_count is not None
+        and (
+            not isinstance(last_result_count, int)
+            or isinstance(last_result_count, bool)
+            or last_result_count < 0
+        )
+    ):
+        raise ValueError("last_result_count must be a non-negative integer")
+
+    payload: dict[str, Any] = {
+        "mode": mode,
+        "health": health,
+        "generation": generation,
+        "enrolled_at": enrolled_at,
+        "client_enrollment_id": client_enrollment_id.strip(),
+        "enrolled_sources_json": json.dumps(
+            _canonical_auto_upload_strings(
+                enrolled_sources, field="enrolled_sources"
+            ),
+            separators=(",", ":"),
+        ),
+        "enrolled_projects_json": json.dumps(
+            _canonical_auto_upload_strings(
+                enrolled_projects, field="enrolled_projects"
+            ),
+            separators=(",", ":"),
+        ),
+        "server_enrollment_id": server_enrollment_id,
+        "authorization_revision": authorization_revision,
+        "recurring_authorization_version": recurring_authorization_version,
+        "retention_version": retention_version,
+        "egress_profile_hash": egress_profile_hash,
+        "hook_targets_json": json.dumps(
+            _canonical_auto_upload_strings(
+                hook_targets, field="hook_targets", allow_empty=True
+            ),
+            separators=(",", ":"),
+        ),
+        "claude_hook_observed_at": claude_hook_observed_at,
+        "codex_hook_observed_at": codex_hook_observed_at,
+        "last_completed_at": last_completed_at,
+        "next_retry_at": next_retry_at,
+        "consecutive_failures": consecutive_failures,
+        "last_result_code": last_result_code,
+        "last_result_count": last_result_count,
+        "last_receipt_reference": last_receipt_reference,
+        "current_run_id": current_run_id,
+        "current_run_stage": current_run_stage,
+        "revocation_pending": int(bool(revocation_pending)),
+        "updated_at": _now_iso(),
+    }
+    columns = list(payload)
+    placeholders = ", ".join("?" for _ in columns)
+    assignments = ", ".join(f"{column} = excluded.{column}" for column in columns)
+    conn.execute(
+        "INSERT INTO auto_upload_enrollment "
+        f"(singleton_id, {', '.join(columns)}) VALUES (1, {placeholders}) "
+        f"ON CONFLICT(singleton_id) DO UPDATE SET {assignments}",
+        [payload[column] for column in columns],
+    )
+    conn.commit()
+    enrollment = get_auto_upload_enrollment(conn)
+    assert enrollment is not None
+    return enrollment
+
+
+def update_auto_upload_enrollment(
+    conn: sqlite3.Connection,
+    *,
+    expected_generation: int | None = None,
+    **changes: Any,
+) -> bool:
+    """Update enrollment fields, optionally using generation as a CAS guard."""
+    if not changes:
+        return get_auto_upload_enrollment(conn) is not None
+
+    stored_changes: dict[str, Any] = {}
+    allowed = {
+        "mode", "health", "generation", "enrolled_at",
+        "client_enrollment_id", "server_enrollment_id",
+        "authorization_revision", "recurring_authorization_version",
+        "retention_version", "egress_profile_hash", "last_completed_at",
+        "next_retry_at", "consecutive_failures", "last_result_code",
+        "last_result_count", "last_receipt_reference", "current_run_id",
+        "current_run_stage", "revocation_pending",
+        "claude_hook_observed_at", "codex_hook_observed_at",
+        *_AUTO_UPLOAD_LIST_FIELDS,
+    }
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"unknown automatic-upload fields: {', '.join(sorted(unknown))}")
+
+    for field, value in changes.items():
+        if field in _AUTO_UPLOAD_LIST_FIELDS:
+            values = _canonical_auto_upload_strings(
+                value,
+                field=field,
+                allow_empty=(field == "hook_targets"),
+            )
+            stored_changes[_AUTO_UPLOAD_LIST_FIELDS[field]] = json.dumps(
+                values, separators=(",", ":")
+            )
+        else:
+            stored_changes[field] = value
+
+    if "mode" in changes and changes["mode"] not in _AUTO_UPLOAD_MODES:
+        raise ValueError(f"invalid automatic-upload mode: {changes['mode']!r}")
+    if "health" in changes and changes["health"] not in _AUTO_UPLOAD_HEALTH_VALUES:
+        raise ValueError(f"invalid automatic-upload health: {changes['health']!r}")
+    for field in ("generation", "authorization_revision"):
+        value = changes.get(field)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise ValueError(f"{field} must be a positive integer")
+    for field in ("consecutive_failures", "last_result_count"):
+        value = changes.get(field)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"{field} must be a non-negative integer")
+    for field in (
+        "enrolled_at",
+        "last_completed_at",
+        "next_retry_at",
+        "claude_hook_observed_at",
+        "codex_hook_observed_at",
+    ):
+        value = changes.get(field)
+        if value is not None:
+            _parse_auto_upload_timestamp(value, field=field)
+    if "client_enrollment_id" in changes and (
+        not isinstance(changes["client_enrollment_id"], str)
+        or not changes["client_enrollment_id"].strip()
+    ):
+        raise ValueError("client_enrollment_id must be a non-empty string")
+    if "revocation_pending" in changes:
+        stored_changes["revocation_pending"] = int(bool(changes["revocation_pending"]))
+
+    stored_changes["updated_at"] = _now_iso()
+    assignments = ", ".join(f"{field} = ?" for field in stored_changes)
+    params = list(stored_changes.values())
+    where = "singleton_id = 1"
+    if expected_generation is not None:
+        if (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 1
+        ):
+            raise ValueError("expected_generation must be a positive integer")
+        where += " AND generation = ?"
+        params.append(expected_generation)
+    cursor = conn.execute(
+        f"UPDATE auto_upload_enrollment SET {assignments} WHERE {where}",
+        params,
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
 _LATEST_SUCCESSFUL_REVISIONS_CTE = """
 WITH ranked_shared_revisions AS (
     SELECT
@@ -4093,6 +4564,247 @@ latest_shared_revisions AS (
     WHERE revision_rank = 1
 )
 """
+
+_SUCCESSFUL_EXACT_REVISION_EXISTS_SQL = """
+EXISTS (
+    SELECT 1
+    FROM share_sessions exact_ss
+    JOIN shares exact_share ON exact_share.share_id = exact_ss.share_id
+    WHERE exact_ss.session_id = s.session_id
+      AND exact_ss.content_revision = s.content_revision
+      AND exact_share.shared_at IS NOT NULL
+)
+"""
+
+
+_AUTO_UPLOAD_EXCLUSION_REASONS = (
+    "pre_enrollment",
+    "unsupported_unsettled",
+    "held_or_embargoed",
+    "blocked_review_status",
+    "changed_revision_needing_approval",
+    "already_shared",
+    "source_excluded",
+    "project_excluded",
+    "missing_blob",
+    "raw_source_unavailable",
+    "scope_confirmation_changed",
+)
+
+
+def _auto_upload_raw_source_resolvable(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    path = Path(value)
+    if path.is_file():
+        return True
+    return bool(
+        path.is_dir()
+        and (path / "subagents").is_dir()
+        and any((path / "subagents").glob("agent-*.jsonl"))
+    )
+
+
+def get_auto_upload_candidate_report(
+    conn: sqlite3.Connection,
+    *,
+    current_sources: Iterable[str],
+    current_projects: Iterable[str],
+    source_confirmed: bool,
+    projects_confirmed: bool,
+    completion_modes: Mapping[str, str],
+    now: datetime | None = None,
+    limit: int = AUTO_UPLOAD_CANDIDATE_LIMIT,
+) -> dict[str, Any]:
+    """Return the deterministic, safety-gated automatic-upload candidates.
+
+    ``completion_modes`` is the audited per-source contract supplied by the
+    parser layer: each enrolled source maps to ``explicit_close`` or
+    ``stable_revision``. The latter requires both ``end_time`` and the current
+    content revision to have remained unchanged for 24 hours. This helper only
+    reads stored scores; it never invokes scoring or mutates review state.
+
+    Newly discovered sources/projects remain excluded without changing the
+    enrollment. Removing confirmation for an enrolled scope fails closed.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if not isinstance(source_confirmed, bool) or not isinstance(projects_confirmed, bool):
+        raise ValueError("source_confirmed and projects_confirmed must be booleans")
+    if not isinstance(completion_modes, Mapping):
+        raise ValueError("completion_modes must map source names to completion modes")
+    invalid_modes = {
+        source: mode
+        for source, mode in completion_modes.items()
+        if mode not in {"explicit_close", "stable_revision"}
+    }
+    if invalid_modes:
+        raise ValueError(f"invalid completion modes: {invalid_modes!r}")
+
+    exclusion_counts = {reason: 0 for reason in _AUTO_UPLOAD_EXCLUSION_REASONS}
+    base_report: dict[str, Any] = {
+        "eligible": [],
+        "selected": [],
+        "eligible_count": 0,
+        "selected_count": 0,
+        "deferred_by_cap": 0,
+        "exclusion_counts": exclusion_counts,
+        "exclusions": [],
+        "scope_blockers": [],
+        "limit": limit,
+    }
+    enrollment = get_auto_upload_enrollment(conn)
+    if enrollment is None:
+        base_report["scope_blockers"] = ["not_enrolled"]
+        return base_report
+
+    enrolled_sources = set(enrollment["enrolled_sources"])
+    enrolled_projects = set(enrollment["enrolled_projects"])
+    active_sources = set(_canonical_auto_upload_strings(
+        current_sources, field="current_sources", allow_empty=True
+    ))
+    active_projects = set(_canonical_auto_upload_strings(
+        current_projects, field="current_projects", allow_empty=True
+    ))
+    scope_blockers: list[str] = []
+    if not source_confirmed:
+        scope_blockers.append("source_confirmation_missing")
+    if not projects_confirmed:
+        scope_blockers.append("project_confirmation_missing")
+    if not enrolled_sources.issubset(active_sources):
+        scope_blockers.append("enrolled_source_removed")
+    if not enrolled_projects.issubset(active_projects):
+        scope_blockers.append("enrolled_project_removed")
+    base_report["scope_blockers"] = scope_blockers
+
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    else:
+        current_time = current_time.astimezone(timezone.utc)
+    enrolled_at = _parse_auto_upload_timestamp(
+        enrollment["enrolled_at"], field="enrolled_at"
+    )
+    stable_cutoff = current_time - timedelta(hours=AUTO_UPLOAD_STABILITY_HOURS)
+
+    rows = conn.execute(
+        _LATEST_SUCCESSFUL_REVISIONS_CTE
+        + "SELECT s.session_id, s.project, s.source, s.display_title, "
+        "s.end_time, s.review_status, s.hold_state, s.embargo_until, "
+        "s.blob_path, s.raw_source_path, s.content_revision AS revision_hash, "
+        "s.revision_stable_since, s.ai_failure_value_score, "
+        "latest.content_revision AS last_shared_revision_hash, "
+        f"({_SUCCESSFUL_EXACT_REVISION_EXISTS_SQL}) "
+        "AS already_shared_exact_revision "
+        "FROM sessions s "
+        "LEFT JOIN latest_shared_revisions latest ON latest.session_id = s.session_id "
+        "ORDER BY s.session_id"
+    ).fetchall()
+
+    eligible: list[dict[str, Any]] = []
+    exclusions: list[dict[str, str]] = []
+
+    def exclude(row: sqlite3.Row, reason: str) -> None:
+        exclusion_counts[reason] += 1
+        exclusions.append({"session_id": row["session_id"], "reason": reason})
+
+    for row in rows:
+        if row["source"] not in enrolled_sources:
+            exclude(row, "source_excluded")
+            continue
+        if row["project"] not in enrolled_projects:
+            exclude(row, "project_excluded")
+            continue
+        if scope_blockers:
+            exclude(row, "scope_confirmation_changed")
+            continue
+
+        try:
+            end_time = _parse_auto_upload_timestamp(row["end_time"], field="end_time")
+        except ValueError:
+            exclude(row, "unsupported_unsettled")
+            continue
+        if end_time <= enrolled_at:
+            exclude(row, "pre_enrollment")
+            continue
+        if end_time > current_time:
+            exclude(row, "unsupported_unsettled")
+            continue
+
+        completion_mode = completion_modes.get(row["source"])
+        if completion_mode == "stable_revision":
+            try:
+                stable_since = _parse_auto_upload_timestamp(
+                    row["revision_stable_since"], field="revision_stable_since"
+                )
+            except ValueError:
+                exclude(row, "unsupported_unsettled")
+                continue
+            if stable_since > stable_cutoff or end_time > stable_cutoff:
+                exclude(row, "unsupported_unsettled")
+                continue
+        elif completion_mode != "explicit_close":
+            exclude(row, "unsupported_unsettled")
+            continue
+
+        latest_revision = row["last_shared_revision_hash"]
+        current_revision = row["revision_hash"]
+        if row["already_shared_exact_revision"]:
+            exclude(row, "already_shared")
+            continue
+        if (
+            latest_revision is not None
+            and latest_revision != current_revision
+            and row["review_status"] != "approved"
+        ):
+            exclude(row, "changed_revision_needing_approval")
+            continue
+        if row["review_status"] not in {"new", "shortlisted", "approved"}:
+            exclude(row, "blocked_review_status")
+            continue
+
+        hold_state = effective_hold_state(
+            row["hold_state"], row["embargo_until"], now=current_time
+        )
+        if hold_state not in SHAREABLE_HOLD_STATES:
+            exclude(row, "held_or_embargoed")
+            continue
+        if _read_blob_for_revision(row["session_id"], row["blob_path"]) is None:
+            exclude(row, "missing_blob")
+            continue
+        if not _auto_upload_raw_source_resolvable(row["raw_source_path"]):
+            exclude(row, "raw_source_unavailable")
+            continue
+
+        candidate = dict(row)
+        candidate.pop("hold_state", None)
+        candidate.pop("embargo_until", None)
+        candidate.pop("already_shared_exact_revision", None)
+        candidate["completion_mode"] = completion_mode
+        candidate["updated_since_last_share"] = latest_revision is not None
+        candidate["_end_timestamp"] = end_time.timestamp()
+        eligible.append(candidate)
+
+    eligible.sort(
+        key=lambda row: (
+            row["ai_failure_value_score"] is None,
+            -(row["ai_failure_value_score"] or 0),
+            -row["_end_timestamp"],
+            row["session_id"],
+        )
+    )
+    for candidate in eligible:
+        candidate.pop("_end_timestamp", None)
+    selected = eligible[:limit]
+    base_report.update({
+        "eligible": eligible,
+        "selected": selected,
+        "eligible_count": len(eligible),
+        "selected_count": len(selected),
+        "deferred_by_cap": max(0, len(eligible) - len(selected)),
+        "exclusions": exclusions,
+    })
+    return base_report
 
 
 def revision_review_blockers(
@@ -4134,7 +4846,7 @@ def already_shared_revision_blockers(
         "FROM sessions s "
         "JOIN latest_shared_revisions latest ON latest.session_id = s.session_id "
         f"WHERE s.session_id IN ({placeholders}) "
-        "AND s.content_revision IS latest.content_revision "
+        f"AND ({_SUCCESSFUL_EXACT_REVISION_EXISTS_SQL}) "
         "ORDER BY s.session_id",
         session_ids,
     ).fetchall()
@@ -4678,6 +5390,7 @@ def add_policy(
         VALUES (?, ?, ?, ?, ?)""",
         (policy_id, policy_type, value, reason, now),
     )
+    mark_auto_upload_profile_changed(conn)
     conn.commit()
     return policy_id
 
@@ -4688,5 +5401,7 @@ def remove_policy(conn: sqlite3.Connection, policy_id: str) -> bool:
         "DELETE FROM policies WHERE policy_id = ?",
         (policy_id,),
     )
+    if cursor.rowcount > 0:
+        mark_auto_upload_profile_changed(conn)
     conn.commit()
     return cursor.rowcount > 0

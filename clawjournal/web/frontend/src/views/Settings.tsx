@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api.ts';
 import type { WorkbenchConfig } from '../types.ts';
 import { useToast } from '../components/Toast.tsx';
+import { AutoUploadPanel } from '../components/AutoUploadControls.tsx';
 import { colors, selectStyle, btnPrimary } from '../theme.ts';
 
 type ConfigPatch = Partial<{
@@ -136,6 +137,8 @@ export function Settings() {
           Default AI-PII review on for new shares
         </label>
       </div>
+
+      <AutoUploadPanel />
 
       {/* Advanced — scoring + UI toggles most users never change. Collapsed by
           default so the page leads with the export-gate essentials above. */}
