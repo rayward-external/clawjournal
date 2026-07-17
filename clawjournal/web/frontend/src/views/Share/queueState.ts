@@ -1,9 +1,57 @@
 const IDS_PARAM = 'ids';
 const SELECTION_PARAM = 'selection';
 const EXCLUDE_PARAM = 'exclude';
+const QUEUE_REF_PARAM = 'queue_ref';
+const STORAGE_PREFIX = 'clawjournal.share.queue.';
+
+// Python's loopback HTTP server rejects request lines above 65,536 bytes.
+// Leave headroom for the path and the Share workflow's other query params.
+export const MAX_QUEUE_QUERY_LENGTH = 48_000;
+
+export interface QueueSelectionStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
 
 function parseIds(value: string | null): string[] {
   return value ? value.split(',').filter(Boolean) : [];
+}
+
+function storageKey(ref: string): string {
+  return `${STORAGE_PREFIX}${ref}`;
+}
+
+function parseStoredQueue(
+  params: URLSearchParams,
+  storage: QueueSelectionStorage | null,
+): string[] | null {
+  const ref = params.get(QUEUE_REF_PARAM);
+  if (!ref || !/^[A-Za-z0-9_-]{1,128}$/.test(ref) || !storage) return null;
+  try {
+    const raw = storage.getItem(storageKey(ref));
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || !parsed.every((id) => typeof id === 'string')) return null;
+    return parsed.filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+function createQueueRef(): string {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch { /* fall through */ }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function replaceQueueParams(target: URLSearchParams, source: URLSearchParams): void {
+  target.delete(IDS_PARAM);
+  target.delete(SELECTION_PARAM);
+  target.delete(EXCLUDE_PARAM);
+  target.delete(QUEUE_REF_PARAM);
+  source.forEach((value, key) => target.set(key, value));
 }
 
 /**
@@ -13,6 +61,7 @@ function parseIds(value: string | null): string[] {
 export function queueSelectionFromSearchParams(
   params: URLSearchParams,
   defaultQueue: string[],
+  storage: QueueSelectionStorage | null = null,
 ): string[] | null {
   // `has` intentionally distinguishes an explicit empty queue (`ids=`) from
   // an absent parameter, which means "use the default".
@@ -22,6 +71,11 @@ export function queueSelectionFromSearchParams(
     const excluded = new Set(parseIds(params.get(EXCLUDE_PARAM)));
     return defaultQueue.filter((id) => !excluded.has(id));
   }
+
+  // A reference is an explicit selection even when its local entry was
+  // cleared, evicted, or opened in another browser. Fail closed instead of
+  // treating an unreadable reference as "no selection" and defaulting to all.
+  if (params.has(QUEUE_REF_PARAM)) return parseStoredQueue(params, storage) ?? [];
 
   return null;
 }
@@ -38,37 +92,65 @@ export function syncQueueSelectionToSearchParams(
   params: URLSearchParams,
   queueOrder: string[],
   defaultQueue: string[] | null,
+  storage: QueueSelectionStorage | null = null,
+  refFactory: () => string = createQueueRef,
 ): void {
-  params.delete(IDS_PARAM);
-  params.delete(SELECTION_PARAM);
-  params.delete(EXCLUDE_PARAM);
+  const existingRef = params.get(QUEUE_REF_PARAM);
+  const encoded = new URLSearchParams();
 
   if (defaultQueue === null) {
-    params.set(IDS_PARAM, queueOrder.join(','));
+    encoded.set(IDS_PARAM, queueOrder.join(','));
+  } else {
+    const selected = new Set(queueOrder);
+    const defaultIds = new Set(defaultQueue);
+    const canonicalSelection = defaultQueue.filter((id) => selected.has(id));
+    const preservesDefaultOrder = (
+      queueOrder.length === canonicalSelection.length
+      && queueOrder.every((id, index) => (
+        defaultIds.has(id) && canonicalSelection[index] === id
+      ))
+    );
+    const excluded = defaultQueue.filter((id) => !selected.has(id));
+    const explicitCsv = queueOrder.join(',');
+    const excludedCsv = excluded.join(',');
+
+    // Exclusions are lossless while selected rows retain the default order.
+    // Otherwise keep explicit ids so drag-reordering survives a reload.
+    if (preservesDefaultOrder && excludedCsv.length < explicitCsv.length) {
+      encoded.set(SELECTION_PARAM, 'all');
+      if (excludedCsv) encoded.set(EXCLUDE_PARAM, excludedCsv);
+    } else {
+      encoded.set(IDS_PARAM, explicitCsv);
+    }
+  }
+
+  if (encoded.toString().length <= MAX_QUEUE_QUERY_LENGTH) {
+    replaceQueueParams(params, encoded);
+    if (existingRef && storage) {
+      try { storage.removeItem(storageKey(existingRef)); } catch { /* ignore */ }
+    }
     return;
   }
 
-  const selected = new Set(queueOrder);
-  const defaultIds = new Set(defaultQueue);
-  const canonicalSelection = defaultQueue.filter((id) => selected.has(id));
-  const preservesDefaultOrder = (
-    queueOrder.length === canonicalSelection.length
-    && queueOrder.every((id, index) => (
-      defaultIds.has(id) && canonicalSelection[index] === id
-    ))
-  );
-  const excluded = defaultQueue.filter((id) => !selected.has(id));
-  const explicitCsv = queueOrder.join(',');
-  const excludedCsv = excluded.join(',');
-
-  // Exclusions are only lossless while the selected rows retain the default
-  // order. Otherwise keep the explicit queue so drag-reordering survives a
-  // reload. Choose ids for an empty or small subset because it is shorter.
-  if (preservesDefaultOrder && excludedCsv.length < explicitCsv.length) {
-    params.set(SELECTION_PARAM, 'all');
-    if (excludedCsv) params.set(EXCLUDE_PARAM, excludedCsv);
-    return;
+  // Arbitrary orderings and large middle-sized subsets cannot be represented
+  // safely in a request URL. Store their exact local-only state behind a short
+  // opaque reference; session ids are local identifiers and the workbench URL
+  // is only meaningful on this machine.
+  if (storage) {
+    const ref = existingRef || refFactory();
+    try {
+      storage.setItem(storageKey(ref), JSON.stringify(queueOrder));
+      const stored = new URLSearchParams();
+      stored.set(QUEUE_REF_PARAM, ref);
+      replaceQueueParams(params, stored);
+      return;
+    } catch { /* use the compact fallback below */ }
   }
 
-  params.set(IDS_PARAM, explicitCsv);
+  // Storage can be unavailable in locked-down browser contexts or when its
+  // quota is exhausted. Fail closed: a reload may lose the oversized queue,
+  // but it must never broaden the user's selection to every eligible trace.
+  const fallback = new URLSearchParams();
+  fallback.set(IDS_PARAM, '');
+  replaceQueueParams(params, fallback);
 }

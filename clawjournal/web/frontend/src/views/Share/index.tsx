@@ -41,10 +41,16 @@ import { PackageStep } from './PackageStep.tsx';
 import { SubmitStep } from './SubmitStep.tsx';
 import { DoneStep } from './DoneStep.tsx';
 
+const PACKAGE_LOG_TRACE_LIMIT = 20;
+const PACKAGE_ANIMATION_MAX_MS = 10_000;
+
 export function Share() {
   const { toast } = useToast();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const queueStorage = useMemo(() => {
+    try { return window.localStorage; } catch { return null; }
+  }, []);
   const internalSearchRef = useRef<string | null>(null);
   const skipNextUrlSyncRef = useRef(false);
 
@@ -61,10 +67,13 @@ export function Share() {
 
   // Queue state: ordered list (drag-reorder) with a derived Set for lookups.
   const [queueOrder, setQueueOrder] = useState<string[]>(() => {
-    if (!searchParams.has('ids')) return [];
-    return queueSelectionFromSearchParams(searchParams, []) || [];
+    if (!searchParams.has('ids') && !searchParams.has('queue_ref')) return [];
+    return queueSelectionFromSearchParams(searchParams, [], queueStorage) || [];
   });
-  const [selectionInitialized, setSelectionInitialized] = useState(() => searchParams.has('ids'));
+  const [selectionInitialized, setSelectionInitialized] = useState(() => (
+    (searchParams.has('ids') || searchParams.has('queue_ref'))
+    && queueSelectionFromSearchParams(searchParams, [], queueStorage) !== null
+  ));
   const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
 
   const [note, setNote] = useState(() => searchParams.get('note') || '');
@@ -160,7 +169,7 @@ export function Share() {
         // Put server recommendations first, then default every other eligible
         // trace into the opt-out queue.
         const defaultQueue = queueFromStats(stats);
-        const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue);
+        const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue, queueStorage);
         setQueueOrder(urlQueue ?? defaultQueue);
         setSelectionInitialized(true);
       }
@@ -184,10 +193,10 @@ export function Share() {
   useEffect(() => {
     if (selectionInitialized || !readyStats) return;
     const defaultQueue = queueFromStats(readyStats);
-    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue);
+    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue, queueStorage);
     setQueueOrder(urlQueue ?? defaultQueue);
     setSelectionInitialized(true);
-  }, [readyStats, searchParams, selectionInitialized]);
+  }, [readyStats, searchParams, selectionInitialized, queueStorage]);
 
   useEffect(() => {
     const currentSearch = location.search.startsWith('?') ? location.search.slice(1) : location.search;
@@ -216,8 +225,10 @@ export function Share() {
     setBlockedPackageSessions([]);
 
     const defaultQueue = readyStats ? queueFromStats(readyStats) : [];
-    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue);
-    if (urlQueue !== null && (readyStats !== null || searchParams.has('ids'))) {
+    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue, queueStorage);
+    if (urlQueue !== null && (
+      readyStats !== null || searchParams.has('ids') || searchParams.has('queue_ref')
+    )) {
       setQueueOrder(urlQueue);
       setSelectionInitialized(true);
       return;
@@ -225,7 +236,7 @@ export function Share() {
 
     setQueueOrder(defaultQueue);
     setSelectionInitialized(!!readyStats);
-  }, [location.search, readyStats, searchParams]);
+  }, [location.search, readyStats, searchParams, queueStorage]);
 
   useEffect(() => {
     if (skipNextUrlSyncRef.current) {
@@ -237,7 +248,7 @@ export function Share() {
       if (activeStep === 'queue') next.delete('step'); else next.set('step', activeStep);
       if (selectionInitialized) {
         const defaultQueue = readyStats ? queueFromStats(readyStats) : null;
-        syncQueueSelectionToSearchParams(next, queueOrder, defaultQueue);
+        syncQueueSelectionToSearchParams(next, queueOrder, defaultQueue, queueStorage);
       }
       if (note) next.set('note', note); else next.delete('note');
       if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
@@ -245,7 +256,7 @@ export function Share() {
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, selectionInitialized, readyStats, note, aiPiiEnabled, packagedShareId, setSearchParams]);
+  }, [activeStep, queueOrder, selectionInitialized, readyStats, queueStorage, note, aiPiiEnabled, packagedShareId, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {
@@ -622,17 +633,23 @@ export function Share() {
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact', 'review']));
 
     const approvedList = queuedSessions.filter((s) => approvedIds.has(s.session_id));
+    const traceLogLines = approvedList
+      .slice(0, PACKAGE_LOG_TRACE_LIMIT)
+      .map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`);
+    if (approvedList.length > PACKAGE_LOG_TRACE_LIMIT) {
+      traceLogLines.push(`Adding ${approvedList.length - PACKAGE_LOG_TRACE_LIMIT} more traces...`);
+    }
     const logLines = [
       'Allocating bundle...',
       'Writing manifest.json...',
-      ...approvedList.map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`),
+      ...traceLogLines,
       aiPiiEnabled ? 'Running final AI PII review...' : 'Running final rules-only PII review...',
       'Running final secret scan...',
       'Sealing bundle...',
     ];
 
     const animStart = Date.now();
-    const duration = 2200 + approvedList.length * 220;
+    const duration = Math.min(PACKAGE_ANIMATION_MAX_MS, 2200 + approvedList.length * 220);
 
     const timers: number[] = [];
     logLines.forEach((line, i) => {

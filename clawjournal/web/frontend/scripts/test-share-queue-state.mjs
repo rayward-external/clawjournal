@@ -13,9 +13,17 @@ const output = ts.transpileModule(source, {
 }).outputText;
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(output).toString('base64')}`;
 const {
+  MAX_QUEUE_QUERY_LENGTH,
   queueSelectionFromSearchParams,
   syncQueueSelectionToSearchParams,
 } = await import(moduleUrl);
+
+const storedValues = new Map();
+const storage = {
+  getItem: (key) => storedValues.get(key) ?? null,
+  setItem: (key, value) => storedValues.set(key, value),
+  removeItem: (key) => storedValues.delete(key),
+};
 
 const ids = Array.from({ length: 5_000 }, (_, index) => (
   `session-${index.toString().padStart(5, '0')}-${'a'.repeat(48)}`
@@ -40,9 +48,68 @@ syncQueueSelectionToSearchParams(explicitParams, explicit, ids);
 assert.equal(explicitParams.get('ids'), explicit.join(','));
 assert.deepEqual(queueSelectionFromSearchParams(explicitParams, ids), explicit);
 
+const reordered = [...ids.slice(1), ids[0]];
+const reorderedParams = new URLSearchParams();
+syncQueueSelectionToSearchParams(
+  reorderedParams,
+  reordered,
+  ids,
+  storage,
+  () => 'large-reordered',
+);
+assert.equal(reorderedParams.toString(), 'queue_ref=large-reordered');
+assert.ok(reorderedParams.toString().length < MAX_QUEUE_QUERY_LENGTH);
+assert.deepEqual(queueSelectionFromSearchParams(reorderedParams, ids, storage), reordered);
+
+const middleSubset = ids.filter((_, index) => index % 2 === 0);
+const middleSubsetParams = new URLSearchParams();
+syncQueueSelectionToSearchParams(
+  middleSubsetParams,
+  middleSubset,
+  ids,
+  storage,
+  () => 'large-middle-subset',
+);
+assert.equal(middleSubsetParams.toString(), 'queue_ref=large-middle-subset');
+assert.ok(middleSubsetParams.toString().length < MAX_QUEUE_QUERY_LENGTH);
+assert.deepEqual(queueSelectionFromSearchParams(middleSubsetParams, ids, storage), middleSubset);
+
+const unavailableStorage = {
+  getItem: () => null,
+  setItem: () => { throw new Error('quota exceeded'); },
+  removeItem: () => {},
+};
+const storageFailureParams = new URLSearchParams();
+syncQueueSelectionToSearchParams(storageFailureParams, reordered, ids, unavailableStorage);
+assert.equal(storageFailureParams.toString(), 'ids=');
+assert.deepEqual(queueSelectionFromSearchParams(storageFailureParams, ids, unavailableStorage), []);
+
+const missingRefParams = new URLSearchParams('queue_ref=missing');
+assert.deepEqual(queueSelectionFromSearchParams(missingRefParams, ids, storage), []);
+const invalidRefParams = new URLSearchParams('queue_ref=../../invalid');
+assert.deepEqual(queueSelectionFromSearchParams(invalidRefParams, ids, storage), []);
+
 const emptyParams = new URLSearchParams();
 syncQueueSelectionToSearchParams(emptyParams, [], ids);
 assert.equal(emptyParams.toString(), 'ids=');
 assert.deepEqual(queueSelectionFromSearchParams(emptyParams, ids), []);
 
 assert.equal(queueSelectionFromSearchParams(new URLSearchParams(), ids), null);
+
+const queueStep = await readFile(new URL('../src/views/Share/QueueStep.tsx', import.meta.url), 'utf8');
+assert.doesNotMatch(queueStep, /queueOrder\.includes\(/);
+assert.match(queueStep, /queuedIds\.has\(s\.session_id\)/);
+assert.match(queueStep, /p\.queuedSessions\.slice\(0, visibleQueueCount\)/);
+assert.match(queueStep, /available\.slice\(0, visibleAvailableCount\)/);
+
+const redactStep = await readFile(new URL('../src/views/Share/RedactStep.tsx', import.meta.url), 'utf8');
+assert.match(redactStep, /p\.queuedSessions\.slice\(0, visibleCount\)/);
+assert.doesNotMatch(redactStep, /p\.queuedSessions\.map\(/);
+
+const reviewStep = await readFile(new URL('../src/views/Share/ReviewStep.tsx', import.meta.url), 'utf8');
+assert.match(reviewStep, /sorted\.slice\(0, visibleCount\)/);
+assert.doesNotMatch(reviewStep, /sorted\.map\(/);
+
+const shareIndex = await readFile(new URL('../src/views/Share/index.tsx', import.meta.url), 'utf8');
+assert.match(shareIndex, /\.slice\(0, PACKAGE_LOG_TRACE_LIMIT\)/);
+assert.match(shareIndex, /Math\.min\(PACKAGE_ANIMATION_MAX_MS, 2200 \+ approvedList\.length \* 220\)/);

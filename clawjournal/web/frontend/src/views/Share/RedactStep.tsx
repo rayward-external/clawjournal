@@ -1,8 +1,11 @@
+import { useState } from 'react';
 import { colors } from '../../theme.ts';
 import type { ReadySession, RedactedSessionData } from './types.ts';
 import { classify, emptyBuckets, formatTokens, sessionTotalTokens } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary } from './styles.tsx';
 import { HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
+
+const REDACTION_PAGE_SIZE = 50;
 
 export interface RedactStepProps {
   stepperHeader: React.ReactNode;
@@ -18,6 +21,7 @@ export interface RedactStepProps {
 }
 
 export function RedactStep(p: RedactStepProps) {
+  const [visibleCount, setVisibleCount] = useState(REDACTION_PAGE_SIZE);
   const totals = p.queuedSessions.reduce((acc, s) => {
     const d = p.redactedSessions[s.session_id];
     if (!d || d.loading || !d.buckets) return acc;
@@ -37,6 +41,8 @@ export function RedactStep(p: RedactStepProps) {
     return d && !d.loading;
   }).length;
   const overallPct = p.queuedSessions.length === 0 ? 0 : Math.round((doneCount / p.queuedSessions.length) * 100);
+  const visibleSessions = p.queuedSessions.slice(0, visibleCount);
+  const hiddenCount = p.queuedSessions.length - visibleSessions.length;
 
   // progress bar helper for category rows
   const categoryRow = (
@@ -130,7 +136,7 @@ export function RedactStep(p: RedactStepProps) {
         color: colors.gray400, margin: '0 0 10px', fontWeight: 600,
       }}>Per-trace progress</div>
 
-      {p.queuedSessions.map((s) => {
+      {visibleSessions.map((s) => {
         const d = p.redactedSessions[s.session_id];
         const finished = !!d && !d.loading;
         const flagged = finished && classify(d) === 'review';
@@ -203,6 +209,18 @@ export function RedactStep(p: RedactStepProps) {
           </div>
         );
       })}
+
+      {hiddenCount > 0 && (
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: 10 }}>
+          <button
+            onClick={() => setVisibleCount((count) => count + REDACTION_PAGE_SIZE)}
+            style={btnGhost}
+          >
+            Show {Math.min(REDACTION_PAGE_SIZE, hiddenCount)} more
+            <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenCount} remaining)</span>
+          </button>
+        </div>
+      )}
 
       <div style={{
         position: 'sticky', bottom: 0, marginTop: 14, paddingTop: 14,
