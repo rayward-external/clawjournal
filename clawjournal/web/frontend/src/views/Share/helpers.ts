@@ -1,7 +1,6 @@
 import type { Share as ShareType } from '../../types.ts';
 import {
   CONFIDENCE_THRESHOLD,
-  DEFAULT_SHARE_QUEUE_SIZE,
   STEPS,
 } from './types.ts';
 import type {
@@ -140,13 +139,15 @@ export function formatShareDestination(url: string): string {
 export function queueFromStats(stats: ShareReadyStats): string[] {
   const validIds = new Set(stats.sessions.map((s) => s.session_id));
   const recommended = (stats.recommended_session_ids || [])
-    .filter((id) => validIds.has(id))
-    .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
-  if (recommended.length > 0) return recommended;
-  return stats.sessions
-    .map((s) => s.session_id)
-    .filter(Boolean)
-    .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
+    .filter((id) => validIds.has(id));
+
+  // Start with the server's highest-value recommendations, then include every
+  // other eligible trace. Share is opt-out: users remove traces they do not
+  // want in the bundle instead of adding the hidden pool one at a time.
+  return [...new Set([
+    ...recommended,
+    ...stats.sessions.map((s) => s.session_id).filter(Boolean),
+  ])];
 }
 
 export function completedKeysForStep(step: StepKey): Set<string> {

@@ -128,4 +128,3 @@ export interface RedactedSessionData {
 }
 
 export const CONFIDENCE_THRESHOLD = 0.85;
-export const DEFAULT_SHARE_QUEUE_SIZE = 10;

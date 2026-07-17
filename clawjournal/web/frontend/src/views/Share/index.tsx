@@ -153,11 +153,10 @@ export function Share() {
       setShares(shareList);
       setScoringBackend(backend);
       if (!selectionInitialized && stats.sessions.length > 0) {
-        // Server recommendation is an ordered, reviewable default package.
-        // Trust it and only filter out ids the client can't resolve
-        // (eg. excluded projects).
-        const recommended = queueFromStats(stats);
-        setQueueOrder(recommended);
+        // Put server recommendations first, then default every other eligible
+        // trace into the opt-out queue.
+        const defaultQueue = queueFromStats(stats);
+        setQueueOrder(defaultQueue);
         setSelectionInitialized(true);
       }
       if (stats.sessions.length === 0) {
@@ -217,10 +216,10 @@ export function Share() {
       return;
     }
 
-    const recommended = readyStats && readyStats.sessions.length > 0
+    const defaultQueue = readyStats && readyStats.sessions.length > 0
       ? queueFromStats(readyStats)
       : [];
-    setQueueOrder(recommended);
+    setQueueOrder(defaultQueue);
     setSelectionInitialized(!!readyStats);
   }, [location.search, readyStats, searchParams]);
 
