@@ -113,3 +113,48 @@ assert.doesNotMatch(reviewStep, /sorted\.map\(/);
 const shareIndex = await readFile(new URL('../src/views/Share/index.tsx', import.meta.url), 'utf8');
 assert.match(shareIndex, /\.slice\(0, PACKAGE_LOG_TRACE_LIMIT\)/);
 assert.match(shareIndex, /Math\.min\(PACKAGE_ANIMATION_MAX_MS, 2200 \+ approvedList\.length \* 220\)/);
+assert.match(shareIndex, /cancelRedactionRun\(redactionRunRef\)/);
+assert.match(shareIndex, /return !data \|\| data\.loading/);
+assert.match(shareIndex, /signal: run\.controller\.signal/);
+assert.match(shareIndex, /if \(!isActive\(\)\) break/);
+assert.match(shareIndex, /const approvedSessions = useMemo\(/);
+assert.match(shareIndex, /approvedList=\{approvedSessions\}/);
+
+const apiSource = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8');
+assert.match(apiSource, /redactionReport\(id: string, opts\?: \{ aiPii\?: boolean; signal\?: AbortSignal \}\)/);
+assert.match(apiSource, /signal: opts\?\.signal/);
+
+const packageStep = await readFile(new URL('../src/views/Share/PackageStep.tsx', import.meta.url), 'utf8');
+assert.match(packageStep, /p\.approvedList\.slice\(0, PACKAGE_ANIMATION_TRACE_LIMIT\)\.forEach/);
+assert.doesNotMatch(packageStep, /p\.approvedList\.forEach\(/);
+
+const redactionRunSource = await readFile(new URL('../src/views/Share/redactionRun.ts', import.meta.url), 'utf8');
+const redactionRunOutput = ts.transpileModule(redactionRunSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.ESNext,
+    target: ts.ScriptTarget.ES2022,
+  },
+}).outputText;
+const redactionRunUrl = `data:text/javascript;base64,${Buffer.from(redactionRunOutput).toString('base64')}`;
+const {
+  beginRedactionRun,
+  cancelRedactionRun,
+  finishRedactionRun,
+  isRedactionRunActive,
+} = await import(redactionRunUrl);
+
+const runSlot = { current: null };
+const firstRun = beginRedactionRun(runSlot);
+assert.ok(firstRun);
+assert.equal(beginRedactionRun(runSlot), null);
+assert.equal(isRedactionRunActive(runSlot, firstRun), true);
+cancelRedactionRun(runSlot);
+assert.equal(firstRun.controller.signal.aborted, true);
+assert.equal(isRedactionRunActive(runSlot, firstRun), false);
+
+const replacementRun = beginRedactionRun(runSlot);
+assert.ok(replacementRun);
+finishRedactionRun(runSlot, firstRun);
+assert.equal(isRedactionRunActive(runSlot, replacementRun), true);
+finishRedactionRun(runSlot, replacementRun);
+assert.equal(runSlot.current, null);

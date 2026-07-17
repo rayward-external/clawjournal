@@ -112,9 +112,11 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redacted`);
     },
 
-    redactionReport(id: string, opts?: { aiPii?: boolean }): Promise<RedactionReport> {
+    redactionReport(id: string, opts?: { aiPii?: boolean; signal?: AbortSignal }): Promise<RedactionReport> {
       const q = opts?.aiPii ? '?ai_pii=1' : '';
-      return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`);
+      return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`, {
+        signal: opts?.signal,
+      });
     },
 
     update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; ai_failure_value_score?: number; ai_failure_evidence?: string[]; ai_recovery_labels?: string[]; ai_failure_attribution?: string; ai_failure_modes?: string[]; ai_learning_summary?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {
