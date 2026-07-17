@@ -29,6 +29,10 @@ import {
   queueFromStats,
   sessionTotalTokens,
 } from './helpers.ts';
+import {
+  queueSelectionFromSearchParams,
+  syncQueueSelectionToSearchParams,
+} from './queueState.ts';
 import { SHARE_SHELL_WIDTH, globalStyles } from './styles.tsx';
 import { QueueStep } from './QueueStep.tsx';
 import { RedactStep } from './RedactStep.tsx';
@@ -57,10 +61,10 @@ export function Share() {
 
   // Queue state: ordered list (drag-reorder) with a derived Set for lookups.
   const [queueOrder, setQueueOrder] = useState<string[]>(() => {
-    const csv = searchParams.get('ids');
-    return csv ? csv.split(',').filter(Boolean) : [];
+    if (!searchParams.has('ids')) return [];
+    return queueSelectionFromSearchParams(searchParams, []) || [];
   });
-  const [selectionInitialized, setSelectionInitialized] = useState(() => !!searchParams.get('ids'));
+  const [selectionInitialized, setSelectionInitialized] = useState(() => searchParams.has('ids'));
   const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
 
   const [note, setNote] = useState(() => searchParams.get('note') || '');
@@ -156,7 +160,8 @@ export function Share() {
         // Put server recommendations first, then default every other eligible
         // trace into the opt-out queue.
         const defaultQueue = queueFromStats(stats);
-        setQueueOrder(defaultQueue);
+        const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue);
+        setQueueOrder(urlQueue ?? defaultQueue);
         setSelectionInitialized(true);
       }
       if (stats.sessions.length === 0) {
@@ -177,8 +182,10 @@ export function Share() {
   // =================================================
 
   useEffect(() => {
-    if (selectionInitialized || !readyStats || searchParams.get('ids')) return;
-    setQueueOrder(queueFromStats(readyStats));
+    if (selectionInitialized || !readyStats) return;
+    const defaultQueue = queueFromStats(readyStats);
+    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue);
+    setQueueOrder(urlQueue ?? defaultQueue);
     setSelectionInitialized(true);
   }, [readyStats, searchParams, selectionInitialized]);
 
@@ -189,8 +196,6 @@ export function Share() {
     internalSearchRef.current = currentSearch;
     skipNextUrlSyncRef.current = true;
 
-    const idsParam = searchParams.get('ids');
-    const ids = idsParam ? idsParam.split(',').filter(Boolean) : null;
     const step = parseStep(searchParams.get('step'));
 
     setActiveStep(step);
@@ -210,15 +215,14 @@ export function Share() {
     setPackagingFailed(null);
     setBlockedPackageSessions([]);
 
-    if (ids) {
-      setQueueOrder(ids);
+    const defaultQueue = readyStats ? queueFromStats(readyStats) : [];
+    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue);
+    if (urlQueue !== null && (readyStats !== null || searchParams.has('ids'))) {
+      setQueueOrder(urlQueue);
       setSelectionInitialized(true);
       return;
     }
 
-    const defaultQueue = readyStats && readyStats.sessions.length > 0
-      ? queueFromStats(readyStats)
-      : [];
     setQueueOrder(defaultQueue);
     setSelectionInitialized(!!readyStats);
   }, [location.search, readyStats, searchParams]);
@@ -231,15 +235,17 @@ export function Share() {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       if (activeStep === 'queue') next.delete('step'); else next.set('step', activeStep);
-      const csv = queueOrder.join(',');
-      if (csv) next.set('ids', csv); else next.delete('ids');
+      if (selectionInitialized) {
+        const defaultQueue = readyStats ? queueFromStats(readyStats) : null;
+        syncQueueSelectionToSearchParams(next, queueOrder, defaultQueue);
+      }
       if (note) next.set('note', note); else next.delete('note');
       if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
       if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, note, aiPiiEnabled, packagedShareId, setSearchParams]);
+  }, [activeStep, queueOrder, selectionInitialized, readyStats, note, aiPiiEnabled, packagedShareId, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {

@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "npm run test:share-queue",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:share-queue": "node scripts/test-share-queue-state.mjs"
   },
   "dependencies": {
     "react": "^19.2.4",
