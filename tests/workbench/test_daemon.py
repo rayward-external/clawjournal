@@ -2957,10 +2957,18 @@ def test_upload_pii_summary_reports_backend_for_zero_row_export(tmp_path, ai_pii
     assert summary["backend"] is None
 
 
-def test_finalize_reraises_control_gate_instead_of_swallowing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("raised", ["control_changed", "wrapped_gate_error"])
+def test_finalize_reraises_control_gate_instead_of_swallowing(
+    tmp_path, monkeypatch, raised
+):
     # A before_ai_call control gate firing during AI-PII review must propagate
     # as ControlChanged (so the runner records a clean control stop), not be
     # collapsed into a generic retryable packaging failure by the blanket except.
+    #
+    # The realistic shape is a *bare* ControlChanged: review_session_pii_hybrid
+    # unwraps _AgentCallGateError to its .cause before it can reach finalize, so
+    # _apply_upload_pii_redactions raises ControlChanged, never the wrapper.
+    # (The wrapped case is exercised too, as defense in depth.)
     from clawjournal.workbench import daemon as daemon_module
     from clawjournal.redaction.pii import _AgentCallGateError
     from clawjournal.auto_upload import ControlChanged
@@ -2969,8 +2977,12 @@ def test_finalize_reraises_control_gate_instead_of_swallowing(tmp_path, monkeypa
     export_dir.mkdir()
     (export_dir / "sessions.jsonl").write_text('{"session_id":"s1"}\n', encoding="utf-8")
 
+    control = ControlChanged("paused mid-review")
+
     def gate_fires(*_args, **_kwargs):
-        raise _AgentCallGateError(ControlChanged("paused mid-review"))
+        if raised == "control_changed":
+            raise control
+        raise _AgentCallGateError(control)
 
     monkeypatch.setattr(daemon_module, "_apply_upload_pii_redactions", gate_fires)
 

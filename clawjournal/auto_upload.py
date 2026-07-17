@@ -1354,21 +1354,28 @@ def enable(
 
             config = load_config()
             config["auto_upload_capability_available"] = True
-            # The enrollment consumed this one-shot manual credential.  Never
-            # let automatic runs fall back to it.
-            config.pop("verified_email_token", None)
-            config.pop("verified_email_token_expires_at", None)
+            # Only the create / credential-rotation path sends the one-shot
+            # verified_email_token to the server; the non-rotating update path
+            # reuses the pinned active credential and never sends it. Deleting it
+            # there would silently destroy a still-valid manual-share credential
+            # the user just re-verified, so gate the removal to the paths that
+            # actually consumed it.
+            consumed_one_shot_token = not (updating and not rotating_credentials)
+            if consumed_one_shot_token:
+                config.pop("verified_email_token", None)
+                config.pop("verified_email_token_expires_at", None)
             if save_config(config) is False:
                 raise AutoUploadError(
                     "config_persistence_failed",
                     "Recurring enrollment could not persist its local config safely.",
                 )
-            persisted_config = _load_config_readonly()
-            if persisted_config.get("verified_email_token"):
-                raise AutoUploadError(
-                    "config_persistence_failed",
-                    "The consumed one-shot verification credential could not be removed durably.",
-                )
+            if consumed_one_shot_token:
+                persisted_config = _load_config_readonly()
+                if persisted_config.get("verified_email_token"):
+                    raise AutoUploadError(
+                        "config_persistence_failed",
+                        "The consumed one-shot verification credential could not be removed durably.",
+                    )
 
             # Phase 2 commits Enabled before making the active bearer visible.
             # A crash between these writes is Enabled + recovery-only, which is
@@ -2644,6 +2651,14 @@ def _submit_pending_artifact(
             "payload_too_large", "The sealed recurring ZIP exceeds the current hosted limit."
         )
     _server_enrollment_gate(capabilities, enrollment, credentials)
+    # Re-validate the raw fingerprint ledger immediately BEFORE the locked
+    # section, never inside it: raw session files are unrelated to privacy-
+    # config writes, so hashing up to five (potentially very large) session
+    # logs while holding the egress lock would stall every concurrent
+    # save_config for the full, size-unbounded re-hash. Only the profile-hash
+    # recompute and the submitting transition need the lock for atomicity vs
+    # profile writers.
+    _validate_raw_fingerprint_ledger(conn, share)
     # The protected server check above can take long enough for a local pause,
     # hold, revision, or privacy-profile edit to win. Profile writers share
     # this short cross-process boundary lock; DB policy writers atomically bump
@@ -2659,7 +2674,6 @@ def _submit_pending_artifact(
             api_origin=str(credentials["api_origin"]),
             ai_backend=ai_backend,
         )
-        _validate_raw_fingerprint_ledger(conn, share)
         state = str(share.get("submission_state"))
         if state not in {"sealed", "submitting"} or not _transition_submission(
             conn,
@@ -3530,18 +3544,23 @@ def _run_cycle_impl(
                         "payload_too_large",
                         "The final recurring ZIP exceeds the hosted size limit.",
                     )
-                artifact_path, artifact_hash = _write_sealed_zip(
-                    Path(packaged["export_dir"]), zip_bytes
-                )
-                client_submission_id = _seal_share_ledger(
-                    conn,
-                    share_id=share_id,
-                    enrollment=enrollment,
-                    artifact_path=artifact_path,
-                    artifact_sha256=artifact_hash,
-                    raw_fingerprints=fingerprints,
-                )
+                # Seal and the post-seal rechecks share one cleanup guard: a
+                # failure while writing the ZIP or committing the seal ledger
+                # (e.g. a generation/profile change racing this boundary) would
+                # otherwise orphan the draft share row and the on-disk sealed
+                # ZIP, which nothing later reclaims.
                 try:
+                    artifact_path, artifact_hash = _write_sealed_zip(
+                        Path(packaged["export_dir"]), zip_bytes
+                    )
+                    client_submission_id = _seal_share_ledger(
+                        conn,
+                        share_id=share_id,
+                        enrollment=enrollment,
+                        artifact_path=artifact_path,
+                        artifact_sha256=artifact_hash,
+                        raw_fingerprints=fingerprints,
+                    )
                     if _raw_fingerprints(selected) != fingerprints:
                         raise ControlChanged("A selected raw trace changed before egress.")
                     _assert_control_state(

@@ -1609,6 +1609,45 @@ def test_reauthorization_accepts_earlier_server_cutoff_from_clock_skew(
         conn.close()
 
 
+def test_non_rotating_update_preserves_unused_manual_verified_email_token(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    # A non-rotating scope/terms update reuses the pinned active credential and
+    # never sends verified_email_token, so it must not delete a still-valid
+    # manual-share token the user re-verified after enrolling.
+    config = _save_scope_config(upload_token="valid-manual-token")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(
+        conn,
+        config,
+        enrolled_at="2026-07-15T13:00:00+00:00",
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto,
+        "update_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": "2026-07-15T13:00:00+00:00",
+            "authorization_revision": 2,
+        },
+    )
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result.get("ok") is not False
+    assert config_module.load_config().get("verified_email_token") == "valid-manual-token"
+
+
 def test_reauthorization_discards_same_enrollment_sealed_artifact_after_patch(
     isolated_auto_upload,
     monkeypatch,
