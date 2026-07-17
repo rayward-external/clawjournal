@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter, useLocation } from 'react-router-dom';
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../../api.ts';
 import { ToastProvider } from '../../components/Toast.tsx';
@@ -8,6 +8,11 @@ import { Share } from './index.tsx';
 
 function LocationProbe() {
   return <output data-testid="location-search">{useLocation().search}</output>;
+}
+
+function NavigationProbe({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate(to)}>Navigate</button>;
 }
 
 function readySession(id: string): ReadySession {
@@ -63,6 +68,7 @@ function mockInitialLoad(stats: ShareReadyStats) {
 }
 
 afterEach(() => {
+  window.localStorage.clear();
   vi.restoreAllMocks();
 });
 
@@ -84,16 +90,23 @@ describe('Share selection defaults', () => {
     const last = screen.getByRole('checkbox', { name: 'Include trace: Trace s12' });
     expect(first).toBeChecked();
     expect(last).toBeChecked();
-    expect(screen.getByTestId('location-search')).toHaveTextContent(/^$/);
 
     fireEvent.click(first);
     await waitFor(() => expect(first).not.toBeChecked());
-    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent('exclude_ids=s1'));
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+      expect(params.get('exclude')).toBe('s1');
+    });
     expect(last).toBeChecked();
 
     fireEvent.click(first);
     await waitFor(() => expect(first).toBeChecked());
-    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent(/^$/));
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+      expect(params.has('exclude')).toBe(false);
+    });
   });
 
   it('bounds large-history rendering while retaining and confirming the full selection', async () => {
@@ -130,6 +143,37 @@ describe('Share selection defaults', () => {
     expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s2' })).toBeChecked();
     await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent('ids=s2'));
+  });
+
+  it('restores the latest URL selection when navigation wins the initial-load race', async () => {
+    let resolveReady!: (stats: Awaited<ReturnType<typeof api.shareReady>>) => void;
+    vi.spyOn(api, 'shareReady').mockReturnValue(new Promise((resolve) => { resolveReady = resolve; }));
+    vi.spyOn(api.shares, 'list').mockResolvedValue([]);
+    vi.spyOn(api, 'scoringBackend').mockResolvedValue({ backend: null, display_name: null });
+    vi.spyOn(api, 'shareDestination').mockResolvedValue({
+      configured: false,
+      daemon_upload_supported: false,
+      submissions_open: false,
+      preferred_upload_flow: 'manual',
+      cli_ingest_supported: false,
+      share_page_url: null,
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+        <NavigationProbe to="/share?ids=s1" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate' }));
+    resolveReady(readyStats(2) as Awaited<ReturnType<typeof api.shareReady>>);
+
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s2' })).not.toBeChecked();
+    await waitFor(() => expect(screen.getByTestId('location-search')).toHaveTextContent('ids=s1'));
   });
 
   it('gates a large Redact deep link before any redaction or AI review starts', async () => {
@@ -171,7 +215,7 @@ describe('Share selection defaults', () => {
       await waitFor(() => {
         const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
         expect(params.has('step')).toBe(false);
-        expect(params.has('selection')).toBe(false);
+        expect(params.get('selection')).not.toBe('locked');
       });
     },
   );
@@ -221,6 +265,120 @@ describe('Share selection defaults', () => {
     expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual(['s1', 's2']);
     expect(redactionSpy).not.toHaveBeenCalledWith('s3', expect.anything());
     expect(redactionSpy.mock.calls.every(([, options]) => options?.aiPii === true)).toBe(true);
+  });
+
+  it('stores a large locked snapshot by reference without adding a newly eligible trace', async () => {
+    const ids = Array.from(
+      { length: 800 },
+      (_, index) => `session-${index.toString().padStart(4, '0')}-${'x'.repeat(64)}`,
+    );
+    const stats: ShareReadyStats = {
+      ...readyStats(0),
+      count: ids.length,
+      total_approved: ids.length,
+      recommended_session_ids: [ids[0]],
+      sessions: ids.map(readySession),
+    };
+    mockInitialLoad(stats);
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(
+      () => new Promise(() => {}),
+    );
+
+    const firstView = render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('800 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Redact 800 traces' }));
+
+    let lockedSearch = '';
+    let lockedRef = '';
+    await waitFor(() => {
+      lockedSearch = screen.getByTestId('location-search').textContent || '';
+      const params = new URLSearchParams(lockedSearch);
+      expect(params.get('step')).toBe('redact');
+      expect(params.get('selection')).toBe('locked');
+      lockedRef = params.get('queue_ref') || '';
+      expect(lockedRef).not.toBe('');
+      expect(params.has('ids')).toBe(false);
+    });
+    expect(JSON.parse(window.localStorage.getItem(`clawjournal.share.queue.${lockedRef}`) || '[]')).toEqual(ids);
+
+    firstView.unmount();
+    const newlyEligible = 'newly-eligible-trace';
+    vi.mocked(api.shareReady).mockResolvedValue({
+      ...stats,
+      count: stats.count + 1,
+      total_approved: stats.total_approved + 1,
+      sessions: [...stats.sessions, readySession(newlyEligible)],
+    } as Awaited<ReturnType<typeof api.shareReady>>);
+    redactionSpy.mockClear();
+
+    render(
+      <MemoryRouter initialEntries={[`/share${lockedSearch}`]}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Redacting your traces' })).toBeInTheDocument();
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+    expect(redactionSpy).not.toHaveBeenCalledWith(newlyEligible, expect.anything());
+  });
+
+  it('rejects a locked downstream URL when its queue reference is missing', async () => {
+    mockInitialLoad(readyStats(3));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&queue_ref=missing&selection=locked']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Share' })).toBeInTheDocument();
+    expect(screen.getByText(/Nothing is preselected/)).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.has('step')).toBe(false);
+      expect(params.get('selection')).not.toBe('locked');
+    });
+  });
+
+  it('keeps a stale locked snapshot on Queue after the user selects a new trace', async () => {
+    mockInitialLoad(readyStats(2));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport');
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&ids=no-longer-eligible&selection=locked']}>
+        <ToastProvider><Share /></ToastProvider>
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Share' })).toBeInTheDocument();
+    expect(screen.getByText(/Nothing is preselected/)).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.has('step')).toBe(false);
+      expect(params.get('selection')).not.toBe('locked');
+    });
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' }));
+
+    expect(await screen.findByRole('heading', { name: 'What would you like to share?' })).toBeInTheDocument();
+    expect(redactionSpy).not.toHaveBeenCalled();
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.has('step')).toBe(false);
+      expect(params.get('selection')).not.toBe('locked');
+    });
   });
 
   it('resumes an existing packaged large share without restarting queue work', async () => {

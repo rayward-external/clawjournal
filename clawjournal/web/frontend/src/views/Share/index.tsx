@@ -28,11 +28,23 @@ import {
   formatDate,
   hasLockedQueueSelection,
   parseStep,
-  queueFromSelectionParams,
   queueFromStats,
+  sanitizeQueueSelection,
   sessionTotalTokens,
-  writeQueueSelectionParams,
 } from './helpers.ts';
+import {
+  isQueueSelectionRestorable,
+  queueSelectionFromSearchParams,
+  syncQueueSelectionToSearchParams,
+} from './queueState.ts';
+import type { QueueSelectionStorage } from './queueState.ts';
+import {
+  beginRedactionRun,
+  cancelRedactionRun,
+  finishRedactionRun,
+  isRedactionRunActive,
+} from './redactionRun.ts';
+import type { RedactionRun } from './redactionRun.ts';
 import { SHARE_SHELL_WIDTH, globalStyles } from './styles.tsx';
 import { QueueStep } from './QueueStep.tsx';
 import { RedactStep } from './RedactStep.tsx';
@@ -47,26 +59,55 @@ function stepConsumesUnpackagedQueue(step: StepKey, packagedShareId: string | nu
     || (step === 'package' && !packagedShareId);
 }
 
-function safeStepFromParams(params: URLSearchParams): StepKey {
+function hasRestorableLockedQueueSelection(
+  params: URLSearchParams,
+  storage: QueueSelectionStorage | null,
+): boolean {
+  return hasLockedQueueSelection(params)
+    && isQueueSelectionRestorable(params, storage);
+}
+
+function safeStepFromParams(
+  params: URLSearchParams,
+  storage: QueueSelectionStorage | null,
+): StepKey {
   const requested = parseStep(params.get('step'));
   return stepConsumesUnpackagedQueue(requested, params.get('share'))
-    && !hasLockedQueueSelection(params)
+    && !hasRestorableLockedQueueSelection(params, storage)
     ? 'queue'
     : requested;
 }
+
+function restoredQueueFromParams(
+  stats: ShareReadyStats,
+  params: URLSearchParams,
+  storage: QueueSelectionStorage | null,
+): string[] {
+  const defaultQueue = queueFromStats(stats);
+  const restored = queueSelectionFromSearchParams(params, defaultQueue, storage);
+  return sanitizeQueueSelection(stats, restored ?? defaultQueue);
+}
+
+const PACKAGE_LOG_TRACE_LIMIT = 20;
+const PACKAGE_ANIMATION_MAX_MS = 10_000;
 
 export function Share() {
   const { toast } = useToast();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const latestSearchParamsRef = useRef(searchParams);
+  latestSearchParamsRef.current = searchParams;
+  const queueStorage = useMemo(() => {
+    try { return window.localStorage; } catch { return null; }
+  }, []);
   const internalSearchRef = useRef<string | null>(null);
   const skipNextUrlSyncRef = useRef(false);
 
   const [activeStep, setActiveStep] = useState<StepKey>(
-    () => safeStepFromParams(searchParams),
+    () => safeStepFromParams(searchParams, queueStorage),
   );
   const [completedKeys, setCompletedKeys] = useState<Set<string>>(() => {
-    const step = safeStepFromParams(searchParams);
+    const step = safeStepFromParams(searchParams, queueStorage);
     return completedKeysForStep(step);
   });
 
@@ -75,19 +116,24 @@ export function Share() {
 
   // Queue state: ordered list (drag-reorder) with a derived Set for lookups.
   const [queueOrder, setQueueOrder] = useState<string[]>(() => {
-    if (!searchParams.has('ids')) return [];
-    return (searchParams.get('ids') || '').split(',').filter(Boolean);
+    if (!searchParams.has('ids') && !searchParams.has('queue_ref')) return [];
+    return queueSelectionFromSearchParams(searchParams, [], queueStorage) || [];
   });
   // Explicit URL ids can only be trusted after the share-ready response tells
   // us which sessions are still eligible. Keep the raw order while loading,
   // then sanitize and deduplicate it against that server-filtered set.
-  const [selectionInitialized, setSelectionInitialized] = useState(false);
+  const [selectionInitialized, setSelectionInitialized] = useState(() => (
+    (searchParams.has('ids') || searchParams.has('queue_ref'))
+    && isQueueSelectionRestorable(searchParams, queueStorage)
+  ));
   const [selectionLocked, setSelectionLocked] = useState(
-    () => safeStepFromParams(searchParams) !== 'queue' && hasLockedQueueSelection(searchParams),
+    () => safeStepFromParams(searchParams, queueStorage) !== 'queue'
+      && hasRestorableLockedQueueSelection(searchParams, queueStorage),
   );
   const [confirmedLargeQueueIds, setConfirmedLargeQueueIds] = useState<Set<string> | null>(() => (
-    safeStepFromParams(searchParams) !== 'queue' && hasLockedQueueSelection(searchParams)
-      ? new Set((searchParams.get('ids') || '').split(',').filter(Boolean))
+    safeStepFromParams(searchParams, queueStorage) !== 'queue'
+      && hasRestorableLockedQueueSelection(searchParams, queueStorage)
+      ? new Set(queueSelectionFromSearchParams(searchParams, [], queueStorage) || [])
       : null
   ));
   const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
@@ -117,6 +163,10 @@ export function Share() {
 
   // Redaction state
   const [redactedSessions, setRedactedSessions] = useState<Record<string, RedactedSessionData>>({});
+  const redactionRunRef = useRef<RedactionRun | null>(null);
+  const cancelRedaction = useCallback(() => {
+    cancelRedactionRun(redactionRunRef);
+  }, []);
 
   // Review state
   const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
@@ -178,13 +228,12 @@ export function Share() {
       api.shares.list(),
       api.scoringBackend().catch(() => ({ backend: null, display_name: null })),
     ]).then(([stats, shareList, backend]) => {
+      const latestSearchParams = latestSearchParamsRef.current;
       setReadyStats(stats);
       setShares(shareList);
       setScoringBackend(backend);
-      if (!selectionInitialized) {
-        setQueueOrder(queueFromSelectionParams(stats, searchParams));
-        setSelectionInitialized(true);
-      }
+      setQueueOrder(restoredQueueFromParams(stats, latestSearchParams, queueStorage));
+      setSelectionInitialized(true);
       if (stats.sessions.length === 0) {
         api.sessions.list({ status: 'new', sort: 'start_time', order: 'desc', limit: 10 })
           .then(setCandidates)
@@ -204,25 +253,35 @@ export function Share() {
 
   useEffect(() => {
     if (selectionInitialized || !readyStats) return;
-    setQueueOrder(queueFromSelectionParams(readyStats, searchParams));
+    setQueueOrder(restoredQueueFromParams(readyStats, searchParams, queueStorage));
     setSelectionInitialized(true);
-  }, [readyStats, searchParams, selectionInitialized]);
+  }, [readyStats, searchParams, selectionInitialized, queueStorage]);
 
   useEffect(() => {
     const currentSearch = location.search.startsWith('?') ? location.search.slice(1) : location.search;
     if (internalSearchRef.current === currentSearch) return;
 
+    cancelRedaction();
     internalSearchRef.current = currentSearch;
     skipNextUrlSyncRef.current = true;
 
     const requestedStep = parseStep(searchParams.get('step'));
-    const lockedSelection = hasLockedQueueSelection(searchParams);
+    const lockedSelection = hasRestorableLockedQueueSelection(searchParams, queueStorage);
+    const selected = readyStats
+      ? restoredQueueFromParams(readyStats, searchParams, queueStorage)
+      : isQueueSelectionRestorable(searchParams, queueStorage)
+        ? queueSelectionFromSearchParams(searchParams, [], queueStorage) || []
+        : [];
+    // Before readyStats arrives, an exact non-empty carrier may provisionally
+    // restore the step, but guardedActiveStep still prevents work. Once the
+    // eligible set is known, an empty sanitized snapshot fails back to Queue.
+    const usableLockedSelection = lockedSelection
+      && (readyStats === null || selected.length > 0);
     const step = stepConsumesUnpackagedQueue(requestedStep, searchParams.get('share'))
-      && !lockedSelection
+      && !usableLockedSelection
       ? 'queue'
       : requestedStep;
-    const downstreamSelectionLocked = step !== 'queue' && lockedSelection;
-
+    const downstreamSelectionLocked = step !== 'queue' && usableLockedSelection;
     setActiveStep(step);
     setCompletedKeys(completedKeysForStep(step));
     setSelectionLocked(downstreamSelectionLocked);
@@ -241,26 +300,25 @@ export function Share() {
     setPackagingFailed(null);
     setBlockedPackageSessions([]);
 
-    const selected = readyStats
-      ? queueFromSelectionParams(readyStats, searchParams)
-      : searchParams.has('ids')
-        ? (searchParams.get('ids') || '').split(',').filter(Boolean)
-        : [];
     setQueueOrder(selected);
     setConfirmedLargeQueueIds(downstreamSelectionLocked ? new Set(selected) : null);
-    setSelectionInitialized(!!readyStats);
+    setSelectionInitialized(
+      readyStats !== null || isQueueSelectionRestorable(searchParams, queueStorage),
+    );
 
     // Reject stale/bookmarked downstream URLs that do not carry an exact
-    // Queue snapshot. Keeping any explicit `ids` lets the user review that
-    // selection on Queue, but no redaction or packaging may start yet.
-    if (step !== requestedStep || (step === 'queue' && searchParams.has('selection'))) {
+    // Queue snapshot. Keep its exact ids/ref for review, but never strip the
+    // unlocked selection=all encoding used by the opt-out queue.
+    const staleLockedMarker = step === 'queue'
+      && searchParams.get('selection') === 'locked';
+    if (step !== requestedStep || staleLockedMarker) {
       const next = new URLSearchParams(searchParams);
       next.delete('step');
-      next.delete('selection');
+      if (next.get('selection') === 'locked') next.delete('selection');
       internalSearchRef.current = next.toString();
       setSearchParams(next, { replace: true });
     }
-  }, [location.search, readyStats, searchParams, setSearchParams]);
+  }, [location.search, readyStats, searchParams, queueStorage, cancelRedaction, setSearchParams]);
 
   useEffect(() => {
     if (skipNextUrlSyncRef.current) {
@@ -269,15 +327,21 @@ export function Share() {
     }
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
-      if (activeStep === 'queue') next.delete('step'); else next.set('step', activeStep);
-      writeQueueSelectionParams(next, readyStats, queueOrder, selectionLocked && activeStep !== 'queue');
+      const locked = selectionLocked && activeStep !== 'queue';
+      if (activeStep === 'queue') next.delete('step');
+      else next.set('step', activeStep);
+      if (selectionInitialized) {
+        const defaultQueue = !locked && readyStats ? queueFromStats(readyStats) : null;
+        syncQueueSelectionToSearchParams(next, queueOrder, defaultQueue, queueStorage);
+        if (locked) next.set('selection', 'locked');
+      }
       if (note) next.set('note', note); else next.delete('note');
       if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
       if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, note, aiPiiEnabled, packagedShareId, readyStats, selectionLocked, setSearchParams]);
+  }, [activeStep, queueOrder, selectionInitialized, selectionLocked, readyStats, queueStorage, note, aiPiiEnabled, packagedShareId, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {
@@ -333,10 +397,55 @@ export function Share() {
   // Existing packaged Submit/Done flows do not consume this queue and remain
   // reloadable without repeating redaction.
   const consumesUnpackagedQueue = stepConsumesUnpackagedQueue(activeStep, packagedShareId);
+  const lockedSelectionReady = selectionLocked
+    && selectionInitialized
+    && readyStats !== null
+    && queuedSessions.length > 0;
   const guardedActiveStep: StepKey = consumesUnpackagedQueue
-    && (!selectionLocked || largeBundleNeedsConfirmation)
+    && (!lockedSelectionReady || largeBundleNeedsConfirmation)
     ? 'queue'
     : activeStep;
+  const approvedSessions = useMemo(
+    () => queuedSessions.filter((s) => approvedIds.has(s.session_id)),
+    [queuedSessions, approvedIds],
+  );
+
+  // A locked deep link can only be validated after the eligible-session list
+  // arrives. If every saved id has since become ineligible, revoke the lock
+  // and stay on Queue. Do this without replaying the full external-navigation
+  // reset, which would erase Package state whenever a normal reload refreshes
+  // readyStats.
+  useEffect(() => {
+    if (
+      readyStats === null
+      || !selectionInitialized
+      || !selectionLocked
+      || !stepConsumesUnpackagedQueue(activeStep, packagedShareId)
+      || queuedSessions.length > 0
+    ) return;
+
+    cancelRedaction();
+    setSelectionLocked(false);
+    setConfirmedLargeQueueIds(null);
+    setCompletedKeys(completedKeysForStep('queue'));
+    setActiveStep('queue');
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('step');
+      if (next.get('selection') === 'locked') next.delete('selection');
+      internalSearchRef.current = next.toString();
+      return next;
+    }, { replace: true });
+  }, [
+    activeStep,
+    cancelRedaction,
+    packagedShareId,
+    queuedSessions.length,
+    readyStats,
+    selectionInitialized,
+    selectionLocked,
+    setSearchParams,
+  ]);
 
   useEffect(() => {
     if (!packagedShareId) return;
@@ -387,6 +496,7 @@ export function Share() {
   };
 
   const updateAiPiiEnabled = (enabled: boolean) => {
+    cancelRedaction();
     setAiPiiEnabled(enabled);
     setSelectionLocked(false);
     setConfirmedLargeQueueIds(null);
@@ -410,23 +520,14 @@ export function Share() {
   };
 
   const returnToQueue = () => {
+    cancelRedaction();
     setSelectionLocked(false);
     setConfirmedLargeQueueIds(null);
     setActiveStep('queue');
   };
 
-  const lockQueueSelectionInUrl = (nextStep: StepKey) => {
+  const lockQueueSelection = () => {
     setSelectionLocked(true);
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.set('step', nextStep);
-      writeQueueSelectionParams(next, readyStats, queueOrder, true);
-      if (note) next.set('note', note); else next.delete('note');
-      if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
-      if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
-      internalSearchRef.current = next.toString();
-      return next;
-    }, { replace: true });
   };
 
   const reorderQueue = (fromId: string, overId: string) => {
@@ -443,6 +544,7 @@ export function Share() {
   };
 
   const startFreshShare = useCallback(() => {
+    cancelRedaction();
     setQueueOrder(readyStats ? queueFromStats(readyStats) : []);
     setSelectionLocked(false);
     setConfirmedLargeQueueIds(null);
@@ -463,7 +565,7 @@ export function Share() {
     setBlockedPackageSessions([]);
     resetAddTracesPicker();
     setActiveStep('queue');
-  }, [readyStats, resetAddTracesPicker]);
+  }, [cancelRedaction, readyStats, resetAddTracesPicker]);
 
   const onStepClick = (key: string) => {
     const k = key as StepKey;
@@ -483,18 +585,35 @@ export function Share() {
   // transient timeouts without doubling the wait for the common case.
   const REDACTION_CONCURRENCY = 2;
   const REDACTION_RETRIES = 1;
-  const redactionStartedRef = useRef(false);
+
+  // Cancel work that no longer belongs to the active selection. Aborting the
+  // fetch stops the browser from waiting on in-flight reports; the per-run
+  // identity checks below also prevent stale results and future batches.
+  useEffect(() => {
+    if (activeStep !== 'redact') cancelRedaction();
+  }, [activeStep, cancelRedaction]);
+
+  useEffect(() => {
+    cancelRedaction();
+  }, [queuedSessions, aiPiiEnabled, cancelRedaction]);
+
+  useEffect(() => () => cancelRedaction(), [cancelRedaction]);
 
   const runRedaction = useCallback(async () => {
-    if (redactionStartedRef.current) return;
-    redactionStartedRef.current = true;
+    const run = beginRedactionRun(redactionRunRef);
+    if (!run) return;
+    const isActive = () => isRedactionRunActive(redactionRunRef, run);
     const sessions = queuedSessions;
     const cached = redactedSessions;
-    const missing = sessions.filter((s) => !cached[s.session_id]);
+    const missing = sessions.filter((s) => {
+      const data = cached[s.session_id];
+      return !data || data.loading;
+    });
 
     // mark missing ones as loading up-front so the per-trace list renders
     if (missing.length > 0) {
       setRedactedSessions((prev) => {
+        if (!isActive()) return prev;
         const next = { ...prev };
         missing.forEach((s) => {
           if (!next[s.session_id]) next[s.session_id] = { messages: [], loading: true };
@@ -506,10 +625,15 @@ export function Share() {
     const fetchReport = async (sessionId: string) => {
       let lastErr: unknown = null;
       for (let attempt = 0; attempt <= REDACTION_RETRIES; attempt++) {
+        if (!isActive()) throw new Error('Redaction canceled');
         try {
-          return await api.sessions.redactionReport(sessionId, { aiPii: aiPiiEnabled });
+          return await api.sessions.redactionReport(sessionId, {
+            aiPii: aiPiiEnabled,
+            signal: run.controller.signal,
+          });
         } catch (e) {
           lastErr = e;
+          if (!isActive()) throw e;
           if (attempt < REDACTION_RETRIES) {
             // brief pause to let a flaky CLI/model settle before retrying
             await new Promise((r) => setTimeout(r, 800));
@@ -521,7 +645,9 @@ export function Share() {
 
     const processOne = async (s: ReadySession) => {
       try {
+        if (!isActive()) return;
         const report = await fetchReport(s.session_id);
+        if (!isActive()) return;
         const msgs: RedactedReviewMessage[] = (report.redacted_session.messages || []).map((m) => ({
           role: m.role,
           content: m.content || '',
@@ -536,46 +662,56 @@ export function Share() {
         const trufflehogHits = (report.redaction_log || [])
           .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
           .length;
-        setRedactedSessions((prev) => ({
-          ...prev,
-          [s.session_id]: {
-            messages: msgs, loading: false,
-            redactionCount: report.redaction_count,
-            aiPiiFindings: report.ai_pii_findings || [],
-            aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
-            buckets,
-            trufflehogHits,
-          },
-        }));
+        setRedactedSessions((prev) => {
+          if (!isActive()) return prev;
+          return {
+            ...prev,
+            [s.session_id]: {
+              messages: msgs, loading: false,
+              redactionCount: report.redaction_count,
+              aiPiiFindings: report.ai_pii_findings || [],
+              aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
+              buckets,
+              trufflehogHits,
+            },
+          };
+        });
       } catch {
-        setRedactedSessions((prev) => ({
-          ...prev,
-          [s.session_id]: {
-            messages: [{ role: 'system', content: '(unable to load redacted content)' }],
-            loading: false,
-            redactionCount: 0,
-            aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
-            buckets: emptyBuckets(),
-          },
-        }));
+        if (!isActive()) return;
+        setRedactedSessions((prev) => {
+          if (!isActive()) return prev;
+          return {
+            ...prev,
+            [s.session_id]: {
+              messages: [{ role: 'system', content: '(unable to load redacted content)' }],
+              loading: false,
+              redactionCount: 0,
+              aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
+              buckets: emptyBuckets(),
+            },
+          };
+        });
       }
     };
 
-    for (let i = 0; i < missing.length; i += REDACTION_CONCURRENCY) {
-      const batch = missing.slice(i, i + REDACTION_CONCURRENCY);
-      await Promise.all(batch.map(processOne));
+    try {
+      for (let i = 0; i < missing.length; i += REDACTION_CONCURRENCY) {
+        if (!isActive()) break;
+        const batch = missing.slice(i, i + REDACTION_CONCURRENCY);
+        await Promise.all(batch.map(processOne));
+      }
+    } finally {
+      finishRedactionRun(redactionRunRef, run);
     }
-    redactionStartedRef.current = false;
   }, [queuedSessions, redactedSessions, aiPiiEnabled]);
 
   const handleStartRedaction = () => {
     // Confirmation covers this exact set and any later subset (for example,
     // removing a blocked trace during review), but never newly added traces.
     setConfirmedLargeQueueIds(new Set(queueOrder));
-    lockQueueSelectionInUrl('redact');
+    lockQueueSelection();
     setCompletedKeys((prev) => new Set([...prev, 'queue']));
     setActiveStep('redact');
-    void runRedaction();
   };
 
   // if Redact step is the active step and there are sessions lacking data, kick it off
@@ -704,18 +840,24 @@ export function Share() {
     setPackageLog('Allocating bundle...');
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact', 'review']));
 
-    const approvedList = queuedSessions.filter((s) => approvedIds.has(s.session_id));
+    const approvedList = approvedSessions;
+    const traceLogLines = approvedList
+      .slice(0, PACKAGE_LOG_TRACE_LIMIT)
+      .map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`);
+    if (approvedList.length > PACKAGE_LOG_TRACE_LIMIT) {
+      traceLogLines.push(`Adding ${approvedList.length - PACKAGE_LOG_TRACE_LIMIT} more traces...`);
+    }
     const logLines = [
       'Allocating bundle...',
       'Writing manifest.json...',
-      ...approvedList.map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`),
+      ...traceLogLines,
       aiPiiEnabled ? 'Running final AI PII review...' : 'Running final rules-only PII review...',
       'Running final secret scan...',
       'Sealing bundle...',
     ];
 
     const animStart = Date.now();
-    const duration = 2200 + approvedList.length * 220;
+    const duration = Math.min(PACKAGE_ANIMATION_MAX_MS, 2200 + approvedList.length * 220);
 
     const timers: number[] = [];
     logLines.forEach((line, i) => {
@@ -798,7 +940,7 @@ export function Share() {
     } finally {
       packagingStartedRef.current = false;
     }
-  }, [queuedSessions, approvedIds, note, toast, aiPiiEnabled]);
+  }, [approvedSessions, note, toast, aiPiiEnabled]);
 
   const handleStartPackage = () => {
     if (queuedSessions.length === 0) return;
@@ -1032,8 +1174,8 @@ export function Share() {
     return (
       <PackageStep
         stepperHeader={stepperHeader}
-        approvedCount={queuedSessions.filter((s) => approvedIds.has(s.session_id)).length}
-        approvedList={queuedSessions.filter((s) => approvedIds.has(s.session_id))}
+        approvedCount={approvedSessions.length}
+        approvedList={approvedSessions}
         progress={packageProgress}
         log={packageLog}
         failed={packagingFailed}

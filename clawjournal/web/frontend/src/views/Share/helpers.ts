@@ -137,10 +137,17 @@ export function formatShareDestination(url: string): string {
 }
 
 export function queueFromStats(stats: ShareReadyStats): string[] {
-  // `sessions` is already the server-filtered, shareable set (hold, embargo,
-  // source, project, and revision gates have run). Preserve its ranked order,
-  // but select the complete set so users only need to deselect exceptions.
-  return [...new Set(stats.sessions.map((s) => s.session_id).filter(Boolean))];
+  const validIds = new Set(stats.sessions.map((s) => s.session_id));
+  const recommended = (stats.recommended_session_ids || [])
+    .filter((id) => validIds.has(id));
+
+  // Start with the server's highest-value recommendations, then include every
+  // other eligible trace. Share is opt-out: users remove traces they do not
+  // want in the bundle instead of adding a hidden pool one at a time.
+  return [...new Set([
+    ...recommended,
+    ...stats.sessions.map((s) => s.session_id).filter(Boolean),
+  ])];
 }
 
 function csvParam(params: URLSearchParams, name: string): string[] | null {
@@ -156,26 +163,38 @@ export function queueFromSelectionParams(
   // queue and must not fall back to the select-all default on reload.
   const explicitIds = csvParam(params, 'ids');
   if (explicitIds !== null) {
-    const eligibleIds = new Set(queueFromStats(stats));
-    const seen = new Set<string>();
-    return explicitIds.filter((id) => {
-      if (!eligibleIds.has(id) || seen.has(id)) return false;
-      seen.add(id);
-      return true;
-    });
+    return sanitizeQueueSelection(stats, explicitIds);
   }
 
-  const excludedIds = new Set(csvParam(params, 'exclude_ids') || []);
+  const excludedIds = new Set([
+    ...(csvParam(params, 'exclude') || []),
+    ...(csvParam(params, 'exclude_ids') || []),
+  ]);
   return queueFromStats(stats).filter((id) => !excludedIds.has(id));
+}
+
+export function sanitizeQueueSelection(
+  stats: ShareReadyStats,
+  selection: string[],
+): string[] {
+  const eligibleIds = new Set(queueFromStats(stats));
+  const seen = new Set<string>();
+  return selection.filter((id) => {
+    if (!eligibleIds.has(id) || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
 }
 
 export function hasLockedQueueSelection(params: URLSearchParams): boolean {
   // A downstream step may only consume an exact, explicitly locked snapshot.
-  // `exclude_ids` and an omitted `ids` parameter are relative to the current
-  // eligible set, so either could silently absorb newly eligible traces after
-  // a reload.
+  // Relative exclusions could silently absorb newly eligible traces after a
+  // reload. Exactly one exact carrier must be present; queue_ref points to a
+  // local-only exact snapshot and is validated by queueState before use.
+  const exactCarrierCount = Number(params.has('ids')) + Number(params.has('queue_ref'));
   return params.get('selection') === 'locked'
-    && params.has('ids')
+    && exactCarrierCount === 1
+    && !params.has('exclude')
     && !params.has('exclude_ids');
 }
 
