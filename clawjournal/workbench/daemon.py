@@ -1749,6 +1749,16 @@ def finalize_share_export_for_upload(
                 pii_summary["agent_timeout_seconds"],
             )
     except Exception as exc:
+        from ..redaction.pii import _AgentCallGateError
+
+        if isinstance(exc, _AgentCallGateError):
+            # A before_ai_call control gate (pause/disable/profile/revision/
+            # generation change) fired during AI-PII review. pii.py re-raises it
+            # past ignore_llm_errors precisely so the caller can stop cleanly;
+            # propagate the original control exception (a ControlChanged) to the
+            # runner's dedicated handler instead of collapsing a deliberate
+            # control stop into a retryable "packaging failed".
+            raise exc.cause
         logger.warning("PII redaction pass failed: %s", exc)
         return {
             "error": "PII redaction failed — upload aborted. Try again or report this issue.",

@@ -406,18 +406,35 @@ def _legacy_content_revision(session_id: str) -> str:
     return f"legacy:{digest}"
 
 
-def _read_blob_for_revision(
-    session_id: str,
-    blob_path: str | None,
-) -> dict[str, Any] | None:
-    """Load a migration-time blob, tolerating stale stored blob paths."""
+def _blob_candidate_paths(session_id: str, blob_path: str | None) -> list[Path]:
     candidates: list[Path] = []
     if blob_path:
         candidates.append(Path(blob_path))
     canonical = BLOBS_DIR / f"{session_id}.json"
     if canonical not in candidates:
         candidates.append(canonical)
-    for candidate in candidates:
+    return candidates
+
+
+def _blob_present_for_revision(session_id: str, blob_path: str | None) -> bool:
+    """Cheap presence check for a session blob — no parse.
+
+    The auto-upload candidate report is polled frequently (status/preview) and
+    iterates every eligible session; a full ``json.load`` of each blob here
+    would make it O(eligible x blob size) in disk I/O. Existence is sufficient
+    for the report's ``missing_blob`` gate — the packaging path re-reads and
+    validates the blob before any egress, so a present-but-corrupt blob is
+    still caught there rather than crossing the machine boundary.
+    """
+    return any(path.is_file() for path in _blob_candidate_paths(session_id, blob_path))
+
+
+def _read_blob_for_revision(
+    session_id: str,
+    blob_path: str | None,
+) -> dict[str, Any] | None:
+    """Load a migration-time blob, tolerating stale stored blob paths."""
+    for candidate in _blob_candidate_paths(session_id, blob_path):
         try:
             with open(candidate) as f:
                 blob = json.load(f)
@@ -4770,7 +4787,7 @@ def get_auto_upload_candidate_report(
         if hold_state not in SHAREABLE_HOLD_STATES:
             exclude(row, "held_or_embargoed")
             continue
-        if _read_blob_for_revision(row["session_id"], row["blob_path"]) is None:
+        if not _blob_present_for_revision(row["session_id"], row["blob_path"]):
             exclude(row, "missing_blob")
             continue
         if not _auto_upload_raw_source_resolvable(row["raw_source_path"]):

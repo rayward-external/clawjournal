@@ -1258,16 +1258,26 @@ def enable(
                     "malformed_enrollment_response",
                     "Hosted service changed the enrollment identity during an update.",
                 )
-            if updating and parsed_server_enrolled_at != intent_enrolled_at:
+            # The create clamp below stores max(local_intent, server), so a
+            # stable enrollment's stored boundary is >= the server's own value.
+            # On an update the server returns that same (<= stored) original
+            # boundary; requiring exact equality would permanently fail
+            # reauthorization whenever the local clock led the server at create
+            # time. Reject only a server attempt to move the boundary *later*
+            # than what we committed — an unexpected forward move for a fixed
+            # enrollment. An earlier/equal server value is the normal
+            # clock-skew case; we keep our own, more conservative boundary and
+            # never backdate it.
+            if updating and parsed_server_enrolled_at > intent_enrolled_at:
                 raise AutoUploadError(
                     "malformed_enrollment_response",
-                    "Hosted service changed the future-only enrollment boundary during an update.",
+                    "Hosted service moved the future-only enrollment boundary later during an update.",
                 )
 
             # Never let a skewed or malformed hosted clock backdate the local
             # future-only boundary.  On first create the conservative cutoff is
             # the later of the durable local intent and server acceptance.  A
-            # review/update must preserve the original boundary exactly.
+            # review/update preserves the original stored boundary exactly.
             effective_enrolled_at = (
                 intent_enrolled_at
                 if updating

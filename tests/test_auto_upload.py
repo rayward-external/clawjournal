@@ -1516,10 +1516,60 @@ def test_new_enrollment_after_disable_resets_prior_cadence_and_receipt(
         conn.close()
 
 
-def test_reauthorization_rejects_changed_future_only_cutoff(
+def test_reauthorization_rejects_later_future_only_cutoff(
     isolated_auto_upload,
     monkeypatch,
 ):
+    # Moving the boundary *later* than the committed one is an unexpected
+    # forward move for a fixed enrollment and must be rejected.
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(
+        conn,
+        config,
+        enrolled_at="2026-07-15T13:00:00+00:00",
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto,
+        "update_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": "2026-07-15T14:00:00+00:00",
+            "authorization_revision": 2,
+        },
+    )
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "malformed_enrollment_response"
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "paused"
+        assert enrollment["health"] == "action_required"
+        assert enrollment["enrolled_at"] == "2026-07-15T13:00:00+00:00"
+    finally:
+        conn.close()
+
+
+def test_reauthorization_accepts_earlier_server_cutoff_from_clock_skew(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    # The create clamp stores max(local_intent, server), so when the local
+    # clock led the server at create time the stored boundary is later than the
+    # server's own value. On reauthorization the server returns that earlier
+    # original value; this must succeed and keep the stored (more conservative)
+    # boundary, not fail reauth forever.
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -1548,12 +1598,12 @@ def test_reauthorization_rejects_changed_future_only_cutoff(
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
-    assert result["code"] == "malformed_enrollment_response"
+    assert result.get("code") != "malformed_enrollment_response"
+    assert result.get("ok") is not False
     conn = open_index()
     try:
         enrollment = get_auto_upload_enrollment(conn)
-        assert enrollment["mode"] == "paused"
-        assert enrollment["health"] == "action_required"
+        assert enrollment["mode"] == "enabled"
         assert enrollment["enrolled_at"] == "2026-07-15T13:00:00+00:00"
     finally:
         conn.close()

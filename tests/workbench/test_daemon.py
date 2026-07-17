@@ -2957,6 +2957,33 @@ def test_upload_pii_summary_reports_backend_for_zero_row_export(tmp_path, ai_pii
     assert summary["backend"] is None
 
 
+def test_finalize_reraises_control_gate_instead_of_swallowing(tmp_path, monkeypatch):
+    # A before_ai_call control gate firing during AI-PII review must propagate
+    # as ControlChanged (so the runner records a clean control stop), not be
+    # collapsed into a generic retryable packaging failure by the blanket except.
+    from clawjournal.workbench import daemon as daemon_module
+    from clawjournal.redaction.pii import _AgentCallGateError
+    from clawjournal.auto_upload import ControlChanged
+
+    export_dir = tmp_path / "share"
+    export_dir.mkdir()
+    (export_dir / "sessions.jsonl").write_text('{"session_id":"s1"}\n', encoding="utf-8")
+
+    def gate_fires(*_args, **_kwargs):
+        raise _AgentCallGateError(ControlChanged("paused mid-review"))
+
+    monkeypatch.setattr(daemon_module, "_apply_upload_pii_redactions", gate_fires)
+
+    with pytest.raises(ControlChanged):
+        daemon_module.finalize_share_export_for_upload(
+            export_dir,
+            {"redaction_summary": {}},
+            ai_pii=True,
+            ai_backend="codex",
+            before_ai_call=lambda: None,
+        )
+
+
 def test_finalized_ai_manifest_requires_complete_nested_coverage():
     from clawjournal.workbench.daemon import _manifest_is_finalized_for_upload
 

@@ -451,6 +451,36 @@ def test_candidate_report_explains_each_safety_exclusion(index_conn):
     }
 
 
+def test_candidate_report_uses_cheap_blob_presence_not_full_parse(
+    index_conn, monkeypatch
+):
+    # The report is polled frequently (status/preview); it must not full-parse
+    # every eligible session's blob. A present blob should pass the missing_blob
+    # gate via a cheap existence check, never via _read_blob_for_revision.
+    from clawjournal.workbench import index as index_module
+
+    _enroll(index_conn, sources=("claude",), projects=("project-one",))
+    upsert_sessions(index_conn, [_session("eligible")])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("candidate report must not full-parse blobs")
+
+    monkeypatch.setattr(index_module, "_read_blob_for_revision", forbidden)
+
+    report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("claude",),
+        current_projects=("project-one",),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"claude": "explicit_close"},
+        now=NOW,
+    )
+
+    assert [row["session_id"] for row in report["selected"]] == ["eligible"]
+    assert report["exclusion_counts"]["missing_blob"] == 0
+
+
 def test_candidate_excludes_any_previously_shared_exact_revision(index_conn):
     _enroll(index_conn)
     upsert_sessions(index_conn, [_session("reverted", content="revision-a")])
