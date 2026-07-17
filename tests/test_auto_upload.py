@@ -344,6 +344,83 @@ def test_status_is_read_only_without_an_install(
     assert not isolated_auto_upload["install"].exists()
 
 
+@pytest.mark.parametrize("receipt_kind", ["missing", "auto_weekly"])
+def test_enable_requires_a_successful_hosted_manual_receipt_before_network(
+    isolated_auto_upload,
+    monkeypatch,
+    receipt_kind,
+):
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    if receipt_kind == "auto_weekly":
+        share_id = create_share(conn, ["session-one"])
+        conn.execute(
+            "UPDATE shares SET status = 'shared', shared_at = ?, "
+            "hosted_receipt_id = ?, submission_channel = 'auto_weekly' "
+            "WHERE share_id = ?",
+            (
+                "2026-07-13T00:00:00+00:00",
+                "automatic-receipt-does-not-qualify",
+                share_id,
+            ),
+        )
+        conn.commit()
+    conn.close()
+
+    forbidden_calls: list[str] = []
+
+    class ScannerForbidden:
+        def scan_once_strict(self, _required_sources):
+            forbidden_calls.append("scan")
+            raise AssertionError("manual-receipt gate must run before strict scan")
+
+    def network_forbidden(*_args, **_kwargs):
+        forbidden_calls.append("network")
+        raise AssertionError("manual-receipt gate must run before network")
+
+    monkeypatch.setattr("clawjournal.workbench.daemon.Scanner", ScannerForbidden)
+    monkeypatch.setattr(auto, "fetch_capabilities", network_forbidden)
+
+    result = auto.enable(agent="claude")
+
+    assert result["ok"] is False
+    assert result["code"] == "manual_share_required"
+    assert forbidden_calls == []
+    assert not credential_path().exists()
+
+
+@pytest.mark.parametrize("submission_channel", [None, "manual"])
+def test_enable_accepts_legacy_and_explicit_manual_receipts(
+    isolated_auto_upload,
+    monkeypatch,
+    submission_channel,
+):
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    share_id = create_share(conn, ["session-one"])
+    conn.execute(
+        "UPDATE shares SET status = 'shared', shared_at = ?, "
+        "hosted_receipt_id = ?, submission_channel = ? WHERE share_id = ?",
+        (
+            "2026-07-13T00:00:00+00:00",
+            "successful-manual-receipt",
+            submission_channel,
+            share_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    _patch_strict_scanner(monkeypatch)
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "fetch_authorization", lambda _caps: _terms())
+
+    result = auto.enable(agent="claude", challenge_only=True)
+
+    assert result["code"] == "authorization_required"
+
+
 def test_v1_scope_rejects_sources_without_audited_raw_snapshot(
     isolated_auto_upload,
 ):
@@ -1268,6 +1345,7 @@ def test_receipt_lookup_succeeds_when_ambiguous_artifact_bytes_are_missing(
 
 
 def _patch_enable_dependencies(monkeypatch, *, hook_result: bool = True):
+    monkeypatch.setattr(auto, "_has_successful_manual_receipt", lambda _conn: True)
     _patch_strict_scanner(monkeypatch)
     monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
     monkeypatch.setattr(auto, "fetch_authorization", lambda _caps: _terms())

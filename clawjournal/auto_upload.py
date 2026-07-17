@@ -545,6 +545,18 @@ def _selected_hook_missing(enrollment: Mapping[str, Any]) -> bool:
     return False
 
 
+def _has_successful_manual_receipt(conn: sqlite3.Connection) -> bool:
+    """Return whether this installation completed a hosted manual share."""
+
+    return (
+        conn.execute(
+            "SELECT 1 FROM shares WHERE hosted_receipt_id IS NOT NULL "
+            "AND COALESCE(submission_channel, 'manual') != 'auto_weekly' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
 def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
     hooks = []
     for target in SUPPORTED_HOOK_TARGETS:
@@ -612,10 +624,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         except sqlite3.DatabaseError:
             return _off_status(config)
         report = _candidate_report(db, enrollment, config=config)
-        successful_manual = db.execute(
-            "SELECT 1 FROM shares WHERE hosted_receipt_id IS NOT NULL "
-            "AND COALESCE(submission_channel, 'manual') != 'auto_weekly' LIMIT 1"
-        ).fetchone() is not None
+        successful_manual = _has_successful_manual_receipt(db)
         mode = enrollment.get("mode", "off") if enrollment else "off"
         stored_health = enrollment.get("health", "ready") if enrollment else "ready"
         overlay = None
@@ -985,6 +994,11 @@ def enable(
                 "scope_blockers": scope["blockers"],
                 "unsupported_sources": scope["unsupported_sources"],
             }
+        if not _has_successful_manual_receipt(conn):
+            return AutoUploadError(
+                "manual_share_required",
+                "Complete one successful hosted manual share before enabling automatic uploads.",
+            ).as_result()
         from .workbench.daemon import Scanner
 
         scan = Scanner().scan_once_strict(list(scope["sources"]))
