@@ -29,6 +29,17 @@ import {
   queueFromStats,
   sessionTotalTokens,
 } from './helpers.ts';
+import {
+  queueSelectionFromSearchParams,
+  syncQueueSelectionToSearchParams,
+} from './queueState.ts';
+import {
+  beginRedactionRun,
+  cancelRedactionRun,
+  finishRedactionRun,
+  isRedactionRunActive,
+} from './redactionRun.ts';
+import type { RedactionRun } from './redactionRun.ts';
 import { SHARE_SHELL_WIDTH, globalStyles } from './styles.tsx';
 import { QueueStep } from './QueueStep.tsx';
 import { RedactStep } from './RedactStep.tsx';
@@ -37,10 +48,16 @@ import { PackageStep } from './PackageStep.tsx';
 import { SubmitStep } from './SubmitStep.tsx';
 import { DoneStep } from './DoneStep.tsx';
 
+const PACKAGE_LOG_TRACE_LIMIT = 20;
+const PACKAGE_ANIMATION_MAX_MS = 10_000;
+
 export function Share() {
   const { toast } = useToast();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const queueStorage = useMemo(() => {
+    try { return window.localStorage; } catch { return null; }
+  }, []);
   const internalSearchRef = useRef<string | null>(null);
   const skipNextUrlSyncRef = useRef(false);
 
@@ -57,10 +74,13 @@ export function Share() {
 
   // Queue state: ordered list (drag-reorder) with a derived Set for lookups.
   const [queueOrder, setQueueOrder] = useState<string[]>(() => {
-    const csv = searchParams.get('ids');
-    return csv ? csv.split(',').filter(Boolean) : [];
+    if (!searchParams.has('ids') && !searchParams.has('queue_ref')) return [];
+    return queueSelectionFromSearchParams(searchParams, [], queueStorage) || [];
   });
-  const [selectionInitialized, setSelectionInitialized] = useState(() => !!searchParams.get('ids'));
+  const [selectionInitialized, setSelectionInitialized] = useState(() => (
+    (searchParams.has('ids') || searchParams.has('queue_ref'))
+    && queueSelectionFromSearchParams(searchParams, [], queueStorage) !== null
+  ));
   const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
 
   const [note, setNote] = useState(() => searchParams.get('note') || '');
@@ -88,6 +108,10 @@ export function Share() {
 
   // Redaction state
   const [redactedSessions, setRedactedSessions] = useState<Record<string, RedactedSessionData>>({});
+  const redactionRunRef = useRef<RedactionRun | null>(null);
+  const cancelRedaction = useCallback(() => {
+    cancelRedactionRun(redactionRunRef);
+  }, []);
 
   // Review state
   const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
@@ -153,11 +177,11 @@ export function Share() {
       setShares(shareList);
       setScoringBackend(backend);
       if (!selectionInitialized && stats.sessions.length > 0) {
-        // Server recommendation is an ordered, reviewable default package.
-        // Trust it and only filter out ids the client can't resolve
-        // (eg. excluded projects).
-        const recommended = queueFromStats(stats);
-        setQueueOrder(recommended);
+        // Put server recommendations first, then default every other eligible
+        // trace into the opt-out queue.
+        const defaultQueue = queueFromStats(stats);
+        const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue, queueStorage);
+        setQueueOrder(urlQueue ?? defaultQueue);
         setSelectionInitialized(true);
       }
       if (stats.sessions.length === 0) {
@@ -178,20 +202,21 @@ export function Share() {
   // =================================================
 
   useEffect(() => {
-    if (selectionInitialized || !readyStats || searchParams.get('ids')) return;
-    setQueueOrder(queueFromStats(readyStats));
+    if (selectionInitialized || !readyStats) return;
+    const defaultQueue = queueFromStats(readyStats);
+    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue, queueStorage);
+    setQueueOrder(urlQueue ?? defaultQueue);
     setSelectionInitialized(true);
-  }, [readyStats, searchParams, selectionInitialized]);
+  }, [readyStats, searchParams, selectionInitialized, queueStorage]);
 
   useEffect(() => {
     const currentSearch = location.search.startsWith('?') ? location.search.slice(1) : location.search;
     if (internalSearchRef.current === currentSearch) return;
 
+    cancelRedaction();
     internalSearchRef.current = currentSearch;
     skipNextUrlSyncRef.current = true;
 
-    const idsParam = searchParams.get('ids');
-    const ids = idsParam ? idsParam.split(',').filter(Boolean) : null;
     const step = parseStep(searchParams.get('step'));
 
     setActiveStep(step);
@@ -211,18 +236,19 @@ export function Share() {
     setPackagingFailed(null);
     setBlockedPackageSessions([]);
 
-    if (ids) {
-      setQueueOrder(ids);
+    const defaultQueue = readyStats ? queueFromStats(readyStats) : [];
+    const urlQueue = queueSelectionFromSearchParams(searchParams, defaultQueue, queueStorage);
+    if (urlQueue !== null && (
+      readyStats !== null || searchParams.has('ids') || searchParams.has('queue_ref')
+    )) {
+      setQueueOrder(urlQueue);
       setSelectionInitialized(true);
       return;
     }
 
-    const recommended = readyStats && readyStats.sessions.length > 0
-      ? queueFromStats(readyStats)
-      : [];
-    setQueueOrder(recommended);
+    setQueueOrder(defaultQueue);
     setSelectionInitialized(!!readyStats);
-  }, [location.search, readyStats, searchParams]);
+  }, [location.search, readyStats, searchParams, queueStorage, cancelRedaction]);
 
   useEffect(() => {
     if (skipNextUrlSyncRef.current) {
@@ -232,15 +258,17 @@ export function Share() {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       if (activeStep === 'queue') next.delete('step'); else next.set('step', activeStep);
-      const csv = queueOrder.join(',');
-      if (csv) next.set('ids', csv); else next.delete('ids');
+      if (selectionInitialized) {
+        const defaultQueue = readyStats ? queueFromStats(readyStats) : null;
+        syncQueueSelectionToSearchParams(next, queueOrder, defaultQueue, queueStorage);
+      }
       if (note) next.set('note', note); else next.delete('note');
       if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
       if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, note, aiPiiEnabled, packagedShareId, setSearchParams]);
+  }, [activeStep, queueOrder, selectionInitialized, readyStats, queueStorage, note, aiPiiEnabled, packagedShareId, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {
@@ -288,6 +316,10 @@ export function Share() {
     () => queueOrder.map((id) => sessionById[id]).filter((s): s is ReadySession => !!s),
     [queueOrder, sessionById],
   );
+  const approvedSessions = useMemo(
+    () => queuedSessions.filter((s) => approvedIds.has(s.session_id)),
+    [queuedSessions, approvedIds],
+  );
 
   useEffect(() => {
     if (!packagedShareId) return;
@@ -327,6 +359,7 @@ export function Share() {
   };
 
   const updateAiPiiEnabled = (enabled: boolean) => {
+    cancelRedaction();
     setAiPiiEnabled(enabled);
     setRedactedSessions({});
     setApprovedIds(new Set());
@@ -361,6 +394,7 @@ export function Share() {
   };
 
   const startFreshShare = useCallback(() => {
+    cancelRedaction();
     setQueueOrder([]);
     setCompletedKeys(new Set());
     setPackagedShareId(null);
@@ -379,12 +413,16 @@ export function Share() {
     setBlockedPackageSessions([]);
     resetAddTracesPicker();
     setActiveStep('queue');
-  }, [resetAddTracesPicker]);
+  }, [cancelRedaction, resetAddTracesPicker]);
 
   const onStepClick = (key: string) => {
     const k = key as StepKey;
     if (k === activeStep) return;
-    if (k === 'queue') { setActiveStep('queue'); return; }
+    if (k === 'queue') {
+      cancelRedaction();
+      setActiveStep('queue');
+      return;
+    }
     if (completedKeys.has(k)) setActiveStep(k);
   };
 
@@ -399,18 +437,35 @@ export function Share() {
   // transient timeouts without doubling the wait for the common case.
   const REDACTION_CONCURRENCY = 2;
   const REDACTION_RETRIES = 1;
-  const redactionStartedRef = useRef(false);
+
+  // Cancel work that no longer belongs to the active selection. Aborting the
+  // fetch stops the browser from waiting on in-flight reports; the per-run
+  // identity checks below also prevent stale results and future batches.
+  useEffect(() => {
+    if (activeStep !== 'redact') cancelRedaction();
+  }, [activeStep, cancelRedaction]);
+
+  useEffect(() => {
+    cancelRedaction();
+  }, [queuedSessions, aiPiiEnabled, cancelRedaction]);
+
+  useEffect(() => () => cancelRedaction(), [cancelRedaction]);
 
   const runRedaction = useCallback(async () => {
-    if (redactionStartedRef.current) return;
-    redactionStartedRef.current = true;
+    const run = beginRedactionRun(redactionRunRef);
+    if (!run) return;
+    const isActive = () => isRedactionRunActive(redactionRunRef, run);
     const sessions = queuedSessions;
     const cached = redactedSessions;
-    const missing = sessions.filter((s) => !cached[s.session_id]);
+    const missing = sessions.filter((s) => {
+      const data = cached[s.session_id];
+      return !data || data.loading;
+    });
 
     // mark missing ones as loading up-front so the per-trace list renders
     if (missing.length > 0) {
       setRedactedSessions((prev) => {
+        if (!isActive()) return prev;
         const next = { ...prev };
         missing.forEach((s) => {
           if (!next[s.session_id]) next[s.session_id] = { messages: [], loading: true };
@@ -422,10 +477,15 @@ export function Share() {
     const fetchReport = async (sessionId: string) => {
       let lastErr: unknown = null;
       for (let attempt = 0; attempt <= REDACTION_RETRIES; attempt++) {
+        if (!isActive()) throw new Error('Redaction canceled');
         try {
-          return await api.sessions.redactionReport(sessionId, { aiPii: aiPiiEnabled });
+          return await api.sessions.redactionReport(sessionId, {
+            aiPii: aiPiiEnabled,
+            signal: run.controller.signal,
+          });
         } catch (e) {
           lastErr = e;
+          if (!isActive()) throw e;
           if (attempt < REDACTION_RETRIES) {
             // brief pause to let a flaky CLI/model settle before retrying
             await new Promise((r) => setTimeout(r, 800));
@@ -437,7 +497,9 @@ export function Share() {
 
     const processOne = async (s: ReadySession) => {
       try {
+        if (!isActive()) return;
         const report = await fetchReport(s.session_id);
+        if (!isActive()) return;
         const msgs: RedactedReviewMessage[] = (report.redacted_session.messages || []).map((m) => ({
           role: m.role,
           content: m.content || '',
@@ -452,36 +514,47 @@ export function Share() {
         const trufflehogHits = (report.redaction_log || [])
           .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
           .length;
-        setRedactedSessions((prev) => ({
-          ...prev,
-          [s.session_id]: {
-            messages: msgs, loading: false,
-            redactionCount: report.redaction_count,
-            aiPiiFindings: report.ai_pii_findings || [],
-            aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
-            buckets,
-            trufflehogHits,
-          },
-        }));
+        setRedactedSessions((prev) => {
+          if (!isActive()) return prev;
+          return {
+            ...prev,
+            [s.session_id]: {
+              messages: msgs, loading: false,
+              redactionCount: report.redaction_count,
+              aiPiiFindings: report.ai_pii_findings || [],
+              aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
+              buckets,
+              trufflehogHits,
+            },
+          };
+        });
       } catch {
-        setRedactedSessions((prev) => ({
-          ...prev,
-          [s.session_id]: {
-            messages: [{ role: 'system', content: '(unable to load redacted content)' }],
-            loading: false,
-            redactionCount: 0,
-            aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
-            buckets: emptyBuckets(),
-          },
-        }));
+        if (!isActive()) return;
+        setRedactedSessions((prev) => {
+          if (!isActive()) return prev;
+          return {
+            ...prev,
+            [s.session_id]: {
+              messages: [{ role: 'system', content: '(unable to load redacted content)' }],
+              loading: false,
+              redactionCount: 0,
+              aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
+              buckets: emptyBuckets(),
+            },
+          };
+        });
       }
     };
 
-    for (let i = 0; i < missing.length; i += REDACTION_CONCURRENCY) {
-      const batch = missing.slice(i, i + REDACTION_CONCURRENCY);
-      await Promise.all(batch.map(processOne));
+    try {
+      for (let i = 0; i < missing.length; i += REDACTION_CONCURRENCY) {
+        if (!isActive()) break;
+        const batch = missing.slice(i, i + REDACTION_CONCURRENCY);
+        await Promise.all(batch.map(processOne));
+      }
+    } finally {
+      finishRedactionRun(redactionRunRef, run);
     }
-    redactionStartedRef.current = false;
   }, [queuedSessions, redactedSessions, aiPiiEnabled]);
 
   const handleStartRedaction = () => {
@@ -616,18 +689,24 @@ export function Share() {
     setPackageLog('Allocating bundle...');
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact', 'review']));
 
-    const approvedList = queuedSessions.filter((s) => approvedIds.has(s.session_id));
+    const approvedList = approvedSessions;
+    const traceLogLines = approvedList
+      .slice(0, PACKAGE_LOG_TRACE_LIMIT)
+      .map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`);
+    if (approvedList.length > PACKAGE_LOG_TRACE_LIMIT) {
+      traceLogLines.push(`Adding ${approvedList.length - PACKAGE_LOG_TRACE_LIMIT} more traces...`);
+    }
     const logLines = [
       'Allocating bundle...',
       'Writing manifest.json...',
-      ...approvedList.map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`),
+      ...traceLogLines,
       aiPiiEnabled ? 'Running final AI PII review...' : 'Running final rules-only PII review...',
       'Running final secret scan...',
       'Sealing bundle...',
     ];
 
     const animStart = Date.now();
-    const duration = 2200 + approvedList.length * 220;
+    const duration = Math.min(PACKAGE_ANIMATION_MAX_MS, 2200 + approvedList.length * 220);
 
     const timers: number[] = [];
     logLines.forEach((line, i) => {
@@ -710,7 +789,7 @@ export function Share() {
     } finally {
       packagingStartedRef.current = false;
     }
-  }, [queuedSessions, approvedIds, note, toast, aiPiiEnabled]);
+  }, [approvedSessions, note, toast, aiPiiEnabled]);
 
   const handleStartPackage = () => {
     if (queuedSessions.length === 0) return;
@@ -902,7 +981,10 @@ export function Share() {
         redactedSessions={redactedSessions}
         allDone={redactAllDone}
         aiPiiEnabled={aiPiiEnabled}
-        onBack={() => setActiveStep('queue')}
+        onBack={() => {
+          cancelRedaction();
+          setActiveStep('queue');
+        }}
         onContinue={goToReview}
         globalStyles={globalStyles}
         showHelp={showHelp}
@@ -944,8 +1026,8 @@ export function Share() {
     return (
       <PackageStep
         stepperHeader={stepperHeader}
-        approvedCount={queuedSessions.filter((s) => approvedIds.has(s.session_id)).length}
-        approvedList={queuedSessions.filter((s) => approvedIds.has(s.session_id))}
+        approvedCount={approvedSessions.length}
+        approvedList={approvedSessions}
         progress={packageProgress}
         log={packageLog}
         failed={packagingFailed}
