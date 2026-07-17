@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -59,6 +60,7 @@ from .raw_sources import RawFingerprint, RawSourceChanged, fingerprint_raw_sourc
 from .scoring.backends import resolve_backend
 from .share_flow import build_zip, package, verify_coverage
 from .workbench.index import (
+    auto_upload_review_blockers,
     apply_share_redactions,
     get_auto_upload_candidate_report,
     get_auto_upload_enrollment,
@@ -79,11 +81,13 @@ MAX_SESSIONS = 5
 BACKOFF_BASE_SECONDS = 15 * 60
 BACKOFF_MAX_SECONDS = 24 * 60 * 60
 RUN_LOCK_FILENAME = "auto-upload.lock"
+CONTROL_LOCK_FILENAME = "auto-upload-control.lock"
 SEALED_ZIP_FILENAME = "auto-upload.sealed.zip"
 TELEMETRY_MAX_BYTES = 512 * 1024
 TELEMETRY_BACKUPS = 2
 SUPPORTED_HOOK_TARGETS = ("claude", "codex")
 HOOK_DB_BUSY_TIMEOUT_MS = 0
+_CONTROL_THREAD_LOCK = threading.Lock()
 
 # V1 supports only sources with both a SessionStart trigger and an audited,
 # content-bound raw-input resolver.  Other parsers remain available for manual
@@ -238,6 +242,53 @@ def due_decision(
 
 def _run_lock_path() -> Path:
     return Path(config_module.CONFIG_DIR) / RUN_LOCK_FILENAME
+
+
+def _control_lock_path() -> Path:
+    return Path(config_module.CONFIG_DIR) / CONTROL_LOCK_FILENAME
+
+
+@contextmanager
+def control_mutation_lock() -> Iterator[None]:
+    """Serialize the short DB/credential handoff for Enable and Disable.
+
+    Hosted requests and config writes stay outside this lock so Disable remains
+    responsive and lock ordering stays acyclic. Each generation/credential
+    phase is ordered locally; Enable's recovery-only then Enabled+active phases
+    make every crash boundary fail-closed. The OS releases the file lock if a
+    process dies.
+    """
+
+    path = _control_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _CONTROL_THREAD_LOCK:
+        file = path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                file.seek(0, os.SEEK_END)
+                if file.tell() == 0:
+                    file.write(b"0")
+                    file.flush()
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    file.seek(0)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+        finally:
+            file.close()
 
 
 @contextmanager
@@ -716,6 +767,34 @@ def preview(*, refresh: bool = False, now: datetime | None = None) -> dict[str, 
         conn.close()
 
 
+def _authorization_profile_hash(challenge: Mapping[str, Any]) -> str:
+    """Bind acceptance to the complete profile shown to the user.
+
+    This is deliberately an unkeyed content digest: loading an authorization
+    challenge must remain read-only and must not bootstrap the install salt.
+    The digest is only an opaque local challenge token; the profile itself is
+    already returned to the local CLI/browser for review.
+    """
+
+    payload = {
+        "authorization": challenge["authorization"],
+        "retention": challenge["retention"],
+        "scope": challenge["scope"],
+        "ai": challenge["ai"],
+        "cap": challenge["cap"],
+        "cadence_days": challenge["cadence_days"],
+        "maximum_bundle_size": challenge["maximum_bundle_size"],
+        "destination_origin": challenge["destination_origin"],
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _authorization_challenge(
     capabilities: Mapping[str, Any],
     terms: Mapping[str, Any],
@@ -740,7 +819,7 @@ def _authorization_challenge(
             "Hosted service returned incomplete recurring authorization terms.",
             retryable=True,
         )
-    return {
+    challenge = {
         "ok": False,
         "status": 409,
         "code": "authorization_required",
@@ -763,6 +842,8 @@ def _authorization_challenge(
         "maximum_bundle_size": capabilities["maximum_bundle_size"],
         "destination_origin": capabilities["origin"],
     }
+    challenge["authorization_profile_hash"] = _authorization_profile_hash(challenge)
+    return challenge
 
 
 def _hook_targets(agent: str) -> list[AgentName]:
@@ -795,11 +876,92 @@ def _restore_hook_files(snapshots: Mapping[Path, str | None]) -> None:
             atomic_write_text(path, previous, parents=True)
 
 
+def _reconcile_explicit_pause_after_reauthorization(
+    conn: sqlite3.Connection,
+    *,
+    intent_generation: int,
+    client_enrollment_id: str,
+    server_enrollment_id: str,
+    enrolled_at: datetime,
+    enrolled_sources: Sequence[str],
+    enrolled_projects: Sequence[str],
+    authorization_revision: int,
+    authorization_version: str,
+    retention_version: str,
+    egress_profile: str,
+    hook_targets: Sequence[AgentName],
+    restore_credentials: Mapping[str, Any] | None = None,
+) -> bool:
+    """Commit a definite hosted reauthorization without undoing a racing Pause.
+
+    Pause is the only control this recovery may merge with.  Every identity,
+    generation, and audit marker must match the one-step Pause winner so a
+    stale reauthorization can never overwrite Disable, Resume, or a profile
+    mutation.  The extra generation records the local reconciliation while
+    preserving the user's paused authority boundary.
+    """
+
+    with control_mutation_lock():
+        current = get_auto_upload_enrollment(conn)
+        if (
+            current is None
+            or int(current.get("generation", 0)) != intent_generation + 1
+            or current.get("mode") != "paused"
+            or current.get("last_result_code") != "paused"
+            or current.get("client_enrollment_id") != client_enrollment_id
+            or current.get("server_enrollment_id") != server_enrollment_id
+            or current.get("revocation_pending")
+        ):
+            return False
+        reconciled_generation = int(current["generation"]) + 1
+        if not update_auto_upload_enrollment(
+            conn,
+            expected_generation=int(current["generation"]),
+            generation=reconciled_generation,
+            mode="paused",
+            health="ready",
+            enrolled_at=_iso(enrolled_at),
+            client_enrollment_id=client_enrollment_id,
+            enrolled_sources=enrolled_sources,
+            enrolled_projects=enrolled_projects,
+            server_enrollment_id=server_enrollment_id,
+            authorization_revision=authorization_revision,
+            recurring_authorization_version=authorization_version,
+            retention_version=retention_version,
+            egress_profile_hash=egress_profile,
+            hook_targets=hook_targets,
+            consecutive_failures=0,
+            next_retry_at=None,
+            revocation_pending=False,
+            current_run_id=None,
+            current_run_stage=None,
+            last_result_code="paused",
+        ):
+            return False
+        if restore_credentials is not None:
+            try:
+                write_credentials(restore_credentials)
+            except CredentialStoreError:
+                # The hosted/local authorization revision is already
+                # reconciled and remains Paused. Surface that the active
+                # credential could not be restored instead of reporting a
+                # misleading healthy Pause over recovery-only authority.
+                update_auto_upload_enrollment(
+                    conn,
+                    expected_generation=reconciled_generation,
+                    health="action_required",
+                    last_result_code="credential_store_failed",
+                )
+                raise
+        return True
+
+
 def enable(
     *,
     agent: str = "all",
     accepted_authorization_version: str | None = None,
     accepted_retention_version: str | None = None,
+    accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
 ) -> dict[str, Any]:
     """Review or transactionally create/update a recurring enrollment.
@@ -851,10 +1013,12 @@ def enable(
         )
         expected_auth = challenge["authorization"]["version"]
         expected_retention = challenge["retention"]["version"]
+        expected_profile = challenge["authorization_profile_hash"]
         if (
             challenge_only
             or accepted_authorization_version != expected_auth
             or accepted_retention_version != expected_retention
+            or accepted_authorization_profile_hash != expected_profile
         ):
             # Non-mutating challenge response.  The HTTP adapter maps this to
             # 409 so CLI/GUI cannot replace exact-version acceptance with --yes.
@@ -1026,6 +1190,8 @@ def enable(
         # "server enrollment was created" from earlier failures by these.
         response: dict[str, Any] | None = None
         credential_record: dict[str, Any] | None = None
+        server_reauthorization_succeeded = False
+        recovery_only_written = False
         try:
             snapshots = _snapshot_hook_files(SUPPORTED_HOOK_TARGETS)
             hook_results = install_hooks(agent=agent)
@@ -1107,6 +1273,10 @@ def enable(
                 if updating
                 else max(intent_enrolled_at, parsed_server_enrolled_at)
             )
+            # Both PATCH with a still-valid active token and an idempotent
+            # credential reissue with fresh email verification definitively
+            # advance the same hosted enrollment authorization.
+            server_reauthorization_succeeded = bool(updating)
 
             if updating:
                 # A sealed artifact is durably pre-send.  The successful PATCH
@@ -1147,7 +1317,30 @@ def enable(
                     "enrollment_id": enrollment_id,
                     **{field: response[field] for field in required_credentials},
                 }
-            write_credentials(credential_record)
+
+            assert credential_record is not None
+            recovery_record = {
+                **credential_record,
+                "active_token": None,
+                "active_token_expires_at": None,
+            }
+
+            # Phase 1 persists recovery-only authority. The hosted create stays
+            # outside this short lock so Disable remains responsive, but once a
+            # response exists Disable and Enable have a definite local order.
+            # No crash point before the DB commit can leave Off + active bearer.
+            with control_mutation_lock():
+                current_before_recovery = get_auto_upload_enrollment(conn)
+                if (
+                    current_before_recovery is None
+                    or int(current_before_recovery.get("generation", 0))
+                    != generation
+                ):
+                    raise ControlChanged(
+                        "Automatic upload controls changed before recovery state was saved."
+                    )
+                write_credentials(recovery_record)
+                recovery_only_written = True
 
             config = load_config()
             config["auto_upload_capability_available"] = True
@@ -1167,51 +1360,92 @@ def enable(
                     "The consumed one-shot verification credential could not be removed durably.",
                 )
 
-            if not update_auto_upload_enrollment(
-                conn,
-                expected_generation=generation,
-                mode="enabled",
-                health="ready",
-                enrolled_at=_iso(effective_enrolled_at),
-                client_enrollment_id=client_enrollment_id,
-                enrolled_sources=scope["sources"],
-                enrolled_projects=scope["projects"],
-                server_enrollment_id=enrollment_id,
-                authorization_revision=authorization_revision,
-                recurring_authorization_version=str(expected_auth),
-                retention_version=str(expected_retention),
-                egress_profile_hash=profile,
-                hook_targets=targets,
-                last_result_code="enabled",
-                # Reauthorization keeps the cadence of the same durable
-                # enrollment. A true create after Disable is new authority and
-                # must schedule its first cycle from its new enrolled_at
-                # boundary, never from the prior enrollment's receipt.
-                last_completed_at=(
-                    existing.get("last_completed_at")
-                    if updating and existing is not None
-                    else None
-                ),
-                last_result_count=(
-                    existing.get("last_result_count")
-                    if updating and existing is not None
-                    else None
-                ),
-                last_receipt_reference=(
-                    existing.get("last_receipt_reference")
-                    if updating and existing is not None
-                    else None
-                ),
-                consecutive_failures=0,
-                next_retry_at=None,
-                revocation_pending=False,
-                current_run_id=None,
-                current_run_stage=None,
-            ):
-                raise ControlChanged("Automatic upload controls changed before commit.")
-            committed = True
+            # Phase 2 commits Enabled before making the active bearer visible.
+            # A crash between these writes is Enabled + recovery-only, which is
+            # fail-closed and can be revoked by Disable on the next attempt.
+            with control_mutation_lock():
+                current_before_commit = get_auto_upload_enrollment(conn)
+                if (
+                    current_before_commit is None
+                    or int(current_before_commit.get("generation", 0)) != generation
+                ):
+                    raise ControlChanged(
+                        "Automatic upload controls changed before commit."
+                    )
+                if not update_auto_upload_enrollment(
+                    conn,
+                    expected_generation=generation,
+                    mode="enabled",
+                    health="ready",
+                    enrolled_at=_iso(effective_enrolled_at),
+                    client_enrollment_id=client_enrollment_id,
+                    enrolled_sources=scope["sources"],
+                    enrolled_projects=scope["projects"],
+                    server_enrollment_id=enrollment_id,
+                    authorization_revision=authorization_revision,
+                    recurring_authorization_version=str(expected_auth),
+                    retention_version=str(expected_retention),
+                    egress_profile_hash=profile,
+                    hook_targets=targets,
+                    last_result_code="enabled",
+                    # Reauthorization keeps the cadence of the same durable
+                    # enrollment. A true create after Disable is new authority
+                    # and schedules from its new enrolled_at boundary.
+                    last_completed_at=(
+                        existing.get("last_completed_at")
+                        if updating and existing is not None
+                        else None
+                    ),
+                    last_result_count=(
+                        existing.get("last_result_count")
+                        if updating and existing is not None
+                        else None
+                    ),
+                    last_receipt_reference=(
+                        existing.get("last_receipt_reference")
+                        if updating and existing is not None
+                        else None
+                    ),
+                    consecutive_failures=0,
+                    next_retry_at=None,
+                    revocation_pending=False,
+                    current_run_id=None,
+                    current_run_stage=None,
+                ):
+                    raise ControlChanged(
+                        "Automatic upload controls changed before commit."
+                    )
+                write_credentials(credential_record)
+                committed = True
         except Exception as exc:
             current_after_failure = get_auto_upload_enrollment(conn)
+            if (
+                server_reauthorization_succeeded
+                and isinstance(exc, ControlChanged)
+                and isinstance(response, dict)
+                and isinstance(response.get("enrollment_id"), str)
+                and isinstance(response.get("authorization_revision"), int)
+                and _reconcile_explicit_pause_after_reauthorization(
+                    conn,
+                    intent_generation=generation,
+                    client_enrollment_id=client_enrollment_id,
+                    server_enrollment_id=str(response["enrollment_id"]),
+                    enrolled_at=effective_enrolled_at,
+                    enrolled_sources=scope["sources"],
+                    enrolled_projects=scope["projects"],
+                    authorization_revision=int(response["authorization_revision"]),
+                    authorization_version=str(expected_auth),
+                    retention_version=str(expected_retention),
+                    egress_profile=profile,
+                    hook_targets=targets,
+                    restore_credentials=(
+                        credential_record
+                        if recovery_only_written or rotating_credentials
+                        else None
+                    ),
+                )
+            ):
+                return status(conn=conn)
             if (
                 updating
                 and current_after_failure is not None
@@ -1304,17 +1538,53 @@ def enable(
                             enrollment_id=str(response_local["enrollment_id"]),
                             recovery_token=recovery,
                         )
-                        delete_credentials()
-                        update_auto_upload_enrollment(
-                            conn,
-                            expected_generation=generation,
-                            mode="off",
-                            health="ready",
-                            server_enrollment_id=None,
-                            authorization_revision=None,
-                            revocation_pending=False,
-                            last_result_code=error.code,
-                        )
+                        with control_mutation_lock():
+                            revoked_enrollment = get_auto_upload_enrollment(conn)
+                            if (
+                                revoked_enrollment is None
+                                or revoked_enrollment.get("client_enrollment_id")
+                                != client_enrollment_id
+                            ):
+                                raise ControlChanged(
+                                    "Newer enrollment authority owns the credential store."
+                                )
+                            revoked_generation = int(
+                                revoked_enrollment["generation"]
+                            )
+                            if revoked_generation == generation:
+                                if not update_auto_upload_enrollment(
+                                    conn,
+                                    expected_generation=revoked_generation,
+                                    mode="off",
+                                    health="ready",
+                                    client_enrollment_id=str(uuid.uuid4()),
+                                    server_enrollment_id=None,
+                                    authorization_revision=None,
+                                    revocation_pending=False,
+                                    last_result_code=error.code,
+                                ):
+                                    raise ControlChanged(
+                                        "Controls changed before revocation cleanup."
+                                    )
+                                delete_credentials()
+                            elif revoked_enrollment.get("mode") != "off":
+                                raise ControlChanged(
+                                    "Newer active enrollment owns the credential store."
+                                )
+                            elif not revoked_enrollment.get("revocation_pending"):
+                                # Disable already won and recorded its own final
+                                # outcome. Preserve that newer audit row; the
+                                # stale hosted enrollment is now revoked. Rotate
+                                # its spent create key before another Enable.
+                                if not update_auto_upload_enrollment(
+                                    conn,
+                                    expected_generation=revoked_generation,
+                                    client_enrollment_id=str(uuid.uuid4()),
+                                ):
+                                    raise ControlChanged(
+                                        "Controls changed before create-key rotation."
+                                    )
+                                delete_credentials()
                     except Exception:
                         try:
                             tombstone = {
@@ -1328,16 +1598,44 @@ def enable(
                                     response_local.get("recovery_token_expires_at") or "unknown"
                                 ),
                             }
-                            write_credentials(tombstone)
-                            update_auto_upload_enrollment(
-                                conn,
-                                expected_generation=generation,
-                                mode="off",
-                                health="retrying",
-                                server_enrollment_id=str(response_local["enrollment_id"]),
-                                revocation_pending=True,
-                                last_result_code="revocation_pending",
-                            )
+                            with control_mutation_lock():
+                                rollback_enrollment = get_auto_upload_enrollment(conn)
+                                if (
+                                    rollback_enrollment is None
+                                    or rollback_enrollment.get("client_enrollment_id")
+                                    != client_enrollment_id
+                                    or (
+                                        int(rollback_enrollment["generation"])
+                                        != generation
+                                        and rollback_enrollment.get("mode") != "off"
+                                    )
+                                ):
+                                    raise ControlChanged(
+                                        "Newer enrollment authority owns the credential store."
+                                    )
+                                rollback_generation = int(
+                                    rollback_enrollment["generation"]
+                                )
+                                write_credentials(tombstone)
+                                # Publishing new recovery work advances the
+                                # generation. A Disable that started before
+                                # this handoff can no longer clear it with a
+                                # stale no-credential snapshot.
+                                if not update_auto_upload_enrollment(
+                                    conn,
+                                    expected_generation=rollback_generation,
+                                    generation=rollback_generation + 1,
+                                    mode="off",
+                                    health="retrying",
+                                    server_enrollment_id=str(
+                                        response_local["enrollment_id"]
+                                    ),
+                                    revocation_pending=True,
+                                    last_result_code="revocation_pending",
+                                ):
+                                    raise ControlChanged(
+                                        "Controls changed before recovery was recorded."
+                                    )
                         except Exception:
                             pass
             else:
@@ -1438,44 +1736,64 @@ def disable() -> dict[str, Any]:
 
     conn = open_index()
     try:
-        enrollment = get_auto_upload_enrollment(conn)
-        revocation_needed = bool(
-            enrollment is not None
-            and (
-                enrollment.get("mode") != "off"
-                or enrollment.get("revocation_pending")
+        # Establish Off and strip active authority as one ordered local phase.
+        # Hosted revocation stays outside the lock; every later DB write is a
+        # CAS against the generation this Disable owns.
+        with control_mutation_lock():
+            enrollment = get_auto_upload_enrollment(conn)
+            disable_generation = (
+                int(enrollment["generation"])
+                if enrollment is not None
+                else None
             )
-        )
-        if enrollment is not None and revocation_needed:
-            old_generation = int(enrollment["generation"])
-            new_generation = old_generation + 1
-            if not update_auto_upload_enrollment(
-                conn,
-                expected_generation=old_generation,
-                mode="off",
-                health="ready",
-                generation=new_generation,
-                revocation_pending=True,
-                current_run_id=None,
-                current_run_stage=None,
-                last_result_code="disabling",
-            ):
-                return AutoUploadError(
-                    "control_conflict", "Automatic upload state changed."
-                ).as_result()
-
-        # Remove local upload authority before touching hooks or the network.
-        # Hook cleanup is best-effort because an inert Off hook cannot egress.
-        try:
-            credentials = remove_active_token()
-        except CredentialStoreError as exc:
-            if enrollment is not None:
-                update_auto_upload_enrollment(
-                    conn,
-                    health="action_required",
-                    last_result_code="credential_store_failed",
+            pending_create_intent = bool(
+                enrollment is not None
+                and enrollment.get("mode") == "off"
+                and enrollment.get("last_result_code") == "enrollment_pending"
+            )
+            revocation_needed = bool(
+                enrollment is not None
+                and (
+                    enrollment.get("mode") != "off"
+                    or enrollment.get("revocation_pending")
                 )
-            return AutoUploadError("credential_store_failed", str(exc)).as_result()
+            )
+            if enrollment is not None and (
+                revocation_needed or pending_create_intent
+            ):
+                old_generation = int(enrollment["generation"])
+                disable_generation = old_generation + 1
+                if not update_auto_upload_enrollment(
+                    conn,
+                    expected_generation=old_generation,
+                    mode="off",
+                    health="ready",
+                    generation=disable_generation,
+                    # A first-create intent has no remote authority yet. Its
+                    # enable owner revokes if the request later succeeds.
+                    revocation_pending=revocation_needed,
+                    current_run_id=None,
+                    current_run_stage=None,
+                    last_result_code="disabling",
+                ):
+                    return AutoUploadError(
+                        "control_conflict", "Automatic upload state changed."
+                    ).as_result()
+
+            # Remove local upload authority before touching hooks or network.
+            try:
+                credentials = remove_active_token()
+            except CredentialStoreError as exc:
+                if enrollment is not None:
+                    update_auto_upload_enrollment(
+                        conn,
+                        expected_generation=disable_generation,
+                        health="action_required",
+                        last_result_code="credential_store_failed",
+                    )
+                return AutoUploadError(
+                    "credential_store_failed", str(exc)
+                ).as_result()
 
         hook_error = False
         for target in SUPPORTED_HOOK_TARGETS:
@@ -1499,6 +1817,7 @@ def disable() -> dict[str, Any]:
             if enrollment is not None and not enrollment.get("revocation_pending"):
                 update_auto_upload_enrollment(
                     conn,
+                    expected_generation=disable_generation,
                     revocation_pending=True,
                     health="retrying",
                     last_result_code="revocation_pending",
@@ -1520,6 +1839,7 @@ def disable() -> dict[str, Any]:
             if enrollment is not None and revocation_needed:
                 update_auto_upload_enrollment(
                     conn,
+                    expected_generation=disable_generation,
                     health="action_required",
                     revocation_pending=True,
                     last_result_code="recovery_credential_missing",
@@ -1531,6 +1851,7 @@ def disable() -> dict[str, Any]:
                 # definite and must not resurrect Revocation pending.
                 update_auto_upload_enrollment(
                     conn,
+                    expected_generation=disable_generation,
                     health="action_required" if hook_error else "ready",
                     revocation_pending=False,
                     next_retry_at=None,
@@ -1582,10 +1903,10 @@ def disable() -> dict[str, Any]:
                     _commit_receipt(conn, share_id=str(share["share_id"]), receipt=receipt)
 
             if not unresolved:
-                delete_credentials()
-                if enrollment is not None:
-                    update_auto_upload_enrollment(
+                with control_mutation_lock():
+                    cleared = enrollment is None or update_auto_upload_enrollment(
                         conn,
+                        expected_generation=disable_generation,
                         revocation_pending=False,
                         health="action_required" if hook_error else "ready",
                         next_retry_at=None,
@@ -1593,10 +1914,15 @@ def disable() -> dict[str, Any]:
                             "hook_cleanup_failed" if hook_error else "disabled"
                         ),
                     )
+                    # Delete the sole recovery credential only after the CAS
+                    # proves no newer recovery handoff superseded this Disable.
+                    if cleared:
+                        delete_credentials()
             else:
                 if enrollment is not None:
                     update_auto_upload_enrollment(
                         conn,
+                        expected_generation=disable_generation,
                         health="retrying",
                         last_result_code="receipt_reconciliation_pending",
                         next_retry_at=_iso(_now() + timedelta(minutes=15)),
@@ -1610,6 +1936,7 @@ def disable() -> dict[str, Any]:
             if enrollment is not None:
                 update_auto_upload_enrollment(
                     conn,
+                    expected_generation=disable_generation,
                     health="retrying",
                     revocation_pending=True,
                     last_result_code="revocation_pending",
@@ -1776,6 +2103,8 @@ def _assert_control_state(
         session_ids = list(expected_revisions)
         if release_gate_blockers(conn, session_ids):
             raise ControlChanged("A selected trace is no longer released for sharing.")
+        if auto_upload_review_blockers(conn, session_ids):
+            raise ControlChanged("A selected trace no longer clears automatic review gates.")
         if _current_revisions(conn, session_ids) != dict(expected_revisions):
             raise ControlChanged("A selected trace revision changed during the run.")
         if require_due and not due_decision(enrollment).due:
@@ -2021,16 +2350,18 @@ def _seal_share_ledger(
             or current["egress_profile_hash"] != enrollment["egress_profile_hash"]
         ):
             raise ControlChanged()
-        if release_gate_blockers(
-            conn,
-            [
-                row["session_id"]
-                for row in conn.execute(
-                    "SELECT session_id FROM share_sessions WHERE share_id = ?",
-                    (share_id,),
-                ).fetchall()
-            ],
-        ) or share_revision_blockers(conn, share_id):
+        session_ids = [
+            row["session_id"]
+            for row in conn.execute(
+                "SELECT session_id FROM share_sessions WHERE share_id = ?",
+                (share_id,),
+            ).fetchall()
+        ]
+        if (
+            release_gate_blockers(conn, session_ids)
+            or auto_upload_review_blockers(conn, session_ids)
+            or share_revision_blockers(conn, share_id)
+        ):
             raise ControlChanged("A share gate changed before artifact sealing.")
         cursor = conn.execute(
             "UPDATE shares SET submission_channel = 'auto_weekly', enrollment_id = ?, "
@@ -2091,7 +2422,11 @@ def _transition_submission(
                 (share_id,),
             ).fetchall()
         ]
-        if release_gate_blockers(conn, session_ids) or share_revision_blockers(conn, share_id):
+        if (
+            release_gate_blockers(conn, session_ids)
+            or auto_upload_review_blockers(conn, session_ids)
+            or share_revision_blockers(conn, share_id)
+        ):
             conn.rollback()
             return False
         cursor = conn.execute(
@@ -2758,7 +3093,13 @@ def _run_cycle_impl(
                 ).as_result()
 
             decision = due_decision(enrollment)
-            if not force and pending_at_start is None and not decision.due:
+            if not force and not decision.due:
+                # A 'submitting' artifact already had its receipt reconciled
+                # above; surface that. Otherwise honor cadence/backoff: a
+                # pending 'sealed' artifact from a retryable failure must wait
+                # out its next_retry_at rather than re-submit on every wake-up.
+                if receipt_probe is not None:
+                    return receipt_probe
                 return {
                     "ok": True,
                     "code": decision.reason,
@@ -3011,6 +3352,20 @@ def _run_cycle_impl(
                         "scan": second_scan,
                     }
                 report = _candidate_report(conn, enrollment)
+                if not report["selected"]:
+                    # The candidate set became empty between the two strict
+                    # scans (e.g. the only candidate's revision changed and its
+                    # 24h stability clock reset). That is benign nothing_new —
+                    # not an oversized bundle — and must not become a durable
+                    # action_required that blocks every future cycle.
+                    _record_cycle_result(
+                        conn,
+                        generation=generation,
+                        code="nothing_new",
+                        count=0,
+                        success=True,
+                    )
+                    return {"ok": True, "code": "nothing_new", "count": 0}
                 settings = get_effective_share_settings(conn, config)
                 settings["source_filter"] = list(enrollment["enrolled_sources"])
                 selected, deferred_by_size = _ranked_size_prefix(
@@ -3022,6 +3377,8 @@ def _run_cycle_impl(
                 report["deferred_by_size"] = deferred_by_size
                 report["exclusion_counts"]["deferred_by_size"] = deferred_by_size
                 if not selected:
+                    # Candidates existed but none fit the hosted size budget —
+                    # a genuine oversize condition worth surfacing to the user.
                     raise AutoUploadError(
                         "payload_too_large",
                         "The highest-ranked trace cannot fit the hosted size limit.",
@@ -3221,11 +3578,17 @@ def _run_cycle_impl(
                     "deferred_by_size": deferred_by_size,
                 }
             except ControlChanged as exc:
+                # A control change voids this cycle. Most causes (pause,
+                # disable, profile edit) stop the next cycle at the mode check,
+                # but a persistent mismatch would otherwise raise here every
+                # SessionStart with health='ready' and no next_retry_at, i.e. a
+                # full-cycle storm. Record backoff so a lasting control mismatch
+                # cannot relaunch on every wake-up.
                 _record_cycle_result(
                     conn,
                     generation=generation,
                     code=exc.code,
-                    action_required=False,
+                    retryable=True,
                 )
                 return exc.as_result()
             except RecurringServiceError as exc:
@@ -3373,17 +3736,20 @@ def _hook_due_check_on_connection(
         "SELECT enrollment.singleton_id, enrollment.mode, enrollment.enrolled_at, "
         "enrollment.last_completed_at, enrollment.next_retry_at, "
         "EXISTS(SELECT 1 FROM shares WHERE submission_channel = 'auto_weekly' "
-        "  AND submission_state IN ('sealed', 'submitting')) AS recovery_pending, "
-        "EXISTS(SELECT 1 FROM shares WHERE submission_channel = 'auto_weekly' "
         "  AND submission_state = 'submitting') AS submitting_pending "
         "FROM (SELECT 1) AS anchor LEFT JOIN enrollment ON 1 = 1"
     ).fetchone()
     if row is None:
         return DueDecision(False, "index-unavailable")
+    # A 'submitting' artifact may already have crossed egress; its receipt must
+    # be reconciled promptly regardless of cadence/backoff, so this stays
+    # immediately due (the runner's recovery step can only look up receipts).
     if row["submitting_pending"]:
         return DueDecision(True, "receipt-recovery-pending")
-    if row["singleton_id"] is not None and row["mode"] == "enabled" and row["recovery_pending"]:
-        return DueDecision(True, "recovery-pending")
+    # A merely 'sealed' artifact is a retryable submit failure with a stamped
+    # next_retry_at. It must honor that backoff instead of relaunching a full
+    # cycle on every SessionStart, so fall through to due_decision rather than
+    # forcing due=True on recovery_pending.
     enrollment = dict(row) if row["singleton_id"] is not None else None
     return due_decision(enrollment, now=now)
 

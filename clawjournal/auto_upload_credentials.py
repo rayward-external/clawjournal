@@ -122,9 +122,14 @@ def _require_private_mode(path: Path, expected: int) -> None:
         # disable inheritance.  PowerShell/.NET ships with supported Windows
         # Python versions; any failure blocks enrollment rather than falling
         # back to a best-effort chmod.
+        # The target path is passed via an environment variable, NOT a
+        # positional argument: `powershell.exe -Command <script> <path>` does
+        # not populate $args (only -File does), so $args[0] would be $null and
+        # every ACL call would fail. Reading $env avoids that and cannot be
+        # command-injected the way string interpolation could.
         script = r"""
 $ErrorActionPreference = 'Stop'
-$target = $args[0]
+$target = $env:CLAWJOURNAL_ACL_TARGET
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $isDirectory = Test-Path -LiteralPath $target -PathType Container
 if ($isDirectory) {
@@ -148,12 +153,13 @@ Set-Acl -LiteralPath $target -AclObject $acl
 """
         try:
             completed = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=15,
+                env={**os.environ, "CLAWJOURNAL_ACL_TARGET": str(path)},
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise CredentialStoreError(

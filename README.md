@@ -249,7 +249,7 @@ Scoring uses the current agent's automation CLI by default (`codex exec` in Code
 
 ### 6. Package & Share
 
-Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploading is a **separate, opt-in step**. Manual Share uploads only sessions you explicitly add and confirm; the separately authorized automatic option below is limited to its exact future scope. `pending_review` and active `embargoed` sessions are blocked in both paths, while `auto_redacted` (default) and `released` are allowed. Redaction (your strings, paths, usernames, secrets) is applied to everything in the bundle — traces *and* `manifest.json`.
+Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploading is a **separate, opt-in step**. Manual Share starts with eligible sessions selected in the queue; you can deselect any of them, and only traces you keep and confirm are uploaded. The separately authorized automatic option below is limited to its exact future scope. `pending_review` and active `embargoed` sessions are blocked in both paths, while `auto_redacted` (default) and `released` are allowed. Redaction (your strings, paths, usernames, secrets) is applied to everything in the bundle — traces *and* `manifest.json`.
 
 > *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 

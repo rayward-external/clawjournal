@@ -235,6 +235,41 @@ def test_auto_upload_status_preview_and_control_routes(server, monkeypatch):
     assert pause_calls == [True]
 
 
+def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypatch):
+    from clawjournal import auto_upload
+
+    calls = []
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: calls.append(kwargs)
+        or {"ok": True, "mode": "enabled", "health": "ready"},
+    )
+
+    status_code, body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+        },
+    )
+
+    assert status_code == 200
+    assert body["mode"] == "enabled"
+    assert calls == [
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+            "challenge_only": False,
+        }
+    ]
+
+
 def test_auto_upload_get_status_is_local_only(server, monkeypatch):
     from clawjournal import auto_upload
     from clawjournal.workbench import daemon
@@ -2903,6 +2938,23 @@ def test_upload_pii_redaction_defaults_to_rules_only(tmp_path, monkeypatch):
     assert summary["replacement_count"] == 1
     assert summary["coverage"] == {"full": 0, "rules_only": 1}
     assert "alice@example.com" not in sessions_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("ai_pii", [False, True])
+def test_upload_pii_summary_reports_backend_for_zero_row_export(tmp_path, ai_pii):
+    # An all-excluded share writes an empty sessions.jsonl. Callers read
+    # pii_summary["backend"] unconditionally, so the empty-sessions early
+    # return must include the key or finalize raises KeyError('backend').
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions_file.write_text("", encoding="utf-8")
+
+    summary = _apply_upload_pii_redactions(
+        sessions_file, ai_pii=ai_pii, backend="codex"
+    )
+
+    assert summary["session_count"] == 0
+    assert "backend" in summary
+    assert summary["backend"] is None
 
 
 def test_finalized_ai_manifest_requires_complete_nested_coverage():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 
 import pytest
 
@@ -149,3 +150,61 @@ def test_insecure_existing_file_is_rejected(isolated_store):
 
     with pytest.raises(store.CredentialStoreError, match="mode 0644"):
         store.load_credentials()
+
+
+def test_windows_acl_passes_target_via_env_not_positional(tmp_path, monkeypatch):
+    # Create the target before patching os.name — patching it to "nt" makes
+    # pathlib build a WindowsPath, which cannot instantiate on POSIX. The nt
+    # branch of _require_private_mode itself constructs no Path, so calling it
+    # directly exercises the ACL invocation safely.
+    target = tmp_path / "credentials;$(whoami)'"
+    target.mkdir()
+    calls = []
+
+    class _Done:
+        returncode = 0
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": list(argv), "env": kwargs.get("env")})
+        return _Done()
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store.os, "name", "nt")
+
+    store._require_private_mode(target, 0o700)
+
+    assert len(calls) == 1
+    argv = calls[0]["argv"]
+    # powershell.exe -NoProfile -NonInteractive -Command <script> : the path
+    # must NOT be a trailing positional (that never populates $args).
+    assert argv[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    assert len(argv) == 5
+    assert "$env:CLAWJOURNAL_ACL_TARGET" in argv[4]
+    assert "$args" not in argv[4]
+    assert all(str(target) not in arg for arg in argv)
+    assert calls[0]["env"]["CLAWJOURNAL_ACL_TARGET"] == str(target)
+
+
+@pytest.mark.parametrize("failure", ("nonzero", "launch-error", "timeout"))
+def test_windows_acl_failure_is_fail_closed(tmp_path, monkeypatch, failure):
+    target = tmp_path / "credentials"
+    target.mkdir()
+
+    class _Failed:
+        returncode = 1
+
+    def fake_run(_argv, **_kwargs):
+        if failure == "launch-error":
+            raise OSError("PowerShell unavailable")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("powershell.exe", 15)
+        return _Failed()
+
+    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store.os, "name", "nt")
+
+    with pytest.raises(
+        store.CredentialStoreError,
+        match="could not establish a current-user-only Windows ACL",
+    ):
+        store._require_private_mode(target, 0o700)

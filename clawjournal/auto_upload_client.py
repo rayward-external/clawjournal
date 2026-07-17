@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -292,7 +293,11 @@ def _open_request(request: urllib.request.Request, *, timeout: int) -> bytes:
                 status=exc.code,
             ) from exc
         raise _parse_error(exc) from exc
-    except (TimeoutError, urllib.error.URLError, OSError) as exc:
+    except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # http.client.HTTPException (BadStatusLine, IncompleteRead, …) is raised
+        # by getresponse()/read() on a truncated or malformed reply and is NOT
+        # an OSError, so it must be classified here too — otherwise disable()'s
+        # revoke/lookup crashes unclassified and submit skips ambiguous marking.
         raise RecurringServiceError(
             "server_unavailable",
             "Could not reach the hosted recurring-upload service.",
@@ -505,7 +510,12 @@ def submit_artifact(
     try:
         raw = _open_request(request, timeout=120)
     except RecurringServiceError as exc:
-        if exc.code == "server_unavailable":
+        # The multipart body is fully sent before any response is read, so a
+        # transport failure (unreachable) or an unexpected redirect answered
+        # after the body crossed egress leaves the submission unconfirmed. Both
+        # must be ambiguous so the runner reconciles receipts before retrying,
+        # never terminally 'rejected' with a bundle possibly committed server-side.
+        if exc.code in ("server_unavailable", "redirect_rejected"):
             raise RecurringServiceError(
                 exc.code,
                 exc.message,

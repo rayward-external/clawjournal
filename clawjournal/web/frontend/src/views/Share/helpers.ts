@@ -1,7 +1,6 @@
 import type { Share as ShareType } from '../../types.ts';
 import {
   CONFIDENCE_THRESHOLD,
-  DEFAULT_SHARE_QUEUE_SIZE,
   STEPS,
 } from './types.ts';
 import type {
@@ -138,15 +137,92 @@ export function formatShareDestination(url: string): string {
 }
 
 export function queueFromStats(stats: ShareReadyStats): string[] {
-  const validIds = new Set(stats.sessions.map((s) => s.session_id));
-  const recommended = (stats.recommended_session_ids || [])
-    .filter((id) => validIds.has(id))
-    .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
-  if (recommended.length > 0) return recommended;
-  return stats.sessions
-    .map((s) => s.session_id)
-    .filter(Boolean)
-    .slice(0, DEFAULT_SHARE_QUEUE_SIZE);
+  // `sessions` is already the server-filtered, shareable set (hold, embargo,
+  // source, project, and revision gates have run). Preserve its ranked order,
+  // but select the complete set so users only need to deselect exceptions.
+  return [...new Set(stats.sessions.map((s) => s.session_id).filter(Boolean))];
+}
+
+function csvParam(params: URLSearchParams, name: string): string[] | null {
+  if (!params.has(name)) return null;
+  return (params.get(name) || '').split(',').filter(Boolean);
+}
+
+export function queueFromSelectionParams(
+  stats: ShareReadyStats,
+  params: URLSearchParams,
+): string[] {
+  // `ids=` is intentionally meaningful: it represents an explicitly empty
+  // queue and must not fall back to the select-all default on reload.
+  const explicitIds = csvParam(params, 'ids');
+  if (explicitIds !== null) {
+    const eligibleIds = new Set(queueFromStats(stats));
+    const seen = new Set<string>();
+    return explicitIds.filter((id) => {
+      if (!eligibleIds.has(id) || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }
+
+  const excludedIds = new Set(csvParam(params, 'exclude_ids') || []);
+  return queueFromStats(stats).filter((id) => !excludedIds.has(id));
+}
+
+export function hasLockedQueueSelection(params: URLSearchParams): boolean {
+  // A downstream step may only consume an exact, explicitly locked snapshot.
+  // `exclude_ids` and an omitted `ids` parameter are relative to the current
+  // eligible set, so either could silently absorb newly eligible traces after
+  // a reload.
+  return params.get('selection') === 'locked'
+    && params.has('ids')
+    && !params.has('exclude_ids');
+}
+
+export function writeQueueSelectionParams(
+  params: URLSearchParams,
+  stats: ShareReadyStats | null,
+  queueOrder: string[],
+  locked = false,
+): void {
+  // Until readyStats arrives we cannot tell default-all from an explicit
+  // subset, so leave the selection encoding untouched.
+  if (!stats) return;
+
+  if (locked) {
+    // Once Queue is confirmed, materialize the complete ordered set. Never
+    // re-derive a downstream selection from future share-ready responses.
+    params.set('ids', queueOrder.join(','));
+    params.delete('exclude_ids');
+    params.set('selection', 'locked');
+    return;
+  }
+
+  params.delete('selection');
+
+  const defaults = queueFromStats(stats);
+  const selected = new Set(queueOrder);
+  const excluded = defaults.filter((id) => !selected.has(id));
+  const defaultOrderedSubset = defaults.filter((id) => selected.has(id));
+  const sameOrder = defaultOrderedSubset.length === queueOrder.length
+    && defaultOrderedSubset.every((id, index) => id === queueOrder[index]);
+
+  if (sameOrder && excluded.length === 0) {
+    // The common default needs no URL payload at all.
+    params.delete('ids');
+    params.delete('exclude_ids');
+  } else if (queueOrder.length === 0) {
+    params.set('ids', '');
+    params.delete('exclude_ids');
+  } else if (sameOrder && excluded.length < queueOrder.length) {
+    // A small set of user deselections stays compact even for large queues.
+    params.delete('ids');
+    params.set('exclude_ids', excluded.join(','));
+  } else {
+    // Explicit/reordered subsets retain their exact order for deep links.
+    params.set('ids', queueOrder.join(','));
+    params.delete('exclude_ids');
+  }
 }
 
 export function completedKeysForStep(step: StepKey): Set<string> {

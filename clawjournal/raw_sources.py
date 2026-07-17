@@ -76,7 +76,12 @@ def read_raw_source_snapshot(
     snapshots: list[tuple[Path, bytes]] = []
     member_records: list[dict[str, object]] = []
     total_size = 0
-    latest_mtime_ns = int(directory_stat.st_mtime_ns)
+    # Derive the fingerprint's mtime from the tracked member files only, never
+    # from the directory's own st_mtime_ns: the directory mtime changes whenever
+    # any unrelated top-level entry is created or removed, which would spuriously
+    # trip the raw-source-changed gate even though every parser input byte is
+    # identical. (members_before is non-empty, guaranteed above.)
+    latest_mtime_ns = 0
     for member in members_before:
         data, fingerprint = _read_file_snapshot(member)
         snapshots.append((member, data))

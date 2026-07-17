@@ -292,12 +292,14 @@ export interface AutoUploadStatus {
 }
 
 export interface AutoUploadAuthorizationChallenge {
+  authorization_profile_hash: string;
   authorization: { version: string; text: string };
   retention: { version: string; text: string };
   scope: { sources: string[]; projects: string[] };
   ai: { enabled: boolean; backend: string | null };
   cap: number;
   cadence_days: number;
+  maximum_bundle_size: number;
   destination_origin: string | null;
 }
 

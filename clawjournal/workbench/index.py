@@ -4590,6 +4590,7 @@ _AUTO_UPLOAD_EXCLUSION_REASONS = (
     "raw_source_unavailable",
     "scope_confirmation_changed",
 )
+AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES = frozenset({"new", "shortlisted", "approved"})
 
 
 def _auto_upload_raw_source_resolvable(value: Any) -> bool:
@@ -4759,7 +4760,7 @@ def get_auto_upload_candidate_report(
         ):
             exclude(row, "changed_revision_needing_approval")
             continue
-        if row["review_status"] not in {"new", "shortlisted", "approved"}:
+        if row["review_status"] not in AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES:
             exclude(row, "blocked_review_status")
             continue
 
@@ -4829,6 +4830,53 @@ def revision_review_blockers(
         session_ids,
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def auto_upload_review_blockers(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Return selected traces that no longer clear automatic review gates.
+
+    First-time traces may remain ``new``, ``shortlisted``, or ``approved``.
+    A changed revision of a previously shared trace must remain ``approved``
+    through the final submission transition.
+    """
+    ordered_ids = list(dict.fromkeys(session_ids))
+    if not ordered_ids:
+        return []
+    placeholders = ", ".join("?" for _ in ordered_ids)
+    rows = conn.execute(
+        "SELECT session_id, review_status FROM sessions "
+        f"WHERE session_id IN ({placeholders})",
+        ordered_ids,
+    ).fetchall()
+    by_id = {str(row["session_id"]): row for row in rows}
+    blockers: list[dict[str, Any]] = []
+    blocked_ids: set[str] = set()
+    for session_id in ordered_ids:
+        row = by_id.get(session_id)
+        if row is None:
+            blockers.append({
+                "session_id": session_id,
+                "review_status": None,
+                "reason": "missing",
+            })
+            blocked_ids.add(session_id)
+        elif row["review_status"] not in AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES:
+            blockers.append({
+                "session_id": session_id,
+                "review_status": row["review_status"],
+                "reason": "blocked_review_status",
+            })
+            blocked_ids.add(session_id)
+
+    for blocker in revision_review_blockers(conn, ordered_ids):
+        session_id = str(blocker["session_id"])
+        if session_id in blocked_ids:
+            continue
+        blockers.append({**blocker, "reason": "changed_revision_needing_approval"})
+    return blockers
 
 
 def already_shared_revision_blockers(
@@ -4905,16 +4953,20 @@ def get_share_ready_stats(
     """Return sessions whose current content revision has not been shared.
 
     By default returns only `review_status='approved'` sessions; pass
-    `include_unapproved=True` to widen the pool so the Preview UI can
-    offer new, never-shared sessions for explicit review. A changed revision
-    of a previously shared trace still requires fresh approval before it is
-    offered. Recommendations are ranked by failure value first so the share
-    wizard starts with the best failure examples.
+    `include_unapproved=True` to widen the pool to new, shortlisted, and
+    approved sessions so the Preview UI can offer never-shared sessions for
+    explicit review. Blocked and segmented sessions are never share-ready. A
+    changed revision of a previously shared trace still requires fresh
+    approval before it is offered. Recommendations are ranked by failure value
+    first so the share wizard starts with the best failure examples.
     """
     where_clauses: list[str] = []
     params: list[Any] = []
-    where_clauses.append("s.review_status != 'segmented'")
-    if not include_unapproved:
+    if include_unapproved:
+        where_clauses.append(
+            "s.review_status IN ('new', 'shortlisted', 'approved')"
+        )
+    else:
         where_clauses.append("s.review_status = 'approved'")
     if source_filter is not None:
         if isinstance(source_filter, (list, tuple)):

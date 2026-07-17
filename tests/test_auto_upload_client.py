@@ -194,3 +194,49 @@ def test_typed_http_error_preserves_code_and_retryability():
     assert parsed.code == "rate_limited"
     assert parsed.retryable is True
     assert parsed.retry_after == 9
+
+
+
+import hashlib
+import http.client
+import urllib.request
+
+
+def test_open_request_classifies_http_exception_as_server_unavailable(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise http.client.BadStatusLine("garbage status line")
+
+    monkeypatch.setattr(client._OPENER, "open", boom)
+    request = urllib.request.Request("https://data.rayward.ai/api/x")
+    with pytest.raises(client.RecurringServiceError) as exc:
+        client._open_request(request, timeout=5)
+    assert exc.value.code == "server_unavailable"
+    assert exc.value.retryable is True
+
+
+def test_submit_redirect_after_body_is_ambiguous(tmp_path, monkeypatch):
+    artifact = tmp_path / "bundle.zip"
+    artifact.write_bytes(b"sealed-bytes")
+    digest = hashlib.sha256(b"sealed-bytes").hexdigest()
+
+    def redirect(*_args, **_kwargs):
+        raise client.RecurringServiceError(
+            "redirect_rejected", "unexpected redirect", status=307
+        )
+
+    monkeypatch.setattr(client, "_open_request", redirect)
+    with pytest.raises(client.RecurringServiceError) as exc:
+        client.submit_artifact(
+            {"recurring_submission_url": "https://data.rayward.ai/api/submissions"},
+            active_token="tok",
+            artifact_path=artifact,
+            client_submission_id="cs-1",
+            authorization_revision=1,
+            trace_revision_keys=["k1"],
+            artifact_sha256=digest,
+        )
+    # The body already crossed egress, so a redirect must reconcile receipts,
+    # not terminally reject a bundle the server may have committed.
+    assert exc.value.code == "redirect_rejected"
+    assert exc.value.ambiguous is True
+    assert exc.value.retryable is True

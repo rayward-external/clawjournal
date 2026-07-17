@@ -51,6 +51,7 @@ function deferred<T>() {
 function authorizationRequired() {
   return new ApiError(409, 'Authorization required', {
     code: 'authorization_required',
+    authorization_profile_hash: 'profile-hash-v2',
     authorization: {
       version: 'recurring-v2',
       text: 'I authorize capped recurring uploads of eligible future traces.',
@@ -63,6 +64,7 @@ function authorizationRequired() {
     ai: { enabled: true, backend: 'codex' },
     cap: 5,
     cadence_days: 7,
+    maximum_bundle_size: 5_000_000,
     destination_origin: 'https://share.example.test',
   });
 }
@@ -163,6 +165,7 @@ describe('AutoUploadPanel authorization', () => {
       agent: 'claude',
       accepted_authorization_version: 'recurring-v2',
       accepted_retention_version: 'retention-v3',
+      accepted_authorization_profile_hash: 'profile-hash-v2',
     });
     expect(await screen.findByText('recurring-v2')).toBeInTheDocument();
 
@@ -323,5 +326,36 @@ describe('AutoUploadPanel status and controls', () => {
     await waitFor(() => expect(disableSpy).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getAllByText('Off')).toHaveLength(2));
     expect(screen.queryByText('Revocation pending')).not.toBeInTheDocument();
+  });
+});
+
+describe('AuthorizationDialog focus and dismissal', () => {
+  it('moves focus into the dialog and stays dismissable while the challenge loads', async () => {
+    const enrolled = status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: { sources: ['claude'], projects: ['project-a'] },
+      authorization: { version: 'recurring-v1', text: 'terms' },
+      hooks: [
+        { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
+      ],
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(enrolled);
+    // The challenge fetch never settles → the dialog is stuck loading; it must
+    // still move focus in and stay dismissable rather than trapping the user.
+    vi.spyOn(api.autoUpload, 'enable').mockReturnValue(
+      new Promise<AutoUploadStatus>(() => {}),
+    );
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    expect(cancel).not.toBeDisabled();
+    fireEvent.click(cancel);
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
 });

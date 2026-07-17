@@ -1104,6 +1104,83 @@ class TestShares:
             "s3", "s4", "s5", "s1", "s2", "s6", "s7", "s8", "s9", "s10",
         ]
 
+    def test_share_ready_widened_pool_uses_safe_review_status_allowlist(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        session_ids = (
+            "new-ok",
+            "shortlisted-ok",
+            "approved-ok",
+            "blocked",
+            "segmented",
+            "held-new",
+            "embargoed-shortlisted",
+            "excluded-approved",
+        )
+        upsert_sessions(index_conn, [
+            _make_session(
+                sid,
+                project=(
+                    "claude:private-repo"
+                    if sid == "excluded-approved"
+                    else "claude:public-repo"
+                ),
+                start_time=now.isoformat(),
+                end_time=(now + timedelta(minutes=10)).isoformat(),
+            )
+            for sid in session_ids
+        ])
+        statuses = {
+            "new-ok": "new",
+            "shortlisted-ok": "shortlisted",
+            "approved-ok": "approved",
+            "blocked": "blocked",
+            "segmented": "segmented",
+            "held-new": "new",
+            "embargoed-shortlisted": "shortlisted",
+            "excluded-approved": "approved",
+        }
+        for sid, status in statuses.items():
+            update_session(
+                index_conn,
+                sid,
+                status=status,
+                ai_quality_score=5,
+                ai_failure_value_score=5,
+            )
+        set_hold_state(
+            index_conn,
+            "held-new",
+            "pending_review",
+            changed_by="user",
+            reason="test",
+        )
+        set_hold_state(
+            index_conn,
+            "embargoed-shortlisted",
+            "embargoed",
+            changed_by="user",
+            reason="test",
+            embargo_until=(now + timedelta(days=30)).isoformat(),
+        )
+
+        stats = get_share_ready_stats(
+            index_conn,
+            include_unapproved=True,
+            excluded_projects=["claude:private-repo"],
+        )
+
+        assert {s["session_id"] for s in stats["sessions"]} == {
+            "new-ok",
+            "shortlisted-ok",
+            "approved-ok",
+        }
+        assert set(stats["recommended_session_ids"]) == {
+            "new-ok",
+            "shortlisted-ok",
+            "approved-ok",
+        }
+
     def test_share_ready_respects_excluded_project_rules(self, index_conn):
         from datetime import datetime, timedelta, timezone
         now = datetime.now(timezone.utc)

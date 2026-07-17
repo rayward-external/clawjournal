@@ -6,6 +6,7 @@ import { useToast } from '../../components/Toast.tsx';
 import { Spinner } from '../../components/Spinner.tsx';
 import { Stepper } from '../../components/Stepper.tsx';
 import {
+  LARGE_BUNDLE_CONFIRM_THRESHOLD,
   STEPS,
 } from './types.ts';
 import type {
@@ -25,9 +26,12 @@ import {
   emptyBuckets,
   formatBytes,
   formatDate,
+  hasLockedQueueSelection,
   parseStep,
+  queueFromSelectionParams,
   queueFromStats,
   sessionTotalTokens,
+  writeQueueSelectionParams,
 } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, globalStyles } from './styles.tsx';
 import { QueueStep } from './QueueStep.tsx';
@@ -37,6 +41,20 @@ import { PackageStep } from './PackageStep.tsx';
 import { SubmitStep } from './SubmitStep.tsx';
 import { DoneStep } from './DoneStep.tsx';
 
+function stepConsumesUnpackagedQueue(step: StepKey, packagedShareId: string | null): boolean {
+  return step === 'redact'
+    || step === 'review'
+    || (step === 'package' && !packagedShareId);
+}
+
+function safeStepFromParams(params: URLSearchParams): StepKey {
+  const requested = parseStep(params.get('step'));
+  return stepConsumesUnpackagedQueue(requested, params.get('share'))
+    && !hasLockedQueueSelection(params)
+    ? 'queue'
+    : requested;
+}
+
 export function Share() {
   const { toast } = useToast();
   const location = useLocation();
@@ -45,10 +63,10 @@ export function Share() {
   const skipNextUrlSyncRef = useRef(false);
 
   const [activeStep, setActiveStep] = useState<StepKey>(
-    () => parseStep(searchParams.get('step')),
+    () => safeStepFromParams(searchParams),
   );
   const [completedKeys, setCompletedKeys] = useState<Set<string>>(() => {
-    const step = parseStep(searchParams.get('step'));
+    const step = safeStepFromParams(searchParams);
     return completedKeysForStep(step);
   });
 
@@ -57,16 +75,27 @@ export function Share() {
 
   // Queue state: ordered list (drag-reorder) with a derived Set for lookups.
   const [queueOrder, setQueueOrder] = useState<string[]>(() => {
-    const csv = searchParams.get('ids');
-    return csv ? csv.split(',').filter(Boolean) : [];
+    if (!searchParams.has('ids')) return [];
+    return (searchParams.get('ids') || '').split(',').filter(Boolean);
   });
-  const [selectionInitialized, setSelectionInitialized] = useState(() => !!searchParams.get('ids'));
+  // Explicit URL ids can only be trusted after the share-ready response tells
+  // us which sessions are still eligible. Keep the raw order while loading,
+  // then sanitize and deduplicate it against that server-filtered set.
+  const [selectionInitialized, setSelectionInitialized] = useState(false);
+  const [selectionLocked, setSelectionLocked] = useState(
+    () => safeStepFromParams(searchParams) !== 'queue' && hasLockedQueueSelection(searchParams),
+  );
+  const [confirmedLargeQueueIds, setConfirmedLargeQueueIds] = useState<Set<string> | null>(() => (
+    safeStepFromParams(searchParams) !== 'queue' && hasLockedQueueSelection(searchParams)
+      ? new Set((searchParams.get('ids') || '').split(',').filter(Boolean))
+      : null
+  ));
   const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
 
   const [note, setNote] = useState(() => searchParams.get('note') || '');
   const [aiPiiEnabled, setAiPiiEnabled] = useState(() => searchParams.get('ai_pii') === '1');
   const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
-  const [showAddTraces, setShowAddTraces] = useState(false);
+  const [showAddTraces, setShowAddTraces] = useState(true);
   const [showHelp, setShowHelp] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -78,7 +107,7 @@ export function Share() {
   const [dateFilter, setDateFilter] = useState('');
 
   const resetAddTracesPicker = useCallback(() => {
-    setShowAddTraces(false);
+    setShowAddTraces(true);
     setSearchQuery('');
     setSourceFilter('');
     setProjectFilter('');
@@ -152,12 +181,8 @@ export function Share() {
       setReadyStats(stats);
       setShares(shareList);
       setScoringBackend(backend);
-      if (!selectionInitialized && stats.sessions.length > 0) {
-        // Server recommendation is an ordered, reviewable default package.
-        // Trust it and only filter out ids the client can't resolve
-        // (eg. excluded projects).
-        const recommended = queueFromStats(stats);
-        setQueueOrder(recommended);
+      if (!selectionInitialized) {
+        setQueueOrder(queueFromSelectionParams(stats, searchParams));
         setSelectionInitialized(true);
       }
       if (stats.sessions.length === 0) {
@@ -178,8 +203,8 @@ export function Share() {
   // =================================================
 
   useEffect(() => {
-    if (selectionInitialized || !readyStats || searchParams.get('ids')) return;
-    setQueueOrder(queueFromStats(readyStats));
+    if (selectionInitialized || !readyStats) return;
+    setQueueOrder(queueFromSelectionParams(readyStats, searchParams));
     setSelectionInitialized(true);
   }, [readyStats, searchParams, selectionInitialized]);
 
@@ -190,12 +215,17 @@ export function Share() {
     internalSearchRef.current = currentSearch;
     skipNextUrlSyncRef.current = true;
 
-    const idsParam = searchParams.get('ids');
-    const ids = idsParam ? idsParam.split(',').filter(Boolean) : null;
-    const step = parseStep(searchParams.get('step'));
+    const requestedStep = parseStep(searchParams.get('step'));
+    const lockedSelection = hasLockedQueueSelection(searchParams);
+    const step = stepConsumesUnpackagedQueue(requestedStep, searchParams.get('share'))
+      && !lockedSelection
+      ? 'queue'
+      : requestedStep;
+    const downstreamSelectionLocked = step !== 'queue' && lockedSelection;
 
     setActiveStep(step);
     setCompletedKeys(completedKeysForStep(step));
+    setSelectionLocked(downstreamSelectionLocked);
     setNote(searchParams.get('note') || '');
     setAiPiiEnabled(searchParams.get('ai_pii') === '1');
     setPackagedShareId(searchParams.get('share'));
@@ -211,18 +241,26 @@ export function Share() {
     setPackagingFailed(null);
     setBlockedPackageSessions([]);
 
-    if (ids) {
-      setQueueOrder(ids);
-      setSelectionInitialized(true);
-      return;
-    }
-
-    const recommended = readyStats && readyStats.sessions.length > 0
-      ? queueFromStats(readyStats)
-      : [];
-    setQueueOrder(recommended);
+    const selected = readyStats
+      ? queueFromSelectionParams(readyStats, searchParams)
+      : searchParams.has('ids')
+        ? (searchParams.get('ids') || '').split(',').filter(Boolean)
+        : [];
+    setQueueOrder(selected);
+    setConfirmedLargeQueueIds(downstreamSelectionLocked ? new Set(selected) : null);
     setSelectionInitialized(!!readyStats);
-  }, [location.search, readyStats, searchParams]);
+
+    // Reject stale/bookmarked downstream URLs that do not carry an exact
+    // Queue snapshot. Keeping any explicit `ids` lets the user review that
+    // selection on Queue, but no redaction or packaging may start yet.
+    if (step !== requestedStep || (step === 'queue' && searchParams.has('selection'))) {
+      const next = new URLSearchParams(searchParams);
+      next.delete('step');
+      next.delete('selection');
+      internalSearchRef.current = next.toString();
+      setSearchParams(next, { replace: true });
+    }
+  }, [location.search, readyStats, searchParams, setSearchParams]);
 
   useEffect(() => {
     if (skipNextUrlSyncRef.current) {
@@ -232,15 +270,14 @@ export function Share() {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       if (activeStep === 'queue') next.delete('step'); else next.set('step', activeStep);
-      const csv = queueOrder.join(',');
-      if (csv) next.set('ids', csv); else next.delete('ids');
+      writeQueueSelectionParams(next, readyStats, queueOrder, selectionLocked && activeStep !== 'queue');
       if (note) next.set('note', note); else next.delete('note');
       if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
       if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, note, aiPiiEnabled, packagedShareId, setSearchParams]);
+  }, [activeStep, queueOrder, note, aiPiiEnabled, packagedShareId, readyStats, selectionLocked, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {
@@ -288,6 +325,18 @@ export function Share() {
     () => queueOrder.map((id) => sessionById[id]).filter((s): s is ReadySession => !!s),
     [queueOrder, sessionById],
   );
+  const confirmedLargeQueueCoversCurrent = confirmedLargeQueueIds !== null
+    && queueOrder.every((id) => confirmedLargeQueueIds.has(id));
+  const largeBundleNeedsConfirmation = queuedSessions.length > LARGE_BUNDLE_CONFIRM_THRESHOLD
+    && !confirmedLargeQueueCoversCurrent;
+  // Only a locked exact-ID snapshot can restore an unpackaged downstream step.
+  // Existing packaged Submit/Done flows do not consume this queue and remain
+  // reloadable without repeating redaction.
+  const consumesUnpackagedQueue = stepConsumesUnpackagedQueue(activeStep, packagedShareId);
+  const guardedActiveStep: StepKey = consumesUnpackagedQueue
+    && (!selectionLocked || largeBundleNeedsConfirmation)
+    ? 'queue'
+    : activeStep;
 
   useEffect(() => {
     if (!packagedShareId) return;
@@ -319,15 +368,28 @@ export function Share() {
   const removeFromQueue = (id: string) => {
     const next = queueOrder.filter((x) => x !== id);
     setQueueOrder(next);
-    if (next.length === 0) resetAddTracesPicker();
   };
 
   const addToQueue = (id: string) => {
-    setQueueOrder((prev) => prev.includes(id) ? prev : [...prev, id]);
+    setQueueOrder((prev) => {
+      if (prev.includes(id)) return prev;
+      const defaults = readyStats ? queueFromStats(readyStats) : [];
+      const previousIds = new Set(prev);
+      const defaultOrderedSubset = defaults.filter((sessionId) => previousIds.has(sessionId));
+      const followsDefaultOrder = defaultOrderedSubset.length === prev.length
+        && defaultOrderedSubset.every((sessionId, index) => sessionId === prev[index]);
+      if (followsDefaultOrder && defaults.includes(id)) {
+        previousIds.add(id);
+        return defaults.filter((sessionId) => previousIds.has(sessionId));
+      }
+      return [...prev, id];
+    });
   };
 
   const updateAiPiiEnabled = (enabled: boolean) => {
     setAiPiiEnabled(enabled);
+    setSelectionLocked(false);
+    setConfirmedLargeQueueIds(null);
     setRedactedSessions({});
     setApprovedIds(new Set());
     setExpandedReviewIds(new Set());
@@ -347,6 +409,26 @@ export function Share() {
     setSupportContact(null);
   };
 
+  const returnToQueue = () => {
+    setSelectionLocked(false);
+    setConfirmedLargeQueueIds(null);
+    setActiveStep('queue');
+  };
+
+  const lockQueueSelectionInUrl = (nextStep: StepKey) => {
+    setSelectionLocked(true);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('step', nextStep);
+      writeQueueSelectionParams(next, readyStats, queueOrder, true);
+      if (note) next.set('note', note); else next.delete('note');
+      if (aiPiiEnabled) next.set('ai_pii', '1'); else next.delete('ai_pii');
+      if (packagedShareId) next.set('share', packagedShareId); else next.delete('share');
+      internalSearchRef.current = next.toString();
+      return next;
+    }, { replace: true });
+  };
+
   const reorderQueue = (fromId: string, overId: string) => {
     if (fromId === overId) return;
     setQueueOrder((prev) => {
@@ -361,7 +443,9 @@ export function Share() {
   };
 
   const startFreshShare = useCallback(() => {
-    setQueueOrder([]);
+    setQueueOrder(readyStats ? queueFromStats(readyStats) : []);
+    setSelectionLocked(false);
+    setConfirmedLargeQueueIds(null);
     setCompletedKeys(new Set());
     setPackagedShareId(null);
     setNote('');
@@ -379,12 +463,12 @@ export function Share() {
     setBlockedPackageSessions([]);
     resetAddTracesPicker();
     setActiveStep('queue');
-  }, [resetAddTracesPicker]);
+  }, [readyStats, resetAddTracesPicker]);
 
   const onStepClick = (key: string) => {
     const k = key as StepKey;
-    if (k === activeStep) return;
-    if (k === 'queue') { setActiveStep('queue'); return; }
+    if (k === guardedActiveStep) return;
+    if (k === 'queue') { returnToQueue(); return; }
     if (completedKeys.has(k)) setActiveStep(k);
   };
 
@@ -485,6 +569,10 @@ export function Share() {
   }, [queuedSessions, redactedSessions, aiPiiEnabled]);
 
   const handleStartRedaction = () => {
+    // Confirmation covers this exact set and any later subset (for example,
+    // removing a blocked trace during review), but never newly added traces.
+    setConfirmedLargeQueueIds(new Set(queueOrder));
+    lockQueueSelectionInUrl('redact');
     setCompletedKeys((prev) => new Set([...prev, 'queue']));
     setActiveStep('redact');
     void runRedaction();
@@ -492,10 +580,10 @@ export function Share() {
 
   // if Redact step is the active step and there are sessions lacking data, kick it off
   useEffect(() => {
-    if (activeStep !== 'redact') return;
+    if (guardedActiveStep !== 'redact') return;
     const anyMissing = queuedSessions.some((s) => !redactedSessions[s.session_id] || redactedSessions[s.session_id].loading);
     if (anyMissing) void runRedaction();
-  }, [activeStep, queuedSessions, redactedSessions, runRedaction]);
+  }, [guardedActiveStep, queuedSessions, redactedSessions, runRedaction]);
 
   const redactAllDone = queuedSessions.length > 0 && queuedSessions.every((s) => {
     const d = redactedSessions[s.session_id];
@@ -749,10 +837,10 @@ export function Share() {
 
   // kick off packaging when the step becomes active (eg. back-forward)
   useEffect(() => {
-    if (activeStep === 'package' && !packagingStartedRef.current && !packagedShareId) {
+    if (guardedActiveStep === 'package' && !packagingStartedRef.current && !packagedShareId) {
       void runPackage();
     }
-  }, [activeStep, packagedShareId, runPackage]);
+  }, [guardedActiveStep, packagedShareId, runPackage]);
 
   // Belt-and-suspenders: advance to Done once the share id lands and the
   // animation has finished. Runs even if the inline `setActiveStep('done')`
@@ -763,12 +851,12 @@ export function Share() {
     // just mean "still loading" — routing to Done on that would strand a
     // genuinely-submittable bundle, since this effect can't re-route once
     // `activeStep` leaves 'package'.
-    if (activeStep === 'package' && packagedShareId && packageProgress >= 100 && !packagingFailed && !destinationLoading) {
+    if (guardedActiveStep === 'package' && packagedShareId && packageProgress >= 100 && !packagingFailed && !destinationLoading) {
       setCompletedKeys((prev) => new Set([...prev, 'package']));
       const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
       setActiveStep(canSubmit ? 'submit' : 'done');
     }
-  }, [activeStep, packagedShareId, packageProgress, packagingFailed, shareDestination, destinationLoading]);
+  }, [guardedActiveStep, packagedShareId, packageProgress, packagingFailed, shareDestination, destinationLoading]);
 
   // Reload/deep-link robustness: a page reload or bookmark can land directly on
   // Submit. If hosted submission isn't available (disabled, closed, or the
@@ -778,18 +866,18 @@ export function Share() {
   // for the (now-independent) destination probe — a still-null destination only
   // after it resolves means not-submittable. Mirrors the package→done branch.
   useEffect(() => {
-    if (activeStep !== 'submit' || receiptId || loading || destinationLoading) return;
+    if (guardedActiveStep !== 'submit' || receiptId || loading || destinationLoading) return;
     const canSubmit = !!shareDestination?.daemon_upload_supported && !!shareDestination?.submissions_open;
     if (!canSubmit) setActiveStep('done');
-  }, [activeStep, shareDestination, receiptId, loading, destinationLoading]);
+  }, [guardedActiveStep, shareDestination, receiptId, loading, destinationLoading]);
 
   // A Submit deep-link with no packaged share has nothing to act on; send the
   // user back to the start rather than rendering a dead-end Submit bound to a
   // null share id. In the normal flow `packagedShareId` is always set before we
   // advance to Submit, so this only fires on a stale/partial deep-link.
   useEffect(() => {
-    if (activeStep === 'submit' && !packagedShareId) setActiveStep('queue');
-  }, [activeStep, packagedShareId]);
+    if (guardedActiveStep === 'submit' && !packagedShareId) setActiveStep('queue');
+  }, [guardedActiveStep, packagedShareId]);
 
   // =================================================
   // Step 5: Done actions
@@ -834,13 +922,13 @@ export function Share() {
     // Keep the current step even if it's 'submit' (e.g. a Submit deep-link
     // resolving to a non-submittable destination) so the stepper never
     // highlights nothing for the frame before the reroute to 'done'.
-    ? STEPS.filter(s => s.key !== 'submit' || s.key === activeStep)
+    ? STEPS.filter(s => s.key !== 'submit' || s.key === guardedActiveStep)
     : STEPS;
 
   const stepperHeader = (
     <Stepper
       steps={visibleSteps}
-      activeKey={activeStep}
+      activeKey={guardedActiveStep}
       completedKeys={completedKeys}
       onStepClick={onStepClick}
     />
@@ -849,7 +937,7 @@ export function Share() {
   // =====================================================
   // STEP 1: QUEUE
   // =====================================================
-  if (activeStep === 'queue') {
+  if (guardedActiveStep === 'queue') {
     return (
       <QueueStep
         stepperHeader={stepperHeader}
@@ -894,7 +982,7 @@ export function Share() {
   // =====================================================
   // STEP 2: REDACT
   // =====================================================
-  if (activeStep === 'redact') {
+  if (guardedActiveStep === 'redact') {
     return (
       <RedactStep
         stepperHeader={stepperHeader}
@@ -902,7 +990,7 @@ export function Share() {
         redactedSessions={redactedSessions}
         allDone={redactAllDone}
         aiPiiEnabled={aiPiiEnabled}
-        onBack={() => setActiveStep('queue')}
+        onBack={returnToQueue}
         onContinue={goToReview}
         globalStyles={globalStyles}
         showHelp={showHelp}
@@ -914,7 +1002,7 @@ export function Share() {
   // =====================================================
   // STEP 3: REVIEW
   // =====================================================
-  if (activeStep === 'review') {
+  if (guardedActiveStep === 'review') {
     return (
       <ReviewStep
         stepperHeader={stepperHeader}
@@ -940,7 +1028,7 @@ export function Share() {
   // =====================================================
   // STEP 4: PACKAGE
   // =====================================================
-  if (activeStep === 'package') {
+  if (guardedActiveStep === 'package') {
     return (
       <PackageStep
         stepperHeader={stepperHeader}
@@ -961,7 +1049,7 @@ export function Share() {
   // =====================================================
   // STEP 5: SUBMIT
   // =====================================================
-  if (activeStep === 'submit') {
+  if (guardedActiveStep === 'submit') {
     return (
       <SubmitStep
         stepperHeader={stepperHeader}
@@ -980,7 +1068,7 @@ export function Share() {
   // =====================================================
   // STEP 6: DONE
   // =====================================================
-  if (activeStep === 'done') {
+  if (guardedActiveStep === 'done') {
     return (
       <DoneStep
         stepperHeader={stepperHeader}

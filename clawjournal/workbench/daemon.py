@@ -138,9 +138,15 @@ def _strict_scan_log_guard() -> Iterator[None]:
     handlers: list[logging.Handler] = []
     seen: set[int] = set()
     loggers = [logging.getLogger()]
+    # Snapshot the registry under the logging module lock: a concurrent
+    # first-time getLogger() in another daemon thread mutates loggerDict, and an
+    # unlocked values() iteration would raise "dictionary changed size during
+    # iteration" and abort the strict scan (spurious runner_crash + backoff).
+    with logging._lock:
+        registered = list(logging.Logger.manager.loggerDict.values())
     loggers.extend(
         candidate
-        for candidate in logging.Logger.manager.loggerDict.values()
+        for candidate in registered
         if isinstance(candidate, logging.Logger)
     )
     for configured_logger in loggers:
@@ -1627,6 +1633,10 @@ def _apply_upload_pii_redactions(
             "workers": 0,
             "agent_timeout_seconds": timeout_seconds,
             "ai_enabled": ai_pii,
+            # No session was reviewed, so no AI backend ran. Callers read
+            # pii_summary["backend"] unconditionally; omitting it raises
+            # KeyError('backend') on an all-excluded (zero-row) share.
+            "backend": None,
         }
 
     def redact_one(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
@@ -2058,6 +2068,19 @@ def _final_manual_share_egress_gate(
             "error": "Trace revisions changed after review.",
             "block_reason": "revision_conflict",
             "blocked_sessions": revision_blockers,
+            "status": 409,
+        }
+
+    # Predecessor/duplicate-revision state is mutable during the minutes-long
+    # AI-PII pass between the pre-flight check and this gate (e.g. a sibling
+    # share in the same revision chain lands first), so re-check it here too —
+    # otherwise a stale-predecessor duplicate that #109 added this gate to
+    # refuse could still cross egress.
+    predecessor_blockers = share_predecessor_blockers(conn, share_id)
+    if predecessor_blockers:
+        return {
+            "error": "Share revisions are duplicate or based on a stale predecessor",
+            "blockers": predecessor_blockers,
             "status": 409,
         }
     return None
@@ -3878,6 +3901,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 accepted_retention_version=(
                     str(body["accepted_retention_version"])
                     if body.get("accepted_retention_version") is not None
+                    else None
+                ),
+                accepted_authorization_profile_hash=(
+                    str(body["accepted_authorization_profile_hash"])
+                    if body.get("accepted_authorization_profile_hash") is not None
                     else None
                 ),
                 challenge_only=bool(body.get("challenge_only")),

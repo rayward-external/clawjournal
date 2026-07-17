@@ -71,22 +71,6 @@ function outcomeTooltip(badge: string | null): string {
   return 'How this session ended (heuristic, not a score).';
 }
 
-function riskFlags(session: Session): string[] {
-  const flags: string[] = [];
-  const risks = session.risk_level;
-  if (!risks) return flags;
-  try {
-    const arr: string[] = typeof risks === 'string' ? JSON.parse(risks) : risks;
-    for (const r of arr) {
-      if (r.includes('secret')) flags.push('secrets');
-      else if (r.includes('name')) flags.push('names');
-      else if (r.includes('url')) flags.push('private URLs');
-      else if (r.includes('review')) flags.push('review needed');
-    }
-  } catch { /* ignore */ }
-  return flags;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Type chip colors — derived from the same palette as BadgeChip     */
 /* ------------------------------------------------------------------ */
@@ -193,6 +177,7 @@ export function Inbox() {
   const expandedMsgsRef = useRef(expandedMessages);
   expandedMsgsRef.current = expandedMessages;
   const loadRequestSeqRef = useRef(0);
+  const selectNewRowsRef = useRef(true);
   // Session ids with an in-flight redacted-content fetch (single-flight guard).
   const loadingIdsRef = useRef<Set<string>>(new Set());
 
@@ -228,6 +213,18 @@ export function Inbox() {
       if (requestSeq !== loadRequestSeqRef.current) return;
       const visibleRows = data.slice(0, pageSize);
       setSessions(prev => append ? [...prev, ...visibleRows] : visibleRows);
+      if (append) {
+        // Individual deselections stay deselected while newly discovered rows
+        // still follow the default. The bulk Clear action opts out explicitly.
+        setSelectedIds((prev) => {
+          if (!selectNewRowsRef.current) return prev;
+          const next = new Set(prev);
+          visibleRows.forEach((session) => next.add(session.session_id));
+          return next;
+        });
+      } else {
+        setSelectedIds(new Set(visibleRows.map((session) => session.session_id)));
+      }
       setOffset(currentOffset);
       setHasMore(data.length > pageSize);
     } catch (e) {
@@ -243,6 +240,7 @@ export function Inbox() {
   }, [sort, sourceFilter, projectFilter, typeFilter, recoveryFilter, attributionFilter, modeFilter, pageSize, toast]);
 
   useEffect(() => {
+    selectNewRowsRef.current = true;
     setOffset(0);
     setHasMore(false);
     setSelectedIds(new Set());
@@ -279,23 +277,6 @@ export function Inbox() {
       el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
   }, [focusIndex]);
-
-  const handleAction = async (sessionId: string, action: 'approved' | 'blocked') => {
-    try {
-      await api.sessions.update(sessionId, { status: action });
-      setSessions(prev => {
-        const next = prev.filter(s => s.session_id !== sessionId);
-        // Clamp focusIndex so it doesn't go out of bounds
-        setFocusIndex(fi => fi >= next.length ? Math.max(next.length - 1, 0) : fi);
-        return next;
-      });
-      setSelectedIds(prev => { const next = new Set(prev); next.delete(sessionId); return next; });
-      loadStats();
-      toast(action === 'approved' ? 'Session approved' : 'Session skipped', 'success');
-    } catch (e) {
-      toast(e instanceof Error ? e.message : 'Action failed', 'error');
-    }
-  };
 
   const handleBulkAction = async (action: 'approved' | 'blocked') => {
     const ids = [...selectedIds];
@@ -359,8 +340,10 @@ export function Inbox() {
 
   const toggleSelectAll = () => {
     if (selectedIds.size === sessions.length) {
+      selectNewRowsRef.current = false;
       setSelectedIds(new Set());
     } else {
+      selectNewRowsRef.current = true;
       setSelectedIds(new Set(sessions.map(s => s.session_id)));
     }
   };
@@ -678,8 +661,6 @@ export function Inbox() {
         {sessions.map((s, idx) => {
           const expanded = expandedId === s.session_id;
           const msgs = expandedMessages[s.session_id];
-          const flags = riskFlags(s);
-          const isToReview = true;
           const isFocused = idx === focusIndex;
           const isSelected = selectedIds.has(s.session_id);
 
@@ -848,14 +829,3 @@ export function Inbox() {
     </div>
   );
 }
-
-const kbdStyle: React.CSSProperties = {
-  display: 'inline-block',
-  padding: '0 4px',
-  background: colors.gray100,
-  border: `1px solid ${colors.gray300}`,
-  borderRadius: 3,
-  fontSize: 10,
-  fontFamily: 'monospace',
-  lineHeight: '16px',
-};

@@ -2,6 +2,7 @@
 
 import dataclasses
 import hashlib
+import io
 import json
 import logging
 import os
@@ -184,7 +185,12 @@ def _iter_jsonl_bytes(data: bytes, *, filepath: Path):
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"invalid UTF-8 JSONL input: {filepath.name}") from exc
-    for line_number, line in enumerate(text.splitlines(), start=1):
+    # Split on newlines exactly like the non-strict `for line in f` path
+    # (universal newlines: \n, \r\n, \r). str.splitlines() must NOT be used
+    # here: it also breaks on U+2028/U+2029/U+0085, which JSON.stringify (e.g.
+    # Claude Code) emits unescaped inside string values, so a single valid
+    # JSONL record would be split into fragments and fail strict parsing.
+    for line_number, line in enumerate(io.StringIO(text, newline=None), start=1):
         line = line.strip()
         if not line:
             continue

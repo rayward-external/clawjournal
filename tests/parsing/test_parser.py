@@ -57,6 +57,25 @@ def test_strict_jsonl_parser_rejects_malformed_nonblank_line(
             )
 
 
+# U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, U+0085 NEXT LINE —
+# str.splitlines() breaks on all three; str.split("\n")/file iteration do not.
+@pytest.mark.parametrize("code_point", [0x2028, 0x2029, 0x0085])
+def test_strict_jsonl_parser_accepts_unicode_line_separators_inside_values(
+    tmp_path, code_point
+):
+    # JSON.stringify (Claude Code) emits these unescaped inside string values.
+    # json.loads accepts them, so strict parsing must not split on them the way
+    # str.splitlines() would — otherwise valid session files hard-fail and
+    # permanently block every auto-upload cycle for that source.
+    path = tmp_path / "session.jsonl"
+    payload = {"type": "user", "text": f"before{chr(code_point)}after"}
+    path.write_bytes((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    rows = list(_iter_jsonl(path, strict=True))
+
+    assert rows == [payload]
+
+
 @pytest.fixture(autouse=True)
 def _isolate_workbuddy_ai_projects(tmp_path, monkeypatch):
     monkeypatch.setattr(

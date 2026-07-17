@@ -61,10 +61,19 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
   const authorizationText = stringField(authorization, 'text');
   const retentionVersion = stringField(retention, 'version');
   const retentionText = stringField(retention, 'text');
-  if (!authorizationVersion || !authorizationText || !retentionVersion || !retentionText) {
+  const authorizationProfileHash = stringField(error.body, 'authorization_profile_hash');
+  const maximumBundleSize = typeof error.body.maximum_bundle_size === 'number'
+    && error.body.maximum_bundle_size > 0
+    ? error.body.maximum_bundle_size
+    : null;
+  if (
+    !authorizationVersion || !authorizationText || !retentionVersion ||
+    !retentionText || !authorizationProfileHash || maximumBundleSize === null
+  ) {
     return null;
   }
   return {
+    authorization_profile_hash: authorizationProfileHash,
     authorization: { version: authorizationVersion, text: authorizationText },
     retention: { version: retentionVersion, text: retentionText },
     scope: {
@@ -79,6 +88,7 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
     cadence_days: typeof error.body.cadence_days === 'number'
       ? error.body.cadence_days
       : 7,
+    maximum_bundle_size: maximumBundleSize,
     destination_origin: typeof error.body.destination_origin === 'string'
       ? error.body.destination_origin
       : null,
@@ -179,10 +189,16 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   const { toast } = useToast();
   const titleId = useId();
   const requestedRef = useRef(false);
+  const dialogRef = useRef<HTMLElement>(null);
   const [agent, setAgent] = useState<AutoUploadAgent>(() => selectedAgent(initialStatus));
   const [challenge, setChallenge] = useState<AutoUploadAuthorizationChallenge | null>(null);
   const [accepted, setAccepted] = useState(false);
   const [loading, setLoading] = useState(false);
+  // Distinct from `loading`: true only while the mutating enable POST is in
+  // flight. Dismissal is blocked during that brief window but allowed during
+  // the read-only challenge fetch, which can otherwise hang (slow strict scan
+  // or unreachable hosted origin) and trap the user in an unclosable modal.
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [verificationRequired, setVerificationRequired] = useState(false);
   const [tokenValid, setTokenValid] = useState(false);
@@ -252,17 +268,50 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
     }
   }, [initialStatus, open, requestChallenge]);
 
+  // Move focus into the dialog on open and restore it to the previously
+  // focused element on close, so keyboard and screen-reader focus follow the
+  // modal instead of staying on the background controls behind the overlay.
+  useEffect(() => {
+    if (!open) return;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    return () => { previousFocus?.focus?.(); };
+  }, [open]);
+
+  // Behave like a real modal: trap Tab within the dialog's focusables and
+  // swallow every other page keystroke (capture phase) so background controls
+  // can never be operated through the overlay. Escape dismisses unless a
+  // mutating submit is in flight.
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !loading) {
-        event.preventDefault();
-        onClose();
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        if (!submitting) { event.preventDefault(); onClose(); }
+        return;
       }
+      if (event.key === 'Tab') {
+        const focusables = dialogRef.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), ' +
+          'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        );
+        if (focusables && focusables.length > 0) {
+          const first = focusables[0];
+          const last = focusables[focusables.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }
+      }
+      event.stopPropagation();
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [loading, onClose, open]);
+  }, [submitting, onClose, open]);
 
   if (!open) return null;
 
@@ -273,11 +322,13 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
 
   const enableWithAcceptedTerms = async () => {
     if (!challenge || !accepted) return;
+    setSubmitting(true);
     try {
       const next = await api.autoUpload.enable({
         agent,
         accepted_authorization_version: challenge.authorization.version,
         accepted_retention_version: challenge.retention.version,
+        accepted_authorization_profile_hash: challenge.authorization_profile_hash,
       });
       onEnabled(next);
       toast('Automatic upload enabled', 'success');
@@ -294,6 +345,8 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       } else {
         setError(errorMessage(enableError, 'Could not enable automatic upload.'));
       }
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -374,13 +427,15 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   return (
     <div
       role="presentation"
-      onMouseDown={event => { if (event.target === event.currentTarget && !loading) onClose(); }}
+      onMouseDown={event => { if (event.target === event.currentTarget && !submitting) onClose(); }}
       style={{
         position: 'fixed', inset: 0, zIndex: 9998, padding: 20,
         display: 'grid', placeItems: 'center', background: 'rgba(27, 26, 23, 0.45)',
       }}
     >
       <section
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -417,6 +472,12 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
           <SummaryItem label="Projects" value={compactList(scope.projects, 'No confirmed projects')} />
           <SummaryItem label="Schedule" value={`Every ${cadence} days, on the next supported agent session`} />
           <SummaryItem label="Per-cycle cap" value={`Up to ${cap} selected traces`} />
+          {challenge && (
+            <SummaryItem
+              label="Hosted bundle limit"
+              value={`${(challenge.maximum_bundle_size / (1024 * 1024)).toFixed(1)} MiB`}
+            />
+          )}
           {challenge?.destination_origin && (
             <SummaryItem label="Destination" value={challenge.destination_origin} />
           )}
@@ -576,7 +637,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
         )}
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
-          <button disabled={loading} onClick={onClose} style={{ ...btnSecondary, ...disabledStyle(loading) }}>
+          <button disabled={submitting} onClick={onClose} style={{ ...btnSecondary, ...disabledStyle(submitting) }}>
             Cancel
           </button>
           {!verificationRequired && (

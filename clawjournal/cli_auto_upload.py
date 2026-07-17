@@ -5,8 +5,31 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import re
 import sys
 from typing import Any
+
+# Strip C0/C1 control characters (keep only tab and newline) from any text the
+# hosted service controls before printing it, so a malicious/compromised
+# endpoint cannot inject ANSI escape sequences that rewrite or hide the
+# locally-computed consent summary in the terminal.
+_TERMINAL_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _sanitize_terminal(text: Any) -> str:
+    return _TERMINAL_CONTROL_CHARS.sub("", str(text))
+
+
+def _sanitize_terminal_line(text: Any) -> str:
+    """Sanitize an untrusted value that must stay on one terminal line."""
+
+    return (
+        _sanitize_terminal(text)
+        .replace("\t", " ")
+        .replace("\n", " ")
+        .replace("\u2028", " ")
+        .replace("\u2029", " ")
+    )
 
 
 def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
@@ -19,6 +42,7 @@ def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
     enable.add_argument("--agent", choices=["claude", "codex", "all"], default="all")
     enable.add_argument("--accept-authorization-version", default=None)
     enable.add_argument("--accept-retention-version", default=None)
+    enable.add_argument("--accept-authorization-profile-hash", default=None)
     enable.add_argument("--json", action="store_true")
 
     status = commands.add_parser("status", help="Show automatic-sharing status")
@@ -43,44 +67,57 @@ def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
 
 def _print_human(result: dict[str, Any]) -> None:
     if result.get("ok") is False:
-        print(f"Automatic upload: {result.get('code', 'error')}", file=sys.stderr)
+        print(
+            _sanitize_terminal_line(
+                f"Automatic upload: {result.get('code', 'error')}"
+            ),
+            file=sys.stderr,
+        )
         if result.get("message"):
-            print(str(result["message"]), file=sys.stderr)
+            print(_sanitize_terminal(result["message"]), file=sys.stderr)
         return
     if "mode" in result:
         overlay = f", {result['overlay']}" if result.get("overlay") else ""
-        print(f"Automatic upload: {result['mode']} / {result.get('health', 'ready')}{overlay}")
+        print(_sanitize_terminal_line(
+            f"Automatic upload: {result['mode']} / "
+            f"{result.get('health', 'ready')}{overlay}"
+        ))
         scope = result.get("scope") or {}
         if scope.get("sources"):
-            print(f"Sources: {', '.join(scope['sources'])}")
+            print(_sanitize_terminal_line(f"Sources: {', '.join(scope['sources'])}"))
         if scope.get("projects"):
-            print(f"Projects: {', '.join(scope['projects'])}")
+            print(_sanitize_terminal_line(f"Projects: {', '.join(scope['projects'])}"))
         if result.get("next_due_at"):
-            print(f"Next due: {result['next_due_at']} (on the next supported agent session)")
+            print(_sanitize_terminal_line(
+                f"Next due: {result['next_due_at']} "
+                "(on the next supported agent session)"
+            ))
         if result.get("next_retry_at"):
-            print(f"Next retry: {result['next_retry_at']}")
+            print(_sanitize_terminal_line(f"Next retry: {result['next_retry_at']}"))
         eligibility = result.get("eligibility") or {}
-        print(
+        print(_sanitize_terminal_line(
             "Eligible: "
             f"{eligibility.get('eligible_count', 0)} "
             f"(next cycle selects {eligibility.get('selected_count', 0)})"
-        )
+        ))
         return
     if "selected" in result:
-        print(
+        print(_sanitize_terminal_line(
             f"Eligible: {result.get('eligible_count', 0)}; "
             f"selected: {result.get('selected_count', 0)}; "
             f"deferred by cap: {result.get('deferred_by_cap', 0)}"
-        )
+        ))
         for reason, count in sorted((result.get("exclusion_counts") or {}).items()):
             if count:
-                print(f"  {reason}: {count}")
+                print(_sanitize_terminal_line(f"  {reason}: {count}"))
         return
-    print(f"Automatic upload: {result.get('code', 'complete')}")
+    print(_sanitize_terminal_line(
+        f"Automatic upload: {result.get('code', 'complete')}"
+    ))
     if result.get("count") is not None:
-        print(f"Trace count: {result['count']}")
+        print(_sanitize_terminal_line(f"Trace count: {result['count']}"))
     if result.get("receipt_reference"):
-        print(f"Receipt: {result['receipt_reference']}")
+        print(_sanitize_terminal_line(f"Receipt: {result['receipt_reference']}"))
 
 
 def _emit(result: dict[str, Any], *, output_json: bool) -> None:
@@ -90,7 +127,9 @@ def _emit(result: dict[str, Any], *, output_json: bool) -> None:
         _print_human(result)
 
 
-def _interactive_accept(args, challenge: dict[str, Any]) -> tuple[str, str] | None:
+def _interactive_accept(
+    args, challenge: dict[str, Any]
+) -> tuple[str, str, str] | None:
     if not sys.stdin.isatty():
         return None
     authorization = challenge["authorization"]
@@ -98,29 +137,47 @@ def _interactive_accept(args, challenge: dict[str, Any]) -> tuple[str, str] | No
     scope = challenge["scope"]
     ai = challenge["ai"]
     print("\nRecurring scope authorization\n")
-    print(str(authorization["text"]))
+    print(_sanitize_terminal(authorization["text"]))
     print("\nRetention\n")
-    print(str(retention["text"]))
-    print(f"\nSources: {', '.join(scope['sources'])}")
-    print(f"Projects: {', '.join(scope['projects'])}")
-    print(f"Cycle cap: {challenge['cap']}; cadence: {challenge['cadence_days']} days")
+    print(_sanitize_terminal(retention["text"]))
+    print()
+    print(_sanitize_terminal_line(f"Sources: {', '.join(scope['sources'])}"))
+    print(_sanitize_terminal_line(f"Projects: {', '.join(scope['projects'])}"))
+    print(_sanitize_terminal_line(
+        f"Cycle cap: {challenge['cap']}; cadence: {challenge['cadence_days']} days"
+    ))
+    print(_sanitize_terminal_line(
+        f"Maximum bundle size: {challenge['maximum_bundle_size']} bytes"
+    ))
     if challenge.get("destination_origin"):
-        print(f"Destination: {challenge['destination_origin']}")
-    print(
+        print(_sanitize_terminal_line(
+            f"Destination: {challenge['destination_origin']}"
+        ))
+    print(_sanitize_terminal_line(
         "AI-PII: "
         + (f"enabled via {ai.get('backend')}" if ai.get("enabled") else "disabled")
-    )
-    entered_auth = input(
-        f"Type authorization version {authorization['version']} to accept: "
-    ).strip()
-    if entered_auth != authorization["version"]:
+    ))
+    try:
+        entered_auth = input(
+            _sanitize_terminal_line(
+                f"Type authorization version {authorization['version']} to accept: "
+            )
+        ).strip()
+        if entered_auth != authorization["version"]:
+            return None
+        entered_retention = input(
+            _sanitize_terminal_line(
+                f"Type retention version {retention['version']} to accept: "
+            )
+        ).strip()
+    except (EOFError, OSError, KeyboardInterrupt):
         return None
-    entered_retention = input(
-        f"Type retention version {retention['version']} to accept: "
-    ).strip()
     if entered_retention != retention["version"]:
         return None
-    return entered_auth, entered_retention
+    profile_hash = challenge.get("authorization_profile_hash")
+    if not isinstance(profile_hash, str) or not profile_hash:
+        return None
+    return entered_auth, entered_retention, profile_hash
 
 
 def _fresh_email_verification() -> bool:
@@ -131,14 +188,26 @@ def _fresh_email_verification() -> bool:
         request_email_verification,
     )
 
-    email = input("Academic email for fresh enrollment verification: ").strip()
-    if not email:
+    # request/confirm reach the hosted service and validate input, so a bad
+    # email (ValueError), a mistyped code (HostedServiceError, a ValueError
+    # subclass), a network failure (URLError, an OSError subclass), or Ctrl-D
+    # (EOFError) must surface as a clean message, not a raw traceback — mirror
+    # the verify-email command's handling.
+    try:
+        email = input("Academic email for fresh enrollment verification: ").strip()
+        if not email:
+            return False
+        request_email_verification(email)
+        code = getpass.getpass("Verification code: ").strip()
+        if not code:
+            return False
+        confirm_pending_email_verification(code)
+    except (OSError, RuntimeError, ValueError, EOFError, KeyboardInterrupt) as exc:
+        print(
+            f"Verification did not complete: {_sanitize_terminal(exc)}",
+            file=sys.stderr,
+        )
         return False
-    request_email_verification(email)
-    code = getpass.getpass("Verification code: ").strip()
-    if not code:
-        return False
-    confirm_pending_email_verification(code)
     return True
 
 
@@ -162,10 +231,12 @@ def run(args) -> None:
     elif command == "enable":
         auth_version = args.accept_authorization_version
         retention_version = args.accept_retention_version
+        profile_hash = args.accept_authorization_profile_hash
         result = auto_upload.enable(
             agent=args.agent,
             accepted_authorization_version=auth_version,
             accepted_retention_version=retention_version,
+            accepted_authorization_profile_hash=profile_hash,
         )
         if result.get("code") == "authorization_required" and not output_json:
             accepted = _interactive_accept(args, result)
@@ -176,11 +247,12 @@ def run(args) -> None:
                     "message": "Exact recurring authorization versions were not accepted.",
                 }
             else:
-                auth_version, retention_version = accepted
+                auth_version, retention_version, profile_hash = accepted
                 result = auto_upload.enable(
                     agent=args.agent,
                     accepted_authorization_version=auth_version,
                     accepted_retention_version=retention_version,
+                    accepted_authorization_profile_hash=profile_hash,
                 )
         if result.get("code") == "email_verification_required" and not output_json:
             if _fresh_email_verification():
@@ -189,6 +261,7 @@ def run(args) -> None:
                     agent=args.agent,
                     accepted_authorization_version=auth_version,
                     accepted_retention_version=retention_version,
+                    accepted_authorization_profile_hash=profile_hash,
                 )
             else:
                 result = {

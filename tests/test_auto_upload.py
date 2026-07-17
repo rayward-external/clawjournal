@@ -11,6 +11,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import threading
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -280,6 +281,24 @@ def _create_pending_share(
     )
     conn.commit()
     return share_id, artifact_path
+
+
+def _seed_changed_approved_revision(conn, root: Path) -> str:
+    """Seed a revision whose automatic eligibility depends on fresh approval."""
+    _seed_released_session(conn, root)
+    prior_share_id = create_share(conn, ["session-one"])
+    conn.execute(
+        "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+        ("2026-07-13T00:00:00+00:00", prior_share_id),
+    )
+    revision = "changed-revision-needing-fresh-approval"
+    conn.execute(
+        "UPDATE sessions SET content_revision = ?, review_status = 'approved' "
+        "WHERE session_id = 'session-one'",
+        (revision,),
+    )
+    conn.commit()
+    return revision
 
 
 def _patch_runner_host(monkeypatch, *, origin: str = ORIGIN) -> None:
@@ -800,8 +819,8 @@ def test_prior_enrollment_pending_artifact_cannot_cross_reenrollment(
     assert result["code"] == "receipt_reconciliation_pending"
 
 
-@pytest.mark.parametrize("mutation", ["hold", "revision", "raw"])
-def test_recovery_rechecks_hold_revision_and_raw_fingerprint(
+@pytest.mark.parametrize("mutation", ["hold", "review", "revision", "raw"])
+def test_recovery_rechecks_hold_review_revision_and_raw_fingerprint(
     isolated_auto_upload,
     mutation,
 ):
@@ -838,6 +857,12 @@ def test_recovery_rechecks_hold_revision_and_raw_fingerprint(
             changed_by="test",
             reason="late privacy hold",
         )
+    elif mutation == "review":
+        conn.execute(
+            "UPDATE sessions SET review_status = 'blocked' WHERE session_id = ?",
+            ("session-one",),
+        )
+        conn.commit()
     elif mutation == "revision":
         conn.execute(
             "UPDATE sessions SET content_revision = ? WHERE session_id = ?",
@@ -856,6 +881,109 @@ def test_recovery_rechecks_hold_revision_and_raw_fingerprint(
             api_origin=ORIGIN,
             ai_backend=None,
         )
+    conn.close()
+
+
+@pytest.mark.parametrize("review_status", ["new", "blocked"])
+def test_revoked_fresh_approval_stops_before_ai_and_submit(
+    isolated_auto_upload,
+    monkeypatch,
+    review_status,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_changed_approved_revision(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+    external_calls: list[str] = []
+
+    def revoke_in_package(conn, _session_ids, _settings, **kwargs):
+        conn.execute(
+            "UPDATE sessions SET review_status = ? WHERE session_id = 'session-one'",
+            (review_status,),
+        )
+        conn.commit()
+        kwargs["before_ai_call"]()
+        external_calls.append("ai")
+        raise AssertionError("revoked approval must stop before AI")
+
+    monkeypatch.setattr(auto, "package", revoke_in_package)
+    monkeypatch.setattr(
+        auto,
+        "submit_artifact",
+        lambda *_args, **_kwargs: external_calls.append("submit"),
+    )
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] == "control_changed"
+    assert external_calls == []
+
+
+@pytest.mark.parametrize("boundary", ["seal", "submit"])
+def test_revoked_fresh_approval_stops_atomic_artifact_boundaries(
+    isolated_auto_upload,
+    boundary,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_changed_approved_revision(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+
+    if boundary == "seal":
+        share_id = create_share(conn, ["session-one"])
+        artifact_dir = isolated_auto_upload["install"] / "shares" / share_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / auto.SEALED_ZIP_FILENAME
+        artifact_path.write_bytes(b"not-yet-sealed")
+        raw_path = conn.execute(
+            "SELECT raw_source_path FROM sessions WHERE session_id = 'session-one'"
+        ).fetchone()[0]
+        fingerprints = auto._raw_fingerprints([
+            {"session_id": "session-one", "raw_source_path": raw_path}
+        ])
+    else:
+        share_id, _ = _create_pending_share(
+            conn,
+            isolated_auto_upload["install"],
+            session_id="session-one",
+            enrollment_id="server-enrollment-1",
+            state="sealed",
+        )
+
+    conn.execute(
+        "UPDATE sessions SET review_status = 'new' WHERE session_id = 'session-one'"
+    )
+    conn.commit()
+
+    if boundary == "seal":
+        with pytest.raises(auto.ControlChanged):
+            auto._seal_share_ledger(
+                conn,
+                share_id=share_id,
+                enrollment=enrollment,
+                artifact_path=artifact_path,
+                artifact_sha256=hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+                raw_fingerprints=fingerprints,
+            )
+        expected_state = None
+    else:
+        assert auto._transition_submission(
+            conn,
+            share_id=share_id,
+            from_state="sealed",
+            to_state="submitting",
+            generation=int(enrollment["generation"]),
+        ) is False
+        expected_state = "sealed"
+
+    state = conn.execute(
+        "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()[0]
+    assert state == expected_state
     conn.close()
 
 
@@ -1161,6 +1289,12 @@ def _patch_enable_dependencies(monkeypatch, *, hook_result: bool = True):
     monkeypatch.setattr(auto, "uninstall_agent_hook", lambda _target: None)
 
 
+def _current_authorization_profile_hash(*, agent: str = "claude") -> str:
+    challenge = auto.enable(agent=agent, challenge_only=True)
+    assert challenge["code"] == "authorization_required"
+    return str(challenge["authorization_profile_hash"])
+
+
 def _enrollment_response() -> dict[str, Any]:
     return {
         "enrollment_id": "server-enrollment-1",
@@ -1211,10 +1345,19 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
         conn.close()
     assert not credential_path().exists()
 
+    versions_only = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+    )
+    assert versions_only["code"] == "authorization_required"
+    assert create_calls == []
+
     result = auto.enable(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=challenge["authorization_profile_hash"],
     )
 
     assert result["mode"] == "enabled"
@@ -1231,6 +1374,58 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
         assert enrollment["mode"] == "enabled"
         assert enrollment["server_enrollment_id"] == "server-enrollment-1"
         assert enrollment["hook_targets"] == ["claude"]
+    finally:
+        conn.close()
+
+
+def test_enable_rejects_acceptance_when_displayed_scope_changes(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "create_enrollment",
+        lambda *_args, **_kwargs: create_calls.append("create"),
+    )
+
+    displayed = auto.enable(agent="claude", challenge_only=True)
+    assert displayed["scope"]["projects"] == ["project-one"]
+
+    conn = open_index()
+    try:
+        session, _raw_path = _session(
+            isolated_auto_upload["root"],
+            "session-two",
+            project="project-two",
+        )
+        assert upsert_sessions(conn, [session]) == 1
+    finally:
+        conn.close()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=displayed["authorization_profile_hash"],
+    )
+
+    assert result["code"] == "authorization_required"
+    assert result["scope"]["projects"] == ["project-one", "project-two"]
+    assert (
+        result["authorization_profile_hash"]
+        != displayed["authorization_profile_hash"]
+    )
+    assert create_calls == []
+    assert not credential_path().exists()
+    conn = open_index()
+    try:
+        assert get_auto_upload_enrollment(conn) is None
     finally:
         conn.close()
 
@@ -1256,6 +1451,7 @@ def test_enable_never_backdates_cutoff_before_durable_local_intent(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["mode"] == "enabled"
@@ -1303,6 +1499,7 @@ def test_new_enrollment_after_disable_resets_prior_cadence_and_receipt(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["mode"] == "enabled"
@@ -1348,6 +1545,7 @@ def test_reauthorization_rejects_changed_future_only_cutoff(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "malformed_enrollment_response"
@@ -1393,6 +1591,7 @@ def test_reauthorization_discards_same_enrollment_sealed_artifact_after_patch(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["mode"] == "enabled"
@@ -1407,6 +1606,131 @@ def test_reauthorization_discards_same_enrollment_sealed_artifact_after_patch(
         assert enrollment["authorization_revision"] == 2
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("rotating_credentials", [False, True])
+@pytest.mark.parametrize("restore_fails", [False, True])
+def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
+    isolated_auto_upload,
+    monkeypatch,
+    restore_fails,
+    rotating_credentials,
+):
+    config = _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        recurring_authorization_version="authorization-old",
+        retention_version="retention-old",
+        egress_profile_hash="profile-old",
+    )
+    conn.close()
+    stored_credentials = _credentials()
+    if rotating_credentials:
+        stored_credentials["active_token_expires_at"] = "2020-01-01T00:00:00+00:00"
+    write_credentials(stored_credentials)
+    _patch_enable_dependencies(monkeypatch)
+
+    patch_succeeded = threading.Event()
+    recovery_only_written = threading.Event()
+    release_recovery_write = threading.Event()
+    enable_results: list[dict[str, Any]] = []
+    thread_errors: list[BaseException] = []
+    real_write_credentials = auto.write_credentials
+
+    def successful_reauthorization(*_args, **_kwargs):
+        patch_succeeded.set()
+        response = {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": ENROLLED_AT,
+            "authorization_revision": 2,
+        }
+        if rotating_credentials:
+            response.update({
+                key: value
+                for key, value in _credentials().items()
+                if key in {
+                    "active_token",
+                    "active_token_expires_at",
+                    "recovery_token",
+                    "recovery_token_expires_at",
+                }
+            })
+        return response
+
+    def block_after_recovery_write(record):
+        if record.get("active_token") is not None and restore_fails:
+            raise CredentialStoreError("active credential restore failed")
+        path = real_write_credentials(record)
+        if record.get("active_token") is None:
+            assert patch_succeeded.is_set()
+            recovery_only_written.set()
+            assert release_recovery_write.wait(timeout=5)
+        return path
+
+    def run_enable():
+        try:
+            enable_results.append(
+                auto.enable(
+                    agent="claude",
+                    accepted_authorization_version=AUTH_VERSION,
+                    accepted_retention_version=RETENTION_VERSION,
+                    accepted_authorization_profile_hash=profile_hash,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            thread_errors.append(exc)
+
+    monkeypatch.setattr(
+        auto,
+        "create_enrollment" if rotating_credentials else "update_enrollment",
+        successful_reauthorization,
+    )
+    monkeypatch.setattr(auto, "write_credentials", block_after_recovery_write)
+    profile_hash = _current_authorization_profile_hash()
+    enable_thread = threading.Thread(target=run_enable, name="reauthorize")
+    enable_thread.start()
+    assert recovery_only_written.wait(timeout=5), "recovery credential was not saved"
+    assert load_credentials(required=True)["active_token"] is None
+
+    paused = auto.pause()
+
+    assert paused["mode"] == "paused"
+    assert paused["generation"] == 3
+    release_recovery_write.set()
+    enable_thread.join(timeout=5)
+    assert not enable_thread.is_alive()
+    assert thread_errors == []
+    assert len(enable_results) == 1
+    if restore_fails:
+        assert enable_results[0]["code"] == "credential_store_failed"
+    else:
+        assert enable_results[0]["mode"] == "paused"
+        assert enable_results[0]["generation"] == 4
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "paused"
+        assert enrollment["health"] == (
+            "action_required" if restore_fails else "ready"
+        )
+        assert enrollment["last_result_code"] == (
+            "credential_store_failed" if restore_fails else "paused"
+        )
+        assert enrollment["authorization_revision"] == 2
+        assert enrollment["recurring_authorization_version"] == AUTH_VERSION
+        assert enrollment["retention_version"] == RETENTION_VERSION
+        assert enrollment["egress_profile_hash"] != "profile-old"
+        assert enrollment["hook_targets"] == ["claude"]
+    finally:
+        conn.close()
+    assert load_credentials(required=True)["active_token"] == (
+        None if restore_fails else "active-secret"
+    )
 
 
 def test_reauthorization_blocks_before_patch_while_receipt_is_ambiguous(
@@ -1438,6 +1762,7 @@ def test_reauthorization_blocks_before_patch_while_receipt_is_ambiguous(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "receipt_reconciliation_pending"
@@ -1482,6 +1807,7 @@ def test_enable_snapshot_failure_returns_structured_error_and_stays_off(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["ok"] is False
@@ -1522,6 +1848,7 @@ def test_enable_rolls_back_hook_failure_before_server_or_credentials(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "hook_install_failed"
@@ -1565,6 +1892,7 @@ def test_enable_revokes_server_enrollment_when_credential_commit_fails(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "credential_store_failed"
@@ -1575,6 +1903,79 @@ def test_enable_revokes_server_enrollment_when_credential_commit_fails(
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["mode"] == "off"
         assert enrollment["server_enrollment_id"] is None
+    finally:
+        conn.close()
+
+
+def test_definitely_revoked_first_create_rotates_next_idempotency_key(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+
+    create_ids: list[str] = []
+    revoked: list[str] = []
+    credential_writes = 0
+    real_write_credentials = auto.write_credentials
+
+    def create(_capabilities, **kwargs):
+        create_ids.append(str(kwargs["client_enrollment_id"]))
+        response = _enrollment_response()
+        response["enrollment_id"] = f"server-enrollment-{len(create_ids)}"
+        return response
+
+    def fail_first_credential_write(record):
+        nonlocal credential_writes
+        credential_writes += 1
+        if credential_writes == 1:
+            raise CredentialStoreError("disk full")
+        return real_write_credentials(record)
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+    monkeypatch.setattr(auto, "write_credentials", fail_first_credential_write)
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoked.append(enrollment_id),
+    )
+    profile_hash = _current_authorization_profile_hash()
+
+    failed = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=profile_hash,
+    )
+
+    assert failed["code"] == "credential_store_failed"
+    assert revoked == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        after_revoke = get_auto_upload_enrollment(conn)
+        assert after_revoke["client_enrollment_id"] != create_ids[0]
+        rotated_id = after_revoke["client_enrollment_id"]
+    finally:
+        conn.close()
+
+    enabled = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=profile_hash,
+    )
+
+    assert enabled["mode"] == "enabled"
+    assert create_ids == [create_ids[0], rotated_id]
+    assert create_ids[0] != create_ids[1]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["client_enrollment_id"] == create_ids[1]
+        assert enrollment["server_enrollment_id"] == "server-enrollment-2"
     finally:
         conn.close()
 
@@ -1622,6 +2023,7 @@ def test_enable_generation_race_cannot_commit_or_restore_over_newer_controls(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "control_changed"
@@ -1635,6 +2037,347 @@ def test_enable_generation_race_cannot_commit_or_restore_over_newer_controls(
         assert enrollment["last_result_code"] == "newer-user-control"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("rollback_revoke_fails", [False, True])
+def test_disable_cancels_first_enable_while_create_request_is_in_flight(
+    isolated_auto_upload,
+    monkeypatch,
+    rollback_revoke_fails,
+):
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+
+    create_started = threading.Event()
+    allow_create_response = threading.Event()
+    enable_results: list[dict[str, Any]] = []
+    enable_errors: list[BaseException] = []
+    credential_writes: list[dict[str, Any]] = []
+    revoke_attempts: list[tuple[str, str]] = []
+    real_write_credentials = auto.write_credentials
+
+    def blocked_create(*_args, **_kwargs):
+        create_started.set()
+        assert allow_create_response.wait(timeout=5), "test did not release create request"
+        return _enrollment_response()
+
+    def record_credential_write(record):
+        credential_writes.append(dict(record))
+        return real_write_credentials(record)
+
+    def revoke(_caps, *, enrollment_id, recovery_token):
+        revoke_attempts.append((enrollment_id, recovery_token))
+        if rollback_revoke_fails and len(revoke_attempts) == 1:
+            raise RecurringServiceError(
+                "network_error", "temporary revoke failure", retryable=True
+            )
+
+    def run_enable():
+        try:
+            enable_results.append(
+                auto.enable(
+                    agent="claude",
+                    accepted_authorization_version=AUTH_VERSION,
+                    accepted_retention_version=RETENTION_VERSION,
+                    accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            enable_errors.append(exc)
+
+    monkeypatch.setattr(auto, "create_enrollment", blocked_create)
+    monkeypatch.setattr(auto, "write_credentials", record_credential_write)
+    monkeypatch.setattr(auto, "revoke_enrollment", revoke)
+    monkeypatch.setattr(
+        auto, "recovery_capabilities", lambda origin: _capabilities(origin)
+    )
+
+    enable_thread = threading.Thread(target=run_enable, name="enable-request")
+    enable_thread.start()
+    assert create_started.wait(timeout=5), "enable did not reach hosted create"
+
+    pending_conn = open_index()
+    try:
+        pending = get_auto_upload_enrollment(pending_conn)
+        assert pending["mode"] == "off"
+        assert pending["generation"] == 1
+        assert pending["last_result_code"] == "enrollment_pending"
+    finally:
+        pending_conn.close()
+
+    disabled = auto.disable()
+
+    assert disabled["mode"] == "off"
+    assert disabled["generation"] == 2
+    assert disabled["overlay"] is None
+    assert disabled["last_result"]["code"] == "disabled"
+    allow_create_response.set()
+    enable_thread.join(timeout=5)
+    assert not enable_thread.is_alive()
+
+    assert enable_errors == []
+    assert len(enable_results) == 1
+    assert enable_results[0]["code"] == "control_changed"
+    assert revoke_attempts == [("server-enrollment-1", "recovery-secret")]
+    if rollback_revoke_fails:
+        assert len(credential_writes) == 1
+        assert credential_writes[0]["active_token"] is None
+        assert credential_writes[0]["active_token_expires_at"] is None
+        tombstone = load_credentials(required=True)
+        assert tombstone["active_token"] is None
+        assert tombstone["recovery_token"] == "recovery-secret"
+        pending_conn = open_index()
+        try:
+            pending_revoke = get_auto_upload_enrollment(pending_conn)
+            assert pending_revoke["mode"] == "off"
+            assert pending_revoke["generation"] == 3
+            assert pending_revoke["revocation_pending"] is True
+            assert pending_revoke["last_result_code"] == "revocation_pending"
+        finally:
+            pending_conn.close()
+
+        recovered = auto.disable()
+
+        assert recovered["mode"] == "off"
+        assert recovered["generation"] == 4
+        assert recovered["overlay"] is None
+        assert revoke_attempts == [
+            ("server-enrollment-1", "recovery-secret"),
+            ("server-enrollment-1", "recovery-secret"),
+        ]
+    else:
+        assert credential_writes == []
+    assert not credential_path().exists()
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["generation"] == (4 if rollback_revoke_fails else 2)
+        assert enrollment["revocation_pending"] is False
+        assert enrollment["last_result_code"] == "disabled"
+        if not rollback_revoke_fails:
+            assert enrollment["server_enrollment_id"] is None
+    finally:
+        conn.close()
+
+
+def test_disable_waits_for_authority_handoff_and_recovers_after_process_death(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda *_args, **_kwargs: _enrollment_response()
+    )
+    monkeypatch.setattr(
+        auto, "recovery_capabilities", lambda origin: _capabilities(origin)
+    )
+
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    active_write_started = threading.Event()
+    release_active_write = threading.Event()
+    enable_errors: list[BaseException] = []
+    disable_results: list[dict[str, Any]] = []
+    observations: list[tuple[str | None, str]] = []
+    revoke_attempts: list[tuple[str, str]] = []
+    real_write_credentials = auto.write_credentials
+
+    def crash_during_active_write(record):
+        observation_conn = open_index()
+        try:
+            enrollment = get_auto_upload_enrollment(observation_conn)
+            observations.append((record.get("active_token"), enrollment["mode"]))
+        finally:
+            observation_conn.close()
+        if record.get("active_token"):
+            active_write_started.set()
+            assert release_active_write.wait(timeout=5)
+            raise SimulatedProcessDeath()
+        return real_write_credentials(record)
+
+    def run_enable():
+        try:
+            auto.enable(
+                agent="claude",
+                accepted_authorization_version=AUTH_VERSION,
+                accepted_retention_version=RETENTION_VERSION,
+                accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+            )
+        except BaseException as exc:  # expected simulated process death
+            enable_errors.append(exc)
+
+    def run_disable():
+        disable_results.append(auto.disable())
+
+    monkeypatch.setattr(auto, "write_credentials", crash_during_active_write)
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_attempts.append(
+            (enrollment_id, recovery_token)
+        ),
+    )
+
+    enable_thread = threading.Thread(target=run_enable, name="enable-crash")
+    enable_thread.start()
+    assert active_write_started.wait(timeout=5)
+
+    persisted = load_credentials(required=True)
+    assert persisted["active_token"] is None
+    assert persisted["recovery_token"] == "recovery-secret"
+
+    disable_thread = threading.Thread(target=run_disable, name="disable-after-crash")
+    disable_thread.start()
+    # Disable must wait for the active-write authority phase, not race past it
+    # with a stale credential snapshot.
+    disable_thread.join(timeout=0.1)
+    assert disable_thread.is_alive()
+
+    release_active_write.set()
+    enable_thread.join(timeout=5)
+    disable_thread.join(timeout=5)
+    assert not enable_thread.is_alive()
+    assert not disable_thread.is_alive()
+    assert len(enable_errors) == 1
+    assert isinstance(enable_errors[0], SimulatedProcessDeath)
+    assert observations == [
+        (None, "off"),
+        ("active-secret", "enabled"),
+    ]
+    assert revoke_attempts == [("server-enrollment-1", "recovery-secret")]
+    assert len(disable_results) == 1
+    assert disable_results[0]["mode"] == "off"
+    assert disable_results[0]["generation"] == 2
+    assert disable_results[0]["last_result"]["code"] == "disabled"
+    assert not credential_path().exists()
+
+
+def test_stale_disable_cannot_erase_later_rollback_recovery_handoff(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+
+    create_started = threading.Event()
+    allow_create_response = threading.Event()
+    disable_in_hook_cleanup = threading.Event()
+    allow_disable_to_finish = threading.Event()
+    rollback_revoke_failed = threading.Event()
+    enable_results: list[dict[str, Any]] = []
+    disable_results: list[dict[str, Any]] = []
+    thread_errors: list[BaseException] = []
+    revoke_attempts: list[tuple[str, str]] = []
+
+    def blocked_create(*_args, **_kwargs):
+        create_started.set()
+        assert allow_create_response.wait(timeout=5)
+        return _enrollment_response()
+
+    def block_stale_disable_hook(_target):
+        if (
+            threading.current_thread().name == "stale-disable"
+            and not disable_in_hook_cleanup.is_set()
+        ):
+            disable_in_hook_cleanup.set()
+            assert allow_disable_to_finish.wait(timeout=5)
+
+    def revoke(_caps, *, enrollment_id, recovery_token):
+        revoke_attempts.append((enrollment_id, recovery_token))
+        if threading.current_thread().name == "enable-request":
+            rollback_revoke_failed.set()
+            raise RecurringServiceError(
+                "network_error", "temporary revoke failure", retryable=True
+            )
+
+    def run_enable():
+        try:
+            enable_results.append(
+                auto.enable(
+                    agent="claude",
+                    accepted_authorization_version=AUTH_VERSION,
+                    accepted_retention_version=RETENTION_VERSION,
+                    accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            thread_errors.append(exc)
+
+    def run_disable():
+        try:
+            disable_results.append(auto.disable())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            thread_errors.append(exc)
+
+    monkeypatch.setattr(auto, "create_enrollment", blocked_create)
+    monkeypatch.setattr(auto, "uninstall_agent_hook", block_stale_disable_hook)
+    monkeypatch.setattr(auto, "revoke_enrollment", revoke)
+    monkeypatch.setattr(
+        auto, "recovery_capabilities", lambda origin: _capabilities(origin)
+    )
+
+    enable_thread = threading.Thread(target=run_enable, name="enable-request")
+    enable_thread.start()
+    assert create_started.wait(timeout=5)
+
+    disable_thread = threading.Thread(target=run_disable, name="stale-disable")
+    disable_thread.start()
+    assert disable_in_hook_cleanup.wait(timeout=5)
+
+    allow_create_response.set()
+    assert rollback_revoke_failed.wait(timeout=5)
+
+    deadline = time.monotonic() + 5
+    while True:
+        pending_conn = open_index()
+        try:
+            pending = get_auto_upload_enrollment(pending_conn)
+        finally:
+            pending_conn.close()
+        if pending["generation"] == 3 and pending["revocation_pending"]:
+            break
+        assert time.monotonic() < deadline, "rollback recovery handoff not persisted"
+        time.sleep(0.01)
+
+    tombstone = load_credentials(required=True)
+    assert tombstone["active_token"] is None
+    assert tombstone["recovery_token"] == "recovery-secret"
+
+    allow_disable_to_finish.set()
+    enable_thread.join(timeout=5)
+    disable_thread.join(timeout=5)
+    assert not enable_thread.is_alive()
+    assert not disable_thread.is_alive()
+    assert thread_errors == []
+    assert enable_results[0]["code"] == "control_changed"
+    assert disable_results[0]["generation"] == 3
+    assert disable_results[0]["overlay"] == "revocation_pending"
+    assert disable_results[0]["last_result"]["code"] == "revocation_pending"
+    assert load_credentials(required=True)["recovery_token"] == "recovery-secret"
+
+    recovered = auto.disable()
+
+    assert recovered["mode"] == "off"
+    assert recovered["generation"] == 4
+    assert recovered["overlay"] is None
+    assert recovered["last_result"]["code"] == "disabled"
+    assert revoke_attempts == [
+        ("server-enrollment-1", "recovery-secret"),
+        ("server-enrollment-1", "recovery-secret"),
+    ]
+    assert not credential_path().exists()
 
 
 def test_reauthorization_cannot_resurrect_active_token_after_disable_wins(
@@ -1683,6 +2426,7 @@ def test_reauthorization_cannot_resurrect_active_token_after_disable_wins(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "control_changed"
@@ -2220,6 +2964,84 @@ def test_action_required_sealed_artifact_does_not_lookup_or_post(
     assert calls == []
 
 
+def test_sealed_backoff_is_respected_by_hook_and_runner(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    # A retryable submit failure leaves the share 'sealed' with next_retry_at
+    # stamped. Neither the SessionStart due-check nor the runner may relaunch a
+    # full cycle before that backoff elapses.
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-01T00:00:00+00:00")
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    retry_at = datetime.now(timezone.utc) + timedelta(hours=6)
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        health="retrying",
+        consecutive_failures=1,
+        next_retry_at=retry_at.isoformat(),
+    )
+    conn.close()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("backoff must prevent any egress before next_retry_at")
+
+    monkeypatch.setattr(auto, "load_credentials", forbidden)
+    monkeypatch.setattr(auto, "lookup_receipt", forbidden)
+    monkeypatch.setattr(auto, "submit_artifact", forbidden)
+
+    # Hook due-check backs off while retry_at is in the future...
+    assert auto.hook_session_start_check(
+        "claude", retry_at - timedelta(hours=1)
+    ) == agent_hooks.DueDecision(False, "retry-wait")
+    # ...and becomes due once it elapses.
+    assert auto.hook_session_start_check(
+        "claude", retry_at + timedelta(hours=1)
+    ) == agent_hooks.DueDecision(True, "retry-due")
+
+    # A scheduled runner started during backoff exits without any egress call.
+    result = auto.run_cycle(force=False)
+    assert result["code"] == "retry-wait"
+
+
+def test_submitting_pending_stays_due_despite_backoff(isolated_auto_upload):
+    # A 'submitting' artifact may already have crossed egress; its receipt must
+    # be reconciled promptly regardless of next_retry_at, so it stays due.
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-01T00:00:00+00:00")
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    retry_at = datetime.now(timezone.utc) + timedelta(hours=6)
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        health="retrying",
+        consecutive_failures=1,
+        next_retry_at=retry_at.isoformat(),
+    )
+    conn.close()
+
+    assert auto.hook_session_start_check(
+        "claude", retry_at - timedelta(hours=1)
+    ) == agent_hooks.DueDecision(True, "receipt-recovery-pending")
+
+
 def test_action_required_submitting_artifact_allows_receipt_lookup_only(
     isolated_auto_upload,
     monkeypatch,
@@ -2526,6 +3348,7 @@ def test_definite_receipt_404_unblocks_explicit_reauthorization(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert enabled["mode"] == "enabled"
@@ -2652,3 +3475,35 @@ def test_policy_and_allowlist_mutations_pause_and_advance_generation(
     assert after_allowlist_remove["generation"] == expected_generation
     assert after_allowlist_remove["last_result_code"] == "profile_changed"
     conn.close()
+
+
+
+def test_control_changed_during_cycle_records_backoff(isolated_auto_upload, monkeypatch):
+    # A control change mid-cycle must record exponential backoff, not leave the
+    # enrollment health='ready' with no next_retry_at (which would relaunch a
+    # full cycle on every SessionStart for a persistent mismatch).
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-01T00:00:00+00:00")
+    conn.close()
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    def control_changed(**_kwargs):
+        raise auto.ControlChanged("scope drifted mid-cycle")
+
+    monkeypatch.setattr(auto, "_assert_control_state", control_changed)
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] == "control_changed"
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] == "retrying"
+        assert enrollment["consecutive_failures"] == 1
+        assert enrollment["next_retry_at"] is not None
+    finally:
+        conn.close()

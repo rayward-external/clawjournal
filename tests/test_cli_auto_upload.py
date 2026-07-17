@@ -28,12 +28,14 @@ def test_noninteractive_enable_requires_exact_versions(monkeypatch, capsys):
         "status": 409,
         "code": "authorization_required",
         "message": "review",
+        "authorization_profile_hash": "profile-sha256",
         "authorization": {"version": "auth-v1", "text": "future uploads"},
         "retention": {"version": "ret-v1", "text": "retention"},
         "scope": {"sources": ["codex"], "projects": ["project"]},
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
         "cadence_days": 7,
+        "maximum_bundle_size": 5_000_000,
     }
     monkeypatch.setattr("clawjournal.auto_upload.enable", lambda **kwargs: challenge)
     monkeypatch.setattr(sys, "argv", ["clawjournal", "auto-upload", "enable", "--json"])
@@ -42,3 +44,190 @@ def test_noninteractive_enable_requires_exact_versions(monkeypatch, capsys):
         main()
 
     assert json.loads(capsys.readouterr().out)["code"] == "authorization_required"
+
+
+
+class _FakeStdin:
+    def isatty(self):
+        return True
+
+
+def test_sanitize_terminal_defangs_ansi_but_keeps_tab_newline():
+    from clawjournal.cli_auto_upload import _sanitize_terminal, _sanitize_terminal_line
+
+    assert "\x1b" not in _sanitize_terminal("x\x1b[2Ky")
+    assert "\x07" not in _sanitize_terminal("a\x07b")
+    assert _sanitize_terminal("a\tb\nc") == "a\tb\nc"
+    assert _sanitize_terminal("a\rb") == "ab"
+    assert _sanitize_terminal_line("a\tb\nc\u2028d\u2029e") == "a b c d e"
+
+
+def test_human_output_sanitizes_all_dynamic_single_line_fields(capsys):
+    import clawjournal.cli_auto_upload as cli
+
+    attack = "value\x1b[2J\nforged\x07"
+    cli._print_human({"ok": False, "code": attack, "message": attack})
+    cli._print_human({
+        "ok": True,
+        "mode": attack,
+        "health": attack,
+        "overlay": attack,
+        "scope": {"sources": [attack], "projects": [attack]},
+        "next_due_at": attack,
+        "next_retry_at": attack,
+        "eligibility": {"eligible_count": 1, "selected_count": 1},
+    })
+    cli._print_human({
+        "ok": True,
+        "code": attack,
+        "count": 1,
+        "receipt_reference": attack,
+    })
+
+    captured = capsys.readouterr()
+    assert "\x1b" not in captured.out + captured.err
+    assert "\x07" not in captured.out + captured.err
+    assert "Receipt: value[2J forged" in captured.out
+
+
+def test_interactive_challenge_sanitizes_versions_scope_and_backend(
+    monkeypatch, capsys
+):
+    import clawjournal.cli_auto_upload as cli
+
+    attack = "value\x1b[2J\nforged\x07"
+    challenge = {
+        "authorization_profile_hash": "profile-sha256",
+        "authorization": {"version": attack, "text": attack},
+        "retention": {"version": attack, "text": attack},
+        "scope": {"sources": [attack], "projects": [attack]},
+        "ai": {"enabled": True, "backend": attack},
+        "cap": 5,
+        "cadence_days": 7,
+        "maximum_bundle_size": 5_000_000,
+        "destination_origin": attack,
+    }
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return attack
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr("builtins.input", answer)
+
+    assert cli._interactive_accept(None, challenge) == (
+        attack,
+        attack,
+        "profile-sha256",
+    )
+    output = capsys.readouterr().out
+    assert "\x1b" not in output + "".join(prompts)
+    assert "\x07" not in output + "".join(prompts)
+    assert all("\n" not in prompt for prompt in prompts)
+
+
+def test_fresh_email_verification_reports_clean_error(monkeypatch, capsys):
+    import clawjournal.cli_auto_upload as cli
+
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: "student@uni.edu")
+
+    def bad_email(_email):
+        raise ValueError("Enter a valid academic email address.")
+
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon.request_email_verification", bad_email
+    )
+
+    assert cli._fresh_email_verification() is False
+    assert "Verification did not complete" in capsys.readouterr().err
+
+
+def test_interactive_enable_replays_exact_profile_after_email_verification(
+    monkeypatch, capsys
+):
+    challenge = {
+        "ok": False,
+        "status": 409,
+        "code": "authorization_required",
+        "message": "review",
+        "authorization_profile_hash": "profile-sha256",
+        "authorization": {"version": "auth-v1", "text": "future uploads"},
+        "retention": {"version": "ret-v1", "text": "retention"},
+        "scope": {"sources": ["codex"], "projects": ["project"]},
+        "ai": {"enabled": False, "backend": None},
+        "cap": 5,
+        "cadence_days": 7,
+        "maximum_bundle_size": 5_000_000,
+    }
+    calls = []
+
+    def enable(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return challenge
+        if len(calls) == 2:
+            return {
+                "ok": False,
+                "code": "email_verification_required",
+                "message": "verify",
+            }
+        return {"ok": True, "mode": "enabled", "health": "ready"}
+
+    answers = iter(["auth-v1", "ret-v1", "student@uni.edu"])
+    monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: "123456")
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon.request_email_verification",
+        lambda _email: None,
+    )
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon.confirm_pending_email_verification",
+        lambda _code: None,
+    )
+    monkeypatch.setattr(sys, "argv", ["clawjournal", "auto-upload", "enable"])
+
+    main()
+
+    accepted = {
+        "agent": "all",
+        "accepted_authorization_version": "auth-v1",
+        "accepted_retention_version": "ret-v1",
+        "accepted_authorization_profile_hash": "profile-sha256",
+    }
+    assert calls == [
+        {
+            "agent": "all",
+            "accepted_authorization_version": None,
+            "accepted_retention_version": None,
+            "accepted_authorization_profile_hash": None,
+        },
+        accepted,
+        accepted,
+    ]
+    assert "Automatic upload: enabled / ready" in capsys.readouterr().out
+
+
+def test_interactive_accept_handles_keyboard_interrupt(monkeypatch):
+    import clawjournal.cli_auto_upload as cli
+
+    challenge = {
+        "authorization_profile_hash": "profile-sha256",
+        "authorization": {"version": "auth-v1", "text": "future uploads"},
+        "retention": {"version": "ret-v1", "text": "retention"},
+        "scope": {"sources": ["codex"], "projects": ["project"]},
+        "ai": {"enabled": False, "backend": None},
+        "cap": 5,
+        "cadence_days": 7,
+        "maximum_bundle_size": 5_000_000,
+    }
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_a, **_k: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    assert cli._interactive_accept(None, challenge) is None

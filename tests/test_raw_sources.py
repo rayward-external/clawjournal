@@ -66,3 +66,24 @@ def test_subagent_fingerprint_tracks_parser_members_only(tmp_path: Path) -> None
 
     snapshots, _fingerprint = read_raw_source_snapshot(session_dir)
     assert [path.name for path, _data in snapshots] == ["agent-1.jsonl"]
+
+
+
+def test_subagent_fingerprint_ignores_unrelated_parent_directory_touch(tmp_path: Path) -> None:
+    # The directory's own st_mtime_ns must not feed the fingerprint: it changes
+    # whenever any unrelated top-level entry is created/removed, which would
+    # spuriously trip the raw-source-changed gate even though every parser
+    # input byte is identical.
+    import os
+
+    session_dir = tmp_path / "session-id"
+    subagents = session_dir / "subagents"
+    subagents.mkdir(parents=True)
+    (subagents / "agent-1.jsonl").write_text('{"a":1}\n', encoding="utf-8")
+    baseline = fingerprint_raw_source(session_dir)
+
+    before_mtime = session_dir.stat().st_mtime_ns
+    os.utime(session_dir, ns=(before_mtime + 1_000_000_000, before_mtime + 1_000_000_000))
+
+    assert session_dir.stat().st_mtime_ns != before_mtime
+    assert fingerprint_raw_source(session_dir) == baseline
