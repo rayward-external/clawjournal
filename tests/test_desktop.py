@@ -118,7 +118,9 @@ def test_launchers_start_outside_home_shadow_package(isolated_desktop: Path) -> 
     desktop._write_windows_bootstrap()
     bootstrap = desktop.WINDOWS_BOOTSTRAP.read_text(encoding="utf-8")
     assert "from clawjournal.cli import main" in bootstrap
+    assert "CREATE_NO_WINDOW" in bootstrap
     assert repr(str(desktop.LOG_FILE)) in bootstrap
+    compile(bootstrap, str(desktop.WINDOWS_BOOTSTRAP), "exec")
 
 
 def test_launch_reuses_live_workbench(
