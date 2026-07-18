@@ -11,6 +11,9 @@
 .PARAMETER WithFrontend
     Also build the browser workbench (requires Node.js / npm).
 
+.PARAMETER DesktopShortcut
+    Build the browser workbench and install the one-click desktop shortcut.
+
 .PARAMETER VenvPath
     Where to create the venv. Default: $HOME\.clawjournal-venv (or the
     CLAWJOURNAL_VENV environment variable, if set).
@@ -20,14 +23,22 @@
 
 .EXAMPLE
     .\scripts\install.ps1 -WithFrontend
+
+.EXAMPLE
+    .\scripts\install.ps1 -DesktopShortcut
 #>
 [CmdletBinding()]
 param(
     [switch]$WithFrontend,
+    [switch]$DesktopShortcut,
     [string]$VenvPath
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($DesktopShortcut) {
+    $WithFrontend = $true
+}
 
 # Resolve repo root (parent of scripts\). If we were piped via iwr|iex with no
 # script on disk, $PSScriptRoot is empty — clone the repo first.
@@ -128,7 +139,15 @@ if ($WithFrontend) {
     }
 }
 
-# 5) Report.
+# 5) Optional desktop launcher. It uses the just-installed venv executable so
+#    the shortcut remains independent of the user's PATH.
+if ($DesktopShortcut) {
+    Write-Host "-> Installing desktop shortcut"
+    & $ClawJournalExe desktop install
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+# 6) Report.
 $InstalledVersion = & $VenvPy -c "import clawjournal; print(clawjournal.__version__)" 2>$null
 if (-not $InstalledVersion) { $InstalledVersion = '?' }
 Write-Host ""
@@ -141,7 +160,7 @@ Write-Host ""
 Write-Host "Or add the venv to PATH for this session:"
 Write-Host "        `$env:Path = `"$VenvBin;`" + `$env:Path"
 
-# 6) Soft hints for optional runtime deps.
+# 7) Soft hints for optional runtime deps.
 $DistHtml = Join-Path $RepoDir 'clawjournal\web\frontend\dist\index.html'
 $FeSrcDir = Join-Path $RepoDir 'clawjournal\web\frontend\src'
 $frontendBuilt = Test-Path $DistHtml

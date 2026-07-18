@@ -4266,6 +4266,23 @@ def main() -> None:
         help="Opaque ID echoed into _meta.request_id when --json is set",
     )
 
+    # Optional one-click desktop launcher. Platform-specific implementation is
+    # isolated in desktop.py so importing the core CLI remains lightweight.
+    desktop_parser = sub.add_parser(
+        "desktop", help="Manage the one-click desktop workbench shortcut"
+    )
+    desktop_sub = desktop_parser.add_subparsers(dest="desktop_command", required=True)
+    desktop_sub.add_parser(
+        "install", help="Install the shortcut and dynamic daily expression icon"
+    )
+    desktop_sub.add_parser("uninstall", help="Remove the shortcut and icon refresh task")
+    desktop_refresh = desktop_sub.add_parser(
+        "refresh", help="Refresh the icon for the current days-since-opened value"
+    )
+    desktop_refresh.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+    desktop_sub.add_parser("status", help="Show shortcut and expression status as JSON")
+    desktop_sub.add_parser("launch", help="Open the workbench and request a fresh scan")
+
     # Workbench commands
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
@@ -4661,7 +4678,18 @@ def main() -> None:
     args = parser.parse_args()
     command = args.command or "export"
 
+    if command == "desktop":
+        from .desktop import run_desktop_command
+        exit_code = run_desktop_command(args)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
     if command == "serve":
+        # A manual `clawjournal serve` counts as opening the journal too, but
+        # does not create desktop state unless the optional shortcut exists.
+        from .desktop import note_opened
+        note_opened()
         from .workbench.daemon import RELOAD_CHILD_ENV, RELOAD_OPEN_BROWSER_ENV
         is_reload_child = os.environ.get(RELOAD_CHILD_ENV) == "1"
 
