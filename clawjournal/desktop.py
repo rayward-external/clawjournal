@@ -126,7 +126,7 @@ def days_since_last_opened(now: dt.datetime | None = None) -> int:
             opened = opened.astimezone()
     except (FileNotFoundError, OSError, ValueError):
         return 0
-    elapsed = (current.astimezone().date() - opened.astimezone().date()).days
+    elapsed = (current.date() - opened.astimezone(current.tzinfo).date()).days
     return max(0, min(MAX_SAD_DAYS, elapsed))
 
 

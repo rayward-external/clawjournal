@@ -112,8 +112,9 @@ def test_note_opened_is_noop_until_installed(isolated_desktop: Path) -> None:
 
 def test_launchers_start_outside_home_shadow_package(isolated_desktop: Path) -> None:
     shell_launcher = desktop._shell_launcher(desktop._command("desktop", "launch"), log=True)
-    assert f"cd {desktop.shlex.quote(str(desktop.STATE_DIR))}" in shell_launcher
-    assert f"cd {desktop.shlex.quote(str(isolated_desktop))}" not in shell_launcher
+    launcher_lines = shell_launcher.splitlines()
+    assert f"cd {desktop.shlex.quote(str(desktop.STATE_DIR))}" in launcher_lines
+    assert f"cd {desktop.shlex.quote(str(isolated_desktop))}" not in launcher_lines
 
     desktop._write_windows_bootstrap()
     bootstrap = desktop.WINDOWS_BOOTSTRAP.read_text(encoding="utf-8")
