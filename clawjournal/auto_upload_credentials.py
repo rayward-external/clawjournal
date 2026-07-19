@@ -133,41 +133,84 @@ $target = $env:CLAWJOURNAL_ACL_TARGET
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $isDirectory = Test-Path -LiteralPath $target -PathType Container
 if ($isDirectory) {
-  $acl = New-Object System.Security.AccessControl.DirectorySecurity
-  $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+  $grant = "*$($identity.Value):(OI)(CI)F"
 } else {
-  $acl = New-Object System.Security.AccessControl.FileSecurity
-  $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+  $grant = "*$($identity.Value):F"
 }
-$acl.SetAccessRuleProtection($true, $false)
-$acl.SetOwner($identity)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-  $identity,
-  [System.Security.AccessControl.FileSystemRights]::FullControl,
-  $inheritance,
-  [System.Security.AccessControl.PropagationFlags]::None,
-  [System.Security.AccessControl.AccessControlType]::Allow
+& icacls.exe $target /inheritance:r | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  throw "icacls failed with exit code $LASTEXITCODE"
+}
+$existingAcl = Get-Acl -LiteralPath $target
+$otherIdentities = @(
+  $existingAcl.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]
+  ) |
+    Where-Object { $_.IdentityReference -ne $identity } |
+    ForEach-Object { $_.IdentityReference.Value } |
+    Sort-Object -Unique
 )
-$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $target -AclObject $acl
+foreach ($otherIdentity in $otherIdentities) {
+  & icacls.exe $target /remove "*$otherIdentity" | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "icacls could not remove an existing credential ACL entry"
+  }
+}
+& icacls.exe $target /grant:r $grant | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  throw "icacls failed with exit code $LASTEXITCODE"
+}
+$acl = Get-Acl -LiteralPath $target
+$rules = @($acl.GetAccessRules(
+  $true,
+  $true,
+  [System.Security.Principal.SecurityIdentifier]
+))
+if (-not $acl.AreAccessRulesProtected -or $rules.Count -eq 0) {
+  throw 'credential ACL is not protected or has no access rules'
+}
+$unexpected = @($rules | Where-Object {
+  $_.IdentityReference -ne $identity -or
+  $_.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow
+})
+$fullControl = @($rules | Where-Object {
+  ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+    [System.Security.AccessControl.FileSystemRights]::FullControl
+})
+if ($unexpected.Count -ne 0 -or $fullControl.Count -eq 0) {
+  throw 'credential ACL does not grant full control exclusively to the current user'
+}
 """
         try:
+            child_env = os.environ.copy()
+            child_env["CLAWJOURNAL_ACL_TARGET"] = str(path)
             completed = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
                 check=False,
                 timeout=15,
-                env={**os.environ, "CLAWJOURNAL_ACL_TARGET": str(path)},
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise CredentialStoreError(
                 f"could not establish a current-user-only Windows ACL for {path}"
             ) from exc
         if completed.returncode != 0:
+            detail = (
+                getattr(completed, "stderr", "")
+                or getattr(completed, "stdout", "")
+                or ""
+            ).strip()
+            suffix = f": {detail}" if detail else ""
             raise CredentialStoreError(
-                f"could not establish a current-user-only Windows ACL for {path}"
+                f"could not establish a current-user-only Windows ACL for {path}{suffix}"
             )
         return
     actual = stat.S_IMODE(path.stat().st_mode)
