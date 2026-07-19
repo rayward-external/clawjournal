@@ -37,10 +37,11 @@ export class ApiError extends Error {
   }
 }
 
-// The server-side AI review is capped at 180 seconds. Keep a slightly wider
-// browser deadline so configured long reviews can finish, while a wedged daemon
-// or dropped response can never leave the Share workflow loading forever.
-export const REDACTION_REPORT_TIMEOUT_MS = 190_000;
+// The server-side AI review is capped at 180 seconds, and its agent runner gets
+// another 10 seconds to terminate and collect output. Leave a further 10
+// seconds for the daemon to serialize the report and the browser to receive it.
+// A wedged daemon or dropped response still gets a finite browser deadline.
+export const REDACTION_REPORT_TIMEOUT_MS = 200_000;
 
 declare global {
   interface Window {
