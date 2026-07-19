@@ -514,6 +514,29 @@ class TestSessionsAPI:
         assert data["ai_coverage"] == "disabled"
         assert any(entry["type"] == "blocked_domain" for entry in data["redaction_log"])
 
+    def test_redaction_report_ai_review_uses_bounded_configured_timeout(
+        self, server, monkeypatch
+    ):
+        captured = {}
+
+        def fake_review(session, **kwargs):
+            captured["session_id"] = session["session_id"]
+            captured["timeout_seconds"] = kwargs["timeout_seconds"]
+            return []
+
+        monkeypatch.setenv("CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS", "23")
+        monkeypatch.setattr(
+            "clawjournal.redaction.pii.review_session_pii_with_agent", fake_review
+        )
+
+        status, data = _get(
+            server, "/api/sessions/sess-0/redaction-report?ai_pii=1"
+        )
+
+        assert status == 200
+        assert data["ai_coverage"] == "full"
+        assert captured == {"session_id": "sess-0", "timeout_seconds": 23}
+
     def test_update_session_status(self, server):
         status, data = _post(server, "/api/sessions/sess-0", {"status": "approved"})
         assert status == 200

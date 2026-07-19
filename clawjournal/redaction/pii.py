@@ -11,11 +11,13 @@ until LLM-PII gets a no-plaintext deterministic apply design.
 from __future__ import annotations
 
 import json
+import math
 import re
 import tempfile
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from ..findings import (
@@ -448,25 +450,80 @@ def review_session_pii_with_agent(
             if not ignore_errors:
                 raise
     else:
-        # Multiple batches — run in parallel
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
-            futures = {
-                pool.submit(
+        # Multiple batches share ONE request budget. Submitting every batch up
+        # front made timeout_seconds apply once per worker wave, so a large trace
+        # could keep the HTTP handler and agent CLIs alive long after the browser
+        # deadline. Refill only while time remains and pass each new worker the
+        # remaining budget. Backend wrappers retain their existing 10-second
+        # process-cleanup grace, so total wall time is bounded by budget + grace.
+        deadline = monotonic() + max(0.001, float(timeout_seconds))
+        worker_count = min(max_workers, len(batches))
+        pool = ThreadPoolExecutor(max_workers=worker_count)
+        futures: dict[Any, list[tuple[str, int, str, str]]] = {}
+        next_batch = 0
+        timed_out = False
+
+        def fill_workers() -> None:
+            nonlocal next_batch
+            while len(futures) < worker_count and next_batch < len(batches):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return
+                batch = batches[next_batch]
+                next_batch += 1
+                future = pool.submit(
                     _review_batch,
                     session_id,
                     batch,
                     rubric=rubric,
                     backend=backend,
-                    timeout_seconds=timeout_seconds,
-                ): batch
-                for batch in batches
-            }
-            for future in as_completed(futures):
-                try:
-                    findings.extend(future.result())
-                except RuntimeError as exc:
-                    if not ignore_errors:
-                        errors.append(exc)
+                    timeout_seconds=max(1, math.ceil(remaining)),
+                )
+                futures[future] = batch
+
+        try:
+            fill_workers()
+            while futures:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                # OpenClaw/Hermes wrappers allow ten seconds after their own
+                # deadline to terminate and collect output.
+                done, _ = wait(
+                    futures,
+                    timeout=remaining + 10,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    timed_out = True
+                    break
+                for future in done:
+                    futures.pop(future, None)
+                    try:
+                        findings.extend(future.result())
+                    except RuntimeError as exc:
+                        if not ignore_errors:
+                            errors.append(exc)
+                if errors:
+                    break
+                if next_batch < len(batches) and monotonic() >= deadline:
+                    timed_out = True
+                    break
+                fill_workers()
+            if next_batch < len(batches):
+                timed_out = True
+        finally:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        if timed_out and not ignore_errors:
+            errors.append(
+                RuntimeError(
+                    f"PII review timed out after {timeout_seconds}s for session {session_id}"
+                )
+            )
         if errors:
             raise errors[0]
 
