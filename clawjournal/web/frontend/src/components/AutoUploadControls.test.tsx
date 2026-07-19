@@ -13,6 +13,7 @@ function status(overrides: Partial<AutoUploadStatus> = {}): AutoUploadStatus {
     run_now_allowed: false,
     overlay: null,
     pending_submission_state: null,
+    ui_visible: true,
     offer_available: false,
     scope: { sources: [], projects: [] },
     cap: 5,
@@ -79,6 +80,18 @@ afterEach(() => {
 });
 
 describe('AutoUploadOffer', () => {
+  it('stays hidden when the internal rollout flag is off', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      ui_visible: false,
+      offer_available: true,
+    }));
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-hidden" />);
+    await flushPromises();
+
+    expect(screen.queryByText('Share future traces automatically?')).not.toBeInTheDocument();
+  });
+
   it('requires a manual receipt and server capability, then persists dismissal', async () => {
     const statusSpy = vi.spyOn(api.autoUpload, 'status');
 
@@ -115,6 +128,18 @@ describe('AutoUploadOffer', () => {
     statusSpy.mockResolvedValueOnce(status({ offer_available: true }));
     renderControl(<AutoUploadOffer manualReceiptId="receipt-3" />);
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
+  });
+});
+
+describe('AutoUploadPanel visibility', () => {
+  it('renders nothing when the internal rollout flag is off', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({ ui_visible: false }));
+
+    renderControl(<AutoUploadPanel />);
+    await waitFor(() => expect(api.autoUpload.status).toHaveBeenCalledTimes(1));
+
+    expect(screen.queryByRole('heading', { name: 'Automatic uploads' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review and enable' })).not.toBeInTheDocument();
   });
 });
 

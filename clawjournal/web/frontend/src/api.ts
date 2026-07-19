@@ -112,6 +112,7 @@ function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadSt
       || raw.pending_submission_state === 'submitting'
       ? raw.pending_submission_state
       : null,
+    ui_visible: raw.ui_visible === true,
     offer_available: raw.offer_available === true,
     scope: {
       sources: Array.isArray(scope.sources) ? scope.sources : [],

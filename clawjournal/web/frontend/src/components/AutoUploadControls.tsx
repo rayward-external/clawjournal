@@ -714,7 +714,7 @@ export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string |
     try { window.localStorage.setItem(OFFER_DISMISSED_KEY, manualReceiptId); } catch { /* best effort */ }
   };
 
-  if (!status || dismissed || status.mode !== 'off' || !status.offer_available) return null;
+  if (!status || !status.ui_visible || dismissed || status.mode !== 'off' || !status.offer_available) return null;
 
   return (
     <>
@@ -838,6 +838,8 @@ export function AutoUploadPanel() {
     padding: '16px 20px',
     marginBottom: 14,
   };
+
+  if (!status || !status.ui_visible) return null;
 
   if (!status && !loadError) {
     return <div style={panelStyle}><span style={{ color: colors.gray500, fontSize: 13 }}>Loading automatic-upload status…</span></div>;

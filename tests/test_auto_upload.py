@@ -344,6 +344,31 @@ def test_status_is_read_only_without_an_install(
     assert not isolated_auto_upload["install"].exists()
 
 
+def test_auto_upload_ui_is_hidden_unless_internal_rollout_is_enabled(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
+    assert auto.status()["ui_visible"] is False
+
+    monkeypatch.setenv(auto.AUTO_UPLOAD_UI_ENV, "1")
+    assert auto.status()["ui_visible"] is True
+
+
+def test_existing_auto_upload_authority_keeps_controls_visible(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+
+    assert auto.status()["ui_visible"] is True
+
+
 @pytest.mark.parametrize("receipt_kind", ["missing", "auto_weekly"])
 def test_enable_requires_a_successful_hosted_manual_receipt_before_network(
     isolated_auto_upload,
