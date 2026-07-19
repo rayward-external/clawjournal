@@ -121,8 +121,30 @@ assert.match(shareIndex, /const approvedSessions = useMemo\(/);
 assert.match(shareIndex, /approvedList=\{approvedSessions\}/);
 
 const apiSource = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8');
-assert.match(apiSource, /redactionReport\(id: string, opts\?: \{ aiPii\?: boolean; signal\?: AbortSignal \}\)/);
-assert.match(apiSource, /signal: opts\?\.signal/);
+assert.match(apiSource, /REDACTION_REPORT_TIMEOUT_MS = 190_000/);
+assert.match(apiSource, /redactionReport\(id: string, opts\?: \{ aiPii\?: boolean; signal\?: AbortSignal; timeoutMs\?: number \}\)/);
+assert.match(apiSource, /signal: controller\.signal/);
+
+const apiOutput = ts.transpileModule(apiSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.ESNext,
+    target: ts.ScriptTarget.ES2022,
+  },
+}).outputText;
+const apiUrl = `data:text/javascript;base64,${Buffer.from(apiOutput).toString('base64')}`;
+const { api, ApiError } = await import(apiUrl);
+const originalFetch = globalThis.fetch;
+globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => {
+  init.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+});
+try {
+  await assert.rejects(
+    api.sessions.redactionReport('wedged-session', { timeoutMs: 5 }),
+    (error) => error instanceof ApiError && error.status === 408,
+  );
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 const packageStep = await readFile(new URL('../src/views/Share/PackageStep.tsx', import.meta.url), 'utf8');
 assert.match(packageStep, /p\.approvedList\.slice\(0, PACKAGE_ANIMATION_TRACE_LIMIT\)\.forEach/);

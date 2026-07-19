@@ -37,6 +37,11 @@ export class ApiError extends Error {
   }
 }
 
+// The server-side AI review is capped at 180 seconds. Keep a slightly wider
+// browser deadline so configured long reviews can finish, while a wedged daemon
+// or dropped response can never leave the Share workflow loading forever.
+export const REDACTION_REPORT_TIMEOUT_MS = 190_000;
+
 declare global {
   interface Window {
     __CLAWJOURNAL_API_TOKEN__?: string;
@@ -112,11 +117,28 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redacted`);
     },
 
-    redactionReport(id: string, opts?: { aiPii?: boolean; signal?: AbortSignal }): Promise<RedactionReport> {
+    async redactionReport(id: string, opts?: { aiPii?: boolean; signal?: AbortSignal; timeoutMs?: number }): Promise<RedactionReport> {
       const q = opts?.aiPii ? '?ai_pii=1' : '';
-      return request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`, {
-        signal: opts?.signal,
-      });
+      const controller = new AbortController();
+      let timedOut = false;
+      const abortFromParent = () => controller.abort(opts?.signal?.reason);
+      if (opts?.signal?.aborted) abortFromParent();
+      else opts?.signal?.addEventListener('abort', abortFromParent, { once: true });
+      const timeout = globalThis.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, opts?.timeoutMs ?? REDACTION_REPORT_TIMEOUT_MS);
+      try {
+        return await request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`, {
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (timedOut) throw new ApiError(408, 'Redaction report timed out');
+        throw error;
+      } finally {
+        globalThis.clearTimeout(timeout);
+        opts?.signal?.removeEventListener('abort', abortFromParent);
+      }
     },
 
     update(id: string, body: { status?: string; notes?: string; reason?: string; ai_quality_score?: number; ai_score_reason?: string; ai_failure_value_score?: number; ai_failure_evidence?: string[]; ai_recovery_labels?: string[]; ai_failure_attribution?: string; ai_failure_modes?: string[]; ai_learning_summary?: string; hold_state?: HoldState; embargo_until?: string | null }): Promise<{ ok: boolean }> {

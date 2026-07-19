@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import type { Session, Share as ShareType } from '../../types.ts';
-import { api } from '../../api.ts';
+import { api, ApiError } from '../../api.ts';
 import { useToast } from '../../components/Toast.tsx';
 import { Spinner } from '../../components/Spinner.tsx';
 import { Stepper } from '../../components/Stepper.tsx';
@@ -486,6 +486,9 @@ export function Share() {
         } catch (e) {
           lastErr = e;
           if (!isActive()) throw e;
+          // A hard request deadline means the daemon or response path is wedged.
+          // Retrying immediately would only double the bounded wait.
+          if (e instanceof ApiError && e.status === 408) break;
           if (attempt < REDACTION_RETRIES) {
             // brief pause to let a flaky CLI/model settle before retrying
             await new Promise((r) => setTimeout(r, 800));
@@ -629,7 +632,8 @@ export function Share() {
       try {
         report = await api.sessions.redactionReport(id, { aiPii: true });
         break;
-      } catch {
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 408) break;
         if (attempt === 0) await new Promise((r) => setTimeout(r, 800));
       }
     }
