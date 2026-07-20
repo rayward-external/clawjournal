@@ -4494,8 +4494,17 @@ def run_server(
     open_browser: bool = True,
     source_filter: str | None = None,
     remote: bool = False,
+    allow_port_fallback: bool = True,
 ) -> None:
-    """Start the workbench daemon — scanner + HTTP server."""
+    """Start the workbench daemon — scanner + HTTP server.
+
+    `allow_port_fallback` keeps the historical behaviour for `clawjournal
+    serve`: if the requested port is taken, quietly bind an ephemeral one. The
+    desktop launcher passes False, because there a busy port almost always
+    means our own daemon already won the race — silently starting a second one
+    would put two scanners on the same SQLite index and strand the browser on
+    a port that won't be there next time.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
@@ -4509,6 +4518,8 @@ def run_server(
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), WorkbenchHandler)
     except OSError:
+        if not allow_port_fallback:
+            raise
         server = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]

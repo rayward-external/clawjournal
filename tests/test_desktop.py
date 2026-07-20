@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import socket
 import subprocess
 from pathlib import Path
 
@@ -334,6 +335,75 @@ def test_launch_reuses_live_workbench(
         ("scan", 9001),
         ("browser", "http://localhost:9001/"),
     ]
+
+
+def test_busy_daemon_is_reused_instead_of_starting_a_second_one(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: liveness was an /api/stats call with a 0.6s timeout, so a
+    daemon busy scanning read as 'not running' and a duplicate was started."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    # Never accepts, exactly like a daemon too busy to answer. The backlog
+    # must exceed the number of probes: each unaccepted connect holds a slot.
+    listener.listen(64)
+    port = listener.getsockname()[1]
+
+    calls: list[object] = []
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": port})
+    monkeypatch.setattr(desktop, "_request_scan", lambda p: calls.append(("scan", p)))
+    monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
+
+    def must_not_run(**kwargs: object) -> None:
+        raise AssertionError("started a second daemon against a live port")
+
+    monkeypatch.setattr("clawjournal.workbench.daemon.run_server", must_not_run)
+    try:
+        assert desktop._workbench_running(port) is True
+        desktop.launch()
+    finally:
+        listener.close()
+
+    assert calls == [("scan", port), ("browser", f"http://localhost:{port}/")]
+    assert desktop._workbench_running(port) is False  # closed again
+
+
+def test_losing_the_startup_race_does_not_spawn_a_duplicate(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two fast clicks: the loser must join the winner, not take a random port."""
+    calls: list[object] = []
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 8384})
+    monkeypatch.setattr(desktop, "_workbench_running", lambda p: False)
+    monkeypatch.setattr(desktop, "_request_scan", lambda p: calls.append(("scan", p)))
+    monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
+    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda *a, **k: None)
+
+    def bind_conflict(**kwargs: object) -> None:
+        assert kwargs["allow_port_fallback"] is False
+        raise OSError(48, "Address already in use")
+
+    monkeypatch.setattr("clawjournal.workbench.daemon.run_server", bind_conflict)
+    desktop.launch()
+
+    assert calls == [("scan", 8384), ("browser", "http://localhost:8384/")]
+
+
+def test_run_server_can_refuse_the_ephemeral_port_fallback() -> None:
+    """`serve` keeps the fallback; the launcher opts out of it."""
+    from clawjournal.workbench import daemon as daemon_mod
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(64)
+    port = listener.getsockname()[1]
+    try:
+        with pytest.raises(OSError):
+            daemon_mod.run_server(
+                port=port, open_browser=False, allow_port_fallback=False
+            )
+    finally:
+        listener.close()
 
 
 def test_status_json_shape(isolated_desktop: Path) -> None:

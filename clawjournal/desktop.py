@@ -955,16 +955,17 @@ def note_opened() -> None:
 
 
 def _workbench_running(port: int) -> bool:
-    token = ensure_api_token(_config_dir())
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/stats",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=0.6) as response:
-            return response.status == 200
-    except (OSError, urllib.error.URLError):
-        return False
+    """Whether anything already holds the workbench port.
+
+    Deliberately a bare TCP connect, not an API call. This used to request
+    `/api/stats` — a real SQL aggregate over the index — with a 0.6s timeout,
+    so a daemon that was merely busy scanning read as "not running" and the
+    launcher started a second one. Liveness here only needs to answer "is the
+    port taken", and `_daemon_port_is_open` already answers exactly that.
+    """
+    from .cli import _daemon_port_is_open
+
+    return _daemon_port_is_open(port)
 
 
 def _request_scan(port: int) -> None:
@@ -1006,7 +1007,14 @@ def launch() -> None:
     from .workbench.daemon import run_server
 
     ensure_pricing_fresh()
-    run_server(port=port, open_browser=True)
+    try:
+        run_server(port=port, open_browser=True, allow_port_fallback=False)
+    except OSError:
+        # Another click won the race between the probe above and the bind.
+        # That process owns the port, so join it instead of quietly starting a
+        # duplicate daemon on an ephemeral port.
+        _request_scan(port)
+        webbrowser.open(url)
 
 
 def _remove_file(path: Path) -> None:
