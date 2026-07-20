@@ -21,11 +21,10 @@ from typing import Any
 # rules — a small ask keeps the distiller focused on the window's strongest lessons.
 MAX_RULES = 5
 
-# INSTALLED-set cap: the durable merged set the user's agents load. Wider than the
-# per-run cap so lessons accumulate across weekly runs instead of churning — a rule
-# only leaves when decayed support ranks it below a newer lesson, not because one
-# run's 5 slots filled up. 10 rules ≈ a screen of text; still reviewable.
-MAX_INSTALLED_RULES = 10
+# INSTALLED-set cap: the active context budget the user's agents load. The local
+# store may retain more historical states (proposed/dropped/rejected), but only the
+# current top five belong in Claude/Codex context.
+MAX_INSTALLED_RULES = 5
 
 VALID_KINDS = ("avoid", "do")
 
