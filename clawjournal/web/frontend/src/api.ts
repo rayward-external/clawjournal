@@ -23,6 +23,10 @@ import type {
   BenchmarkTrend,
   Features,
   WorkbenchConfig,
+  AutoUploadAgent,
+  AutoUploadCandidateReport,
+  AutoUploadHookDiagnostic,
+  AutoUploadStatus,
 } from './types.ts';
 
 const BASE = '/api';
@@ -89,6 +93,101 @@ function qs(params: Record<string, string | number | string[] | number[] | null 
   }
   const s = p.toString();
   return s ? `?${s}` : '';
+}
+
+function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadStatus {
+  const scope = raw.scope ?? { sources: [], projects: [] };
+  const ai = raw.ai ?? { enabled: false, backend: null };
+  const authorization = raw.authorization ?? { version: null, text: null };
+  const retention = raw.retention ?? { version: null, text: null };
+  const eligibility = raw.eligibility ?? {
+    selected_count: 0,
+    eligible_count: 0,
+    exclusion_counts: {},
+  };
+  return {
+    mode: raw.mode === 'enabled' || raw.mode === 'paused' ? raw.mode : 'off',
+    health: raw.health === 'action_required' || raw.health === 'retrying'
+      ? raw.health
+      : 'ready',
+    run_now_allowed: raw.run_now_allowed === true,
+    overlay: raw.overlay === 'running' || raw.overlay === 'revocation_pending'
+      ? raw.overlay
+      : null,
+    pending_submission_state: raw.pending_submission_state === 'sealed'
+      || raw.pending_submission_state === 'submitting'
+      ? raw.pending_submission_state
+      : null,
+    ui_visible: raw.ui_visible === true,
+    offer_available: raw.offer_available === true,
+    scope: {
+      sources: Array.isArray(scope.sources) ? scope.sources : [],
+      projects: Array.isArray(scope.projects) ? scope.projects : [],
+    },
+    cap: typeof raw.cap === 'number' ? raw.cap : 5,
+    cadence_days: typeof raw.cadence_days === 'number' ? raw.cadence_days : 7,
+    ai: {
+      enabled: ai.enabled === true,
+      backend: typeof ai.backend === 'string' ? ai.backend : null,
+    },
+    authorization: {
+      version: typeof authorization.version === 'string' ? authorization.version : null,
+      text: typeof authorization.text === 'string' ? authorization.text : null,
+    },
+    retention: {
+      version: typeof retention.version === 'string' ? retention.version : null,
+      text: typeof retention.text === 'string' ? retention.text : null,
+    },
+    enrolled_at: typeof raw.enrolled_at === 'string' ? raw.enrolled_at : null,
+    next_due_at: typeof raw.next_due_at === 'string' ? raw.next_due_at : null,
+    next_retry_at: typeof raw.next_retry_at === 'string' ? raw.next_retry_at : null,
+    hooks: normalizeAutoUploadHooks(raw.hooks),
+    eligibility: {
+      selected_count: typeof eligibility.selected_count === 'number'
+        ? eligibility.selected_count
+        : 0,
+      eligible_count: typeof eligibility.eligible_count === 'number'
+        ? eligibility.eligible_count
+        : 0,
+      exclusion_counts: eligibility.exclusion_counts ?? {},
+    },
+    last_result: raw.last_result ?? null,
+  };
+}
+
+function normalizeAutoUploadHooks(value: unknown): AutoUploadHookDiagnostic[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => {
+    if (!item || typeof item !== 'object') return [];
+    const hook = item as Record<string, unknown>;
+    if (typeof hook.agent !== 'string' || !hook.agent.trim()) return [];
+    return [{
+      agent: hook.agent,
+      selected: hook.selected === true,
+      configured: hook.configured === true,
+      installed: hook.installed === true,
+      last_observed_at: typeof hook.last_observed_at === 'string'
+        ? hook.last_observed_at
+        : null,
+      ...(typeof hook.diagnostic === 'string' ? { diagnostic: hook.diagnostic } : {}),
+    }];
+  });
+}
+
+function normalizeAutoUploadPreview(
+  raw: Partial<AutoUploadCandidateReport>,
+): AutoUploadCandidateReport {
+  return {
+    eligible: Array.isArray(raw.eligible) ? raw.eligible : [],
+    selected: Array.isArray(raw.selected) ? raw.selected : [],
+    eligible_count: typeof raw.eligible_count === 'number' ? raw.eligible_count : 0,
+    selected_count: typeof raw.selected_count === 'number' ? raw.selected_count : 0,
+    deferred_by_cap: typeof raw.deferred_by_cap === 'number' ? raw.deferred_by_cap : 0,
+    exclusion_counts: raw.exclusion_counts ?? {},
+    exclusions: Array.isArray(raw.exclusions) ? raw.exclusions : [],
+    scope_blockers: Array.isArray(raw.scope_blockers) ? raw.scope_blockers : [],
+    limit: typeof raw.limit === 'number' ? raw.limit : 5,
+  };
 }
 
 export const api = {
@@ -218,6 +317,78 @@ export const api = {
     },
   },
 
+  autoUpload: {
+    async status(): Promise<AutoUploadStatus> {
+      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/status');
+      return normalizeAutoUploadStatus(status);
+    },
+
+    async preview(opts?: { refresh?: boolean }): Promise<AutoUploadCandidateReport> {
+      const report = await request<Partial<AutoUploadCandidateReport>>(
+        '/auto-upload/preview',
+        opts?.refresh
+          ? {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ refresh: true }),
+            }
+          : undefined,
+      );
+      return normalizeAutoUploadPreview(report);
+    },
+
+    async enable(body: {
+      agent: AutoUploadAgent;
+      accepted_authorization_version?: string;
+      accepted_retention_version?: string;
+      accepted_authorization_profile_hash?: string;
+      challenge_only?: boolean;
+    }): Promise<AutoUploadStatus> {
+      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/enable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return normalizeAutoUploadStatus(status);
+    },
+
+    async run(): Promise<AutoUploadStatus> {
+      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      return normalizeAutoUploadStatus(status);
+    },
+
+    async pause(): Promise<AutoUploadStatus> {
+      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/pause', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      return normalizeAutoUploadStatus(status);
+    },
+
+    async resume(): Promise<AutoUploadStatus> {
+      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      return normalizeAutoUploadStatus(status);
+    },
+
+    async disable(): Promise<AutoUploadStatus> {
+      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/disable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      return normalizeAutoUploadStatus(status);
+    },
+  },
+
   dashboard(params: { start?: string; end?: string } = {}): Promise<DashboardData> {
     return request(`/dashboard${qs(params)}`);
   },
@@ -245,7 +416,10 @@ export const api = {
     submit_page_url?: string | null;
     maximum_bundle_size?: number | null;
     accepted_manifest_schema_versions?: string[];
-    supported_institution_email_policy?: { domain_suffixes?: string[] } | null;
+    supported_institution_email_policy?: {
+      domain_suffixes?: string[];
+      explicit_collaborators_supported?: boolean;
+    } | null;
     support_contact?: string | null;
     message?: string;
   }> {

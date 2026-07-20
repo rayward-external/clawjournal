@@ -7,8 +7,9 @@ ClawJournal is designed to be usable without uploading anything.
 - `clawjournal scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` run locally.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
 - `bundle-export` writes files to disk. It does not contact a server.
-- If you never use the workbench Submit step, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
+- If you never use the workbench Submit step, never explicitly enable Automatic uploads, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
 - If you are explicitly enrolled in OpenRefinery Agent Failure Sharing, the optional agent hook only shows a local reminder and can open the existing Share workflow. The hook does not read transcripts, package bundles, or upload data by itself.
+- The separate recurring-upload `SessionStart` hook is inert unless you explicitly accept the current recurring authorization and the local SQLite enrollment remains enabled. It only starts a detached local runner when a cycle is due; it never sends trace content from the hook process.
 
 ## Automatic redaction
 
@@ -51,7 +52,7 @@ That second layer can catch identifying text such as:
 - phone numbers and addresses
 - device names and location-like text
 
-Review is still your responsibility before publishing anything.
+For manual publishing, review is still your responsibility. The separately authorized recurring path below does not show each bundle, so it uses stricter completion, coverage, findings, hold, revision, and exact-artifact gates instead.
 
 ## Mandatory post-redaction scan (TruffleHog)
 
@@ -77,7 +78,7 @@ brew install trufflehog          # macOS
 
 The managed copy is downloaded from TruffleHog's own GitHub release artifacts at your explicit request and is only ever invoked as a subprocess. `clawjournal trufflehog status` shows which binary the gate will use.
 
-For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the final PII pass rewrites the file. Either scan finding something aborts the upload. The final PII pass always runs deterministic rules. If you opt in to AI-assisted review for a bundle, it also reviews sessions in a small bounded worker pool and falls back to deterministic PII rules when an AI backend errors or times out; the manifest records `redaction_summary.pii_review.ai_enabled` plus `redaction_summary.coverage.full` vs. `rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
+For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the final PII pass rewrites the file. Either scan finding something aborts the upload. The final PII pass always runs deterministic rules. If you opt in to AI-assisted review for a bundle, it also reviews sessions in a small bounded worker pool. A manual share records any per-trace rules-only fallback; an automatic share fails closed unless every trace has full coverage from the exact accepted provider. The manifest records this under `redaction_summary.pii_review.coverage.full` and `.rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
 
 One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
 
@@ -102,6 +103,16 @@ Uploading is a separate path from local export.
 - The ingest and hosted-share URLs must use `https://`, except for `localhost` and `127.0.0.1` during local development.
 - Self-hosted ingest upload uses `clawjournal bundle-share <bundle_id>`.
 - You can inspect what would be packaged with `clawjournal share --preview --status approved`.
+
+### Explicitly authorized recurring upload
+
+After a successful hosted manual submission, you may separately authorize automatic sharing for an exact future source/project scope. V1 limits that scope to Claude Code and Codex, whose append-only inputs have strict parsing and content-bound mutation checks; other sources remain manual-share only. This is not a replay of manual-bundle consent: the workbench shows dedicated, versioned recurring authorization and retention text and requires fresh email verification. The server records the verified identity, accepted versions/time, an opaque scope hash, the fixed five-trace cap, and an authorization revision. Raw project names, custom redaction strings, allowlist values, usernames, and local session IDs are not sent as enrollment metadata.
+
+The local client remains the privacy authority. It considers only post-enrollment completed revisions, uses stored scores without invoking a judge, runs strict source refreshes, rechecks holds/revisions/raw-file fingerprints before egress, and seals the exact ZIP for crash recovery. The hosted service hashes the received ZIP, enforces one-to-five sessions, rejects duplicate pseudonymous revision keys, and returns an idempotent receipt.
+
+Recurring credentials are purpose-separated and stored outside `config.json` in a fail-loud current-user-only credential file. The active credential can submit; the recovery credential can only revoke and reconcile receipts. Pause or disable wins before the local `submitting` transition. After that boundary, one already-started request may finish and cannot be recalled. Disabling does not delete earlier hosted submissions.
+
+Claude Code and Codex hooks trigger due checks only when you start an agent session; there is no cron or daemon timer, so a missed week becomes one capped catch-up cycle. **Run now** is an explicit extra cycle, still capped at five, and resets the next due date only after a successful or clean `nothing_new` result.
 
 ### Email verification
 

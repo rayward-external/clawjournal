@@ -337,7 +337,10 @@ def install_profile(
     if source_scope:
         config = config_module.load_config()
         config_module.set_source_scope(config, source_scope)
-        config_module.save_config(config)
+        if config_module.save_config(config) is False:
+            raise OSError(
+                "OpenRefinery source scope could not be saved safely; review automatic-upload status."
+            )
 
     return {
         "profile": PROFILE_NAME,

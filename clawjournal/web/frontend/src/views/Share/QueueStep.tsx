@@ -3,14 +3,16 @@ import { Link } from 'react-router-dom';
 import type { Session, Share as ShareType } from '../../types.ts';
 import { api } from '../../api.ts';
 import { colors } from '../../theme.ts';
+import { ConfirmDialog } from '../../components/ConfirmDialog.tsx';
 import { SessionDrawer } from '../../components/SessionDrawer.tsx';
 import { TraceCard } from '../../components/TraceCard.tsx';
+import { LARGE_BUNDLE_CONFIRM_THRESHOLD } from './types.ts';
 import type { ReadySession, ShareReadyStats } from './types.ts';
 import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip, sessionTotalTokens, sourceFullLabel } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
 
-const QUEUE_PAGE_SIZE = 50;
+const TRACE_RENDER_BATCH = 50;
 
 export interface QueueStepProps {
   stepperHeader: React.ReactNode;
@@ -66,10 +68,12 @@ function UpdatedSinceShareBadge({ session }: { session: ReadySession }) {
 
 export function QueueStep(p: QueueStepProps) {
   const [dragId, setDragId] = useState<string | null>(null);
-  const [visibleQueueCount, setVisibleQueueCount] = useState(QUEUE_PAGE_SIZE);
-  const [visibleAvailableCount, setVisibleAvailableCount] = useState(QUEUE_PAGE_SIZE);
+  const [pickerRenderLimit, setPickerRenderLimit] = useState(TRACE_RENDER_BATCH);
+  const [queueRenderLimit, setQueueRenderLimit] = useState(TRACE_RENDER_BATCH);
+  const [confirmLargeBundle, setConfirmLargeBundle] = useState(false);
 
   const allSessions = p.readyStats?.sessions || [];
+  const selectedIds = new Set(p.queueOrder);
   // `total_approved` counts every approved session; `allSessions` only holds the
   // ones actually eligible to share. When approved > 0 but eligible == 0, the
   // sessions exist but are all held/embargoed/excluded/already-shared — say so
@@ -77,8 +81,6 @@ export function QueueStep(p: QueueStepProps) {
   const totalApproved = p.readyStats?.total_approved ?? 0;
   const totalTokens = p.queuedSessions.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
   const uniqueProjects = [...new Set(p.queuedSessions.map(s => s.project).filter(Boolean))];
-  const visibleQueuedSessions = p.queuedSessions.slice(0, visibleQueueCount);
-  const hiddenQueueCount = p.queuedSessions.length - visibleQueuedSessions.length;
 
   const onDragStart = (e: React.DragEvent, id: string) => {
     setDragId(id);
@@ -92,14 +94,14 @@ export function QueueStep(p: QueueStepProps) {
   };
   const onDragEnd = () => setDragId(null);
 
-  // Add-traces filter list (everything not in queue)
+  // The expanded picker is also the fastest way to trim the default queue, so
+  // keep selected and unselected traces together under the same filters.
   const sources = [...new Set(allSessions.map(s => s.source).filter(Boolean))].sort();
   const projects = [...new Set(allSessions.map(s => s.project).filter(Boolean))].sort();
-  const queuedIds = new Set(p.queueOrder);
   // eslint-disable-next-line react-hooks/purity
   const dateCutoffMs = p.dateFilter ? (Date.now() - ((p.dateFilter === '7d' ? 7 : p.dateFilter === '30d' ? 30 : 90) * 86_400_000)) : null;
 
-  const available = allSessions.filter((s) => !queuedIds.has(s.session_id)).filter(s => {
+  const filteredSessions = allSessions.filter(s => {
     if (p.searchQuery && !(s.display_title || '').toLowerCase().includes(p.searchQuery.toLowerCase())
       && !(s.project || '').toLowerCase().includes(p.searchQuery.toLowerCase())) return false;
     if (p.sourceFilter && s.source !== p.sourceFilter) return false;
@@ -108,13 +110,14 @@ export function QueueStep(p: QueueStepProps) {
     if (dateCutoffMs && (!s.start_time || new Date(s.start_time).getTime() < dateCutoffMs)) return false;
     return true;
   });
-  const visibleAvailable = available.slice(0, visibleAvailableCount);
-  const hiddenAvailableCount = available.length - visibleAvailable.length;
+  const available = filteredSessions.filter((s) => !selectedIds.has(s.session_id));
+  const visiblePickerSessions = filteredSessions.slice(0, pickerRenderLimit);
+  const visibleQueuedSessions = p.queuedSessions.slice(0, queueRenderLimit);
 
   const historyShares = p.shares.filter(b => b.status === 'shared' || b.status === 'exported');
 
   const renderAddTracesPicker = () => (
-    <div style={{
+    <div id="share-trace-picker" style={{
       marginTop: 10, padding: 12,
       background: colors.gray50, border: `1px solid ${colors.gray200}`, borderRadius: 8,
     }}>
@@ -161,16 +164,24 @@ export function QueueStep(p: QueueStepProps) {
         </select>
       </div>
       <div style={{ maxHeight: '36vh', overflowY: 'auto', border: `1px solid ${colors.gray200}`, borderRadius: 6, background: colors.white }}>
-        {available.length === 0 ? (
+        {filteredSessions.length === 0 ? (
           <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
-            {allSessions.length === p.queuedSessions.length ? 'All available traces are already in the queue.' : 'No sessions match your filters.'}
+            No sessions match your filters.
           </div>
-        ) : visibleAvailable.map((s, i) => (
-          <div key={s.session_id} style={{
-            display: 'grid', gridTemplateColumns: '1fr auto', gap: 10,
+        ) : visiblePickerSessions.map((s, i) => (
+          <label key={s.session_id} style={{
+            display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 10,
             alignItems: 'center', padding: '8px 12px',
-            borderBottom: i < visibleAvailable.length - 1 ? `1px solid ${colors.gray100}` : 'none',
+            borderBottom: i < visiblePickerSessions.length - 1 ? `1px solid ${colors.gray100}` : 'none',
+            cursor: 'pointer',
           }}>
+            <input
+              type="checkbox"
+              checked={selectedIds.has(s.session_id)}
+              aria-label={`Include trace: ${s.display_title || 'Untitled'}`}
+              onChange={(e) => e.target.checked ? p.onAdd(s.session_id) : p.onRemove(s.session_id)}
+              style={{ width: 15, height: 15, accentColor: colors.gray900 }}
+            />
             <div style={{ minWidth: 0 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
                 <span style={{
@@ -192,22 +203,26 @@ export function QueueStep(p: QueueStepProps) {
                 </>)}
               </div>
             </div>
-            <button onClick={() => p.onAdd(s.session_id)} style={btnSecondary}>
-              <Icon name="plus" size={12} />
-              Add
-            </button>
-          </div>
+          </label>
         ))}
-      </div>
-      {hiddenAvailableCount > 0 && (
-        <div style={{ display: 'flex', justifyContent: 'center', marginTop: 8 }}>
+        {filteredSessions.length > visiblePickerSessions.length && (
           <button
-            onClick={() => setVisibleAvailableCount((count) => count + QUEUE_PAGE_SIZE)}
-            style={btnSecondary}
+            onClick={() => setPickerRenderLimit((current) => current + TRACE_RENDER_BATCH)}
+            style={{
+              ...btnGhost, width: '100%', justifyContent: 'center', padding: '10px 12px',
+              borderTop: `1px solid ${colors.gray200}`, borderRadius: 0,
+            }}
           >
-            Show {Math.min(QUEUE_PAGE_SIZE, hiddenAvailableCount)} more
-            <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenAvailableCount} remaining)</span>
+            Show {Math.min(TRACE_RENDER_BATCH, filteredSessions.length - visiblePickerSessions.length)} more
+            <span style={{ color: colors.gray400, fontWeight: 400 }}>
+              ({filteredSessions.length - visiblePickerSessions.length} remaining)
+            </span>
           </button>
+        )}
+      </div>
+      {filteredSessions.length > TRACE_RENDER_BATCH && (
+        <div style={{ marginTop: 7, fontSize: 11.5, color: colors.gray500 }}>
+          Showing {visiblePickerSessions.length} of {filteredSessions.length} matching traces. All eligible traces remain selected unless you uncheck them.
         </div>
       )}
     </div>
@@ -326,16 +341,22 @@ export function QueueStep(p: QueueStepProps) {
                 {uniqueProjects.length > 0 && ` · ${uniqueProjects.length} project${uniqueProjects.length !== 1 ? 's' : ''}`}
               </div>
             </div>
-            <span
-              style={{
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-                color: colors.gray500, fontSize: 11.5,
-              }}
-              title="Drag the handle on the left of each row to reorder"
-            >
-              <Icon name="grip" size={12} />
-              Drag to reorder
-            </span>
+            {p.showAddTraces ? (
+              <span style={{ color: colors.gray500, fontSize: 11.5 }}>
+                Use the checkboxes below to deselect traces
+              </span>
+            ) : (
+              <span
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  color: colors.gray500, fontSize: 11.5,
+                }}
+                title="Drag the handle on the left of each row to reorder"
+              >
+                <Icon name="grip" size={12} />
+                Drag to reorder
+              </span>
+            )}
             </div>
             <div style={{
               padding: '7px 14px 10px',
@@ -351,6 +372,7 @@ export function QueueStep(p: QueueStepProps) {
           </div>
 
           {/* Trace list */}
+          {!p.showAddTraces && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 18 }} onDragEnd={onDragEnd}>
             {visibleQueuedSessions.map((s) => {
               const isDragging = dragId === s.session_id;
@@ -453,23 +475,23 @@ export function QueueStep(p: QueueStepProps) {
                 </div>
               );
             })}
-            {hiddenQueueCount > 0 && (
-              <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 4 }}>
-                <button
-                  onClick={() => setVisibleQueueCount((count) => count + QUEUE_PAGE_SIZE)}
-                  style={btnSecondary}
-                >
-                  Show {Math.min(QUEUE_PAGE_SIZE, hiddenQueueCount)} more
-                  <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenQueueCount} remaining)</span>
-                </button>
-              </div>
+            {p.queuedSessions.length > visibleQueuedSessions.length && (
+              <button
+                onClick={() => setQueueRenderLimit((current) => current + TRACE_RENDER_BATCH)}
+                style={{ ...btnSecondary, alignSelf: 'center', marginTop: 4 }}
+              >
+                Show {Math.min(TRACE_RENDER_BATCH, p.queuedSessions.length - visibleQueuedSessions.length)} more selected traces
+              </button>
             )}
           </div>
+          )}
 
           {/* Add more traces */}
           <div style={{ marginBottom: 18 }}>
             <button
               onClick={() => p.setShowAddTraces(!p.showAddTraces)}
+              aria-expanded={p.showAddTraces}
+              aria-controls="share-trace-picker"
               style={{
                 ...btnGhost, color: colors.gray600, fontSize: 13,
                 padding: '6px 10px', border: `1px solid ${colors.gray300}`,
@@ -477,7 +499,7 @@ export function QueueStep(p: QueueStepProps) {
               }}
             >
               <Icon name={p.showAddTraces ? 'chevron' : 'plus'} size={12} />
-              {p.showAddTraces ? 'Hide' : 'Add more traces'}
+              {p.showAddTraces ? 'Hide traces' : 'Add more traces'}
               {!p.showAddTraces && available.length > 0 && (
                 <span style={{ color: colors.gray400, fontWeight: 400, marginLeft: 4 }}>({available.length} available)</span>
               )}
@@ -535,7 +557,13 @@ export function QueueStep(p: QueueStepProps) {
               </div>
               <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
                 <button
-                  onClick={p.onContinue}
+                  onClick={() => {
+                    if (p.queuedSessions.length > LARGE_BUNDLE_CONFIRM_THRESHOLD) {
+                      setConfirmLargeBundle(true);
+                    } else {
+                      p.onContinue();
+                    }
+                  }}
                   disabled={p.queuedSessions.length === 0}
                   style={{ ...btnPrimary, opacity: p.queuedSessions.length === 0 ? 0.4 : 1, cursor: p.queuedSessions.length === 0 ? 'not-allowed' : 'pointer' }}
                 >
@@ -545,6 +573,18 @@ export function QueueStep(p: QueueStepProps) {
               </div>
             </div>
           </div>
+
+          <ConfirmDialog
+            open={confirmLargeBundle}
+            title="Review large bundle?"
+            message={`You selected ${p.queuedSessions.length} traces. Redaction and optional AI-assisted PII review will run for every selected trace. Continue only if you intend to review this full bundle.`}
+            confirmLabel={`Redact ${p.queuedSessions.length} traces`}
+            onConfirm={() => {
+              setConfirmLargeBundle(false);
+              p.onContinue();
+            }}
+            onCancel={() => setConfirmLargeBundle(false)}
+          />
         </>
       )}
 

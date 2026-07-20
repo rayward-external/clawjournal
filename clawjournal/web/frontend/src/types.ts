@@ -224,6 +224,86 @@ export interface WorkbenchConfig {
   scorer_backend_detected: string | null;
 }
 
+export type AutoUploadMode = 'off' | 'enabled' | 'paused';
+export type AutoUploadHealth = 'ready' | 'action_required' | 'retrying';
+export type AutoUploadOverlay = 'running' | 'revocation_pending' | null;
+export type AutoUploadAgent = 'claude' | 'codex' | 'all';
+
+export interface AutoUploadHookDiagnostic {
+  agent: string;
+  selected: boolean;
+  configured: boolean;
+  installed: boolean;
+  last_observed_at: string | null;
+  diagnostic?: string;
+}
+
+export interface AutoUploadCandidateReport {
+  eligible: Array<Record<string, unknown>>;
+  selected: Array<Record<string, unknown>>;
+  eligible_count: number;
+  selected_count: number;
+  deferred_by_cap: number;
+  exclusion_counts: Record<string, number>;
+  exclusions: Array<{ session_id?: string; reason: string }>;
+  scope_blockers: string[];
+  limit: number;
+}
+
+export interface AutoUploadStatus {
+  mode: AutoUploadMode;
+  health: AutoUploadHealth;
+  run_now_allowed: boolean;
+  overlay: AutoUploadOverlay;
+  pending_submission_state: 'sealed' | 'submitting' | null;
+  ui_visible: boolean;
+  offer_available: boolean;
+  scope: {
+    sources: string[];
+    projects: string[];
+  };
+  cap: number;
+  cadence_days: number;
+  ai: {
+    enabled: boolean;
+    backend: string | null;
+  };
+  authorization: {
+    version: string | null;
+    text: string | null;
+  };
+  retention: {
+    version: string | null;
+    text: string | null;
+  };
+  enrolled_at: string | null;
+  next_due_at: string | null;
+  next_retry_at: string | null;
+  hooks: AutoUploadHookDiagnostic[];
+  eligibility: {
+    selected_count: number;
+    eligible_count: number;
+    exclusion_counts: Record<string, number>;
+  };
+  last_result: {
+    code: string;
+    count: number | null;
+    receipt_reference: string | null;
+  } | null;
+}
+
+export interface AutoUploadAuthorizationChallenge {
+  authorization_profile_hash: string;
+  authorization: { version: string; text: string };
+  retention: { version: string; text: string };
+  scope: { sources: string[]; projects: string[] };
+  ai: { enabled: boolean; backend: string | null };
+  cap: number;
+  cadence_days: number;
+  maximum_bundle_size: number;
+  destination_origin: string | null;
+}
+
 export interface Stats {
   total: number;
   by_status: Record<string, number>;

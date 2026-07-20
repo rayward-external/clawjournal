@@ -9,7 +9,7 @@ from copy import deepcopy
 import pytest
 
 from clawjournal.workbench.index import (
-    REVISION_TRACKING_SCHEMA_VERSION,
+    WORKBENCH_SCHEMA_VERSION,
     RevisionConflictError,
     already_shared_revision_blockers,
     compute_content_revision,
@@ -494,7 +494,7 @@ def test_v5_migration_backfills_blob_and_historical_share_baseline(
 
     conn = open_index()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == REVISION_TRACKING_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
         session_revision = conn.execute(
             "SELECT content_revision FROM sessions WHERE session_id = 'trace-1'"
         ).fetchone()[0]

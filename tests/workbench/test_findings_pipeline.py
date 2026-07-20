@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -280,3 +281,36 @@ class TestDrainBackfill:
     def test_empty_when_nothing_flagged(self, conn):
         report = drain_findings_backfill(conn, config={})
         assert report == {"processed": 0, "missing_blob": 0, "errored": 0}
+
+    def test_safe_logging_omits_session_path_exception_and_traceback(
+        self, conn, monkeypatch, caplog
+    ):
+        session = _settled_session("RAW_BACKFILL_SESSION_SENTINEL")
+        session["project"] = "/private/backfill/project-sentinel"
+        upsert_sessions(conn, [session])
+        conn.execute("UPDATE sessions SET findings_backfill_needed = 1")
+        conn.commit()
+
+        def fail_pipeline(*args, **kwargs):
+            assert kwargs["safe_logging"] is True
+            raise RuntimeError(
+                "RAW_BACKFILL_EXCEPTION_SENTINEL /private/backfill/project-sentinel"
+            )
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.findings_pipeline.run_findings_pipeline",
+            fail_pipeline,
+        )
+        caplog.set_level(logging.DEBUG)
+
+        report = drain_findings_backfill(
+            conn, config={}, progress_every=1, safe_logging=True
+        )
+
+        assert report == {"processed": 0, "missing_blob": 0, "errored": 1}
+        assert "backfill_failed" in caplog.text
+        assert "RAW_BACKFILL_SESSION_SENTINEL" not in caplog.text
+        assert "RAW_BACKFILL_EXCEPTION_SENTINEL" not in caplog.text
+        assert "/private/backfill/project-sentinel" not in caplog.text
+        assert "Traceback" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)

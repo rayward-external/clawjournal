@@ -14,6 +14,7 @@ const output = ts.transpileModule(source, {
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(output).toString('base64')}`;
 const {
   MAX_QUEUE_QUERY_LENGTH,
+  isQueueSelectionRestorable,
   queueSelectionFromSearchParams,
   syncQueueSelectionToSearchParams,
 } = await import(moduleUrl);
@@ -96,11 +97,35 @@ assert.deepEqual(queueSelectionFromSearchParams(emptyParams, ids), []);
 
 assert.equal(queueSelectionFromSearchParams(new URLSearchParams(), ids), null);
 
+const lockedParams = new URLSearchParams();
+syncQueueSelectionToSearchParams(lockedParams, explicit, null, storage);
+lockedParams.set('selection', 'locked');
+assert.equal(lockedParams.toString(), `ids=${encodeURIComponent(explicit.join(','))}&selection=locked`);
+assert.equal(isQueueSelectionRestorable(lockedParams, storage), true);
+assert.deepEqual(queueSelectionFromSearchParams(lockedParams, [...ids, 'newly-eligible'], storage), explicit);
+
+const largeLockedParams = new URLSearchParams();
+syncQueueSelectionToSearchParams(
+  largeLockedParams,
+  reordered,
+  null,
+  storage,
+  () => 'large-locked',
+);
+largeLockedParams.set('selection', 'locked');
+assert.equal(largeLockedParams.toString(), 'queue_ref=large-locked&selection=locked');
+assert.equal(isQueueSelectionRestorable(largeLockedParams, storage), true);
+assert.deepEqual(queueSelectionFromSearchParams(largeLockedParams, ids, storage), reordered);
+
+const missingLockedParams = new URLSearchParams('queue_ref=missing&selection=locked');
+assert.equal(isQueueSelectionRestorable(missingLockedParams, storage), false);
+assert.deepEqual(queueSelectionFromSearchParams(missingLockedParams, ids, storage), []);
+
 const queueStep = await readFile(new URL('../src/views/Share/QueueStep.tsx', import.meta.url), 'utf8');
 assert.doesNotMatch(queueStep, /queueOrder\.includes\(/);
-assert.match(queueStep, /queuedIds\.has\(s\.session_id\)/);
-assert.match(queueStep, /p\.queuedSessions\.slice\(0, visibleQueueCount\)/);
-assert.match(queueStep, /available\.slice\(0, visibleAvailableCount\)/);
+assert.match(queueStep, /selectedIds\.has\(s\.session_id\)/);
+assert.match(queueStep, /p\.queuedSessions\.slice\(0, queueRenderLimit\)/);
+assert.match(queueStep, /filteredSessions\.slice\(0, pickerRenderLimit\)/);
 
 const redactStep = await readFile(new URL('../src/views/Share/RedactStep.tsx', import.meta.url), 'utf8');
 assert.match(redactStep, /p\.queuedSessions\.slice\(0, visibleCount\)/);

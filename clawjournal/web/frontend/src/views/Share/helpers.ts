@@ -143,11 +143,105 @@ export function queueFromStats(stats: ShareReadyStats): string[] {
 
   // Start with the server's highest-value recommendations, then include every
   // other eligible trace. Share is opt-out: users remove traces they do not
-  // want in the bundle instead of adding the hidden pool one at a time.
+  // want in the bundle instead of adding a hidden pool one at a time.
   return [...new Set([
     ...recommended,
     ...stats.sessions.map((s) => s.session_id).filter(Boolean),
   ])];
+}
+
+function csvParam(params: URLSearchParams, name: string): string[] | null {
+  if (!params.has(name)) return null;
+  return (params.get(name) || '').split(',').filter(Boolean);
+}
+
+export function queueFromSelectionParams(
+  stats: ShareReadyStats,
+  params: URLSearchParams,
+): string[] {
+  // `ids=` is intentionally meaningful: it represents an explicitly empty
+  // queue and must not fall back to the select-all default on reload.
+  const explicitIds = csvParam(params, 'ids');
+  if (explicitIds !== null) {
+    return sanitizeQueueSelection(stats, explicitIds);
+  }
+
+  const excludedIds = new Set([
+    ...(csvParam(params, 'exclude') || []),
+    ...(csvParam(params, 'exclude_ids') || []),
+  ]);
+  return queueFromStats(stats).filter((id) => !excludedIds.has(id));
+}
+
+export function sanitizeQueueSelection(
+  stats: ShareReadyStats,
+  selection: string[],
+): string[] {
+  const eligibleIds = new Set(queueFromStats(stats));
+  const seen = new Set<string>();
+  return selection.filter((id) => {
+    if (!eligibleIds.has(id) || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+export function hasLockedQueueSelection(params: URLSearchParams): boolean {
+  // A downstream step may only consume an exact, explicitly locked snapshot.
+  // Relative exclusions could silently absorb newly eligible traces after a
+  // reload. Exactly one exact carrier must be present; queue_ref points to a
+  // local-only exact snapshot and is validated by queueState before use.
+  const exactCarrierCount = Number(params.has('ids')) + Number(params.has('queue_ref'));
+  return params.get('selection') === 'locked'
+    && exactCarrierCount === 1
+    && !params.has('exclude')
+    && !params.has('exclude_ids');
+}
+
+export function writeQueueSelectionParams(
+  params: URLSearchParams,
+  stats: ShareReadyStats | null,
+  queueOrder: string[],
+  locked = false,
+): void {
+  // Until readyStats arrives we cannot tell default-all from an explicit
+  // subset, so leave the selection encoding untouched.
+  if (!stats) return;
+
+  if (locked) {
+    // Once Queue is confirmed, materialize the complete ordered set. Never
+    // re-derive a downstream selection from future share-ready responses.
+    params.set('ids', queueOrder.join(','));
+    params.delete('exclude_ids');
+    params.set('selection', 'locked');
+    return;
+  }
+
+  params.delete('selection');
+
+  const defaults = queueFromStats(stats);
+  const selected = new Set(queueOrder);
+  const excluded = defaults.filter((id) => !selected.has(id));
+  const defaultOrderedSubset = defaults.filter((id) => selected.has(id));
+  const sameOrder = defaultOrderedSubset.length === queueOrder.length
+    && defaultOrderedSubset.every((id, index) => id === queueOrder[index]);
+
+  if (sameOrder && excluded.length === 0) {
+    // The common default needs no URL payload at all.
+    params.delete('ids');
+    params.delete('exclude_ids');
+  } else if (queueOrder.length === 0) {
+    params.set('ids', '');
+    params.delete('exclude_ids');
+  } else if (sameOrder && excluded.length < queueOrder.length) {
+    // A small set of user deselections stays compact even for large queues.
+    params.delete('ids');
+    params.set('exclude_ids', excluded.join(','));
+  } else {
+    // Explicit/reordered subsets retain their exact order for deep links.
+    params.set('ids', queueOrder.join(','));
+    params.delete('exclude_ids');
+  }
 }
 
 export function completedKeysForStep(step: StepKey): Set<string> {

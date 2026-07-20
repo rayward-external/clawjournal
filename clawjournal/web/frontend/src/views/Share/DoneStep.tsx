@@ -4,6 +4,7 @@ import type { ShareDestination } from './types.ts';
 import { formatShareDestination } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost } from './styles.tsx';
 import { Icon } from './shared.tsx';
+import { AutoUploadOffer } from '../../components/AutoUploadControls.tsx';
 
 export interface DoneStepProps {
   stepperHeader: React.ReactNode;
@@ -220,6 +221,8 @@ export function DoneStep(p: DoneStepProps) {
             <>Hosted submission is not configured for this install. The redacted zip stays on this computer.</>
           )}
         </div>
+
+        <AutoUploadOffer manualReceiptId={p.receiptId} />
 
         <div style={{
           margin: '20px auto', maxWidth: 480, textAlign: 'left' as const,

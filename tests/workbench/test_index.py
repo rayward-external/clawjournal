@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +86,26 @@ class TestUpsertSessions:
         ]
         new_count = upsert_sessions(index_conn, sessions)
         assert new_count == 2
+
+    @pytest.mark.parametrize(
+        "session_id",
+        ("claude-science:org-1:frame-1", "../outside-the-blob-directory"),
+    )
+    def test_unsafe_session_ids_use_safe_blob_filenames(
+        self, index_conn, tmp_path, session_id
+    ):
+        assert upsert_sessions(index_conn, [_make_session(session_id)]) == 1
+
+        row = index_conn.execute(
+            "SELECT blob_path FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        blob_path = Path(row["blob_path"])
+
+        assert blob_path.parent == tmp_path / "blobs"
+        assert blob_path.name.startswith("session-")
+        assert get_session_detail(index_conn, session_id)["messages"]
+        assert not (tmp_path / "outside-the-blob-directory.json").exists()
 
     @pytest.mark.parametrize("status", ["approved", "blocked"])
     def test_upsert_preserves_review_status(self, index_conn, status):
@@ -1103,6 +1124,83 @@ class TestShares:
         assert stats["recommended_session_ids"] == [
             "s3", "s4", "s5", "s1", "s2", "s6", "s7", "s8", "s9", "s10",
         ]
+
+    def test_share_ready_widened_pool_uses_safe_review_status_allowlist(self, index_conn):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        session_ids = (
+            "new-ok",
+            "shortlisted-ok",
+            "approved-ok",
+            "blocked",
+            "segmented",
+            "held-new",
+            "embargoed-shortlisted",
+            "excluded-approved",
+        )
+        upsert_sessions(index_conn, [
+            _make_session(
+                sid,
+                project=(
+                    "claude:private-repo"
+                    if sid == "excluded-approved"
+                    else "claude:public-repo"
+                ),
+                start_time=now.isoformat(),
+                end_time=(now + timedelta(minutes=10)).isoformat(),
+            )
+            for sid in session_ids
+        ])
+        statuses = {
+            "new-ok": "new",
+            "shortlisted-ok": "shortlisted",
+            "approved-ok": "approved",
+            "blocked": "blocked",
+            "segmented": "segmented",
+            "held-new": "new",
+            "embargoed-shortlisted": "shortlisted",
+            "excluded-approved": "approved",
+        }
+        for sid, status in statuses.items():
+            update_session(
+                index_conn,
+                sid,
+                status=status,
+                ai_quality_score=5,
+                ai_failure_value_score=5,
+            )
+        set_hold_state(
+            index_conn,
+            "held-new",
+            "pending_review",
+            changed_by="user",
+            reason="test",
+        )
+        set_hold_state(
+            index_conn,
+            "embargoed-shortlisted",
+            "embargoed",
+            changed_by="user",
+            reason="test",
+            embargo_until=(now + timedelta(days=30)).isoformat(),
+        )
+
+        stats = get_share_ready_stats(
+            index_conn,
+            include_unapproved=True,
+            excluded_projects=["claude:private-repo"],
+        )
+
+        assert {s["session_id"] for s in stats["sessions"]} == {
+            "new-ok",
+            "shortlisted-ok",
+            "approved-ok",
+        }
+        assert set(stats["recommended_session_ids"]) == {
+            "new-ok",
+            "shortlisted-ok",
+            "approved-ok",
+        }
 
     def test_share_ready_respects_excluded_project_rules(self, index_conn):
         from datetime import datetime, timedelta, timezone

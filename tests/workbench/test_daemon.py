@@ -1,6 +1,7 @@
 """Tests for the workbench daemon HTTP API."""
 
 import json
+import logging
 import os
 import time
 import urllib.error
@@ -20,6 +21,7 @@ from clawjournal.workbench.daemon import (
     run_server,
     _SHARE_COOLDOWN_SECONDS,
     _apply_upload_pii_redactions,
+    _build_share_zip,
     _reload_child_command,
     _missing_ingest_url_error,
     _warn_if_frontend_stale,
@@ -168,6 +170,252 @@ def _delete(port, path, *, skip_auth=False):
     resp = conn.getresponse()
     resp_body = resp.read().decode()
     return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/api/auto-upload/status"),
+        ("get", "/api/auto-upload/preview"),
+        ("post", "/api/auto-upload/preview"),
+        ("post", "/api/auto-upload/enable"),
+        ("post", "/api/auto-upload/run"),
+        ("post", "/api/auto-upload/pause"),
+        ("post", "/api/auto-upload/resume"),
+        ("post", "/api/auto-upload/disable"),
+    ],
+)
+def test_auto_upload_endpoints_require_api_auth(server, method, path):
+    request = _get if method == "get" else _post
+
+    status, body = request(server, path, skip_auth=True)
+
+    assert status == 401
+    assert body == ""
+
+
+def test_auto_upload_status_preview_and_control_routes(server, monkeypatch):
+    from clawjournal import auto_upload
+
+    preview_calls = []
+    pause_calls = []
+    monkeypatch.setattr(
+        auto_upload,
+        "status",
+        lambda: {"ok": True, "mode": "off", "overlay": None},
+    )
+    monkeypatch.setattr(
+        auto_upload,
+        "preview",
+        lambda *, refresh: preview_calls.append(refresh)
+        or {"ok": True, "refresh": refresh},
+    )
+    monkeypatch.setattr(
+        auto_upload,
+        "pause",
+        lambda: pause_calls.append(True) or {"ok": True, "mode": "paused"},
+    )
+
+    status_code, body = _get(server, "/api/auto-upload/status")
+    assert status_code == 200
+    assert body["mode"] == "off"
+
+    status_code, body = _get(server, "/api/auto-upload/preview")
+    assert status_code == 200
+    assert body["refresh"] is False
+
+    status_code, body = _post(server, "/api/auto-upload/preview")
+    assert status_code == 200
+    assert body["refresh"] is True
+
+    status_code, body = _post(server, "/api/auto-upload/pause")
+    assert status_code == 200
+    assert body["mode"] == "paused"
+    assert preview_calls == [False, True]
+    assert pause_calls == [True]
+
+
+def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypatch):
+    from clawjournal import auto_upload
+
+    calls = []
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: calls.append(kwargs)
+        or {"ok": True, "mode": "enabled", "health": "ready"},
+    )
+
+    status_code, body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+        },
+    )
+
+    assert status_code == 200
+    assert body["mode"] == "enabled"
+    assert calls == [
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+            "challenge_only": False,
+        }
+    ]
+
+
+def test_auto_upload_get_status_is_local_only(server, monkeypatch):
+    from clawjournal import auto_upload
+    from clawjournal.workbench import daemon
+
+    def unexpected_network(*args, **kwargs):
+        raise AssertionError("GET status must not invoke network")
+
+    monkeypatch.setattr(auto_upload, "fetch_capabilities", unexpected_network)
+    monkeypatch.setattr(auto_upload, "_load_config_readonly", lambda: {})
+    monkeypatch.setattr(auto_upload, "hook_diagnostics", lambda *args, **kwargs: {})
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", unexpected_network)
+
+    status_code, body = _get(server, "/api/auto-upload/status")
+
+    assert status_code == 200
+    assert body["ok"] is True
+    assert body["mode"] == "off"
+
+
+def test_config_allowlist_does_not_report_success_when_persistence_fails(
+    server, monkeypatch
+):
+    monkeypatch.setattr(
+        "clawjournal.config.load_config", lambda: {"allowlist_entries": []}
+    )
+    monkeypatch.setattr("clawjournal.config.save_config", lambda _config: False)
+
+    status_code, body = _post(
+        server,
+        "/api/allowlist",
+        {"type": "exact", "text": "private value"},
+    )
+
+    assert status_code == 500
+    assert "persistence could not be confirmed" in body["error"]
+
+
+@pytest.mark.parametrize(
+    ("current", "lock_available", "expected_code"),
+    [
+        ({"ok": True, "mode": "off", "overlay": None}, None, "not_enabled"),
+        ({"ok": True, "mode": "paused", "overlay": None}, None, "paused"),
+        (
+            {
+                "ok": True,
+                "mode": "enabled",
+                "health": "action_required",
+                "overlay": None,
+            },
+            None,
+            "action_required",
+        ),
+        ({"ok": True, "mode": "enabled", "overlay": None}, False, "already_running"),
+    ],
+)
+def test_auto_upload_run_rejects_ineligible_state_before_spawning(
+    server, monkeypatch, current, lock_available, expected_code
+):
+    from clawjournal import auto_upload
+    from clawjournal.workbench import daemon
+
+    def unexpected_thread(*args, **kwargs):
+        raise AssertionError("ineligible run must not construct a worker thread")
+
+    def unexpected_cycle(*args, **kwargs):
+        raise AssertionError("ineligible run must not execute a cycle")
+
+    class LockProbe:
+        def __enter__(self):
+            if lock_available is None:
+                raise AssertionError("ineligible run must not probe the runner lock")
+            return lock_available
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(auto_upload, "status", lambda: dict(current))
+    monkeypatch.setattr(auto_upload, "run_cycle", unexpected_cycle)
+    monkeypatch.setattr(
+        auto_upload,
+        "whole_run_lock",
+        lambda *, blocking: LockProbe(),
+    )
+    monkeypatch.setattr(daemon, "_auto_upload_run_thread", None)
+    monkeypatch.setattr(daemon, "threading", SimpleNamespace(Thread=unexpected_thread))
+
+    status_code, body = _post(server, "/api/auto-upload/run")
+
+    assert status_code == 409
+    assert body["ok"] is False
+    assert body["code"] == expected_code
+    assert daemon._auto_upload_run_thread is None
+
+
+def test_auto_upload_run_allows_hook_only_action_with_stale_overlay_if_lock_free(
+    server, monkeypatch
+):
+    from clawjournal import auto_upload
+    from clawjournal.workbench import daemon
+
+    threads = []
+
+    class AvailableLock:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *args):
+            return False
+
+    class DeferredThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = False
+            threads.append(self)
+
+        def is_alive(self):
+            return self.started
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(
+        auto_upload,
+        "status",
+        lambda: {
+            "ok": True,
+            "mode": "enabled",
+            "health": "action_required",
+            "run_now_allowed": True,
+            "overlay": "running",
+        },
+    )
+    monkeypatch.setattr(
+        auto_upload,
+        "whole_run_lock",
+        lambda *, blocking: AvailableLock(),
+    )
+    monkeypatch.setattr(daemon, "_auto_upload_run_thread", None)
+    monkeypatch.setattr(daemon, "threading", SimpleNamespace(Thread=DeferredThread))
+
+    status_code, body = _post(server, "/api/auto-upload/run")
+
+    assert status_code == 200
+    assert body["overlay"] == "running"
+    assert len(threads) == 1
+    assert threads[0].started is True
 
 
 def _seed_timeline(index_setup):
@@ -747,6 +995,298 @@ class TestScanner:
         assert scanner.last_unchanged_count == 2
         assert scanner.last_updated_by_source == {"codex": 1}
         assert scanner.last_unchanged_by_source == {"codex": 2}
+
+    def test_strict_scan_reports_partial_enrolled_source_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [
+                {
+                    "source": "claude",
+                    "dir_name": "PRIVATE_PROJECT_GOOD_SENTINEL",
+                    "locator": None,
+                },
+                {
+                    "source": "claude",
+                    "dir_name": "PRIVATE_PROJECT_BAD_SENTINEL",
+                    "locator": None,
+                },
+                {
+                    "source": "codex",
+                    "dir_name": "UNRELATED_PROJECT_SENTINEL",
+                    "locator": None,
+                },
+            ],
+        )
+        parsed_projects = []
+
+        def parse_project(dir_name, **kwargs):
+            parsed_projects.append(dir_name)
+            logging.getLogger("clawjournal.parsing.parser").warning(
+                "lower parser project=%s", dir_name
+            )
+            if dir_name == "PRIVATE_PROJECT_BAD_SENTINEL":
+                raise RuntimeError(
+                    "PRIVATE_EXCEPTION_SENTINEL /private/project/path"
+                )
+            return []
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.parse_project_sessions", parse_project
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+        caplog.set_level(logging.DEBUG)
+
+        report = Scanner().scan_once_strict(["claude"])
+
+        assert report["ok"] is False
+        assert report["discovered_sources"] == ["claude"]
+        assert report["failures"] == [
+            {"source": "claude", "stage": "parse", "code": "parse_failed"}
+        ]
+        assert parsed_projects == [
+            "PRIVATE_PROJECT_GOOD_SENTINEL",
+            "PRIVATE_PROJECT_BAD_SENTINEL",
+        ]
+        combined = json.dumps(report) + caplog.text
+        assert "PRIVATE_PROJECT" not in combined
+        assert "UNRELATED_PROJECT_SENTINEL" not in combined
+        assert "PRIVATE_EXCEPTION_SENTINEL" not in combined
+        assert "/private/project/path" not in combined
+        assert "Traceback" not in caplog.text
+        assert "parse_failed" in caplog.text
+
+    @pytest.mark.parametrize("source", ["claude", "codex"])
+    def test_strict_scan_rejects_malformed_jsonl_without_partial_upsert(
+        self, tmp_path, monkeypatch, source
+    ):
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+        raw_file = tmp_path / f"{source}-session.jsonl"
+        raw_file.write_text(
+            '{"type":"session_meta","timestamp":"2026-07-15T00:00:00Z"}\n'
+            '{"truncated":',
+            encoding="utf-8",
+        )
+        if source == "claude":
+            project_dir = tmp_path / "claude-project"
+            project_dir.mkdir()
+            raw_file.rename(project_dir / raw_file.name)
+            locator = {
+                "native_project_dir": project_dir,
+                "local_agent_sessions": [],
+            }
+        else:
+            locator = None
+            monkeypatch.setattr(
+                "clawjournal.parsing.parser._get_codex_project_index",
+                lambda: {"test-project": [raw_file]},
+            )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [{
+                "source": source,
+                "dir_name": "test-project",
+                "locator": locator,
+            }],
+        )
+
+        report = Scanner().scan_once_strict([source])
+
+        assert report["ok"] is False
+        assert report["failures"] == [
+            {"source": source, "stage": "parse", "code": "parse_failed"}
+        ]
+        conn = open_index()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        finally:
+            conn.close()
+
+    def test_strict_scan_logs_no_raw_session_or_findings_exception(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [
+                {
+                    "source": "claude",
+                    "dir_name": "RAW_PROJECT_PATH_SENTINEL",
+                    "locator": None,
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.parse_project_sessions",
+            lambda *args, **kwargs: [{
+                "session_id": "RAW_SESSION_ID_SENTINEL",
+                "raw_source_path": "/private/raw/session.jsonl",
+                "_raw_source_fingerprint": (1, 2, 3, 4, "a" * 64),
+            }],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.upsert_sessions",
+            lambda conn, sessions, *, stats: 1,
+        )
+
+        def fail_findings(*args, **kwargs):
+            assert kwargs["safe_logging"] is True
+            logging.getLogger("clawjournal.workbench.findings_pipeline").error(
+                "raw id=%s path=%s",
+                "RAW_SESSION_ID_SENTINEL",
+                "RAW_PROJECT_PATH_SENTINEL",
+            )
+            raise RuntimeError("RAW_FINDINGS_EXCEPTION_SENTINEL")
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.run_findings_pipeline", fail_findings
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+        caplog.set_level(logging.DEBUG)
+
+        report = Scanner().scan_once_strict(["claude"])
+
+        assert report["failures"] == [
+            {"source": "claude", "stage": "findings", "code": "findings_failed"}
+        ]
+        assert "RAW_SESSION_ID_SENTINEL" not in caplog.text
+        assert "RAW_PROJECT_PATH_SENTINEL" not in caplog.text
+        assert "RAW_FINDINGS_EXCEPTION_SENTINEL" not in caplog.text
+        assert "Traceback" not in caplog.text
+        assert "findings_failed" in caplog.text
+
+    def test_strict_scan_backfill_logs_only_bounded_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+
+        def fail_backfill(conn, *, config, safe_logging):
+            assert safe_logging is True
+            try:
+                raise RuntimeError("RAW_BACKFILL_EXCEPTION_SENTINEL")
+            except RuntimeError:
+                logging.getLogger(
+                    "clawjournal.workbench.findings_pipeline"
+                ).exception(
+                    "raw id=%s path=%s",
+                    "RAW_BACKFILL_SESSION_SENTINEL",
+                    "/private/backfill/project",
+                )
+            raise RuntimeError("RAW_OUTER_BACKFILL_SENTINEL")
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.drain_findings_backfill", fail_backfill
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+        caplog.set_level(logging.DEBUG)
+
+        report = Scanner().scan_once_strict(["claude"])
+
+        assert report["ok"] is False
+        assert "backfill_failed" in caplog.text
+        assert "RAW_BACKFILL" not in caplog.text
+        assert "RAW_OUTER_BACKFILL_SENTINEL" not in caplog.text
+        assert "/private/backfill/project" not in caplog.text
+        assert "Traceback" not in caplog.text
+
+
+    def test_transport_zip_omits_local_export_path_but_keeps_disk_manifest(
+        self, tmp_path
+    ):
+        sentinel = "/Users/alice/.clawjournal/shares/private-bundle"
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(
+            json.dumps({
+                "share_id": "share-1",
+                "export_path": sentinel,
+                "session_count": 1,
+            }),
+            encoding="utf-8",
+        )
+        (tmp_path / "sessions.jsonl").write_text("{}\n", encoding="utf-8")
+        (tmp_path / "trufflehog.post-pii.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+        zip_bytes = _build_share_zip(tmp_path)
+
+        with zipfile.ZipFile(BytesIO(zip_bytes)) as archive:
+            transported_bytes = archive.read("manifest.json")
+            transported = json.loads(transported_bytes)
+        assert "export_path" not in transported
+        assert sentinel.encode("utf-8") not in transported_bytes
+        assert (
+            json.loads(manifest_path.read_text(encoding="utf-8"))["export_path"]
+            == sentinel
+        )
+
+    def test_strict_scan_fails_when_enrolled_source_is_not_discovered(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+
+        report = Scanner().scan_once_strict(["codex"])
+
+        assert report["ok"] is False
+        assert report["missing_sources"] == ["codex"]
+        assert report["failures"] == [
+            {
+                "source": "codex",
+                "stage": "discovery",
+                "code": "source_not_discovered",
+            }
+        ]
 
     def test_score_unscored_once_uses_default_agent_scoring(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
@@ -1386,6 +1926,38 @@ class TestShareDestinationAPI:
         assert status == 200
         assert data["configured"] is False
         assert data["share_page_url"] is None
+
+    @pytest.mark.parametrize(
+        "share_url",
+        (
+            "https://data.rayward.ai:not-a-port/share",
+            "https://user:password@data.rayward.ai/share",
+            "https://[invalid/share",
+        ),
+    )
+    def test_malformed_or_credentialed_share_destination_is_disabled(
+        self, monkeypatch, share_url
+    ):
+        from clawjournal.workbench import daemon
+
+        monkeypatch.setattr(daemon, "_HOSTED_SHARE_URL", share_url)
+
+        configured_url, _message = daemon._validated_hosted_share_url()
+
+        assert configured_url is None
+
+    def test_ipv6_loopback_share_destination_is_allowed(self, monkeypatch):
+        from clawjournal.workbench import daemon
+
+        monkeypatch.setattr(
+            daemon,
+            "_HOSTED_SHARE_URL",
+            "http://[::1]:8080/share",
+        )
+
+        share_url, _message = daemon._validated_hosted_share_url()
+
+        assert share_url == "http://[::1]:8080/share"
 
 
 class TestSharesAPI:
@@ -2235,6 +2807,72 @@ class TestSelfHostedRevisionConflicts:
         assert result["status"] == 409
         assert tuple(row) == ("exported", None)
 
+    @pytest.mark.parametrize("mutation", ["hold", "revision", "source"])
+    def test_final_egress_gate_rechecks_mutable_gates(
+        self, index_setup, monkeypatch, mutation
+    ):
+        from clawjournal.workbench import daemon
+
+        conn, share_id = self._share(monkeypatch)
+        original_build = daemon._build_multipart_body
+
+        def build_then_mutate(*args, **kwargs):
+            result = original_build(*args, **kwargs)
+            if mutation == "hold":
+                set_hold_state(
+                    conn,
+                    "sess-0",
+                    "pending_review",
+                    changed_by="test",
+                    reason="inject hold immediately before egress",
+                )
+            elif mutation == "revision":
+                conn.execute(
+                    "UPDATE sessions SET content_revision = ? WHERE session_id = ?",
+                    ("changed-after-review", "sess-0"),
+                )
+                conn.commit()
+            else:
+                conn.execute(
+                    "UPDATE sessions SET source = ? WHERE session_id = ?",
+                    ("codex", "sess-0"),
+                )
+                conn.commit()
+            return result
+
+        monkeypatch.setattr(daemon, "_build_multipart_body", build_then_mutate)
+        egress_calls = 0
+
+        def unexpected_egress(*args, **kwargs):
+            nonlocal egress_calls
+            egress_calls += 1
+            raise AssertionError("self-hosted upload egress must be blocked")
+
+        monkeypatch.setattr(daemon.urllib.request, "urlopen", unexpected_egress)
+        try:
+            result = daemon.upload_share_to_self_hosted_ingest(
+                conn, share_id, source_filter="claude"
+            )
+        finally:
+            conn.close()
+
+        assert result["status"] == 409
+        assert egress_calls == 0
+        if mutation == "hold":
+            assert result["blockers"] == [
+                {
+                    "session_id": "sess-0",
+                    "hold_state": "pending_review",
+                    "embargo_until": None,
+                }
+            ]
+        elif mutation == "revision":
+            assert result["block_reason"] == "revision_conflict"
+            assert result["blocked_sessions"][0]["session_id"] == "sess-0"
+        else:
+            assert result["blockers"][0]["source"] == "codex"
+            assert result["blockers"][0]["allowed_sources"] == "claude"
+
 
 def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
     sessions_file = tmp_path / "sessions.jsonl"
@@ -2266,6 +2904,7 @@ def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
         assert ignore_llm_errors is True
         assert return_coverage is True
         assert timeout_seconds == 23
+        assert _kw.get("backend") == "codex"
         with lock:
             active += 1
             max_active = max(max_active, active)
@@ -2290,11 +2929,16 @@ def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS", "23")
     monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", fake_review)
 
-    summary = _apply_upload_pii_redactions(sessions_file, ai_pii=True)
+    summary = _apply_upload_pii_redactions(
+        sessions_file,
+        ai_pii=True,
+        backend="codex",
+    )
 
     assert summary["workers"] == 4
     assert summary["agent_timeout_seconds"] == 23
     assert summary["ai_enabled"] is True
+    assert summary["backend"] == "codex"
     assert summary["finding_count"] == 4
     assert summary["replacement_count"] == 4
     assert summary["coverage"] == {"full": 4, "rules_only": 0}
@@ -2336,6 +2980,139 @@ def test_upload_pii_redaction_defaults_to_rules_only(tmp_path, monkeypatch):
     assert summary["replacement_count"] == 1
     assert summary["coverage"] == {"full": 0, "rules_only": 1}
     assert "alice@example.com" not in sessions_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("ai_pii", [False, True])
+def test_upload_pii_summary_reports_backend_for_zero_row_export(tmp_path, ai_pii):
+    # An all-excluded share writes an empty sessions.jsonl. Callers read
+    # pii_summary["backend"] unconditionally, so the empty-sessions early
+    # return must include the key or finalize raises KeyError('backend').
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions_file.write_text("", encoding="utf-8")
+
+    summary = _apply_upload_pii_redactions(
+        sessions_file, ai_pii=ai_pii, backend="codex"
+    )
+
+    assert summary["session_count"] == 0
+    assert "backend" in summary
+    assert summary["backend"] is None
+
+
+@pytest.mark.parametrize("raised", ["control_changed", "wrapped_gate_error"])
+def test_finalize_reraises_control_gate_instead_of_swallowing(
+    tmp_path, monkeypatch, raised
+):
+    # A before_ai_call control gate firing during AI-PII review must propagate
+    # as ControlChanged (so the runner records a clean control stop), not be
+    # collapsed into a generic retryable packaging failure by the blanket except.
+    #
+    # The realistic shape is a *bare* ControlChanged: review_session_pii_hybrid
+    # unwraps _AgentCallGateError to its .cause before it can reach finalize, so
+    # _apply_upload_pii_redactions raises ControlChanged, never the wrapper.
+    # (The wrapped case is exercised too, as defense in depth.)
+    from clawjournal.workbench import daemon as daemon_module
+    from clawjournal.redaction.pii import _AgentCallGateError
+    from clawjournal.auto_upload import ControlChanged
+
+    export_dir = tmp_path / "share"
+    export_dir.mkdir()
+    (export_dir / "sessions.jsonl").write_text('{"session_id":"s1"}\n', encoding="utf-8")
+
+    control = ControlChanged("paused mid-review")
+
+    def gate_fires(*_args, **_kwargs):
+        if raised == "control_changed":
+            raise control
+        raise _AgentCallGateError(control)
+
+    monkeypatch.setattr(daemon_module, "_apply_upload_pii_redactions", gate_fires)
+
+    with pytest.raises(ControlChanged):
+        daemon_module.finalize_share_export_for_upload(
+            export_dir,
+            {"redaction_summary": {}},
+            ai_pii=True,
+            ai_backend="codex",
+            before_ai_call=lambda: None,
+        )
+
+
+def test_finalized_ai_manifest_requires_complete_nested_coverage():
+    from clawjournal.workbench.daemon import _manifest_is_finalized_for_upload
+
+    base = {
+        "redaction_summary": {
+            "pii_review": {
+                "session_count": 2,
+                "ai_enabled": True,
+                "backend": "codex",
+                "coverage": {"full": 2, "rules_only": 0},
+            },
+            "trufflehog_post_pii": {
+                "findings": 0,
+                "bypassed": False,
+                "binary_missing": False,
+                "scan_error": None,
+            },
+        }
+    }
+
+    assert _manifest_is_finalized_for_upload(
+        base,
+        ai_pii=True,
+        ai_backend="codex",
+    )
+    partial = json.loads(json.dumps(base))
+    partial["redaction_summary"]["pii_review"]["coverage"] = {
+        "full": 1,
+        "rules_only": 1,
+    }
+    assert not _manifest_is_finalized_for_upload(
+        partial,
+        ai_pii=True,
+        ai_backend="codex",
+    )
+    legacy = json.loads(json.dumps(base))
+    del legacy["redaction_summary"]["pii_review"]["coverage"]
+    assert not _manifest_is_finalized_for_upload(legacy, ai_pii=True)
+
+
+def test_finalize_blocks_rules_only_fallback_when_ai_configured(tmp_path, monkeypatch):
+    from clawjournal.workbench import daemon
+
+    (tmp_path / "sessions.jsonl").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        daemon,
+        "_apply_upload_pii_redactions",
+        lambda *_args, **_kwargs: {
+            "session_count": 1,
+            "finding_count": 0,
+            "replacement_count": 0,
+            "coverage": {"full": 0, "rules_only": 1},
+            "workers": 1,
+            "agent_timeout_seconds": 180,
+            "ai_enabled": True,
+            "backend": "codex",
+        },
+    )
+
+    error, manifest = daemon.finalize_share_export_for_upload(
+        tmp_path,
+        {},
+        ai_pii=True,
+        ai_backend="codex",
+    )
+
+    assert error is not None
+    assert error["block_reason"] == "ai-pii-incomplete"
+    assert manifest["redaction_summary"]["pii_review"]["coverage"] == {
+        "full": 0,
+        "rules_only": 1,
+    }
+    persisted = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert persisted["redaction_summary"]["pii_review"]["backend"] == "codex"
 
 
 class TestVerifyEmailAPI:
@@ -2494,6 +3271,43 @@ class TestVerifyEmailAPI:
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             with pytest.raises(ValueError):
                 request_email_verification("someone@gmail.com")
+
+    def test_request_verification_defers_explicit_collaborator_check_to_host(self, monkeypatch):
+        from clawjournal.workbench.daemon import request_email_verification
+
+        saved = {}
+        capabilities = {
+            "supported_institution_email_policy": {
+                "domain_suffixes": [".edu", "rayward.ai"],
+                "explicit_collaborators_supported": True,
+            },
+        }
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(capabilities=capabilities),
+        ):
+            result = request_email_verification("Collaborator@Gmail.com")
+
+        assert result["verification_id"] == "verify-123"
+        assert saved["pending_verification_email"] == "collaborator@gmail.com"
+
+    @pytest.mark.parametrize("email", ["@gmail.com", "collaborator@", "two@@gmail.com", "first last@gmail.com"])
+    def test_explicit_collaborator_policy_still_rejects_malformed_email(self, email):
+        from clawjournal.workbench.daemon import _email_domain_allowed
+
+        capabilities = {
+            "supported_institution_email_policy": {
+                "domain_suffixes": [".edu"],
+                "explicit_collaborators_supported": True,
+            },
+        }
+
+        assert _email_domain_allowed(email, capabilities) is False
 
     def test_request_verification_clears_stale_token_on_email_switch(self, monkeypatch):
         """Requesting a code for a different email must drop the previously
@@ -2671,6 +3485,86 @@ class TestShareAPI:
         listed = next(share for share in share_list if share["share_id"] == share_id)
         assert listed["hosted_receipt_id"] == "rcpt-test-123"
         assert "gcs_uri" not in listed
+
+    @pytest.mark.parametrize("mutation", ["hold", "revision", "source"])
+    def test_hosted_final_egress_gate_rechecks_mutable_gates(
+        self, monkeypatch, mutation
+    ):
+        from clawjournal.workbench import daemon
+        from clawjournal.workbench.index import create_share
+
+        conn = open_index()
+        set_hold_state(conn, "sess-0", "released", changed_by="user")
+        share_id = create_share(conn, ["sess-0"])
+        monkeypatch.setattr(daemon, "load_config", lambda: _share_config())
+
+        original_build = daemon._build_multipart_body
+
+        def build_then_mutate(*args, **kwargs):
+            result = original_build(*args, **kwargs)
+            if mutation == "hold":
+                set_hold_state(
+                    conn,
+                    "sess-0",
+                    "pending_review",
+                    changed_by="test",
+                    reason="inject hold immediately before egress",
+                )
+            elif mutation == "revision":
+                conn.execute(
+                    "UPDATE sessions SET content_revision = ? WHERE session_id = ?",
+                    ("changed-after-review", "sess-0"),
+                )
+                conn.commit()
+            else:
+                conn.execute(
+                    "UPDATE sessions SET source = ? WHERE session_id = ?",
+                    ("codex", "sess-0"),
+                )
+                conn.commit()
+            return result
+
+        monkeypatch.setattr(daemon, "_build_multipart_body", build_then_mutate)
+        base_urlopen = _mock_urlopen_factory()
+        submission_calls = 0
+
+        def urlopen(req, **kwargs):
+            nonlocal submission_calls
+            if "/api/submissions" in req.full_url:
+                submission_calls += 1
+            return base_urlopen(req, **kwargs)
+
+        monkeypatch.setattr(daemon.urllib.request, "urlopen", urlopen)
+        try:
+            result = daemon.submit_share_to_hosted(
+                conn,
+                share_id,
+                accept_terms=True,
+                ownership_certification=True,
+                consent_version="consent-v1",
+                retention_policy_version="retention-v1",
+                settings={
+                    "custom_strings": [],
+                    "extra_usernames": [],
+                    "excluded_projects": [],
+                    "blocked_domains": [],
+                    "allowlist_entries": [],
+                    "source_filter": "claude",
+                },
+            )
+        finally:
+            conn.close()
+
+        assert result["status"] == 409
+        assert submission_calls == 0
+        if mutation == "hold":
+            assert result["blockers"][0]["hold_state"] == "pending_review"
+        elif mutation == "revision":
+            assert result["block_reason"] == "revision_conflict"
+            assert result["blocked_sessions"][0]["session_id"] == "sess-0"
+        else:
+            assert result["blockers"][0]["source"] == "codex"
+            assert result["blockers"][0]["allowed_sources"] == "claude"
 
     def test_share_success_clears_cached_upload_token(self, server, monkeypatch):
         """Successful upload should clear the cached single-use token."""

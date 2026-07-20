@@ -148,11 +148,41 @@ def _parse_pii_provider_arg(value: str) -> str:
 
 
 def _mask_config_for_display(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a copy of config with redact_strings values masked."""
-    out = dict(config)
-    if out.get("redact_strings"):
-        out["redact_strings"] = [_mask_secret(s) for s in out["redact_strings"]]
-    return out
+    """Return a recursively masked display copy of configuration.
+
+    ``redact_strings`` are themselves sensitive policy values.  In addition,
+    mask secret-bearing keys generically so adding a future token field cannot
+    silently turn ``clawjournal config`` into a credential disclosure path.
+    """
+
+    secret_fragments = (
+        "token",
+        "secret",
+        "credential",
+        "password",
+        "api_key",
+        "access_key",
+        "private_key",
+    )
+
+    def copy_value(value: Any, *, key: str | None = None) -> Any:
+        normalized_key = (key or "").lower()
+        if key == "redact_strings" and isinstance(value, list):
+            return [_mask_secret(str(item)) for item in value]
+        if any(fragment in normalized_key for fragment in secret_fragments):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return _mask_secret(value)
+            return "***"
+        if isinstance(value, Mapping):
+            return {str(child_key): copy_value(child, key=str(child_key))
+                    for child_key, child in value.items()}
+        if isinstance(value, list):
+            return [copy_value(item) for item in value]
+        return value
+
+    return {str(key): copy_value(value, key=str(key)) for key, value in config.items()}
 
 
 def _source_label(source_filter: str) -> str:
@@ -450,7 +480,10 @@ def configure(
             # Re-enabling pops the key rather than storing False, keeping
             # config.json clean (mirrors the scorer_backend "none" pattern).
             config.pop("scoring_warmup_declined", None)
-    save_config(config)
+    if save_config(config) is False:
+        raise RuntimeError(
+            "Config persistence could not be confirmed; review automatic-upload status before retrying."
+        )
     if not quiet:
         print(f"Config saved to {CONFIG_FILE}")
         print(json.dumps(_mask_config_for_display(config), indent=2))
@@ -3937,6 +3970,9 @@ def main() -> None:
     hooks_launch.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     hooks_launch.add_argument("--json", action="store_true", help="Output result as JSON")
 
+    from .cli_auto_upload import add_auto_upload_parser
+    add_auto_upload_parser(sub)
+
     su = sub.add_parser("selfupdate",
                         help="Pull the latest clawjournal from the public repo (manual sync update)")
     su.add_argument("--check", action="store_true",
@@ -4693,6 +4729,11 @@ def main() -> None:
             source_filter=args.source,
             remote=args.remote,
         )
+        return
+
+    if command == "auto-upload":
+        from .cli_auto_upload import run as run_auto_upload
+        run_auto_upload(args)
         return
 
     if command == "scan":
