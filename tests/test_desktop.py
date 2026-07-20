@@ -15,16 +15,13 @@ from clawjournal import desktop
 @pytest.fixture
 def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     home = tmp_path / "home"
-    config = home / ".clawjournal"
-    state = config / "desktop"
     desktop_dir = home / "Desktop"
-    monkeypatch.setattr(desktop, "CONFIG_DIR", config)
-    monkeypatch.setattr(desktop, "STATE_DIR", state)
-    monkeypatch.setattr(desktop, "ICONS_DIR", state / "icons")
-    monkeypatch.setattr(desktop, "STATE_FILE", state / "install.json")
-    monkeypatch.setattr(desktop, "LAST_OPENED_FILE", state / "last_opened")
-    monkeypatch.setattr(desktop, "LOG_FILE", state / "launcher.log")
-    monkeypatch.setattr(desktop, "WINDOWS_BOOTSTRAP", state / "windows-launch.py")
+    # Every desktop path derives from `clawjournal.config.CONFIG_DIR` at call
+    # time, so redirecting that one attribute isolates all of them. The autouse
+    # `tmp_config` fixture in conftest already does this for every test in the
+    # suite; this only repoints it under the fake home so state and shortcut
+    # live together.
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", home / ".clawjournal")
     monkeypatch.setattr(desktop, "_home", lambda: home)
     monkeypatch.setattr(desktop, "_desktop_dir", lambda _platform: desktop_dir)
     monkeypatch.setattr(desktop, "_platform", lambda: "linux")
@@ -52,10 +49,10 @@ def test_days_since_last_opened_uses_calendar_days(
 def test_render_face_writes_standard_icon_formats(isolated_desktop: Path) -> None:
     desktop.render_icon(0)
     desktop.render_icon(10)
-    smile = (desktop.ICONS_DIR / "clawjournal-day-0.png").read_bytes()
-    crying = (desktop.ICONS_DIR / "clawjournal-day-10.png").read_bytes()
-    ico = (desktop.ICONS_DIR / "clawjournal-day-10.ico").read_bytes()
-    icns = (desktop.ICONS_DIR / "clawjournal-day-10.icns").read_bytes()
+    smile = (desktop._icons_dir() / "clawjournal-day-0.png").read_bytes()
+    crying = (desktop._icons_dir() / "clawjournal-day-10.png").read_bytes()
+    ico = (desktop._icons_dir() / "clawjournal-day-10.ico").read_bytes()
+    icns = (desktop._icons_dir() / "clawjournal-day-10.icns").read_bytes()
 
     assert smile.startswith(b"\x89PNG\r\n\x1a\n")
     assert crying.startswith(b"\x89PNG\r\n\x1a\n")
@@ -85,7 +82,7 @@ def test_linux_install_refresh_and_uninstall(isolated_desktop: Path) -> None:
     removed = desktop.uninstall()
     assert removed["removed"] is True
     assert not shortcut.exists()
-    assert not desktop.STATE_DIR.exists()
+    assert not desktop._state_dir().exists()
 
 
 def test_install_removes_managed_previous_shortcut(isolated_desktop: Path) -> None:
@@ -107,7 +104,7 @@ def test_install_removes_managed_previous_shortcut(isolated_desktop: Path) -> No
 
 def test_note_opened_is_noop_until_installed(isolated_desktop: Path) -> None:
     desktop.note_opened()
-    assert not desktop.LAST_OPENED_FILE.exists()
+    assert not desktop._last_opened_file().exists()
 
 
 def test_note_opened_rewrites_only_on_a_new_day(
@@ -183,42 +180,141 @@ def test_windows_shortcut_ownership_is_detected_in_both_encodings(
 
 
 def test_trim_log_keeps_the_recent_tail(isolated_desktop: Path) -> None:
-    desktop.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    desktop._log_file().parent.mkdir(parents=True, exist_ok=True)
     line = "x" * 99 + "\n"
-    desktop.LOG_FILE.write_text(line * 40_000, encoding="utf-8")
-    assert desktop.LOG_FILE.stat().st_size > desktop.LOG_MAX_BYTES
+    desktop._log_file().write_text(line * 40_000, encoding="utf-8")
+    assert desktop._log_file().stat().st_size > desktop.LOG_MAX_BYTES
 
     desktop._trim_log()
 
-    trimmed = desktop.LOG_FILE.read_text(encoding="utf-8")
+    trimmed = desktop._log_file().read_text(encoding="utf-8")
     assert len(trimmed) <= desktop.LOG_MAX_BYTES // 2
     # Whole lines only, and the newest content survives.
     assert trimmed.startswith("x")
     assert trimmed.endswith(line)
 
     desktop._trim_log()  # already small enough: unchanged
-    assert desktop.LOG_FILE.read_text(encoding="utf-8") == trimmed
+    assert desktop._log_file().read_text(encoding="utf-8") == trimmed
 
 
 def test_days_since_last_opened_accepts_a_naive_stamp(isolated_desktop: Path) -> None:
-    desktop.LAST_OPENED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    desktop._last_opened_file().parent.mkdir(parents=True, exist_ok=True)
     naive = dt.datetime.now() - dt.timedelta(days=4)
-    desktop.LAST_OPENED_FILE.write_text(naive.isoformat(timespec="seconds") + "\n", encoding="utf-8")
+    desktop._last_opened_file().write_text(naive.isoformat(timespec="seconds") + "\n", encoding="utf-8")
     assert desktop.days_since_last_opened() == 4
+
+
+def test_desktop_paths_follow_the_patched_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: these paths were module constants bound at import time.
+
+    `tmp_config` in conftest is autouse but only patches
+    `clawjournal.config.CONFIG_DIR`, so anything captured at import escaped it
+    and still pointed at the real ~/.clawjournal. A daemon test that served
+    index.html would then reach `note_opened()` and rewrite the developer's
+    actual desktop shortcut. Deliberately does NOT use `isolated_desktop`.
+    """
+    assert Path.home() not in desktop._state_file().parents
+
+    redirected = tmp_path / "elsewhere"
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", redirected)
+    state = redirected / "desktop"
+    assert desktop._state_dir() == state
+    assert desktop._state_file() == state / "install.json"
+    assert desktop._icons_dir() == state / "icons"
+    assert desktop._last_opened_file() == state / "last_opened"
+    assert desktop._log_file() == state / "launcher.log"
+    assert desktop._windows_bootstrap() == state / "windows-launch.py"
+
+
+def test_refresh_refuses_to_overwrite_a_foreign_file(isolated_desktop: Path) -> None:
+    """Refresh runs unattended daily — it must not clobber a user's file."""
+    shortcut = Path(desktop.install()["shortcut"])
+    shortcut.unlink()
+    shortcut.write_text("[Desktop Entry]\nName=My own launcher\n", encoding="utf-8")
+
+    with pytest.raises(desktop.DesktopError, match="Refusing to replace"):
+        desktop.refresh(quiet=True)
+    assert "My own launcher" in shortcut.read_text(encoding="utf-8")
+
+
+def test_refresh_does_not_resurrect_a_deleted_shortcut(isolated_desktop: Path) -> None:
+    """Deleting the icon must stick, rather than reappearing at the next run."""
+    shortcut = Path(desktop.install()["shortcut"])
+    shortcut.unlink()
+
+    with pytest.raises(desktop.DesktopError, match="is missing"):
+        desktop.refresh(quiet=True)
+    assert not shortcut.exists()
+
+    # note_opened swallows it so the daemon keeps serving pages regardless.
+    desktop._write_last_opened(dt.datetime.now().astimezone() - dt.timedelta(days=3))
+    desktop.note_opened()
+    assert not shortcut.exists()
+
+
+def test_windows_refresh_never_writes_an_unowned_shortcut(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Windows path had no guards at all: it recreated a deleted .lnk at
+    every scheduled run, leaving the user unable to remove the icon."""
+    wrote: list[Path] = []
+    monkeypatch.setattr(desktop, "_write_windows_shortcut", lambda p, i: wrote.append(p))
+    lnk = isolated_desktop / "Desktop" / f"{desktop.SHORTCUT_NAME}.lnk"
+    lnk.parent.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(desktop.DesktopError, match="is missing"):
+        desktop._refresh_windows(lnk, 0)
+    assert wrote == []
+    assert not lnk.exists()
+
+    lnk.write_bytes(b"L\x00\x00\x00" + "C:\\Games\\solitaire.exe".encode("utf-16-le"))
+    with pytest.raises(desktop.DesktopError, match="Refusing to replace"):
+        desktop._refresh_windows(lnk, 0)
+    assert wrote == []
+
+
+def test_macos_install_leaves_nothing_behind_when_it_fails(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial bundle would lack Info.plist and disown itself permanently."""
+    monkeypatch.setattr(desktop, "_platform", lambda: "macos")
+    app = isolated_desktop / "Desktop" / f"{desktop.SHORTCUT_NAME}.app"
+    real_write = desktop._write_bytes
+
+    def fail_on_bundle_icon(path: Path, payload: bytes) -> None:
+        if path.name == "ClawJournal.icns":
+            raise OSError("No space left on device")
+        real_write(path, payload)
+
+    monkeypatch.setattr(desktop, "_write_bytes", fail_on_bundle_icon)
+    with pytest.raises(OSError):
+        desktop.install()
+
+    assert not app.exists()
+    assert list(app.parent.glob(f".{app.name}.*.new")) == []
+
+    # And the failure must not have wedged a later attempt.
+    monkeypatch.setattr(desktop, "_write_bytes", real_write)
+    result = desktop.install()
+    assert Path(result["shortcut"]) == app
+    assert desktop._macos_app_is_managed(app) is True
+    assert (app / "Contents" / "MacOS" / "ClawJournal").exists()
 
 
 def test_launchers_start_outside_home_shadow_package(isolated_desktop: Path) -> None:
     shell_launcher = desktop._shell_launcher(desktop._command("desktop", "launch"), log=True)
     launcher_lines = shell_launcher.splitlines()
-    assert f"cd {desktop.shlex.quote(str(desktop.STATE_DIR))}" in launcher_lines
+    assert f"cd {desktop.shlex.quote(str(desktop._state_dir()))}" in launcher_lines
     assert f"cd {desktop.shlex.quote(str(isolated_desktop))}" not in launcher_lines
 
     desktop._write_windows_bootstrap()
-    bootstrap = desktop.WINDOWS_BOOTSTRAP.read_text(encoding="utf-8")
+    bootstrap = desktop._windows_bootstrap().read_text(encoding="utf-8")
     assert "from clawjournal.cli import main" in bootstrap
     assert "CREATE_NO_WINDOW" in bootstrap
-    assert repr(str(desktop.LOG_FILE)) in bootstrap
-    compile(bootstrap, str(desktop.WINDOWS_BOOTSTRAP), "exec")
+    assert repr(str(desktop._log_file())) in bootstrap
+    compile(bootstrap, str(desktop._windows_bootstrap()), "exec")
 
 
 def test_launch_reuses_live_workbench(
@@ -242,7 +338,7 @@ def test_launch_reuses_live_workbench(
 
 def test_status_json_shape(isolated_desktop: Path) -> None:
     assert desktop.status() == {"installed": False}
-    desktop.STATE_DIR.mkdir(parents=True)
+    desktop._state_dir().mkdir(parents=True)
     shortcut = isolated_desktop / "Desktop" / "ClawJournal.desktop"
     shortcut.parent.mkdir(parents=True)
     shortcut.write_text("managed", encoding="utf-8")

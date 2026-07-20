@@ -30,16 +30,43 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .config import CONFIG_DIR, load_config
+from . import config as _config
+from .config import load_config
 from .paths import atomic_write_text, ensure_api_token
 
 
-STATE_DIR = CONFIG_DIR / "desktop"
-ICONS_DIR = STATE_DIR / "icons"
-STATE_FILE = STATE_DIR / "install.json"
-LAST_OPENED_FILE = STATE_DIR / "last_opened"
-LOG_FILE = STATE_DIR / "launcher.log"
-WINDOWS_BOOTSTRAP = STATE_DIR / "windows-launch.py"
+# Every path below is resolved on each call rather than bound at import time.
+# Binding `CONFIG_DIR` into module constants would pin the real ~/.clawjournal
+# even when a caller (notably the autouse `tmp_config` test fixture) has
+# redirected `clawjournal.config.CONFIG_DIR` elsewhere — which is how a test
+# run would end up rewriting the user's actual shortcut.
+def _config_dir() -> Path:
+    return _config.CONFIG_DIR
+
+
+def _state_dir() -> Path:
+    return _config_dir() / "desktop"
+
+
+def _icons_dir() -> Path:
+    return _state_dir() / "icons"
+
+
+def _state_file() -> Path:
+    return _state_dir() / "install.json"
+
+
+def _last_opened_file() -> Path:
+    return _state_dir() / "last_opened"
+
+
+def _log_file() -> Path:
+    return _state_dir() / "launcher.log"
+
+
+def _windows_bootstrap() -> Path:
+    return _state_dir() / "windows-launch.py"
+
 
 SHORTCUT_NAME = "ClawJournal"
 LINUX_MANAGED_MARKER = "X-ClawJournal-Managed=true"
@@ -102,19 +129,19 @@ def _write_bytes(path: Path, payload: bytes) -> None:
 
 def _read_state() -> dict[str, Any] | None:
     try:
-        value = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        value = json.loads(_state_file().read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
 
 
 def _write_state(state: dict[str, Any]) -> None:
-    atomic_write_text(STATE_FILE, json.dumps(state, indent=2) + "\n", parents=True)
+    atomic_write_text(_state_file(), json.dumps(state, indent=2) + "\n", parents=True)
 
 
 def _write_last_opened(when: dt.datetime | None = None) -> None:
     stamp = (when or _now()).isoformat(timespec="seconds")
-    atomic_write_text(LAST_OPENED_FILE, stamp + "\n", parents=True)
+    atomic_write_text(_last_opened_file(), stamp + "\n", parents=True)
 
 
 def _trim_log() -> None:
@@ -124,13 +151,13 @@ def _trim_log() -> None:
     the daemon an O_APPEND descriptor, which keeps writing to the open inode.
     """
     try:
-        if LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
+        if _log_file().stat().st_size <= LOG_MAX_BYTES:
             return
-        with LOG_FILE.open("rb") as handle:
+        with _log_file().open("rb") as handle:
             handle.seek(-(LOG_MAX_BYTES // 2), os.SEEK_END)
             handle.readline()  # discard the partial line at the seek point
             tail = handle.read()
-        with LOG_FILE.open("wb") as handle:
+        with _log_file().open("wb") as handle:
             handle.write(tail)
     except OSError:
         pass
@@ -142,7 +169,7 @@ def _frontend_available() -> bool:
 
 def _read_last_opened() -> dt.datetime | None:
     try:
-        opened = dt.datetime.fromisoformat(LAST_OPENED_FILE.read_text(encoding="utf-8").strip())
+        opened = dt.datetime.fromisoformat(_last_opened_file().read_text(encoding="utf-8").strip())
     except (FileNotFoundError, OSError, ValueError):
         return None
     return opened if opened.tzinfo else opened.astimezone()
@@ -377,11 +404,11 @@ def _icns_from_png(png: bytes) -> bytes:
 
 def render_icon(day: int) -> None:
     day = max(0, min(MAX_SAD_DAYS, int(day)))
-    ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    _icons_dir().mkdir(parents=True, exist_ok=True)
     png = render_face_png(day)
-    _write_bytes(ICONS_DIR / f"clawjournal-day-{day}.png", png)
-    _write_bytes(ICONS_DIR / f"clawjournal-day-{day}.ico", _ico_from_png(png))
-    _write_bytes(ICONS_DIR / f"clawjournal-day-{day}.icns", _icns_from_png(png))
+    _write_bytes(_icons_dir() / f"clawjournal-day-{day}.png", png)
+    _write_bytes(_icons_dir() / f"clawjournal-day-{day}.ico", _ico_from_png(png))
+    _write_bytes(_icons_dir() / f"clawjournal-day-{day}.icns", _icns_from_png(png))
 
 
 def render_icon_set() -> None:
@@ -445,14 +472,14 @@ def _desktop_dir(platform_name: str) -> Path:
 
 def _write_windows_shortcut(path: Path, icon: Path) -> None:
     _write_windows_bootstrap()
-    args = subprocess.list2cmdline([str(WINDOWS_BOOTSTRAP), "desktop", "launch"])
+    args = subprocess.list2cmdline([str(_windows_bootstrap()), "desktop", "launch"])
     target = _windows_background_python()
     script = "; ".join([
         "$w = New-Object -ComObject WScript.Shell",
         f"$s = $w.CreateShortcut({_powershell_quote(path)})",
         f"$s.TargetPath = {_powershell_quote(target)}",
         f"$s.Arguments = {_powershell_quote(args)}",
-        f"$s.WorkingDirectory = {_powershell_quote(STATE_DIR)}",
+        f"$s.WorkingDirectory = {_powershell_quote(_state_dir())}",
         f"$s.IconLocation = {_powershell_quote(str(icon) + ',0')}",
         "$s.Description = 'Scan sessions and open the local ClawJournal workbench'",
         "$s.WindowStyle = 7",
@@ -493,7 +520,7 @@ def _write_windows_bootstrap() -> None:
         "",
         "    subprocess.Popen = _NoConsolePopen",
         "",
-        f"log_path = Path({str(LOG_FILE)!r})",
+        f"log_path = Path({str(_log_file())!r})",
         "log_path.parent.mkdir(parents=True, exist_ok=True)",
         'with log_path.open("a", encoding="utf-8", buffering=1) as log_stream:',
         "    sys.stdout = log_stream",
@@ -506,7 +533,7 @@ def _write_windows_bootstrap() -> None:
         "        raise",
         "",
     ])
-    atomic_write_text(WINDOWS_BOOTSTRAP, content, parents=True)
+    atomic_write_text(_windows_bootstrap(), content, parents=True)
 
 
 def _notify_windows_shortcut(path: Path) -> None:
@@ -518,8 +545,8 @@ def _notify_windows_shortcut(path: Path) -> None:
 
 def _shell_launcher(command: list[str], *, log: bool) -> str:
     rendered = " ".join(shlex.quote(part) for part in command)
-    suffix = f" >> {shlex.quote(str(LOG_FILE))} 2>&1" if log else ""
-    return f"#!/bin/sh\ncd {shlex.quote(str(STATE_DIR))}\nexec {rendered}{suffix}\n"
+    suffix = f" >> {shlex.quote(str(_log_file()))} 2>&1" if log else ""
+    return f"#!/bin/sh\ncd {shlex.quote(str(_state_dir()))}\nexec {rendered}{suffix}\n"
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -580,7 +607,7 @@ def _windows_shortcut_is_managed(path: Path) -> bool:
         return False
     return any(
         token.encode("ascii") in raw or token.encode("utf-16-le") in raw
-        for token in (WINDOWS_BOOTSTRAP.name, "clawjournal.cli")
+        for token in (_windows_bootstrap().name, "clawjournal.cli")
     )
 
 
@@ -601,11 +628,11 @@ def _install_windows(day: int) -> tuple[Path, str, list[str]]:
     shortcut.parent.mkdir(parents=True, exist_ok=True)
     _ensure_available(shortcut, _windows_shortcut_is_managed)
     # Writes the bootstrap the shortcut and the daily task both point at.
-    _write_windows_shortcut(shortcut, ICONS_DIR / f"clawjournal-day-{day}.ico")
+    _write_windows_shortcut(shortcut, _icons_dir() / f"clawjournal-day-{day}.ico")
     _notify_windows_shortcut(shortcut)
 
     task_parts = [
-        _windows_background_python(), str(WINDOWS_BOOTSTRAP),
+        _windows_background_python(), str(_windows_bootstrap()),
         "desktop", "refresh", "--quiet",
     ]
     task_command = subprocess.list2cmdline(task_parts)
@@ -645,12 +672,7 @@ def _install_windows(day: int) -> tuple[Path, str, list[str]]:
 
 def _install_macos(day: int) -> tuple[Path, str, list[str]]:
     app = _desktop_dir("macos") / f"{SHORTCUT_NAME}.app"
-    info_path = app / "Contents" / "Info.plist"
     _ensure_available(app, _macos_app_is_managed)
-    resources = app / "Contents" / "Resources"
-    executable = app / "Contents" / "MacOS" / "ClawJournal"
-    resources.mkdir(parents=True, exist_ok=True)
-    _write_executable(executable, _shell_launcher(_command("desktop", "launch"), log=True))
     info = {
         "CFBundleDisplayName": SHORTCUT_NAME,
         "CFBundleExecutable": "ClawJournal",
@@ -662,11 +684,31 @@ def _install_macos(day: int) -> tuple[Path, str, list[str]]:
         "CFBundleVersion": "1",
         "LSMinimumSystemVersion": "10.15",
     }
-    _write_bytes(info_path, plistlib.dumps(info))
-    _write_bytes(
-        resources / "ClawJournal.icns",
-        (ICONS_DIR / f"clawjournal-day-{day}.icns").read_bytes(),
-    )
+    # Stage the bundle alongside the target and swap it in only once complete.
+    # Info.plist is the sole proof of ownership, and it is written last: a
+    # failure partway through an in-place build would leave a bundle that
+    # `_macos_app_is_managed` disowns forever, wedging both install and
+    # uninstall with no way out but a manual `rm -rf`.
+    staging = app.with_name(f".{app.name}.{os.getpid()}.new")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        resources = staging / "Contents" / "Resources"
+        resources.mkdir(parents=True, exist_ok=True)
+        _write_executable(
+            staging / "Contents" / "MacOS" / "ClawJournal",
+            _shell_launcher(_command("desktop", "launch"), log=True),
+        )
+        _write_bytes(
+            resources / "ClawJournal.icns",
+            (_icons_dir() / f"clawjournal-day-{day}.icns").read_bytes(),
+        )
+        _write_bytes(staging / "Contents" / "Info.plist", plistlib.dumps(info))
+        if app.exists():
+            shutil.rmtree(app)
+        os.replace(staging, app)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
     agent = _home() / "Library" / "LaunchAgents" / f"{MACOS_LAUNCH_AGENT}.plist"
     agent.parent.mkdir(parents=True, exist_ok=True)
@@ -698,13 +740,13 @@ def _install_linux(day: int) -> tuple[Path, str, list[str]]:
     desktop = _desktop_dir("linux") / f"{SHORTCUT_NAME}.desktop"
     desktop.parent.mkdir(parents=True, exist_ok=True)
     _ensure_available(desktop, _linux_entry_is_managed)
-    launcher = STATE_DIR / "launch"
-    refresher = STATE_DIR / "refresh"
+    launcher = _state_dir() / "launch"
+    refresher = _state_dir() / "refresh"
     _write_executable(launcher, _shell_launcher(_command("desktop", "launch"), log=True))
     _write_executable(refresher, _shell_launcher(_command("desktop", "refresh", "--quiet"), log=False))
     atomic_write_text(
         desktop,
-        _linux_desktop_content(launcher, ICONS_DIR / f"clawjournal-day-{day}.png"),
+        _linux_desktop_content(launcher, _icons_dir() / f"clawjournal-day-{day}.png"),
         parents=True,
     )
     desktop.chmod(0o755)
@@ -767,7 +809,7 @@ def install() -> dict[str, Any]:
             "`--desktop-shortcut` (macOS/Linux) or `-DesktopShortcut` (Windows)."
         )
     previous_state = _read_state()
-    if not LAST_OPENED_FILE.exists():
+    if not _last_opened_file().exists():
         _write_last_opened()
     day = days_since_last_opened()
     render_icon(day)
@@ -820,26 +862,37 @@ def _remove_previous_shortcut(
             shutil.rmtree(previous)
 
 
+def _require_managed(path: Path, is_managed: Callable[[Path], bool], kind: str) -> None:
+    """Gate a refresh on the artifact still being present and still being ours.
+
+    Refresh runs unattended — a daily scheduled task, and the daemon's page
+    handler — so it must never resurrect a shortcut the user deleted, nor
+    overwrite a file they put in its place.
+    """
+    if not path.exists():
+        raise DesktopError(f"Desktop {kind} is missing: {path}")
+    _ensure_available(path, is_managed)
+
+
 def _refresh_windows(shortcut: Path, day: int) -> None:
-    _write_windows_shortcut(shortcut, ICONS_DIR / f"clawjournal-day-{day}.ico")
+    _require_managed(shortcut, _windows_shortcut_is_managed, "shortcut")
+    _write_windows_shortcut(shortcut, _icons_dir() / f"clawjournal-day-{day}.ico")
     _notify_windows_shortcut(shortcut)
 
 
 def _refresh_macos(app: Path, day: int) -> None:
+    _require_managed(app, _macos_app_is_managed, "app")
     icon = app / "Contents" / "Resources" / "ClawJournal.icns"
-    if not app.exists():
-        raise DesktopError(f"Desktop app is missing: {app}")
-    _write_bytes(icon, (ICONS_DIR / f"clawjournal-day-{day}.icns").read_bytes())
+    _write_bytes(icon, (_icons_dir() / f"clawjournal-day-{day}.icns").read_bytes())
     os.utime(app, None)
 
 
 def _refresh_linux(shortcut: Path, day: int) -> None:
-    launcher = STATE_DIR / "launch"
-    if not shortcut.exists():
-        raise DesktopError(f"Desktop shortcut is missing: {shortcut}")
+    _require_managed(shortcut, _linux_entry_is_managed, "shortcut")
+    launcher = _state_dir() / "launch"
     atomic_write_text(
         shortcut,
-        _linux_desktop_content(launcher, ICONS_DIR / f"clawjournal-day-{day}.png"),
+        _linux_desktop_content(launcher, _icons_dir() / f"clawjournal-day-{day}.png"),
         parents=True,
     )
     shortcut.chmod(0o755)
@@ -853,7 +906,7 @@ def refresh(*, quiet: bool = False) -> dict[str, Any]:
     shortcut = Path(str(state.get("shortcut", "")))
     day = days_since_last_opened()
     if not all(
-        (ICONS_DIR / f"clawjournal-day-{day}.{suffix}").exists()
+        (_icons_dir() / f"clawjournal-day-{day}.{suffix}").exists()
         for suffix in ("png", "ico", "icns")
     ):
         render_icon(day)
@@ -902,7 +955,7 @@ def note_opened() -> None:
 
 
 def _workbench_running(port: int) -> bool:
-    token = ensure_api_token(CONFIG_DIR)
+    token = ensure_api_token(_config_dir())
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/stats",
         headers={"Authorization": f"Bearer {token}"},
@@ -915,7 +968,7 @@ def _workbench_running(port: int) -> bool:
 
 
 def _request_scan(port: int) -> None:
-    token = ensure_api_token(CONFIG_DIR)
+    token = ensure_api_token(_config_dir())
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/api/scan",
         data=b"",
@@ -934,8 +987,8 @@ def launch() -> None:
     # by supplying streams before logging and the daemon are initialized.
     _trim_log()
     if sys.stdout is None or sys.stderr is None:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        log_stream = open(LOG_FILE, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
+        _log_file().parent.mkdir(parents=True, exist_ok=True)
+        log_stream = open(_log_file(), "a", encoding="utf-8", buffering=1)  # noqa: SIM115
         if sys.stdout is None:
             sys.stdout = log_stream
         if sys.stderr is None:
@@ -994,10 +1047,10 @@ def uninstall() -> dict[str, Any]:
     else:
         raise DesktopError(f"Unknown desktop integration platform: {platform_name}")
 
-    # STATE_DIR is a fixed child of ~/.clawjournal and contains only artifacts
+    # _state_dir() is a fixed child of ~/.clawjournal and contains only artifacts
     # created by this feature.  Resolve and validate before recursive removal.
-    resolved = STATE_DIR.resolve()
-    if resolved.parent == CONFIG_DIR.resolve() and resolved.name == "desktop":
+    resolved = _state_dir().resolve()
+    if resolved.parent == _config_dir().resolve() and resolved.name == "desktop":
         shutil.rmtree(resolved, ignore_errors=True)
     return {"removed": True, "shortcut": str(shortcut)}
 
