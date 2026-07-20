@@ -1095,9 +1095,11 @@ def _email_domain_allowed(
     capabilities: dict[str, Any] | None = None,
 ) -> bool:
     normalized = _normalize_email(email)
-    if "@" not in normalized:
+    if normalized.count("@") != 1:
         return False
-    domain = normalized.rsplit("@", 1)[1]
+    local_part, domain = normalized.rsplit("@", 1)
+    if not local_part or not domain or any(character.isspace() for character in normalized):
+        return False
     policy = (capabilities or {}).get("supported_institution_email_policy")
     suffixes = _HOSTED_EMAIL_SUFFIXES_DEFAULT
     if isinstance(policy, dict) and isinstance(policy.get("domain_suffixes"), list):
@@ -1109,7 +1111,10 @@ def _email_domain_allowed(
         bare_suffix = normalized_suffix[1:] if normalized_suffix.startswith(".") else normalized_suffix
         if domain == bare_suffix or domain.endswith(f".{bare_suffix}"):
             return True
-    return False
+    return bool(
+        isinstance(policy, dict)
+        and policy.get("explicit_collaborators_supported") is True
+    )
 
 
 def _expiry_timestamp(value: Any) -> float | None:
@@ -1153,11 +1158,18 @@ def _validated_hosted_share_url() -> tuple[str | None, str]:
     """Return a configured hosted share URL, or a user-facing disabled reason."""
     if not _HOSTED_SHARE_URL:
         return None, "Hosted submission is not configured for this install."
-    parsed = urlparse(_HOSTED_SHARE_URL)
-    is_https = parsed.scheme == "https" and bool(parsed.netloc)
+    try:
+        parsed = urlparse(_HOSTED_SHARE_URL)
+        parsed.port
+    except ValueError:
+        return None, "CLAWJOURNAL_SHARE_URL must be a valid HTTPS URL, or localhost."
+    hostname = (parsed.hostname or "").lower()
+    has_credentials = parsed.username is not None or parsed.password is not None
+    is_https = parsed.scheme == "https" and bool(hostname) and not has_credentials
     is_local_dev = (
         parsed.scheme == "http"
-        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        and hostname in {"localhost", "127.0.0.1", "::1"}
+        and not has_credentials
     )
     if is_https or is_local_dev:
         return _HOSTED_SHARE_URL, "Hosted submission is configured for browser zip upload."

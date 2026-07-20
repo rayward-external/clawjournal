@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 
 import pytest
 
@@ -68,6 +67,13 @@ def test_remove_active_token_keeps_only_recovery_authority(isolated_store):
 def test_invalid_origin_and_unknown_fields_fail_loudly(isolated_store):
     with pytest.raises(store.CredentialStoreError, match="exact HTTPS origin"):
         store.write_credentials(_record(api_origin="http://data.rayward.ai/api"))
+    with pytest.raises(store.CredentialStoreError, match="exact HTTPS origin"):
+        store.write_credentials(
+            _record(
+                issuer="https://data.rayward.ai:not-a-port",
+                api_origin="https://data.rayward.ai:not-a-port",
+            )
+        )
     with pytest.raises(store.CredentialStoreError, match="unsupported credential fields"):
         store.write_credentials(_record(manual_upload_token="must-not-be-here"))
     with pytest.raises(store.CredentialStoreError, match="same pinned origin"):
@@ -152,55 +158,31 @@ def test_insecure_existing_file_is_rejected(isolated_store):
         store.load_credentials()
 
 
-def test_windows_acl_passes_target_via_env_not_positional(tmp_path, monkeypatch):
-    # Create the target before patching os.name — patching it to "nt" makes
-    # pathlib build a WindowsPath, which cannot instantiate on POSIX. The nt
-    # branch of _require_private_mode itself constructs no Path, so calling it
-    # directly exercises the ACL invocation safely.
-    target = tmp_path / "credentials;$(whoami)'"
+def test_windows_acl_uses_native_backend(tmp_path, monkeypatch):
+    target = tmp_path / "credentials"
     target.mkdir()
     calls = []
 
-    class _Done:
-        returncode = 0
-
-    def fake_run(argv, **kwargs):
-        calls.append({"argv": list(argv), "env": kwargs.get("env")})
-        return _Done()
-
-    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store, "_set_windows_private_acl", calls.append)
     monkeypatch.setattr(store.os, "name", "nt")
 
     store._require_private_mode(target, 0o700)
 
-    assert len(calls) == 1
-    argv = calls[0]["argv"]
-    # powershell.exe -NoProfile -NonInteractive -Command <script> : the path
-    # must NOT be a trailing positional (that never populates $args).
-    assert argv[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
-    assert len(argv) == 5
-    assert "$env:CLAWJOURNAL_ACL_TARGET" in argv[4]
-    assert "$args" not in argv[4]
-    assert all(str(target) not in arg for arg in argv)
-    assert calls[0]["env"]["CLAWJOURNAL_ACL_TARGET"] == str(target)
+    assert calls == [target]
 
 
-@pytest.mark.parametrize("failure", ("nonzero", "launch-error", "timeout"))
+@pytest.mark.parametrize(
+    "failure",
+    (OSError("API unavailable"), store.CredentialStoreError("invalid ACL")),
+)
 def test_windows_acl_failure_is_fail_closed(tmp_path, monkeypatch, failure):
     target = tmp_path / "credentials"
     target.mkdir()
 
-    class _Failed:
-        returncode = 1
+    def fail(_path):
+        raise failure
 
-    def fake_run(_argv, **_kwargs):
-        if failure == "launch-error":
-            raise OSError("PowerShell unavailable")
-        if failure == "timeout":
-            raise subprocess.TimeoutExpired("powershell.exe", 15)
-        return _Failed()
-
-    monkeypatch.setattr(store.subprocess, "run", fake_run)
+    monkeypatch.setattr(store, "_set_windows_private_acl", fail)
     monkeypatch.setattr(store.os, "name", "nt")
 
     with pytest.raises(

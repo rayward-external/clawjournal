@@ -383,4 +383,44 @@ describe('AuthorizationDialog focus and dismissal', () => {
     fireEvent.click(cancel);
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
+
+  it('ignores a stale challenge response from a prior dialog opening', async () => {
+    const enrolled = status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: { sources: ['claude'], projects: ['project-a'] },
+      authorization: { version: 'recurring-v1', text: 'terms' },
+      hooks: [
+        { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
+      ],
+    });
+    const staleChallenge = deferred<AutoUploadStatus>();
+    const freshChallenge = deferred<AutoUploadStatus>();
+    const staleError = authorizationRequired();
+    const freshError = authorizationRequired();
+    (staleError.body.authorization as Record<string, unknown>).text = 'Stale authorization text';
+    (freshError.body.authorization as Record<string, unknown>).text = 'Fresh authorization text';
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(enrolled);
+    vi.spyOn(api.autoUpload, 'enable')
+      .mockReturnValueOnce(staleChallenge.promise)
+      .mockReturnValueOnce(freshChallenge.promise);
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review scope and terms' }));
+
+    await act(async () => {
+      freshChallenge.reject(freshError);
+      await flushPromises();
+    });
+    expect(await screen.findByText('Fresh authorization text')).toBeInTheDocument();
+
+    await act(async () => {
+      staleChallenge.reject(staleError);
+      await flushPromises();
+    });
+    expect(screen.getByText('Fresh authorization text')).toBeInTheDocument();
+    expect(screen.queryByText('Stale authorization text')).not.toBeInTheDocument();
+  });
 });

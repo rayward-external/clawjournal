@@ -393,7 +393,10 @@ export const api = {
     submit_page_url?: string | null;
     maximum_bundle_size?: number | null;
     accepted_manifest_schema_versions?: string[];
-    supported_institution_email_policy?: { domain_suffixes?: string[] } | null;
+    supported_institution_email_policy?: {
+      domain_suffixes?: string[];
+      explicit_collaborators_supported?: boolean;
+    } | null;
     support_contact?: string | null;
     message?: string;
   }> {
