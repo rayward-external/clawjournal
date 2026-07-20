@@ -5,12 +5,35 @@ from __future__ import annotations
 import datetime as dt
 import json
 import socket
+import struct
 import subprocess
+import zlib
 from pathlib import Path
 
 import pytest
 
 from clawjournal import desktop
+
+
+def _decode_rgba(png: bytes) -> tuple[int, int, bytes]:
+    """Minimal decoder for the 8-bit RGBA, filter-0 PNGs this module writes."""
+    pos, idat, width, height = 8, b"", 0, 0
+    while pos < len(png):
+        length = struct.unpack(">I", png[pos:pos + 4])[0]
+        kind = png[pos + 4:pos + 8]
+        data = png[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height = struct.unpack(">II", data[:8])
+        elif kind == b"IDAT":
+            idat += data
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    pixels = bytearray()
+    for y in range(height):
+        assert raw[y * (stride + 1)] == 0, "only filter type 0 is written"
+        pixels += raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)]
+    return width, height, bytes(pixels)
 
 
 @pytest.fixture
@@ -45,6 +68,53 @@ def test_days_since_last_opened_uses_calendar_days(
 
     desktop._write_last_opened(now - dt.timedelta(days=30))
     assert desktop.days_since_last_opened(now) == 10
+
+
+def test_day_count_survives_a_dst_fall_back(isolated_desktop: Path) -> None:
+    """Same local date either side of a DST shift must still be Day 0.
+
+    Regression: the stored instant was reprojected through *today's* UTC
+    offset, so an open at 00:30 on the fall-back day read as the previous
+    calendar day once the clocks went back that afternoon.
+    """
+    opened = dt.datetime(2026, 11, 1, 0, 30, tzinfo=dt.timezone(dt.timedelta(hours=-4)))
+    afternoon = dt.datetime(2026, 11, 1, 20, 0, tzinfo=dt.timezone(dt.timedelta(hours=-5)))
+    assert opened.date() == afternoon.date()
+
+    desktop._write_last_opened(opened)
+    assert desktop.days_since_last_opened(afternoon) == 0
+    assert desktop.opened_today(afternoon) is True
+
+    # The next local day still advances, spring-forward offset included.
+    next_day = dt.datetime(2026, 11, 2, 9, 0, tzinfo=dt.timezone(dt.timedelta(hours=-5)))
+    assert desktop.days_since_last_opened(next_day) == 1
+    assert desktop.opened_today(next_day) is False
+
+
+def test_png_stores_straight_alpha_not_premultiplied(isolated_desktop: Path) -> None:
+    """Regression: RGB was written premultiplied into a colour-type-6 PNG, so
+    the drop shadow rendered near-black and every edge carried a dark fringe."""
+    shadow = (79, 53, 18, 55)
+    canvas = desktop._Canvas(4, scale=1)
+    canvas.ellipse(2, 2, 2, 2, shadow)
+    width, _, pixels = _decode_rgba(canvas.png())
+    centre = (2 * width + 2) * 4
+    red, green, blue, alpha = pixels[centre:centre + 4]
+
+    assert alpha == shadow[3]
+    # Exactness is limited by 8-bit premultiplied storage at low alpha; the bug
+    # produced (17, 11, 4), which is nowhere near this tolerance.
+    assert abs(red - shadow[0]) <= 3
+    assert abs(green - shadow[1]) <= 3
+    assert abs(blue - shadow[2]) <= 3
+
+    # Strongly-covered edges of the face disk keep the face colour.
+    _, _, face = _decode_rgba(desktop.render_face_png(0))
+    edges = [
+        face[i:i + 4] for i in range(0, len(face), 4) if 200 <= face[i + 3] < 255
+    ]
+    assert edges, "expected antialiased edge pixels"
+    assert min(px[0] for px in edges) > 150  # premultiplied fringing lands near 145
 
 
 def test_render_face_writes_standard_icon_formats(isolated_desktop: Path) -> None:
@@ -196,6 +266,80 @@ def test_trim_log_keeps_the_recent_tail(isolated_desktop: Path) -> None:
 
     desktop._trim_log()  # already small enough: unchanged
     assert desktop._log_file().read_text(encoding="utf-8") == trimmed
+
+
+def test_trim_log_keeps_a_newline_free_log(isolated_desktop: Path) -> None:
+    """Regression: one enormous line had no newline in the kept window, so the
+    seek-to-line-boundary step discarded the entire log."""
+    desktop._log_file().parent.mkdir(parents=True, exist_ok=True)
+    desktop._log_file().write_text("y" * (desktop.LOG_MAX_BYTES * 3), encoding="utf-8")
+
+    desktop._trim_log()
+
+    kept = desktop._log_file().read_text(encoding="utf-8")
+    assert kept, "the whole log was thrown away"
+    assert len(kept) <= desktop.LOG_MAX_BYTES // 2
+    assert set(kept) == {"y"}
+
+
+def test_ico_directory_states_a_non_256_dimension(isolated_desktop: Path) -> None:
+    """0 means 256 in an ICO entry; smaller icons must state their real size."""
+    png = desktop.render_face_png(0, size=64)
+    entry = desktop._ico_from_png(png, size=64)[6:8]
+    assert entry == bytes([64, 64])
+    assert desktop._ico_from_png(png, size=256)[6:8] == bytes([0, 0])
+
+
+def test_desktop_exec_quote_escapes_backslashes_for_both_layers(
+    isolated_desktop: Path,
+) -> None:
+    """Desktop-entry values are unescaped twice, so one backslash needs four."""
+    quoted = desktop._desktop_exec_quote(Path(r"/tmp/od\d/launch"))
+    assert quoted == r'"/tmp/od\\\\d/launch"'
+    # Escapes added for the other special characters must not be re-escaped.
+    assert desktop._desktop_exec_quote(Path('/tmp/a$b`c"d')) == r'"/tmp/a\$b\`c\"d"'
+
+
+def test_malformed_plist_is_not_ours_rather_than_a_crash(
+    isolated_desktop: Path,
+) -> None:
+    """plistlib raises ExpatError (not InvalidFileException) on bad XML."""
+    app = isolated_desktop / "Desktop" / "Foreign.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents" / "Info.plist").write_bytes(
+        b'<?xml version="1.0"?><plist version="1.0"><dict><key>oops'
+    )
+    assert desktop._macos_app_is_managed(app) is False
+
+
+def test_install_cleans_up_a_shortcut_left_in_a_relocated_desktop_dir(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The desktop directory itself moves (OneDrive redirect, xdg change).
+
+    Requiring the same parent orphaned the old icon permanently, since
+    install.json is rewritten to the new path straight afterwards.
+    """
+    old_desktop = isolated_desktop / "Desktop"
+    stale = Path(desktop.install()["shortcut"])
+    assert stale.parent == old_desktop
+
+    relocated = isolated_desktop / "OneDrive" / "Desktop"
+    monkeypatch.setattr(desktop, "_desktop_dir", lambda _platform: relocated)
+    result = desktop.install()
+
+    assert Path(result["shortcut"]).parent == relocated
+    assert not stale.exists(), "old shortcut orphaned in the previous desktop dir"
+
+
+def test_bootstrap_does_not_log_a_traceback_for_a_clean_exit(
+    isolated_desktop: Path,
+) -> None:
+    desktop._write_windows_bootstrap()
+    bootstrap = desktop._windows_bootstrap().read_text(encoding="utf-8")
+    assert "except SystemExit:" in bootstrap
+    assert bootstrap.index("except SystemExit:") < bootstrap.index("except BaseException:")
+    compile(bootstrap, str(desktop._windows_bootstrap()), "exec")
 
 
 def test_days_since_last_opened_accepts_a_naive_stamp(isolated_desktop: Path) -> None:

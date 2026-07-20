@@ -149,16 +149,26 @@ def _trim_log() -> None:
 
     Truncating in place rather than rotating matters: the POSIX launchers hand
     the daemon an O_APPEND descriptor, which keeps writing to the open inode.
+    Anything appended between the read and the rewrite is lost, which is an
+    acceptable trade for a diagnostic log we only touch at launch.
     """
     try:
         if _log_file().stat().st_size <= LOG_MAX_BYTES:
             return
         with _log_file().open("rb") as handle:
             handle.seek(-(LOG_MAX_BYTES // 2), os.SEEK_END)
-            handle.readline()  # discard the partial line at the seek point
-            tail = handle.read()
-        with _log_file().open("wb") as handle:
+            raw = handle.read()
+        # Start at a line boundary, but never at the cost of the whole tail:
+        # a log with no newline in this window is one enormous line, and
+        # dropping through to the first newline would empty the file.
+        newline = raw.find(b"\n")
+        tail = raw[newline + 1:] if newline >= 0 else raw
+        if not tail:
+            tail = raw
+        # r+b rather than wb: never leave the log momentarily zero-length.
+        with _log_file().open("r+b") as handle:
             handle.write(tail)
+            handle.truncate()
     except OSError:
         pass
 
@@ -175,25 +185,24 @@ def _read_last_opened() -> dt.datetime | None:
     return opened if opened.tzinfo else opened.astimezone()
 
 
+# Both helpers compare stored wall-clock dates directly. Reprojecting the
+# stored instant through *today's* UTC offset breaks across a DST boundary:
+# an open at 00:30 on a fall-back day reads as the previous day once the
+# offset shifts that afternoon, flipping the icon to Day 1 on the same day it
+# was used. The stamp already records the local date it was written.
 def days_since_last_opened(now: dt.datetime | None = None) -> int:
     """Return a local-calendar day count, clamped to the icon range."""
-    current = now or _now()
-    if current.tzinfo is None:
-        current = current.astimezone()
     opened = _read_last_opened()
     if opened is None:
         return 0
-    elapsed = (current.date() - opened.astimezone(current.tzinfo).date()).days
+    elapsed = ((now or _now()).date() - opened.date()).days
     return max(0, min(MAX_SAD_DAYS, elapsed))
 
 
 def opened_today(now: dt.datetime | None = None) -> bool:
     """Whether an open is already recorded for the current local calendar day."""
-    current = now or _now()
-    if current.tzinfo is None:
-        current = current.astimezone()
     opened = _read_last_opened()
-    return opened is not None and opened.astimezone(current.tzinfo).date() == current.date()
+    return opened is not None and opened.date() == (now or _now()).date()
 
 
 class _Canvas:
@@ -304,6 +313,20 @@ class _Canvas:
                                 total += self.pixels[src + channel]
                         reduced[dst + channel] = total // samples
 
+        # `_blend` composites in premultiplied space, which is also what makes
+        # the box filter above correct. PNG colour type 6 stores *straight*
+        # alpha, so undo the premultiplication on the way out — otherwise the
+        # translucent drop shadow renders near-black instead of warm brown and
+        # every antialiased edge of the face carries a dark fringe.
+        for i in range(0, len(reduced), 4):
+            alpha = reduced[i + 3]
+            if alpha in (0, 255):
+                continue
+            for channel in range(3):
+                reduced[i + channel] = min(
+                    255, (reduced[i + channel] * 255 + alpha // 2) // alpha
+                )
+
         rows = b"".join(
             b"\x00" + bytes(reduced[y * out_size * 4:(y + 1) * out_size * 4])
             for y in range(out_size)
@@ -391,9 +414,12 @@ def render_face_png(day: int, *, size: int = ICON_SIZE) -> bytes:
     return c.png()
 
 
-def _ico_from_png(png: bytes) -> bytes:
+def _ico_from_png(png: bytes, size: int = ICON_SIZE) -> bytes:
+    # A 0 in the ICO directory's width/height byte means 256; anything smaller
+    # must state its real dimension.
+    dimension = 0 if size >= 256 else size
     header = struct.pack("<HHH", 0, 1, 1)
-    entry = struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png), 22)
+    entry = struct.pack("<BBBBHHII", dimension, dimension, 0, 0, 1, 32, len(png), 22)
     return header + entry + png
 
 
@@ -527,7 +553,12 @@ def _write_windows_bootstrap() -> None:
         "    sys.stderr = log_stream",
         "    try:",
         "        from clawjournal.cli import main",
+        "",
         "        main()",
+        "    except SystemExit:",
+        "        # A chosen exit code, not a crash: propagate it without",
+        "        # filling the log with a traceback for an ordinary failure.",
+        "        raise",
         "    except BaseException:",
         "        traceback.print_exc()",
         "        raise",
@@ -572,9 +603,14 @@ def _linux_desktop_content(launcher: Path, icon: Path) -> str:
 
 
 def _desktop_exec_quote(path: Path) -> str:
-    """Quote one executable path using the Desktop Entry Exec grammar."""
-    value = str(path)
-    for char in ("\\", '"', "`", "$"):
+    """Quote one executable path using the Desktop Entry Exec grammar.
+
+    The value passes through two unescaping layers — the desktop-file format's
+    own, then Exec's quoting — so a literal backslash needs four in the file.
+    Backslashes are escaped first so the escapes added below are not re-escaped.
+    """
+    value = str(path).replace("\\", "\\\\\\\\")
+    for char in ('"', "`", "$"):
         value = value.replace(char, "\\" + char)
     return f'"{value}"'
 
@@ -589,9 +625,13 @@ def _linux_entry_is_managed(path: Path) -> bool:
 def _macos_app_is_managed(path: Path) -> bool:
     try:
         info = plistlib.loads((path / "Contents" / "Info.plist").read_bytes())
-    except (FileNotFoundError, OSError, plistlib.InvalidFileException):
+    except Exception:  # noqa: BLE001
+        # Unreadable or unparseable means "cannot prove it is ours", which is
+        # the safe answer. Deliberately broad: plistlib raises
+        # InvalidFileException for a bad header but ExpatError for malformed
+        # XML, and a foreign bundle must not crash install with a traceback.
         return False
-    return info.get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
+    return isinstance(info, dict) and info.get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
 
 
 def _windows_shortcut_is_managed(path: Path) -> bool:
@@ -838,7 +878,15 @@ def _remove_previous_shortcut(
     current: Path,
     platform_name: str,
 ) -> None:
-    """Remove a renamed shortcut only when our prior state identifies it."""
+    """Remove the shortcut our prior state names, once it has moved.
+
+    Covers a rename (a changed SHORTCUT_NAME) and, more importantly, a move:
+    the desktop directory itself can relocate when OneDrive redirection turns
+    on or `xdg-user-dir DESKTOP` changes. Requiring the same parent left that
+    icon orphaned forever, since install.json is immediately rewritten to the
+    new path and uninstall could no longer find the old one. Every branch below
+    still proves ownership from the artifact before deleting anything.
+    """
     if not previous_state or previous_state.get("platform") != platform_name:
         return
     raw_previous = previous_state.get("shortcut")
@@ -846,10 +894,7 @@ def _remove_previous_shortcut(
         return
     previous = Path(raw_previous)
     same_path = os.path.normcase(os.path.abspath(previous)) == os.path.normcase(os.path.abspath(current))
-    same_parent = os.path.normcase(os.path.abspath(previous.parent)) == os.path.normcase(
-        os.path.abspath(current.parent)
-    )
-    if same_path or not same_parent:
+    if same_path:
         return
     if platform_name == "windows":
         if _windows_shortcut_is_managed(previous):
