@@ -617,20 +617,24 @@ class TestRunDefaultAgentTaskCodex:
         with pytest.raises(RuntimeError, match="Unsupported effort for codex"):
             run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review", effort="max")
 
-    def test_stdin_closed_to_avoid_hang(self, monkeypatch, tmp_path):
-        """codex exec reads stdin in addition to the prompt arg; we must give it
-        EOF (stdin=DEVNULL) or it blocks until timeout in non-interactive contexts."""
+    def test_prompt_is_delivered_via_stdin(self, monkeypatch, tmp_path):
+        """Large prompts must not enter argv and exceed Windows' command limit."""
         _stub_which(monkeypatch)
         captured = {}
+        captured_cmd = []
 
         def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
             captured.update(kw)
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
-        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="review")
-        assert captured.get("stdin") is subprocess.DEVNULL
-        assert "input" not in captured  # cannot pass both
+        prompt = "review" * 10_000
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt=prompt)
+        assert captured_cmd[-1] == "-"
+        assert prompt not in captured_cmd
+        assert captured["input"] == prompt
+        assert "stdin" not in captured
 
     def test_nonzero_exit_raises(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)
@@ -665,19 +669,6 @@ class TestRunDefaultAgentTaskCodex:
         schema_path = tmp_path / "output_schema.json"
         assert schema_path.exists()
         assert json.loads(schema_path.read_text(encoding="utf-8")) == schema
-
-    def test_task_prompt_appended_to_cmd(self, monkeypatch, tmp_path):
-        """Verify task_prompt is the last positional argument for codex exec."""
-        _stub_which(monkeypatch)
-        captured_cmd = []
-
-        def spy_run(cmd, **kw):
-            captured_cmd.extend(cmd)
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
-        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="do stuff")
-        assert captured_cmd[-1] == "do stuff"
 
     def test_uses_resolved_command_path(self, monkeypatch, tmp_path):
         shim = r"C:\Users\me\AppData\Roaming\npm\codex.cmd"

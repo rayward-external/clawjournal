@@ -13,6 +13,7 @@ import pytest
 
 from clawjournal.workbench.index import (
     HOSTED_SUBMISSION_SCHEMA_VERSION,
+    REVISION_TRACKING_SCHEMA_VERSION,
     SESSION_IDENTITY_SCHEMA_VERSION,
     WIDENED_MESSAGE_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
@@ -35,7 +36,8 @@ def _columns(conn, table):
 
 class TestFreshInstall:
     def test_workbench_version_advances_to_widened(self, fresh_db):
-        assert WORKBENCH_SCHEMA_VERSION == HOSTED_SUBMISSION_SCHEMA_VERSION
+        assert WORKBENCH_SCHEMA_VERSION == REVISION_TRACKING_SCHEMA_VERSION
+        assert REVISION_TRACKING_SCHEMA_VERSION > HOSTED_SUBMISSION_SCHEMA_VERSION
         assert HOSTED_SUBMISSION_SCHEMA_VERSION > WIDENED_MESSAGE_SCHEMA_VERSION
         assert WIDENED_MESSAGE_SCHEMA_VERSION > SESSION_IDENTITY_SCHEMA_VERSION
         conn = open_index()
@@ -190,7 +192,7 @@ class TestUpgradeFromV4:
             cols_after = _columns(conn, "shares")
             assert {"hosted_receipt_id", "hosted_status", "hosted_submission_url"}.issubset(cols_after)
             version_after = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version_after == HOSTED_SUBMISSION_SCHEMA_VERSION
+            assert version_after == WORKBENCH_SCHEMA_VERSION
             # Pre-existing rows keep their data; the new columns default to NULL.
             row = conn.execute(
                 "SELECT hosted_receipt_id, hosted_status, hosted_submission_url "
@@ -201,8 +203,8 @@ class TestUpgradeFromV4:
             conn.close()
 
     def test_upgrade_is_idempotent(self, fresh_db):
-        # Open twice from a fresh DB — second open is a no-op for the
-        # hosted-submission migration since user_version already == v5.
+        # Open twice from a fresh DB — the second open is a no-op at the
+        # current workbench schema version.
         conn = open_index()
         version_before = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
@@ -210,7 +212,7 @@ class TestUpgradeFromV4:
         conn = open_index()
         try:
             version_after = conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version_after == version_before == HOSTED_SUBMISSION_SCHEMA_VERSION
+            assert version_after == version_before == WORKBENCH_SCHEMA_VERSION
             cols = _columns(conn, "shares")
             assert {"hosted_receipt_id", "hosted_status", "hosted_submission_url"}.issubset(cols)
         finally:

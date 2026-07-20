@@ -51,6 +51,7 @@ from .findings_pipeline import (
 )
 from .index import (
     add_policy,
+    already_shared_revision_blockers,
     apply_share_redactions,
     build_trufflehog_blocked_sessions,
     create_share,
@@ -70,10 +71,13 @@ from .index import (
     query_sessions,
     query_unscored_sessions,
     release_gate_blockers,
+    RevisionConflictError,
+    revision_review_blockers,
     remove_policy,
     search_fts,
     SCORE_SETTLE_SECONDS,
     session_matches_excluded_projects,
+    share_predecessor_blockers,
     source_scope_blockers,
     update_session,
     upsert_sessions,
@@ -95,6 +99,7 @@ from ..parsing.parser import (
     KIMI_SOURCE,
     OPENCODE_SOURCE,
     OPENCLAW_SOURCE,
+    WORKBUDDY_SOURCE,
     discover_projects,
     parse_project_sessions,
 )
@@ -136,7 +141,7 @@ _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 WORKBENCH_SOURCES = {
     CLAUDE_SOURCE, CLAUDE_SCIENCE_SOURCE, CODEX_SOURCE, OPENCLAW_SOURCE,
     CURSOR_SOURCE, COPILOT_SOURCE, AIDER_SOURCE,
-    GEMINI_SOURCE, OPENCODE_SOURCE, KIMI_SOURCE,
+    GEMINI_SOURCE, OPENCODE_SOURCE, KIMI_SOURCE, WORKBUDDY_SOURCE,
 }
 
 # Path to the built frontend dist directory.
@@ -398,7 +403,7 @@ def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
 
 
 class Scanner:
-    """Periodically scans source directories and indexes new sessions."""
+    """Periodically scans source directories and indexes new or changed sessions."""
 
     def __init__(self, source_filter: str | None = None):
         self.source_filter = source_filter
@@ -406,6 +411,10 @@ class Scanner:
         self._thread: threading.Thread | None = None
         self._last_scan_mtimes: dict[str, float] = {}
         self.last_linked_count = 0
+        self.last_updated_count = 0
+        self.last_unchanged_count = 0
+        self.last_updated_by_source: dict[str, int] = {}
+        self.last_unchanged_by_source: dict[str, int] = {}
         self.last_scored_count = 0
         self._score_thread: threading.Thread | None = None
         self._score_lock = threading.Lock()
@@ -421,7 +430,16 @@ class Scanner:
             self._thread.join(timeout=5)
 
     def scan_once(self) -> dict[str, int]:
-        """Run a single scan pass. Returns {source: new_session_count}."""
+        """Run a scan pass and return ``{source: new_session_count}``.
+
+        The return shape is retained for existing callers. Counts for traces
+        whose content changed (or remained unchanged) are exposed on the
+        ``last_updated_*`` and ``last_unchanged_*`` attributes.
+        """
+        self.last_updated_count = 0
+        self.last_unchanged_count = 0
+        self.last_updated_by_source = {}
+        self.last_unchanged_by_source = {}
         conn = open_index()
         try:
             config = load_config()
@@ -453,8 +471,19 @@ class Scanner:
                         locator=project.get("locator"),
                     )
                     if sessions:
-                        new_count = upsert_sessions(conn, sessions)
+                        upsert_stats: dict[str, int] = {}
+                        new_count = upsert_sessions(conn, sessions, stats=upsert_stats)
                         results[source] = results.get(source, 0) + new_count
+                        updated_count = upsert_stats.get("updated", 0)
+                        unchanged_count = upsert_stats.get("unchanged", 0)
+                        self.last_updated_count += updated_count
+                        self.last_unchanged_count += unchanged_count
+                        self.last_updated_by_source[source] = (
+                            self.last_updated_by_source.get(source, 0) + updated_count
+                        )
+                        self.last_unchanged_by_source[source] = (
+                            self.last_unchanged_by_source.get(source, 0) + unchanged_count
+                        )
                         # Drive each freshly-upserted session through the
                         # findings pipeline. Settle-threshold + revision
                         # check inside the driver keep this cheap on steady
@@ -615,12 +644,19 @@ class Scanner:
                 results = self.scan_once()
                 trigger_scoring_warmup(self)
                 total_new = sum(results.values())
-                if total_new > 0 or self.last_linked_count > 0:
+                if (
+                    total_new > 0
+                    or self.last_updated_count > 0
+                    or self.last_linked_count > 0
+                ):
                     logger.info(
-                        "Indexed %d new sessions, linked %d subagent relationships: %s",
+                        "Indexed %d new sessions, updated %d existing traces, "
+                        "linked %d subagent relationships: new=%s updated=%s",
                         total_new,
+                        self.last_updated_count,
                         self.last_linked_count,
                         results,
+                        self.last_updated_by_source,
                     )
             except Exception:
                 logger.exception("Scanner error")
@@ -1652,6 +1688,13 @@ def _prepare_share_export_for_upload(
     )
     if export_dir is None:
         return None, manifest, {"error": "Failed to prepare upload zip", "status": 500}
+    if manifest.get("block_reason") == "revision_conflict":
+        return export_dir, manifest, {
+            "error": manifest.get("block_message") or "Trace revisions changed after review.",
+            "block_reason": "revision_conflict",
+            "blocked_sessions": manifest.get("blocked_sessions", []),
+            "status": 409,
+        }
 
     # Stamp the redaction-settings fingerprint so a later reuse can detect when
     # the allowlist / custom redactions changed and rebuild instead of shipping
@@ -1726,27 +1769,38 @@ def upload_share_to_self_hosted_ingest(
             "blockers": source_blockers,
             "status": 409,
         }
+    predecessor_blockers = share_predecessor_blockers(conn, share_id)
+    if predecessor_blockers:
+        return {
+            "error": "Share revisions are duplicate or based on a stale predecessor",
+            "blockers": predecessor_blockers,
+            "status": 409,
+        }
 
-    # Re-export to ensure latest field filtering and secret redaction
-    export_dir, manifest = export_share_to_disk(
+    # Reuse the immutable artifact the user reviewed whenever one exists.
+    # Re-exporting live blobs here could silently include appended content that
+    # was never part of the bundle review. On a cache miss the export path
+    # verifies the create-time revision snapshot before reading current blobs.
+    export_dir, manifest, error = _prepare_share_export_for_upload(
         conn,
         share_id,
         share,
-        custom_strings=custom_strings,
-        extra_usernames=extra_usernames,
-        excluded_projects=excluded_projects,
-        blocked_domains=blocked_domains,
-        allowlist_entries=allowlist_entries,
-    )
-    if export_dir is None:
-        return {"error": "Export failed.", "status": 500}
-    error, manifest = finalize_share_export_for_upload(
-        export_dir,
-        manifest,
-        ai_pii=ai_pii_review_enabled,
+        {
+            "custom_strings": custom_strings or [],
+            "extra_usernames": extra_usernames or [],
+            "excluded_projects": excluded_projects or [],
+            "blocked_domains": blocked_domains or [],
+            "allowlist_entries": allowlist_entries or [],
+            "source_filter": source_filter,
+            "ai_pii_review_enabled": ai_pii_review_enabled,
+        },
+        reuse_finalized=True,
+        ai_pii_review_enabled=ai_pii_review_enabled,
     )
     if error:
         return error
+    if export_dir is None:
+        return {"error": "Export failed.", "status": 500}
 
     sessions_file = export_dir / "sessions.jsonl"
     manifest_file = export_dir / "manifest.json"
@@ -1800,14 +1854,28 @@ def upload_share_to_self_hosted_ingest(
         gcs_uri_from_server = upload_result.get("gcs_uri", "")
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
+        error_data: dict[str, Any] = {}
         try:
-            error_data = json.loads(error_body)
+            parsed_error = json.loads(error_body)
+            if isinstance(parsed_error, dict):
+                error_data = parsed_error
             error_msg = error_data.get("error", error_body)
         except json.JSONDecodeError:
             error_msg = error_body
-        if exc.code == 409:
-            gcs_uri_from_server = ""
-        elif exc.code in (400, 401, 403, 429):
+        confirmed_hash = (
+            error_data.get("bundle_hash")
+            or error_data.get("existing_bundle_hash")
+        )
+        if (
+            exc.code == 409
+            and error_data.get("idempotent") is True
+            and confirmed_hash == bundle_hash
+        ):
+            # The service explicitly proved that the same immutable bundle is
+            # already stored. This is a safe retry after an ambiguous client
+            # timeout, not a stale-revision conflict.
+            gcs_uri_from_server = str(error_data.get("gcs_uri") or "")
+        elif exc.code in (400, 401, 403, 409, 429):
             if exc.code in (401, 403):
                 _clear_stored_upload_token()
             return {"error": error_msg, "status": exc.code}
@@ -1936,6 +2004,13 @@ def submit_share_to_hosted(
         return {
             "error": "Share contains sessions that are not released",
             "blockers": blockers,
+            "status": 409,
+        }
+    predecessor_blockers = share_predecessor_blockers(conn, share_id)
+    if predecessor_blockers:
+        return {
+            "error": "Share revisions are duplicate or based on a stale predecessor",
+            "blockers": predecessor_blockers,
             "status": 409,
         }
 
@@ -3037,7 +3112,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     # Use AI-only detection (skip redundant rule-based PII scan
                     # since redact_session() already handles regex patterns)
                     findings = review_session_pii_with_agent(
-                        detail, ignore_errors=False, backend="auto",
+                        detail,
+                        ignore_errors=False,
+                        backend="auto",
+                        timeout_seconds=_upload_pii_timeout_seconds(),
                     )
                     ai_coverage = "full"
                     if findings:
@@ -3424,12 +3502,43 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "blockers": source_blockers,
                 }, 409)
                 return
-            share_id = create_share(
-                conn,
+            review_blockers = revision_review_blockers(conn, session_ids)
+            if review_blockers:
+                _json_response(self, {
+                    "error": "Updated traces require fresh approval before re-upload.",
+                    "blockers": review_blockers,
+                }, 409)
+                return
+            duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
+            if duplicate_blockers:
+                _json_response(self, {
+                    "error": "One or more selected trace revisions were already shared.",
+                    "blockers": duplicate_blockers,
+                }, 409)
+                return
+            current_rows = conn.execute(
+                f"SELECT session_id, content_revision FROM sessions WHERE session_id IN "
+                f"({','.join('?' for _ in session_ids)})",
                 session_ids,
-                note=note,
-                source_filter=settings.get("source_filter"),
-            )
+            ).fetchall()
+            expected_revisions = {
+                row["session_id"]: row["content_revision"] for row in current_rows
+            }
+            try:
+                share_id = create_share(
+                    conn,
+                    session_ids,
+                    note=note,
+                    source_filter=settings.get("source_filter"),
+                    expected_revisions=expected_revisions,
+                )
+            except RevisionConflictError as exc:
+                _json_response(self, {
+                    "error": str(exc),
+                    "block_reason": "revision_conflict",
+                    "blockers": exc.blockers,
+                }, 409)
+                return
             share = get_share(conn, share_id)
             if share is None:
                 _json_response(self, {"error": "Share not found"}, 404)
@@ -3503,6 +3612,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if not session_ids:
             _json_response(self, {"error": "session_ids required"}, 400)
             return
+        expected_revisions = body.get("expected_revisions")
+        if expected_revisions is not None and not isinstance(expected_revisions, dict):
+            _json_response(self, {"error": "expected_revisions must be an object"}, 400)
+            return
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
@@ -3513,12 +3626,35 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "blockers": source_blockers,
                 }, 409)
                 return
-            share_id = create_share(
-                conn, session_ids,
-                attestation=body.get("attestation"),
-                note=body.get("note"),
-                source_filter=settings.get("source_filter"),
-            )
+            review_blockers = revision_review_blockers(conn, session_ids)
+            if review_blockers:
+                _json_response(self, {
+                    "error": "Updated traces require fresh approval before re-upload.",
+                    "blockers": review_blockers,
+                }, 409)
+                return
+            duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
+            if duplicate_blockers:
+                _json_response(self, {
+                    "error": "One or more selected trace revisions were already shared.",
+                    "blockers": duplicate_blockers,
+                }, 409)
+                return
+            try:
+                share_id = create_share(
+                    conn, session_ids,
+                    attestation=body.get("attestation"),
+                    note=body.get("note"),
+                    source_filter=settings.get("source_filter"),
+                    expected_revisions=expected_revisions,
+                )
+            except RevisionConflictError as exc:
+                _json_response(self, {
+                    "error": str(exc),
+                    "block_reason": "revision_conflict",
+                    "blockers": exc.blockers,
+                }, 409)
+                return
             _json_response(self, {"share_id": share_id, "bundle_id": share_id}, 201)
         finally:
             conn.close()
@@ -3661,13 +3797,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
 
             if manifest.get("blocked"):
+                status_code = 409 if manifest.get("block_reason") == "revision_conflict" else 422
                 _json_response(self, {
                     "error": manifest.get("block_message") or "Share blocked by TruffleHog",
                     "block_reason": manifest.get("block_reason"),
                     "export_path": str(export_dir),
                     "blocked_sessions": manifest.get("blocked_sessions", []),
                     "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
-                }, 422)
+                }, status_code)
                 return
 
             _json_response(self, {
@@ -3879,7 +4016,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if scanner:
             results = scanner.scan_once()
             warmup = trigger_scoring_warmup(scanner)
-            payload: dict[str, Any] = {"ok": True, "new_sessions": results}
+            payload: dict[str, Any] = {
+                "ok": True,
+                "new_sessions": results,
+                "updated_sessions": scanner.last_updated_by_source,
+                "unchanged_sessions": scanner.last_unchanged_by_source,
+            }
             payload["scoring_warmup"] = warmup
             if force:
                 from ..config import load_config as _load_config
@@ -4391,8 +4533,10 @@ def run_server(
         trigger_scoring_warmup(scanner)
         total = sum(results.values())
         logger.info(
-            "Initial scan complete: %d sessions indexed, %d subagent relationships linked",
+            "Initial scan complete: %d new sessions indexed, %d existing traces updated, "
+            "%d subagent relationships linked",
             total,
+            scanner.last_updated_count,
             scanner.last_linked_count,
         )
         scanner.start()

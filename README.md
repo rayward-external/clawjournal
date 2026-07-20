@@ -1,6 +1,6 @@
 # ClawJournal
 
-Review and curate your coding-agent session traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline, anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
+Review and curate your coding-agent session traces — 100% locally. ClawJournal scans session logs from Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, WorkBuddy, and Cline, anonymizes secrets and personal information, and gives you a browser workbench to review everything before it ever leaves your machine.
 
 ## Copy-paste prompts
 
@@ -173,7 +173,7 @@ Tell ClawJournal which agents to scan and what to exclude or redact.
 <summary><b>Show shell commands</b></summary>
 
 ```bash
-clawjournal config --source all                   # claude | claude-science | codex | gemini | opencode | openclaw | kimi | custom | all
+clawjournal config --source all                   # claude | claude-science | codex | gemini | opencode | openclaw | kimi | workbuddy | custom | all
 clawjournal list                                  # see discovered projects
 clawjournal config --exclude "project1,project2"  # optional (appends)
 clawjournal config --redact "string1,string2"     # optional custom redactions (appends)
@@ -270,6 +270,8 @@ clawjournal share --interactive --weekly
 ```
 
 It lists shareable traces, prioritizes AI-scored high-failure-value sessions, shows the redacted preview, asks for consent, then uploads when hosted submission is available or saves a ZIP for manual upload. Useful filters: `--all`, `--source codex`, `--source claude`, `--search "text"`, and `--ai-pii-review` for the optional AI PII pass.
+
+**Continuing an already-shared trace is supported.** A later `clawjournal scan` reports the existing trace as updated without creating a duplicate ID. Because the new content has not been reviewed, ClawJournal resets that trace to `new` and clears its old AI score. Approve it again in the Inbox; it will then reappear in Share with an **Updated since last share** label. The next bundle keeps the same trace identity and records which earlier revision it replaces.
 
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
@@ -414,9 +416,26 @@ Each line of the exported JSONL is one session: `session_id`, `project`, `model`
 
 </details>
 
+## WorkBuddy traces
+
+WorkBuddy support is best-effort because Tencent documents log access through the desktop app rather than a stable public trace schema. ClawJournal scans JSON, JSONL, log, and zip files from:
+
+- `~/WorkBuddy/*/.workbuddy/`
+- `~/.clawjournal/workbuddy/`
+- common WorkBuddy support/log folders on macOS and Windows
+
+If automatic discovery does not find sessions, use WorkBuddy's Help menu to open the local log folder or directory, then copy the resulting zip or trace folder into `~/.clawjournal/workbuddy/<project-name>/` and run:
+
+```bash
+clawjournal scan --source workbuddy
+clawjournal list --source workbuddy
+```
+
+On Windows, the import folder is `%USERPROFILE%\.clawjournal\workbuddy\<project-name>\`.
+
 ## Supported agents
 
-Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, and Cline.
+Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, WorkBuddy, and Cline.
 
 ## Project docs
 

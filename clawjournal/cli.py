@@ -34,6 +34,8 @@ from .parsing.parser import (
     LOCAL_AGENT_DIR,
     OPENCODE_DIR,
     OPENCLAW_DIR,
+    WORKBUDDY_DIR,
+    WORKBUDDY_IMPORT_DIR,
     discover_projects,
     parse_project_sessions,
 )
@@ -76,18 +78,18 @@ EXPORT_REVIEW_PUBLISH_STEPS = [
 
 SETUP_TO_PUBLISH_STEPS = [
     "Step 1/5: Run prep/list to review project scope: clawjournal prep && clawjournal list",
-    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|claude-science|codex|gemini|all>",
+    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>",
     "Step 3/5: Configure exclusions/redactions and confirm projects: clawjournal config ...",
     "Step 4/5: Export locally: clawjournal export --output /tmp/clawjournal_export.jsonl",
     "Step 5/5: Review and confirm: clawjournal confirm ...",
 ]
 
-EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"}
-SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "all", "both"]
-WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "gemini", "kimi"]
+EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"}
+SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"]
+WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "gemini", "kimi"]
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
-FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SCORE_SOURCE_CHOICES = set(WORKBENCH_SOURCE_CHOICES) | {"failure-corpus", "failure-v1", "all", "auto", "both"}
 
 
@@ -117,7 +119,7 @@ def _normalize_score_source_filter(raw: str | None) -> str | list[str] | None:
     if value == "both":
         print(
             "Warning: --source both is deprecated for scoring; use "
-            "--source failure-corpus or --source claude,claude-science,codex,opencode,openclaw.",
+            "--source failure-corpus or --source claude,claude-science,codex,opencode,openclaw,workbuddy.",
             file=sys.stderr,
         )
         return ["claude", "codex"]
@@ -177,9 +179,11 @@ def _source_label(source_filter: str) -> str:
         return "Copilot CLI"
     if source_filter == "aider":
         return "Aider"
+    if source_filter == "workbuddy":
+        return "WorkBuddy"
     if source_filter == "custom":
         return "Custom"
-    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
+    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom"
 
 
 def _normalize_source_filter(source_filter: str) -> str:
@@ -238,7 +242,9 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
     if source_filter == "aider":
         from .parsing.parser import _get_aider_project_index
         return bool(_get_aider_project_index())
-    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists()
+    if source_filter == "workbuddy":
+        return WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
+    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists() or WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
 
 
 def _filter_projects_by_source(projects: list[dict], source_filter: str) -> list[dict]:
@@ -299,14 +305,14 @@ def _build_status_next_steps(
         steps = []
         if not source_confirmed:
             steps.append(
-                "Ask the user to explicitly choose export source scope: Claude Code, Claude Science, Codex, Gemini, or all. "
-                "Then set it: clawjournal config --source <claude|claude-science|codex|gemini|all>. "
+                "Ask the user to explicitly choose export source scope: Claude Code, Claude Science, Codex, Gemini, WorkBuddy, or all. "
+                "Then set it: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>. "
                 "Do not run export until source scope is explicitly confirmed."
             )
         else:
             steps.append(
                 f"Source scope is currently set to '{configured_source}'. "
-                "If the user wants a different scope, run: clawjournal config --source <claude|claude-science|codex|gemini|all>."
+                "If the user wants a different scope, run: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>."
             )
         if not projects_confirmed:
             steps.append(
@@ -1167,7 +1173,7 @@ def prep(source_filter: str = "auto") -> None:
             from .parsing.parser import GEMINI_DIR
             err = f"{GEMINI_DIR} was not found."
         else:
-            err = "None of ~/.claude, ~/.claude-science, ~/.codex, or ~/.gemini/tmp were found."
+            err = "None of ~/.claude, ~/.claude-science, ~/.codex, ~/.gemini/tmp, ~/WorkBuddy, or ~/.clawjournal/workbuddy were found."
         print(json.dumps({"error": err}))
         sys.exit(1)
 
@@ -1232,13 +1238,29 @@ def _run_scan(source_filter: str | None = None) -> None:
     results = scanner.scan_once()
 
     total_new = sum(results.values())
-    if total_new:
-        print(f"Indexed {total_new} new sessions:")
-        for source, count in sorted(results.items()):
-            if count > 0:
-                print(f"  {source}: {count}")
+    total_updated = scanner.last_updated_count
+    if total_new or total_updated:
+        new_label = "session" if total_new == 1 else "sessions"
+        updated_label = "trace" if total_updated == 1 else "traces"
+        print(
+            f"Indexed {total_new} new {new_label}; "
+            f"updated {total_updated} existing {updated_label}:"
+        )
+        sources = set(results) | set(scanner.last_updated_by_source)
+        for source in sorted(sources):
+            parts = []
+            new_count = results.get(source, 0)
+            updated_count = scanner.last_updated_by_source.get(source, 0)
+            if new_count:
+                label = "new session" if new_count == 1 else "new sessions"
+                parts.append(f"{new_count} {label}")
+            if updated_count:
+                label = "updated trace" if updated_count == 1 else "updated traces"
+                parts.append(f"{updated_count} {label}")
+            if parts:
+                print(f"  {source}: {', '.join(parts)}")
     else:
-        print("No new sessions found.")
+        print("No new or updated sessions found.")
 
     conn = open_index()
     try:
@@ -1408,10 +1430,14 @@ def _resolve_share_id(conn, prefix: str) -> str | None:
 def _run_bundle_create(args) -> None:
     """Create a bundle from session IDs or by review status."""
     from .workbench.index import (
+        already_shared_revision_blockers,
         create_share,
         get_effective_share_settings,
+        get_share_ready_stats,
         open_index,
         query_sessions,
+        RevisionConflictError,
+        revision_review_blockers,
         source_scope_blockers,
     )
 
@@ -1419,6 +1445,7 @@ def _run_bundle_create(args) -> None:
     try:
         settings = get_effective_share_settings(conn, load_config())
         session_ids = list(args.session_ids) if args.session_ids else []
+        explicitly_selected = bool(session_ids)
 
         if args.status and not session_ids:
             sessions = query_sessions(
@@ -1428,6 +1455,24 @@ def _run_bundle_create(args) -> None:
                 limit=10000,
             )
             session_ids = [s["session_id"] for s in sessions]
+
+        ready = get_share_ready_stats(
+            conn,
+            excluded_projects=settings["excluded_projects"],
+            source_filter=settings.get("source_filter"),
+            include_unapproved=True,
+        )
+        ready_ids = {session["session_id"] for session in ready["sessions"]}
+        ineligible_ids = [sid for sid in session_ids if sid not in ready_ids]
+        if explicitly_selected and ineligible_ids:
+            print(
+                "Selected sessions are not eligible to bundle. They may already "
+                "be shared at this revision, require fresh approval, or be missing: "
+                + ", ".join(ineligible_ids)
+            )
+            sys.exit(1)
+        if not explicitly_selected:
+            session_ids = [sid for sid in session_ids if sid in ready_ids]
 
         if not session_ids:
             print("No sessions to bundle. Provide session IDs or use --status approved.")
@@ -1440,13 +1485,36 @@ def _run_bundle_create(args) -> None:
         if source_blockers:
             print("Some selected sessions are outside the confirmed source scope.")
             sys.exit(1)
+        review_blockers = revision_review_blockers(conn, session_ids)
+        if review_blockers:
+            print("Updated traces require fresh approval before re-upload.")
+            sys.exit(1)
+        duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
+        if duplicate_blockers:
+            print("One or more selected trace revisions were already shared.")
+            sys.exit(1)
 
-        share_id = create_share(
-            conn, session_ids,
-            attestation=args.attestation,
-            note=args.note,
-            source_filter=settings.get("source_filter"),
-        )
+        placeholders = ", ".join("?" for _ in session_ids)
+        revision_rows = conn.execute(
+            f"SELECT session_id, content_revision FROM sessions "
+            f"WHERE session_id IN ({placeholders})",
+            session_ids,
+        ).fetchall()
+        expected_revisions = {
+            row["session_id"]: row["content_revision"] for row in revision_rows
+        }
+
+        try:
+            share_id = create_share(
+                conn, session_ids,
+                attestation=args.attestation,
+                note=args.note,
+                source_filter=settings.get("source_filter"),
+                expected_revisions=expected_revisions,
+            )
+        except RevisionConflictError:
+            print("A selected trace changed while the bundle was being created. Review it and retry.")
+            sys.exit(1)
         # Get actual count from DB (create_share only links IDs that exist)
         from .workbench.index import get_share
         share = get_share(conn, share_id)
@@ -1951,8 +2019,10 @@ def _run_share(args) -> None:
         create_share,
         get_effective_share_settings,
         get_share,
+        get_share_ready_stats,
         open_index,
         query_sessions,
+        RevisionConflictError,
         session_matches_excluded_projects,
         source_scope_blockers,
     )
@@ -1963,6 +2033,7 @@ def _run_share(args) -> None:
     try:
         settings = get_effective_share_settings(conn, config)
         session_ids = list(args.session_ids) if args.session_ids else []
+        explicitly_selected = bool(session_ids)
 
         # Query once, reuse for both ID collection and preview
         if args.status and not session_ids:
@@ -1987,6 +2058,34 @@ def _run_share(args) -> None:
             session for session in session_rows
             if not session_matches_excluded_projects(session, settings["excluded_projects"])
         ]
+        ready = get_share_ready_stats(
+            conn,
+            excluded_projects=settings["excluded_projects"],
+            source_filter=settings.get("source_filter"),
+            include_unapproved=True,
+        )
+        ready_by_id = {row["session_id"]: row for row in ready["sessions"]}
+        ineligible_ids = [sid for sid in session_ids if sid not in ready_by_id]
+        if explicitly_selected and ineligible_ids:
+            print(
+                "Selected sessions are not eligible to share. They may already "
+                "be uploaded at this revision or require fresh approval: "
+                + ", ".join(ineligible_ids)
+            )
+            sys.exit(1)
+        session_rows = [
+            session for session in session_rows
+            if session["session_id"] in ready_by_id
+        ]
+        for session in session_rows:
+            session.update({
+                key: ready_by_id[session["session_id"]].get(key)
+                for key in (
+                    "revision_hash",
+                    "last_shared_revision_hash",
+                    "updated_since_last_share",
+                )
+            })
         source_blockers = source_scope_blockers(
             conn,
             [s["session_id"] for s in session_rows],
@@ -2016,12 +2115,21 @@ def _run_share(args) -> None:
         from .workbench.daemon import _prepare_share_export_for_upload
 
         pii_status = _print_share_pii_warning(output_json=getattr(args, "json", False))
-        share_id = create_share(
-            conn,
-            session_ids,
-            note=args.note,
-            source_filter=settings.get("source_filter"),
-        )
+        try:
+            share_id = create_share(
+                conn,
+                session_ids,
+                note=args.note,
+                source_filter=settings.get("source_filter"),
+                expected_revisions={
+                    session["session_id"]: session["revision_hash"]
+                    for session in session_rows
+                    if session.get("revision_hash")
+                },
+            )
+        except RevisionConflictError:
+            print("A selected trace changed after review. Review it again and retry.")
+            sys.exit(1)
         share = get_share(conn, share_id)
         if share is None:
             print("Share failed: newly created share could not be loaded.")
@@ -3853,7 +3961,7 @@ def main() -> None:
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
-                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, or all")
+                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, workbuddy, or all")
     cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
                      help="Confirm the AI scoring backend for automatic workbench scoring")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
@@ -6552,12 +6660,12 @@ def _run_export(args) -> None:
             "error": "Source scope is not confirmed yet.",
             "hint": (
                 "Explicitly choose one source scope before exporting: "
-                "`claude`, `claude-science`, `codex`, `gemini`, or `all`."
+                "`claude`, `claude-science`, `codex`, `gemini`, `workbuddy`, or `all`."
             ),
             "required_action": (
-                "Ask the user whether to export Claude Code, Claude Science, Codex, Gemini, or all. "
-                "Then run `clawjournal config --source <claude|claude-science|codex|gemini|all>` "
-                "or pass `--source <claude|claude-science|codex|gemini|all>` on the export command."
+                "Ask the user whether to export Claude Code, Claude Science, Codex, Gemini, WorkBuddy, or all. "
+                "Then run `clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>` "
+                "or pass `--source <claude|claude-science|codex|gemini|workbuddy|all>` on the export command."
             ),
             "allowed_sources": sorted(EXPLICIT_SOURCE_CHOICES),
             "blocked_on_step": "Step 2/5",
@@ -6581,7 +6689,7 @@ def _run_export(args) -> None:
             from .parsing.parser import GEMINI_DIR
             print(f"Error: {GEMINI_DIR} not found.", file=sys.stderr)
         else:
-            print("Error: none of ~/.claude, ~/.claude-science, ~/.codex, or ~/.gemini/tmp were found.", file=sys.stderr)
+            print("Error: none of ~/.claude, ~/.claude-science, ~/.codex, ~/.gemini/tmp, ~/WorkBuddy, or ~/.clawjournal/workbuddy were found.", file=sys.stderr)
         sys.exit(1)
 
     projects = discover_projects(source_filter=source_filter)

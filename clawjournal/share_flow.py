@@ -16,10 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from .workbench.index import (
+    already_shared_revision_blockers,
     apply_share_redactions,
     create_share,
     get_share,
     release_gate_blockers,
+    RevisionConflictError,
+    revision_review_blockers,
     source_scope_blockers,
 )
 
@@ -210,7 +213,8 @@ def gate_blockers(conn, session_ids: list[str]) -> list[dict]:
 
 
 def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
-            note: str | None = None) -> dict:
+            note: str | None = None,
+            expected_revisions: dict[str, str] | None = None) -> dict:
     """Create a share row and seal the bundle. Returns:
         {ok, share_id, export_dir, manifest, blocked_sessions, error}
     blocked_sessions is the list of sessions TruffleHog/PII blocked (for recovery).
@@ -222,12 +226,35 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             "error": "Share contains sessions outside the confirmed source scope",
             "blockers": source_blockers,
         }
-    share_id = create_share(
-        conn,
-        session_ids,
-        note=note,
-        source_filter=settings.get("source_filter"),
-    )
+    review_blockers = revision_review_blockers(conn, session_ids)
+    if review_blockers:
+        return {
+            "ok": False,
+            "error": "Updated traces require fresh approval before re-upload",
+            "blockers": review_blockers,
+        }
+    duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
+    if duplicate_blockers:
+        return {
+            "ok": False,
+            "error": "One or more selected trace revisions were already shared",
+            "blockers": duplicate_blockers,
+        }
+    try:
+        share_id = create_share(
+            conn,
+            session_ids,
+            note=note,
+            source_filter=settings.get("source_filter"),
+            expected_revisions=expected_revisions,
+        )
+    except RevisionConflictError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "block_reason": "revision_conflict",
+            "blockers": exc.blockers,
+        }
     share = get_share(conn, share_id)
     if share is None:
         return {"ok": False, "error": "Share row could not be loaded after creation."}

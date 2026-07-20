@@ -1,5 +1,6 @@
 """Local SQLite + FTS5 index for the scientist workbench."""
 
+import hashlib
 import json
 import logging
 import os
@@ -27,15 +28,30 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 # `sessions.session_key` bridge to `event_sessions.session_key`, and
 # version 4 marks the workbench as widened-message-aware (parser path
 # now produces messages with optional `invocations` / `snippets` /
-# `extra` / `author` fields, all routed through redaction).
+# `extra` / `author` fields, all routed through redaction), version 5
+# stores hosted-submission receipts, and version 6 tracks immutable
+# content revisions for re-sharing traces that continue to grow.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
 HOSTED_SUBMISSION_SCHEMA_VERSION = 5
-WORKBENCH_SCHEMA_VERSION = HOSTED_SUBMISSION_SCHEMA_VERSION
+REVISION_TRACKING_SCHEMA_VERSION = 6
+WORKBENCH_SCHEMA_VERSION = REVISION_TRACKING_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
-FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw")
+FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SHARE_RECOMMENDATION_LIMIT = 10
+
+
+class RevisionConflictError(ValueError):
+    """A selected trace no longer matches the revision a caller reviewed."""
+
+    def __init__(self, blockers: list[dict[str, Any]]):
+        self.blockers = blockers
+        session_ids = ", ".join(
+            str(blocker.get("session_id", "unknown")) for blocker in blockers
+        )
+        super().__init__(f"Trace revisions changed before share creation: {session_ids}")
+
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
 # onto a single coherent label set. Prevents the duplicate-meaning rows we
@@ -111,7 +127,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     ai_scorer_backend      TEXT,
     ai_scorer_model        TEXT,
     ai_rubric_git_sha      TEXT,
-    ai_scored_at           TEXT
+    ai_scored_at           TEXT,
+    content_revision       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shares (
@@ -131,9 +148,11 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 
 CREATE TABLE IF NOT EXISTS share_sessions (
-    share_id     TEXT NOT NULL REFERENCES shares(share_id),
-    session_id   TEXT NOT NULL REFERENCES sessions(session_id),
-    added_at     TEXT NOT NULL,
+    share_id          TEXT NOT NULL REFERENCES shares(share_id),
+    session_id        TEXT NOT NULL REFERENCES sessions(session_id),
+    added_at          TEXT NOT NULL,
+    content_revision  TEXT,
+    replaces_revision TEXT,
     PRIMARY KEY (share_id, session_id)
 );
 
@@ -285,6 +304,79 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _revision_json_value(value: Any) -> Any:
+    """Return a JSON-stable representation for content revision hashing."""
+    if isinstance(value, dict):
+        return {
+            str(key): _revision_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_revision_json_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_revision_json_value(item) for item in value]
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(
+                item, sort_keys=True, separators=(",", ":"), default=str,
+            ),
+        )
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def compute_content_revision(session: dict[str, Any]) -> str:
+    """Hash the normalized transcript content of a parsed session.
+
+    Session identity, parser metadata, indexing timestamps, review state, and
+    scoring fields intentionally do not participate. This means parser-only
+    enrichment can refresh metadata without making a reviewed trace stale,
+    while an appended or edited message always creates a new revision.
+    """
+    payload = {
+        "messages": _revision_json_value(session.get("messages", [])),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _legacy_content_revision(session_id: str) -> str:
+    """Return a stable opaque baseline when a migrated blob is unreadable."""
+    digest = hashlib.sha256(f"legacy-session:{session_id}".encode("utf-8")).hexdigest()
+    return f"legacy:{digest}"
+
+
+def _read_blob_for_revision(
+    session_id: str,
+    blob_path: str | None,
+) -> dict[str, Any] | None:
+    """Load a migration-time blob, tolerating stale stored blob paths."""
+    candidates: list[Path] = []
+    if blob_path:
+        candidates.append(Path(blob_path))
+    canonical = BLOBS_DIR / f"{session_id}.json"
+    if canonical not in candidates:
+        candidates.append(canonical)
+    for candidate in candidates:
+        try:
+            with open(candidate) as f:
+                blob = json.load(f)
+            if isinstance(blob, dict):
+                return blob
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def open_index() -> sqlite3.Connection:
     """Open (and initialize if needed) the index database.
 
@@ -388,6 +480,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_session_identity_bridge(conn)
     _migrate_widened_message_model(conn)
     _migrate_hosted_submission_receipts(conn)
+    _migrate_revision_tracking(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -575,6 +668,83 @@ def _migrate_hosted_submission_receipts(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_revision_tracking(conn: sqlite3.Connection) -> None:
+    """Add trace/share revisions and advance the workbench schema v5 -> v6.
+
+    Existing sessions are hashed from their stored blobs. Historical shares
+    inherit that same revision as their selection baseline: completed shares
+    therefore stay suppressed, while old drafts can detect a later append
+    before export. Missing or unreadable blobs receive an explicit stable
+    legacy baseline, copied to their historical share selections as well.
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= REVISION_TRACKING_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, col, col_type in [
+            ("sessions", "content_revision", "TEXT"),
+            ("share_sessions", "content_revision", "TEXT"),
+            ("share_sessions", "replaces_revision", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e):
+                    raise
+
+        session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        blob_path_expr = (
+            "blob_path" if "blob_path" in session_columns else "NULL AS blob_path"
+        )
+        rows = conn.execute(
+            f"SELECT session_id, {blob_path_expr} FROM sessions "
+            "WHERE content_revision IS NULL"
+        ).fetchall()
+        for row in rows:
+            blob = _read_blob_for_revision(row["session_id"], row["blob_path"])
+            revision = (
+                compute_content_revision(blob)
+                if blob is not None
+                else _legacy_content_revision(row["session_id"])
+            )
+            conn.execute(
+                "UPDATE sessions SET content_revision = ? WHERE session_id = ?",
+                (revision, row["session_id"]),
+            )
+
+        # Very old indexes also kept the latest share on sessions.share_id.
+        # Restore any missing join rows before stamping historical baselines.
+        if "share_id" in session_columns:
+            conn.execute(
+                "INSERT OR IGNORE INTO share_sessions "
+                "(share_id, session_id, added_at) "
+                "SELECT s.share_id, s.session_id, sh.created_at "
+                "FROM sessions s JOIN shares sh ON sh.share_id = s.share_id "
+                "WHERE s.share_id IS NOT NULL"
+            )
+        # Existing drafts also need a frozen selection baseline so a later
+        # append is detected before export. Successful rows use the same value
+        # as their initial post-upgrade uploaded baseline.
+        conn.execute(
+            "UPDATE share_sessions AS ss "
+            "SET content_revision = ("
+            "  SELECT s.content_revision FROM sessions s "
+            "  WHERE s.session_id = ss.session_id"
+            ") "
+            "WHERE ss.content_revision IS NULL"
+        )
+        conn.execute(f"PRAGMA user_version = {REVISION_TRACKING_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
     """One-time rename of bundles→shares, bundle_sessions→share_sessions, bundle_id→share_id.
 
@@ -640,15 +810,17 @@ def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
         # 2. Recreate share_sessions (FK column is share_id).
         conn.execute(
             """CREATE TABLE share_sessions (
-                share_id   TEXT NOT NULL REFERENCES shares(share_id),
-                session_id TEXT NOT NULL REFERENCES sessions(session_id),
-                added_at   TEXT NOT NULL,
+                share_id          TEXT NOT NULL REFERENCES shares(share_id),
+                session_id        TEXT NOT NULL REFERENCES sessions(session_id),
+                added_at          TEXT NOT NULL,
+                content_revision  TEXT,
+                replaces_revision TEXT,
                 PRIMARY KEY (share_id, session_id)
             )"""
         )
         conn.execute(
-            "INSERT INTO share_sessions (share_id, session_id, added_at)"
-            " SELECT bundle_id, session_id, added_at FROM bundle_sessions"
+            "INSERT INTO share_sessions (share_id, session_id, added_at) "
+            "SELECT bundle_id, session_id, added_at FROM bundle_sessions"
         )
         conn.execute("DROP TABLE bundle_sessions")
         conn.execute("DROP INDEX IF EXISTS idx_bundle_sessions_session_id")
@@ -714,6 +886,7 @@ def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
             "ai_scorer_model        TEXT",
             "ai_rubric_git_sha      TEXT",
             "ai_scored_at           TEXT",
+            "content_revision       TEXT",
         ]
         known_names = {
             "session_id", "project", "source", "model", "start_time",
@@ -727,7 +900,7 @@ def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
             "ai_display_title", "ai_failure_value_score", "ai_recovery_labels",
             "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
             "ai_scorer_backend", "ai_scorer_model", "ai_rubric_git_sha",
-            "ai_scored_at",
+            "ai_scored_at", "content_revision",
         }
         # Map column name -> declared type from the old table so we preserve
         # types for any columns not in the base schema.
@@ -1741,7 +1914,12 @@ def recompute_estimated_costs(conn: sqlite3.Connection) -> int:
     return changed
 
 
-def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) -> int:
+def upsert_sessions(
+    conn: sqlite3.Connection,
+    sessions: list[dict[str, Any]],
+    *,
+    stats: dict[str, int] | None = None,
+) -> int:
     """Index parsed sessions into the database.
 
     Takes parsed session dicts (output of parser.parse_project_sessions).
@@ -1749,8 +1927,14 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
     BLOBS_DIR/{session_id}.json, and updates FTS index.
 
     Returns the count of new sessions inserted (sessions that did not
-    previously exist in the index).
+    previously exist in the index). When ``stats`` is provided, it is filled
+    with ``inserted``, ``updated`` (content revision changed), and
+    ``unchanged`` counts without changing the legacy integer return value.
     """
+    counts = {"inserted": 0, "updated": 0, "unchanged": 0}
+    if stats is not None:
+        stats.clear()
+        stats.update(counts)
     if not sessions:
         return 0
 
@@ -1773,8 +1957,9 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         session_key = _derive_session_key_from_source(
             source, session.get("raw_source_path")
         )
-        stats = session.get("stats", {})
+        session_stats = session.get("stats", {})
         duration = _compute_duration(session)
+        content_revision = compute_content_revision(session)
 
         # Compute badges and signals
         badges = compute_all_badges(session)
@@ -1801,17 +1986,42 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
             "ai_value_badges, ai_risk_badges, "
             "ai_effort_estimate, ai_summary, "
             "share_id, session_key, parent_session_id, subagent_session_ids, "
-            "estimated_cost_usd, end_time "
+            "estimated_cost_usd, end_time, content_revision "
             "FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         is_new = existing is None
+        content_updated = (
+            existing is not None
+            and existing["content_revision"] != content_revision
+        )
 
-        # Write blob
-        blob_path = _write_blob(session_id, session)
+        # Avoid rewriting the blob/FTS record for a byte-equivalent transcript.
+        # Metadata fields still flow through the SQL upsert below so parser
+        # enrichment and ongoing cost estimates can refresh independently.
+        metadata_updated = False
+        if is_new or content_updated:
+            blob_path = _write_blob(session_id, session)
+        else:
+            stored_blob_path = conn.execute(
+                "SELECT blob_path FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()["blob_path"]
+            blob_path = (
+                Path(stored_blob_path)
+                if stored_blob_path
+                else BLOBS_DIR / f"{session_id}.json"
+            )
+            stored_blob = _read_blob_for_revision(session_id, str(blob_path))
+            metadata_updated = (
+                stored_blob is None
+                or _revision_json_value(stored_blob) != _revision_json_value(session)
+            )
+            if metadata_updated:
+                blob_path = _write_blob(session_id, session)
 
         # Delete old FTS entry before replacing.
-        if has_fts and not is_new:
+        if has_fts and not is_new and (content_updated or metadata_updated):
             conn.execute(
                 "DELETE FROM sessions_fts WHERE session_id = ?",
                 (session_id,),
@@ -1842,10 +2052,10 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
         preserved_subagent_session_ids = existing["subagent_session_ids"] if not is_new else None
 
         # Compute estimated cost from model + token counts
-        in_tok = stats.get("input_tokens", 0)
-        out_tok = stats.get("output_tokens", 0)
-        cache_read = stats.get("cache_read_tokens", 0)
-        cache_create = stats.get("cache_creation_tokens", 0)
+        in_tok = session_stats.get("input_tokens", 0)
+        out_tok = session_stats.get("output_tokens", 0)
+        cache_read = session_stats.get("cache_read_tokens", 0)
+        cache_create = session_stats.get("cache_creation_tokens", 0)
         cost = _resolve_estimated_cost(
             existing,
             model=session.get("model"),
@@ -1892,7 +2102,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 client_origin, runtime_channel, outer_session_id,
                 estimated_cost_usd,
                 tool_counts, user_interrupts,
-                hold_state
+                hold_state, content_revision
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?,
@@ -1919,7 +2129,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 ?, ?, ?,
                 ?,
                 ?, ?,
-                'auto_redacted'
+                'auto_redacted', ?
             )
             ON CONFLICT(session_id) DO UPDATE SET
                 project = excluded.project,
@@ -1948,7 +2158,89 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 blob_path = excluded.blob_path,
                 raw_source_path = excluded.raw_source_path,
                 session_key = COALESCE(excluded.session_key, session_key),
-                updated_at = excluded.updated_at,
+                updated_at = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN excluded.updated_at ELSE sessions.updated_at END,
+                review_status = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN CASE
+                        WHEN sessions.review_status = 'segmented' THEN 'segmented'
+                        ELSE 'new'
+                    END
+                    ELSE sessions.review_status
+                END,
+                selection_reason = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.selection_reason END,
+                reviewer_notes = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.reviewer_notes END,
+                reviewed_at = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.reviewed_at END,
+                ai_quality_score = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_quality_score END,
+                ai_score_reason = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_score_reason END,
+                ai_episode_quality = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_episode_quality END,
+                ai_quality_tier = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_quality_tier END,
+                ai_scoring_detail = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_scoring_detail END,
+                ai_task_type = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_task_type END,
+                ai_outcome_badge = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_outcome_badge END,
+                ai_value_badges = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_value_badges END,
+                ai_risk_badges = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_risk_badges END,
+                ai_display_title = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_display_title END,
+                ai_effort_estimate = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_effort_estimate END,
+                ai_summary = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_summary END,
+                ai_failure_value_score = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_failure_value_score END,
+                ai_recovery_labels = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_recovery_labels END,
+                ai_failure_attribution = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_failure_attribution END,
+                ai_failure_modes = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_failure_modes END,
+                ai_learning_summary = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_learning_summary END,
+                ai_scorer_backend = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_scorer_backend END,
+                ai_scorer_model = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_scorer_model END,
+                ai_rubric_git_sha = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_rubric_git_sha END,
+                ai_scored_at = CASE
+                    WHEN sessions.content_revision IS NOT excluded.content_revision
+                    THEN NULL ELSE sessions.ai_scored_at END,
                 parent_session_id = COALESCE(excluded.parent_session_id, parent_session_id),
                 segment_index = excluded.segment_index,
                 segment_start_message = excluded.segment_start_message,
@@ -1959,15 +2251,16 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 outer_session_id = excluded.outer_session_id,
                 estimated_cost_usd = excluded.estimated_cost_usd,
                 tool_counts = excluded.tool_counts,
-                user_interrupts = excluded.user_interrupts
+                user_interrupts = excluded.user_interrupts,
+                content_revision = excluded.content_revision
             """,
             (
                 session_id, project, source, session.get("model"), session.get("model_effort"),
                 session.get("start_time"), session.get("end_time"), duration,
                 session.get("git_branch"),
-                stats.get("user_messages", 0),
-                stats.get("assistant_messages", 0),
-                stats.get("tool_uses", 0),
+                session_stats.get("user_messages", 0),
+                session_stats.get("assistant_messages", 0),
+                session_stats.get("tool_uses", 0),
                 in_tok,
                 out_tok,
                 cache_read,
@@ -2011,7 +2304,8 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
                 session.get("outer_session_id"),
                 cost,
                 json.dumps(badges.get("tool_counts", {})) or None,
-                stats.get("user_interrupts", 0),
+                session_stats.get("user_interrupts", 0),
+                content_revision,
             ),
         )
 
@@ -2029,7 +2323,7 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
             )
 
         # Insert FTS entry
-        if has_fts:
+        if has_fts and (is_new or content_updated or metadata_updated):
             transcript = _flatten_transcript(session)
             conn.execute(
                 "INSERT INTO sessions_fts("
@@ -2046,8 +2340,15 @@ def upsert_sessions(conn: sqlite3.Connection, sessions: list[dict[str, Any]]) ->
 
         if is_new:
             new_count += 1
+            counts["inserted"] += 1
+        elif content_updated:
+            counts["updated"] += 1
+        else:
+            counts["unchanged"] += 1
 
     conn.commit()
+    if stats is not None:
+        stats.update(counts)
     return new_count
 
 
@@ -3589,61 +3890,147 @@ def get_insights(
     return result
 
 
+def _latest_successful_revision(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    exclude_share_id: str | None = None,
+) -> str | None:
+    """Return the most recently uploaded content revision for a trace."""
+    where = [
+        "ss.session_id = ?",
+        "sh.shared_at IS NOT NULL",
+        "ss.content_revision IS NOT NULL",
+    ]
+    params: list[Any] = [session_id]
+    if exclude_share_id is not None:
+        where.append("ss.share_id != ?")
+        params.append(exclude_share_id)
+    row = conn.execute(
+        "SELECT ss.content_revision FROM share_sessions ss "
+        "JOIN shares sh ON sh.share_id = ss.share_id "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY sh.shared_at DESC, sh.created_at DESC, ss.share_id DESC "
+        "LIMIT 1",
+        params,
+    ).fetchone()
+    return row["content_revision"] if row is not None else None
+
+
 def create_share(
     conn: sqlite3.Connection,
     session_ids: list[str],
     attestation: str | None = None,
     note: str | None = None,
     source_filter: str | list[str] | tuple[str, ...] | None = None,
+    expected_revisions: dict[str, str] | None = None,
 ) -> str:
     """Create a share linking the given sessions.
 
-    Returns the new share_id.
+    Returns the new share_id. ``expected_revisions`` lets callers bind a UI
+    selection to the exact revisions the user reviewed; a concurrent append
+    raises ``ValueError`` before any share row is created.
     """
     share_id = str(uuid.uuid4())
     now = _now_iso()
+    started_transaction = not conn.in_transaction
+    if started_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Verify all sessions exist while holding the same write transaction
+        # that records their immutable share snapshots.
+        found_sessions: dict[str, str | None] = {}
+        if session_ids:
+            placeholders = ", ".join("?" for _ in session_ids)
+            source_clause = ""
+            params: list[Any] = list(session_ids)
+            if source_filter is not None:
+                if isinstance(source_filter, (list, tuple)):
+                    values = [s for s in source_filter if s]
+                    if values:
+                        source_clause = (
+                            f" AND source IN ({','.join('?' for _ in values)})"
+                        )
+                        params.extend(values)
+                else:
+                    source_clause = " AND source = ?"
+                    params.append(source_filter)
+            rows = conn.execute(
+                "SELECT session_id, content_revision FROM sessions "
+                f"WHERE session_id IN ({placeholders}){source_clause}",
+                params,
+            ).fetchall()
+            found_sessions = {
+                row["session_id"]: row["content_revision"]
+                for row in rows
+            }
 
-    # Verify all sessions exist
-    found_ids: set[str] = set()
-    if session_ids:
-        placeholders = ", ".join("?" for _ in session_ids)
-        source_clause = ""
-        params: list[Any] = list(session_ids)
-        if source_filter is not None:
-            if isinstance(source_filter, (list, tuple)):
-                values = [s for s in source_filter if s]
-                if values:
-                    source_clause = f" AND source IN ({','.join('?' for _ in values)})"
-                    params.extend(values)
-            else:
-                source_clause = " AND source = ?"
-                params.append(source_filter)
-        rows = conn.execute(
-            f"SELECT session_id FROM sessions WHERE session_id IN ({placeholders}){source_clause}",
-            params,
-        ).fetchall()
-        found_ids = {row["session_id"] for row in rows}
+        if expected_revisions is not None:
+            expected_ids = set(expected_revisions)
+            found_ids = set(found_sessions)
+            requested_ids = set(session_ids)
+            blockers = [
+                {
+                    "session_id": sid,
+                    "expected_revision_hash": expected_revisions.get(sid),
+                    "current_revision_hash": found_sessions.get(sid),
+                }
+                for sid in sorted(expected_ids | found_ids | requested_ids)
+                if (
+                    sid not in expected_ids
+                    or sid not in requested_ids
+                    or sid not in found_ids
+                    or expected_revisions[sid] != found_sessions[sid]
+                )
+            ]
+            if blockers:
+                raise RevisionConflictError(blockers)
 
-    conn.execute(
-        """INSERT INTO shares (
-            share_id, created_at, session_count, status,
-            attestation, submission_note
-        ) VALUES (?, ?, ?, 'draft', ?, ?)""",
-        (share_id, now, len(found_ids), attestation, note),
-    )
-
-    for sid in found_ids:
         conn.execute(
-            "INSERT OR IGNORE INTO share_sessions (share_id, session_id, added_at) VALUES (?, ?, ?)",
-            (share_id, sid, now),
-        )
-        conn.execute(
-            "UPDATE sessions SET share_id = ?, updated_at = ? WHERE session_id = ?",
-            (share_id, now, sid),
+            """INSERT INTO shares (
+                share_id, created_at, session_count, status,
+                attestation, submission_note
+            ) VALUES (?, ?, ?, 'draft', ?, ?)""",
+            (share_id, now, len(found_sessions), attestation, note),
         )
 
-    conn.commit()
+        for sid, content_revision in found_sessions.items():
+            replaces_revision = _latest_successful_revision(conn, sid)
+            conn.execute(
+                "INSERT OR IGNORE INTO share_sessions "
+                "(share_id, session_id, added_at, content_revision, replaces_revision) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (share_id, sid, now, content_revision, replaces_revision),
+            )
+            conn.execute(
+                "UPDATE sessions SET share_id = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (share_id, now, sid),
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return share_id
+
+
+def share_revision_blockers(
+    conn: sqlite3.Connection,
+    share_id: str,
+) -> list[dict[str, Any]]:
+    """Return selected share snapshots whose local trace has since changed."""
+    rows = conn.execute(
+        "SELECT ss.session_id, ss.content_revision AS expected_revision_hash, "
+        "s.content_revision AS current_revision_hash, s.review_status "
+        "FROM share_sessions ss "
+        "JOIN sessions s ON s.session_id = ss.session_id "
+        "WHERE ss.share_id = ? "
+        "AND ss.content_revision IS NOT s.content_revision "
+        "ORDER BY ss.session_id",
+        (share_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def source_scope_blockers(
@@ -3687,6 +4074,115 @@ def get_shares(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [_with_legacy_bundle_alias(dict(row)) for row in rows]
 
 
+_LATEST_SUCCESSFUL_REVISIONS_CTE = """
+WITH ranked_shared_revisions AS (
+    SELECT
+        ss.session_id,
+        ss.content_revision,
+        ROW_NUMBER() OVER (
+            PARTITION BY ss.session_id
+            ORDER BY sh.shared_at DESC, sh.created_at DESC, ss.share_id DESC
+        ) AS revision_rank
+    FROM share_sessions ss
+    JOIN shares sh ON sh.share_id = ss.share_id
+    WHERE sh.shared_at IS NOT NULL AND ss.content_revision IS NOT NULL
+),
+latest_shared_revisions AS (
+    SELECT session_id, content_revision
+    FROM ranked_shared_revisions
+    WHERE revision_rank = 1
+)
+"""
+
+
+def revision_review_blockers(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Return re-shared revisions that have not received fresh approval."""
+    if not session_ids:
+        return []
+    placeholders = ", ".join("?" for _ in session_ids)
+    rows = conn.execute(
+        _LATEST_SUCCESSFUL_REVISIONS_CTE
+        + "SELECT s.session_id, s.review_status, "
+        "s.content_revision AS revision_hash, "
+        "latest.content_revision AS last_shared_revision_hash "
+        "FROM sessions s "
+        "JOIN latest_shared_revisions latest ON latest.session_id = s.session_id "
+        f"WHERE s.session_id IN ({placeholders}) "
+        "AND s.content_revision IS NOT latest.content_revision "
+        "AND s.review_status != 'approved' "
+        "ORDER BY s.session_id",
+        session_ids,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def already_shared_revision_blockers(
+    conn: sqlite3.Connection,
+    session_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Return selected traces whose exact current revision already uploaded."""
+    if not session_ids:
+        return []
+    placeholders = ", ".join("?" for _ in session_ids)
+    rows = conn.execute(
+        _LATEST_SUCCESSFUL_REVISIONS_CTE
+        + "SELECT s.session_id, s.content_revision AS revision_hash, "
+        "latest.content_revision AS last_shared_revision_hash "
+        "FROM sessions s "
+        "JOIN latest_shared_revisions latest ON latest.session_id = s.session_id "
+        f"WHERE s.session_id IN ({placeholders}) "
+        "AND s.content_revision IS latest.content_revision "
+        "ORDER BY s.session_id",
+        session_ids,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def share_predecessor_blockers(
+    conn: sqlite3.Connection,
+    share_id: str,
+) -> list[dict[str, Any]]:
+    """Return packaged replacements based on a stale uploaded predecessor.
+
+    The share remains valid when the latest successful revision is the
+    predecessor captured at creation. If a different share already uploaded
+    this share's own revision, it is a known duplicate. Any third revision
+    means a newer replacement won the race and this share must not overwrite
+    it.
+    """
+    rows = conn.execute(
+        "SELECT session_id, content_revision, replaces_revision "
+        "FROM share_sessions WHERE share_id = ? ORDER BY session_id",
+        (share_id,),
+    ).fetchall()
+    blockers: list[dict[str, Any]] = []
+    for row in rows:
+        latest = _latest_successful_revision(
+            conn,
+            row["session_id"],
+            exclude_share_id=share_id,
+        )
+        if latest is None:
+            continue
+        if latest == row["content_revision"]:
+            reason = "already_shared_revision"
+        elif latest == row["replaces_revision"]:
+            continue
+        else:
+            reason = "stale_predecessor"
+        blockers.append({
+            "session_id": row["session_id"],
+            "revision_hash": row["content_revision"],
+            "replaces_revision_hash": row["replaces_revision"],
+            "latest_shared_revision_hash": latest,
+            "reason": reason,
+        })
+    return blockers
+
+
 def get_share_ready_stats(
     conn: sqlite3.Connection,
     *,
@@ -3694,54 +4190,59 @@ def get_share_ready_stats(
     source_filter: str | list[str] | tuple[str, ...] | None = None,
     include_unapproved: bool = False,
 ) -> dict[str, Any]:
-    """Return sessions that have not been shared before.
+    """Return sessions whose current content revision has not been shared.
 
     By default returns only `review_status='approved'` sessions; pass
     `include_unapproved=True` to widen the pool so the Preview UI can
-    offer non-approved sessions for explicit review. Recommendations are
-    ranked by failure value first so the share wizard starts with the best
-    failure examples.
+    offer new, never-shared sessions for explicit review. A changed revision
+    of a previously shared trace still requires fresh approval before it is
+    offered. Recommendations are ranked by failure value first so the share
+    wizard starts with the best failure examples.
     """
     where_clauses: list[str] = []
     params: list[Any] = []
+    where_clauses.append("s.review_status != 'segmented'")
     if not include_unapproved:
-        where_clauses.append("review_status = 'approved'")
+        where_clauses.append("s.review_status = 'approved'")
     if source_filter is not None:
         if isinstance(source_filter, (list, tuple)):
             values = [s for s in source_filter if s]
             if values:
-                where_clauses.append(f"source IN ({','.join('?' for _ in values)})")
+                where_clauses.append(f"s.source IN ({','.join('?' for _ in values)})")
                 params.extend(values)
         else:
-            where_clauses.append("source = ?")
+            where_clauses.append("s.source = ?")
             params.append(source_filter)
-    where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-    and_sql = " AND" if where_clauses else " WHERE"
+    # A current revision is eligible when no successful snapshot exists or it
+    # differs from the latest successful snapshot. Changed previously-shared
+    # traces are never exposed before fresh approval, even in the widened pool.
+    where_clauses.extend([
+        "(latest.content_revision IS NULL "
+        "OR s.content_revision IS NOT latest.content_revision)",
+        "NOT (latest.content_revision IS NOT NULL "
+        "AND s.content_revision IS NOT latest.content_revision "
+        "AND s.review_status != 'approved')",
+    ])
+    where_sql = f" WHERE {' AND '.join(where_clauses)}"
     rows = conn.execute(
-        "SELECT session_id, project, model, source, display_title,"
-        " ai_quality_score, ai_failure_value_score, ai_recovery_labels,"
-        " ai_failure_attribution, ai_failure_modes, ai_learning_summary,"
-        " user_messages, assistant_messages, tool_uses,"
-        f" input_tokens, output_tokens, ({_OUTCOME_NORMALIZE_SQL}) as outcome_badge, client_origin,"
-        " runtime_channel, start_time, review_status, hold_state, embargo_until"
-        " FROM sessions"
+        _LATEST_SUCCESSFUL_REVISIONS_CTE
+        + "SELECT s.session_id, s.project, s.model, s.source, s.display_title,"
+        " s.ai_quality_score, s.ai_failure_value_score, s.ai_recovery_labels,"
+        " s.ai_failure_attribution, s.ai_failure_modes, s.ai_learning_summary,"
+        " s.user_messages, s.assistant_messages, s.tool_uses,"
+        f" s.input_tokens, s.output_tokens, ({_OUTCOME_NORMALIZE_SQL}) as outcome_badge, s.client_origin,"
+        " s.runtime_channel, s.start_time, s.review_status, s.hold_state, s.embargo_until,"
+        " s.content_revision AS revision_hash,"
+        " latest.content_revision AS last_shared_revision_hash,"
+        " CASE WHEN latest.content_revision IS NOT NULL "
+        "      AND s.content_revision IS NOT latest.content_revision "
+        "      THEN 1 ELSE 0 END AS updated_since_last_share"
+        " FROM sessions s"
+        " LEFT JOIN latest_shared_revisions latest ON latest.session_id = s.session_id"
         f"{where_sql}"
-        f"{and_sql} session_id NOT IN ("
-        "   SELECT DISTINCT session_id FROM ("
-        "     SELECT s.session_id AS session_id"
-        "     FROM sessions s"
-        "     JOIN shares b ON s.share_id = b.share_id"
-        "     WHERE b.shared_at IS NOT NULL"
-        "     UNION"
-        "     SELECT bs.session_id AS session_id"
-        "     FROM share_sessions bs"
-        "     JOIN shares b ON bs.share_id = b.share_id"
-        "     WHERE b.shared_at IS NOT NULL"
-        "   )"
-        " )"
-        " ORDER BY (ai_failure_value_score IS NULL),"
-        " ai_failure_value_score DESC, start_time DESC,"
-        " (review_status = 'approved') DESC, ai_quality_score DESC",
+        " ORDER BY (s.ai_failure_value_score IS NULL),"
+        " s.ai_failure_value_score DESC, s.start_time DESC,"
+        " (s.review_status = 'approved') DESC, s.ai_quality_score DESC",
         params,
     ).fetchall()
     cols = ["session_id", "project", "model", "source", "display_title",
@@ -3749,9 +4250,14 @@ def get_share_ready_stats(
             "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
             "user_messages", "assistant_messages", "tool_uses", "input_tokens",
             "output_tokens", "outcome_badge", "client_origin", "runtime_channel",
-            "start_time", "review_status", "hold_state", "embargo_until"]
+            "start_time", "review_status", "hold_state", "embargo_until",
+            "revision_hash", "last_shared_revision_hash",
+            "updated_since_last_share"]
     sessions = [dict(zip(cols, r)) for r in rows]
     for session in sessions:
+        session["updated_since_last_share"] = bool(
+            session["updated_since_last_share"]
+        )
         for field in ("ai_recovery_labels", "ai_failure_modes"):
             if isinstance(session.get(field), str):
                 try:
@@ -3839,7 +4345,9 @@ def get_share(
 
     # Fetch linked sessions
     session_rows = conn.execute(
-        "SELECT s.* FROM share_sessions bs"
+        "SELECT s.*, bs.content_revision AS share_content_revision, "
+        "bs.replaces_revision AS share_replaces_revision "
+        "FROM share_sessions bs"
         " JOIN sessions s ON s.session_id = bs.session_id"
         " WHERE bs.share_id = ?"
         " ORDER BY s.start_time ASC, bs.added_at ASC",
@@ -3873,6 +4381,7 @@ EXPORT_FIELDS = {
     "ai_quality_score", "ai_failure_value_score", "ai_recovery_labels",
     "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
     "ai_scoring_detail", "task_type",
+    "revision_hash", "replaces_revision_hash",
     # NOTE: files_touched and commands_run are intentionally excluded from
     # exports — they contain unredacted file paths and shell commands that
     # could leak internal project structure or sensitive information.
@@ -3973,43 +4482,101 @@ def export_share_to_disk(
     total_redactions = 0
     redaction_types: dict[str, int] = {}
 
+    def block_revision_conflicts(
+        blockers: list[dict[str, Any]],
+    ) -> tuple[Path, dict[str, Any]]:
+        # This is deliberately in-memory only. A re-export attempt after a
+        # trace grows must not overwrite or delete the already-reviewed,
+        # pinned artifact for the older revision.
+        manifest["blocked"] = True
+        manifest["block_reason"] = "revision_conflict"
+        manifest["block_message"] = (
+            "One or more traces changed after selection. Review the updated "
+            "trace and create a new share."
+        )
+        manifest["blocked_sessions"] = blockers
+        return export_dir, manifest
+
+    stale_rows = share_revision_blockers(conn, share_id)
+    if stale_rows:
+        return block_revision_conflicts(stale_rows)
+
+    # Re-read the linked rows so the export uses authoritative create-time
+    # snapshots even if its caller holds an older share dictionary.
+    current_share = get_share(conn, share_id)
+    selected_sessions = (
+        current_share.get("sessions", []) if current_share is not None else []
+    )
+    prepared: list[tuple[dict[str, Any], dict[str, Any], str, str | None]] = []
+    skipped_session_ids: list[str] = []
+    preflight_blockers: list[dict[str, Any]] = []
+    for selected in selected_sessions:
+        session_id = selected["session_id"]
+        if session_matches_excluded_projects(selected, excluded_projects):
+            skipped_session_ids.append(session_id)
+            continue
+        detail = get_session_detail(conn, session_id)
+        if detail is None:
+            skipped_session_ids.append(session_id)
+            continue
+        expected_revision = selected.get("share_content_revision")
+        actual_revision = compute_content_revision(detail)
+        if actual_revision != expected_revision:
+            preflight_blockers.append({
+                "session_id": session_id,
+                "expected_revision_hash": expected_revision,
+                "current_revision_hash": actual_revision,
+                "review_status": selected.get("review_status"),
+            })
+            continue
+        prepared.append((
+            selected,
+            detail,
+            actual_revision,
+            selected.get("share_replaces_revision"),
+        ))
+    if preflight_blockers:
+        return block_revision_conflicts(preflight_blockers)
+
     try:
         with open(tmp_sessions_file, "w") as f:
-            for s in share.get("sessions", []):
-                if session_matches_excluded_projects(s, excluded_projects):
-                    continue
-                detail = get_session_detail(conn, s["session_id"])
-                if detail:
-                    detail, n_redacted, redaction_log = apply_share_redactions(
-                        conn,
-                        detail,
-                        custom_strings=custom_strings,
-                        user_allowlist=allowlist_entries,
-                        extra_usernames=extra_usernames,
-                        blocked_domains=blocked_domains,
+            for selected, detail, revision_hash, replaces_revision_hash in prepared:
+                detail, n_redacted, redaction_log = apply_share_redactions(
+                    conn,
+                    detail,
+                    custom_strings=custom_strings,
+                    user_allowlist=allowlist_entries,
+                    extra_usernames=extra_usernames,
+                    blocked_domains=blocked_domains,
+                )
+                total_redactions += n_redacted
+                for entry in redaction_log:
+                    rtype = entry.get("type", "unknown")
+                    redaction_types[rtype] = redaction_types.get(rtype, 0) + 1
+                # Custom string redactions are counted in n_redacted but
+                # don't produce log entries — track them separately.
+                custom_count = n_redacted - len(redaction_log)
+                if custom_count > 0:
+                    redaction_types["custom"] = (
+                        redaction_types.get("custom", 0) + custom_count
                     )
-                    total_redactions += n_redacted
-                    for entry in redaction_log:
-                        rtype = entry.get("type", "unknown")
-                        redaction_types[rtype] = redaction_types.get(rtype, 0) + 1
-                    # Custom string redactions are counted in n_redacted but
-                    # don't produce log entries — track them separately.
-                    custom_count = n_redacted - len(redaction_log)
-                    if custom_count > 0:
-                        redaction_types["custom"] = redaction_types.get("custom", 0) + custom_count
-                    clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
-                    f.write(json.dumps(clean, default=str) + "\n")
-                    manifest["sessions"].append({
-                        "session_id": clean.get("session_id") or s["session_id"],
-                        "project": clean.get("project"),
-                        "source": clean.get("source"),
-                        "model": clean.get("model"),
-                        # Aggregated counts per §Bundle manifest provenance —
-                        # no hashes, plaintext, or offsets.
-                        "redactions": build_session_redactions_summary(
-                            conn, s["session_id"],
-                        ),
-                    })
+                clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
+                clean["revision_hash"] = revision_hash
+                clean["replaces_revision_hash"] = replaces_revision_hash
+                f.write(json.dumps(clean, default=str) + "\n")
+                manifest["sessions"].append({
+                    "session_id": clean.get("session_id") or selected["session_id"],
+                    "project": clean.get("project"),
+                    "source": clean.get("source"),
+                    "model": clean.get("model"),
+                    "revision_hash": revision_hash,
+                    "replaces_revision_hash": replaces_revision_hash,
+                    # Aggregated counts per §Bundle manifest provenance —
+                    # no hashes, plaintext, or offsets.
+                    "redactions": build_session_redactions_summary(
+                        conn, selected["session_id"],
+                    ),
+                })
         os.replace(tmp_sessions_file, sessions_file)
     except BaseException:
         tmp_sessions_file.unlink(missing_ok=True)
@@ -4034,6 +4601,22 @@ def export_share_to_disk(
     trufflehog_scanner.write_report(export_dir / "trufflehog.json", trufflehog_report)
     manifest["redaction_summary"]["trufflehog"] = trufflehog_report.summary()
 
+    # A successful share baseline must describe only emitted sessions. Remove
+    # selections filtered out during packaging instead of letting their
+    # create-time snapshots masquerade as uploaded revisions later. Defer DB
+    # mutation until all scanners complete so an exception leaves no open
+    # partial selection change.
+    for session_id in skipped_session_ids:
+        conn.execute(
+            "DELETE FROM share_sessions WHERE share_id = ? AND session_id = ?",
+            (share_id, session_id),
+        )
+        conn.execute(
+            "UPDATE sessions SET share_id = NULL "
+            "WHERE session_id = ? AND share_id = ?",
+            (session_id, share_id),
+        )
+
     if trufflehog_report.blocking:
         manifest["blocked"] = True
         manifest["block_reason"] = trufflehog_report.block_reason
@@ -4047,8 +4630,8 @@ def export_share_to_disk(
         # but do NOT advance status to shared/exported — that would
         # silently imply the share is clean.
         conn.execute(
-            "UPDATE shares SET manifest = ? WHERE share_id = ?",
-            (json.dumps(manifest, default=str), share_id),
+            "UPDATE shares SET session_count = ?, manifest = ? WHERE share_id = ?",
+            (manifest["session_count"], json.dumps(manifest, default=str), share_id),
         )
         conn.commit()
         return export_dir, manifest
@@ -4058,8 +4641,14 @@ def export_share_to_disk(
 
     next_status = "shared" if share.get("status") == "shared" else "exported"
     conn.execute(
-        "UPDATE shares SET status = ?, manifest = ? WHERE share_id = ?",
-        (next_status, json.dumps(manifest, default=str), share_id),
+        "UPDATE shares SET status = ?, session_count = ?, manifest = ? "
+        "WHERE share_id = ?",
+        (
+            next_status,
+            manifest["session_count"],
+            json.dumps(manifest, default=str),
+            share_id,
+        ),
     )
     conn.commit()
 

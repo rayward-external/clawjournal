@@ -4,6 +4,8 @@ import type { BlockedShareSession, ReadySession } from './types.ts';
 import { SHARE_SHELL_WIDTH, btnPrimary, btnSecondary } from './styles.tsx';
 import { Icon } from './shared.tsx';
 
+const PACKAGE_ANIMATION_TRACE_LIMIT = 20;
+
 export interface PackageStepProps {
   stepperHeader: React.ReactNode;
   approvedCount: number;
@@ -31,7 +33,7 @@ export function PackageStep(p: PackageStepProps) {
   useEffect(() => {
     if (p.failed) return;
     const timers: number[] = [];
-    p.approvedList.forEach((s, i) => {
+    p.approvedList.slice(0, PACKAGE_ANIMATION_TRACE_LIMIT).forEach((s, i) => {
       timers.push(window.setTimeout(() => {
         setFlying((prev) => [...prev, { id: `${s.session_id}-${Date.now()}-${i}`, title: `${s.session_id.slice(0, 10)}.jsonl` }]);
       }, 400 + i * 220));

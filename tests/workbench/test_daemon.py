@@ -514,6 +514,29 @@ class TestSessionsAPI:
         assert data["ai_coverage"] == "disabled"
         assert any(entry["type"] == "blocked_domain" for entry in data["redaction_log"])
 
+    def test_redaction_report_ai_review_uses_bounded_configured_timeout(
+        self, server, monkeypatch
+    ):
+        captured = {}
+
+        def fake_review(session, **kwargs):
+            captured["session_id"] = session["session_id"]
+            captured["timeout_seconds"] = kwargs["timeout_seconds"]
+            return []
+
+        monkeypatch.setenv("CLAWJOURNAL_UPLOAD_PII_TIMEOUT_SECONDS", "23")
+        monkeypatch.setattr(
+            "clawjournal.redaction.pii.review_session_pii_with_agent", fake_review
+        )
+
+        status, data = _get(
+            server, "/api/sessions/sess-0/redaction-report?ai_pii=1"
+        )
+
+        assert status == 200
+        assert data["ai_coverage"] == "full"
+        assert captured == {"session_id": "sess-0", "timeout_seconds": 23}
+
     def test_update_session_status(self, server):
         status, data = _post(server, "/api/sessions/sess-0", {"status": "approved"})
         assert status == 200
@@ -681,6 +704,49 @@ class TestScanner:
         assert seen["source_filter"] == "cursor"
         assert called["linked"] is True
         assert scanner.last_linked_count == 3
+
+    def test_scan_once_tracks_updated_and_unchanged_sessions(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+        monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [
+                {"source": "codex", "dir_name": "project", "locator": None}
+            ],
+        )
+        parsed = [{"session_id": "existing-session"}]
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.parse_project_sessions",
+            lambda *args, **kwargs: parsed,
+        )
+
+        def fake_upsert(conn, sessions, *, stats=None):
+            assert sessions is parsed
+            assert stats is not None
+            stats.update(inserted=0, updated=1, unchanged=2)
+            return 0
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.upsert_sessions", fake_upsert)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.run_findings_pipeline",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+
+        scanner = Scanner(source_filter="codex")
+        results = scanner.scan_once()
+
+        assert results == {"codex": 0}
+        assert scanner.last_updated_count == 1
+        assert scanner.last_unchanged_count == 2
+        assert scanner.last_updated_by_source == {"codex": 1}
+        assert scanner.last_unchanged_by_source == {"codex": 2}
 
     def test_score_unscored_once_uses_default_agent_scoring(self, tmp_path, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
@@ -1087,6 +1153,27 @@ class TestScanner:
         assert settings["blocked_domains"] == ["api.internal"]
 
 
+class TestScanAPI:
+    def test_endpoint_reports_new_updated_and_unchanged_by_source(
+        self, server_with_scanner, monkeypatch
+    ):
+        port, scanner = server_with_scanner
+        scanner.scan_once = lambda: {"codex": 0, "claude": 2}
+        scanner.last_updated_by_source = {"codex": 1}
+        scanner.last_unchanged_by_source = {"codex": 4, "claude": 3}
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.trigger_scoring_warmup",
+            lambda active_scanner: {"status": "disabled"},
+        )
+
+        status, data = _post(port, "/api/scan")
+
+        assert status == 200
+        assert data["new_sessions"] == {"codex": 0, "claude": 2}
+        assert data["updated_sessions"] == {"codex": 1}
+        assert data["unchanged_sessions"] == {"codex": 4, "claude": 3}
+
+
 class TestScoringWarmupAPI:
     def test_endpoint_returns_disabled_without_scanner(self, server):
         status, data = _post(server, "/api/scoring/warmup")
@@ -1336,6 +1423,103 @@ class TestSharesAPI:
     def test_create_empty_fails(self, server):
         status, data = _post(server, "/api/shares", {"session_ids": []})
         assert status == 400
+
+    def test_create_rejects_revision_changed_after_ui_review(self, server):
+        conn = open_index()
+        try:
+            reviewed_revision = conn.execute(
+                "SELECT content_revision FROM sessions WHERE session_id = 'sess-0'"
+            ).fetchone()[0]
+            session = {
+                "session_id": "sess-0",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [
+                    {"role": "user", "content": "Task 0: extended result", "tool_uses": []},
+                    {"role": "assistant", "content": "Done.", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 1,
+                    "tool_uses": 0,
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                },
+            }
+            upsert_sessions(conn, [session])
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0"],
+            "expected_revisions": {"sess-0": reviewed_revision},
+        })
+
+        assert status == 409
+        assert data["block_reason"] == "revision_conflict"
+        assert data["blockers"][0]["session_id"] == "sess-0"
+
+    def test_create_rejects_exact_revision_already_shared(self, server):
+        from clawjournal.workbench.index import create_share
+
+        conn = open_index()
+        try:
+            first_share = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+                ("2026-07-01T00:00:00+00:00", first_share),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0"],
+        })
+
+        assert status == 409
+        assert "already shared" in data["error"]
+        assert data["blockers"][0]["session_id"] == "sess-0"
+
+    def test_create_rejects_unapproved_extension_of_shared_trace(self, server):
+        from clawjournal.workbench.index import create_share
+
+        conn = open_index()
+        try:
+            first_share = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status = 'shared', shared_at = ? WHERE share_id = ?",
+                ("2026-07-01T00:00:00+00:00", first_share),
+            )
+            conn.commit()
+            upsert_sessions(conn, [{
+                "session_id": "sess-0",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [
+                    {"role": "user", "content": "Task 0: extended result", "tool_uses": []},
+                    {"role": "assistant", "content": "A new iteration.", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 1,
+                    "tool_uses": 0,
+                    "input_tokens": 120,
+                    "output_tokens": 60,
+                },
+            }])
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["sess-0"],
+        })
+
+        assert status == 409
+        assert "fresh approval" in data["error"]
+        assert data["blockers"][0]["review_status"] == "new"
 
     def test_create_rejects_sessions_outside_configured_source_scope(self, server, monkeypatch):
         monkeypatch.setattr(
@@ -1967,6 +2151,89 @@ def test_redaction_settings_fingerprint_covers_all_inputs():
         _redaction_settings_fingerprint({**base, "custom_strings": ["b", "a", "c"]})
         == _redaction_settings_fingerprint({**base, "custom_strings": ["c", "a", "b"]})
     )
+
+
+class TestSelfHostedRevisionConflicts:
+    def _share(self, monkeypatch):
+        from clawjournal.workbench.index import create_share
+
+        _mock_trufflehog_clean(monkeypatch)
+        conn = open_index()
+        set_hold_state(conn, "sess-0", "released", changed_by="user")
+        share_id = create_share(conn, ["sess-0"])
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._ensure_self_hosted_upload_credentials",
+            lambda: ("test@university.edu", "token"),
+        )
+        return conn, share_id
+
+    @staticmethod
+    def _conflict_response(req, *, matching: bool):
+        import re
+
+        body = req.data.decode("utf-8", errors="replace")
+        match = re.search(
+            r'name="bundle_hash"\r\n\r\n([0-9a-f]{64})\r\n',
+            body,
+        )
+        assert match is not None
+        confirmed_hash = match.group(1) if matching else "0" * 64
+        payload = json.dumps({
+            "error": "already exists",
+            "idempotent": True,
+            "bundle_hash": confirmed_hash,
+            "gcs_uri": "gs://test/existing/sessions.jsonl",
+        }).encode()
+        raise urllib.error.HTTPError(
+            req.full_url,
+            409,
+            "Conflict",
+            hdrs=None,
+            fp=BytesIO(payload),
+        )
+
+    def test_accepts_only_proven_same_bundle_409(self, index_setup, monkeypatch):
+        from clawjournal.workbench.daemon import upload_share_to_self_hosted_ingest
+
+        conn, share_id = self._share(monkeypatch)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            lambda req, timeout: self._conflict_response(req, matching=True),
+        )
+        try:
+            result = upload_share_to_self_hosted_ingest(conn, share_id)
+            row = conn.execute(
+                "SELECT status, shared_at FROM shares WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert result["ok"] is True
+        assert row["status"] == "shared"
+        assert row["shared_at"] is not None
+
+    def test_rejects_mismatched_409_without_marking_shared(
+        self, index_setup, monkeypatch
+    ):
+        from clawjournal.workbench.daemon import upload_share_to_self_hosted_ingest
+
+        conn, share_id = self._share(monkeypatch)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            lambda req, timeout: self._conflict_response(req, matching=False),
+        )
+        try:
+            result = upload_share_to_self_hosted_ingest(conn, share_id)
+            row = conn.execute(
+                "SELECT status, shared_at FROM shares WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert result["status"] == 409
+        assert tuple(row) == ("exported", None)
 
 
 def test_upload_pii_redaction_runs_sessions_in_parallel(tmp_path, monkeypatch):
@@ -2624,6 +2891,66 @@ class TestShareAPI:
         assert data["blockers"][0]["session_id"] == "qs-held"
         assert data["blockers"][0]["hold_state"] == "pending_review"
 
+    def test_quick_share_rejects_exact_revision_already_shared(self, server):
+        from clawjournal.workbench.index import create_share
+
+        WorkbenchHandler._last_share_time = 0.0
+        conn = open_index()
+        try:
+            share_id = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", share_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/quick-share", {
+            "session_ids": ["sess-0"],
+        })
+
+        assert status == 409
+        assert "already shared" in data["error"]
+
+    def test_quick_share_rejects_unapproved_extension(self, server):
+        from clawjournal.workbench.index import create_share
+
+        WorkbenchHandler._last_share_time = 0.0
+        conn = open_index()
+        try:
+            share_id = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", share_id),
+            )
+            conn.commit()
+            upsert_sessions(conn, [{
+                "session_id": "sess-0",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [
+                    {"role": "user", "content": "extended iteration", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 0,
+                    "tool_uses": 0,
+                    "input_tokens": 100,
+                    "output_tokens": 0,
+                },
+            }])
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/quick-share", {
+            "session_ids": ["sess-0"],
+        })
+
+        assert status == 409
+        assert "fresh approval" in data["error"]
+
     def test_share_duplicate_prevention(self, server, monkeypatch):
         """Already-submitted bundle → 409; force surfaces a clearer message."""
         WorkbenchHandler._last_share_time = 0.0
@@ -2647,6 +2974,63 @@ class TestShareAPI:
         assert status == 409
         assert "cannot be overwritten" in data["error"]
         assert data["receipt_id"] == "rcpt-test-123"
+
+    def test_hosted_upload_rejects_stale_replacement_predecessor(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench.index import create_share, update_session
+
+        WorkbenchHandler._last_share_time = 0.0
+        conn = open_index()
+        try:
+            set_hold_state(conn, "sess-0", "released", changed_by="user")
+            share_r1 = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", share_r1),
+            )
+            conn.commit()
+
+            upsert_sessions(conn, [{
+                "session_id": "sess-0",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "revision two"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            }])
+            update_session(conn, "sess-0", status="approved")
+            share_r2 = create_share(conn, ["sess-0"])
+
+            upsert_sessions(conn, [{
+                "session_id": "sess-0",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "revision three"}],
+                "stats": {"user_messages": 1, "assistant_messages": 0, "tool_uses": 0},
+            }])
+            update_session(conn, "sess-0", status="approved")
+            share_r3 = create_share(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-03T00:00:00+00:00", share_r3),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config", lambda: _share_config()
+        )
+        status, data = _post(
+            server,
+            f"/api/shares/{share_r2}/upload",
+            self._consent_body(),
+        )
+
+        assert status == 409
+        assert data["blockers"][0]["reason"] == "stale_predecessor"
 
     def test_duplicate_receipt_returned_even_without_valid_token(self, server, monkeypatch):
         """Receipt hydration/retry should not require a still-valid upload token."""

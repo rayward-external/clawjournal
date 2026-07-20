@@ -129,6 +129,8 @@ function sourceInfo(s: Session): { label: string; color: string } {
     return { label: 'Claude Science', color: '#9333ea' };
   if (s.source === 'openclaw')
     return { label: 'OpenClaw', color: '#6b7280' };
+  if (s.source === 'workbuddy')
+    return { label: 'WorkBuddy', color: '#0f766e' };
   return { label: s.source, color: '#6b7280' };
 }
 
@@ -226,6 +228,15 @@ export function Inbox() {
       if (requestSeq !== loadRequestSeqRef.current) return;
       const visibleRows = data.slice(0, pageSize);
       setSessions(prev => append ? [...prev, ...visibleRows] : visibleRows);
+      // Sessions are an opt-out bulk-selection surface: select every row as it
+      // becomes visible, while preserving any choices already made on rows
+      // from earlier pages.
+      setSelectedIds(prev => {
+        if (!append) return new Set(visibleRows.map(s => s.session_id));
+        const next = new Set(prev);
+        visibleRows.forEach(s => next.add(s.session_id));
+        return next;
+      });
       setOffset(currentOffset);
       setHasMore(data.length > pageSize);
     } catch (e) {

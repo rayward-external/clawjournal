@@ -10,6 +10,8 @@ import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
 
+const QUEUE_PAGE_SIZE = 50;
+
 export interface QueueStepProps {
   stepperHeader: React.ReactNode;
   readyStats: ShareReadyStats | null;
@@ -43,8 +45,29 @@ export interface QueueStepProps {
   toast: (msg: string, kind?: 'success' | 'error') => void;
 }
 
+function UpdatedSinceShareBadge({ session }: { session: ReadySession }) {
+  if (!session.updated_since_last_share) return null;
+
+  return (
+    <span
+      title="This trace has new content since its most recent successful share."
+      style={{
+        display: 'inline-flex', alignItems: 'center', flexShrink: 0,
+        padding: '1px 6px', borderRadius: 999,
+        background: colors.primary50, border: `1px solid ${colors.primary200}`,
+        color: colors.primary700, fontSize: 10.5, fontWeight: 600,
+        lineHeight: '16px', whiteSpace: 'nowrap',
+      }}
+    >
+      Updated since last share
+    </span>
+  );
+}
+
 export function QueueStep(p: QueueStepProps) {
   const [dragId, setDragId] = useState<string | null>(null);
+  const [visibleQueueCount, setVisibleQueueCount] = useState(QUEUE_PAGE_SIZE);
+  const [visibleAvailableCount, setVisibleAvailableCount] = useState(QUEUE_PAGE_SIZE);
 
   const allSessions = p.readyStats?.sessions || [];
   // `total_approved` counts every approved session; `allSessions` only holds the
@@ -54,6 +77,8 @@ export function QueueStep(p: QueueStepProps) {
   const totalApproved = p.readyStats?.total_approved ?? 0;
   const totalTokens = p.queuedSessions.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
   const uniqueProjects = [...new Set(p.queuedSessions.map(s => s.project).filter(Boolean))];
+  const visibleQueuedSessions = p.queuedSessions.slice(0, visibleQueueCount);
+  const hiddenQueueCount = p.queuedSessions.length - visibleQueuedSessions.length;
 
   const onDragStart = (e: React.DragEvent, id: string) => {
     setDragId(id);
@@ -70,10 +95,11 @@ export function QueueStep(p: QueueStepProps) {
   // Add-traces filter list (everything not in queue)
   const sources = [...new Set(allSessions.map(s => s.source).filter(Boolean))].sort();
   const projects = [...new Set(allSessions.map(s => s.project).filter(Boolean))].sort();
+  const queuedIds = new Set(p.queueOrder);
   // eslint-disable-next-line react-hooks/purity
   const dateCutoffMs = p.dateFilter ? (Date.now() - ((p.dateFilter === '7d' ? 7 : p.dateFilter === '30d' ? 30 : 90) * 86_400_000)) : null;
 
-  const available = allSessions.filter((s) => !p.queueOrder.includes(s.session_id)).filter(s => {
+  const available = allSessions.filter((s) => !queuedIds.has(s.session_id)).filter(s => {
     if (p.searchQuery && !(s.display_title || '').toLowerCase().includes(p.searchQuery.toLowerCase())
       && !(s.project || '').toLowerCase().includes(p.searchQuery.toLowerCase())) return false;
     if (p.sourceFilter && s.source !== p.sourceFilter) return false;
@@ -82,6 +108,8 @@ export function QueueStep(p: QueueStepProps) {
     if (dateCutoffMs && (!s.start_time || new Date(s.start_time).getTime() < dateCutoffMs)) return false;
     return true;
   });
+  const visibleAvailable = available.slice(0, visibleAvailableCount);
+  const hiddenAvailableCount = available.length - visibleAvailable.length;
 
   const historyShares = p.shares.filter(b => b.status === 'shared' || b.status === 'exported');
 
@@ -137,18 +165,21 @@ export function QueueStep(p: QueueStepProps) {
           <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
             {allSessions.length === p.queuedSessions.length ? 'All available traces are already in the queue.' : 'No sessions match your filters.'}
           </div>
-        ) : available.map((s, i) => (
+        ) : visibleAvailable.map((s, i) => (
           <div key={s.session_id} style={{
             display: 'grid', gridTemplateColumns: '1fr auto', gap: 10,
             alignItems: 'center', padding: '8px 12px',
-            borderBottom: i < available.length - 1 ? `1px solid ${colors.gray100}` : 'none',
+            borderBottom: i < visibleAvailable.length - 1 ? `1px solid ${colors.gray100}` : 'none',
           }}>
             <div style={{ minWidth: 0 }}>
-              <div style={{
-                fontSize: 13, color: colors.gray900, fontWeight: 500,
-                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-              }}>
-                {s.display_title || 'Untitled'}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                <span style={{
+                  minWidth: 0, fontSize: 13, color: colors.gray900, fontWeight: 500,
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {s.display_title || 'Untitled'}
+                </span>
+                <UpdatedSinceShareBadge session={s} />
               </div>
               <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
                 <SourceBadge s={s} />
@@ -168,6 +199,17 @@ export function QueueStep(p: QueueStepProps) {
           </div>
         ))}
       </div>
+      {hiddenAvailableCount > 0 && (
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: 8 }}>
+          <button
+            onClick={() => setVisibleAvailableCount((count) => count + QUEUE_PAGE_SIZE)}
+            style={btnSecondary}
+          >
+            Show {Math.min(QUEUE_PAGE_SIZE, hiddenAvailableCount)} more
+            <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenAvailableCount} remaining)</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 
@@ -310,7 +352,7 @@ export function QueueStep(p: QueueStepProps) {
 
           {/* Trace list */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 18 }} onDragEnd={onDragEnd}>
-            {p.queuedSessions.map((s) => {
+            {visibleQueuedSessions.map((s) => {
               const isDragging = dragId === s.session_id;
               return (
                 <div
@@ -334,11 +376,14 @@ export function QueueStep(p: QueueStepProps) {
                     <Icon name="grip" size={14} />
                   </div>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{
-                      fontSize: 13.5, color: colors.gray900, fontWeight: 500,
-                      whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                    }}>
-                      {s.display_title || 'Untitled'}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                      <span style={{
+                        minWidth: 0, fontSize: 13.5, color: colors.gray900, fontWeight: 500,
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                      }}>
+                        {s.display_title || 'Untitled'}
+                      </span>
+                      <UpdatedSinceShareBadge session={s} />
                     </div>
                     {/* Row 1: source · project · tokens · tools */}
                     <div style={{ fontSize: 11.5, color: colors.gray500, display: 'flex', gap: 8, alignItems: 'center', marginTop: 2, flexWrap: 'nowrap', overflow: 'hidden' }}>
@@ -408,6 +453,17 @@ export function QueueStep(p: QueueStepProps) {
                 </div>
               );
             })}
+            {hiddenQueueCount > 0 && (
+              <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 4 }}>
+                <button
+                  onClick={() => setVisibleQueueCount((count) => count + QUEUE_PAGE_SIZE)}
+                  style={btnSecondary}
+                >
+                  Show {Math.min(QUEUE_PAGE_SIZE, hiddenQueueCount)} more
+                  <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenQueueCount} remaining)</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Add more traces */}

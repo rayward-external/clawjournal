@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { RedactedText } from '../../components/RedactedText.tsx';
 import { ToolUseCard } from '../../components/ToolUseCard.tsx';
 import { colors } from '../../theme.ts';
@@ -5,6 +6,8 @@ import type { ReadySession, RedactedSessionData } from './types.ts';
 import { aggregateCategories, classify, formatTokens, hexAlpha, sessionTotalTokens } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { HelpModal, Icon, SourceBadge, StatusDot, ThinkingBlock, UsageDisclosure } from './shared.tsx';
+
+const REVIEW_PAGE_SIZE = 50;
 
 export interface ReviewStepProps {
   stepperHeader: React.ReactNode;
@@ -26,6 +29,7 @@ export interface ReviewStepProps {
 }
 
 export function ReviewStep(p: ReviewStepProps) {
+  const [visibleCount, setVisibleCount] = useState(REVIEW_PAGE_SIZE);
   const sorted = [...p.queuedSessions].sort((a, b) => {
     const sa = classify(p.redactedSessions[a.session_id]);
     const sb = classify(p.redactedSessions[b.session_id]);
@@ -38,6 +42,8 @@ export function ReviewStep(p: ReviewStepProps) {
   const cleanUnapprovedCount = p.queuedSessions.filter((s) => (
     classify(p.redactedSessions[s.session_id]) === 'clear' && !p.approvedIds.has(s.session_id)
   )).length;
+  const visibleSessions = sorted.slice(0, visibleCount);
+  const hiddenCount = sorted.length - visibleSessions.length;
 
   return (
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
@@ -93,7 +99,7 @@ export function ReviewStep(p: ReviewStepProps) {
       </div>
 
       <div>
-        {sorted.map((s) => (
+        {visibleSessions.map((s) => (
           <ReviewRow
             key={s.session_id}
             session={s}
@@ -107,6 +113,17 @@ export function ReviewStep(p: ReviewStepProps) {
             onRetryAi={() => p.onRetryAi(s.session_id)}
           />
         ))}
+        {hiddenCount > 0 && (
+          <div style={{ display: 'flex', justifyContent: 'center', marginTop: 10 }}>
+            <button
+              onClick={() => setVisibleCount((count) => count + REVIEW_PAGE_SIZE)}
+              style={btnSecondary}
+            >
+              Show {Math.min(REVIEW_PAGE_SIZE, hiddenCount)} more
+              <span style={{ color: colors.gray400, fontWeight: 400 }}>({hiddenCount} remaining)</span>
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={{
@@ -271,12 +288,15 @@ function ReviewRow({
               {!approved && aiUnavailable && (
                 <button
                   onClick={onRetryAi}
+                  disabled={data?.loading}
                   style={{
                     ...btnGhost, color: colors.primary500, fontSize: 12.5,
                     border: `1px solid ${colors.primary200}`, padding: '4px 8px', background: colors.white,
+                    opacity: data?.loading ? 0.55 : 1,
+                    cursor: data?.loading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  <Icon name="retry" size={12} /> Retry AI
+                  <Icon name="retry" size={12} /> {data?.loading ? 'Retrying...' : 'Retry AI'}
                 </button>
               )}
             </div>

@@ -9,6 +9,7 @@ const SOURCE_ICONS: Record<string, string> = {
   'claude-science': 'CS',
   codex: 'CX',
   openclaw: 'OC',
+  workbuddy: 'WB',
 };
 
 function formatDuration(seconds: number | null): string {
