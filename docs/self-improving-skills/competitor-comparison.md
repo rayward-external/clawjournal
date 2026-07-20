@@ -97,7 +97,7 @@ No other project in the field combines all of the following; these are ClawJourn
 
 2. **A mandatory deterministic privacy/egress gate on personal data.** Anonymize-before-any-AI-call + deterministic secrets scrub + **TruffleHog hard-deny** + hold-state upload gating. Among the personal-history miners, this is unique: Lore, claude-reflect, openclaw, Aristotle, and supervisor all lack a deterministic scrub/egress gate (most sidestep it by not egressing). agentmemory strips secrets but has no TruffleHog-style hard-deny.
 
-3. **A single capped, recency-decayed, human-previewed lessons skill (≤5 per skill, ≤10 installed).** Nearly every analog produces *unbounded, growing* output (claude-reflect's CLAUDE.md accretion, ECC's hundreds of skills, agentmemory's memory graph) or diffs into an existing file (openclaw). The disciplined budget + recency decay is rare outside the benchmark optimizers.
+3. **A single capped, recency-decayed, human-previewed lessons skill (≤5 active installed).** Nearly every analog produces *unbounded, growing* output (claude-reflect's CLAUDE.md accretion, ECC's hundreds of skills, agentmemory's memory graph) or diffs into an existing file (openclaw). The disciplined budget + recency decay is rare outside the benchmark optimizers.
 
 4. **Automated recurring weekly re-distill with stronger-replaces-weakest AND rejected-fingerprint suppression, together.** openclaw has the weekly cron + suppression; Aristotle has the suppression; SkillOpt has the rejected-edit buffer + validation-gated replacement — but only ClawJournal combines the scheduled cadence, the capped weakest-replacement merge, AND the never-re-propose-unchanged suppression in one loop over lived personal history.
 
@@ -120,6 +120,6 @@ The honest caveat: on **validation**, ClawJournal is *weaker* than the research 
 - **Falsifiable-claim taxonomy** (align): the 6-category correct/wrong/almost/needs-nuance/cant-verify/skipped decomposition turns fuzzy human corrections into structured, gradable signal.
 - **Learnable skill-bank management policy + multi-granularity tiering** (CODESKILL, SkillX): frame add/evolve/prune as an explicit policy, and tier rules by specificity (planning/functional/atomic) rather than a flat list.
 - **Surrogate co-evolving verifier** (CoEvoSkills): a learned proxy critic that gives actionable feedback without ground-truth tests — a candidate remedy for ClawJournal's validation gap where no held-out replay exists.
-- **Retrieval-gated skill injection** (SkillAdaptor / SkillX): attach a lesson only when embedding-relevant to the current task, so the ≤5/≤10 budget isn't spent on irrelevant rules.
+- **Retrieval-gated skill injection** (SkillAdaptor / SkillX): attach a lesson only when embedding-relevant to the current task, so the active ≤5 budget isn't spent on irrelevant rules.
 - **Measured false-positive rate as an observational quality metric** (openclaw-self-evolving): report a concrete FP rate for proposed rules to make "directional" validation less hand-wavy.
 - **Recency-windowed candidate-review UX** (SpecStory Lore's "/lore last 30 days, just show candidates"; skill-builder's `--days`): dry-run "show me the candidates for the last N days" before install, reinforcing the human gate.

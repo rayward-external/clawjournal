@@ -356,7 +356,7 @@ mapped to where each would land:
   where no held-out replay / ground-truth test exists — a candidate remedy for the validation
   gap without benchmark tasks.
 - **Retrieval-gated skill injection** (SkillAdaptor / SkillX) → attach a lesson only when
-  embedding-relevant to the task, so the ≤5/≤10 budget isn't spent on irrelevant rules (Mode B).
+  embedding-relevant to the task, so the active ≤5 budget isn't spent on irrelevant rules (Mode B).
 - **Falsifiable-claim taxonomy** (align) → §6 signal: the 6-category correct/wrong/almost/
   needs-nuance/cant-verify/skipped decomposition structures fuzzy human corrections.
 - **Positive "what-worked" reinforcement channel** (SpecStory / claude-reflect) → §6 good-cases

@@ -22,6 +22,9 @@ END_MARKER = "<!-- END clawjournal-lessons -->"
 
 
 def claude_skill_path() -> Path:
+    # Path.home(), not $HOME: on Windows the agents resolve their global dirs
+    # from USERPROFILE (as Path.home() does), and Git Bash/MSYS commonly set
+    # HOME to a different path the agents never read.
     return Path.home() / ".claude" / "skills" / SKILL_NAME / "SKILL.md"
 
 
