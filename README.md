@@ -143,7 +143,7 @@ Install an optional **ClawJournal** shortcut on Windows, macOS, or Linux after t
 clawjournal desktop install
 ```
 
-One click opens the local workbench and starts a fresh background scan. If the daemon is already running, the shortcut reuses it and requests a new scan. Its face is a big smile on the day you open ClawJournal, becomes progressively sadder on local calendar Days 1–9, and reaches a dramatic crying face on Day 10 (and later). The eleven icons are rendered locally, and a user-level daily task keeps the displayed expression current; if that task cannot be registered, the icon still refreshes at login and whenever ClawJournal opens.
+One click opens the local workbench and starts a fresh background scan. If the daemon is already running, the shortcut reuses it and requests a new scan. Its face is a big smile on the day you open ClawJournal, becomes progressively sadder on local calendar Days 1–9, and reaches a dramatic crying face on Day 10 (and later). Loading the workbench in your browser counts as opening it, so a pinned tab against an already-running daemon resets the face too. The eleven icons are rendered locally, and a user-level daily task keeps the displayed expression current; if that task cannot be registered, the icon still refreshes at login and whenever ClawJournal opens.
 
 ```bash
 clawjournal desktop status       # current shortcut, Day number, and mood

@@ -4073,6 +4073,18 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._serve_placeholder()
             return
 
+        if file_path.name == "index.html":
+            # Loading the workbench is what "opening ClawJournal" means to the
+            # user — a pinned tab against a long-lived daemon should reset the
+            # desktop icon just like relaunching the shortcut does. This is a
+            # no-op unless the optional desktop integration is installed, and
+            # does no work once an open is recorded for today.
+            try:
+                from ..desktop import note_opened
+                note_opened()
+            except Exception:  # noqa: BLE001 - never fail a page load over the icon
+                logger.debug("Desktop open notification failed", exc_info=True)
+
         content_types = {
             ".html": "text/html",
             ".js": "application/javascript",

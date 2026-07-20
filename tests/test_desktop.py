@@ -110,6 +110,103 @@ def test_note_opened_is_noop_until_installed(isolated_desktop: Path) -> None:
     assert not desktop.LAST_OPENED_FILE.exists()
 
 
+def test_note_opened_rewrites_only_on_a_new_day(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desktop.install()
+    refreshes: list[bool] = []
+    monkeypatch.setattr(desktop, "refresh", lambda *, quiet=False: refreshes.append(quiet))
+
+    # The daemon calls this on every index.html load; same-day opens must not
+    # rewrite the shortcut.
+    desktop.note_opened()
+    desktop.note_opened()
+    assert refreshes == []
+
+    desktop._write_last_opened(dt.datetime.now().astimezone() - dt.timedelta(days=3))
+    desktop.note_opened()
+    assert refreshes == [True]
+    assert desktop.opened_today() is True
+
+
+def test_install_refuses_to_clobber_a_foreign_file_despite_stale_state(
+    isolated_desktop: Path,
+) -> None:
+    """Ownership must be proven by the artifact, not by install.json."""
+    result = desktop.install()
+    shortcut = Path(result["shortcut"])
+
+    # The user removed our shortcut and put their own file at the same path,
+    # while install.json still names it.
+    shortcut.unlink()
+    shortcut.write_text("[Desktop Entry]\nName=My own launcher\n", encoding="utf-8")
+
+    with pytest.raises(desktop.DesktopError, match="Refusing to replace"):
+        desktop.install()
+    assert "My own launcher" in shortcut.read_text(encoding="utf-8")
+
+
+def test_uninstall_leaves_a_foreign_file_in_place(isolated_desktop: Path) -> None:
+    result = desktop.install()
+    shortcut = Path(result["shortcut"])
+    shortcut.unlink()
+    shortcut.write_text("[Desktop Entry]\nName=My own launcher\n", encoding="utf-8")
+
+    assert desktop.uninstall()["removed"] is True
+    assert shortcut.exists()
+
+
+def test_uninstall_rejects_an_unknown_platform(isolated_desktop: Path) -> None:
+    desktop._write_state({
+        "version": 1,
+        "platform": "haiku",
+        "shortcut": str(isolated_desktop / "Desktop" / "ClawJournal.desktop"),
+    })
+    with pytest.raises(desktop.DesktopError, match="Unknown desktop integration platform"):
+        desktop.uninstall()
+
+
+def test_windows_shortcut_ownership_is_detected_in_both_encodings(
+    isolated_desktop: Path,
+) -> None:
+    lnk = isolated_desktop / "Desktop" / "ClawJournal.lnk"
+    lnk.parent.mkdir(parents=True)
+
+    lnk.write_bytes(b"L\x00\x00\x00" + "windows-launch.py".encode("utf-16-le"))
+    assert desktop._windows_shortcut_is_managed(lnk) is True
+
+    lnk.write_bytes(b"L\x00\x00\x00" + b"clawjournal.cli")
+    assert desktop._windows_shortcut_is_managed(lnk) is True
+
+    lnk.write_bytes(b"L\x00\x00\x00" + "C:\\Games\\solitaire.exe".encode("utf-16-le"))
+    assert desktop._windows_shortcut_is_managed(lnk) is False
+
+
+def test_trim_log_keeps_the_recent_tail(isolated_desktop: Path) -> None:
+    desktop.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = "x" * 99 + "\n"
+    desktop.LOG_FILE.write_text(line * 40_000, encoding="utf-8")
+    assert desktop.LOG_FILE.stat().st_size > desktop.LOG_MAX_BYTES
+
+    desktop._trim_log()
+
+    trimmed = desktop.LOG_FILE.read_text(encoding="utf-8")
+    assert len(trimmed) <= desktop.LOG_MAX_BYTES // 2
+    # Whole lines only, and the newest content survives.
+    assert trimmed.startswith("x")
+    assert trimmed.endswith(line)
+
+    desktop._trim_log()  # already small enough: unchanged
+    assert desktop.LOG_FILE.read_text(encoding="utf-8") == trimmed
+
+
+def test_days_since_last_opened_accepts_a_naive_stamp(isolated_desktop: Path) -> None:
+    desktop.LAST_OPENED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    naive = dt.datetime.now() - dt.timedelta(days=4)
+    desktop.LAST_OPENED_FILE.write_text(naive.isoformat(timespec="seconds") + "\n", encoding="utf-8")
+    assert desktop.days_since_last_opened() == 4
+
+
 def test_launchers_start_outside_home_shadow_package(isolated_desktop: Path) -> None:
     shell_launcher = desktop._shell_launcher(desktop._command("desktop", "launch"), log=True)
     launcher_lines = shell_launcher.splitlines()

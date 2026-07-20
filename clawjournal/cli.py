@@ -4686,12 +4686,15 @@ def main() -> None:
         return
 
     if command == "serve":
-        # A manual `clawjournal serve` counts as opening the journal too, but
-        # does not create desktop state unless the optional shortcut exists.
-        from .desktop import note_opened
-        note_opened()
         from .workbench.daemon import RELOAD_CHILD_ENV, RELOAD_OPEN_BROWSER_ENV
         is_reload_child = os.environ.get(RELOAD_CHILD_ENV) == "1"
+
+        # A manual `clawjournal serve` counts as opening the journal too, but
+        # does not create desktop state unless the optional shortcut exists.
+        # Reload children are restarts of one session, not new opens.
+        if not is_reload_child:
+            from .desktop import note_opened
+            note_opened()
 
         # Supervisor: watch *.py and restart the server child on change. The
         # child re-runs this same command with RELOAD_CHILD_ENV set, so it falls

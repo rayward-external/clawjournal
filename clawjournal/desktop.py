@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +42,17 @@ LOG_FILE = STATE_DIR / "launcher.log"
 WINDOWS_BOOTSTRAP = STATE_DIR / "windows-launch.py"
 
 SHORTCUT_NAME = "ClawJournal"
+LINUX_MANAGED_MARKER = "X-ClawJournal-Managed=true"
 WINDOWS_TASK_NAME = "ClawJournal Desktop Icon"
 MACOS_LAUNCH_AGENT = "ai.rayward.clawjournal.desktop-icon"
 LINUX_SYSTEMD_UNIT = "clawjournal-desktop-icon"
 
 MAX_SAD_DAYS = 10
 ICON_SIZE = 256
+
+# The shortcut redirects the daemon's stdout/stderr here, and the daemon logs
+# every HTTP request, so the log needs a ceiling to stay bounded over months.
+LOG_MAX_BYTES = 1_000_000
 
 
 class DesktopError(RuntimeError):
@@ -111,8 +117,35 @@ def _write_last_opened(when: dt.datetime | None = None) -> None:
     atomic_write_text(LAST_OPENED_FILE, stamp + "\n", parents=True)
 
 
+def _trim_log() -> None:
+    """Keep the most recent half of an oversized launcher log.
+
+    Truncating in place rather than rotating matters: the POSIX launchers hand
+    the daemon an O_APPEND descriptor, which keeps writing to the open inode.
+    """
+    try:
+        if LOG_FILE.stat().st_size <= LOG_MAX_BYTES:
+            return
+        with LOG_FILE.open("rb") as handle:
+            handle.seek(-(LOG_MAX_BYTES // 2), os.SEEK_END)
+            handle.readline()  # discard the partial line at the seek point
+            tail = handle.read()
+        with LOG_FILE.open("wb") as handle:
+            handle.write(tail)
+    except OSError:
+        pass
+
+
 def _frontend_available() -> bool:
     return (Path(__file__).resolve().parent / "web" / "frontend" / "dist" / "index.html").is_file()
+
+
+def _read_last_opened() -> dt.datetime | None:
+    try:
+        opened = dt.datetime.fromisoformat(LAST_OPENED_FILE.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return opened if opened.tzinfo else opened.astimezone()
 
 
 def days_since_last_opened(now: dt.datetime | None = None) -> int:
@@ -120,14 +153,20 @@ def days_since_last_opened(now: dt.datetime | None = None) -> int:
     current = now or _now()
     if current.tzinfo is None:
         current = current.astimezone()
-    try:
-        opened = dt.datetime.fromisoformat(LAST_OPENED_FILE.read_text(encoding="utf-8").strip())
-        if opened.tzinfo is None:
-            opened = opened.astimezone()
-    except (FileNotFoundError, OSError, ValueError):
+    opened = _read_last_opened()
+    if opened is None:
         return 0
     elapsed = (current.date() - opened.astimezone(current.tzinfo).date()).days
     return max(0, min(MAX_SAD_DAYS, elapsed))
+
+
+def opened_today(now: dt.datetime | None = None) -> bool:
+    """Whether an open is already recorded for the current local calendar day."""
+    current = now or _now()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    opened = _read_last_opened()
+    return opened is not None and opened.astimezone(current.tzinfo).date() == current.date()
 
 
 class _Canvas:
@@ -500,7 +539,7 @@ def _linux_desktop_content(launcher: Path, icon: Path) -> str:
         "Terminal=false",
         "StartupNotify=true",
         "Categories=Utility;Development;",
-        "X-ClawJournal-Managed=true",
+        LINUX_MANAGED_MARKER,
         "",
     ])
 
@@ -513,25 +552,58 @@ def _desktop_exec_quote(path: Path) -> str:
     return f'"{value}"'
 
 
-def _ensure_available(path: Path, *, managed_marker: str | None = None) -> None:
-    if not path.exists() or _read_state() is not None:
+def _linux_entry_is_managed(path: Path) -> bool:
+    try:
+        return LINUX_MANAGED_MARKER in path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _macos_app_is_managed(path: Path) -> bool:
+    try:
+        info = plistlib.loads((path / "Contents" / "Info.plist").read_bytes())
+    except (FileNotFoundError, OSError, plistlib.InvalidFileException):
+        return False
+    return info.get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
+
+
+def _windows_shortcut_is_managed(path: Path) -> bool:
+    """A .lnk is ours when it still points at one of our own entry points.
+
+    .lnk is a binary format with no comment field, but the target and argument
+    strings are stored verbatim, so scan the raw bytes for our entry-point
+    names in both the ASCII and UTF-16LE encodings the format mixes.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    return any(
+        token.encode("ascii") in raw or token.encode("utf-16-le") in raw
+        for token in (WINDOWS_BOOTSTRAP.name, "clawjournal.cli")
+    )
+
+
+def _ensure_available(path: Path, is_managed: Callable[[Path], bool]) -> None:
+    """Refuse to clobber anything at the shortcut path we did not create.
+
+    Ownership is proven by the artifact itself, never by the presence of our
+    install state: a user can delete our shortcut and put their own file at
+    the same path while `install.json` still names it.
+    """
+    if not path.exists() or is_managed(path):
         return
-    if managed_marker:
-        try:
-            if managed_marker in path.read_text(encoding="utf-8"):
-                return
-        except (OSError, UnicodeDecodeError, IsADirectoryError):
-            pass
     raise DesktopError(f"Refusing to replace an existing item: {path}")
 
 
 def _install_windows(day: int) -> tuple[Path, str, list[str]]:
     shortcut = _desktop_dir("windows") / f"{SHORTCUT_NAME}.lnk"
     shortcut.parent.mkdir(parents=True, exist_ok=True)
-    _ensure_available(shortcut)
+    _ensure_available(shortcut, _windows_shortcut_is_managed)
+    # Writes the bootstrap the shortcut and the daily task both point at.
     _write_windows_shortcut(shortcut, ICONS_DIR / f"clawjournal-day-{day}.ico")
+    _notify_windows_shortcut(shortcut)
 
-    _write_windows_bootstrap()
     task_parts = [
         _windows_background_python(), str(WINDOWS_BOOTSTRAP),
         "desktop", "refresh", "--quiet",
@@ -547,12 +619,15 @@ def _install_windows(day: int) -> tuple[Path, str, list[str]]:
         warnings.append("Could not register the daily icon task; the face will still update whenever ClawJournal opens.")
         refresh_mode = "when opened"
     else:
-        # schtasks.exe defaults to refusing/terminating tasks on battery power.
-        # Icon refresh is tiny and should keep working on laptops unplugged.
+        # schtasks.exe defaults to refusing/terminating tasks on battery power,
+        # and to skipping a run outright if the machine was asleep at 09:00.
+        # Windows has no login-time fallback like the macOS and Linux paths, so
+        # -StartWhenAvailable is what keeps a laptop's icon from going stale.
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         settings_script = "; ".join([
             "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
-            "-DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)",
+            "-DontStopIfGoingOnBatteries -StartWhenAvailable "
+            "-ExecutionTimeLimit (New-TimeSpan -Minutes 5)",
             f"Set-ScheduledTask -TaskName {_powershell_quote(WINDOWS_TASK_NAME)} "
             "-Settings $settings | Out-Null",
         ])
@@ -561,20 +636,17 @@ def _install_windows(day: int) -> tuple[Path, str, list[str]]:
             "-Command", settings_script,
         ])
         if settings_result.returncode != 0:
-            warnings.append("The daily task was installed, but Windows kept its default battery restriction.")
+            warnings.append(
+                "The daily task was installed, but Windows kept its defaults: the icon "
+                "may not refresh on battery or after a missed run."
+            )
     return shortcut, refresh_mode, warnings
 
 
 def _install_macos(day: int) -> tuple[Path, str, list[str]]:
     app = _desktop_dir("macos") / f"{SHORTCUT_NAME}.app"
     info_path = app / "Contents" / "Info.plist"
-    if app.exists() and _read_state() is None:
-        try:
-            owned = plistlib.loads(info_path.read_bytes()).get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
-        except (FileNotFoundError, OSError, plistlib.InvalidFileException):
-            owned = False
-        if not owned:
-            raise DesktopError(f"Refusing to replace an existing item: {app}")
+    _ensure_available(app, _macos_app_is_managed)
     resources = app / "Contents" / "Resources"
     executable = app / "Contents" / "MacOS" / "ClawJournal"
     resources.mkdir(parents=True, exist_ok=True)
@@ -625,7 +697,7 @@ def _systemd_quote(path: Path) -> str:
 def _install_linux(day: int) -> tuple[Path, str, list[str]]:
     desktop = _desktop_dir("linux") / f"{SHORTCUT_NAME}.desktop"
     desktop.parent.mkdir(parents=True, exist_ok=True)
-    _ensure_available(desktop, managed_marker="X-ClawJournal-Managed=true")
+    _ensure_available(desktop, _linux_entry_is_managed)
     launcher = STATE_DIR / "launch"
     refresher = STATE_DIR / "refresh"
     _write_executable(launcher, _shell_launcher(_command("desktop", "launch"), log=True))
@@ -645,7 +717,7 @@ def _install_linux(day: int) -> tuple[Path, str, list[str]]:
         "\n".join([
             "[Desktop Entry]", "Type=Application", "Name=Refresh ClawJournal icon",
             f"Exec={_desktop_exec_quote(refresher)}", "Terminal=false", "NoDisplay=true",
-            "X-GNOME-Autostart-enabled=true", "X-ClawJournal-Managed=true", "",
+            "X-GNOME-Autostart-enabled=true", LINUX_MANAGED_MARKER, "",
         ]),
         parents=True,
     )
@@ -714,7 +786,8 @@ def install() -> dict[str, Any]:
         "installed_at": _now().isoformat(timespec="seconds"),
     }
     _write_state(state)
-    refresh(quiet=True)
+    # No refresh() here: each installer already wrote the Day `day` icon and
+    # notified the shell, so refreshing would just rewrite the shortcut again.
     return {**state, "day": day, "warnings": warnings}
 
 
@@ -737,20 +810,13 @@ def _remove_previous_shortcut(
     if same_path or not same_parent:
         return
     if platform_name == "windows":
-        _remove_file(previous)
+        if _windows_shortcut_is_managed(previous):
+            _remove_file(previous)
     elif platform_name == "linux":
-        try:
-            if "X-ClawJournal-Managed=true" in previous.read_text(encoding="utf-8"):
-                _remove_file(previous)
-        except (FileNotFoundError, OSError, UnicodeDecodeError):
-            pass
+        if _linux_entry_is_managed(previous):
+            _remove_file(previous)
     elif platform_name == "macos":
-        try:
-            info = plistlib.loads((previous / "Contents" / "Info.plist").read_bytes())
-            managed = info.get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
-        except (FileNotFoundError, OSError, plistlib.InvalidFileException):
-            managed = False
-        if managed:
+        if _macos_app_is_managed(previous):
             shutil.rmtree(previous)
 
 
@@ -819,8 +885,13 @@ def mood_label(day: int) -> str:
 
 
 def note_opened() -> None:
-    """Record an open only when the optional desktop integration exists."""
-    if _read_state() is None:
+    """Record an open only when the optional desktop integration exists.
+
+    Cheap to call repeatedly: the icon only ever changes on a calendar-day
+    boundary, so an open already recorded for today needs no shortcut rewrite.
+    That keeps this safe on the daemon's page-serving path.
+    """
+    if _read_state() is None or opened_today():
         return
     _write_last_opened()
     try:
@@ -861,6 +932,7 @@ def launch() -> None:
     """Open the workbench and ensure a scan happens, reusing a live daemon."""
     # pythonw.exe gives Windows a true no-console launcher. Preserve diagnostics
     # by supplying streams before logging and the daemon are initialized.
+    _trim_log()
     if sys.stdout is None or sys.stderr is None:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         log_stream = open(LOG_FILE, "a", encoding="utf-8", buffering=1)  # noqa: SIM115
@@ -899,19 +971,15 @@ def uninstall() -> dict[str, Any]:
     shortcut = Path(str(state.get("shortcut", "")))
     if platform_name == "windows":
         _run_quiet(["schtasks.exe", "/Delete", "/F", "/TN", WINDOWS_TASK_NAME])
-        _remove_file(shortcut)
-        _notify_windows_shortcut(shortcut)
+        if _windows_shortcut_is_managed(shortcut):
+            _remove_file(shortcut)
+            _notify_windows_shortcut(shortcut)
     elif platform_name == "macos":
         agent = _home() / "Library" / "LaunchAgents" / f"{MACOS_LAUNCH_AGENT}.plist"
         uid = str(os.getuid()) if hasattr(os, "getuid") else ""
         _run_quiet(["launchctl", "bootout", f"gui/{uid}", str(agent)])
         _remove_file(agent)
-        info = shortcut / "Contents" / "Info.plist"
-        try:
-            managed = plistlib.loads(info.read_bytes()).get("CFBundleIdentifier") == MACOS_LAUNCH_AGENT
-        except (FileNotFoundError, OSError, plistlib.InvalidFileException):
-            managed = False
-        if managed:
+        if _macos_app_is_managed(shortcut):
             shutil.rmtree(shortcut)
     elif platform_name == "linux":
         _run_quiet([
@@ -921,11 +989,8 @@ def uninstall() -> dict[str, Any]:
             _remove_file(_home() / ".config" / "systemd" / "user" / f"{LINUX_SYSTEMD_UNIT}.{suffix}")
         _run_quiet(["systemctl", "--user", "daemon-reload"])
         _remove_file(_home() / ".config" / "autostart" / "clawjournal-desktop-icon.desktop")
-        try:
-            if "X-ClawJournal-Managed=true" in shortcut.read_text(encoding="utf-8"):
-                _remove_file(shortcut)
-        except (FileNotFoundError, OSError, UnicodeDecodeError):
-            pass
+        if _linux_entry_is_managed(shortcut):
+            _remove_file(shortcut)
     else:
         raise DesktopError(f"Unknown desktop integration platform: {platform_name}")
 
