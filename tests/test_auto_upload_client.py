@@ -51,6 +51,16 @@ def test_capabilities_reject_cross_origin_endpoint():
         )
 
 
+def test_capabilities_reject_malformed_origin_port_with_typed_error():
+    with pytest.raises(client.CapabilityError) as exc_info:
+        client.validate_capabilities(
+            _caps(),
+            origin="https://data.rayward.ai:not-a-port",
+        )
+
+    assert exc_info.value.code == "invalid_destination"
+
+
 @pytest.mark.parametrize(
     "origin",
     (

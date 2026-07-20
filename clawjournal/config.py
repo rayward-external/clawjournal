@@ -128,6 +128,7 @@ class ClawJournalConfig(TypedDict, total=False):
     benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
     scoring_warmup_declined: bool  # user declined the background auto-scorer (suppresses prompt + server-side auto-start)
     auto_upload_capability_available: bool  # non-authoritative UI offer cache; Enable revalidates live
+    auto_upload_ui_enabled: bool  # internal rollout flag; default hidden
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {
@@ -137,6 +138,7 @@ DEFAULT_CONFIG: ClawJournalConfig = {
     "redact_strings": [],
     "allowlist_entries": [],
     "benchmark_tab_enabled": True,
+    "auto_upload_ui_enabled": False,
 }
 
 

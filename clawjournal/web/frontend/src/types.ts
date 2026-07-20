@@ -256,6 +256,7 @@ export interface AutoUploadStatus {
   run_now_allowed: boolean;
   overlay: AutoUploadOverlay;
   pending_submission_state: 'sealed' | 'submitting' | null;
+  ui_visible: boolean;
   offer_available: boolean;
   scope: {
     sources: string[];

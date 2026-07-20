@@ -189,6 +189,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   const { toast } = useToast();
   const titleId = useId();
   const requestedRef = useRef(false);
+  const challengeRequestRef = useRef(0);
   const dialogRef = useRef<HTMLElement>(null);
   const [agent, setAgent] = useState<AutoUploadAgent>(() => selectedAgent(initialStatus));
   const [challenge, setChallenge] = useState<AutoUploadAuthorizationChallenge | null>(null);
@@ -208,45 +209,66 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   const [code, setCode] = useState('');
   const [devCode, setDevCode] = useState<string | null>(null);
 
-  const showEmailVerification = useCallback(async (message: string) => {
+  const showEmailVerification = useCallback(async (
+    message: string,
+    isCurrent: () => boolean = () => true,
+  ) => {
+    if (!isCurrent()) return;
     setVerificationRequired(true);
     setTokenValid(false);
     try {
       const status = await api.share.uploadStatus();
+      if (!isCurrent()) return;
       setVerifiedEmail(status.verified_email);
       setPendingEmail(status.pending_email);
       setEmail(status.pending_email || status.verified_email || '');
     } catch {
       // Keep the verification form usable even if the status refresh failed.
     }
-    setError(message);
+    if (isCurrent()) setError(message);
   }, []);
 
   const requestChallenge = useCallback(async (requestedAgent: AutoUploadAgent = agent) => {
+    const requestId = challengeRequestRef.current + 1;
+    challengeRequestRef.current = requestId;
+    const isCurrent = () => challengeRequestRef.current === requestId;
     setLoading(true);
     setError(null);
     setAccepted(false);
+    setChallenge(null);
     try {
       // challenge_only can never enroll by contract, so a success here means
       // the daemon violated that contract; refuse to treat it as enabled.
       await api.autoUpload.enable({ agent: requestedAgent, challenge_only: true });
-      setError('The service did not return the required authorization challenge. Review status before continuing.');
+      if (isCurrent()) {
+        setError('The service did not return the required authorization challenge. Review status before continuing.');
+      }
     } catch (requestError) {
+      if (!isCurrent()) return;
       const next = challengeFromError(requestError);
       if (next) {
         setChallenge(next);
       } else if (requiresEmailVerification(requestError)) {
-        await showEmailVerification('Verify your email before loading the recurring authorization.');
+        await showEmailVerification(
+          'Verify your email before loading the recurring authorization.',
+          isCurrent,
+        );
       } else {
         setError(errorMessage(requestError, 'Could not load recurring authorization.'));
       }
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [agent, showEmailVerification]);
 
+  const dismissDialog = useCallback(() => {
+    challengeRequestRef.current += 1;
+    onClose();
+  }, [onClose]);
+
   useEffect(() => {
     if (!open) {
+      challengeRequestRef.current += 1;
       requestedRef.current = false;
       setChallenge(null);
       setAccepted(false);
@@ -287,7 +309,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation();
-        if (!submitting) { event.preventDefault(); onClose(); }
+        if (!submitting) { event.preventDefault(); dismissDialog(); }
         return;
       }
       if (event.key === 'Tab') {
@@ -311,7 +333,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [submitting, onClose, open]);
+  }, [dismissDialog, submitting, open]);
 
   if (!open) return null;
 
@@ -332,7 +354,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       });
       onEnabled(next);
       toast('Automatic upload enabled', 'success');
-      onClose();
+      dismissDialog();
     } catch (enableError) {
       const refreshedChallenge = challengeFromError(enableError);
       if (refreshedChallenge) {
@@ -427,7 +449,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   return (
     <div
       role="presentation"
-      onMouseDown={event => { if (event.target === event.currentTarget && !submitting) onClose(); }}
+      onMouseDown={event => { if (event.target === event.currentTarget && !submitting) dismissDialog(); }}
       style={{
         position: 'fixed', inset: 0, zIndex: 9998, padding: 20,
         display: 'grid', placeItems: 'center', background: 'rgba(27, 26, 23, 0.45)',
@@ -637,7 +659,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
         )}
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
-          <button disabled={submitting} onClick={onClose} style={{ ...btnSecondary, ...disabledStyle(submitting) }}>
+          <button disabled={submitting} onClick={dismissDialog} style={{ ...btnSecondary, ...disabledStyle(submitting) }}>
             Cancel
           </button>
           {!verificationRequired && (
@@ -714,7 +736,7 @@ export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string |
     try { window.localStorage.setItem(OFFER_DISMISSED_KEY, manualReceiptId); } catch { /* best effort */ }
   };
 
-  if (!status || dismissed || status.mode !== 'off' || !status.offer_available) return null;
+  if (!status || !status.ui_visible || dismissed || status.mode !== 'off' || !status.offer_available) return null;
 
   return (
     <>
@@ -851,6 +873,10 @@ export function AutoUploadPanel() {
       </div>
     );
   }
+
+  // The rollout gate must stay below the error branch: an enrolled user whose
+  // status fetch failed still needs the Retry path to reach Pause/Turn off.
+  if (!status.ui_visible) return null;
 
   const exclusionEntries = Object.entries(status.eligibility.exclusion_counts)
     .filter(([, count]) => count > 0)

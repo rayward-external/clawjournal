@@ -406,14 +406,63 @@ def _legacy_content_revision(session_id: str) -> str:
     return f"legacy:{digest}"
 
 
+_WINDOWS_RESERVED_BLOB_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+_HASHED_BLOB_PREFIX = "session-sha256-"
+
+
+def _blob_storage_path(session_id: str) -> Path:
+    """Return a cross-platform-safe canonical path for one session blob."""
+
+    basename = session_id.split(".", 1)[0].upper()
+    utf8_length = len(session_id.encode("utf-8"))
+    utf16_length = len(session_id.encode("utf-16-le")) // 2
+    safe_component = bool(session_id) and not any(
+        ord(character) < 32 or character in '<>:"/\\|?*'
+        for character in session_id
+    )
+    if (
+        safe_component
+        and not session_id.startswith(_HASHED_BLOB_PREFIX)
+        and not session_id.endswith((" ", "."))
+        and basename not in _WINDOWS_RESERVED_BLOB_NAMES
+        and utf8_length <= 200
+        and utf16_length <= 200
+    ):
+        filename = f"{session_id}.json"
+    else:
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        filename = f"{_HASHED_BLOB_PREFIX}{digest}.json"
+    return BLOBS_DIR / filename
+
+
 def _blob_candidate_paths(session_id: str, blob_path: str | None) -> list[Path]:
     candidates: list[Path] = []
     if blob_path:
         candidates.append(Path(blob_path))
-    canonical = BLOBS_DIR / f"{session_id}.json"
+    canonical = _blob_storage_path(session_id)
     if canonical not in candidates:
         candidates.append(canonical)
+    if session_id and "/" not in session_id and "\\" not in session_id:
+        legacy = BLOBS_DIR / f"{session_id}.json"
+        if legacy not in candidates:
+            candidates.append(legacy)
     return candidates
+
+
+def resolve_blob_path(session_id: str, blob_path: str | None = None) -> Path | None:
+    """Resolve the stored, canonical, or safe legacy blob path."""
+
+    for candidate in _blob_candidate_paths(session_id, blob_path):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _blob_present_for_revision(session_id: str, blob_path: str | None) -> bool:
@@ -426,7 +475,7 @@ def _blob_present_for_revision(session_id: str, blob_path: str | None) -> bool:
     validates the blob before any egress, so a present-but-corrupt blob is
     still caught there rather than crossing the machine boundary.
     """
-    return any(path.is_file() for path in _blob_candidate_paths(session_id, blob_path))
+    return resolve_blob_path(session_id, blob_path) is not None
 
 
 def _read_blob_for_revision(
@@ -436,7 +485,7 @@ def _read_blob_for_revision(
     """Load a migration-time blob, tolerating stale stored blob paths."""
     for candidate in _blob_candidate_paths(session_id, blob_path):
         try:
-            with open(candidate) as f:
+            with open(candidate, encoding="utf-8") as f:
                 blob = json.load(f)
             if isinstance(blob, dict):
                 return blob
@@ -1197,17 +1246,18 @@ def _derive_session_key_from_source(
     """Best-effort `event_sessions.session_key` derivation from workbench provenance."""
     if not isinstance(source, str) or not isinstance(raw_source_path, str):
         return None
-    if not raw_source_path.strip():
+    normalized_source_path = raw_source_path.strip()
+    if not normalized_source_path:
         return None
 
-    path = Path(raw_source_path)
     if source == "codex":
-        return f"codex:{path}"
+        return f"codex:{normalized_source_path}"
     if source == "openclaw":
-        return f"openclaw:{path}"
+        return f"openclaw:{normalized_source_path}"
     if source != "claude":
         return None
 
+    path = Path(normalized_source_path)
     if ".claude" in path.parts and path.suffix == ".jsonl":
         la_key = _derive_local_agent_claude_session_key(path)
         if la_key is not None:
@@ -2009,8 +2059,8 @@ def _generate_display_title(session: dict[str, Any]) -> str:
 def _write_blob(session_id: str, session: dict[str, Any]) -> Path:
     """Write full session JSON to blob storage. Returns the blob file path."""
     BLOBS_DIR.mkdir(parents=True, exist_ok=True)
-    blob_path = BLOBS_DIR / f"{session_id}.json"
-    with open(blob_path, "w") as f:
+    blob_path = _blob_storage_path(session_id)
+    with open(blob_path, "w", encoding="utf-8") as f:
         json.dump(session, f, default=str)
     return blob_path
 
@@ -2026,16 +2076,10 @@ def read_blob(
     need the already-anonymized blob text to re-scan or re-apply
     without re-parsing from the source.
     """
-    blob_path = BLOBS_DIR / f"{session_id}.json"
-    if not blob_path.exists():
-        return None
-    try:
-        with open(blob_path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        if log_errors:
-            logger.warning("Could not read blob for session %s", session_id)
-        return None
+    blob = _read_blob_for_revision(session_id, None)
+    if blob is None and log_errors:
+        logger.warning("Could not read blob for session %s", session_id)
+    return blob
 
 
 def _resolve_estimated_cost(
@@ -2116,8 +2160,8 @@ def upsert_sessions(
     """Index parsed sessions into the database.
 
     Takes parsed session dicts (output of parser.parse_project_sessions).
-    Stores metadata in sessions table, writes full session JSON to
-    BLOBS_DIR/{session_id}.json, and updates FTS index.
+    Stores metadata in sessions table, writes full session JSON to a
+    cross-platform-safe path under BLOBS_DIR, and updates FTS index.
 
     Returns the count of new sessions inserted (sessions that did not
     previously exist in the index). When ``stats`` is provided, it is filled
@@ -2203,7 +2247,7 @@ def upsert_sessions(
             blob_path = (
                 Path(stored_blob_path)
                 if stored_blob_path
-                else BLOBS_DIR / f"{session_id}.json"
+                else _blob_storage_path(session_id)
             )
             stored_blob = _read_blob_for_revision(session_id, str(blob_path))
             metadata_updated = (
@@ -2712,22 +2756,8 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, A
     result = dict(row)
 
     # Load messages from blob
-    blob_path_str = result.get("blob_path")
-    blob_path = Path(blob_path_str) if blob_path_str else None
-    # Fallback: if stored path is stale, try the canonical location
-    if blob_path and not blob_path.exists():
-        fallback = BLOBS_DIR / f"{session_id}.json"
-        if fallback.exists():
-            blob_path = fallback
-    if blob_path and blob_path.exists():
-        try:
-            with open(blob_path) as f:
-                blob_data = json.load(f)
-            result["messages"] = blob_data.get("messages", [])
-        except (json.JSONDecodeError, OSError):
-            result["messages"] = []
-    else:
-        result["messages"] = []
+    blob_data = _read_blob_for_revision(session_id, result.get("blob_path"))
+    result["messages"] = blob_data.get("messages", []) if blob_data else []
 
     # Parse JSON fields
     for field in (

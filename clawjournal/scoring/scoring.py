@@ -706,7 +706,7 @@ def load_scoring_rubric() -> str:
     """Load the scoring rubric from the canonical prompt copy."""
     for path in _RUBRIC_SEARCH_PATHS:
         if path.exists():
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             if text.startswith("---"):
                 try:
                     end = text.index("---", 3)
@@ -1693,7 +1693,7 @@ def score_session(
     progress: Callable[[str], None] | None = None,
 ) -> ScoringResult:
     """Score a session: format → judge → store. No aggregation formulas."""
-    from ..workbench.index import BLOBS_DIR, get_session_detail
+    from ..workbench.index import get_session_detail, resolve_blob_path
 
     detail = get_session_detail(conn, session_id)
     if not detail:
@@ -1707,13 +1707,12 @@ def score_session(
 
     messages = detail.get("messages", [])
     blob_path_str = detail.get("blob_path")
-    blob_path = Path(blob_path_str) if isinstance(blob_path_str, str) and blob_path_str else None
-    if blob_path and not blob_path.exists():
-        fallback = BLOBS_DIR / f"{session_id}.json"
-        if fallback.exists():
-            blob_path = fallback
+    blob_path = resolve_blob_path(
+        session_id,
+        blob_path_str if isinstance(blob_path_str, str) else None,
+    )
 
-    if blob_path is None or not blob_path.exists():
+    if blob_path is None:
         raise RuntimeError(
             "Session transcript is unavailable. Re-run `clawjournal scan` to rebuild the index."
         )
@@ -1722,7 +1721,7 @@ def score_session(
     # do not persist a false 1/5 score for broken index state.
     if not messages:
         try:
-            blob_data = json.loads(blob_path.read_text())
+            blob_data = json.loads(blob_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             raise RuntimeError(
                 "Session transcript is unreadable. Re-run `clawjournal scan` to rebuild the index."

@@ -1904,6 +1904,25 @@ class TestShareDestinationAPI:
         assert data["configured"] is False
         assert data["share_page_url"] is None
 
+    @pytest.mark.parametrize(
+        "share_url",
+        (
+            "https://data.rayward.ai:not-a-port/share",
+            "https://user:password@data.rayward.ai/share",
+            "https://[invalid/share",
+        ),
+    )
+    def test_malformed_or_credentialed_share_destination_is_disabled(
+        self, monkeypatch, share_url
+    ):
+        from clawjournal.workbench import daemon
+
+        monkeypatch.setattr(daemon, "_HOSTED_SHARE_URL", share_url)
+
+        configured_url, _message = daemon._validated_hosted_share_url()
+
+        assert configured_url is None
+
     def test_ipv6_loopback_share_destination_is_allowed(self, monkeypatch):
         from clawjournal.workbench import daemon
 
@@ -3229,6 +3248,43 @@ class TestVerifyEmailAPI:
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             with pytest.raises(ValueError):
                 request_email_verification("someone@gmail.com")
+
+    def test_request_verification_defers_explicit_collaborator_check_to_host(self, monkeypatch):
+        from clawjournal.workbench.daemon import request_email_verification
+
+        saved = {}
+        capabilities = {
+            "supported_institution_email_policy": {
+                "domain_suffixes": [".edu", "rayward.ai"],
+                "explicit_collaborators_supported": True,
+            },
+        }
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(capabilities=capabilities),
+        ):
+            result = request_email_verification("Collaborator@Gmail.com")
+
+        assert result["verification_id"] == "verify-123"
+        assert saved["pending_verification_email"] == "collaborator@gmail.com"
+
+    @pytest.mark.parametrize("email", ["@gmail.com", "collaborator@", "two@@gmail.com", "first last@gmail.com"])
+    def test_explicit_collaborator_policy_still_rejects_malformed_email(self, email):
+        from clawjournal.workbench.daemon import _email_domain_allowed
+
+        capabilities = {
+            "supported_institution_email_policy": {
+                "domain_suffixes": [".edu"],
+                "explicit_collaborators_supported": True,
+            },
+        }
+
+        assert _email_domain_allowed(email, capabilities) is False
 
     def test_request_verification_clears_stale_token_on_email_switch(self, monkeypatch):
         """Requesting a code for a different email must drop the previously

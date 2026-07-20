@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -59,7 +58,13 @@ def _validate_origin(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise CredentialStoreError(f"{field} must be a non-empty HTTPS origin")
     candidate = value.strip()
-    parsed = urlsplit(candidate)
+    try:
+        parsed = urlsplit(candidate)
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise CredentialStoreError(
+            f"{field} must be an exact HTTPS origin, or explicitly enabled loopback HTTP origin"
+        ) from exc
     hostname = (parsed.hostname or "").lower()
     scheme = parsed.scheme.lower()
     local_http = (
@@ -79,7 +84,7 @@ def _validate_origin(value: Any, *, field: str) -> str:
         raise CredentialStoreError(
             f"{field} must be an exact HTTPS origin, or explicitly enabled loopback HTTP origin"
         )
-    port = f":{parsed.port}" if parsed.port is not None else ""
+    port = f":{parsed_port}" if parsed_port is not None else ""
     rendered_host = f"[{hostname}]" if ":" in hostname else hostname
     return f"{scheme}://{rendered_host}{port}"
 
@@ -115,60 +120,277 @@ def _validate_record(record: Mapping[str, Any]) -> dict[str, str | None]:
     return normalized
 
 
+def _set_windows_private_acl(path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    token_query = 0x0008
+    token_user_class = 1
+    error_insufficient_buffer = 122
+    acl_revision = 2
+    acl_size_information = 2
+    access_allowed_ace_type = 0
+    object_inherit_ace = 0x01
+    container_inherit_ace = 0x02
+    inherited_ace = 0x10
+    file_all_access = 0x001F01FF
+    se_file_object = 1
+    dacl_security_information = 0x00000004
+    protected_dacl_security_information = 0x80000000
+    se_dacl_protected = 0x1000
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("user", SidAndAttributes)]
+
+    class Acl(ctypes.Structure):
+        _fields_ = [
+            ("revision", ctypes.c_ubyte),
+            ("sbz1", ctypes.c_ubyte),
+            ("size", wintypes.WORD),
+            ("ace_count", wintypes.WORD),
+            ("sbz2", wintypes.WORD),
+        ]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("ace_type", ctypes.c_ubyte),
+            ("ace_flags", ctypes.c_ubyte),
+            ("ace_size", wintypes.WORD),
+        ]
+
+    class AccessAllowedAce(ctypes.Structure):
+        _fields_ = [
+            ("header", AceHeader),
+            ("mask", wintypes.DWORD),
+            ("sid_start", wintypes.DWORD),
+        ]
+
+    class AclSizeInformation(ctypes.Structure):
+        _fields_ = [
+            ("ace_count", wintypes.DWORD),
+            ("acl_bytes_in_use", wintypes.DWORD),
+            ("acl_bytes_free", wintypes.DWORD),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+    advapi32.GetLengthSid.restype = wintypes.DWORD
+    advapi32.InitializeAcl.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+    advapi32.InitializeAcl.restype = wintypes.BOOL
+    advapi32.AddAccessAllowedAceEx.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    advapi32.AddAccessAllowedAceEx.restype = wintypes.BOOL
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    advapi32.GetAclInformation.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    advapi32.EqualSid.restype = wintypes.BOOL
+
+    def raise_last_error(api_name: str) -> None:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"{api_name} failed: {ctypes.FormatError(error).strip()}")
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
+    ):
+        raise_last_error("OpenProcessToken")
+    try:
+        required = wintypes.DWORD()
+        ctypes.set_last_error(0)
+        advapi32.GetTokenInformation(
+            token, token_user_class, None, 0, ctypes.byref(required)
+        )
+        if ctypes.get_last_error() != error_insufficient_buffer or required.value == 0:
+            raise_last_error("GetTokenInformation")
+        token_buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token,
+            token_user_class,
+            token_buffer,
+            required.value,
+            ctypes.byref(required),
+        ):
+            raise_last_error("GetTokenInformation")
+        current_sid = ctypes.cast(
+            token_buffer, ctypes.POINTER(TokenUser)
+        ).contents.user.sid
+        sid_length = advapi32.GetLengthSid(current_sid)
+        if sid_length == 0:
+            raise_last_error("GetLengthSid")
+
+        acl_size = ctypes.sizeof(Acl) + AccessAllowedAce.sid_start.offset + sid_length
+        acl_buffer = ctypes.create_string_buffer(acl_size)
+        acl_pointer = ctypes.cast(acl_buffer, ctypes.c_void_p)
+        if not advapi32.InitializeAcl(acl_pointer, acl_size, acl_revision):
+            raise_last_error("InitializeAcl")
+        inheritance = object_inherit_ace | container_inherit_ace if path.is_dir() else 0
+        if not advapi32.AddAccessAllowedAceEx(
+            acl_pointer,
+            acl_revision,
+            inheritance,
+            file_all_access,
+            current_sid,
+        ):
+            raise_last_error("AddAccessAllowedAceEx")
+
+        security_information = (
+            dacl_security_information | protected_dacl_security_information
+        )
+        status = advapi32.SetNamedSecurityInfoW(
+            str(path),
+            se_file_object,
+            security_information,
+            None,
+            None,
+            acl_pointer,
+            None,
+        )
+        if status != 0:
+            raise OSError(
+                status,
+                f"SetNamedSecurityInfoW failed: {ctypes.FormatError(status).strip()}",
+            )
+
+        stored_acl = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        status = advapi32.GetNamedSecurityInfoW(
+            str(path),
+            se_file_object,
+            dacl_security_information,
+            None,
+            None,
+            ctypes.byref(stored_acl),
+            None,
+            ctypes.byref(descriptor),
+        )
+        if status != 0:
+            raise OSError(
+                status,
+                f"GetNamedSecurityInfoW failed: {ctypes.FormatError(status).strip()}",
+            )
+        try:
+            control = wintypes.WORD()
+            revision = wintypes.DWORD()
+            if not advapi32.GetSecurityDescriptorControl(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)
+            ):
+                raise_last_error("GetSecurityDescriptorControl")
+            acl_info = AclSizeInformation()
+            if not advapi32.GetAclInformation(
+                stored_acl,
+                ctypes.byref(acl_info),
+                ctypes.sizeof(acl_info),
+                acl_size_information,
+            ):
+                raise_last_error("GetAclInformation")
+            ace_pointer = ctypes.c_void_p()
+            if acl_info.ace_count != 1 or not advapi32.GetAce(
+                stored_acl, 0, ctypes.byref(ace_pointer)
+            ):
+                raise CredentialStoreError(
+                    "credential ACL does not contain exactly one access rule"
+                )
+            ace = ctypes.cast(
+                ace_pointer, ctypes.POINTER(AccessAllowedAce)
+            ).contents
+            ace_sid = ctypes.c_void_p(
+                ace_pointer.value + AccessAllowedAce.sid_start.offset
+            )
+            if (
+                not control.value & se_dacl_protected
+                or ace.header.ace_type != access_allowed_ace_type
+                or ace.header.ace_flags & inherited_ace
+                or ace.header.ace_flags & (object_inherit_ace | container_inherit_ace)
+                != inheritance
+                or ace.mask != file_all_access
+                or not advapi32.EqualSid(ace_sid, current_sid)
+            ):
+                raise CredentialStoreError(
+                    "credential ACL does not grant full control exclusively to the current user"
+                )
+        finally:
+            if descriptor:
+                kernel32.LocalFree(descriptor)
+    finally:
+        kernel32.CloseHandle(token)
+
+
 def _require_private_mode(path: Path, expected: int) -> None:
     if os.name == "nt":
-        # POSIX mode bits do not establish a Windows credential boundary.
-        # Replace the DACL with one FullControl ACE for the current user and
-        # disable inheritance.  PowerShell/.NET ships with supported Windows
-        # Python versions; any failure blocks enrollment rather than falling
-        # back to a best-effort chmod.
-        # The target path is passed via an environment variable, NOT a
-        # positional argument: `powershell.exe -Command <script> <path>` does
-        # not populate $args (only -File does), so $args[0] would be $null and
-        # every ACL call would fail. Reading $env avoids that and cannot be
-        # command-injected the way string interpolation could.
-        script = r"""
-$ErrorActionPreference = 'Stop'
-$target = $env:CLAWJOURNAL_ACL_TARGET
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$isDirectory = Test-Path -LiteralPath $target -PathType Container
-if ($isDirectory) {
-  $acl = New-Object System.Security.AccessControl.DirectorySecurity
-  $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-} else {
-  $acl = New-Object System.Security.AccessControl.FileSecurity
-  $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
-}
-$acl.SetAccessRuleProtection($true, $false)
-$acl.SetOwner($identity)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-  $identity,
-  [System.Security.AccessControl.FileSystemRights]::FullControl,
-  $inheritance,
-  [System.Security.AccessControl.PropagationFlags]::None,
-  [System.Security.AccessControl.AccessControlType]::Allow
-)
-$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $target -AclObject $acl
-"""
         try:
-            completed = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=15,
-                env={**os.environ, "CLAWJOURNAL_ACL_TARGET": str(path)},
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
+            _set_windows_private_acl(path)
+        except (OSError, CredentialStoreError) as exc:
             raise CredentialStoreError(
-                f"could not establish a current-user-only Windows ACL for {path}"
+                f"could not establish a current-user-only Windows ACL for {path}: {exc}"
             ) from exc
-        if completed.returncode != 0:
-            raise CredentialStoreError(
-                f"could not establish a current-user-only Windows ACL for {path}"
-            )
         return
     actual = stat.S_IMODE(path.stat().st_mode)
     if actual != expected:

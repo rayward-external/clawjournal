@@ -87,6 +87,7 @@ TELEMETRY_MAX_BYTES = 512 * 1024
 TELEMETRY_BACKUPS = 2
 SUPPORTED_HOOK_TARGETS = ("claude", "codex")
 HOOK_DB_BUSY_TIMEOUT_MS = 0
+AUTO_UPLOAD_UI_ENV = "CLAWJOURNAL_ENABLE_AUTO_UPLOAD_UI"
 _CONTROL_THREAD_LOCK = threading.Lock()
 
 # V1 supports only sources with both a SessionStart trigger and an audited,
@@ -557,6 +558,25 @@ def _has_successful_manual_receipt(conn: sqlite3.Connection) -> bool:
     )
 
 
+def _auto_upload_ui_visible(
+    config: Mapping[str, Any],
+    enrollment: Mapping[str, Any] | None = None,
+) -> bool:
+    explicitly_enabled = (
+        os.environ.get(AUTO_UPLOAD_UI_ENV) == "1"
+        or config.get("auto_upload_ui_enabled") is True
+    )
+    existing_authority = bool(
+        enrollment
+        and (
+            enrollment.get("mode") != "off"
+            or enrollment.get("server_enrollment_id")
+            or enrollment.get("revocation_pending")
+        )
+    )
+    return explicitly_enabled or existing_authority
+
+
 def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
     hooks = []
     for target in SUPPORTED_HOOK_TARGETS:
@@ -570,6 +590,7 @@ def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
         "run_now_allowed": False,
         "overlay": None,
         "pending_submission_state": None,
+        "ui_visible": _auto_upload_ui_visible(config),
         "offer_available": False,
         "scope": {"sources": [], "projects": []},
         "cap": MAX_SESSIONS,
@@ -671,6 +692,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             ),
             "overlay": overlay,
             "pending_submission_state": pending_submission_state,
+            "ui_visible": _auto_upload_ui_visible(config, enrollment),
             "offer_available": bool(
                 mode == "off"
                 and successful_manual

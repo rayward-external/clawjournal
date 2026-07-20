@@ -72,7 +72,14 @@ def _normalized_origin(
     allow_local_http: bool = False,
     require_exact_origin: bool = False,
 ) -> str:
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise CapabilityError(
+            "invalid_destination",
+            "Recurring upload requires an exact HTTPS destination origin.",
+        ) from exc
     hostname = (parsed.hostname or "").lower()
     scheme = parsed.scheme.lower()
     local = hostname in {"localhost", "127.0.0.1", "::1"}
@@ -94,7 +101,7 @@ def _normalized_origin(
             "invalid_destination",
             "Recurring upload requires an exact HTTPS destination origin.",
         )
-    port = f":{parsed.port}" if parsed.port is not None else ""
+    port = f":{parsed_port}" if parsed_port is not None else ""
     rendered_host = f"[{hostname}]" if ":" in hostname else hostname
     return f"{scheme}://{rendered_host}{port}"
 

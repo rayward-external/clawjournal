@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +86,26 @@ class TestUpsertSessions:
         ]
         new_count = upsert_sessions(index_conn, sessions)
         assert new_count == 2
+
+    @pytest.mark.parametrize(
+        "session_id",
+        ("claude-science:org-1:frame-1", "../outside-the-blob-directory"),
+    )
+    def test_unsafe_session_ids_use_safe_blob_filenames(
+        self, index_conn, tmp_path, session_id
+    ):
+        assert upsert_sessions(index_conn, [_make_session(session_id)]) == 1
+
+        row = index_conn.execute(
+            "SELECT blob_path FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        blob_path = Path(row["blob_path"])
+
+        assert blob_path.parent == tmp_path / "blobs"
+        assert blob_path.name.startswith("session-")
+        assert get_session_detail(index_conn, session_id)["messages"]
+        assert not (tmp_path / "outside-the-blob-directory.json").exists()
 
     @pytest.mark.parametrize("status", ["approved", "blocked"])
     def test_upsert_preserves_review_status(self, index_conn, status):
