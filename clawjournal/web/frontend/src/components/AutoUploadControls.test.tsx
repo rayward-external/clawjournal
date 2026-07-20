@@ -141,6 +141,24 @@ describe('AutoUploadPanel visibility', () => {
     expect(screen.queryByRole('heading', { name: 'Automatic uploads' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Review and enable' })).not.toBeInTheDocument();
   });
+
+  it('keeps the error and Retry path when the status fetch fails, so an enrolled user can reach the controls', async () => {
+    vi.spyOn(api.autoUpload, 'status')
+      .mockRejectedValueOnce(new ApiError(500, 'daemon unreachable'))
+      .mockResolvedValueOnce(status({ mode: 'enabled', run_now_allowed: true }));
+
+    renderControl(<AutoUploadPanel />);
+
+    expect(await screen.findByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Automatic uploads' })).toBeInTheDocument();
+    expect(screen.getByText('daemon unreachable')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Turn off' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
 });
 
 describe('AutoUploadPanel authorization', () => {

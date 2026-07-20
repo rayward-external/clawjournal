@@ -861,8 +861,6 @@ export function AutoUploadPanel() {
     marginBottom: 14,
   };
 
-  if (!status || !status.ui_visible) return null;
-
   if (!status && !loadError) {
     return <div style={panelStyle}><span style={{ color: colors.gray500, fontSize: 13 }}>Loading automatic-upload status…</span></div>;
   }
@@ -875,6 +873,10 @@ export function AutoUploadPanel() {
       </div>
     );
   }
+
+  // The rollout gate must stay below the error branch: an enrolled user whose
+  // status fetch failed still needs the Retry path to reach Pause/Turn off.
+  if (!status.ui_visible) return null;
 
   const exclusionEntries = Object.entries(status.eligibility.exclusion_counts)
     .filter(([, count]) => count > 0)
