@@ -12,7 +12,6 @@ re-run can't leave a half-written skill. We never write into a repo ``cwd``.
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 
 from ..paths import atomic_write_text
@@ -22,18 +21,15 @@ BEGIN_MARKER = "<!-- BEGIN clawjournal-lessons (managed by `clawjournal skill`) 
 END_MARKER = "<!-- END clawjournal-lessons -->"
 
 
-def _home_dir() -> Path:
-    """Home directory for agent-global installs, honoring test/user HOME overrides."""
-    home = os.environ.get("HOME")
-    return Path(home).expanduser() if home else Path.home()
-
-
 def claude_skill_path() -> Path:
-    return _home_dir() / ".claude" / "skills" / SKILL_NAME / "SKILL.md"
+    # Path.home(), not $HOME: on Windows the agents resolve their global dirs
+    # from USERPROFILE (as Path.home() does), and Git Bash/MSYS commonly set
+    # HOME to a different path the agents never read.
+    return Path.home() / ".claude" / "skills" / SKILL_NAME / "SKILL.md"
 
 
 def codex_agents_path() -> Path:
-    return _home_dir() / ".codex" / "AGENTS.md"
+    return Path.home() / ".codex" / "AGENTS.md"
 
 
 def claude_skill_hash_path(path: Path | None = None) -> Path:

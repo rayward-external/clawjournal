@@ -164,7 +164,10 @@ def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path
         trend = {}
         objective_trend = {}
 
+    # Path.home() reads HOME on POSIX and USERPROFILE on Windows; set both so
+    # the test never writes to the real ~/.codex regardless of platform.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr("clawjournal.cli_skill._ensure_corpus", lambda *a, **k: None)
     monkeypatch.setattr("clawjournal.cli_skill._config_excluded_projects", lambda *a, **k: [])
     monkeypatch.setattr("clawjournal.workbench.index.open_index", lambda: ConnProxy())
