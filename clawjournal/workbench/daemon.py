@@ -3544,7 +3544,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     # Use AI-only detection (skip redundant rule-based PII scan
                     # since redact_session() already handles regex patterns)
                     findings = review_session_pii_with_agent(
-                        detail, ignore_errors=False, backend="auto",
+                        detail,
+                        ignore_errors=False,
+                        backend="auto",
+                        timeout_seconds=_upload_pii_timeout_seconds(),
                     )
                     ai_coverage = "full"
                     if findings:

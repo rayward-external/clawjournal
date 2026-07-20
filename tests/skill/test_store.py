@@ -86,3 +86,18 @@ def test_mark_installed_drops_rules_not_in_new_set(index_conn):
     kept_guidance = {r.guidance for r in store.load_kept(index_conn)}
     assert kept_guidance == {"kept strong rule"}
     assert store.fingerprint(old) not in store.installed_fingerprints(index_conn)
+
+
+def test_dropped_rule_remains_archived(index_conn):
+    old = _r("old archived lesson")
+    keep = _r("kept active lesson")
+    store.mark_installed(index_conn, [old, keep], now="2026-06-01T00:00:00+00:00")
+    store.mark_installed(index_conn, [keep], now="2026-06-08T00:00:00+00:00")
+
+    row = index_conn.execute(
+        "SELECT state, installed_at, last_seen_at FROM skill_rules WHERE fingerprint = ?",
+        (store.fingerprint(old),),
+    ).fetchone()
+    assert row["state"] == "dropped"
+    assert row["installed_at"] is None
+    assert row["last_seen_at"] == "2026-06-08T00:00:00+00:00"

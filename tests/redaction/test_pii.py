@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -610,3 +611,32 @@ def test_review_session_pii_with_agent_ignores_errors(monkeypatch):
     monkeypatch.setattr("clawjournal.redaction.pii._review_batch", failing_runner)
     findings = review_session_pii_with_agent(session, backend="claude", ignore_errors=True)
     assert findings == []
+
+
+def test_review_session_pii_with_agent_uses_one_deadline_across_batch_waves(monkeypatch):
+    session = {"session_id": "s1", "messages": [{"content": "test"}]}
+    batches = [[("s1", index, "content", "text")] for index in range(3)]
+    calls = []
+
+    monkeypatch.setattr("clawjournal.redaction.pii._split_into_batches", lambda _items: batches)
+
+    def slow_runner(*args, **kwargs):
+        calls.append(kwargs["timeout_seconds"])
+        time.sleep(0.03)
+        return []
+
+    monkeypatch.setattr("clawjournal.redaction.pii._review_batch", slow_runner)
+
+    with pytest.raises(RuntimeError, match="PII review timed out"):
+        review_session_pii_with_agent(
+            session,
+            backend="claude",
+            ignore_errors=False,
+            max_workers=1,
+            timeout_seconds=0.01,
+        )
+
+    # The old implementation submitted all three batches and restarted the
+    # timeout for each worker wave. Once the one request budget expires, no
+    # second or third agent process is launched.
+    assert calls == [1]

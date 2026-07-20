@@ -195,7 +195,14 @@ class TestCheckBackendRuntime:
 class TestRequireBackendCommand:
     def test_found(self, monkeypatch):
         monkeypatch.setattr("clawjournal.scoring.backends.shutil.which", lambda cmd: "/usr/bin/" + cmd)
-        assert require_backend_command("claude") == "claude"
+        assert require_backend_command("claude") == "/usr/bin/claude"
+
+    def test_returns_windows_cmd_shim(self, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.scoring.backends.shutil.which",
+            lambda cmd: rf"C:\Users\me\AppData\Roaming\npm\{cmd}.cmd",
+        )
+        assert require_backend_command("codex").endswith(r"\codex.cmd")
 
     def test_missing_raises(self, monkeypatch):
         monkeypatch.setattr("clawjournal.scoring.backends.shutil.which", lambda cmd: None)
@@ -541,6 +548,20 @@ class TestRunDefaultAgentTaskClaude:
         assert captured["input"] == "hello"
         assert captured["cwd"] == str(tmp_path)
 
+    def test_subprocess_decodes_utf8_with_replacement(self, monkeypatch, tmp_path):
+        """Windows must not decode agent UTF-8 output with the active ANSI codepage."""
+        _stub_which(monkeypatch)
+        captured = {}
+
+        def spy_run(cmd, **kw):
+            captured.update(kw)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="claude", cwd=tmp_path, task_prompt="hello")
+        assert captured["encoding"] == "utf-8"
+        assert captured["errors"] == "replace"
+
 
 class TestRunDefaultAgentTaskCodex:
     def test_success(self, monkeypatch, tmp_path):
@@ -647,7 +668,20 @@ class TestRunDefaultAgentTaskCodex:
         )
         schema_path = tmp_path / "output_schema.json"
         assert schema_path.exists()
-        assert json.loads(schema_path.read_text()) == schema
+        assert json.loads(schema_path.read_text(encoding="utf-8")) == schema
+
+    def test_uses_resolved_command_path(self, monkeypatch, tmp_path):
+        shim = r"C:\Users\me\AppData\Roaming\npm\codex.cmd"
+        monkeypatch.setattr("clawjournal.scoring.backends.shutil.which", lambda cmd: shim)
+        captured_cmd = []
+
+        def spy_run(cmd, **kw):
+            captured_cmd.extend(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("clawjournal.scoring.backends.subprocess.run", spy_run)
+        run_default_agent_task(backend="codex", cwd=tmp_path, task_prompt="do stuff")
+        assert captured_cmd[0] == shim
 
     def test_output_file_path_traversal_rejected(self, monkeypatch, tmp_path):
         _stub_which(monkeypatch)
@@ -817,7 +851,7 @@ class TestRunDefaultAgentTaskHermes:
         run_default_agent_task(
             backend="hermes", cwd=tmp_path, task_prompt="score", model="nous/hermes",
         )
-        assert captured_cmd == ["hermes", "-z", "score", "--model", "nous/hermes"]
+        assert captured_cmd == ["/usr/bin/hermes", "-z", "score", "--model", "nous/hermes"]
 
 
 class TestRunDefaultAgentTaskUnsupportedBackend:

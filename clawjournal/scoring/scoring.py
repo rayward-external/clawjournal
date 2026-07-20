@@ -999,6 +999,8 @@ def _rubric_revision(rubric: str) -> str:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except Exception:

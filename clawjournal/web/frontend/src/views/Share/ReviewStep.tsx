@@ -288,12 +288,15 @@ function ReviewRow({
               {!approved && aiUnavailable && (
                 <button
                   onClick={onRetryAi}
+                  disabled={data?.loading}
                   style={{
                     ...btnGhost, color: colors.primary500, fontSize: 12.5,
                     border: `1px solid ${colors.primary200}`, padding: '4px 8px', background: colors.white,
+                    opacity: data?.loading ? 0.55 : 1,
+                    cursor: data?.loading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  <Icon name="retry" size={12} /> Retry AI
+                  <Icon name="retry" size={12} /> {data?.loading ? 'Retrying...' : 'Retry AI'}
                 </button>
               )}
             </div>

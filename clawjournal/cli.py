@@ -3008,6 +3008,12 @@ def _score_single_session(
         if redaction_settings is not None:
             score_kwargs["redaction_settings"] = redaction_settings
         result = score_session(conn, session_id, **score_kwargs)
+    except FileNotFoundError as e:
+        missing = getattr(e, "filename", None) or str(e)
+        return {
+            "session_id": session_id,
+            "error": f"Missing file or command during scoring: {missing}",
+        }
     except RuntimeError as e:
         return {
             "session_id": session_id,
