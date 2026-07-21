@@ -611,7 +611,10 @@ def _scan_text_for_raw_matches(text: str) -> list[dict]:
     Used only by the findings-engine entry points — the apply path
     needs ``raw`` to build the replace map and to compute salted
     hashes. Streaming via stdin means no plaintext tempfile of the
-    session can be orphaned by a SIGKILL.
+    *session* is ever written. The JSON *report* (which carries the
+    matched ``Secret`` values) still goes through a 0600 mkstemp file
+    that is unlinked in ``finally`` — a SIGKILL in that window can
+    orphan it; betterleaks cannot stream reports to stdout.
 
     Silently returns ``[]`` when the binary is missing or bypassed;
     the findings pipeline should not fail a scan just because the
