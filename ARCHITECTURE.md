@@ -81,7 +81,8 @@ Optional self-hosted path:
 
 Optional hosted recurring path:
 
-- It remains unavailable unless hosted discovery advertises protocol v1 and the participant has a successful manual receipt.
+- It remains unavailable unless hosted discovery advertises protocol v2 and the participant has a successful manual receipt.
+- Enrollment sends the explicit (source, project) scope entries and requires two distinct affirmative acts: the versioned recurring authorization/retention acceptance and the versioned ownership certification. The server computes and owns the scope hash; the client pins the value read back at enrollment and fails closed on any drift.
 - The local SQLite singleton owns mode, generation, accepted exact scope/profile, cadence, health, and run overlay. Private files own active/recovery credentials; `config.json` never does.
 - The hosted service owns versioned recurring authorization, credential hashes, exact-byte idempotency, cross-enrollment duplicate-revision rejection, storage, and receipts.
 - Public discovery can close or go dark without stranding recovery: fixed, origin-pinned receipt and revocation routes remain recovery-only. No content egress occurs while the capability is unavailable.

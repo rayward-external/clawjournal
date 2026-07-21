@@ -34,6 +34,7 @@ from .agent_hooks import (
     uninstall_agent_hook,
 )
 from .auto_upload_client import (
+    MAX_SCOPE_ENTRIES,
     CapabilityError,
     RecurringServiceError,
     create_enrollment,
@@ -113,21 +114,26 @@ class AutoUploadError(RuntimeError):
         *,
         retryable: bool = False,
         retry_after: int | None = None,
+        ambiguous: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
         self.retry_after = retry_after
+        self.ambiguous = ambiguous
 
     def as_result(self) -> dict[str, Any]:
-        return {
+        result = {
             "ok": False,
             "code": self.code,
             "message": self.message,
             "retryable": self.retryable,
             "retry_after": self.retry_after,
         }
+        if self.ambiguous:
+            result["ambiguous"] = True
+        return result
 
 
 class ControlChanged(AutoUploadError):
@@ -373,7 +379,20 @@ def _current_scope(
         and not session_matches_excluded_projects(row, excluded)
     ]
     projects = sorted({str(row["project"]) for row in scoped_rows if row.get("project")})
+    # Protocol v2 enrolls explicit (source, project) entries. Certify the FULL
+    # cross product of the confirmed sources and projects — exactly the scope
+    # the candidate filter enforces (source IN sources AND project IN
+    # projects) and exactly what the consent surfaces display as two lists.
+    # Enrolling only the currently-observed pairs would let a later session in
+    # a new combination of already-enrolled source and project egress outside
+    # the server-certified scope.
+    entries = sorted((source, project) for source in sources for project in projects)
     blockers: list[str] = []
+    if len(entries) > MAX_SCOPE_ENTRIES:
+        # The hosted service caps enrollment scope entries; surface it before
+        # consent, network, or the strict scan rather than as a server-worded
+        # rejection after all three.
+        blockers.append("scope_too_large")
     if not source_confirmed:
         blockers.append("source_confirmation_missing")
     if not projects_confirmed:
@@ -388,6 +407,7 @@ def _current_scope(
     return {
         "sources": sources,
         "projects": projects,
+        "entries": entries,
         "source_confirmed": source_confirmed,
         "projects_confirmed": projects_confirmed,
         "blockers": blockers,
@@ -400,13 +420,6 @@ def _keyed_digest(domain: str, payload: Any) -> str:
     salt = ensure_hash_salt(install_dir)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hmac.new(salt, domain.encode("utf-8") + b"\0" + encoded, hashlib.sha256).hexdigest()
-
-
-def scope_hash(sources: Sequence[str], projects: Sequence[str]) -> str:
-    return _keyed_digest(
-        "clawjournal-recurring-scope-v1",
-        {"sources": sorted(set(sources)), "projects": sorted(set(projects))},
-    )
 
 
 def trace_revision_key(session_id: str, content_revision: str) -> str:
@@ -815,6 +828,7 @@ def _authorization_profile_hash(challenge: Mapping[str, Any]) -> str:
     payload = {
         "authorization": challenge["authorization"],
         "retention": challenge["retention"],
+        "ownership_certification": challenge["ownership_certification"],
         "scope": challenge["scope"],
         "ai": challenge["ai"],
         "cap": challenge["cap"],
@@ -841,6 +855,8 @@ def _authorization_challenge(
     authorization_text = terms.get("authorization_text")
     retention_version = terms.get("retention_policy_version")
     retention_text = terms.get("retention_text")
+    ownership_version = terms.get("ownership_certification_version")
+    ownership_text = terms.get("ownership_certification_text")
     if not all(
         isinstance(value, str) and value.strip()
         for value in (
@@ -848,6 +864,8 @@ def _authorization_challenge(
             authorization_text,
             retention_version,
             retention_text,
+            ownership_version,
+            ownership_text,
         )
     ):
         raise AutoUploadError(
@@ -859,7 +877,10 @@ def _authorization_challenge(
         "ok": False,
         "status": 409,
         "code": "authorization_required",
-        "message": "Review and accept the exact recurring authorization and retention terms.",
+        "message": (
+            "Review and accept the exact recurring authorization, retention, "
+            "and ownership-certification terms."
+        ),
         "authorization": {
             "version": authorization_version,
             "text": authorization_text,
@@ -868,9 +889,14 @@ def _authorization_challenge(
             "version": retention_version,
             "text": retention_text,
         },
+        "ownership_certification": {
+            "version": ownership_version,
+            "text": ownership_text,
+        },
         "scope": {
             "sources": list(scope["sources"]),
             "projects": list(scope["projects"]),
+            "entries": [list(entry) for entry in scope["entries"]],
         },
         "ai": {"enabled": ai_backend is not None, "backend": ai_backend},
         "cap": MAX_SESSIONS,
@@ -924,6 +950,8 @@ def _reconcile_explicit_pause_after_reauthorization(
     authorization_revision: int,
     authorization_version: str,
     retention_version: str,
+    ownership_certification_version: str,
+    server_scope_hash: str,
     egress_profile: str,
     hook_targets: Sequence[AgentName],
     restore_credentials: Mapping[str, Any] | None = None,
@@ -964,6 +992,8 @@ def _reconcile_explicit_pause_after_reauthorization(
             authorization_revision=authorization_revision,
             recurring_authorization_version=authorization_version,
             retention_version=retention_version,
+            ownership_certification_version=ownership_certification_version,
+            server_scope_hash=server_scope_hash,
             egress_profile_hash=egress_profile,
             hook_targets=hook_targets,
             consecutive_failures=0,
@@ -997,6 +1027,7 @@ def enable(
     agent: str = "all",
     accepted_authorization_version: str | None = None,
     accepted_retention_version: str | None = None,
+    accepted_ownership_certification_version: str | None = None,
     accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
 ) -> dict[str, Any]:
@@ -1005,6 +1036,8 @@ def enable(
     ``challenge_only`` always returns the authorization challenge and can
     never enroll, so clients that only want to display the current terms
     are not depending on version mismatch to keep the call non-mutating.
+    Protocol v2 requires the ownership certification to be accepted with the
+    same exact-version discipline as the authorization and retention terms.
     """
 
     targets = _hook_targets(agent)
@@ -1014,10 +1047,19 @@ def enable(
         config = load_config()
         scope = _current_scope(conn, config)
         if scope["blockers"]:
+            first_blocker = scope["blockers"][0]
+            if first_blocker == "scope_too_large":
+                message = (
+                    "The source x project scope exceeds the hosted limit of "
+                    f"{MAX_SCOPE_ENTRIES} entries; exclude projects "
+                    "(config --exclude) or narrow the source scope first."
+                )
+            else:
+                message = "Confirm a non-empty source and project scope before enabling."
             return {
                 "ok": False,
-                "code": scope["blockers"][0],
-                "message": "Confirm a non-empty source and project scope before enabling.",
+                "code": first_blocker,
+                "message": message,
                 "scope_blockers": scope["blockers"],
                 "unsupported_sources": scope["unsupported_sources"],
             }
@@ -1026,6 +1068,15 @@ def enable(
                 "manual_share_required",
                 "Complete one successful hosted manual share before enabling automatic uploads.",
             ).as_result()
+        # Fail fast on the cheap network checks BEFORE the strict scan: the
+        # scan re-parses every enrolled source log (minutes of CPU on a large
+        # history), so an incompatible protocol, closed enrollment, or
+        # unreachable host must be surfaced without paying it. Later steps
+        # (server create/PATCH, the runner's enrollment gate) re-enforce
+        # capability freshness, so a closure during the scan still loses
+        # nothing.
+        capabilities = fetch_capabilities(force=True)
+        terms = fetch_authorization(capabilities)
         from .workbench.daemon import Scanner
 
         scan = Scanner().scan_once_strict(list(scope["sources"]))
@@ -1047,18 +1098,18 @@ def enable(
                 "scope_blockers": scope["blockers"],
             }
         ai_backend = _resolved_ai_backend(config)
-        capabilities = fetch_capabilities(force=True)
-        terms = fetch_authorization(capabilities)
         challenge = _authorization_challenge(
             capabilities, terms, scope, ai_backend
         )
         expected_auth = challenge["authorization"]["version"]
         expected_retention = challenge["retention"]["version"]
+        expected_ownership = challenge["ownership_certification"]["version"]
         expected_profile = challenge["authorization_profile_hash"]
         if (
             challenge_only
             or accepted_authorization_version != expected_auth
             or accepted_retention_version != expected_retention
+            or accepted_ownership_certification_version != expected_ownership
             or accepted_authorization_profile_hash != expected_profile
         ):
             # Non-mutating challenge response.  The HTTP adapter maps this to
@@ -1160,7 +1211,6 @@ def enable(
             ai_backend=ai_backend,
             config=config,
         )
-        scope_digest = scope_hash(scope["sources"], scope["projects"])
         intent_enrolled_at = (
             _parse_time(existing.get("enrolled_at"))
             if updating and existing is not None
@@ -1231,7 +1281,14 @@ def enable(
         # "server enrollment was created" from earlier failures by these.
         response: dict[str, Any] | None = None
         credential_record: dict[str, Any] | None = None
+        server_scope_hash: str | None = None
+        # True only once the read-back confirmed the server recorded exactly
+        # the certification version the user accepted. Until then, a definite
+        # PATCH is in an UNVERIFIABLE consent state (the request carries only
+        # a boolean), and any failure must revoke rather than pause.
+        certification_verified = False
         server_reauthorization_succeeded = False
+        email_enrollment_may_have_committed = False
         recovery_only_written = False
         try:
             snapshots = _snapshot_hook_files(SUPPORTED_HOOK_TARGETS)
@@ -1253,14 +1310,26 @@ def enable(
                         "credential_invalid",
                         "The active recurring-upload credential is unavailable.",
                     )
-                response = update_enrollment(
-                    capabilities,
-                    enrollment_id=str(existing["server_enrollment_id"]),
-                    active_token=active_token,
-                    scope_hash=scope_digest,
-                    authorization_version=str(expected_auth),
-                    retention_version=str(expected_retention),
-                )
+                try:
+                    response = update_enrollment(
+                        capabilities,
+                        enrollment_id=str(existing["server_enrollment_id"]),
+                        active_token=active_token,
+                        scope_entries=scope["entries"],
+                        authorization_version=str(expected_auth),
+                        retention_version=str(expected_retention),
+                        # Reached only after the exact-version acceptance check
+                        # above matched accepted_ownership_certification_version.
+                        ownership_certification=True,
+                    )
+                except RecurringServiceError as mutation_error:
+                    # A lost/truncated PATCH response can mean the server
+                    # committed the new, not-yet-read-back certification. The
+                    # known enrollment id + pinned recovery token let the
+                    # failure handler compensate by revoking it.
+                    if mutation_error.ambiguous:
+                        server_reauthorization_succeeded = True
+                    raise
             else:
                 upload_token = str(config.get("verified_email_token") or "").strip()
                 if not upload_token:
@@ -1268,14 +1337,30 @@ def enable(
                         "email_verification_required",
                         "Verify your email again before creating a recurring enrollment.",
                     )
-                response = create_enrollment(
-                    capabilities,
-                    upload_token=upload_token,
-                    client_enrollment_id=client_enrollment_id,
-                    scope_hash=scope_digest,
-                    authorization_version=str(expected_auth),
-                    retention_version=str(expected_retention),
-                )
+                try:
+                    response = create_enrollment(
+                        capabilities,
+                        upload_token=upload_token,
+                        client_enrollment_id=client_enrollment_id,
+                        scope_entries=scope["entries"],
+                        authorization_version=str(expected_auth),
+                        retention_version=str(expected_retention),
+                        ownership_certification=True,
+                    )
+                except RecurringServiceError as mutation_error:
+                    if mutation_error.ambiguous:
+                        email_enrollment_may_have_committed = True
+                    raise
+                email_enrollment_may_have_committed = True
+
+            # The server mutation is definite the moment the create/PATCH
+            # returns 2xx — BEFORE the response body is validated below. On an
+            # update a malformed body then leaves a definitely-modified (and,
+            # until read-back, unverified) hosted enrollment. PATCH can revoke
+            # with the pinned recovery token; credential-rotation POST must use
+            # the freshly reissued recovery token and never the invalidated old
+            # one.
+            server_reauthorization_succeeded = bool(updating)
 
             enrollment_id = response.get("enrollment_id")
             enrolled_at = response.get("enrolled_at")
@@ -1324,10 +1409,6 @@ def enable(
                 if updating
                 else max(intent_enrolled_at, parsed_server_enrolled_at)
             )
-            # Both PATCH with a still-valid active token and an idempotent
-            # credential reissue with fresh email verification definitively
-            # advance the same hosted enrollment authorization.
-            server_reauthorization_succeeded = bool(updating)
 
             if updating:
                 # A sealed artifact is durably pre-send.  The successful PATCH
@@ -1393,6 +1474,53 @@ def enable(
                 write_credentials(recovery_record)
                 recovery_only_written = True
 
+            # Protocol v2: the server owns the scope hash (an HMAC with its
+            # own key), so pin the authorized scope by reading it back from
+            # the definite enrollment state; the runner's scope gate compares
+            # against this stored value. This network read runs AFTER Phase 1
+            # deliberately: the freshest recovery token (including one just
+            # reissued by a rotating reauthorization) is already durably
+            # persisted, so a failed or crashed read leaves revocable
+            # recovery-only authority rather than dropping live server tokens
+            # on the floor. A failed read aborts enrollment fail-closed; the
+            # create path's compensating revoke still applies.
+            remote_state = get_enrollment(
+                capabilities,
+                enrollment_id=str(enrollment_id),
+                active_token=str(credential_record["active_token"]),
+            )
+            server_scope_hash = remote_state.get("scope_hash")
+            if not isinstance(server_scope_hash, str) or not server_scope_hash:
+                raise AutoUploadError(
+                    "malformed_enrollment_response",
+                    "Hosted service returned no authoritative scope hash.",
+                    retryable=True,
+                )
+            # The enrollment request carries only a certification BOOLEAN; the
+            # server records whatever certification version is current at
+            # POST/PATCH time. A rotation between fetch_authorization and the
+            # enrollment request would otherwise commit authority under terms
+            # the user never reviewed — and pin a stale version the runner
+            # gate could never match. Verify the recorded version equals the
+            # exact one the user accepted before any commit; the create
+            # path's compensating revoke removes the just-created enrollment.
+            # (authorization/retention versions need no read-back check: the
+            # request SENDS them and the server rejects stale values.)
+            if remote_state.get("ownership_certification_version") != str(
+                expected_ownership
+            ):
+                # Distinct code: the failure handler must REVOKE the hosted
+                # enrollment for this case — on the update path too, where the
+                # PATCH has already been applied and the server-side consent
+                # record now misrepresents the user. Merely pausing would
+                # leave that record live.
+                raise AutoUploadError(
+                    "certification_not_accepted",
+                    "The hosted ownership certification changed while enrolling; "
+                    "review the updated terms and enable again.",
+                )
+            certification_verified = True
+
             config = load_config()
             config["auto_upload_capability_available"] = True
             # Only the create / credential-rotation path sends the one-shot
@@ -1443,6 +1571,8 @@ def enable(
                     authorization_revision=authorization_revision,
                     recurring_authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
+                    ownership_certification_version=str(expected_ownership),
+                    server_scope_hash=server_scope_hash,
                     egress_profile_hash=profile,
                     hook_targets=targets,
                     last_result_code="enabled",
@@ -1479,10 +1609,12 @@ def enable(
             current_after_failure = get_auto_upload_enrollment(conn)
             if (
                 server_reauthorization_succeeded
+                and certification_verified
                 and isinstance(exc, ControlChanged)
                 and isinstance(response, dict)
                 and isinstance(response.get("enrollment_id"), str)
                 and isinstance(response.get("authorization_revision"), int)
+                and isinstance(server_scope_hash, str)
                 and _reconcile_explicit_pause_after_reauthorization(
                     conn,
                     intent_generation=generation,
@@ -1494,6 +1626,8 @@ def enable(
                     authorization_revision=int(response["authorization_revision"]),
                     authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
+                    ownership_certification_version=str(expected_ownership),
+                    server_scope_hash=str(server_scope_hash),
                     egress_profile=profile,
                     hook_targets=targets,
                     restore_credentials=(
@@ -1529,7 +1663,53 @@ def enable(
                     _restore_hook_files(snapshots)
                 except OSError:
                     pass
-            if isinstance(exc, RecurringServiceError):
+            fresh_recovery = (
+                response.get("recovery_token")
+                if isinstance(response, dict)
+                else None
+            )
+            response_enrollment_id = (
+                response.get("enrollment_id")
+                if isinstance(response, dict)
+                else None
+            )
+            email_mutation_has_revoke_identity = bool(
+                isinstance(fresh_recovery, str)
+                and fresh_recovery
+                and (
+                    updating
+                    or (
+                        isinstance(response_enrollment_id, str)
+                        and response_enrollment_id
+                    )
+                )
+            )
+            email_mutation_is_unrecoverable = bool(
+                email_enrollment_may_have_committed
+                and not email_mutation_has_revoke_identity
+            )
+            if email_mutation_is_unrecoverable:
+                # The one-shot token may have been consumed and, on credential
+                # rotation, the old recovery token may now be invalid. Remove
+                # the token so every interactive client performs a fresh email
+                # verification, then retry the same durable client enrollment
+                # id to recover/reissue the hosted credentials.
+                try:
+                    failure_config = load_config()
+                    failure_config.pop("verified_email_token", None)
+                    failure_config.pop("verified_email_token_expires_at", None)
+                    save_config(failure_config)
+                except Exception:
+                    pass
+                error = AutoUploadError(
+                    "enrollment_response_ambiguous",
+                    "The hosted enrollment may have succeeded, but its recovery "
+                    "credential was not received. Verify your email again and "
+                    "rerun Enable to recover the same enrollment.",
+                    retryable=True,
+                    ambiguous=True,
+                )
+            elif isinstance(exc, RecurringServiceError):
                 if updating and exc.code in {
                     "credential_invalid",
                     "credential_expired",
@@ -1549,6 +1729,7 @@ def enable(
                         exc.message,
                         retryable=exc.retryable,
                         retry_after=exc.retry_after,
+                        ambiguous=exc.ambiguous,
                     )
             elif isinstance(exc, (AutoUploadError, CredentialStoreError)):
                 error = (
@@ -1575,7 +1756,93 @@ def enable(
             # recovery tombstone and records revocation_pending.
             response_local = response
             record_local = credential_record
-            if updating:
+            # After a DEFINITE server mutation on the updating path the request's
+            # certification boolean gives no way to know which certification
+            # version the server recorded; only a successful, matching read-back
+            # establishes it. Until that verification, any failure — an explicit
+            # mismatch, a malformed 2xx body that raised before the read-back, a
+            # failed/malformed read-back, or a control race — leaves a live
+            # hosted enrollment whose consent record cannot be shown to match
+            # what the user accepted, and the client cannot un-PATCH. Revoke it.
+            #
+            # The revoke identity must NOT come from the (possibly malformed)
+            # response: on the updating path the enrollment id is the one we
+            # PATCHed (existing.server_enrollment_id) and the recovery token is
+            # the reissued one when it validated, else the pinned credential.
+            updating_revoke_id: str | None = None
+            updating_revoke_recovery: str | None = None
+            updating_revoke_recovery_expiry: str | None = None
+            if updating and existing is not None:
+                known_id = str(existing.get("server_enrollment_id") or "")
+                reissued = (
+                    response_local.get("recovery_token")
+                    if isinstance(response_local, dict)
+                    else None
+                )
+                reissued_expiry = (
+                    response_local.get("recovery_token_expires_at")
+                    if isinstance(response_local, dict)
+                    else None
+                )
+                pinned = (
+                    credentials.get("recovery_token")
+                    if isinstance(credentials, dict)
+                    else None
+                )
+                pinned_expiry = (
+                    credentials.get("recovery_token_expires_at")
+                    if isinstance(credentials, dict)
+                    else None
+                )
+                updating_revoke_id = known_id or None
+                if isinstance(reissued, str) and reissued:
+                    updating_revoke_recovery = reissued
+                    updating_revoke_recovery_expiry = (
+                        str(reissued_expiry) if reissued_expiry else None
+                    )
+                elif not rotating_credentials and isinstance(pinned, str) and pinned:
+                    updating_revoke_recovery = pinned
+                    updating_revoke_recovery_expiry = (
+                        str(pinned_expiry) if pinned_expiry else None
+                    )
+            revoke_unverified_certification = (
+                updating
+                and server_reauthorization_succeeded
+                and not certification_verified
+                and updating_revoke_id is not None
+                and updating_revoke_recovery is not None
+            )
+            # Identity for revoking a definite server mutation: known values on
+            # the updating path, the response on the create path (the only path
+            # where the client cannot know the id ahead of the response).
+            if revoke_unverified_certification:
+                revoke_id = updating_revoke_id
+                revoke_recovery = updating_revoke_recovery
+                revoke_recovery_expiry = updating_revoke_recovery_expiry
+            elif (
+                not updating
+                and isinstance(response_local, dict)
+                and response_local.get("enrollment_id")
+            ):
+                revoke_id = str(response_local["enrollment_id"])
+                revoke_recovery = (
+                    record_local.get("recovery_token")
+                    if isinstance(record_local, dict)
+                    else response_local.get("recovery_token")
+                )
+                expiry_source = (
+                    (record_local or {}).get("recovery_token_expires_at")
+                    or response_local.get("recovery_token_expires_at")
+                )
+                revoke_recovery_expiry = (
+                    str(expiry_source) if expiry_source else None
+                )
+            else:
+                revoke_id = None
+                revoke_recovery = None
+                revoke_recovery_expiry = None
+
+            if updating and not revoke_unverified_certification:
                 update_auto_upload_enrollment(
                     conn,
                     expected_generation=generation,
@@ -1583,17 +1850,13 @@ def enable(
                     health="action_required",
                     last_result_code=error.code,
                 )
-            elif isinstance(response_local, dict) and response_local.get("enrollment_id"):
-                recovery = (
-                    record_local.get("recovery_token")
-                    if isinstance(record_local, dict)
-                    else response_local.get("recovery_token")
-                )
-                if isinstance(recovery, str) and recovery:
+            elif revoke_id and isinstance(revoke_recovery, str) and revoke_recovery:
+                recovery = revoke_recovery
+                if recovery:
                     try:
                         revoke_enrollment(
                             capabilities,
-                            enrollment_id=str(response_local["enrollment_id"]),
+                            enrollment_id=revoke_id,
                             recovery_token=recovery,
                         )
                         with control_mutation_lock():
@@ -1648,13 +1911,16 @@ def enable(
                             tombstone = {
                                 "issuer": capabilities["origin"],
                                 "api_origin": capabilities["origin"],
-                                "enrollment_id": str(response_local["enrollment_id"]),
+                                "enrollment_id": revoke_id,
                                 "active_token": None,
                                 "active_token_expires_at": None,
                                 "recovery_token": recovery,
-                                "recovery_token_expires_at": str(
-                                    response_local.get("recovery_token_expires_at") or "unknown"
-                                ),
+                                # Expiry is resolved with the revoke identity:
+                                # the reissued token's expiry when present, else
+                                # the pinned credential's — never the malformed
+                                # response, which may carry neither.
+                                "recovery_token_expires_at": revoke_recovery_expiry
+                                or "unknown",
                             }
                             with control_mutation_lock():
                                 rollback_enrollment = get_auto_upload_enrollment(conn)
@@ -1685,9 +1951,7 @@ def enable(
                                     generation=rollback_generation + 1,
                                     mode="off",
                                     health="retrying",
-                                    server_enrollment_id=str(
-                                        response_local["enrollment_id"]
-                                    ),
+                                    server_enrollment_id=revoke_id,
                                     revocation_pending=True,
                                     last_result_code="revocation_pending",
                                 ):
@@ -1701,7 +1965,14 @@ def enable(
                     conn,
                     expected_generation=generation,
                     mode="off",
-                    health="action_required" if error.code == "control_changed" else "ready",
+                    health=(
+                        "action_required"
+                        if error.code in {
+                            "control_changed",
+                            "enrollment_response_ambiguous",
+                        }
+                        else "ready"
+                    ),
                     revocation_pending=False,
                     last_result_code=error.code,
                 )
@@ -1746,6 +2017,14 @@ def resume() -> dict[str, Any]:
         enrollment = get_auto_upload_enrollment(conn)
         if enrollment is None or enrollment["mode"] == "off":
             return AutoUploadError("not_enabled", "Automatic upload is not enabled.").as_result()
+        if enrollment.get("last_result_code") == "enrollment_response_ambiguous":
+            return AutoUploadError(
+                "enrollment_recovery_required",
+                "Verify your email and review scope and terms to recover the "
+                "hosted enrollment before resuming.",
+                retryable=True,
+                ambiguous=True,
+            ).as_result()
         credentials = load_credentials(required=True)
         if not credentials or not credentials.get("active_token"):
             return AutoUploadError(
@@ -1799,6 +2078,31 @@ def disable() -> dict[str, Any]:
         # CAS against the generation this Disable owns.
         with control_mutation_lock():
             enrollment = get_auto_upload_enrollment(conn)
+            if (
+                enrollment is not None
+                and enrollment.get("last_result_code")
+                == "enrollment_response_ambiguous"
+            ):
+                # A credential-rotation POST may have invalidated the pinned
+                # recovery token before its replacement response was lost.
+                # Never turn that known-stale token into a permanent revoke
+                # tombstone. The enrollment is already fail-closed (Off or
+                # Paused); a fresh email verification must reissue credentials
+                # under the same client enrollment id before Disable can make
+                # a truthful hosted revocation.
+                try:
+                    remove_active_token()
+                except CredentialStoreError as exc:
+                    return AutoUploadError(
+                        "credential_store_failed", str(exc)
+                    ).as_result()
+                return AutoUploadError(
+                    "enrollment_recovery_required",
+                    "Verify your email and rerun Enable to recover the hosted "
+                    "enrollment, then Disable can revoke it safely.",
+                    retryable=True,
+                    ambiguous=True,
+                ).as_result()
             disable_generation = (
                 int(enrollment["generation"])
                 if enrollment is not None
@@ -3131,9 +3435,18 @@ def _server_enrollment_gate(
             "authorization_version_mismatch",
             "Recurring authorization or retention terms changed.",
         )
-    expected_scope_hash = scope_hash(
-        enrollment.get("enrolled_sources", []), enrollment.get("enrolled_projects", [])
-    )
+    # Protocol v2: the scope hash is server-computed (keyed with the server's
+    # secret), so the client pins the value read back at enrollment time and
+    # requires it to be unchanged. A missing stored hash (a pre-v2 enrollment
+    # row) fails closed under its own code so UIs can point the user at
+    # reauthorization rather than implying hosted state drifted.
+    expected_scope_hash = enrollment.get("server_scope_hash")
+    if not isinstance(expected_scope_hash, str) or not expected_scope_hash:
+        raise AutoUploadError(
+            "reauthorization_required",
+            "Reauthorize automatic uploads to accept the updated hosted terms "
+            "(run: clawjournal auto-upload enable).",
+        )
     if remote.get("scope_hash") != expected_scope_hash:
         raise AutoUploadError(
             "authorization_version_mismatch",
@@ -3145,6 +3458,13 @@ def _server_enrollment_gate(
         raise AutoUploadError(
             "authorization_version_mismatch",
             "The hosted recurring terms no longer match local state.",
+        )
+    if remote.get("ownership_certification_version") != enrollment.get(
+        "ownership_certification_version"
+    ):
+        raise AutoUploadError(
+            "authorization_version_mismatch",
+            "The hosted ownership certification no longer matches local state.",
         )
     if int(remote.get("authorization_revision") or 0) != int(
         enrollment.get("authorization_revision") or 0

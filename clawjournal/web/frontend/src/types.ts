@@ -296,7 +296,12 @@ export interface AutoUploadAuthorizationChallenge {
   authorization_profile_hash: string;
   authorization: { version: string; text: string };
   retention: { version: string; text: string };
-  scope: { sources: string[]; projects: string[] };
+  ownership_certification: { version: string; text: string };
+  scope: {
+    sources: string[];
+    projects: string[];
+    entries: Array<[string, string]>;
+  };
   ai: { enabled: boolean; backend: string | null };
   cap: number;
   cadence_days: number;

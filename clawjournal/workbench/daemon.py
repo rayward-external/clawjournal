@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
+from ..auto_upload_client import RECURRING_UPLOAD_API_VERSION
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
 from ..scoring.backends import (
@@ -1243,6 +1244,16 @@ def _fetch_hosted_share_capabilities(*, force: bool = False) -> dict[str, Any]:
         ttl = 300
     _hosted_capabilities_cache = (api_base, now + ttl, dict(capabilities))
     return capabilities
+
+
+def _recurring_offer_available(capabilities: dict[str, Any]) -> bool:
+    """Return whether the live capability document offers this protocol."""
+
+    return bool(
+        capabilities.get("recurring_upload_api_version")
+        == RECURRING_UPLOAD_API_VERSION
+        and capabilities.get("recurring_enrollment_open") is True
+    )
 
 
 def _validate_ingest_url() -> None:
@@ -3932,6 +3943,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     if body.get("accepted_retention_version") is not None
                     else None
                 ),
+                accepted_ownership_certification_version=(
+                    str(body["accepted_ownership_certification_version"])
+                    if body.get("accepted_ownership_certification_version") is not None
+                    else None
+                ),
                 accepted_authorization_profile_hash=(
                     str(body["accepted_authorization_profile_hash"])
                     if body.get("accepted_authorization_profile_hash") is not None
@@ -4563,9 +4579,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 try:
                     capabilities = _fetch_hosted_share_capabilities()
                     config = load_config()
-                    config["auto_upload_capability_available"] = bool(
-                        capabilities.get("recurring_upload_api_version") == 1
-                        and capabilities.get("recurring_enrollment_open") is True
+                    config["auto_upload_capability_available"] = (
+                        _recurring_offer_available(capabilities)
                     )
                     save_config(config)
                 except Exception:

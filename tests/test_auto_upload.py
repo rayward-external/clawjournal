@@ -23,7 +23,7 @@ import pytest
 
 from clawjournal import agent_hooks, auto_upload as auto
 from clawjournal import config as config_module
-from clawjournal.auto_upload_client import RecurringServiceError
+from clawjournal.auto_upload_client import CapabilityError, RecurringServiceError
 from clawjournal.auto_upload_credentials import (
     CredentialStoreError,
     credential_path,
@@ -49,6 +49,10 @@ ORIGIN = "https://data.rayward.ai"
 ENROLLED_AT = "2026-07-10T12:00:00+00:00"
 AUTH_VERSION = "recurring-v1"
 RETENTION_VERSION = "retention-v1"
+OWNERSHIP_VERSION = "ownership-test.v1"
+# Protocol v2: the server owns the scope hash; the client pins the value read
+# back at enrollment time and the runner's gate requires it unchanged.
+SERVER_SCOPE_HASH = "server-scope-hash-1"
 
 
 @pytest.fixture
@@ -178,6 +182,10 @@ def _terms() -> dict[str, str]:
         "authorization_text": "I authorize a weekly upload of up to five traces.",
         "retention_policy_version": RETENTION_VERSION,
         "retention_text": "Uploaded traces follow the stated retention policy.",
+        "ownership_certification_version": OWNERSHIP_VERSION,
+        "ownership_certification_text": (
+            "I certify I own or am authorized to share the enrolled traces."
+        ),
     }
 
 
@@ -213,6 +221,8 @@ def _save_enabled_enrollment(
         authorization_revision=1,
         recurring_authorization_version=AUTH_VERSION,
         retention_version=RETENTION_VERSION,
+        ownership_certification_version=OWNERSHIP_VERSION,
+        server_scope_hash=SERVER_SCOPE_HASH,
         egress_profile_hash=profile,
         hook_targets=["claude", "codex"],
         current_run_id=current_run_id,
@@ -314,7 +324,8 @@ def _patch_runner_host(monkeypatch, *, origin: str = ORIGIN) -> None:
             "authorization_revision": 1,
             "authorization_version": AUTH_VERSION,
             "retention_policy_version": RETENTION_VERSION,
-            "scope_hash": auto.scope_hash(["claude"], ["project-one"]),
+            "ownership_certification_version": OWNERSHIP_VERSION,
+            "scope_hash": SERVER_SCOPE_HASH,
             "revoked_at": None,
         },
     )
@@ -1895,6 +1906,17 @@ def _patch_enable_dependencies(monkeypatch, *, hook_result: bool = True):
     _patch_strict_scanner(monkeypatch)
     monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
     monkeypatch.setattr(auto, "fetch_authorization", lambda _caps: _terms())
+    # Protocol v2: enable() reads the definite enrollment state back after a
+    # successful create/PATCH and pins the server-computed scope hash.
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "scope_hash": SERVER_SCOPE_HASH,
+            "ownership_certification_version": OWNERSHIP_VERSION,
+        },
+    )
     monkeypatch.setattr(auto, "_snapshot_hook_files", lambda _targets: {})
     monkeypatch.setattr(
         auto,
@@ -1938,6 +1960,682 @@ def _enrollment_response() -> dict[str, Any]:
     }
 
 
+def test_enable_fails_fast_on_capabilities_before_the_strict_scan(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The strict scan re-parses every enrolled source log (minutes of CPU on
+    a large history); an incompatible or unreachable hosted service must be
+    surfaced BEFORE paying it, not after."""
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+
+    def incompatible(**_kwargs):
+        raise CapabilityError(
+            "capability_incompatible",
+            "Hosted recurring-upload capability is unavailable or incompatible.",
+        )
+
+    monkeypatch.setattr(auto, "_has_successful_manual_receipt", lambda _conn: True)
+    monkeypatch.setattr(auto, "fetch_capabilities", incompatible)
+    scan_calls = _patch_strict_scanner(monkeypatch)
+
+    result = auto.enable(agent="claude")
+
+    assert result["code"] == "capability_incompatible"
+    assert scan_calls == []
+
+
+def test_scope_entries_are_the_full_source_project_cross_product(
+    isolated_auto_upload,
+):
+    """Certification must cover exactly what the candidate filter enforces
+    (source IN sources AND project IN projects): a later session in a NEW
+    combination of already-enrolled source and project must already be inside
+    the server-certified scope, so entries are the full cross product — not
+    just the pairs observed at enrollment time."""
+    config = _save_scope_config()
+    config["source"] = "all"
+    config_module.save_config(config)
+    conn = open_index()
+    session_a, _ = _session(isolated_auto_upload["root"], "session-a", project="alpha")
+    session_b, _ = _session(isolated_auto_upload["root"], "session-b", project="beta")
+    session_b["source"] = "codex"
+    assert upsert_sessions(conn, [session_a, session_b]) == 2
+
+    scope = auto._current_scope(conn, config_module.load_config())
+
+    assert scope["sources"] == ["claude", "codex"]
+    assert scope["projects"] == ["alpha", "beta"]
+    assert scope["entries"] == [
+        ("claude", "alpha"),
+        ("claude", "beta"),
+        ("codex", "alpha"),
+        ("codex", "beta"),
+    ]
+    conn.close()
+
+
+def test_oversized_scope_blocks_before_consent_network_and_scan(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A scope beyond the hosted entry cap must fail fast with its own code
+    before any consent prompt, network call, or strict scan."""
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+
+    monkeypatch.setattr(auto, "_has_successful_manual_receipt", lambda _conn: True)
+    monkeypatch.setattr(auto, "MAX_SCOPE_ENTRIES", 0)
+
+    def network_forbidden(**_kwargs):
+        raise AssertionError("oversized scope must stop before network")
+
+    monkeypatch.setattr(auto, "fetch_capabilities", network_forbidden)
+    scan_calls = _patch_strict_scanner(monkeypatch)
+
+    result = auto.enable(agent="claude")
+
+    assert result["code"] == "scope_too_large"
+    assert "exceeds the hosted limit" in result["message"]
+    assert scan_calls == []
+
+
+def test_missing_server_scope_hash_surfaces_reauthorization_required(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A pre-v2 enrollment row (no pinned server scope hash) must fail closed
+    under a distinct reauthorization code — nothing hosted drifted, so the
+    generic mismatch wording would misdirect the user."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        server_scope_hash=None,
+    )
+    enrollment = get_auto_upload_enrollment(conn)
+    conn.close()
+
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "revoked_at": None,
+            "submissions_open": True,
+            "terms_current": True,
+            "scope_hash": SERVER_SCOPE_HASH,
+            "authorization_version": AUTH_VERSION,
+            "retention_policy_version": RETENTION_VERSION,
+            "ownership_certification_version": OWNERSHIP_VERSION,
+            "authorization_revision": 1,
+        },
+    )
+    with pytest.raises(auto.AutoUploadError) as excinfo:
+        auto._server_enrollment_gate(
+            _capabilities(),
+            enrollment,
+            _credentials(),
+        )
+    assert excinfo.value.code == "reauthorization_required"
+
+
+def test_read_back_failure_keeps_fresh_recovery_token_persisted(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The post-create read-back runs AFTER Phase-1: a transient GET failure
+    (or crash) must leave the freshly issued recovery token durably persisted
+    so Disable can always revoke with a live credential — never the dropped
+    -tokens state where only a possibly-invalidated older recovery remains."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda *_a, **_k: _enrollment_response()
+    )
+
+    def read_back_down(*_args, **_kwargs):
+        raise RecurringServiceError(
+            code="server_unavailable", message="down", retryable=True
+        )
+
+    monkeypatch.setattr(auto, "get_enrollment", read_back_down)
+    # The compensating revoke also failing must still retain the recovery
+    # tombstone rather than deleting the only live credential.
+    monkeypatch.setattr(auto, "revoke_enrollment", read_back_down)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    credentials = load_credentials(required=False)
+    assert credentials is not None
+    assert credentials["recovery_token"] == _credentials()["recovery_token"]
+    assert credentials["active_token"] is None
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["revocation_pending"] is True
+    finally:
+        conn.close()
+
+
+def test_certification_rotation_during_enroll_aborts_and_revokes(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The enrollment request carries only a certification boolean, so the
+    server records its CURRENT version at POST time. If that version rotates
+    between fetch_authorization and the POST, the read-back must catch the
+    mismatch and abort with the compensating revoke — never report enabled
+    under terms the user never reviewed, nor pin a stale version the runner
+    gate could never match."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda *_a, **_k: _enrollment_response()
+    )
+    # The server rotated the certification after the terms fetch: the
+    # read-back reports a version the user did not accept.
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "scope_hash": SERVER_SCOPE_HASH,
+            "ownership_certification_version": "ownership-rotated.v2",
+        },
+    )
+    revoke_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            enrollment_id
+        )
+        or {},
+    )
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "certification_not_accepted"
+    assert revoke_calls == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        # Nothing may be pinned under the unreviewed certification.
+        assert enrollment.get("server_scope_hash") is None
+        assert enrollment.get("ownership_certification_version") is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("revoke_succeeds", [True, False])
+def test_certification_rotation_during_patch_revokes_the_live_enrollment(
+    isolated_auto_upload,
+    monkeypatch,
+    revoke_succeeds,
+):
+    """On the UPDATE path the PATCH has already been applied when the read-back
+    detects a rotated certification: the hosted enrollment now carries a
+    consent record the user never made and cannot be un-PATCHed. It must be
+    revoked — not left paused-but-live. A failed revoke must leave the
+    recovery tombstone (revocation_pending) so Disable can finish the job."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(
+        auto,
+        "update_enrollment",
+        lambda *_a, **_k: {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": ENROLLED_AT,
+            "authorization_revision": 2,
+        },
+    )
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "scope_hash": SERVER_SCOPE_HASH,
+            "ownership_certification_version": "ownership-rotated.v2",
+        },
+    )
+    revoke_calls: list[str] = []
+
+    def revoke(_caps, *, enrollment_id, recovery_token):
+        revoke_calls.append(enrollment_id)
+        if not revoke_succeeds:
+            raise RecurringServiceError(
+                code="server_unavailable", message="down", retryable=True
+            )
+        return {}
+
+    monkeypatch.setattr(auto, "revoke_enrollment", revoke)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "certification_not_accepted"
+    assert revoke_calls == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        if revoke_succeeds:
+            assert enrollment["revocation_pending"] is False
+            assert enrollment["server_enrollment_id"] is None
+            assert load_credentials(required=False) is None
+        else:
+            assert enrollment["revocation_pending"] is True
+            credentials = load_credentials(required=False)
+            assert credentials is not None
+            assert credentials["recovery_token"] == _credentials()["recovery_token"]
+            assert credentials["active_token"] is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("failure_mode", ["get_fails", "no_scope_hash"])
+def test_unverifiable_read_back_after_patch_revokes_like_a_mismatch(
+    isolated_auto_upload,
+    monkeypatch,
+    failure_mode,
+):
+    """After a definite PATCH the certification boolean gives no way to know
+    which version the server recorded — only the read-back can establish it.
+    A failed or malformed read-back is therefore an UNVERIFIABLE consent state
+    on a live enrollment and must take the same compensating revoke as a
+    confirmed mismatch, never a pause that leaves the enrollment active."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(
+        auto,
+        "update_enrollment",
+        lambda *_a, **_k: {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": ENROLLED_AT,
+            "authorization_revision": 2,
+        },
+    )
+    if failure_mode == "get_fails":
+        def read_back(*_args, **_kwargs):
+            raise RecurringServiceError(
+                code="server_unavailable", message="down", retryable=True
+            )
+    else:
+        def read_back(*_args, **_kwargs):
+            return {"enrollment_id": "server-enrollment-1"}
+
+    monkeypatch.setattr(auto, "get_enrollment", read_back)
+    revoke_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            enrollment_id
+        )
+        or {},
+    )
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == (
+        "server_unavailable" if failure_mode == "get_fails" else "malformed_enrollment_response"
+    )
+    assert revoke_calls == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        {"enrolled_at": ENROLLED_AT},  # missing authorization_revision
+        {"authorization_revision": 2},  # missing enrolled_at
+        {"enrolled_at": ENROLLED_AT, "authorization_revision": 2},  # missing id
+        {},  # empty body
+    ],
+)
+def test_malformed_patch_body_revokes_with_known_identity(
+    isolated_auto_upload,
+    monkeypatch,
+    bad_response,
+):
+    """A PATCH that returns 2xx but a malformed body is a DEFINITE server
+    mutation the read-back never got to verify: it must revoke using the known
+    existing enrollment id and the pinned recovery credential — not the
+    response body, which lacks them — instead of pausing a live enrollment."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(auto, "update_enrollment", lambda *_a, **_k: dict(bad_response))
+
+    def read_back_must_not_run(*_args, **_kwargs):
+        raise AssertionError("read-back is unreachable when the PATCH body is malformed")
+
+    monkeypatch.setattr(auto, "get_enrollment", read_back_must_not_run)
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        )
+        or {},
+    )
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "malformed_enrollment_response"
+    # Revoked with the KNOWN enrollment id + pinned recovery token, not the
+    # (malformed, identity-less) response body.
+    assert revoke_calls == [
+        ("server-enrollment-1", _credentials()["recovery_token"]),
+    ]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
+    finally:
+        conn.close()
+
+
+def test_ambiguous_patch_revokes_with_known_recovery_identity(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+
+    def lose_patch_response(*_args, **_kwargs):
+        raise RecurringServiceError(
+            "server_unavailable",
+            "response was truncated",
+            retryable=True,
+            ambiguous=True,
+        )
+
+    monkeypatch.setattr(auto, "update_enrollment", lose_patch_response)
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        )
+        or {},
+    )
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "server_unavailable"
+    assert result["ambiguous"] is True
+    assert revoke_calls == [("server-enrollment-1", "recovery-secret")]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
+    finally:
+        conn.close()
+
+
+def test_ambiguous_create_requires_fresh_verification_and_reuses_intent(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(upload_token="possibly-consumed")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_ids: list[str] = []
+
+    def create(_capabilities, **kwargs):
+        create_ids.append(str(kwargs["client_enrollment_id"]))
+        if len(create_ids) == 1:
+            raise RecurringServiceError(
+                "server_unavailable",
+                "response was lost",
+                retryable=True,
+                ambiguous=True,
+            )
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+    revoke_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            enrollment_id
+        ),
+    )
+    profile = _current_authorization_profile_hash()
+
+    failed = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert failed["code"] == "enrollment_response_ambiguous"
+    assert failed["ambiguous"] is True
+    assert revoke_calls == []
+    assert "verified_email_token" not in config_module.load_config()
+    blocked_disable = auto.disable()
+    assert blocked_disable["code"] == "enrollment_recovery_required"
+    assert blocked_disable["ambiguous"] is True
+    assert revoke_calls == []
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["health"] == "action_required"
+        first_client_id = enrollment["client_enrollment_id"]
+    finally:
+        conn.close()
+
+    refreshed = config_module.load_config()
+    refreshed["verified_email_token"] = "fresh-one-shot"
+    refreshed["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    assert config_module.save_config(refreshed)
+
+    enabled = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert enabled["mode"] == "enabled"
+    assert create_ids == [first_client_id, first_client_id]
+
+
+def test_ambiguous_credential_rotation_never_uses_invalidated_old_recovery(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    config = _save_scope_config(upload_token="possibly-consumed")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    expired = _credentials()
+    expired["active_token_expires_at"] = "2020-01-01T00:00:00+00:00"
+    write_credentials(expired)
+    _patch_enable_dependencies(monkeypatch)
+    create_ids: list[str] = []
+
+    def rotate(_capabilities, **kwargs):
+        create_ids.append(str(kwargs["client_enrollment_id"]))
+        if len(create_ids) == 1:
+            raise RecurringServiceError(
+                "server_unavailable",
+                "response was lost",
+                retryable=True,
+                ambiguous=True,
+            )
+        response = _enrollment_response()
+        response["enrolled_at"] = ENROLLED_AT
+        response["authorization_revision"] = 2
+        return response
+
+    monkeypatch.setattr(auto, "create_enrollment", rotate)
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        ),
+    )
+
+    profile = _current_authorization_profile_hash()
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["code"] == "enrollment_response_ambiguous"
+    assert result["ambiguous"] is True
+    assert revoke_calls == []
+    assert "verified_email_token" not in config_module.load_config()
+    blocked_resume = auto.resume()
+    assert blocked_resume["code"] == "enrollment_recovery_required"
+    blocked_disable = auto.disable()
+    assert blocked_disable["code"] == "enrollment_recovery_required"
+    assert blocked_disable["ambiguous"] is True
+    assert revoke_calls == []
+    assert load_credentials(required=True)["active_token"] is None
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "paused"
+        assert enrollment["health"] == "action_required"
+        assert enrollment["server_enrollment_id"] == "server-enrollment-1"
+        client_enrollment_id = enrollment["client_enrollment_id"]
+        assert create_ids == [client_enrollment_id]
+    finally:
+        conn.close()
+
+    refreshed = config_module.load_config()
+    refreshed["verified_email_token"] = "fresh-one-shot"
+    refreshed["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    assert config_module.save_config(refreshed)
+    recovered = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+    assert recovered["mode"] == "enabled"
+    assert create_ids == [client_enrollment_id, client_enrollment_id]
+
+    disabled = auto.disable()
+    assert disabled["mode"] == "off"
+    assert revoke_calls == [("server-enrollment-1", "recovery-secret")]
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,
@@ -1961,6 +2659,9 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
     assert challenge["code"] == "authorization_required"
     assert challenge["authorization"]["version"] == AUTH_VERSION
     assert challenge["retention"]["version"] == RETENTION_VERSION
+    assert challenge["ownership_certification"]["version"] == OWNERSHIP_VERSION
+    assert challenge["ownership_certification"]["text"]
+    assert challenge["scope"]["entries"] == [["claude", "project-one"]]
     assert create_calls == []
     conn = open_index()
     try:
@@ -1973,14 +2674,27 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
     )
     assert versions_only["code"] == "authorization_required"
+    assert create_calls == []
+
+    # Protocol v2: accepting terms and the profile hash without the distinct
+    # ownership certification must remain non-mutating.
+    missing_ownership = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=challenge["authorization_profile_hash"],
+    )
+    assert missing_ownership["code"] == "authorization_required"
     assert create_calls == []
 
     result = auto.enable(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=challenge["authorization_profile_hash"],
     )
 
@@ -1988,6 +2702,9 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
     assert result["health"] == "ready"
     assert len(create_calls) == 1
     assert create_calls[0]["upload_token"] == "fresh-one-shot"
+    assert list(create_calls[0]["scope_entries"]) == [("claude", "project-one")]
+    assert create_calls[0]["ownership_certification"] is True
+    assert "scope_hash" not in create_calls[0]
     assert load_credentials(required=True)["active_token"] == "active-secret"
     persisted = config_module.load_config()
     assert "verified_email_token" not in persisted
@@ -2036,11 +2753,16 @@ def test_enable_rejects_acceptance_when_displayed_scope_changes(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=displayed["authorization_profile_hash"],
     )
 
     assert result["code"] == "authorization_required"
     assert result["scope"]["projects"] == ["project-one", "project-two"]
+    assert result["scope"]["entries"] == [
+        ["claude", "project-one"],
+        ["claude", "project-two"],
+    ]
     assert (
         result["authorization_profile_hash"]
         != displayed["authorization_profile_hash"]
@@ -2075,6 +2797,7 @@ def test_enable_never_backdates_cutoff_before_durable_local_intent(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2123,6 +2846,7 @@ def test_new_enrollment_after_disable_resets_prior_cadence_and_receipt(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2145,7 +2869,12 @@ def test_reauthorization_rejects_later_future_only_cutoff(
     monkeypatch,
 ):
     # Moving the boundary *later* than the committed one is an unexpected
-    # forward move for a fixed enrollment and must be rejected.
+    # forward move for a fixed enrollment and must be rejected. Because it is
+    # detected AFTER the PATCH is definite but BEFORE the certification
+    # read-back, the enrollment's recorded certification is unverifiable — so
+    # the definite PATCH is revoked, not left paused-but-live. (Pre-v2 this
+    # merely paused; that left a live hosted enrollment under an unverified
+    # certification, which the read-back contract now forbids.)
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -2166,21 +2895,34 @@ def test_reauthorization_rejects_later_future_only_cutoff(
             "authorization_revision": 2,
         },
     )
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        )
+        or {},
+    )
 
     result = auto.enable(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
     assert result["code"] == "malformed_enrollment_response"
+    assert revoke_calls == [
+        ("server-enrollment-1", _credentials()["recovery_token"]),
+    ]
     conn = open_index()
     try:
         enrollment = get_auto_upload_enrollment(conn)
-        assert enrollment["mode"] == "paused"
-        assert enrollment["health"] == "action_required"
-        assert enrollment["enrolled_at"] == "2026-07-15T13:00:00+00:00"
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
     finally:
         conn.close()
 
@@ -2219,6 +2961,7 @@ def test_reauthorization_accepts_earlier_server_cutoff_from_clock_skew(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2265,6 +3008,7 @@ def test_non_rotating_update_preserves_unused_manual_verified_email_token(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2304,6 +3048,7 @@ def test_reauthorization_discards_same_enrollment_sealed_artifact_after_patch(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2391,6 +3136,7 @@ def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
                     agent="claude",
                     accepted_authorization_version=AUTH_VERSION,
                     accepted_retention_version=RETENTION_VERSION,
+                    accepted_ownership_certification_version=OWNERSHIP_VERSION,
                     accepted_authorization_profile_hash=profile_hash,
                 )
             )
@@ -2475,6 +3221,7 @@ def test_reauthorization_blocks_before_patch_while_receipt_is_ambiguous(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2520,6 +3267,7 @@ def test_enable_snapshot_failure_returns_structured_error_and_stays_off(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2561,6 +3309,7 @@ def test_enable_rolls_back_hook_failure_before_server_or_credentials(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2605,6 +3354,7 @@ def test_enable_revokes_server_enrollment_when_credential_commit_fails(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2661,6 +3411,7 @@ def test_definitely_revoked_first_create_rotates_next_idempotency_key(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=profile_hash,
     )
 
@@ -2678,6 +3429,7 @@ def test_definitely_revoked_first_create_rotates_next_idempotency_key(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=profile_hash,
     )
 
@@ -2736,6 +3488,7 @@ def test_enable_generation_race_cannot_commit_or_restore_over_newer_controls(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2795,6 +3548,7 @@ def test_disable_cancels_first_enable_while_create_request_is_in_flight(
                     agent="claude",
                     accepted_authorization_version=AUTH_VERSION,
                     accepted_retention_version=RETENTION_VERSION,
+                    accepted_ownership_certification_version=OWNERSHIP_VERSION,
                     accepted_authorization_profile_hash=_current_authorization_profile_hash(),
                 )
             )
@@ -2923,6 +3677,7 @@ def test_disable_waits_for_authority_handoff_and_recovers_after_process_death(
                 agent="claude",
                 accepted_authorization_version=AUTH_VERSION,
                 accepted_retention_version=RETENTION_VERSION,
+                accepted_ownership_certification_version=OWNERSHIP_VERSION,
                 accepted_authorization_profile_hash=_current_authorization_profile_hash(),
             )
         except BaseException as exc:  # expected simulated process death
@@ -3022,6 +3777,7 @@ def test_stale_disable_cannot_erase_later_rollback_recovery_handoff(
                     agent="claude",
                     accepted_authorization_version=AUTH_VERSION,
                     accepted_retention_version=RETENTION_VERSION,
+                    accepted_ownership_certification_version=OWNERSHIP_VERSION,
                     accepted_authorization_profile_hash=_current_authorization_profile_hash(),
                 )
             )
@@ -3139,6 +3895,7 @@ def test_reauthorization_cannot_resurrect_active_token_after_disable_wins(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -3343,7 +4100,8 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
         "authorization_revision": 1,
         "authorization_version": AUTH_VERSION,
         "retention_policy_version": RETENTION_VERSION,
-        "scope_hash": auto.scope_hash(["claude"], ["claude:project-one"]),
+        "ownership_certification_version": OWNERSHIP_VERSION,
+        "scope_hash": SERVER_SCOPE_HASH,
         "revoked_at": None,
     }
     monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: capabilities)
@@ -4096,6 +4854,7 @@ def test_definite_receipt_404_unblocks_explicit_reauthorization(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -4142,7 +4901,8 @@ def test_config_profile_mutation_before_final_transition_stops_post(
             "authorization_revision": 1,
             "authorization_version": AUTH_VERSION,
             "retention_policy_version": RETENTION_VERSION,
-            "scope_hash": auto.scope_hash(["claude"], ["project-one"]),
+            "ownership_certification_version": OWNERSHIP_VERSION,
+            "scope_hash": SERVER_SCOPE_HASH,
             "revoked_at": None,
         }
 

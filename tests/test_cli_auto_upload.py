@@ -31,7 +31,12 @@ def test_noninteractive_enable_requires_exact_versions(monkeypatch, capsys):
         "authorization_profile_hash": "profile-sha256",
         "authorization": {"version": "auth-v1", "text": "future uploads"},
         "retention": {"version": "ret-v1", "text": "retention"},
-        "scope": {"sources": ["codex"], "projects": ["project"]},
+        "ownership_certification": {"version": "own-v1", "text": "ownership"},
+        "scope": {
+            "sources": ["codex"],
+            "projects": ["project"],
+            "entries": [["codex", "project"]],
+        },
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
         "cadence_days": 7,
@@ -120,7 +125,12 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
         "authorization_profile_hash": "profile-sha256",
         "authorization": {"version": attack, "text": attack},
         "retention": {"version": attack, "text": attack},
-        "scope": {"sources": [attack], "projects": [attack]},
+        "ownership_certification": {"version": attack, "text": attack},
+        "scope": {
+            "sources": [attack],
+            "projects": [attack],
+            "entries": [[attack, attack]],
+        },
         "ai": {"enabled": True, "backend": attack},
         "cap": 5,
         "cadence_days": 7,
@@ -139,11 +149,13 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
     assert cli._interactive_accept(None, challenge) == (
         attack,
         attack,
+        attack,
         "profile-sha256",
     )
     output = capsys.readouterr().out
     assert "\x1b" not in output + "".join(prompts)
     assert "\x07" not in output + "".join(prompts)
+    assert "Exact authorized source/project pairs:" in output
     assert all("\n" not in prompt for prompt in prompts)
 
 
@@ -175,7 +187,12 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
         "authorization_profile_hash": "profile-sha256",
         "authorization": {"version": "auth-v1", "text": "future uploads"},
         "retention": {"version": "ret-v1", "text": "retention"},
-        "scope": {"sources": ["codex"], "projects": ["project"]},
+        "ownership_certification": {"version": "own-v1", "text": "ownership"},
+        "scope": {
+            "sources": ["codex"],
+            "projects": ["project"],
+            "entries": [["codex", "project"]],
+        },
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
         "cadence_days": 7,
@@ -195,7 +212,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
             }
         return {"ok": True, "mode": "enabled", "health": "ready"}
 
-    answers = iter(["auth-v1", "ret-v1", "student@uni.edu"])
+    answers = iter(["auth-v1", "ret-v1", "own-v1", "student@uni.edu"])
     monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
     monkeypatch.setattr(sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
@@ -216,6 +233,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
         "agent": "all",
         "accepted_authorization_version": "auth-v1",
         "accepted_retention_version": "ret-v1",
+        "accepted_ownership_certification_version": "own-v1",
         "accepted_authorization_profile_hash": "profile-sha256",
     }
     assert calls == [
@@ -223,6 +241,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
             "agent": "all",
             "accepted_authorization_version": None,
             "accepted_retention_version": None,
+            "accepted_ownership_certification_version": None,
             "accepted_authorization_profile_hash": None,
         },
         accepted,
@@ -238,7 +257,12 @@ def test_interactive_accept_handles_keyboard_interrupt(monkeypatch):
         "authorization_profile_hash": "profile-sha256",
         "authorization": {"version": "auth-v1", "text": "future uploads"},
         "retention": {"version": "ret-v1", "text": "retention"},
-        "scope": {"sources": ["codex"], "projects": ["project"]},
+        "ownership_certification": {"version": "own-v1", "text": "ownership"},
+        "scope": {
+            "sources": ["codex"],
+            "projects": ["project"],
+            "entries": [["codex", "project"]],
+        },
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
         "cadence_days": 7,

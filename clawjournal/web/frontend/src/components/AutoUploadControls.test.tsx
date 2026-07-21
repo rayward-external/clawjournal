@@ -61,7 +61,15 @@ function authorizationRequired() {
       version: 'retention-v3',
       text: 'Hosted retention terms for recurring uploads.',
     },
-    scope: { sources: ['claude'], projects: ['project-a'] },
+    ownership_certification: {
+      version: 'ownership-v1',
+      text: 'I certify every automatically uploaded bundle is my own lawful content.',
+    },
+    scope: {
+      sources: ['claude'],
+      projects: ['project-a'],
+      entries: [['claude', 'project-a']],
+    },
     ai: { enabled: true, backend: 'codex' },
     cap: 5,
     cadence_days: 7,
@@ -198,9 +206,21 @@ describe('AutoUploadPanel authorization', () => {
     expect(screen.getByText(/separate from the consent you gave/i)).toBeInTheDocument();
     expect(screen.getByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();
+    expect(screen.getByText('claude → project-a')).toBeInTheDocument();
+    expect(screen.getByText(/exact source\/project pairs shown above/i)).toBeInTheDocument();
     expect(screen.getByText(/can upload without my reviewing each bundle/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('checkbox'));
+    expect(
+      screen.getByText('I certify every automatically uploaded bundle is my own lawful content.'),
+    ).toBeInTheDocument();
+
+    // Both affirmative acts are required: terms acceptance alone must not
+    // enable the button, and the enable POST carries the certification version.
+    const checkboxes = screen.getAllByRole('checkbox');
+    expect(checkboxes).toHaveLength(2);
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByRole('button', { name: 'Enable automatic upload' })).toBeDisabled();
+    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
@@ -208,6 +228,7 @@ describe('AutoUploadPanel authorization', () => {
       agent: 'claude',
       accepted_authorization_version: 'recurring-v2',
       accepted_retention_version: 'retention-v3',
+      accepted_ownership_certification_version: 'ownership-v1',
       accepted_authorization_profile_hash: 'profile-hash-v2',
     });
     expect(await screen.findByText('recurring-v2')).toBeInTheDocument();
@@ -369,6 +390,57 @@ describe('AutoUploadPanel status and controls', () => {
     await waitFor(() => expect(disableSpy).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getAllByText('Off')).toHaveLength(2));
     expect(screen.queryByText('Revocation pending')).not.toBeInTheDocument();
+  });
+});
+
+describe('AuthorizationDialog daemon version skew', () => {
+  it('explains a v1-shaped challenge from an older daemon instead of a retry loop', async () => {
+    const enrolled = status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: { sources: ['claude'], projects: ['project-a'] },
+      authorization: { version: 'recurring-v1', text: 'terms' },
+      hooks: [
+        { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
+      ],
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(enrolled);
+    const v1Error = authorizationRequired();
+    delete (v1Error.body as Record<string, unknown>).ownership_certification;
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(v1Error);
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+
+    expect(
+      await screen.findByText(/older than this page/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+  });
+
+  it('rejects a challenge when any exact scope pair cannot be displayed', async () => {
+    const enrolled = status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: { sources: ['claude'], projects: ['project-a'] },
+      authorization: { version: 'recurring-v2', text: 'terms' },
+      hooks: [
+        { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
+      ],
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(enrolled);
+    const malformed = authorizationRequired();
+    (malformed.body.scope as Record<string, unknown>).entries = [
+      ['claude', 'project-a'],
+      ['hidden-project-without-source'],
+    ];
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(malformed);
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+
+    expect(await screen.findByText(/incompatible authorization challenge/i)).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
   });
 });
 

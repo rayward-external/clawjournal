@@ -24,10 +24,70 @@ from clawjournal.workbench.daemon import (
     _build_share_zip,
     _reload_child_command,
     _missing_ingest_url_error,
+    _recurring_offer_available,
     _warn_if_frontend_stale,
     trigger_scoring_warmup,
 )
 from clawjournal.workbench.index import add_policy, open_index, set_hold_state, upsert_sessions
+
+
+def test_recurring_offer_uses_current_protocol_version():
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 2,
+        "recurring_enrollment_open": True,
+    }) is True
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 1,
+        "recurring_enrollment_open": True,
+    }) is False
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 2,
+        "recurring_enrollment_open": False,
+    }) is False
+
+
+def test_successful_v2_manual_share_caches_offer_available(server, monkeypatch):
+    """End-to-end wiring: a successful manual share against a v2 hosted service
+    must cache auto_upload_capability_available=True so the Workbench enable
+    offer appears. Guards against a regression to the pre-v2 hardcoded
+    ``recurring_upload_api_version == 1`` check in the share-success handler."""
+    from clawjournal.workbench import daemon as daemon_module
+
+    # A capability document shaped like the live v2 /.well-known response.
+    live_v2_capabilities = {
+        "recurring_upload_api_version": 2,
+        "recurring_enrollment_open": True,
+        "supported_recurring_client_versions": ["2"],
+        "maximum_bundle_size": 52428800,
+    }
+    monkeypatch.setattr(
+        daemon_module, "submit_share_to_hosted",
+        lambda *_a, **_k: {"ok": True, "receipt_id": "cj_receipt_1"},
+    )
+    monkeypatch.setattr(
+        daemon_module, "_fetch_hosted_share_capabilities",
+        lambda *_a, **_k: dict(live_v2_capabilities),
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr(daemon_module, "load_config", lambda: {})
+    monkeypatch.setattr(
+        daemon_module, "save_config", lambda config: saved.append(dict(config)) or True
+    )
+    # Clear the shared cooldown so this submission is not rate-limited by an
+    # earlier test.
+    WorkbenchHandler._last_share_time = 0.0
+
+    status, body = _post(server, "/api/shares/share-xyz/upload", {
+        "accept_terms": True,
+        "ownership_certification": True,
+        "consent_version": "consent-v1",
+        "retention_policy_version": "retention-v1",
+    })
+
+    assert status == 200
+    assert body.get("ok") is True
+    assert saved, "the share-success handler must persist the offer cache"
+    assert saved[-1]["auto_upload_capability_available"] is True
 
 
 @pytest.fixture
@@ -253,6 +313,7 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "agent": "codex",
             "accepted_authorization_version": "auth-v1",
             "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
             "accepted_authorization_profile_hash": "profile-sha256",
         },
     )
@@ -264,6 +325,7 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "agent": "codex",
             "accepted_authorization_version": "auth-v1",
             "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
             "accepted_authorization_profile_hash": "profile-sha256",
             "challenge_only": False,
         }

@@ -341,6 +341,7 @@ export const api = {
       agent: AutoUploadAgent;
       accepted_authorization_version?: string;
       accepted_retention_version?: string;
+      accepted_ownership_certification_version?: string;
       accepted_authorization_profile_hash?: string;
       challenge_only?: boolean;
     }): Promise<AutoUploadStatus> {

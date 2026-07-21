@@ -42,6 +42,7 @@ def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
     enable.add_argument("--agent", choices=["claude", "codex", "all"], default="all")
     enable.add_argument("--accept-authorization-version", default=None)
     enable.add_argument("--accept-retention-version", default=None)
+    enable.add_argument("--accept-ownership-certification-version", default=None)
     enable.add_argument("--accept-authorization-profile-hash", default=None)
     enable.add_argument("--json", action="store_true")
 
@@ -140,20 +141,38 @@ def _emit(result: dict[str, Any], *, output_json: bool) -> None:
 
 def _interactive_accept(
     args, challenge: dict[str, Any]
-) -> tuple[str, str, str] | None:
+) -> tuple[str, str, str, str] | None:
     if not sys.stdin.isatty():
         return None
     authorization = challenge["authorization"]
     retention = challenge["retention"]
+    ownership = challenge["ownership_certification"]
     scope = challenge["scope"]
     ai = challenge["ai"]
+    raw_entries = scope.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        return None
+    entries: list[tuple[str, str]] = []
+    for entry in raw_entries:
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != 2
+            or not all(isinstance(value, str) and value for value in entry)
+        ):
+            return None
+        entries.append((entry[0], entry[1]))
     print("\nRecurring scope authorization\n")
     print(_sanitize_terminal(authorization["text"]))
     print("\nRetention\n")
     print(_sanitize_terminal(retention["text"]))
+    print("\nOwnership certification\n")
+    print(_sanitize_terminal(ownership["text"]))
     print()
     print(_sanitize_terminal_line(f"Sources: {', '.join(scope['sources'])}"))
     print(_sanitize_terminal_line(f"Projects: {', '.join(scope['projects'])}"))
+    print("Exact authorized source/project pairs:")
+    for source, project in entries:
+        print(_sanitize_terminal_line(f"  {source} -> {project}"))
     print(_sanitize_terminal_line(
         f"Cycle cap: {challenge['cap']}; cadence: {challenge['cadence_days']} days"
     ))
@@ -181,14 +200,25 @@ def _interactive_accept(
                 f"Type retention version {retention['version']} to accept: "
             )
         ).strip()
+        if entered_retention != retention["version"]:
+            return None
+        # The ownership certification is a distinct affirmative act, like the
+        # manual share's --certify-ownership: it is typed separately and never
+        # bundled into the terms acceptance above.
+        entered_ownership = input(
+            _sanitize_terminal_line(
+                f"Type ownership certification version {ownership['version']} "
+                "to certify: "
+            )
+        ).strip()
     except (EOFError, OSError, KeyboardInterrupt):
         return None
-    if entered_retention != retention["version"]:
+    if entered_ownership != ownership["version"]:
         return None
     profile_hash = challenge.get("authorization_profile_hash")
     if not isinstance(profile_hash, str) or not profile_hash:
         return None
-    return entered_auth, entered_retention, profile_hash
+    return entered_auth, entered_retention, entered_ownership, profile_hash
 
 
 def _fresh_email_verification() -> bool:
@@ -242,11 +272,27 @@ def run(args) -> None:
     elif command == "enable":
         auth_version = args.accept_authorization_version
         retention_version = args.accept_retention_version
+        ownership_version = args.accept_ownership_certification_version
         profile_hash = args.accept_authorization_profile_hash
+
+        def scan_notice() -> None:
+            # Every enable() call strict-refreshes the enrolled source logs
+            # after its fast hosted checks; on a large history that is minutes
+            # of silent CPU without this notice — including the re-runs after
+            # typing the acceptance versions and after email verification.
+            if not output_json:
+                print(
+                    "Checking the hosted service, then refreshing the enrolled "
+                    "source scope (a large history can take a few minutes)…",
+                    file=sys.stderr,
+                )
+
+        scan_notice()
         result = auto_upload.enable(
             agent=args.agent,
             accepted_authorization_version=auth_version,
             accepted_retention_version=retention_version,
+            accepted_ownership_certification_version=ownership_version,
             accepted_authorization_profile_hash=profile_hash,
         )
         if result.get("code") == "authorization_required" and not output_json:
@@ -258,20 +304,32 @@ def run(args) -> None:
                     "message": "Exact recurring authorization versions were not accepted.",
                 }
             else:
-                auth_version, retention_version, profile_hash = accepted
+                (
+                    auth_version,
+                    retention_version,
+                    ownership_version,
+                    profile_hash,
+                ) = accepted
+                scan_notice()
                 result = auto_upload.enable(
                     agent=args.agent,
                     accepted_authorization_version=auth_version,
                     accepted_retention_version=retention_version,
+                    accepted_ownership_certification_version=ownership_version,
                     accepted_authorization_profile_hash=profile_hash,
                 )
-        if result.get("code") == "email_verification_required" and not output_json:
+        if result.get("code") in {
+            "email_verification_required",
+            "enrollment_response_ambiguous",
+        } and not output_json:
             if _fresh_email_verification():
                 # Re-fetching also catches terms changed while the code was in flight.
+                scan_notice()
                 result = auto_upload.enable(
                     agent=args.agent,
                     accepted_authorization_version=auth_version,
                     accepted_retention_version=retention_version,
+                    accepted_ownership_certification_version=ownership_version,
                     accepted_authorization_profile_hash=profile_hash,
                 )
             else:

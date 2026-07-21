@@ -1,4 +1,4 @@
-"""Typed client for the hosted recurring-upload V1 protocol."""
+"""Typed client for the hosted recurring-upload protocol (v2)."""
 
 from __future__ import annotations
 
@@ -18,8 +18,14 @@ from urllib.parse import quote, urljoin, urlsplit
 
 from . import __version__
 
-RECURRING_UPLOAD_API_VERSION = 1
-RECURRING_CLIENT_PROTOCOL_VERSION = "1"
+# Protocol v2 (hosted logical_sessions_v1 rollout): enrollment sends explicit
+# {source, project} scope entries plus an ownership certification the user
+# explicitly accepted; the server computes and owns the scope hash.
+RECURRING_UPLOAD_API_VERSION = 2
+RECURRING_CLIENT_PROTOCOL_VERSION = "2"
+# Mirrors the hosted RECURRING_SCOPE_MAX_ENTRIES contract limit so oversized
+# scopes fail fast locally instead of as a server-worded enrollment rejection.
+MAX_SCOPE_ENTRIES = 200
 MAX_RECURRING_SESSIONS = 5
 ALLOW_INSECURE_LOOPBACK_ENV = "CLAWJOURNAL_ALLOW_INSECURE_LOOPBACK_RECURRING"
 
@@ -259,7 +265,7 @@ def _parse_error(exc: urllib.error.HTTPError) -> RecurringServiceError:
     try:
         body = exc.read().decode("utf-8", errors="replace")
         parsed = json.loads(body) if body else {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, http.client.HTTPException, json.JSONDecodeError):
         parsed = {}
     if not isinstance(parsed, dict):
         parsed = {}
@@ -289,6 +295,7 @@ def _parse_error(exc: urllib.error.HTTPError) -> RecurringServiceError:
 
 
 def _open_request(request: urllib.request.Request, *, timeout: int) -> bytes:
+    mutation_may_have_committed = request.get_method().upper() in {"POST", "PATCH"}
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             return response.read()
@@ -298,8 +305,19 @@ def _open_request(request: urllib.request.Request, *, timeout: int) -> bytes:
                 "redirect_rejected",
                 "Hosted recurring upload refused a redirect.",
                 status=exc.code,
+                ambiguous=mutation_may_have_committed,
             ) from exc
-        raise _parse_error(exc) from exc
+        parsed = _parse_error(exc)
+        if mutation_may_have_committed and exc.code >= 500:
+            parsed = RecurringServiceError(
+                parsed.code,
+                parsed.message,
+                retryable=parsed.retryable,
+                retry_after=parsed.retry_after,
+                status=parsed.status,
+                ambiguous=True,
+            )
+        raise parsed from exc
     except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         # http.client.HTTPException (BadStatusLine, IncompleteRead, …) is raised
         # by getresponse()/read() on a truncated or malformed reply and is NOT
@@ -309,6 +327,7 @@ def _open_request(request: urllib.request.Request, *, timeout: int) -> bytes:
             "server_unavailable",
             "Could not reach the hosted recurring-upload service.",
             retryable=True,
+            ambiguous=mutation_may_have_committed,
         ) from exc
 
 
@@ -338,12 +357,14 @@ def _request_json(
             "malformed_response",
             "Hosted recurring-upload service returned malformed JSON.",
             retryable=True,
+            ambiguous=method.upper() in {"POST", "PATCH"},
         ) from exc
     if not isinstance(parsed, dict):
         raise RecurringServiceError(
             "malformed_response",
             "Hosted recurring-upload service returned an invalid response.",
             retryable=True,
+            ambiguous=method.upper() in {"POST", "PATCH"},
         )
     return parsed
 
@@ -352,26 +373,47 @@ def fetch_authorization(capabilities: Mapping[str, Any]) -> dict[str, Any]:
     return _request_json(str(capabilities["recurring_authorization_url"]))
 
 
+def _scope_payload(scope_entries: Any) -> list[dict[str, str]]:
+    """Encode (source, project) pairs as the protocol-v2 scope entry list."""
+
+    payload: list[dict[str, str]] = []
+    for entry in scope_entries:
+        source, project = entry
+        payload.append({"source": str(source), "project": str(project)})
+    if not payload:
+        raise CapabilityError(
+            "scope_invalid", "A recurring enrollment requires at least one scope entry."
+        )
+    return payload
+
+
 def create_enrollment(
     capabilities: Mapping[str, Any],
     *,
     upload_token: str,
     client_enrollment_id: str,
-    scope_hash: str,
+    scope_entries: Any,
     authorization_version: str,
     retention_version: str,
+    ownership_certification: bool,
 ) -> dict[str, Any]:
+    if ownership_certification is not True:
+        raise CapabilityError(
+            "ownership_certification_required",
+            "Recurring enrollment requires the explicit ownership certification.",
+        )
     return _request_json(
         str(capabilities["recurring_enrollment_url"]),
         method="POST",
         payload={
             "upload_token": upload_token,
             "client_enrollment_id": client_enrollment_id,
-            "scope_hash": scope_hash,
+            "scope": _scope_payload(scope_entries),
             "authorization_version": authorization_version,
             "retention_policy_version": retention_version,
             "client_version": RECURRING_CLIENT_PROTOCOL_VERSION,
             "accept_terms": True,
+            "ownership_certification": True,
         },
     )
 
@@ -395,20 +437,27 @@ def update_enrollment(
     *,
     enrollment_id: str,
     active_token: str,
-    scope_hash: str,
+    scope_entries: Any,
     authorization_version: str,
     retention_version: str,
+    ownership_certification: bool,
 ) -> dict[str, Any]:
+    if ownership_certification is not True:
+        raise CapabilityError(
+            "ownership_certification_required",
+            "Recurring reauthorization requires the explicit ownership certification.",
+        )
     return _request_json(
         _enrollment_endpoint(capabilities, enrollment_id),
         method="PATCH",
         bearer=active_token,
         payload={
-            "scope_hash": scope_hash,
+            "scope": _scope_payload(scope_entries),
             "authorization_version": authorization_version,
             "retention_policy_version": retention_version,
             "client_version": RECURRING_CLIENT_PROTOCOL_VERSION,
             "accept_terms": True,
+            "ownership_certification": True,
         },
     )
 

@@ -49,26 +49,51 @@ function stringList(record: Record<string, unknown> | null, key: string): string
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
+function scopeEntryList(
+  record: Record<string, unknown> | null,
+  key: string,
+): Array<[string, string]> | null {
+  const value = record?.[key];
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const entries: Array<[string, string]> = [];
+  for (const item of value) {
+    if (
+      !Array.isArray(item) || item.length !== 2 ||
+      typeof item[0] !== 'string' || item[0].length === 0 ||
+      typeof item[1] !== 'string' || item[1].length === 0
+    ) {
+      return null;
+    }
+    entries.push([item[0], item[1]]);
+  }
+  return entries;
+}
+
 function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | null {
   if (!(error instanceof ApiError) || error.status !== 409 || error.body.code !== 'authorization_required') {
     return null;
   }
   const authorization = asRecord(error.body.authorization);
   const retention = asRecord(error.body.retention);
+  const ownership = asRecord(error.body.ownership_certification);
   const scope = asRecord(error.body.scope);
   const ai = asRecord(error.body.ai);
   const authorizationVersion = stringField(authorization, 'version');
   const authorizationText = stringField(authorization, 'text');
   const retentionVersion = stringField(retention, 'version');
   const retentionText = stringField(retention, 'text');
+  const ownershipVersion = stringField(ownership, 'version');
+  const ownershipText = stringField(ownership, 'text');
   const authorizationProfileHash = stringField(error.body, 'authorization_profile_hash');
   const maximumBundleSize = typeof error.body.maximum_bundle_size === 'number'
     && error.body.maximum_bundle_size > 0
     ? error.body.maximum_bundle_size
     : null;
+  const scopeEntries = scopeEntryList(scope, 'entries');
   if (
     !authorizationVersion || !authorizationText || !retentionVersion ||
-    !retentionText || !authorizationProfileHash || maximumBundleSize === null
+    !retentionText || !ownershipVersion || !ownershipText ||
+    !authorizationProfileHash || maximumBundleSize === null || scopeEntries === null
   ) {
     return null;
   }
@@ -76,9 +101,11 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
     authorization_profile_hash: authorizationProfileHash,
     authorization: { version: authorizationVersion, text: authorizationText },
     retention: { version: retentionVersion, text: retentionText },
+    ownership_certification: { version: ownershipVersion, text: ownershipText },
     scope: {
       sources: stringList(scope, 'sources'),
       projects: stringList(scope, 'projects'),
+      entries: scopeEntries,
     },
     ai: {
       enabled: ai?.enabled === true,
@@ -96,7 +123,10 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
 }
 
 function requiresEmailVerification(error: unknown): boolean {
-  return error instanceof ApiError && error.body.code === 'email_verification_required';
+  return error instanceof ApiError && (
+    error.body.code === 'email_verification_required' ||
+    error.body.code === 'enrollment_response_ambiguous'
+  );
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -194,6 +224,10 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   const [agent, setAgent] = useState<AutoUploadAgent>(() => selectedAgent(initialStatus));
   const [challenge, setChallenge] = useState<AutoUploadAuthorizationChallenge | null>(null);
   const [accepted, setAccepted] = useState(false);
+  // Protocol v2: the ownership certification is a distinct affirmative act,
+  // mirroring the manual share's separate certify checkbox — never bundled
+  // into the terms acceptance above.
+  const [ownershipCertified, setOwnershipCertified] = useState(false);
   const [loading, setLoading] = useState(false);
   // Distinct from `loading`: true only while the mutating enable POST is in
   // flight. Dismissal is blocked during that brief window but allowed during
@@ -235,6 +269,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
     setLoading(true);
     setError(null);
     setAccepted(false);
+    setOwnershipCertified(false);
     setChallenge(null);
     try {
       // challenge_only can never enroll by contract, so a success here means
@@ -252,6 +287,19 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
         await showEmailVerification(
           'Verify your email before loading the recurring authorization.',
           isCurrent,
+        );
+      } else if (
+        requestError instanceof ApiError &&
+        requestError.status === 409 &&
+        requestError.body.code === 'authorization_required'
+      ) {
+        // A 409 challenge this build cannot parse means the running daemon
+        // speaks an older protocol than this page (e.g. dist upgraded but the
+        // daemon not restarted). Retrying can never succeed — say so.
+        setError(
+          'The running ClawJournal service is older than this page and returned '
+          + 'an incompatible authorization challenge. Restart the service '
+          + '(clawjournal serve) and reload, then try again.',
         );
       } else {
         setError(errorMessage(requestError, 'Could not load recurring authorization.'));
@@ -272,6 +320,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       requestedRef.current = false;
       setChallenge(null);
       setAccepted(false);
+      setOwnershipCertified(false);
       setError(null);
       setVerificationRequired(false);
       setTokenValid(false);
@@ -343,13 +392,14 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   const cadence = challenge?.cadence_days ?? initialStatus.cadence_days;
 
   const enableWithAcceptedTerms = async () => {
-    if (!challenge || !accepted) return;
+    if (!challenge || !accepted || !ownershipCertified) return;
     setSubmitting(true);
     try {
       const next = await api.autoUpload.enable({
         agent,
         accepted_authorization_version: challenge.authorization.version,
         accepted_retention_version: challenge.retention.version,
+        accepted_ownership_certification_version: challenge.ownership_certification.version,
         accepted_authorization_profile_hash: challenge.authorization_profile_hash,
       });
       onEnabled(next);
@@ -360,6 +410,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       if (refreshedChallenge) {
         setChallenge(refreshedChallenge);
         setAccepted(false);
+        setOwnershipCertified(false);
         setVerificationRequired(false);
         setError('The authorization changed while you were reviewing it. Please review the new text.');
       } else if (requiresEmailVerification(enableError)) {
@@ -373,7 +424,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   };
 
   const accept = async () => {
-    if (!challenge || !accepted || loading) return;
+    if (!challenge || !accepted || !ownershipCertified || loading) return;
     setLoading(true);
     setError(null);
     try {
@@ -432,8 +483,16 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       setPendingEmail(null);
       setDevCode(null);
       toast('Email verified', 'success');
-      if (challenge && accepted) {
+      if (challenge && accepted && ownershipCertified) {
         await enableWithAcceptedTerms();
+      } else if (challenge) {
+        // Verified but an acceptance box is unchecked: surface which act is
+        // missing instead of a silent dead-end after the code is consumed.
+        setError(
+          accepted
+            ? 'Check the ownership certification box, then press Continue to enable.'
+            : 'Check both acceptance boxes, then press Continue to enable.',
+        );
       } else {
         setVerificationRequired(false);
         requestedRef.current = true;
@@ -548,6 +607,12 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
               title={`Retention policy · ${challenge.retention.version}`}
               text={challenge.retention.text}
             />
+            <TermsBlock
+              title={`Exact recurring scope · ${challenge.scope.entries.length} source/project pair${challenge.scope.entries.length === 1 ? '' : 's'}`}
+              text={challenge.scope.entries
+                .map(([source, project]) => `${source} → ${project}`)
+                .join('\n')}
+            />
             <label style={{
               display: 'flex', gap: 9, alignItems: 'flex-start', marginTop: 14,
               fontSize: 13, lineHeight: 1.45, color: colors.gray800,
@@ -560,10 +625,30 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
                 style={{ marginTop: 3 }}
               />
               <span>
-                I authorize recurring sharing from this future scope and accept the authorization
+                I authorize recurring sharing from the exact source/project pairs shown above and accept the authorization
                 and retention versions shown above. I understand selected traces can upload without
                 my reviewing each bundle, and I represent that I am authorized to share traces from
                 this scope.
+              </span>
+            </label>
+            <TermsBlock
+              title={`Ownership certification · ${challenge.ownership_certification.version}`}
+              text={challenge.ownership_certification.text}
+            />
+            <label style={{
+              display: 'flex', gap: 9, alignItems: 'flex-start', marginTop: 14,
+              fontSize: 13, lineHeight: 1.45, color: colors.gray800,
+            }}>
+              <input
+                type="checkbox"
+                checked={ownershipCertified}
+                disabled={loading}
+                onChange={event => setOwnershipCertified(event.target.checked)}
+                style={{ marginTop: 3 }}
+                aria-label="Certify bundle ownership"
+              />
+              <span>
+                I certify the ownership statement above for every automatically uploaded bundle.
               </span>
             </label>
           </>
@@ -588,9 +673,9 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
                   Verified as {verifiedEmail ?? email}
                 </span>
                 <button
-                  disabled={loading || !challenge || !accepted}
+                  disabled={loading || !challenge || !accepted || !ownershipCertified}
                   onClick={() => void accept()}
-                  style={{ ...btnPrimary, ...disabledStyle(loading || !challenge || !accepted) }}
+                  style={{ ...btnPrimary, ...disabledStyle(loading || !challenge || !accepted || !ownershipCertified) }}
                 >
                   {loading ? 'Enabling…' : 'Continue'}
                 </button>
@@ -643,7 +728,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
                         onClick={() => void verifyCode()}
                         style={{ ...btnPrimary, ...disabledStyle(loading || !code.trim()) }}
                       >
-                        {loading && code.trim() ? 'Verifying…' : challenge && accepted ? 'Verify and enable' : 'Verify'}
+                        {loading && code.trim() ? 'Verifying…' : challenge && accepted && ownershipCertified ? 'Verify and enable' : 'Verify'}
                       </button>
                     </div>
                     {devCode && (
@@ -664,9 +749,9 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
           </button>
           {!verificationRequired && (
             <button
-              disabled={!challenge || !accepted || loading}
+              disabled={!challenge || !accepted || !ownershipCertified || loading}
               onClick={() => void accept()}
-              style={{ ...btnPrimary, ...disabledStyle(!challenge || !accepted || loading) }}
+              style={{ ...btnPrimary, ...disabledStyle(!challenge || !accepted || !ownershipCertified || loading) }}
             >
               {loading && challenge ? 'Checking verification…' : 'Enable automatic upload'}
             </button>
