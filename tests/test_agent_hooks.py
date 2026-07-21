@@ -128,10 +128,132 @@ def test_install_is_idempotent_and_collapses_stale_duplicates(isolated_home, mon
     assert any(handler.get("command") == "echo keep" for handler in _handlers(document, "SessionStart"))
 
 
+def test_install_migrates_legacy_profile_hook_and_preserves_foreign_hooks(
+    isolated_home, monkeypatch
+):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": (
+            "old-python -m clawjournal.cli auto-upload hook --client codex"
+        ),
+        "commandWindows": (
+            "old-python -m clawjournal.cli auto-upload hook --client codex"
+        ),
+        "timeout": 5,
+        "statusMessage": "Checking automatic sharing schedule",
+        "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    foreign = {
+        "type": "command",
+        "command": "echo keep",
+        "clawjournalProfile": "another-tool",
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [legacy, foreign]},
+                        {"hooks": [legacy]},
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+
+    first = hooks.install_agent_hook("codex", home=isolated_home)
+    first_bytes = codex_path.read_bytes()
+    second = hooks.install_agent_hook("codex", home=isolated_home)
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert codex_path.read_bytes() == first_bytes
+    document = _read(codex_path)
+    handlers = _handlers(document, "SessionStart")
+    own = [handler for handler in handlers if hooks._handler_is_ours(handler)]
+    assert own == [hooks._handler_for("codex")]
+    assert "clawjournalProfile" not in own[0]
+    assert foreign in handlers
+
+
+def test_diagnostics_reports_legacy_handler_without_blocking_configured(
+    isolated_home, monkeypatch
+):
+    """A stale legacy handler next to a healthy current hook is a migration
+    chore, not a broken configuration: an unconfigured selected hook blocks
+    scheduled cycles, and nothing reruns install until the next enable."""
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": "old-python -m clawjournal.cli auto-upload hook --client codex",
+        "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [legacy]},
+                        {"hooks": [hooks._handler_for("codex")]},
+                    ]
+                }
+            }
+        )
+    )
+
+    before = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert before["installed"] is True
+    assert before["configured"] is True
+    assert before["legacy_hook_installed"] is True
+
+    hooks.install_agent_hook("codex", home=isolated_home)
+
+    after = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert after["configured"] is True
+    assert after["legacy_hook_installed"] is False
+    document = _read(codex_path)
+    assert _handlers(document, "SessionStart") == [hooks._handler_for("codex")]
+
+
+def test_diagnostics_marks_legacy_only_install_as_unconfigured(isolated_home):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": "old-python -m clawjournal.cli auto-upload hook --client codex",
+        "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    codex_path.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [legacy]}]}}))
+
+    diagnostics = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert diagnostics["installed"] is True
+    assert diagnostics["configured"] is False
+    assert diagnostics["legacy_hook_installed"] is True
+
+
 def test_uninstall_removes_only_auto_upload_hook_and_is_idempotent(isolated_home):
     path = isolated_home / ".codex" / "hooks.json"
     hooks.install_agent_hook("codex", home=isolated_home)
     document = _read(path)
+    document["hooks"]["SessionStart"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        "old-python -m clawjournal.cli auto-upload hook "
+                        "--client codex"
+                    ),
+                    "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+                }
+            ]
+        }
+    )
     document["hooks"]["SessionStart"].append(
         {"matcher": "startup", "hooks": [{"type": "command", "command": "echo keep"}]}
     )
