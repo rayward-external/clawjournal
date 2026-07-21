@@ -126,7 +126,11 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
         "authorization": {"version": attack, "text": attack},
         "retention": {"version": attack, "text": attack},
         "ownership_certification": {"version": attack, "text": attack},
-        "scope": {"sources": [attack], "projects": [attack]},
+        "scope": {
+            "sources": [attack],
+            "projects": [attack],
+            "entries": [[attack, attack]],
+        },
         "ai": {"enabled": True, "backend": attack},
         "cap": 5,
         "cadence_days": 7,
@@ -151,6 +155,7 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
     output = capsys.readouterr().out
     assert "\x1b" not in output + "".join(prompts)
     assert "\x07" not in output + "".join(prompts)
+    assert "Exact authorized source/project pairs:" in output
     assert all("\n" not in prompt for prompt in prompts)
 
 

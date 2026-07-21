@@ -149,6 +149,18 @@ def _interactive_accept(
     ownership = challenge["ownership_certification"]
     scope = challenge["scope"]
     ai = challenge["ai"]
+    raw_entries = scope.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        return None
+    entries: list[tuple[str, str]] = []
+    for entry in raw_entries:
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != 2
+            or not all(isinstance(value, str) and value for value in entry)
+        ):
+            return None
+        entries.append((entry[0], entry[1]))
     print("\nRecurring scope authorization\n")
     print(_sanitize_terminal(authorization["text"]))
     print("\nRetention\n")
@@ -158,6 +170,9 @@ def _interactive_accept(
     print()
     print(_sanitize_terminal_line(f"Sources: {', '.join(scope['sources'])}"))
     print(_sanitize_terminal_line(f"Projects: {', '.join(scope['projects'])}"))
+    print("Exact authorized source/project pairs:")
+    for source, project in entries:
+        print(_sanitize_terminal_line(f"  {source} -> {project}"))
     print(_sanitize_terminal_line(
         f"Cycle cap: {challenge['cap']}; cadence: {challenge['cadence_days']} days"
     ))
@@ -303,7 +318,10 @@ def run(args) -> None:
                     accepted_ownership_certification_version=ownership_version,
                     accepted_authorization_profile_hash=profile_hash,
                 )
-        if result.get("code") == "email_verification_required" and not output_json:
+        if result.get("code") in {
+            "email_verification_required",
+            "enrollment_response_ambiguous",
+        } and not output_json:
             if _fresh_email_verification():
                 # Re-fetching also catches terms changed while the code was in flight.
                 scan_notice()

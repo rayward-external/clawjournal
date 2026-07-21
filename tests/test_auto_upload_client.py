@@ -231,6 +231,40 @@ def test_open_request_classifies_http_exception_as_server_unavailable(monkeypatc
     assert exc.value.retryable is True
 
 
+@pytest.mark.parametrize("method", ["POST", "PATCH"])
+def test_open_request_marks_lost_mutation_response_ambiguous(monkeypatch, method):
+    def boom(*_args, **_kwargs):
+        raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr(client._OPENER, "open", boom)
+    request = urllib.request.Request(
+        "https://data.rayward.ai/api/recurring-enrollments",
+        data=b"{}",
+        method=method,
+    )
+
+    with pytest.raises(client.RecurringServiceError) as exc:
+        client._open_request(request, timeout=5)
+
+    assert exc.value.code == "server_unavailable"
+    assert exc.value.retryable is True
+    assert exc.value.ambiguous is True
+
+
+def test_mutating_malformed_json_response_is_ambiguous(monkeypatch):
+    monkeypatch.setattr(client, "_open_request", lambda *_a, **_k: b"not-json")
+
+    with pytest.raises(client.RecurringServiceError) as exc:
+        client._request_json(
+            "https://data.rayward.ai/api/recurring-enrollments",
+            method="POST",
+            payload={"request": "body"},
+        )
+
+    assert exc.value.code == "malformed_response"
+    assert exc.value.ambiguous is True
+
+
 def test_submit_redirect_after_body_is_ambiguous(tmp_path, monkeypatch):
     artifact = tmp_path / "bundle.zip"
     artifact.write_bytes(b"sealed-bytes")

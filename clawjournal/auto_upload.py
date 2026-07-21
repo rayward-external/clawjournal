@@ -114,21 +114,26 @@ class AutoUploadError(RuntimeError):
         *,
         retryable: bool = False,
         retry_after: int | None = None,
+        ambiguous: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
         self.retry_after = retry_after
+        self.ambiguous = ambiguous
 
     def as_result(self) -> dict[str, Any]:
-        return {
+        result = {
             "ok": False,
             "code": self.code,
             "message": self.message,
             "retryable": self.retryable,
             "retry_after": self.retry_after,
         }
+        if self.ambiguous:
+            result["ambiguous"] = True
+        return result
 
 
 class ControlChanged(AutoUploadError):
@@ -1283,6 +1288,7 @@ def enable(
         # a boolean), and any failure must revoke rather than pause.
         certification_verified = False
         server_reauthorization_succeeded = False
+        email_enrollment_may_have_committed = False
         recovery_only_written = False
         try:
             snapshots = _snapshot_hook_files(SUPPORTED_HOOK_TARGETS)
@@ -1304,17 +1310,26 @@ def enable(
                         "credential_invalid",
                         "The active recurring-upload credential is unavailable.",
                     )
-                response = update_enrollment(
-                    capabilities,
-                    enrollment_id=str(existing["server_enrollment_id"]),
-                    active_token=active_token,
-                    scope_entries=scope["entries"],
-                    authorization_version=str(expected_auth),
-                    retention_version=str(expected_retention),
-                    # Reached only after the exact-version acceptance check
-                    # above matched accepted_ownership_certification_version.
-                    ownership_certification=True,
-                )
+                try:
+                    response = update_enrollment(
+                        capabilities,
+                        enrollment_id=str(existing["server_enrollment_id"]),
+                        active_token=active_token,
+                        scope_entries=scope["entries"],
+                        authorization_version=str(expected_auth),
+                        retention_version=str(expected_retention),
+                        # Reached only after the exact-version acceptance check
+                        # above matched accepted_ownership_certification_version.
+                        ownership_certification=True,
+                    )
+                except RecurringServiceError as mutation_error:
+                    # A lost/truncated PATCH response can mean the server
+                    # committed the new, not-yet-read-back certification. The
+                    # known enrollment id + pinned recovery token let the
+                    # failure handler compensate by revoking it.
+                    if mutation_error.ambiguous:
+                        server_reauthorization_succeeded = True
+                    raise
             else:
                 upload_token = str(config.get("verified_email_token") or "").strip()
                 if not upload_token:
@@ -1322,26 +1337,29 @@ def enable(
                         "email_verification_required",
                         "Verify your email again before creating a recurring enrollment.",
                     )
-                response = create_enrollment(
-                    capabilities,
-                    upload_token=upload_token,
-                    client_enrollment_id=client_enrollment_id,
-                    scope_entries=scope["entries"],
-                    authorization_version=str(expected_auth),
-                    retention_version=str(expected_retention),
-                    ownership_certification=True,
-                )
+                try:
+                    response = create_enrollment(
+                        capabilities,
+                        upload_token=upload_token,
+                        client_enrollment_id=client_enrollment_id,
+                        scope_entries=scope["entries"],
+                        authorization_version=str(expected_auth),
+                        retention_version=str(expected_retention),
+                        ownership_certification=True,
+                    )
+                except RecurringServiceError as mutation_error:
+                    if mutation_error.ambiguous:
+                        email_enrollment_may_have_committed = True
+                    raise
+                email_enrollment_may_have_committed = True
 
             # The server mutation is definite the moment the create/PATCH
-            # returns 2xx — BEFORE the response body is validated below. On the
-            # updating path a malformed body then leaves a definitely-modified
-            # (and, until the read-back, unverified) hosted enrollment that must
-            # be revoked, not paused; mark it definite here so the failure
-            # handler routes correctly even when the validation just below
-            # raises. (Create keeps this False: the client learns a new
-            # enrollment's id only from the response, so it cannot revoke a
-            # malformed create — the server-expiry / client-id idempotency
-            # path recovers that.)
+            # returns 2xx — BEFORE the response body is validated below. On an
+            # update a malformed body then leaves a definitely-modified (and,
+            # until read-back, unverified) hosted enrollment. PATCH can revoke
+            # with the pinned recovery token; credential-rotation POST must use
+            # the freshly reissued recovery token and never the invalidated old
+            # one.
             server_reauthorization_succeeded = bool(updating)
 
             enrollment_id = response.get("enrollment_id")
@@ -1645,7 +1663,53 @@ def enable(
                     _restore_hook_files(snapshots)
                 except OSError:
                     pass
-            if isinstance(exc, RecurringServiceError):
+            fresh_recovery = (
+                response.get("recovery_token")
+                if isinstance(response, dict)
+                else None
+            )
+            response_enrollment_id = (
+                response.get("enrollment_id")
+                if isinstance(response, dict)
+                else None
+            )
+            email_mutation_has_revoke_identity = bool(
+                isinstance(fresh_recovery, str)
+                and fresh_recovery
+                and (
+                    updating
+                    or (
+                        isinstance(response_enrollment_id, str)
+                        and response_enrollment_id
+                    )
+                )
+            )
+            email_mutation_is_unrecoverable = bool(
+                email_enrollment_may_have_committed
+                and not email_mutation_has_revoke_identity
+            )
+            if email_mutation_is_unrecoverable:
+                # The one-shot token may have been consumed and, on credential
+                # rotation, the old recovery token may now be invalid. Remove
+                # the token so every interactive client performs a fresh email
+                # verification, then retry the same durable client enrollment
+                # id to recover/reissue the hosted credentials.
+                try:
+                    failure_config = load_config()
+                    failure_config.pop("verified_email_token", None)
+                    failure_config.pop("verified_email_token_expires_at", None)
+                    save_config(failure_config)
+                except Exception:
+                    pass
+                error = AutoUploadError(
+                    "enrollment_response_ambiguous",
+                    "The hosted enrollment may have succeeded, but its recovery "
+                    "credential was not received. Verify your email again and "
+                    "rerun Enable to recover the same enrollment.",
+                    retryable=True,
+                    ambiguous=True,
+                )
+            elif isinstance(exc, RecurringServiceError):
                 if updating and exc.code in {
                     "credential_invalid",
                     "credential_expired",
@@ -1665,6 +1729,7 @@ def enable(
                         exc.message,
                         retryable=exc.retryable,
                         retry_after=exc.retry_after,
+                        ambiguous=exc.ambiguous,
                     )
             elif isinstance(exc, (AutoUploadError, CredentialStoreError)):
                 error = (
@@ -1735,7 +1800,7 @@ def enable(
                     updating_revoke_recovery_expiry = (
                         str(reissued_expiry) if reissued_expiry else None
                     )
-                elif isinstance(pinned, str) and pinned:
+                elif not rotating_credentials and isinstance(pinned, str) and pinned:
                     updating_revoke_recovery = pinned
                     updating_revoke_recovery_expiry = (
                         str(pinned_expiry) if pinned_expiry else None
@@ -1900,7 +1965,14 @@ def enable(
                     conn,
                     expected_generation=generation,
                     mode="off",
-                    health="action_required" if error.code == "control_changed" else "ready",
+                    health=(
+                        "action_required"
+                        if error.code in {
+                            "control_changed",
+                            "enrollment_response_ambiguous",
+                        }
+                        else "ready"
+                    ),
                     revocation_pending=False,
                     last_result_code=error.code,
                 )
@@ -1945,6 +2017,14 @@ def resume() -> dict[str, Any]:
         enrollment = get_auto_upload_enrollment(conn)
         if enrollment is None or enrollment["mode"] == "off":
             return AutoUploadError("not_enabled", "Automatic upload is not enabled.").as_result()
+        if enrollment.get("last_result_code") == "enrollment_response_ambiguous":
+            return AutoUploadError(
+                "enrollment_recovery_required",
+                "Verify your email and review scope and terms to recover the "
+                "hosted enrollment before resuming.",
+                retryable=True,
+                ambiguous=True,
+            ).as_result()
         credentials = load_credentials(required=True)
         if not credentials or not credentials.get("active_token"):
             return AutoUploadError(
@@ -1998,6 +2078,31 @@ def disable() -> dict[str, Any]:
         # CAS against the generation this Disable owns.
         with control_mutation_lock():
             enrollment = get_auto_upload_enrollment(conn)
+            if (
+                enrollment is not None
+                and enrollment.get("last_result_code")
+                == "enrollment_response_ambiguous"
+            ):
+                # A credential-rotation POST may have invalidated the pinned
+                # recovery token before its replacement response was lost.
+                # Never turn that known-stale token into a permanent revoke
+                # tombstone. The enrollment is already fail-closed (Off or
+                # Paused); a fresh email verification must reissue credentials
+                # under the same client enrollment id before Disable can make
+                # a truthful hosted revocation.
+                try:
+                    remove_active_token()
+                except CredentialStoreError as exc:
+                    return AutoUploadError(
+                        "credential_store_failed", str(exc)
+                    ).as_result()
+                return AutoUploadError(
+                    "enrollment_recovery_required",
+                    "Verify your email and rerun Enable to recover the hosted "
+                    "enrollment, then Disable can revoke it safely.",
+                    retryable=True,
+                    ambiguous=True,
+                ).as_result()
             disable_generation = (
                 int(enrollment["generation"])
                 if enrollment is not None

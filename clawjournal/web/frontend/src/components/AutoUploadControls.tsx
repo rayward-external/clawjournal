@@ -49,6 +49,26 @@ function stringList(record: Record<string, unknown> | null, key: string): string
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
+function scopeEntryList(
+  record: Record<string, unknown> | null,
+  key: string,
+): Array<[string, string]> | null {
+  const value = record?.[key];
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const entries: Array<[string, string]> = [];
+  for (const item of value) {
+    if (
+      !Array.isArray(item) || item.length !== 2 ||
+      typeof item[0] !== 'string' || item[0].length === 0 ||
+      typeof item[1] !== 'string' || item[1].length === 0
+    ) {
+      return null;
+    }
+    entries.push([item[0], item[1]]);
+  }
+  return entries;
+}
+
 function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | null {
   if (!(error instanceof ApiError) || error.status !== 409 || error.body.code !== 'authorization_required') {
     return null;
@@ -69,10 +89,11 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
     && error.body.maximum_bundle_size > 0
     ? error.body.maximum_bundle_size
     : null;
+  const scopeEntries = scopeEntryList(scope, 'entries');
   if (
     !authorizationVersion || !authorizationText || !retentionVersion ||
     !retentionText || !ownershipVersion || !ownershipText ||
-    !authorizationProfileHash || maximumBundleSize === null
+    !authorizationProfileHash || maximumBundleSize === null || scopeEntries === null
   ) {
     return null;
   }
@@ -84,6 +105,7 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
     scope: {
       sources: stringList(scope, 'sources'),
       projects: stringList(scope, 'projects'),
+      entries: scopeEntries,
     },
     ai: {
       enabled: ai?.enabled === true,
@@ -101,7 +123,10 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
 }
 
 function requiresEmailVerification(error: unknown): boolean {
-  return error instanceof ApiError && error.body.code === 'email_verification_required';
+  return error instanceof ApiError && (
+    error.body.code === 'email_verification_required' ||
+    error.body.code === 'enrollment_response_ambiguous'
+  );
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -582,6 +607,12 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
               title={`Retention policy · ${challenge.retention.version}`}
               text={challenge.retention.text}
             />
+            <TermsBlock
+              title={`Exact recurring scope · ${challenge.scope.entries.length} source/project pair${challenge.scope.entries.length === 1 ? '' : 's'}`}
+              text={challenge.scope.entries
+                .map(([source, project]) => `${source} → ${project}`)
+                .join('\n')}
+            />
             <label style={{
               display: 'flex', gap: 9, alignItems: 'flex-start', marginTop: 14,
               fontSize: 13, lineHeight: 1.45, color: colors.gray800,
@@ -594,7 +625,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
                 style={{ marginTop: 3 }}
               />
               <span>
-                I authorize recurring sharing from this future scope and accept the authorization
+                I authorize recurring sharing from the exact source/project pairs shown above and accept the authorization
                 and retention versions shown above. I understand selected traces can upload without
                 my reviewing each bundle, and I represent that I am authorized to share traces from
                 this scope.

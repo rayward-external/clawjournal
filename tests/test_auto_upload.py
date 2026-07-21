@@ -2419,6 +2419,223 @@ def test_malformed_patch_body_revokes_with_known_identity(
         conn.close()
 
 
+def test_ambiguous_patch_revokes_with_known_recovery_identity(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+
+    def lose_patch_response(*_args, **_kwargs):
+        raise RecurringServiceError(
+            "server_unavailable",
+            "response was truncated",
+            retryable=True,
+            ambiguous=True,
+        )
+
+    monkeypatch.setattr(auto, "update_enrollment", lose_patch_response)
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        )
+        or {},
+    )
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "server_unavailable"
+    assert result["ambiguous"] is True
+    assert revoke_calls == [("server-enrollment-1", "recovery-secret")]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
+    finally:
+        conn.close()
+
+
+def test_ambiguous_create_requires_fresh_verification_and_reuses_intent(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(upload_token="possibly-consumed")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_ids: list[str] = []
+
+    def create(_capabilities, **kwargs):
+        create_ids.append(str(kwargs["client_enrollment_id"]))
+        if len(create_ids) == 1:
+            raise RecurringServiceError(
+                "server_unavailable",
+                "response was lost",
+                retryable=True,
+                ambiguous=True,
+            )
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+    revoke_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            enrollment_id
+        ),
+    )
+    profile = _current_authorization_profile_hash()
+
+    failed = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert failed["code"] == "enrollment_response_ambiguous"
+    assert failed["ambiguous"] is True
+    assert revoke_calls == []
+    assert "verified_email_token" not in config_module.load_config()
+    blocked_disable = auto.disable()
+    assert blocked_disable["code"] == "enrollment_recovery_required"
+    assert blocked_disable["ambiguous"] is True
+    assert revoke_calls == []
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["health"] == "action_required"
+        first_client_id = enrollment["client_enrollment_id"]
+    finally:
+        conn.close()
+
+    refreshed = config_module.load_config()
+    refreshed["verified_email_token"] = "fresh-one-shot"
+    refreshed["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    assert config_module.save_config(refreshed)
+
+    enabled = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert enabled["mode"] == "enabled"
+    assert create_ids == [first_client_id, first_client_id]
+
+
+def test_ambiguous_credential_rotation_never_uses_invalidated_old_recovery(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    config = _save_scope_config(upload_token="possibly-consumed")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    expired = _credentials()
+    expired["active_token_expires_at"] = "2020-01-01T00:00:00+00:00"
+    write_credentials(expired)
+    _patch_enable_dependencies(monkeypatch)
+    create_ids: list[str] = []
+
+    def rotate(_capabilities, **kwargs):
+        create_ids.append(str(kwargs["client_enrollment_id"]))
+        if len(create_ids) == 1:
+            raise RecurringServiceError(
+                "server_unavailable",
+                "response was lost",
+                retryable=True,
+                ambiguous=True,
+            )
+        response = _enrollment_response()
+        response["enrolled_at"] = ENROLLED_AT
+        response["authorization_revision"] = 2
+        return response
+
+    monkeypatch.setattr(auto, "create_enrollment", rotate)
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        ),
+    )
+
+    profile = _current_authorization_profile_hash()
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["code"] == "enrollment_response_ambiguous"
+    assert result["ambiguous"] is True
+    assert revoke_calls == []
+    assert "verified_email_token" not in config_module.load_config()
+    blocked_resume = auto.resume()
+    assert blocked_resume["code"] == "enrollment_recovery_required"
+    blocked_disable = auto.disable()
+    assert blocked_disable["code"] == "enrollment_recovery_required"
+    assert blocked_disable["ambiguous"] is True
+    assert revoke_calls == []
+    assert load_credentials(required=True)["active_token"] is None
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "paused"
+        assert enrollment["health"] == "action_required"
+        assert enrollment["server_enrollment_id"] == "server-enrollment-1"
+        client_enrollment_id = enrollment["client_enrollment_id"]
+        assert create_ids == [client_enrollment_id]
+    finally:
+        conn.close()
+
+    refreshed = config_module.load_config()
+    refreshed["verified_email_token"] = "fresh-one-shot"
+    refreshed["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    assert config_module.save_config(refreshed)
+    recovered = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+    assert recovered["mode"] == "enabled"
+    assert create_ids == [client_enrollment_id, client_enrollment_id]
+
+    disabled = auto.disable()
+    assert disabled["mode"] == "off"
+    assert revoke_calls == [("server-enrollment-1", "recovery-secret")]
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,

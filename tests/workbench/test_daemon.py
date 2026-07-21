@@ -24,10 +24,26 @@ from clawjournal.workbench.daemon import (
     _build_share_zip,
     _reload_child_command,
     _missing_ingest_url_error,
+    _recurring_offer_available,
     _warn_if_frontend_stale,
     trigger_scoring_warmup,
 )
 from clawjournal.workbench.index import add_policy, open_index, set_hold_state, upsert_sessions
+
+
+def test_recurring_offer_uses_current_protocol_version():
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 2,
+        "recurring_enrollment_open": True,
+    }) is True
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 1,
+        "recurring_enrollment_open": True,
+    }) is False
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 2,
+        "recurring_enrollment_open": False,
+    }) is False
 
 
 @pytest.fixture
