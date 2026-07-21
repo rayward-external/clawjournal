@@ -3964,18 +3964,22 @@ def _run_cycle_impl(
                         ai_backend=ai_backend,
                     )
 
-                packaged = package(
-                    conn,
-                    session_ids,
-                    settings,
-                    ai_pii=bool(config.get("ai_pii_review_enabled")),
-                    ai_backend=ai_backend or "auto",
-                    expected_revisions=expected_revisions,
-                    note="Automatic weekly share",
-                    before_ai_call=before_ai_call,
-                )
-                share_id = packaged.get("share_id")
-                if not packaged.get("ok"):
+                review_moved: list[str] = []
+                retried_after_review = False
+                while True:
+                    packaged = package(
+                        conn,
+                        session_ids,
+                        settings,
+                        ai_pii=bool(config.get("ai_pii_review_enabled")),
+                        ai_backend=ai_backend or "auto",
+                        expected_revisions=expected_revisions,
+                        note="Automatic weekly share",
+                        before_ai_call=before_ai_call,
+                    )
+                    share_id = packaged.get("share_id")
+                    if packaged.get("ok"):
+                        break
                     blocked = packaged.get("blocked_sessions") or []
                     mapped_ids: list[str] = []
                     for item in blocked:
@@ -3984,7 +3988,13 @@ def _run_cycle_impl(
                         )
                         if candidate_id in expected_revisions:
                             mapped_ids.append(str(candidate_id))
+                    block_reason = packaged.get("block_reason")
                     if mapped_ids and len(mapped_ids) == len(blocked):
+                        # Block/review-tier findings mapped cleanly to their
+                        # traces: only those go to review. The clean remainder
+                        # is repackaged once in this same cycle (mirroring the
+                        # manual CLI's remove-and-retry loop) instead of
+                        # waiting for the next scheduled run.
                         for session_id in sorted(set(mapped_ids)):
                             set_hold_state(
                                 conn,
@@ -3993,13 +4003,40 @@ def _run_cycle_impl(
                                 changed_by="auto_upload",
                                 reason="Automatic share finding requires review",
                             )
+                        review_moved.extend(sorted(set(mapped_ids)))
                         if isinstance(share_id, str):
                             _cleanup_unsent_draft(conn, share_id)
+                        surviving = [
+                            item for item in selected
+                            if str(item["session_id"]) not in set(mapped_ids)
+                        ]
+                        if surviving and not retried_after_review:
+                            retried_after_review = True
+                            selected = surviving
+                            session_ids = [str(item["session_id"]) for item in selected]
+                            expected_revisions = {
+                                str(item["session_id"]): str(item["revision_hash"])
+                                for item in selected
+                            }
+                            # Narrow every downstream binding to the surviving
+                            # set and repeat the control checks before the
+                            # second packaging attempt — controls win before
+                            # AI/egress, same as the first pass.
+                            fingerprints = _raw_fingerprints(selected)
+                            _bind_scan_fingerprints(second_scan, selected, fingerprints)
+                            _assert_control_state(
+                                expected_generation=generation,
+                                expected_profile_hash=expected_profile,
+                                expected_revisions=expected_revisions,
+                                api_origin=str(credentials["api_origin"]),
+                                ai_backend=ai_backend,
+                            )
+                            continue
                         _record_cycle_result(
                             conn,
                             generation=generation,
                             code="review_attention",
-                            count=len(mapped_ids),
+                            count=len(review_moved),
                             retryable=True,
                         )
                         return {
@@ -4007,25 +4044,65 @@ def _run_cycle_impl(
                             "code": "review_attention",
                             "message": "Selected revisions were moved to pending review.",
                             "retryable": True,
-                            "count": len(mapped_ids),
+                            "count": len(review_moved),
                         }
                     if isinstance(share_id, str):
                         _cleanup_unsent_draft(conn, share_id)
-                    block_reason = packaged.get("block_reason")
                     if block_reason == "ai-pii-incomplete":
                         raise AutoUploadError(
                             "ai_pii_incomplete",
                             "AI-PII coverage was incomplete; no artifact was submitted.",
                             retryable=True,
                         )
-                    if block_reason in ("trufflehog-findings", "secret-scan-findings") or blocked:
+                    if block_reason in ("scanner-not-installed", "scanner-error"):
+                        # Scanner infrastructure trouble is transient from the
+                        # runner's perspective: back off and retry without
+                        # touching hold states — no session is lost or parked
+                        # because a binary was missing for one cycle.
                         raise AutoUploadError(
-                            "unmappable_findings",
+                            "scanner_unavailable",
                             str(
                                 packaged.get("error")
-                                or "Automatic findings could not be mapped safely."
+                                or "The secret scanners are unavailable."
                             ),
+                            retryable=True,
                         )
+                    if block_reason in ("trufflehog-findings", "secret-scan-findings") or blocked:
+                        # Findings that cannot be mapped to individual traces:
+                        # park the whole batch for human review and keep the
+                        # runner alive. The previous behavior — a durable
+                        # non-retryable `unmappable_findings` — stalled every
+                        # future cycle until manual intervention, while the
+                        # sessions stayed candidates and re-failed forever.
+                        for session_id in sorted(set(session_ids)):
+                            set_hold_state(
+                                conn,
+                                session_id,
+                                "pending_review",
+                                changed_by="auto_upload",
+                                reason=(
+                                    "Secret-scan finding could not be mapped "
+                                    "to a single trace"
+                                ),
+                            )
+                        review_moved.extend(sorted(set(session_ids)))
+                        _record_cycle_result(
+                            conn,
+                            generation=generation,
+                            code="review_attention",
+                            count=len(review_moved),
+                            retryable=True,
+                        )
+                        return {
+                            "ok": False,
+                            "code": "review_attention",
+                            "message": (
+                                "Selected revisions were moved to pending review "
+                                "(finding could not be mapped to a single trace)."
+                            ),
+                            "retryable": True,
+                            "count": len(review_moved),
+                        }
                     raise AutoUploadError(
                         "package_failed",
                         str(packaged.get("error") or "Automatic packaging failed."),

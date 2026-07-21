@@ -4291,10 +4291,15 @@ def test_runner_rejects_append_between_strict_parse_and_initial_fingerprint(
         conn.close()
 
 
-def test_unmappable_trufflehog_finding_requires_action_instead_of_retry_loop(
+def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
     isolated_auto_upload,
     monkeypatch,
 ):
+    # A blocking finding with no safe line mapping used to raise a
+    # durable non-retryable `unmappable_findings` — stalling every
+    # future cycle while the sessions stayed candidates and re-failed
+    # forever. Now the whole batch is parked in pending_review (a human
+    # un-sticks it) and the runner stays healthy.
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -4308,7 +4313,10 @@ def test_unmappable_trufflehog_finding_requires_action_instead_of_retry_loop(
     _patch_runner_host(monkeypatch)
     _patch_strict_scanner(monkeypatch)
 
+    parked_ids: list[str] = []
+
     def blocked_package(conn, session_ids, _settings, **kwargs):
+        parked_ids.extend(session_ids)
         share_id = create_share(
             conn,
             session_ids,
@@ -4317,8 +4325,8 @@ def test_unmappable_trufflehog_finding_requires_action_instead_of_retry_loop(
         return {
             "ok": False,
             "share_id": share_id,
-            "error": "TruffleHog found a secret without a safe line mapping.",
-            "block_reason": "trufflehog-findings",
+            "error": "The secret scan found a finding without a safe line mapping.",
+            "block_reason": "secret-scan-findings",
             "blocked_sessions": [],
         }
 
@@ -4332,17 +4340,154 @@ def test_unmappable_trufflehog_finding_requires_action_instead_of_retry_loop(
 
     result = auto.run_cycle(force=True)
 
-    assert result["code"] == "unmappable_findings"
-    assert result["retryable"] is False
+    assert result["code"] == "review_attention"
+    assert result["retryable"] is True
+    assert result["count"] == len(set(parked_ids))
     assert post_calls == []
     conn = open_index()
     try:
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["mode"] == "enabled"
-        assert enrollment["health"] == "action_required"
-        assert enrollment["last_completed_at"] is None
-        assert enrollment["last_result_code"] == "unmappable_findings"
+        # No durable stall: the runner stays healthy and later cycles
+        # proceed with other candidates.
+        assert enrollment["health"] != "action_required"
+        assert enrollment["last_result_code"] == "review_attention"
+        # Every batch session left candidacy via pending_review.
+        for session_id in set(parked_ids):
+            row = conn.execute(
+                "SELECT hold_state FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            assert row["hold_state"] == "pending_review"
         assert conn.execute("SELECT 1 FROM shares").fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    # Two candidates; the first packaging attempt maps a blocking
+    # finding to session-one only. The runner parks that one trace and
+    # repackages the survivor in the SAME cycle (bounded to one retry —
+    # a second blocked attempt parks the rest and returns).
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"], "session-one")
+    _seed_released_session(conn, isolated_auto_upload["root"], "session-two")
+    _save_enabled_enrollment(
+        conn,
+        config,
+        enrolled_at="2026-07-10T00:00:00+00:00",
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    package_calls: list[list[str]] = []
+
+    def tiered_package(conn, session_ids, _settings, **kwargs):
+        package_calls.append(sorted(session_ids))
+        blocked_id = sorted(session_ids)[0]
+        share_id = create_share(
+            conn,
+            session_ids,
+            expected_revisions=kwargs["expected_revisions"],
+        )
+        return {
+            "ok": False,
+            "share_id": share_id,
+            "error": "A blocking finding mapped to one trace.",
+            "block_reason": "secret-scan-findings",
+            "blocked_sessions": [{"session_id": blocked_id}],
+        }
+
+    monkeypatch.setattr(auto, "package", tiered_package)
+    post_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "submit_artifact",
+        lambda *_args, **_kwargs: post_calls.append("POST"),
+    )
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] == "review_attention"
+    assert result["retryable"] is True
+    assert result["count"] == 2
+    assert post_calls == []
+    # Exactly two packaging attempts: the full batch, then the survivor.
+    assert len(package_calls) == 2
+    assert package_calls[0] == ["session-one", "session-two"]
+    assert package_calls[1] == ["session-two"]
+    conn = open_index()
+    try:
+        for session_id in ("session-one", "session-two"):
+            row = conn.execute(
+                "SELECT hold_state FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            assert row["hold_state"] == "pending_review"
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] != "action_required"
+    finally:
+        conn.close()
+
+
+def test_scanner_unavailable_is_retryable_without_hold_changes(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    # A missing scanner binary is infrastructure trouble, not a trace
+    # problem: the cycle backs off retryably and no session is parked.
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(
+        conn,
+        config,
+        enrolled_at="2026-07-10T00:00:00+00:00",
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    def unavailable_package(conn, session_ids, _settings, **kwargs):
+        share_id = create_share(
+            conn,
+            session_ids,
+            expected_revisions=kwargs["expected_revisions"],
+        )
+        return {
+            "ok": False,
+            "share_id": share_id,
+            "error": "Betterleaks is required to export shares but was not found.",
+            "block_reason": "scanner-not-installed",
+            "blocked_sessions": [],
+        }
+
+    monkeypatch.setattr(auto, "package", unavailable_package)
+    monkeypatch.setattr(
+        auto,
+        "submit_artifact",
+        lambda *_args, **_kwargs: pytest.fail("must not submit"),
+    )
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] == "scanner_unavailable"
+    assert result["retryable"] is True
+    conn = open_index()
+    try:
+        row = conn.execute(
+            "SELECT hold_state FROM sessions WHERE session_id = 'session-one'",
+        ).fetchone()
+        assert row["hold_state"] == "released"
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "enabled"
     finally:
         conn.close()
 
