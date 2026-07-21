@@ -34,7 +34,7 @@ def _sanitize_terminal_line(text: Any) -> str:
 
 def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
-        "auto-upload", help="Manage authorized automatic weekly sharing"
+        "auto-upload", help="Manage authorized automatic daily sharing"
     )
     commands = parser.add_subparsers(dest="auto_upload_command", required=True)
 

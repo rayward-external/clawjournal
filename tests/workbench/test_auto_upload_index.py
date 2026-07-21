@@ -1,4 +1,4 @@
-"""Local persistence and candidate selection for automatic weekly uploads."""
+"""Local persistence and candidate selection for automatic daily uploads."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Adversarial tests for the automatic weekly-upload state machine.
+"""Adversarial tests for the automatic daily-upload state machine.
 
 These tests deliberately inject failures at durable-state and egress
 boundaries.  They use only isolated config/index roots and never touch real
@@ -168,6 +168,7 @@ def _capabilities(origin: str = ORIGIN) -> dict[str, Any]:
     return {
         "origin": origin,
         "maximum_bundle_size": 5_000_000,
+        "recurring_cadence_days": 1,
         "recurring_enrollment_url": f"{origin}/api/recurring-enrollments",
         "recurring_submission_url": f"{origin}/api/recurring-submissions",
         "recurring_receipt_lookup_url": (
@@ -179,7 +180,7 @@ def _capabilities(origin: str = ORIGIN) -> dict[str, Any]:
 def _terms() -> dict[str, str]:
     return {
         "authorization_version": AUTH_VERSION,
-        "authorization_text": "I authorize a weekly upload of up to five traces.",
+        "authorization_text": "I authorize a recurring upload of up to five traces.",
         "retention_policy_version": RETENTION_VERSION,
         "retention_text": "Uploaded traces follow the stated retention policy.",
         "ownership_certification_version": OWNERSHIP_VERSION,
@@ -3914,7 +3915,7 @@ def test_reauthorization_cannot_resurrect_active_token_after_disable_wins(
         conn.close()
 
 
-def test_nothing_new_advances_successful_weekly_cadence(
+def test_nothing_new_advances_successful_daily_cadence(
     isolated_auto_upload,
     monkeypatch,
 ):
@@ -3960,7 +3961,7 @@ def test_nothing_new_advances_successful_weekly_cadence(
         assert enrollment["last_result_code"] == "nothing_new"
         assert enrollment["last_result_count"] == 0
         assert enrollment["next_retry_at"] is None
-        assert auto._due_at(enrollment) == completed + timedelta(days=7)
+        assert auto._due_at(enrollment) == completed + timedelta(days=1)
     finally:
         conn.close()
 
@@ -4220,7 +4221,7 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
         assert completed_enrollment["last_result_count"] == 1
         assert completed_enrollment["last_receipt_reference"] == "receipt-happy-path"
         assert completed_enrollment["next_retry_at"] is None
-        assert auto._due_at(completed_enrollment) == completed_at + timedelta(days=7)
+        assert auto._due_at(completed_enrollment) == completed_at + timedelta(days=1)
 
         post_report = auto._candidate_report(conn, completed_enrollment)
         assert post_report["selected"] == []

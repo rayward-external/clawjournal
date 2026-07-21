@@ -1,4 +1,4 @@
-"""Automatic weekly sharing service and crash-safe runner.
+"""Automatic daily sharing service and crash-safe runner.
 
 SQLite is the sole local authority.  Hooks only perform the bounded due check
 at the bottom of this module and detach a runner; all scanning, privacy work,
@@ -35,6 +35,7 @@ from .agent_hooks import (
 )
 from .auto_upload_client import (
     MAX_SCOPE_ENTRIES,
+    RECURRING_CADENCE_DAYS,
     CapabilityError,
     RecurringServiceError,
     create_enrollment,
@@ -82,7 +83,7 @@ from .workbench.index import (
     update_auto_upload_enrollment,
 )
 
-CADENCE_DAYS = 7
+CADENCE_DAYS = RECURRING_CADENCE_DAYS
 MAX_SESSIONS = 5
 BACKOFF_BASE_SECONDS = 15 * 60
 BACKOFF_MAX_SECONDS = 24 * 60 * 60
@@ -900,7 +901,7 @@ def _authorization_challenge(
         },
         "ai": {"enabled": ai_backend is not None, "backend": ai_backend},
         "cap": MAX_SESSIONS,
-        "cadence_days": CADENCE_DAYS,
+        "cadence_days": capabilities["recurring_cadence_days"],
         "maximum_bundle_size": capabilities["maximum_bundle_size"],
         "destination_origin": capabilities["origin"],
     }
@@ -3974,7 +3975,7 @@ def _run_cycle_impl(
                         ai_pii=bool(config.get("ai_pii_review_enabled")),
                         ai_backend=ai_backend or "auto",
                         expected_revisions=expected_revisions,
-                        note="Automatic weekly share",
+                        note="Automatic daily share",
                         before_ai_call=before_ai_call,
                     )
                     share_id = packaged.get("share_id")

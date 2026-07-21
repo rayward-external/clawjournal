@@ -17,7 +17,7 @@ function status(overrides: Partial<AutoUploadStatus> = {}): AutoUploadStatus {
     offer_available: false,
     scope: { sources: [], projects: [] },
     cap: 5,
-    cadence_days: 7,
+    cadence_days: 1,
     ai: { enabled: false, backend: null },
     authorization: { version: null, text: null },
     retention: { version: null, text: null },
@@ -72,7 +72,7 @@ function authorizationRequired() {
     },
     ai: { enabled: true, backend: 'codex' },
     cap: 5,
-    cadence_days: 7,
+    cadence_days: 1,
     maximum_bundle_size: 5_000_000,
     destination_origin: 'https://share.example.test',
   });
@@ -206,6 +206,7 @@ describe('AutoUploadPanel authorization', () => {
     expect(screen.getByText(/separate from the consent you gave/i)).toBeInTheDocument();
     expect(screen.getByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();
+    expect(screen.getByText('Every 1 day, on the next supported agent session')).toBeInTheDocument();
     expect(screen.getByText('claude → project-a')).toBeInTheDocument();
     expect(screen.getByText(/exact source\/project pairs shown above/i)).toBeInTheDocument();
     expect(screen.getByText(/can upload without my reviewing each bundle/i)).toBeInTheDocument();
