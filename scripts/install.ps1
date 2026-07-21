@@ -11,6 +11,10 @@
 .PARAMETER WithFrontend
     Also build the browser workbench (requires Node.js / npm).
 
+.PARAMETER WithSharing
+    Also install the pinned, checksum-verified Betterleaks and TruffleHog
+    binaries used by the share gate.
+
 .PARAMETER VenvPath
     Where to create the venv. Default: $HOME\.clawjournal-venv (or the
     CLAWJOURNAL_VENV environment variable, if set).
@@ -20,10 +24,14 @@
 
 .EXAMPLE
     .\scripts\install.ps1 -WithFrontend
+
+.EXAMPLE
+    .\scripts\install.ps1 -WithFrontend -WithSharing
 #>
 [CmdletBinding()]
 param(
     [switch]$WithFrontend,
+    [switch]$WithSharing,
     [string]$VenvPath
 )
 
@@ -128,7 +136,27 @@ if ($WithFrontend) {
     }
 }
 
-# 5) Report.
+# 5) Optional sharing dependencies. Keep auto-update disabled while the
+# installer is already operating on a freshly synchronized checkout.
+if ($WithSharing) {
+    Write-Host "-> Installing managed secret scanners"
+    $previousNoAutoUpdate = $env:CLAWJOURNAL_NO_AUTO_UPDATE
+    $env:CLAWJOURNAL_NO_AUTO_UPDATE = '1'
+    try {
+        & $ClawJournalExe betterleaks install
+        if ($LASTEXITCODE -ne 0) { throw "Betterleaks installation failed (exit $LASTEXITCODE)." }
+        & $ClawJournalExe trufflehog install
+        if ($LASTEXITCODE -ne 0) { throw "TruffleHog installation failed (exit $LASTEXITCODE)." }
+    } finally {
+        if ($null -eq $previousNoAutoUpdate) {
+            Remove-Item Env:CLAWJOURNAL_NO_AUTO_UPDATE -ErrorAction SilentlyContinue
+        } else {
+            $env:CLAWJOURNAL_NO_AUTO_UPDATE = $previousNoAutoUpdate
+        }
+    }
+}
+
+# 6) Report.
 $InstalledVersion = & $VenvPy -c "import clawjournal; print(clawjournal.__version__)" 2>$null
 if (-not $InstalledVersion) { $InstalledVersion = '?' }
 Write-Host ""
@@ -141,7 +169,7 @@ Write-Host ""
 Write-Host "Or add the venv to PATH for this session:"
 Write-Host "        `$env:Path = `"$VenvBin;`" + `$env:Path"
 
-# 6) Soft hints for optional runtime deps.
+# 7) Soft hints for optional runtime deps.
 $DistHtml = Join-Path $RepoDir 'clawjournal\web\frontend\dist\index.html'
 $FeSrcDir = Join-Path $RepoDir 'clawjournal\web\frontend\src'
 $frontendBuilt = Test-Path $DistHtml
@@ -165,10 +193,18 @@ elseif (Test-Path $FeSrcDir) {
     }
 }
 
+$managedBetterleaks = Join-Path $HOME ".clawjournal\bin\betterleaks.exe"
+if (-not $WithSharing -and -not (Get-Command betterleaks -ErrorAction SilentlyContinue) -and -not (Test-Path $managedBetterleaks)) {
+    Write-Host ""
+    Write-Host "[i] Betterleaks is required when sharing exports."
+    Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalExe betterleaks install"
+    Write-Host "    Or re-run: .\scripts\install.ps1 -WithSharing"
+}
+
 $managedTrufflehog = Join-Path $HOME ".clawjournal\bin\trufflehog.exe"
-if (-not (Get-Command trufflehog -ErrorAction SilentlyContinue) -and -not (Test-Path $managedTrufflehog)) {
+if (-not $WithSharing -and -not (Get-Command trufflehog -ErrorAction SilentlyContinue) -and -not (Test-Path $managedTrufflehog)) {
     Write-Host ""
     Write-Host "[i] TruffleHog is required when sharing exports."
     Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalExe trufflehog install"
-    Write-Host "    Or download a release binary: https://github.com/trufflesecurity/trufflehog/releases"
+    Write-Host "    Or re-run: .\scripts\install.ps1 -WithSharing"
 }

@@ -27,6 +27,52 @@ def _read(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def test_enroll_installs_managed_share_scanners(isolated_hook_env, monkeypatch):
+    calls = []
+    scanner_result = {
+        "ok": True,
+        "missing": [],
+        "scanners": {
+            "betterleaks": {"ok": True, "status": "installed"},
+            "trufflehog": {"ok": True, "status": "installed"},
+        },
+    }
+    monkeypatch.setattr(
+        "clawjournal.redaction.scanner_install.ensure_share_scanners",
+        lambda **kwargs: calls.append(kwargs) or scanner_result,
+    )
+
+    result = hooks.enroll_openrefinery(
+        agent="codex",
+        skip_selfupdate=True,
+        home=isolated_hook_env / "home",
+    )
+
+    assert calls == [{"prefer_managed": True}]
+    assert result["scanners"] == scanner_result
+    assert result["install"]["enabled"] is True
+
+
+def test_enroll_stops_when_share_scanners_cannot_be_installed(
+    isolated_hook_env,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "clawjournal.redaction.scanner_install.ensure_share_scanners",
+        lambda **_kwargs: {
+            "ok": False,
+            "error": "betterleaks: network unavailable",
+        },
+    )
+
+    with pytest.raises(hooks.HookError, match="betterleaks: network unavailable"):
+        hooks.enroll_openrefinery(
+            agent="codex",
+            skip_selfupdate=True,
+            home=isolated_hook_env / "home",
+        )
+
+
 def test_install_profile_writes_claude_and_codex_hooks(isolated_hook_env):
     home = isolated_hook_env / "home"
     claude_settings = home / ".claude" / "settings.json"

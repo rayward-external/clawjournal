@@ -202,6 +202,8 @@ export function Share() {
   const [packageProgress, setPackageProgress] = useState(0);
   const [packageLog, setPackageLog] = useState('');
   const [packagingFailed, setPackagingFailed] = useState<string | null>(null);
+  const [packageBlockReason, setPackageBlockReason] = useState<string | null>(null);
+  const [installingScanners, setInstallingScanners] = useState(false);
   const [blockedPackageSessions, setBlockedPackageSessions] = useState<BlockedShareSession[]>([]);
 
   // Done state
@@ -962,6 +964,7 @@ export function Share() {
     if (packagingStartedRef.current) return;
     packagingStartedRef.current = true;
     setPackagingFailed(null);
+    setPackageBlockReason(null);
     setBlockedPackageSessions([]);
     setPackageProgress(0);
     setPackageLog('Allocating bundle...');
@@ -1060,7 +1063,11 @@ export function Share() {
     } catch (err: unknown) {
       clearAllTimers();
       const msg = err instanceof Error ? err.message : 'Package failed';
+      const blockReason = err instanceof ApiError && typeof err.body.block_reason === 'string'
+        ? err.body.block_reason
+        : null;
       setBlockedPackageSessions(blockedSessionsFromError(err));
+      setPackageBlockReason(blockReason);
       setPackagingFailed(msg);
       setPackageLog(`Failed: ${msg}`);
       toast(msg, 'error');
@@ -1068,6 +1075,25 @@ export function Share() {
       packagingStartedRef.current = false;
     }
   }, [approvedSessions, note, toast, aiPiiEnabled]);
+
+  const installScannersAndRetry = useCallback(async () => {
+    if (installingScanners) return;
+    setInstallingScanners(true);
+    setPackageLog('Installing pinned local scanners...');
+    try {
+      await api.share.installScanners();
+      toast('Local secret scanners installed', 'success');
+      await runPackage();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Scanner installation failed';
+      setPackageBlockReason('scanner-not-installed');
+      setPackagingFailed(msg);
+      setPackageLog(`Failed: ${msg}`);
+      toast(msg, 'error');
+    } finally {
+      setInstallingScanners(false);
+    }
+  }, [installingScanners, runPackage, toast]);
 
   const handleStartPackage = () => {
     if (queuedSessions.length === 0) return;
@@ -1313,7 +1339,10 @@ export function Share() {
         progress={packageProgress}
         log={packageLog}
         failed={packagingFailed}
+        missingScanners={packageBlockReason === 'scanner-not-installed'}
+        installingScanners={installingScanners}
         blockedSessions={blockedPackageSessions}
+        onInstallScannersAndRetry={installScannersAndRetry}
         onRetry={runPackage}
         onRemoveBlockedAndRetry={removeBlockedAndRetry}
         onBack={() => setActiveStep('review')}

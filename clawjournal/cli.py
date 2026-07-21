@@ -1682,6 +1682,7 @@ def _write_bundle_zip(export_dir: Path) -> Path:
 
 def _run_bundle_export(args) -> None:
     """Export a bundle to disk as JSONL + manifest."""
+    from .redaction.scanner_install import ensure_share_scanners
     from .workbench.index import (
         export_share_to_disk,
         get_effective_share_settings,
@@ -1691,6 +1692,20 @@ def _run_bundle_export(args) -> None:
     )
 
     config = load_config()
+
+    scanner_setup = ensure_share_scanners(
+        progress=None if getattr(args, "json", False) else print,
+    )
+    if not scanner_setup["ok"]:
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "error": scanner_setup.get("error"),
+                "block_reason": "scanner-not-installed",
+                "scanner_install": scanner_setup,
+            }, indent=2))
+        else:
+            print(scanner_setup.get("error") or "Required secret scanners are not installed.")
+        sys.exit(2)
 
     # AI-PII review only runs inside the uploadable-zip finalize pass, so the
     # flag is a no-op for a plain on-disk export. Warn instead of silently
@@ -5001,6 +5016,14 @@ def main() -> None:
             update_status = update.get("status") if isinstance(update, dict) else None
             if update_status:
                 print(f"ClawJournal update status: {update_status}")
+            scanners = result.get("scanners") or {}
+            scanner_states = scanners.get("scanners", {}) if isinstance(scanners, dict) else {}
+            if scanner_states:
+                summary = ", ".join(
+                    f"{name} ({state.get('status', 'unknown')})"
+                    for name, state in scanner_states.items()
+                )
+                print(f"Local secret scanners ready: {summary}.")
             install = result["install"]
             installed = install.get("installed", [])
             agents = ", ".join(item.get("agent", "?") for item in installed)

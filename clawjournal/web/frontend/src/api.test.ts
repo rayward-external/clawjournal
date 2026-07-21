@@ -58,3 +58,38 @@ describe('automatic-upload API normalization', () => {
     ]);
   });
 });
+
+describe('share scanner recovery API', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('requests installation of the pinned managed scanners', async () => {
+    const payload = {
+      ok: true,
+      missing: [],
+      scanners: {
+        betterleaks: {
+          ok: true,
+          status: 'installed',
+          install_attempted: true,
+          available: true,
+          managed: true,
+        },
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.share.installScanners()).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith('/api/share/scanners/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+  });
+});
