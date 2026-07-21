@@ -1243,8 +1243,10 @@ def test_hook_due_check_honors_backoff_for_submitting_share(isolated_auto_upload
 
 
 def test_receipt_recovery_failure_stamps_backoff(isolated_auto_upload, monkeypatch):
-    """A failing receipt reconcile must record retryable backoff so the forced
-    'submitting' due-check throttles instead of storming."""
+    """A failing receipt reconcile must stamp ONLY the retry clock so the
+    forced 'submitting' due-check throttles instead of storming — durable
+    status fields (health, last_result_code) stay untouched because recovery
+    runs before every lifecycle gate."""
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -1274,7 +1276,156 @@ def test_receipt_recovery_failure_stamps_backoff(isolated_auto_upload, monkeypat
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["consecutive_failures"] == 1
         assert enrollment["next_retry_at"] is not None
-        assert enrollment["health"] == "retrying"
+        # The read-only probe never rewrites user-facing status.
+        assert enrollment["health"] == "ready"
+        assert enrollment["last_result_code"] is None
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_receipt_recovery_failure_preserves_action_required(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A transient reconcile failure must NOT erase a durable action_required:
+    flipping it to 'retrying' would let a later successful receipt commit
+    upgrade to 'ready' and silently re-open automatic egress past a safety
+    stop the user never reviewed."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, health="action_required")
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        last_result_code="unmappable_findings",
+    )
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: None)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "credential_invalid"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] == "action_required"
+        assert enrollment["last_result_code"] == "unmappable_findings"
+        assert enrollment["consecutive_failures"] == 1
+        assert enrollment["next_retry_at"] is not None
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_receipt_recovery_server_error_stamps_backoff(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The RecurringServiceError handler (server down during lookup) must pace
+    itself exactly like the local-failure handler."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(
+        auto,
+        "recovery_capabilities",
+        lambda origin: {
+            "origin": origin,
+            "recurring_receipt_lookup_url": (
+                f"{origin}/api/recurring-receipts/{{client_submission_id}}"
+            ),
+        },
+    )
+
+    def server_down(*_args, **_kwargs):
+        raise RecurringServiceError(
+            code="server_unavailable", message="down", retryable=True
+        )
+
+    monkeypatch.setattr(auto, "lookup_receipt", server_down)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "server_unavailable"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["consecutive_failures"] == 1
+        assert enrollment["next_retry_at"] is not None
+        assert enrollment["health"] == "ready"
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_receipt_recovery_preserves_disable_overlay_and_paces_off_mode(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """Recovery failures on a non-enabled enrollment must preserve Disable's
+    revocation overlay (mode/health/last_result_code) while still pacing the
+    forced 'submitting' due-check so leftover hooks cannot storm."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, health="action_required")
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        mode="off",
+        last_result_code="revocation_pending",
+    )
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: None)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "credential_invalid"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["health"] == "action_required"
+        assert enrollment["last_result_code"] == "revocation_pending"
+        assert enrollment["next_retry_at"] is not None
         decision = auto._hook_due_check_on_connection(
             conn, datetime.now(timezone.utc)
         )

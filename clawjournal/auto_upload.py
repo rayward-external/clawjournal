@@ -2071,8 +2071,12 @@ def _ranked_size_prefix(
     *,
     settings: Mapping[str, Any],
     maximum_bundle_size: int,
-) -> tuple[list[dict[str, Any]], int]:
-    """Choose the largest conservative ranked prefix before any AI call."""
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Choose the largest conservative ranked prefix before any AI call.
+
+    Returns ``(selected, deferred_by_size, missing)`` — ``missing`` counts
+    candidates whose session row vanished before the size ``break``.
+    """
 
     # ZIP can fail to compress. Apply the exact deterministic share redaction
     # locally before any AI call, then budget those serialized bytes plus
@@ -2269,6 +2273,44 @@ def _record_cycle_result(
         conn,
         expected_generation=generation,
         **changes,
+    )
+
+
+def _record_recovery_backoff(
+    conn: sqlite3.Connection,
+    *,
+    generation: int,
+    retry_after: int | None = None,
+) -> None:
+    """Pace a failed receipt recovery without touching durable status fields.
+
+    The hook due-check forces a 'submitting' share immediately due unless
+    ``next_retry_at`` is in the future, so a failing (or unresolvable) receipt
+    lookup must stamp the retry clock or every SessionStart relaunches a
+    network-calling runner. But receipt recovery deliberately runs before
+    every lifecycle gate — on paused, off, and ``action_required`` enrollments
+    — where ``health``/``last_result_code``/``last_receipt_reference`` carry
+    durable overlays a read-only probe must never rewrite: a durable
+    ``action_required`` gates automatic egress until the user reviews it,
+    Disable owns its revocation overlay, and the Pause-reauthorization merge
+    keys off ``last_result_code``. Stamp ONLY ``consecutive_failures`` and
+    ``next_retry_at`` (the two fields the throttle needs), unlike
+    ``_record_cycle_result`` which rewrites the user-facing status.
+    """
+
+    enrollment = get_auto_upload_enrollment(conn)
+    if enrollment is None or int(enrollment["generation"]) != generation:
+        return
+    failures = int(enrollment.get("consecutive_failures") or 0) + 1
+    delay = retry_after or min(
+        BACKOFF_MAX_SECONDS,
+        BACKOFF_BASE_SECONDS * (2 ** min(failures - 1, 8)),
+    )
+    update_auto_upload_enrollment(
+        conn,
+        expected_generation=generation,
+        consecutive_failures=failures,
+        next_retry_at=_iso(_now() + timedelta(seconds=delay)),
     )
 
 
@@ -2501,16 +2543,18 @@ def _transition_submission(
         )
         if to_state == "submitting" and cursor.rowcount == 1:
             # Entering 'submitting' means every gate just passed, so any stale
-            # next_retry_at from an earlier unrelated failure is obsolete —
-            # clear it in the same transaction. A crash mid-POST then leaves
-            # 'submitting' with no backoff, keeping the first receipt reconcile
-            # immediately due; only a failure of THIS share's submit/reconcile
-            # can stamp a fresh backoff afterwards, and the hook due-check
-            # rightly waits that one out.
+            # next_retry_at (and the failure exponent behind it) from earlier
+            # unrelated failures is obsolete — clear both in the same
+            # transaction. A crash mid-POST then leaves 'submitting' with no
+            # backoff, keeping the first receipt reconcile immediately due;
+            # only a failure of THIS share's submit/reconcile can stamp a
+            # fresh backoff afterwards (starting from a fresh exponent), and
+            # the hook due-check rightly waits that one out.
             conn.execute(
-                "UPDATE auto_upload_enrollment SET next_retry_at = NULL "
+                "UPDATE auto_upload_enrollment SET next_retry_at = NULL, "
+                "consecutive_failures = 0, updated_at = ? "
                 "WHERE singleton_id = 1 AND generation = ?",
-                (generation,),
+                (_iso(_now()), generation),
             )
         conn.commit()
         return cursor.rowcount == 1
@@ -3191,21 +3235,34 @@ def _run_cycle_impl(
                         _checkpoint_recovered_receipt(conn, receipt_probe)
                         return receipt_probe
                     if enrollment.get("mode") != "enabled":
+                        still_pending = _pending_submission(conn)
+                        if (
+                            still_pending is not None
+                            and still_pending.get("submission_state") == "submitting"
+                        ):
+                            # A success-shaped probe can leave the share
+                            # 'submitting' on a non-enabled enrollment (e.g.
+                            # receipt_not_found while Off defers the collapse
+                            # to Disable). With leftover hooks nothing else
+                            # would stamp pacing, so the forced due-check
+                            # would relaunch a runner every SessionStart.
+                            _record_recovery_backoff(
+                                conn,
+                                generation=int(enrollment["generation"]),
+                            )
                         return receipt_probe
                 except RecurringServiceError as exc:
-                    # A failed receipt lookup must stamp backoff: the hook
+                    # A failed receipt lookup must pace itself: the hook
                     # due-check forces 'submitting' immediately due, so without
                     # next_retry_at every SessionStart would relaunch a
-                    # network-calling runner (a spawn storm). Receipt recovery
-                    # is read-only, so it is always safe to retry later —
-                    # record retryable even for normally terminal codes rather
-                    # than action_required, which clears next_retry_at and
-                    # would keep the storm alive.
-                    _record_cycle_result(
+                    # network-calling runner (a spawn storm). Recovery runs
+                    # before every lifecycle gate, so ONLY the retry clock is
+                    # stamped — health/result codes may carry durable overlays
+                    # (a safety action_required, Disable's revocation state)
+                    # that a read-only probe must never rewrite.
+                    _record_recovery_backoff(
                         conn,
                         generation=int(enrollment["generation"]),
-                        code=exc.code,
-                        retryable=True,
                         retry_after=exc.retry_after,
                     )
                     return exc.as_result()
@@ -3215,13 +3272,11 @@ def _run_cycle_impl(
                         if isinstance(exc, AutoUploadError)
                         else AutoUploadError("credential_store_failed", str(exc))
                     )
-                    # Same storm guard as above: stamp backoff so the forced
-                    # 'submitting' due-check waits before the next attempt.
-                    _record_cycle_result(
+                    # Same pacing guard as above: throttle the forced
+                    # 'submitting' due-check without touching durable status.
+                    _record_recovery_backoff(
                         conn,
                         generation=int(enrollment["generation"]),
-                        code=error.code,
-                        retryable=True,
                     )
                     return error.as_result()
 
