@@ -2702,6 +2702,9 @@ def _submit_pending_artifact(
     # recompute and submitting transition have a definite order relative to
     # every supported privacy-setting mutation.
     with config_module.auto_upload_egress_lock():
+        # Raw fingerprints were re-validated just above, immediately before this
+        # lock; skip the size-unbounded re-hash here so it never runs while the
+        # egress lock is held (it would block concurrent save_config writers).
         _validate_pending_for_submission(
             conn,
             share=share,
@@ -2709,6 +2712,7 @@ def _submit_pending_artifact(
             expected_profile_hash=str(enrollment["egress_profile_hash"]),
             api_origin=str(credentials["api_origin"]),
             ai_backend=ai_backend,
+            check_raw_fingerprints=False,
         )
         state = str(share.get("submission_state"))
         if state not in {"sealed", "submitting"} or not _transition_submission(
@@ -2884,8 +2888,17 @@ def _validate_pending_for_submission(
     expected_profile_hash: str,
     api_origin: str,
     ai_backend: str | None,
+    check_raw_fingerprints: bool = True,
 ) -> None:
-    """Re-establish every local safety gate before a recovery POST."""
+    """Re-establish every local safety gate before a recovery POST.
+
+    ``check_raw_fingerprints`` re-hashes the raw parser inputs, which is
+    size-unbounded. The locked submit path already validates the ledger
+    immediately before it acquires the egress lock, so it passes ``False``
+    here to keep that re-hash out of the lock — running it while the lock is
+    held would stall every concurrent ``save_config`` for the full hash of up
+    to five (potentially very large) session logs.
+    """
 
     if share.get("enrollment_id") != enrollment.get("server_enrollment_id"):
         raise AutoUploadError(
@@ -2922,7 +2935,8 @@ def _validate_pending_for_submission(
         api_origin=api_origin,
         ai_backend=ai_backend,
     )
-    _validate_raw_fingerprint_ledger(conn, share)
+    if check_raw_fingerprints:
+        _validate_raw_fingerprint_ledger(conn, share)
 
 
 def _validate_raw_fingerprint_ledger(

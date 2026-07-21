@@ -986,6 +986,66 @@ def test_recovery_rechecks_hold_review_revision_and_raw_fingerprint(
     conn.close()
 
 
+def test_validate_pending_skips_raw_hash_when_disabled(isolated_auto_upload):
+    """check_raw_fingerprints=False keeps the size-unbounded raw re-hash out of
+    the egress lock: the locked submit path validates the ledger just before the
+    lock, so passing False here must not re-hash (a raw change alone won't raise),
+    while the default still re-hashes and catches the change."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+    raw_path.write_text("changed after sealing\n", encoding="utf-8")
+
+    # Guard against a regression that moves the raw hash back under the lock: with
+    # the check disabled the raw mutation is not re-hashed here, so nothing raises.
+    called = False
+    original = auto._validate_raw_fingerprint_ledger
+
+    def _spy(*args, **kwargs):
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)
+
+    auto._validate_raw_fingerprint_ledger = _spy
+    try:
+        auto._validate_pending_for_submission(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            expected_profile_hash=enrollment["egress_profile_hash"],
+            api_origin=ORIGIN,
+            ai_backend=None,
+            check_raw_fingerprints=False,
+        )
+        assert called is False
+
+        # The default still re-hashes and catches the post-seal raw change.
+        with pytest.raises(auto.ControlChanged):
+            auto._validate_pending_for_submission(
+                conn,
+                share=share,
+                enrollment=enrollment,
+                expected_profile_hash=enrollment["egress_profile_hash"],
+                api_origin=ORIGIN,
+                ai_backend=None,
+            )
+        assert called is True
+    finally:
+        auto._validate_raw_fingerprint_ledger = original
+    conn.close()
+
+
 @pytest.mark.parametrize("review_status", ["new", "blocked"])
 def test_revoked_fresh_approval_stops_before_ai_and_submit(
     isolated_auto_upload,
