@@ -1966,6 +1966,7 @@ def _redaction_settings_fingerprint(settings: dict[str, Any]) -> str:
         "blocked_domains": _norm(settings.get("blocked_domains")),
         "allowlist_entries": _norm(settings.get("allowlist_entries")),
         "source_filter": _norm(settings.get("source_filter")),
+        "enabled_findings_engines": _norm(settings.get("enabled_findings_engines")),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")

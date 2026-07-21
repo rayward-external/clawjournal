@@ -110,7 +110,7 @@ def test_trufflehog_block_writes_manifest_only(tmp_path, monkeypatch):
     )
 
     assert summary.blocked is True
-    assert summary.block_reason == "trufflehog-findings"
+    assert summary.block_reason == "secret-scan-findings"
 
     bundle = json.loads(summary.bundle_path.read_text(encoding="utf-8"))
     assert "events" not in bundle, (
@@ -119,7 +119,7 @@ def test_trufflehog_block_writes_manifest_only(tmp_path, monkeypatch):
     assert "event_overrides" not in bundle
     assert "source_snippets" not in bundle
     assert bundle["manifest"]["blocked"] is True
-    assert bundle["manifest"]["block_reason"] == "trufflehog-findings"
+    assert bundle["manifest"]["block_reason"] == "secret-scan-findings"
 
 
 def test_atomic_write_no_partial_file(tmp_path, monkeypatch):

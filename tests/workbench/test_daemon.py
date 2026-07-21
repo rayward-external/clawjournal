@@ -2784,6 +2784,7 @@ def test_redaction_settings_fingerprint_covers_all_inputs():
         "excluded_projects": ["/p"],
         "blocked_domains": ["x.com"],
         "allowlist_entries": [{"value": "v"}],
+        "enabled_findings_engines": ["betterleaks", "regex_pii", "regex_secrets"],
     }
     base_fp = _redaction_settings_fingerprint(base)
 
@@ -2793,6 +2794,7 @@ def test_redaction_settings_fingerprint_covers_all_inputs():
         ("excluded_projects", ["/p", "/q"]),
         ("blocked_domains", ["x.com", "y.com"]),
         ("allowlist_entries", [{"value": "v2"}]),
+        ("enabled_findings_engines", ["regex_pii", "regex_secrets"]),
     ]:
         assert _redaction_settings_fingerprint({**base, key: changed}) != base_fp, \
             f"changing {key} must invalidate the fingerprint"

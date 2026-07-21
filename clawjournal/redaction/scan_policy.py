@@ -263,6 +263,43 @@ def write_report(path: Path, report: GateReport) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
+def preview_gate(bl_report, th_report) -> tuple[bool, str | None]:
+    """Block/pass decision for derived-text previews (events digests,
+    rendered skills) that have no redact loop and no findings-table
+    decisions.
+
+    Warn-tier Betterleaks findings pass; anything redact-or-worse
+    blocks, as do scanner errors and missing binaries on a
+    non-bypassed engine. TruffleHog previews scan all result classes,
+    and any TruffleHog finding blocks (verification cannot be relied
+    on for a preview). A bypassed engine contributes nothing —
+    bypass env vars are the dev/CI escape hatch, same as before.
+    """
+    for name, report in (("betterleaks", bl_report), ("trufflehog", th_report)):
+        if report is None or getattr(report, "bypassed", False):
+            continue
+        if getattr(report, "binary_missing", False):
+            return True, "scanner-not-installed"
+        if getattr(report, "scan_error", None):
+            return True, "scanner-error"
+        findings = getattr(report, "findings", None) or []
+        if name == "trufflehog":
+            if findings:
+                return True, "secret-scan-findings"
+            continue
+        for finding in findings:
+            tier, _reason = classify(
+                engine="betterleaks",
+                rule=finding.rule_id,
+                status="none",
+                entropy=finding.entropy,
+                decision_status=None,
+            )
+            if tier != "warn":
+                return True, "secret-scan-findings"
+    return False, None
+
+
 def format_block_message(report: GateReport) -> str:
     if report.bypassed:
         return (

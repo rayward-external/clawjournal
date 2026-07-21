@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..redaction import pii, secrets, trufflehog
+from ..redaction import betterleaks, pii, scan_policy, secrets, trufflehog
 from .schema import SkillRule, find_external_tokens
 
 SKILL_NAME = "clawjournal-lessons"
@@ -93,6 +93,31 @@ def gate_rendered(text: str, *, run_trufflehog: bool = True) -> list[str]:
                     issues[-1] = f"trufflehog: {reason}"
     except Exception as exc:  # pragma: no cover
         issues.append(f"trufflehog: scan failed ({exc.__class__.__name__})")
+    try:
+        if run_trufflehog and not betterleaks.is_bypassed():
+            bl_report = betterleaks.scan_text(text)
+            if bl_report.binary_missing:
+                issues.append("betterleaks: not installed")
+            elif bl_report.scan_error:
+                issues.append(f"betterleaks: {bl_report.scan_error}")
+            else:
+                # Tier-aware: warn-tier hits (soft rules, low entropy)
+                # pass; a rendered skill has no redact loop, so
+                # anything redact-or-worse blocks the write.
+                significant = [
+                    f for f in bl_report.findings
+                    if scan_policy.classify(
+                        engine=betterleaks.BETTERLEAKS_ENGINE_ID,
+                        rule=f.rule_id,
+                        status="none",
+                        entropy=f.entropy,
+                        decision_status=None,
+                    )[0] != "warn"
+                ]
+                if significant:
+                    issues.append(f"betterleaks: {len(significant)} finding(s)")
+    except Exception as exc:  # pragma: no cover
+        issues.append(f"betterleaks: scan failed ({exc.__class__.__name__})")
     return issues
 
 

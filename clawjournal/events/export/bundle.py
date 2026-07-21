@@ -41,6 +41,8 @@ from typing import Any, Callable
 from clawjournal.events.capabilities import capabilities_json
 from clawjournal.events.view import fetch_vendor_line
 from clawjournal.redaction.anonymizer import Anonymizer
+from clawjournal.redaction import betterleaks as bl
+from clawjournal.redaction import scan_policy
 from clawjournal.redaction import trufflehog as th
 
 BUNDLE_SCHEMA_VERSION = "1.0"
@@ -1392,8 +1394,9 @@ def export_session_bundle(
 
     th_report = th.scan_text(digest_text)
     th_summary = th_report.summary()
-    blocked = th_report.blocking
-    block_reason = th_report.block_reason
+    bl_report = bl.scan_text(digest_text)
+    bl_summary = bl_report.summary()
+    blocked, block_reason = scan_policy.preview_gate(bl_report, th_report)
 
     target = _resolve_output_path(output_path, session_key)
 
@@ -1408,6 +1411,7 @@ def export_session_bundle(
                 "blocked": True,
                 "block_reason": block_reason,
                 "trufflehog": th_summary,
+                "betterleaks": bl_summary,
                 "redaction_summary": redaction_summary,
             },
         }
@@ -1434,6 +1438,7 @@ def export_session_bundle(
     bundle["manifest"] = {
         "sha256": sha,
         "trufflehog": th_summary,
+        "betterleaks": bl_summary,
         "redaction_summary": redaction_summary,
     }
     text = _serialize_bundle(bundle, pretty=pretty)

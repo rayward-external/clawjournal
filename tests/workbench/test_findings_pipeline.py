@@ -212,6 +212,87 @@ class TestRunFindingsPipeline:
         }
         assert engines == {"regex_secrets", "regex_pii"}
 
+    def test_betterleaks_engine_rows_are_persisted(self, conn, monkeypatch):
+        # The default engine set includes betterleaks; its subprocess is
+        # stubbed at the raw-match layer, and its findings land with the
+        # right engine id.
+        from clawjournal.redaction import betterleaks
+
+        raw = "xoxb-FAKE0FAKE0FAKE-FIXTURE0TOKEN-AbCdEfGhIjKlMnOp"
+        monkeypatch.setattr(
+            betterleaks,
+            "_scan_text_for_raw_matches",
+            lambda text: [
+                {"raw": raw, "rule_id": "slack-bot-token", "entropy": 4.7, "line": 1}
+            ],
+        )
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        blob = {
+            "session_id": "bl-engine",
+            "project": "demo",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": old,
+            "end_time": old,
+            "git_branch": "main",
+            "display_title": "bl",
+            "messages": [
+                {"role": "user", "content": f"leak {raw}",
+                 "thinking": "", "tool_uses": []},
+            ],
+            "stats": {"user_messages": 1, "assistant_messages": 0,
+                      "tool_uses": 0, "input_tokens": 1, "output_tokens": 0},
+        }
+        upsert_sessions(conn, [blob])
+        conn.commit()
+        result = run_findings_pipeline(conn, blob["session_id"], blob)
+        assert result["status"] == "rebuilt"
+        rows = conn.execute(
+            "SELECT engine, rule FROM findings WHERE session_id = ? AND engine = ?",
+            (blob["session_id"], "betterleaks"),
+        ).fetchall()
+        assert rows and rows[0]["rule"] == "slack-bot-token"
+
+    def test_betterleaks_engine_failure_is_soft(self, conn, monkeypatch):
+        # A crashing scanner subprocess must not abort the rebuild —
+        # the regex engines' rows still land.
+        from clawjournal.workbench import findings_pipeline as fp
+
+        def boom(session_blob, **kwargs):
+            raise RuntimeError("subprocess exploded")
+
+        monkeypatch.setattr(fp, "scan_session_for_betterleaks_findings", boom)
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        blob = {
+            "session_id": "bl-soft",
+            "project": "demo",
+            "source": "claude",
+            "model": "claude-sonnet-4",
+            "start_time": old,
+            "end_time": old,
+            "git_branch": "main",
+            "display_title": "soft",
+            "messages": [
+                {"role": "user",
+                 "content": "deploy ghp_abcdefghijklmnopqrstuvwxyzABCDEF0123",
+                 "thinking": "", "tool_uses": []},
+            ],
+            "stats": {"user_messages": 1, "assistant_messages": 0,
+                      "tool_uses": 0, "input_tokens": 1, "output_tokens": 0},
+        }
+        upsert_sessions(conn, [blob])
+        conn.commit()
+        result = run_findings_pipeline(conn, blob["session_id"], blob)
+        assert result["status"] == "rebuilt"
+        engines = {
+            r["engine"]
+            for r in conn.execute(
+                "SELECT engine FROM findings WHERE session_id = ?",
+                (blob["session_id"],),
+            ).fetchall()
+        }
+        assert "regex_secrets" in engines
+
     def test_missing_session_row_is_skipped(self, conn):
         # Scanner iterates over parsed sessions but upsert_sessions may
         # filter some out (e.g. slash-command-only titles). The pipeline

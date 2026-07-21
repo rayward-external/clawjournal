@@ -57,6 +57,10 @@ _AUTO_UPLOAD_PROFILE_CONFIG_KEYS = (
     "redact_usernames",
     "allowlist_entries",
     "ai_pii_review_enabled",
+    # The findings-engine set shapes what leaves the machine (which
+    # scanners feed redaction), so changing it pauses enrollment like
+    # any other redaction-profile change.
+    "enabled_findings_engines",
 )
 
 
@@ -123,6 +127,9 @@ class ClawJournalConfig(TypedDict, total=False):
     pending_verification_email: str | None
     pending_verification_expires_at: str | int | None
     ai_pii_review_enabled: bool
+    # Deterministic findings engines (see findings.get_enabled_engines);
+    # default lives there: ("betterleaks", "regex_pii", "regex_secrets").
+    enabled_findings_engines: list[str]
     scorer_backend: str | None
     scorer_backend_confirmed_at: str | None
     benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
@@ -154,6 +161,7 @@ def load_config() -> ClawJournalConfig:
             config = cast(ClawJournalConfig, {**DEFAULT_CONFIG, **stored})
             changed = _migrate_excluded_projects(config)
             changed |= _migrate_remove_device_credentials(config)
+            changed |= _migrate_findings_engines(config)
             if changed:
                 save_config(config)
             return config
@@ -218,6 +226,27 @@ def _migrate_remove_device_credentials(config: ClawJournalConfig) -> bool:
             del config[key]  # type: ignore[misc]
             changed = True
     return changed
+
+
+def _migrate_findings_engines(config: ClawJournalConfig) -> bool:
+    """Add ``betterleaks`` to an explicit ``enabled_findings_engines`` list.
+
+    Users who never set the key ride the default (which now includes
+    betterleaks — see ``findings.get_enabled_engines``); users who
+    pinned an explicit list keep their choices (including a trufflehog
+    opt-in) but gain the new primary engine, since running the share
+    gate's scanner as a findings engine is what keeps the review UI
+    consistent with what the gate will do.
+    """
+    engines = config.get("enabled_findings_engines")
+    if not isinstance(engines, list):
+        return False
+    if any(not isinstance(name, str) for name in engines):
+        return False
+    if "betterleaks" in engines:
+        return False
+    engines.append("betterleaks")
+    return True
 
 
 def save_config(config: ClawJournalConfig) -> bool:
