@@ -10,7 +10,15 @@ Use one of these prompts in Claude Code, Codex, Cursor, or another coding assist
 > **Ordinary workflow — browser workbench**
 >
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions using the browser workbench. If needed, configure source `all`, confirm projects, and scan first. Open the local workbench with `clawjournal serve`, guide me through Share -> Queue -> Redact -> Review -> Package -> Submit, and stop for my consent before upload. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+>
+> Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and open the local browser workbench with `clawjournal serve`.
+>
+> Guide me through Share → Queue → Redact → Review → Package → Submit. Keep trace review in the local workbench rather than copying raw trace contents or secret values into this chat. Preserve all findings, hold, embargo, redaction, and mandatory TruffleHog safeguards. Do not bypass a safety gate. Do not enable optional AI assisted PII review or Automatic uploads unless I specifically choose them.
+>
+> Before submission, summarize the number of selected sessions, included sources and projects, redaction results, AI review status, TruffleHog result, and upload destination. Pause once so I can confirm that the final package and scope are correct, then submit it.
+>
+> Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP locally and tell me where it is so I can upload it at https://data.rayward.ai/share.
 > ```
 
 > [!IMPORTANT]
