@@ -533,14 +533,23 @@ export function Share() {
     if (ids.length === 0) return;
     cancelAiRetries();
     setQueueOrder((prev) => {
-      const merged = new Set(prev);
-      ids.forEach((id) => merged.add(id));
-      // Preserve the default ordering for any default sessions, then append the
-      // rest (already-added extras and newly-added non-default ids) in place.
       const defaults = readyStats ? queueFromStats(readyStats) : [];
-      const ordered = defaults.filter((id) => merged.has(id));
-      const remaining = [...merged].filter((id) => !defaults.includes(id));
-      return [...ordered, ...remaining];
+      const defaultIds = new Set(defaults);
+      const selectedIds = new Set(prev);
+      const newIds = ids.filter((id) => !selectedIds.has(id));
+      if (newIds.length === 0) return prev;
+
+      // Keep the compact default order only while the user has not manually
+      // reordered the queue. Once the order is custom, batch additions must
+      // behave like single additions and leave the existing sequence intact.
+      const defaultOrderedSubset = defaults.filter((id) => selectedIds.has(id));
+      const followsDefaultOrder = defaultOrderedSubset.length === prev.length
+        && defaultOrderedSubset.every((id, index) => id === prev[index]);
+      if (followsDefaultOrder && newIds.every((id) => defaultIds.has(id))) {
+        newIds.forEach((id) => selectedIds.add(id));
+        return defaults.filter((id) => selectedIds.has(id));
+      }
+      return [...prev, ...newIds];
     });
   };
 
