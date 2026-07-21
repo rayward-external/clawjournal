@@ -46,6 +46,50 @@ def test_recurring_offer_uses_current_protocol_version():
     }) is False
 
 
+def test_successful_v2_manual_share_caches_offer_available(server, monkeypatch):
+    """End-to-end wiring: a successful manual share against a v2 hosted service
+    must cache auto_upload_capability_available=True so the Workbench enable
+    offer appears. Guards against a regression to the pre-v2 hardcoded
+    ``recurring_upload_api_version == 1`` check in the share-success handler."""
+    from clawjournal.workbench import daemon as daemon_module
+
+    # A capability document shaped like the live v2 /.well-known response.
+    live_v2_capabilities = {
+        "recurring_upload_api_version": 2,
+        "recurring_enrollment_open": True,
+        "supported_recurring_client_versions": ["2"],
+        "maximum_bundle_size": 52428800,
+    }
+    monkeypatch.setattr(
+        daemon_module, "submit_share_to_hosted",
+        lambda *_a, **_k: {"ok": True, "receipt_id": "cj_receipt_1"},
+    )
+    monkeypatch.setattr(
+        daemon_module, "_fetch_hosted_share_capabilities",
+        lambda *_a, **_k: dict(live_v2_capabilities),
+    )
+    saved: list[dict] = []
+    monkeypatch.setattr(daemon_module, "load_config", lambda: {})
+    monkeypatch.setattr(
+        daemon_module, "save_config", lambda config: saved.append(dict(config)) or True
+    )
+    # Clear the shared cooldown so this submission is not rate-limited by an
+    # earlier test.
+    WorkbenchHandler._last_share_time = 0.0
+
+    status, body = _post(server, "/api/shares/share-xyz/upload", {
+        "accept_terms": True,
+        "ownership_certification": True,
+        "consent_version": "consent-v1",
+        "retention_policy_version": "retention-v1",
+    })
+
+    assert status == 200
+    assert body.get("ok") is True
+    assert saved, "the share-success handler must persist the offer cache"
+    assert saved[-1]["auto_upload_capability_available"] is True
+
+
 @pytest.fixture
 def index_setup(tmp_path, monkeypatch):
     """Set up an index DB in a temp directory and seed it."""
