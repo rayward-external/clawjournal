@@ -94,6 +94,17 @@ def _print_human(result: dict[str, Any]) -> None:
             ))
         if result.get("next_retry_at"):
             print(_sanitize_terminal_line(f"Next retry: {result['next_retry_at']}"))
+        stale_hooks = [
+            str(row.get("agent"))
+            for row in result.get("hooks") or []
+            if isinstance(row, dict) and row.get("legacy_hook_installed")
+        ]
+        if stale_hooks:
+            print(_sanitize_terminal_line(
+                f"Legacy pre-release hook installed for: {', '.join(stale_hooks)}; "
+                "run 'clawjournal auto-upload enable' to migrate it "
+                "(or 'disable' to remove it)"
+            ))
         eligibility = result.get("eligibility") or {}
         print(_sanitize_terminal_line(
             "Eligible: "

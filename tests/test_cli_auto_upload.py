@@ -75,6 +75,7 @@ def test_human_output_sanitizes_all_dynamic_single_line_fields(capsys):
         "scope": {"sources": [attack], "projects": [attack]},
         "next_due_at": attack,
         "next_retry_at": attack,
+        "hooks": [{"agent": attack, "legacy_hook_installed": True}],
         "eligibility": {"eligible_count": 1, "selected_count": 1},
     })
     cli._print_human({
@@ -88,6 +89,25 @@ def test_human_output_sanitizes_all_dynamic_single_line_fields(capsys):
     assert "\x1b" not in captured.out + captured.err
     assert "\x07" not in captured.out + captured.err
     assert "Receipt: value[2J forged" in captured.out
+
+
+def test_human_status_surfaces_legacy_hook_migration_hint(capsys):
+    import clawjournal.cli_auto_upload as cli
+
+    cli._print_human({
+        "ok": True,
+        "mode": "enabled",
+        "health": "ready",
+        "hooks": [
+            {"agent": "claude", "legacy_hook_installed": False},
+            {"agent": "codex", "legacy_hook_installed": True},
+        ],
+        "eligibility": {},
+    })
+
+    out = capsys.readouterr().out
+    assert "Legacy pre-release hook installed for: codex" in out
+    assert "'clawjournal auto-upload enable'" in out
 
 
 def test_interactive_challenge_sanitizes_versions_scope_and_backend(

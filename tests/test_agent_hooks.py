@@ -179,6 +179,63 @@ def test_install_migrates_legacy_profile_hook_and_preserves_foreign_hooks(
     assert foreign in handlers
 
 
+def test_diagnostics_reports_legacy_handler_without_blocking_configured(
+    isolated_home, monkeypatch
+):
+    """A stale legacy handler next to a healthy current hook is a migration
+    chore, not a broken configuration: an unconfigured selected hook blocks
+    scheduled cycles, and nothing reruns install until the next enable."""
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": "old-python -m clawjournal.cli auto-upload hook --client codex",
+        "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [legacy]},
+                        {"hooks": [hooks._handler_for("codex")]},
+                    ]
+                }
+            }
+        )
+    )
+
+    before = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert before["installed"] is True
+    assert before["configured"] is True
+    assert before["legacy_hook_installed"] is True
+
+    hooks.install_agent_hook("codex", home=isolated_home)
+
+    after = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert after["configured"] is True
+    assert after["legacy_hook_installed"] is False
+    document = _read(codex_path)
+    assert _handlers(document, "SessionStart") == [hooks._handler_for("codex")]
+
+
+def test_diagnostics_marks_legacy_only_install_as_unconfigured(isolated_home):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": "old-python -m clawjournal.cli auto-upload hook --client codex",
+        "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    codex_path.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [legacy]}]}}))
+
+    diagnostics = hooks.hook_diagnostics("codex", home=isolated_home)
+    assert diagnostics["installed"] is True
+    assert diagnostics["configured"] is False
+    assert diagnostics["legacy_hook_installed"] is True
+
+
 def test_uninstall_removes_only_auto_upload_hook_and_is_idempotent(isolated_home):
     path = isolated_home / ".codex" / "hooks.json"
     hooks.install_agent_hook("codex", home=isolated_home)

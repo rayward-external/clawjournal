@@ -161,13 +161,23 @@ def _handler_for(client: AgentName) -> dict[str, Any]:
     return handler
 
 
-def _handler_is_ours(handler: Any) -> bool:
+def _handler_is_current(handler: Any) -> bool:
     if not isinstance(handler, dict) or handler.get("type") != "command":
         return False
-    if handler.get("clawjournalProfile") == LEGACY_HOOK_PROFILE:
-        return True
     command = str(handler.get("command", ""))
     return f"-m {HOOK_MODULE}" in command and " run " in f" {command} "
+
+
+def _handler_is_legacy(handler: Any) -> bool:
+    return (
+        isinstance(handler, dict)
+        and handler.get("type") == "command"
+        and handler.get("clawjournalProfile") == LEGACY_HOOK_PROFILE
+    )
+
+
+def _handler_is_ours(handler: Any) -> bool:
+    return _handler_is_current(handler) or _handler_is_legacy(handler)
 
 
 def _upsert_session_start_hook(document: dict[str, Any], client: AgentName) -> bool:
@@ -358,7 +368,14 @@ def hook_diagnostics(
                     handler for handler in group["hooks"] if _handler_is_ours(handler)
                 )
     desired = _handler_for(agent)
-    configured = len(installed_handlers) == 1 and installed_handlers[0] == desired
+    current_handlers = [
+        handler for handler in installed_handlers if _handler_is_current(handler)
+    ]
+    # A leftover legacy handler is migrated only by the next install or
+    # uninstall; until then it must not flip `configured`, because the runner
+    # blocks scheduled cycles on any selected hook that is not configured.
+    configured = len(current_handlers) == 1 and current_handlers[0] == desired
+    legacy_installed = len(current_handlers) != len(installed_handlers)
     observed = (
         last_observed_at.isoformat()
         if isinstance(last_observed_at, datetime)
@@ -369,6 +386,7 @@ def hook_diagnostics(
         "path": str(path),
         "configured": configured,
         "installed": bool(installed_handlers),
+        "legacy_hook_installed": legacy_installed,
         "last_observed_at": observed,
     }
     if agent == "codex" and configured and not observed:
