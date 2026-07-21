@@ -521,6 +521,45 @@ export function Share() {
     });
   };
 
+  // Batch selection helpers. With 1000s of eligible sessions, unchecking traces
+  // one at a time is impractical, so the queue exposes select-all / deselect-all
+  // controls (scoped to whatever filters are active in the picker).
+  const clearQueue = () => {
+    cancelAiRetries();
+    setQueueOrder([]);
+  };
+
+  const addManyToQueue = (ids: string[]) => {
+    if (ids.length === 0) return;
+    cancelAiRetries();
+    setQueueOrder((prev) => {
+      const defaults = readyStats ? queueFromStats(readyStats) : [];
+      const defaultIds = new Set(defaults);
+      const selectedIds = new Set(prev);
+      const newIds = ids.filter((id) => !selectedIds.has(id));
+      if (newIds.length === 0) return prev;
+
+      // Keep the compact default order only while the user has not manually
+      // reordered the queue. Once the order is custom, batch additions must
+      // behave like single additions and leave the existing sequence intact.
+      const defaultOrderedSubset = defaults.filter((id) => selectedIds.has(id));
+      const followsDefaultOrder = defaultOrderedSubset.length === prev.length
+        && defaultOrderedSubset.every((id, index) => id === prev[index]);
+      if (followsDefaultOrder && newIds.every((id) => defaultIds.has(id))) {
+        newIds.forEach((id) => selectedIds.add(id));
+        return defaults.filter((id) => selectedIds.has(id));
+      }
+      return [...prev, ...newIds];
+    });
+  };
+
+  const removeManyFromQueue = (ids: string[]) => {
+    if (ids.length === 0) return;
+    cancelAiRetries();
+    const drop = new Set(ids);
+    setQueueOrder((prev) => prev.filter((id) => !drop.has(id)));
+  };
+
   const updateAiPiiEnabled = (enabled: boolean) => {
     cancelRedaction();
     cancelAiRetries();
@@ -1184,6 +1223,9 @@ export function Share() {
         setAiPiiEnabled={updateAiPiiEnabled}
         onRemove={removeFromQueue}
         onAdd={addToQueue}
+        onClearAll={clearQueue}
+        onAddMany={addManyToQueue}
+        onRemoveMany={removeManyFromQueue}
         onReorder={reorderQueue}
         onHelp={() => setShowHelp(true)}
         onContinue={handleStartRedaction}
