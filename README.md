@@ -25,7 +25,15 @@ Use one of these prompts in Claude Code, Codex, Cursor, or another coding assist
 > **CLI-only workflow — remote terminal or SSH**
 >
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+>
+> Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and run `clawjournal share --interactive --weekly`.
+>
+> Guide me through selecting sessions, reviewing the redacted preview, packaging, and submitting. Do not repeat raw trace contents or secret values in your conversational responses; keep detailed review in the interactive terminal flow. Preserve all findings, hold, embargo, redaction, and mandatory TruffleHog safeguards. Do not bypass a safety gate. Do not enable optional AI assisted PII review or Automatic uploads unless I specifically choose them.
+>
+> Before submission, summarize the number of selected sessions, included sources and projects, redaction results, AI review status, TruffleHog result, and upload destination. Pause once so I can confirm that the final package and scope are correct, then submit it.
+>
+> Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP locally and tell me where it is so I can upload it at https://data.rayward.ai/share.
 > ```
 
 ## Install or update (no coding required)
@@ -302,7 +310,17 @@ clawjournal auto-upload disable   # removes upload authority; prior uploads are 
 
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
-> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.*
+> ```text
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+>
+> Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and run `clawjournal share --interactive --weekly`.
+>
+> Guide me through selecting sessions, reviewing the redacted preview, packaging, and submitting. Do not repeat raw trace contents or secret values in your conversational responses; keep detailed review in the interactive terminal flow. Preserve all findings, hold, embargo, redaction, and mandatory TruffleHog safeguards. Do not bypass a safety gate. Do not enable optional AI assisted PII review or Automatic uploads unless I specifically choose them.
+>
+> Before submission, summarize the number of selected sessions, included sources and projects, redaction results, AI review status, TruffleHog result, and upload destination. Pause once so I can confirm that the final package and scope are correct, then submit it.
+>
+> Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP locally and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> ```
 
 > ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** It only uploads to a **self-hosted** ingest server you configure via `CLAWJOURNAL_INGEST_URL`; without it, it reports *"Hosted sharing is not configured."* Rayward / STEM Data Program participants should ignore it and use the workbench above.
 
