@@ -4436,6 +4436,138 @@ def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
         conn.close()
 
 
+def test_mapped_finding_retry_ships_survivors_with_narrowed_scope(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    # The headline tiered path end-to-end: attempt 1 maps a blocking
+    # finding to session-one only, the retry packages just session-two,
+    # and the cycle seals and submits the survivor — with revisions,
+    # fingerprints, and the sealed ledger all narrowed to the surviving
+    # trace. Catches any future edit that forgets to reassign one of
+    # the narrowed bindings before the retry.
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"], "session-one")
+    _seed_released_session(conn, isolated_auto_upload["root"], "session-two")
+    _save_enabled_enrollment(
+        conn,
+        config,
+        enrolled_at="2026-07-10T00:00:00+00:00",
+    )
+    survivor_revision = str(
+        conn.execute(
+            "SELECT content_revision FROM sessions WHERE session_id = ?",
+            ("session-two",),
+        ).fetchone()["content_revision"]
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    package_calls: list[list[str]] = []
+
+    def package_with_one_bad_trace(conn, session_ids, _settings, **kwargs):
+        package_calls.append(sorted(session_ids))
+        share_id = create_share(
+            conn,
+            session_ids,
+            expected_revisions=kwargs["expected_revisions"],
+        )
+        if len(package_calls) == 1:
+            return {
+                "ok": False,
+                "share_id": share_id,
+                "error": "A blocking finding mapped to one trace.",
+                "block_reason": "secret-scan-findings",
+                "blocked_sessions": [{"session_id": "session-one"}],
+            }
+        # The sealed-zip writer only accepts paths inside the guarded
+        # share area (CONFIG_DIR/shares), like the real export.
+        export_dir = (
+            isolated_auto_upload["install"] / "shares" / share_id / "export"
+        )
+        export_dir.mkdir(parents=True)
+        (export_dir / "sessions.jsonl").write_text(
+            json.dumps({"session_id": "session-two"}) + "\n"
+        )
+        (export_dir / "manifest.json").write_text(
+            json.dumps({"session_count": len(session_ids)})
+        )
+        # build_zip requires the scan artifacts a finalized export ships.
+        for artifact in (
+            "trufflehog.json",
+            "trufflehog.post-pii.json",
+            "secret-scan.json",
+            "secret-scan.post-pii.json",
+        ):
+            (export_dir / artifact).write_text("{}")
+        return {
+            "ok": True,
+            "share_id": share_id,
+            "export_dir": str(export_dir),
+            "manifest": {"session_count": len(session_ids)},
+            "blocked_sessions": [],
+        }
+
+    monkeypatch.setattr(auto, "package", package_with_one_bad_trace)
+    submissions: list[dict[str, Any]] = []
+
+    def submit(_capabilities, **kwargs):
+        submissions.append(dict(kwargs))
+        return {
+            "receipt_id": "receipt-retry-survivor",
+            "accepted_at": "2026-07-15T14:00:00+00:00",
+            "status": "accepted",
+        }
+
+    monkeypatch.setattr(auto, "submit_artifact", submit)
+
+    result = auto.run_cycle(force=True)
+
+    assert result["ok"] is True
+    assert result["code"] == "uploaded"
+    assert result["count"] == 1
+    # Exactly two packaging attempts: full batch, then the survivor.
+    assert package_calls == [["session-one", "session-two"], ["session-two"]]
+    assert len(submissions) == 1
+    submitted = submissions[0]
+    # The submission carries the narrowed scope, not attempt 1's.
+    assert submitted["trace_revision_keys"] == [
+        auto.trace_revision_key("session-two", survivor_revision)
+    ]
+    conn = open_index()
+    try:
+        holds = {
+            row["session_id"]: row["hold_state"]
+            for row in conn.execute(
+                "SELECT session_id, hold_state FROM sessions"
+            ).fetchall()
+        }
+        assert holds["session-one"] == "pending_review"
+        assert holds["session-two"] == "released"
+        share = conn.execute(
+            "SELECT status, sealed_raw_fingerprints, sealed_artifact_sha256 "
+            "FROM shares WHERE status = 'shared'"
+        ).fetchone()
+        assert share is not None
+        # The sealed ledger references only the survivor's raw bytes.
+        assert list(json.loads(share["sealed_raw_fingerprints"])) == ["session-two"]
+        assert share["sealed_artifact_sha256"] == result["artifact_sha256"]
+        shared_rows = conn.execute(
+            "SELECT session_id FROM share_sessions "
+            "JOIN shares USING (share_id) WHERE shares.status = 'shared'"
+        ).fetchall()
+        assert [row["session_id"] for row in shared_rows] == ["session-two"]
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["last_result_code"] == "uploaded"
+        assert enrollment["last_result_count"] == 1
+        assert enrollment["last_receipt_reference"] == "receipt-retry-survivor"
+    finally:
+        conn.close()
+
+
 def test_scanner_unavailable_is_retryable_without_hold_changes(
     isolated_auto_upload,
     monkeypatch,
