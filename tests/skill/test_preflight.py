@@ -56,3 +56,15 @@ def test_blocks_when_trufflehog_missing(monkeypatch):
     monkeypatch.setattr(pf.trufflehog, "is_bypassed", lambda: False)
     monkeypatch.setattr(pf.trufflehog, "is_available", lambda: False)
     assert any("TruffleHog" in p for p in pf.preflight())
+
+
+def test_blocks_when_betterleaks_missing(monkeypatch):
+    monkeypatch.delenv("CLAWJOURNAL_SKIP_BETTERLEAKS", raising=False)
+    monkeypatch.setenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", "1")
+    monkeypatch.setattr(pf, "load_config", lambda: {"source": "all", "projects_confirmed": True})
+    monkeypatch.setattr(pf, "installed_backends", lambda: ["codex"])
+    monkeypatch.setattr(pf.betterleaks, "is_bypassed", lambda: False)
+    monkeypatch.setattr(pf.betterleaks, "is_available", lambda: False)
+    problems = pf.preflight()
+    assert any("Betterleaks" in p for p in problems)
+    assert any("clawjournal betterleaks install" in p for p in problems)
