@@ -1478,8 +1478,13 @@ def enable(
             if remote_state.get("ownership_certification_version") != str(
                 expected_ownership
             ):
+                # Distinct code: the failure handler must REVOKE the hosted
+                # enrollment for this case — on the update path too, where the
+                # PATCH has already been applied and the server-side consent
+                # record now misrepresents the user. Merely pausing would
+                # leave that record live.
                 raise AutoUploadError(
-                    "authorization_version_mismatch",
+                    "certification_not_accepted",
                     "The hosted ownership certification changed while enrolling; "
                     "review the updated terms and enable again.",
                 )
@@ -1671,7 +1676,19 @@ def enable(
             # recovery tombstone and records revocation_pending.
             response_local = response
             record_local = credential_record
-            if updating:
+            # A PATCH recorded under a certification the user never accepted
+            # must not survive as a paused-but-live hosted enrollment: the
+            # server-side consent record misrepresents the user and the client
+            # cannot un-PATCH, so the update path routes into the same revoke
+            # machinery the create path uses. Every other updating failure
+            # keeps the legitimate prior enrollment and merely pauses.
+            revoke_unaccepted_certification = (
+                isinstance(exc, AutoUploadError)
+                and exc.code == "certification_not_accepted"
+                and isinstance(response_local, dict)
+                and bool(response_local.get("enrollment_id"))
+            )
+            if updating and not revoke_unaccepted_certification:
                 update_auto_upload_enrollment(
                     conn,
                     expected_generation=generation,
@@ -1748,8 +1765,12 @@ def enable(
                                 "active_token": None,
                                 "active_token_expires_at": None,
                                 "recovery_token": recovery,
+                                # The update path's PATCH response carries no
+                                # token expiry; the credential record does.
                                 "recovery_token_expires_at": str(
-                                    response_local.get("recovery_token_expires_at") or "unknown"
+                                    (record_local or {}).get("recovery_token_expires_at")
+                                    or response_local.get("recovery_token_expires_at")
+                                    or "unknown"
                                 ),
                             }
                             with control_mutation_lock():

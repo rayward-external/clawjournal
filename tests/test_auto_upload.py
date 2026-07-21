@@ -2187,7 +2187,7 @@ def test_certification_rotation_during_enroll_aborts_and_revokes(
     )
 
     assert result["ok"] is False
-    assert result["code"] == "authorization_version_mismatch"
+    assert result["code"] == "certification_not_accepted"
     assert revoke_calls == ["server-enrollment-1"]
     conn = open_index()
     try:
@@ -2196,6 +2196,85 @@ def test_certification_rotation_during_enroll_aborts_and_revokes(
         # Nothing may be pinned under the unreviewed certification.
         assert enrollment.get("server_scope_hash") is None
         assert enrollment.get("ownership_certification_version") is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("revoke_succeeds", [True, False])
+def test_certification_rotation_during_patch_revokes_the_live_enrollment(
+    isolated_auto_upload,
+    monkeypatch,
+    revoke_succeeds,
+):
+    """On the UPDATE path the PATCH has already been applied when the read-back
+    detects a rotated certification: the hosted enrollment now carries a
+    consent record the user never made and cannot be un-PATCHed. It must be
+    revoked — not left paused-but-live. A failed revoke must leave the
+    recovery tombstone (revocation_pending) so Disable can finish the job."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(
+        auto,
+        "update_enrollment",
+        lambda *_a, **_k: {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": ENROLLED_AT,
+            "authorization_revision": 2,
+        },
+    )
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "scope_hash": SERVER_SCOPE_HASH,
+            "ownership_certification_version": "ownership-rotated.v2",
+        },
+    )
+    revoke_calls: list[str] = []
+
+    def revoke(_caps, *, enrollment_id, recovery_token):
+        revoke_calls.append(enrollment_id)
+        if not revoke_succeeds:
+            raise RecurringServiceError(
+                code="server_unavailable", message="down", retryable=True
+            )
+        return {}
+
+    monkeypatch.setattr(auto, "revoke_enrollment", revoke)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "certification_not_accepted"
+    assert revoke_calls == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        if revoke_succeeds:
+            assert enrollment["revocation_pending"] is False
+            assert enrollment["server_enrollment_id"] is None
+            assert load_credentials(required=False) is None
+        else:
+            assert enrollment["revocation_pending"] is True
+            credentials = load_credentials(required=False)
+            assert credentials is not None
+            assert credentials["recovery_token"] == _credentials()["recovery_token"]
+            assert credentials["active_token"] is None
     finally:
         conn.close()
 
