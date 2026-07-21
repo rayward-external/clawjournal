@@ -1401,6 +1401,17 @@ def export_session_bundle(
     target = _resolve_output_path(output_path, session_key)
 
     if blocked:
+        # An actionable message beside the terse reason: a missing
+        # scanner should tell the user the install command, not just
+        # "scanner-not-installed".
+        block_message = None
+        if block_reason == "scanner-not-installed":
+            hints = []
+            if bl_report.binary_missing:
+                hints.append(bl.INSTALL_HINT)
+            if th_report.binary_missing:
+                hints.append(th.INSTALL_HINT)
+            block_message = "\n".join(hints) or None
         manifest_only_bundle = {
             "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
             "recorder_schema_version": RECORDER_SCHEMA_VERSION,
@@ -1410,6 +1421,7 @@ def export_session_bundle(
                 "sha256": sha,
                 "blocked": True,
                 "block_reason": block_reason,
+                "block_message": block_message,
                 "trufflehog": th_summary,
                 "betterleaks": bl_summary,
                 "redaction_summary": redaction_summary,

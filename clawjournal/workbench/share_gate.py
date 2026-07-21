@@ -20,8 +20,13 @@ post-PII-rewrite). Each pass:
    (bounded by ``max_passes``; non-convergence escalates and blocks).
 
 Block/review findings accumulate across passes (their raws get
-redacted too — the export dir stays on disk for debugging and must not
-hold live secrets — so a later rescan can't re-observe them). The
+redacted too — a best-effort scrub of the on-disk export dir that also
+keeps a later rescan from re-observing them; a span whose replacement
+would break its line's JSON is rolled back, so a *blocked* export dir
+can still hold that plaintext). Redaction is scoped to each finding's
+own line: the same value can be redact-tier in one session and
+warn-tier (user-ignored) in another, and a redact decision must not
+strip it from the session where the user chose to keep it. The
 returned ``GateReport``'s ``blocking`` property is the policy outcome
 the callers act on.
 
@@ -97,6 +102,13 @@ class _DecisionCache:
             self._by_session[session_id] = decisions
         from ..findings import hash_entity  # noqa: PLC0415 — lazy to avoid cycle
 
+        # The gate hashes the *file-level escaped* raw. Scan-time
+        # scanner engines hash the ``json.dumps`` serialized form too
+        # (``_serialize_session_for_scan``), so decisions match under
+        # the default engine set. A regex-only findings config stores
+        # only decoded-form hashes; an escaped-form lookup then misses
+        # and the finding falls through to redact/review — fail-safe,
+        # never fail-open.
         return decisions.get(hash_entity(raw))
 
 
@@ -235,13 +247,22 @@ def _is_valid_json_line(line: str) -> bool:
 def _rewrite_sessions_file(
     sessions_file: Path,
     to_redact: list[PolicyFinding],
-) -> tuple[int, dict[int, int], set[str]]:
-    """Replace every occurrence of the given findings' raws in
-    ``sessions_file``. Returns ``(total_replacements,
-    replacements_by_line, failed_raws)``. Atomic: written to a
-    sibling tmp file and ``os.replace``d in.
+) -> tuple[int, dict[int, int], set[tuple[int, str]]]:
+    """Replace the given findings' raws in ``sessions_file``, scoped to
+    each finding's own line. Returns ``(total_replacements,
+    replacements_by_line, failed_pairs)`` where ``failed_pairs`` holds
+    ``(line, raw)`` for spans rolled back to keep a line's JSON valid.
+    Atomic: written to a sibling tmp file and ``os.replace``d in.
+
+    Scoping matters: the same raw can be redact-tier in one session and
+    warn-tier (user-ignored) in another, and per-session decisions must
+    not bleed across lines. Occurrences on other lines arrive as their
+    own findings (scanners report every match), and the rescan loop
+    catches anything the current pass's map missed. A finding without
+    line metadata errs toward redaction on every line.
     """
-    placeholder_by_raw: dict[str, str] = {}
+    by_line_map: dict[int, dict[str, str]] = {}
+    global_map: dict[str, str] = {}
     # Sort (rule, raw) ascending first so the placeholder choice for a
     # raw flagged by two rules is deterministic across runs.
     for f in sorted(to_redact, key=lambda f: (f.rule, f.raw or "")):
@@ -251,25 +272,37 @@ def _rewrite_sessions_file(
             placeholder = betterleaks.placeholder_for_rule(f.rule)
         else:
             placeholder = trufflehog.placeholder_for_detector(f.rule)
-        placeholder_by_raw.setdefault(f.raw, placeholder)
+        if isinstance(f.line, int):
+            by_line_map.setdefault(f.line, {}).setdefault(f.raw, placeholder)
+        else:
+            global_map.setdefault(f.raw, placeholder)
 
-    if not placeholder_by_raw:
+    if not by_line_map and not global_map:
         return 0, {}, set()
-
-    # Longest raw first so overlapping matches replace cleanly.
-    replacements = sorted(placeholder_by_raw.items(), key=lambda kv: -len(kv[0]))
 
     total = 0
     by_line: dict[int, int] = {}
-    failed_raws: set[str] = set()
+    failed_pairs: set[tuple[int, str]] = set()
     tmp_file = sessions_file.with_suffix(sessions_file.suffix + ".gate-tmp")
     try:
         with open(sessions_file, encoding="utf-8") as src, \
                 open(tmp_file, "w", encoding="utf-8") as dst:
             for line_no, line in enumerate(src, start=1):
+                merged = dict(global_map)
+                merged.update(by_line_map.get(line_no, {}))
                 stripped = line.rstrip("\n")
-                new_line, counts, failed = _rewrite_line(stripped, replacements)
-                failed_raws |= failed
+                if merged:
+                    # Longest raw first so overlaps replace cleanly.
+                    replacements = sorted(
+                        merged.items(), key=lambda kv: -len(kv[0])
+                    )
+                    new_line, counts, failed = _rewrite_line(
+                        stripped, replacements
+                    )
+                else:
+                    new_line, counts, failed = stripped, {}, set()
+                for raw in failed:
+                    failed_pairs.add((line_no, raw))
                 if counts:
                     line_total = sum(counts.values())
                     total += line_total
@@ -279,7 +312,54 @@ def _rewrite_sessions_file(
     except BaseException:
         tmp_file.unlink(missing_ok=True)
         raise
-    return total, by_line, failed_raws
+    return total, by_line, failed_pairs
+
+
+def _rawless_backstop_findings(bl_report, th_report) -> list[PolicyFinding]:
+    """Sticky findings for scanner hits that returned no usable raw.
+
+    ``scan_file_with_raws`` only surfaces raw matches with a non-empty
+    secret value, but both parsers still count the finding in their
+    report (``raw_sha256`` stays ``None``). Without a span there is
+    nothing to redact and no way to match a findings-table decision,
+    so fail closed: a verified credential blocks, everything else
+    requires review. Dropping these silently would let a verified live
+    credential ship whenever TruffleHog omits ``Raw``.
+    """
+    out: list[PolicyFinding] = []
+    for f in th_report.findings:
+        if f.raw_sha256 is None:
+            out.append(
+                PolicyFinding(
+                    engine=trufflehog.TRUFFLEHOG_ENGINE_ID,
+                    rule=f.detector,
+                    status=f.status,
+                    line=f.line,
+                    masked=f.masked,
+                    raw_sha256=None,
+                    entropy=None,
+                    tier="block" if f.status == "verified" else "review",
+                    tier_reason="finding_without_raw",
+                    raw=None,
+                )
+            )
+    for f in bl_report.findings:
+        if f.raw_sha256 is None:
+            out.append(
+                PolicyFinding(
+                    engine=betterleaks.BETTERLEAKS_ENGINE_ID,
+                    rule=f.rule_id,
+                    status="none",
+                    line=f.line,
+                    masked=f.masked,
+                    raw_sha256=None,
+                    entropy=f.entropy,
+                    tier="review",
+                    tier_reason="finding_without_raw",
+                    raw=None,
+                )
+            )
+    return out
 
 
 def run_share_gate(
@@ -363,11 +443,14 @@ def run_share_gate(
                 sticky.setdefault(_finding_key(f), f)
             elif f.tier == "warn":
                 warns.setdefault(_finding_key(f), f)
+        for f in _rawless_backstop_findings(bl_report, th_report):
+            sticky.setdefault(_finding_key(f), f)
 
         # Redact-tier raws are replaced so the share can proceed;
-        # block/review-tier raws are replaced too so the on-disk debug
-        # artifact doesn't retain live secrets (blocking is decided by
-        # `sticky`, not by what remains in the file). Warn-tier values
+        # block/review-tier raws are replaced too, a best-effort scrub
+        # of the on-disk debug artifact (blocking is decided by
+        # `sticky`, not by what remains in the file — an unredactable
+        # span stays in the blocked export dir). Warn-tier values
         # are deliberately left alone — an ignored/allowlisted value is
         # the user's standing decision to keep it.
         redactable = [
@@ -380,19 +463,26 @@ def run_share_gate(
             converged = True
             break
 
-        replaced, by_line, failed_raws = _rewrite_sessions_file(
+        replaced, by_line, failed_pairs = _rewrite_sessions_file(
             sessions_file, redactable
         )
         total_redactions += replaced
         for line_no, count in by_line.items():
             redactions_by_line[line_no] = redactions_by_line.get(line_no, 0) + count
+        failed_raws = {raw for _line, raw in failed_pairs}
         for f in redactable:
-            if f.raw in failed_raws and f.tier not in ("block", "review"):
+            failed_here = (
+                (f.line, f.raw) in failed_pairs
+                # A line-less finding was applied globally; a failure
+                # on any line is its failure.
+                or (f.line is None and f.raw in failed_raws)
+            )
+            if failed_here and f.tier not in ("block", "review"):
                 escalated = dataclasses.replace(
                     f, tier="review", tier_reason="unredactable_span"
                 )
                 sticky.setdefault(_finding_key(escalated), escalated)
-            elif f.tier == "redact" and f.raw not in failed_raws:
+            elif f.tier == "redact" and not failed_here:
                 redacted_keys.add(_finding_key(f))
 
     if not converged:

@@ -169,3 +169,104 @@ class TestFormatBlockMessage:
             converged=False,
         )
         assert "did not converge" in scan_policy.format_block_message(report)
+
+
+class TestPreviewGate:
+    """Composition semantics of the derived-text preview gate.
+
+    Previews (event digests, rendered skills) have no redact loop and
+    no findings-table decisions: warn passes, anything redact-or-worse
+    blocks, any TruffleHog finding blocks, a bypassed engine
+    contributes nothing.
+    """
+
+    @staticmethod
+    def _bl_report(findings=(), **kw):
+        from clawjournal.redaction.betterleaks import BetterleaksReport
+
+        return BetterleaksReport(
+            scanned_path="p", scanned_sha256="x", findings=list(findings), **kw
+        )
+
+    @staticmethod
+    def _bl_finding(rule_id, entropy=4.8):
+        from clawjournal.redaction.betterleaks import BetterleaksFinding
+
+        return BetterleaksFinding(
+            rule_id=rule_id,
+            description="",
+            line=1,
+            masked="***",
+            raw_sha256="sha256:x",
+            entropy=entropy,
+        )
+
+    @staticmethod
+    def _th_report(findings=(), **kw):
+        from clawjournal.redaction.trufflehog import TruffleHogReport
+
+        return TruffleHogReport(
+            scanned_path="p", scanned_sha256="x", findings=list(findings), **kw
+        )
+
+    @staticmethod
+    def _th_finding(status="unverified"):
+        from clawjournal.redaction.trufflehog import TruffleHogFinding
+
+        return TruffleHogFinding(
+            detector="GitHub", status=status, line=1, masked="***", raw_sha256="sha256:x"
+        )
+
+    def test_clean_reports_pass(self):
+        assert scan_policy.preview_gate(self._bl_report(), self._th_report()) == (False, None)
+
+    def test_none_reports_pass(self):
+        # Both engines bypassed upstream -> nothing to consult.
+        assert scan_policy.preview_gate(None, None) == (False, None)
+
+    def test_warn_tier_betterleaks_passes(self):
+        report = self._bl_report(
+            [self._bl_finding("generic-api-key"), self._bl_finding("some-rule", entropy=1.0)]
+        )
+        assert scan_policy.preview_gate(report, self._th_report()) == (False, None)
+
+    def test_redact_tier_betterleaks_blocks(self):
+        report = self._bl_report([self._bl_finding("slack-bot-token")])
+        assert scan_policy.preview_gate(report, self._th_report()) == (
+            True,
+            "secret-scan-findings",
+        )
+
+    def test_review_rule_blocks(self):
+        report = self._bl_report([self._bl_finding("private-key")])
+        assert scan_policy.preview_gate(report, self._th_report())[0] is True
+
+    def test_none_entropy_defaults_to_redact_and_blocks(self):
+        report = self._bl_report([self._bl_finding("sqs-queue", entropy=None)])
+        assert scan_policy.preview_gate(report, self._th_report())[0] is True
+
+    def test_any_trufflehog_finding_blocks(self):
+        # Verification can't be relied on for a preview: even an
+        # unverified TruffleHog hit blocks.
+        result = scan_policy.preview_gate(
+            self._bl_report(), self._th_report([self._th_finding("unverified")])
+        )
+        assert result == (True, "secret-scan-findings")
+
+    def test_missing_binary_blocks(self):
+        report = self._bl_report(binary_missing=True)
+        assert scan_policy.preview_gate(report, self._th_report()) == (
+            True,
+            "scanner-not-installed",
+        )
+
+    def test_scan_error_blocks(self):
+        report = self._th_report(scan_error="boom")
+        assert scan_policy.preview_gate(self._bl_report(), report) == (
+            True,
+            "scanner-error",
+        )
+
+    def test_bypassed_engine_contributes_nothing(self):
+        report = self._bl_report([self._bl_finding("slack-bot-token")], bypassed=True)
+        assert scan_policy.preview_gate(report, self._th_report()) == (False, None)
