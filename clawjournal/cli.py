@@ -1671,6 +1671,8 @@ def _write_bundle_zip(export_dir: Path) -> Path:
             "manifest.json",
             "trufflehog.json",
             "trufflehog.post-pii.json",
+            "secret-scan.json",
+            "secret-scan.post-pii.json",
         ):
             path = export_dir / name
             if path.exists():
@@ -1739,11 +1741,11 @@ def _run_bundle_export(args) -> None:
         if manifest.get("blocked"):
             print(f"Share blocked: {manifest.get('block_reason', 'unknown')}")
             print(manifest.get("block_message", ""))
-            print(f"Report: {export_dir}/trufflehog.json")
+            print(f"Report: {export_dir}/secret-scan.json")
             sys.exit(2)
 
         session_count = len(manifest.get("sessions", []))
-        files = ["sessions.jsonl", "manifest.json", "trufflehog.json"]
+        files = ["sessions.jsonl", "manifest.json", "trufflehog.json", "secret-scan.json"]
         zip_path = None
         if getattr(args, "zip", False) is True:
             from .workbench.daemon import finalize_share_export_for_upload
@@ -1751,6 +1753,7 @@ def _run_bundle_export(args) -> None:
             error, manifest = finalize_share_export_for_upload(
                 export_dir,
                 manifest,
+                conn=conn,
                 ai_pii=getattr(args, "ai_pii_review", False) is True,
             )
             if error:
@@ -1758,8 +1761,9 @@ def _run_bundle_export(args) -> None:
                     print(f"Share blocked: {error.get('block_reason')}")
                 print(error.get("error", "Failed to prepare upload zip."))
                 sys.exit(2 if int(error.get("status", 500)) == 422 else 1)
-            if (export_dir / "trufflehog.post-pii.json").exists():
-                files.append("trufflehog.post-pii.json")
+            for extra in ("trufflehog.post-pii.json", "secret-scan.post-pii.json"):
+                if (export_dir / extra).exists():
+                    files.append(extra)
 
         # Optional training-format conversion
         training_summary = None

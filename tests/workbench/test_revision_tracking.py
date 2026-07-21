@@ -339,13 +339,33 @@ def test_finalized_bundle_stays_pinned_after_append_and_cache_miss(
     monkeypatch.setattr(trufflehog, "is_available", lambda: True)
     monkeypatch.setattr(
         trufflehog,
-        "scan_file",
-        lambda path: trufflehog.TruffleHogReport(
-            scanned_path=str(path),
-            scanned_sha256="sha256:clean",
+        "scan_file_with_raws",
+        lambda path, *, results="verified,unknown,unverified": (
+            trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:clean",
+            ),
+            [],
         ),
     )
     monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+
+    from clawjournal.redaction import betterleaks
+
+    monkeypatch.delenv(betterleaks.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(betterleaks, "is_available", lambda: True)
+    monkeypatch.setattr(
+        betterleaks,
+        "scan_file_with_raws",
+        lambda path: (
+            betterleaks.BetterleaksReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:clean",
+            ),
+            [],
+        ),
+    )
+    monkeypatch.setattr(betterleaks, "_scan_text_for_raw_matches", lambda text: [])
 
     upsert_sessions(index_conn, [_session(content="reviewed revision")])
     _approve(index_conn)

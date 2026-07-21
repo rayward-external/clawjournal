@@ -4075,21 +4075,41 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     finally:
         conn.close()
 
-    from clawjournal.redaction import trufflehog
+    from clawjournal.redaction import betterleaks, trufflehog
 
     monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
     monkeypatch.setattr(trufflehog, "is_available", lambda: True)
     monkeypatch.setattr(
         trufflehog,
-        "scan_file",
-        lambda path: trufflehog.TruffleHogReport(
-            scanned_path=str(path),
-            scanned_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        "scan_file_with_raws",
+        lambda path, *, results="verified,unknown,unverified": (
+            trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            ),
+            [],
         ),
     )
     monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda _text: [])
     monkeypatch.setattr(
         trufflehog, "engine_fingerprint", lambda: "trufflehog test-clean"
+    )
+    monkeypatch.delenv(betterleaks.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(betterleaks, "is_available", lambda: True)
+    monkeypatch.setattr(
+        betterleaks,
+        "scan_file_with_raws",
+        lambda path: (
+            betterleaks.BetterleaksReport(
+                scanned_path=str(path),
+                scanned_sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            ),
+            [],
+        ),
+    )
+    monkeypatch.setattr(betterleaks, "_scan_text_for_raw_matches", lambda _text: [])
+    monkeypatch.setattr(
+        betterleaks, "engine_fingerprint", lambda: "betterleaks test-clean"
     )
     write_credentials(_credentials())
     capabilities = _capabilities()

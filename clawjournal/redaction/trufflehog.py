@@ -386,14 +386,37 @@ def _parse_finding(parsed: dict) -> TruffleHogFinding | None:
     )
 
 
-def scan_file(path: Path) -> TruffleHogReport:
+def scan_file(
+    path: Path,
+    *,
+    results: str = "verified,unknown,unverified",
+) -> TruffleHogReport:
     """Scan ``path`` with TruffleHog. Returns a report.
+
+    ``results`` is passed through as ``--results=``; the tiered share
+    gate narrows it to ``"verified"`` so TruffleHog serves purely as
+    the live-credential check while Betterleaks owns broad detection.
 
     Never raises on missing-binary, findings, subprocess timeouts,
     spawn failures, unexpected exit statuses, or I/O errors reading
     the scanned path — every failure is surfaced as a blocking
     report so the mandatory share gate fails closed rather than
     propagating a raw exception to the caller.
+    """
+    report, _raws = scan_file_with_raws(path, results=results)
+    return report
+
+
+def scan_file_with_raws(
+    path: Path,
+    *,
+    results: str = "verified,unknown,unverified",
+) -> tuple[TruffleHogReport, list[dict]]:
+    """Gate-internal variant of ``scan_file`` that also returns the raw
+    matches (``[{"raw", "detector", "status", "line"}]``) from the same
+    single subprocess, so the share gate can redact the exact on-disk
+    byte sequences without paying for a second scan. Raw values must
+    never be persisted or returned from public ``scan_*`` helpers.
     """
     try:
         scanned_sha256 = _sha256_file(path)
@@ -406,21 +429,21 @@ def scan_file(path: Path) -> TruffleHogReport:
             scanned_path=str(path),
             scanned_sha256="",
             scan_error=f"could not hash scan target: {exc.__class__.__name__}",
-        )
+        ), []
 
     if is_bypassed():
         return TruffleHogReport(
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             bypassed=True,
-        )
+        ), []
 
     if not is_available():
         return TruffleHogReport(
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             binary_missing=True,
-        )
+        ), []
 
     # `or "trufflehog"` covers callers that stub is_available() without
     # providing a real binary (tests); production always resolves a path.
@@ -429,7 +452,7 @@ def scan_file(path: Path) -> TruffleHogReport:
         "filesystem",
         str(path),
         "-j",
-        "--results=verified,unknown,unverified",
+        f"--results={results}",
         "--no-color",
         "--no-update",
     ]
@@ -455,13 +478,13 @@ def scan_file(path: Path) -> TruffleHogReport:
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             scan_error="timed out after 60 seconds",
-        )
+        ), []
     except OSError:
         return TruffleHogReport(
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             scan_error="could not execute the trufflehog binary",
-        )
+        ), []
     # TruffleHog exits 0 on clean and 183 on findings in some versions;
     # accept either as a successful scan.
     if result.returncode not in (0, 183):
@@ -469,9 +492,10 @@ def scan_file(path: Path) -> TruffleHogReport:
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             scan_error=f"unexpected exit status {result.returncode}",
-        )
+        ), []
 
     findings: list[TruffleHogFinding] = []
+    raw_matches: list[dict] = []
     detector_counts: dict[str, int] = {}
     verified = unverified = unknown = 0
     seen_keys: set[tuple] = set()
@@ -494,6 +518,14 @@ def scan_file(path: Path) -> TruffleHogReport:
             continue
         seen_keys.add(key)
         findings.append(finding)
+        raw = parsed.get("Raw")
+        if isinstance(raw, str) and raw:
+            raw_matches.append({
+                "raw": raw,
+                "detector": finding.detector,
+                "status": finding.status,
+                "line": finding.line,
+            })
         detector_counts[finding.detector] = detector_counts.get(finding.detector, 0) + 1
         if finding.status == "verified":
             verified += 1
@@ -513,7 +545,7 @@ def scan_file(path: Path) -> TruffleHogReport:
         unverified=unverified,
         unknown=unknown,
         top_detectors=[detector for detector, _ in top],
-    )
+    ), raw_matches
 
 
 def scan_text(text: str) -> TruffleHogReport:

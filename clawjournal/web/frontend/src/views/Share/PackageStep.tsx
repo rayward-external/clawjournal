@@ -145,6 +145,17 @@ export function PackageStep(p: PackageStepProps) {
                           {session?.display_title || blocked.project || blocked.session_id}
                         </div>
                         <div style={{ fontSize: 11.5, color: colors.gray500 }}>
+                          {firstFinding?.tier && (
+                            <span style={{
+                              display: 'inline-block', marginRight: 6, padding: '0 6px',
+                              borderRadius: 8, fontSize: 10.5, fontWeight: 600,
+                              textTransform: 'uppercase', letterSpacing: 0.4,
+                              background: firstFinding.tier === 'block' ? colors.red100 : colors.yellow100,
+                              color: firstFinding.tier === 'block' ? colors.red700 : colors.yellow700,
+                            }}>
+                              {firstFinding.tier}
+                            </span>
+                          )}
                           {session?.project || blocked.project || 'Unknown project'}
                           {firstFinding?.detector ? ` · ${firstFinding.detector}` : ''}
                           {firstFinding?.masked ? ` · ${firstFinding.masked}` : ''}

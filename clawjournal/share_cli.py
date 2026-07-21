@@ -834,7 +834,7 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
                 print(f"  • {b.get('session_id', '?')[:12]}  {b.get('reason', '')}")
             die("Resolve hold/embargo state (e.g. `clawjournal release <id>`) and retry.")
 
-        print(f"  {DIM}sealing… (redact → TruffleHog → PII pass → re-scan){RST}")
+        print(f"  {DIM}sealing… (redact → secret scan → PII pass → re-scan){RST}")
         expected_revisions = {
             s["row"]["session_id"]: s["row"]["revision_hash"]
             for s in recs
@@ -873,7 +873,7 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
         blocked = res.get("blocked_sessions") or []
         if blocked:
             blocked_ids = {b if isinstance(b, str) else b.get("session_id") for b in blocked}
-            reason = res.get("error") or "TruffleHog blocked the share."
+            reason = res.get("error") or "The final secret scan blocked the share."
             print(f"{RED}Packaging blocked by the final secret scan:{RST}")
             print(f"  {DIM}{reason}{RST}")
             # Same as the web: a blocked trace can't be submitted, so it is removed

@@ -16,6 +16,11 @@ export interface BlockedShareFinding {
   detector?: string | null;
   status?: string | null;
   masked?: string | null;
+  // Tiered-gate fields (daemon ≥ scan-policy rewrite); older manifests
+  // carry only the legacy keys above.
+  engine?: string | null;
+  rule?: string | null;
+  tier?: 'block' | 'review' | 'redact' | 'warn' | null;
 }
 
 export interface BlockedShareSession {

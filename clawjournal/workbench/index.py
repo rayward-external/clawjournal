@@ -5240,59 +5240,6 @@ EXPORT_FIELDS = {
 }
 
 
-def build_trufflehog_blocked_sessions(
-    manifest: dict[str, Any],
-    report: Any,
-) -> list[dict[str, Any]]:
-    """Map TruffleHog JSONL line findings back to exported sessions.
-
-    ``sessions.jsonl`` is one line per exported session. If every finding has
-    a valid line number, the UI can offer an explicit "remove these traces and
-    retry" recovery path. If any finding cannot be mapped, return an empty
-    list so callers keep the existing hard block.
-    """
-    findings = list(getattr(report, "findings", []) or [])
-    if not findings:
-        return []
-
-    sessions = manifest.get("sessions")
-    if not isinstance(sessions, list) or not sessions:
-        return []
-
-    blocked_by_id: dict[str, dict[str, Any]] = {}
-    for finding in findings:
-        line = getattr(finding, "line", None)
-        if not isinstance(line, int) or line < 1 or line > len(sessions):
-            return []
-
-        session = sessions[line - 1]
-        if not isinstance(session, dict):
-            return []
-        session_id = session.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            return []
-
-        entry = blocked_by_id.setdefault(
-            session_id,
-            {
-                "session_id": session_id,
-                "project": session.get("project"),
-                "source": session.get("source"),
-                "model": session.get("model"),
-                "line": line,
-                "findings": [],
-            },
-        )
-        entry["findings"].append({
-            "line": line,
-            "detector": getattr(finding, "detector", None),
-            "status": getattr(finding, "status", None),
-            "masked": getattr(finding, "masked", None),
-        })
-
-    return sorted(blocked_by_id.values(), key=lambda item: item["line"])
-
-
 def export_share_to_disk(
     conn: sqlite3.Connection,
     share_id: str,
@@ -5442,16 +5389,51 @@ def export_share_to_disk(
     }
 
     # Mandatory post-redaction scan — independent oracle against our
-    # own redactor. Any finding (or missing binary) blocks the share.
+    # own redactor. Tiered policy (share_gate/scan_policy): verified
+    # live credentials and private-key material block, recognizable
+    # unverified tokens are span-redacted in place and the share
+    # proceeds, soft signals only warn. Scanner failure fails closed.
+    from ..redaction import scan_policy
     from ..redaction import trufflehog as trufflehog_scanner
+    from .share_gate import build_blocked_sessions, run_share_gate
 
-    trufflehog_report = trufflehog_scanner.scan_file(sessions_file)
-    # Stamp which engine version scanned so the manifest/report make
-    # staleness auditable per share (the managed binary can drift from
-    # the source pin between installs).
-    trufflehog_report.engine = trufflehog_scanner.engine_fingerprint()
-    trufflehog_scanner.write_report(export_dir / "trufflehog.json", trufflehog_report)
-    manifest["redaction_summary"]["trufflehog"] = trufflehog_report.summary()
+    gate_report = run_share_gate(sessions_file, manifest, conn=conn)
+    scan_policy.write_report(export_dir / "secret-scan.json", gate_report)
+    # Legacy artifact + manifest key: the TruffleHog sub-report
+    # (verified-only) keeps its historical name so existing consumers
+    # of trufflehog.json / redaction_summary.trufflehog see the same
+    # all-clean shape on every shippable bundle.
+    if gate_report.trufflehog_report is not None:
+        trufflehog_scanner.write_report(
+            export_dir / "trufflehog.json", gate_report.trufflehog_report
+        )
+        manifest["redaction_summary"]["trufflehog"] = (
+            gate_report.trufflehog_report.summary()
+        )
+    else:
+        manifest["redaction_summary"]["trufflehog"] = {
+            "findings": 0,
+            "bypassed": gate_report.bypassed,
+            "binary_missing": gate_report.binary_missing,
+            "scan_error": gate_report.scan_error,
+            "engine": gate_report.engine,
+        }
+    manifest["redaction_summary"]["secret_scan"] = gate_report.summary()
+    if gate_report.gate_redactions:
+        # Fold gate-time span redactions into the manifest counters and
+        # per-session entries so "3 automatically redacted" is visible.
+        manifest["redaction_summary"]["total_redactions"] = (
+            manifest["redaction_summary"].get("total_redactions", 0)
+            + gate_report.gate_redactions
+        )
+        by_type = manifest["redaction_summary"].setdefault("by_type", {})
+        by_type["gate_secret_scan"] = (
+            by_type.get("gate_secret_scan", 0) + gate_report.gate_redactions
+        )
+        for line_no, count in gate_report.redactions_by_line.items():
+            if 1 <= line_no <= len(manifest["sessions"]):
+                entry = manifest["sessions"][line_no - 1]
+                entry["gate_redactions"] = entry.get("gate_redactions", 0) + count
 
     # A successful share baseline must describe only emitted sessions. Remove
     # selections filtered out during packaging instead of letting their
@@ -5469,11 +5451,13 @@ def export_share_to_disk(
             (session_id, share_id),
         )
 
-    if trufflehog_report.blocking:
+    if gate_report.blocking:
         manifest["blocked"] = True
-        manifest["block_reason"] = trufflehog_report.block_reason
-        manifest["block_message"] = trufflehog_scanner.format_block_message(trufflehog_report)
-        blocked_sessions = build_trufflehog_blocked_sessions(manifest, trufflehog_report)
+        manifest["block_reason"] = gate_report.block_reason
+        manifest["block_message"] = scan_policy.format_block_message(gate_report)
+        blocked_sessions = build_blocked_sessions(
+            manifest, gate_report.block_review_findings
+        )
         if blocked_sessions:
             manifest["blocked_sessions"] = blocked_sessions
         with open(export_dir / "manifest.json", "w") as f:
