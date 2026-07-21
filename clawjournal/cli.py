@@ -3994,6 +3994,19 @@ def main() -> None:
         "status", help="Show which TruffleHog binary clawjournal will use")
     th_status.add_argument("--json", action="store_true", help="Output result as JSON")
 
+    bl = sub.add_parser("betterleaks",
+                        help="Manage the Betterleaks binary used by the share gate")
+    bl_sub = bl.add_subparsers(dest="betterleaks_command")
+    bl_install = bl_sub.add_parser(
+        "install",
+        help="Download the pinned, checksum-verified Betterleaks into ~/.clawjournal/bin")
+    bl_install.add_argument("--force", action="store_true",
+                            help="Reinstall even if a managed binary already exists")
+    bl_install.add_argument("--json", action="store_true", help="Output result as JSON")
+    bl_status = bl_sub.add_parser(
+        "status", help="Show which Betterleaks binary clawjournal will use")
+    bl_status.add_argument("--json", action="store_true", help="Output result as JSON")
+
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
@@ -5191,6 +5204,10 @@ def main() -> None:
         _run_trufflehog_command(args)
         return
 
+    if command == "betterleaks":
+        _run_betterleaks_command(args)
+        return
+
     if command == "list":
         config = load_config()
         resolved_source_choice, _ = _resolve_source_choice(args.source, config)
@@ -5752,6 +5769,83 @@ def _run_trufflehog_command(args) -> None:
     if not is_managed:
         print(f"A pinned v{PINNED_VERSION} can be installed with "
               "`clawjournal trufflehog install` (managed copy takes precedence).")
+
+
+def _run_betterleaks_command(args) -> None:
+    """`clawjournal betterleaks install|status` — manage the primary share-gate scanner."""
+    from .redaction import betterleaks
+    from .redaction.betterleaks_install import PINNED_VERSION, install
+
+    sub_command = getattr(args, "betterleaks_command", None)
+
+    if sub_command == "install":
+        result = install(force=args.force, progress=None if args.json else print)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            status = result["status"]
+            if status == "installed":
+                print(f"Installed Betterleaks {result['version']} at {result['path']}.")
+            elif status == "already-installed":
+                print(
+                    f"Already installed ({result['version']}) at {result['path']}. "
+                    "Pass --force to reinstall."
+                )
+            else:
+                print(f"Install failed ({status}): {result.get('error', '')}")
+                if result.get("url"):
+                    print(f"  URL: {result['url']}")
+                if result.get("hint"):
+                    print(f"  {result['hint']}")
+        if result["status"] not in ("installed", "already-installed"):
+            sys.exit(1)
+        return
+
+    # Default (and explicit `status`): report what the share gate will use.
+    import shutil
+
+    resolved = betterleaks.resolve_binary()
+    managed = betterleaks.managed_binary_path()
+    fingerprint = betterleaks.engine_fingerprint()
+    version_match = betterleaks._BARE_VERSION_RE.search(fingerprint)
+    off_pin = betterleaks.managed_off_pin()
+    is_managed = resolved == str(managed)
+    shadowed_path = shutil.which("betterleaks") if is_managed else None
+    payload = {
+        "resolved_path": resolved,
+        "managed": is_managed,
+        "managed_path": str(managed),
+        # Bare version (e.g. "1.6.1") to match install --json; the raw
+        # engine fingerprint (e.g. "betterleaks 1.6.1") rides alongside.
+        "version": version_match.group(1) if version_match else None,
+        "fingerprint": fingerprint,
+        "pinned_version": PINNED_VERSION,
+        # True when the managed copy drifted from the source pin (e.g.
+        # selfupdate bumped PINNED_VERSION but install was never re-run).
+        "managed_off_pin": off_pin is not None,
+        "shadowed_path_binary": shadowed_path,
+        "available": resolved is not None,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        if resolved is None:
+            sys.exit(1)
+        return
+    if resolved is None:
+        print("Betterleaks: not installed.")
+        print("Run `clawjournal betterleaks install` to install "
+              f"the pinned v{PINNED_VERSION}.")
+        sys.exit(1)
+    origin = "managed install" if is_managed else "PATH"
+    print(f"Betterleaks: {fingerprint} ({origin}: {resolved})")
+    if off_pin is not None:
+        print(f"Warning: the managed copy is v{off_pin[0]} but this clawjournal "
+              f"pins v{off_pin[1]} — run `clawjournal betterleaks install` to update.")
+    if shadowed_path:
+        print(f"(The managed copy takes precedence over the PATH copy at {shadowed_path}.)")
+    if not is_managed:
+        print(f"A pinned v{PINNED_VERSION} can be installed with "
+              "`clawjournal betterleaks install` (managed copy takes precedence).")
 
 
 def _run_events_features(args) -> None:

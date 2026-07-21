@@ -1,0 +1,66 @@
+name: Betterleaks Pin Integrity
+
+# Verifies that the sha256 checksums vendored in
+# clawjournal/redaction/betterleaks_install.py still match the upstream
+# release they pin. Unit tests are hermetic and cannot see this — only a
+# real fetch of upstream's checksums.txt catches a bad pin bump or a
+# release asset that was silently re-uploaded.
+#
+# IMPORTANT: do NOT add this workflow's check to branch-protection
+# required checks. It is path-filtered at the trigger level, so on PRs
+# that do not touch the pinned files it produces no check run at all — a
+# required status would then sit "Expected" forever and block the PR.
+
+on:
+  pull_request:
+    paths:
+      - 'clawjournal/redaction/betterleaks_install.py'
+      - 'scripts/check_betterleaks_pin.py'
+      - '.github/workflows/betterleaks-pin.yml'
+  schedule:
+    # Mondays 06:23 UTC — off the top of the hour, which GitHub delays
+    # under load, and offset from trufflehog-pin.yml's 06:17. Note:
+    # scheduled runs fire only from the default branch (so this
+    # activates after merge), and GitHub auto-disables crons on public
+    # repos after 60 days with no repository activity. Cron failure
+    # emails go to whoever last edited this file.
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: betterleaks-pin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pin-integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch upstream checksums.txt (authenticated, retried)
+        env:
+          # Authenticated so we get this repo's GITHUB_TOKEN rate limit
+          # rather than the shared runner-IP unauthenticated limit.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PINNED=$(python -c "from clawjournal.redaction.betterleaks_install import PINNED_VERSION; print(PINNED_VERSION)")
+          echo "Pinned Betterleaks version: v$PINNED"
+          for attempt in 1 2 3; do
+            if gh release download "v$PINNED" \
+                 -R betterleaks/betterleaks \
+                 -p '*checksums.txt' -O checksums.txt --clobber; then
+              break
+            fi
+            echo "fetch attempt $attempt failed; retrying..." >&2
+            sleep $((attempt * 5))
+          done
+          test -s checksums.txt
+      - name: Compare vendored checksums against upstream
+        run: python scripts/check_betterleaks_pin.py checksums.txt
