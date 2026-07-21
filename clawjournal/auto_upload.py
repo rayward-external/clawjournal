@@ -56,7 +56,12 @@ from .auto_upload_credentials import (
 )
 from .config import load_config, save_config, source_scope_sources
 from .paths import atomic_write_text, ensure_hash_salt
-from .raw_sources import RawFingerprint, RawSourceChanged, fingerprint_raw_source
+from .raw_sources import (
+    RawFingerprint,
+    RawSourceChanged,
+    fingerprint_raw_source,
+    stat_raw_source,
+)
 from .scoring.backends import resolve_backend
 from .share_flow import build_zip, package, verify_coverage
 from .workbench.index import (
@@ -2695,6 +2700,11 @@ def _submit_pending_artifact(
     # recompute and the submitting transition need the lock for atomicity vs
     # profile writers.
     _validate_raw_fingerprint_ledger(conn, share)
+    # Capture a cheap, read-free stat signature of the raw inputs. Acquiring the
+    # egress lock below can block for as long as a concurrent save_config holds
+    # it, and a raw append/replace during that wait leaves the indexed revision
+    # unchanged — so the profile/revision checks inside the lock would miss it.
+    pre_lock_raw_stats = _raw_stat_signatures(conn, share)
     # The protected server check above can take long enough for a local pause,
     # hold, revision, or privacy-profile edit to win. Profile writers share
     # this short cross-process boundary lock; DB policy writers atomically bump
@@ -2702,9 +2712,15 @@ def _submit_pending_artifact(
     # recompute and submitting transition have a definite order relative to
     # every supported privacy-setting mutation.
     with config_module.auto_upload_egress_lock():
-        # Raw fingerprints were re-validated just above, immediately before this
-        # lock; skip the size-unbounded re-hash here so it never runs while the
-        # egress lock is held (it would block concurrent save_config writers).
+        # A raw source that changed while we waited for the lock must abort the
+        # submission: the pre-lock fingerprint validation no longer reflects the
+        # on-disk inputs. This comparison is stat-only (no file reads), so the
+        # size-unbounded raw re-hash never runs under the lock — it stays above,
+        # before the lock, which is why check_raw_fingerprints=False here.
+        if _raw_stat_signatures(conn, share) != pre_lock_raw_stats:
+            raise ControlChanged(
+                "A selected raw trace changed while acquiring the egress lock."
+            )
         _validate_pending_for_submission(
             conn,
             share=share,
@@ -2972,6 +2988,39 @@ def _validate_raw_fingerprint_ledger(
     current_raw = {key: list(value) for key, value in _raw_fingerprints(candidates).items()}
     if stored_raw != current_raw:
         raise ControlChanged("A selected raw trace changed after artifact sealing.")
+
+
+def _raw_stat_signatures(
+    conn: sqlite3.Connection, share: Mapping[str, Any]
+) -> dict[str, tuple]:
+    """Cheap stat-only signatures for a sealed share's raw inputs.
+
+    Detects a raw append/replace that happens while the egress lock is being
+    acquired, without the size-unbounded re-hash of the fingerprint ledger. A
+    vanished or unreadable source counts as a change (raises ``ControlChanged``).
+    """
+
+    rows = conn.execute(
+        "SELECT s.session_id, s.raw_source_path FROM share_sessions ss "
+        "JOIN sessions s ON s.session_id = ss.session_id WHERE ss.share_id = ? "
+        "ORDER BY s.session_id",
+        (share["share_id"],),
+    ).fetchall()
+    signatures: dict[str, tuple] = {}
+    for row in rows:
+        session_id = str(row["session_id"])
+        raw_path = row["raw_source_path"]
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ControlChanged(
+                "A selected trace no longer has a verifiable raw source."
+            )
+        try:
+            signatures[session_id] = stat_raw_source(raw_path)
+        except (OSError, RawSourceChanged) as exc:
+            raise ControlChanged(
+                "A selected raw trace became unavailable while acquiring the egress lock."
+            ) from exc
+    return signatures
 
 
 def _server_enrollment_gate(

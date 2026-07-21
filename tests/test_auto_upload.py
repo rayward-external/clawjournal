@@ -7,6 +7,7 @@ agent hook files or the network.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -1043,6 +1044,96 @@ def test_validate_pending_skips_raw_hash_when_disabled(isolated_auto_upload):
         assert called is True
     finally:
         auto._validate_raw_fingerprint_ledger = original
+    conn.close()
+
+
+def test_raw_stat_signatures_detect_append_and_replace(isolated_auto_upload):
+    """The cheap stat-only signature changes on both an append (size/mtime) and
+    a same-size replace (inode), so it can stand in for the full re-hash when
+    detecting a raw change during the lock wait."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    baseline = auto._raw_stat_signatures(conn, share)
+    with raw_path.open("a", encoding="utf-8") as handle:
+        handle.write("appended content\n")
+    after_append = auto._raw_stat_signatures(conn, share)
+    assert after_append != baseline
+
+    # Replace in place with identical content: same size, new inode -> differs.
+    same_content = raw_path.read_text(encoding="utf-8")
+    raw_path.unlink()
+    raw_path.write_text(same_content, encoding="utf-8")
+    assert auto._raw_stat_signatures(conn, share) != after_append
+    conn.close()
+
+
+def test_submit_aborts_on_raw_change_during_lock_wait(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A raw append/replace that lands while _submit_pending_artifact is blocked
+    acquiring the egress lock must abort before egress, even though the indexed
+    revision is unchanged and the in-lock raw re-hash is skipped for liveness."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "_server_enrollment_gate", lambda *_a, **_k: None)
+
+    def _forbidden_submit(*_args, **_kwargs):
+        raise AssertionError("submit_artifact must not run after a lock-wait raw change")
+
+    monkeypatch.setattr(auto, "submit_artifact", _forbidden_submit)
+
+    @contextlib.contextmanager
+    def _lock_that_mutates_raw():
+        # The raw log grows while we "wait" to acquire the lock.
+        with raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("appended during lock wait\n")
+        yield
+
+    monkeypatch.setattr(
+        auto.config_module, "auto_upload_egress_lock", _lock_that_mutates_raw
+    )
+
+    with pytest.raises(auto.ControlChanged):
+        auto._submit_pending_artifact(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            credentials=_credentials(),
+            capabilities=_capabilities(),
+        )
+
+    state = conn.execute(
+        "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()[0]
+    assert state == "sealed"
     conn.close()
 
 
