@@ -2699,12 +2699,16 @@ def _submit_pending_artifact(
     # save_config for the full, size-unbounded re-hash. Only the profile-hash
     # recompute and the submitting transition need the lock for atomicity vs
     # profile writers.
-    _validate_raw_fingerprint_ledger(conn, share)
-    # Capture a cheap, read-free stat signature of the raw inputs. Acquiring the
-    # egress lock below can block for as long as a concurrent save_config holds
-    # it, and a raw append/replace during that wait leaves the indexed revision
-    # unchanged — so the profile/revision checks inside the lock would miss it.
+    # Capture the cheap, read-free stat baseline BEFORE the final fingerprint
+    # validation below, so the baseline describes — at the latest — the very
+    # snapshot validation confirms against the sealed ledger. A raw append or
+    # replace after that snapshot (including one that lands during the possibly
+    # long wait to acquire the egress lock, when the indexed revision stays
+    # unchanged) is then visible to the post-lock stat comparison. Capturing the
+    # baseline after validation would instead bake a change made in that gap
+    # into the baseline, and check_raw_fingerprints=False would let it ship.
     pre_lock_raw_stats = _raw_stat_signatures(conn, share)
+    _validate_raw_fingerprint_ledger(conn, share)
     # The protected server check above can take long enough for a local pause,
     # hold, revision, or privacy-profile edit to win. Profile writers share
     # this short cross-process boundary lock; DB policy writers atomically bump
@@ -2712,14 +2716,14 @@ def _submit_pending_artifact(
     # recompute and submitting transition have a definite order relative to
     # every supported privacy-setting mutation.
     with config_module.auto_upload_egress_lock():
-        # A raw source that changed while we waited for the lock must abort the
-        # submission: the pre-lock fingerprint validation no longer reflects the
-        # on-disk inputs. This comparison is stat-only (no file reads), so the
-        # size-unbounded raw re-hash never runs under the lock — it stays above,
-        # before the lock, which is why check_raw_fingerprints=False here.
+        # A raw source that changed after the validated snapshot — including one
+        # that lands while we wait for the lock — must abort before egress. The
+        # comparison is stat-only (no file reads), so the size-unbounded raw
+        # re-hash never runs under the lock (which is why
+        # check_raw_fingerprints=False below).
         if _raw_stat_signatures(conn, share) != pre_lock_raw_stats:
             raise ControlChanged(
-                "A selected raw trace changed while acquiring the egress lock."
+                "A selected raw trace changed after its validated snapshot."
             )
         _validate_pending_for_submission(
             conn,

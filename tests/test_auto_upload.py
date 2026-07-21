@@ -1137,6 +1137,71 @@ def test_submit_aborts_on_raw_change_during_lock_wait(
     conn.close()
 
 
+def test_submit_aborts_when_raw_changes_right_after_validation(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A raw change that lands immediately after the final fingerprint validation
+    returns (after the validated snapshot, before the lock) must still abort. The
+    stat baseline is captured *before* that validation, so the post-lock
+    comparison sees the change instead of baking it into the baseline."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "_server_enrollment_gate", lambda *_a, **_k: None)
+
+    def _forbidden_submit(*_args, **_kwargs):
+        raise AssertionError("submit_artifact must not run after a post-validation raw change")
+
+    monkeypatch.setattr(auto, "submit_artifact", _forbidden_submit)
+
+    # Mutate the raw log the instant the *final* pre-lock validation returns —
+    # i.e. right after the snapshot it validated. There are two pre-lock
+    # validations; only the second one (immediately before the baseline+lock)
+    # appends, so it validates a sealed-matching snapshot and then diverges.
+    real_validate = auto._validate_raw_fingerprint_ledger
+    calls = {"count": 0}
+
+    def _validate_then_mutate_on_final(conn_arg, share_arg):
+        real_validate(conn_arg, share_arg)
+        calls["count"] += 1
+        if calls["count"] == 2:
+            with raw_path.open("a", encoding="utf-8") as handle:
+                handle.write("appended right after the validated snapshot\n")
+
+    monkeypatch.setattr(
+        auto, "_validate_raw_fingerprint_ledger", _validate_then_mutate_on_final
+    )
+
+    with pytest.raises(auto.ControlChanged):
+        auto._submit_pending_artifact(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            credentials=_credentials(),
+            capabilities=_capabilities(),
+        )
+
+    state = conn.execute(
+        "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()[0]
+    assert state == "sealed"
+    conn.close()
+
+
 @pytest.mark.parametrize("review_status", ["new", "blocked"])
 def test_revoked_fresh_approval_stops_before_ai_and_submit(
     isolated_auto_upload,
