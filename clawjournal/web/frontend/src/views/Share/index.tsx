@@ -521,6 +521,36 @@ export function Share() {
     });
   };
 
+  // Batch selection helpers. With 1000s of eligible sessions, unchecking traces
+  // one at a time is impractical, so the queue exposes select-all / deselect-all
+  // controls (scoped to whatever filters are active in the picker).
+  const clearQueue = () => {
+    cancelAiRetries();
+    setQueueOrder([]);
+  };
+
+  const addManyToQueue = (ids: string[]) => {
+    if (ids.length === 0) return;
+    cancelAiRetries();
+    setQueueOrder((prev) => {
+      const merged = new Set(prev);
+      ids.forEach((id) => merged.add(id));
+      // Preserve the default ordering for any default sessions, then append the
+      // rest (already-added extras and newly-added non-default ids) in place.
+      const defaults = readyStats ? queueFromStats(readyStats) : [];
+      const ordered = defaults.filter((id) => merged.has(id));
+      const remaining = [...merged].filter((id) => !defaults.includes(id));
+      return [...ordered, ...remaining];
+    });
+  };
+
+  const removeManyFromQueue = (ids: string[]) => {
+    if (ids.length === 0) return;
+    cancelAiRetries();
+    const drop = new Set(ids);
+    setQueueOrder((prev) => prev.filter((id) => !drop.has(id)));
+  };
+
   const updateAiPiiEnabled = (enabled: boolean) => {
     cancelRedaction();
     cancelAiRetries();
@@ -1184,6 +1214,9 @@ export function Share() {
         setAiPiiEnabled={updateAiPiiEnabled}
         onRemove={removeFromQueue}
         onAdd={addToQueue}
+        onClearAll={clearQueue}
+        onAddMany={addManyToQueue}
+        onRemoveMany={removeManyFromQueue}
         onReorder={reorderQueue}
         onHelp={() => setShowHelp(true)}
         onContinue={handleStartRedaction}
