@@ -1,4 +1,4 @@
-"""Typed client for the hosted recurring-upload V1 protocol."""
+"""Typed client for the hosted recurring-upload protocol (v2)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,9 @@ from . import __version__
 # explicitly accepted; the server computes and owns the scope hash.
 RECURRING_UPLOAD_API_VERSION = 2
 RECURRING_CLIENT_PROTOCOL_VERSION = "2"
+# Mirrors the hosted RECURRING_SCOPE_MAX_ENTRIES contract limit so oversized
+# scopes fail fast locally instead of as a server-worded enrollment rejection.
+MAX_SCOPE_ENTRIES = 200
 MAX_RECURRING_SESSIONS = 5
 ALLOW_INSECURE_LOOPBACK_ENV = "CLAWJOURNAL_ALLOW_INSECURE_LOOPBACK_RECURRING"
 

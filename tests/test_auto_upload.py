@@ -1988,6 +1988,156 @@ def test_enable_fails_fast_on_capabilities_before_the_strict_scan(
     assert scan_calls == []
 
 
+def test_scope_entries_are_the_full_source_project_cross_product(
+    isolated_auto_upload,
+):
+    """Certification must cover exactly what the candidate filter enforces
+    (source IN sources AND project IN projects): a later session in a NEW
+    combination of already-enrolled source and project must already be inside
+    the server-certified scope, so entries are the full cross product — not
+    just the pairs observed at enrollment time."""
+    config = _save_scope_config()
+    config["source"] = "all"
+    config_module.save_config(config)
+    conn = open_index()
+    session_a, _ = _session(isolated_auto_upload["root"], "session-a", project="alpha")
+    session_b, _ = _session(isolated_auto_upload["root"], "session-b", project="beta")
+    session_b["source"] = "codex"
+    assert upsert_sessions(conn, [session_a, session_b]) == 2
+
+    scope = auto._current_scope(conn, config_module.load_config())
+
+    assert scope["sources"] == ["claude", "codex"]
+    assert scope["projects"] == ["alpha", "beta"]
+    assert scope["entries"] == [
+        ("claude", "alpha"),
+        ("claude", "beta"),
+        ("codex", "alpha"),
+        ("codex", "beta"),
+    ]
+    conn.close()
+
+
+def test_oversized_scope_blocks_before_consent_network_and_scan(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A scope beyond the hosted entry cap must fail fast with its own code
+    before any consent prompt, network call, or strict scan."""
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+
+    monkeypatch.setattr(auto, "_has_successful_manual_receipt", lambda _conn: True)
+    monkeypatch.setattr(auto, "MAX_SCOPE_ENTRIES", 0)
+
+    def network_forbidden(**_kwargs):
+        raise AssertionError("oversized scope must stop before network")
+
+    monkeypatch.setattr(auto, "fetch_capabilities", network_forbidden)
+    scan_calls = _patch_strict_scanner(monkeypatch)
+
+    result = auto.enable(agent="claude")
+
+    assert result["code"] == "scope_too_large"
+    assert "exceeds the hosted limit" in result["message"]
+    assert scan_calls == []
+
+
+def test_missing_server_scope_hash_surfaces_reauthorization_required(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A pre-v2 enrollment row (no pinned server scope hash) must fail closed
+    under a distinct reauthorization code — nothing hosted drifted, so the
+    generic mismatch wording would misdirect the user."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        server_scope_hash=None,
+    )
+    enrollment = get_auto_upload_enrollment(conn)
+    conn.close()
+
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "revoked_at": None,
+            "submissions_open": True,
+            "terms_current": True,
+            "scope_hash": SERVER_SCOPE_HASH,
+            "authorization_version": AUTH_VERSION,
+            "retention_policy_version": RETENTION_VERSION,
+            "ownership_certification_version": OWNERSHIP_VERSION,
+            "authorization_revision": 1,
+        },
+    )
+    with pytest.raises(auto.AutoUploadError) as excinfo:
+        auto._server_enrollment_gate(
+            _capabilities(),
+            enrollment,
+            _credentials(),
+        )
+    assert excinfo.value.code == "reauthorization_required"
+
+
+def test_read_back_failure_keeps_fresh_recovery_token_persisted(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The post-create read-back runs AFTER Phase-1: a transient GET failure
+    (or crash) must leave the freshly issued recovery token durably persisted
+    so Disable can always revoke with a live credential — never the dropped
+    -tokens state where only a possibly-invalidated older recovery remains."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda *_a, **_k: _enrollment_response()
+    )
+
+    def read_back_down(*_args, **_kwargs):
+        raise RecurringServiceError(
+            code="server_unavailable", message="down", retryable=True
+        )
+
+    monkeypatch.setattr(auto, "get_enrollment", read_back_down)
+    # The compensating revoke also failing must still retain the recovery
+    # tombstone rather than deleting the only live credential.
+    monkeypatch.setattr(auto, "revoke_enrollment", read_back_down)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    credentials = load_credentials(required=False)
+    assert credentials is not None
+    assert credentials["recovery_token"] == _credentials()["recovery_token"]
+    assert credentials["active_token"] is None
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["revocation_pending"] is True
+    finally:
+        conn.close()
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,

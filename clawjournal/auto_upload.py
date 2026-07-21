@@ -34,6 +34,7 @@ from .agent_hooks import (
     uninstall_agent_hook,
 )
 from .auto_upload_client import (
+    MAX_SCOPE_ENTRIES,
     CapabilityError,
     RecurringServiceError,
     create_enrollment,
@@ -373,16 +374,20 @@ def _current_scope(
         and not session_matches_excluded_projects(row, excluded)
     ]
     projects = sorted({str(row["project"]) for row in scoped_rows if row.get("project")})
-    # Protocol v2 enrolls the exact observed (source, project) pairs rather
-    # than a client-computed hash; the server normalizes and owns the hash.
-    entries = sorted(
-        {
-            (str(row["source"]), str(row["project"]))
-            for row in scoped_rows
-            if row.get("project")
-        }
-    )
+    # Protocol v2 enrolls explicit (source, project) entries. Certify the FULL
+    # cross product of the confirmed sources and projects — exactly the scope
+    # the candidate filter enforces (source IN sources AND project IN
+    # projects) and exactly what the consent surfaces display as two lists.
+    # Enrolling only the currently-observed pairs would let a later session in
+    # a new combination of already-enrolled source and project egress outside
+    # the server-certified scope.
+    entries = sorted((source, project) for source in sources for project in projects)
     blockers: list[str] = []
+    if len(entries) > MAX_SCOPE_ENTRIES:
+        # The hosted service caps enrollment scope entries; surface it before
+        # consent, network, or the strict scan rather than as a server-worded
+        # rejection after all three.
+        blockers.append("scope_too_large")
     if not source_confirmed:
         blockers.append("source_confirmation_missing")
     if not projects_confirmed:
@@ -410,13 +415,6 @@ def _keyed_digest(domain: str, payload: Any) -> str:
     salt = ensure_hash_salt(install_dir)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hmac.new(salt, domain.encode("utf-8") + b"\0" + encoded, hashlib.sha256).hexdigest()
-
-
-def scope_hash(sources: Sequence[str], projects: Sequence[str]) -> str:
-    return _keyed_digest(
-        "clawjournal-recurring-scope-v1",
-        {"sources": sorted(set(sources)), "projects": sorted(set(projects))},
-    )
 
 
 def trace_revision_key(session_id: str, content_revision: str) -> str:
@@ -1044,10 +1042,19 @@ def enable(
         config = load_config()
         scope = _current_scope(conn, config)
         if scope["blockers"]:
+            first_blocker = scope["blockers"][0]
+            if first_blocker == "scope_too_large":
+                message = (
+                    "The source x project scope exceeds the hosted limit of "
+                    f"{MAX_SCOPE_ENTRIES} entries; exclude projects "
+                    "(config --exclude) or narrow the source scope first."
+                )
+            else:
+                message = "Confirm a non-empty source and project scope before enabling."
             return {
                 "ok": False,
-                "code": scope["blockers"][0],
-                "message": "Confirm a non-empty source and project scope before enabling.",
+                "code": first_blocker,
+                "message": message,
                 "scope_blockers": scope["blockers"],
                 "unsupported_sources": scope["unsupported_sources"],
             }
@@ -1413,24 +1420,6 @@ def enable(
                 }
 
             assert credential_record is not None
-            # Protocol v2: the server owns the scope hash (an HMAC with its
-            # own key), so pin the authorized scope by reading it back from
-            # the definite enrollment state; the runner's scope gate compares
-            # against this stored value. A failed read aborts enrollment
-            # before any local authority is persisted (the create path's
-            # compensating revoke still applies).
-            remote_state = get_enrollment(
-                capabilities,
-                enrollment_id=str(enrollment_id),
-                active_token=str(credential_record["active_token"]),
-            )
-            server_scope_hash = remote_state.get("scope_hash")
-            if not isinstance(server_scope_hash, str) or not server_scope_hash:
-                raise AutoUploadError(
-                    "malformed_enrollment_response",
-                    "Hosted service returned no authoritative scope hash.",
-                    retryable=True,
-                )
             recovery_record = {
                 **credential_record,
                 "active_token": None,
@@ -1453,6 +1442,29 @@ def enable(
                     )
                 write_credentials(recovery_record)
                 recovery_only_written = True
+
+            # Protocol v2: the server owns the scope hash (an HMAC with its
+            # own key), so pin the authorized scope by reading it back from
+            # the definite enrollment state; the runner's scope gate compares
+            # against this stored value. This network read runs AFTER Phase 1
+            # deliberately: the freshest recovery token (including one just
+            # reissued by a rotating reauthorization) is already durably
+            # persisted, so a failed or crashed read leaves revocable
+            # recovery-only authority rather than dropping live server tokens
+            # on the floor. A failed read aborts enrollment fail-closed; the
+            # create path's compensating revoke still applies.
+            remote_state = get_enrollment(
+                capabilities,
+                enrollment_id=str(enrollment_id),
+                active_token=str(credential_record["active_token"]),
+            )
+            server_scope_hash = remote_state.get("scope_hash")
+            if not isinstance(server_scope_hash, str) or not server_scope_hash:
+                raise AutoUploadError(
+                    "malformed_enrollment_response",
+                    "Hosted service returned no authoritative scope hash.",
+                    retryable=True,
+                )
 
             config = load_config()
             config["auto_upload_capability_available"] = True
@@ -3199,14 +3211,17 @@ def _server_enrollment_gate(
         )
     # Protocol v2: the scope hash is server-computed (keyed with the server's
     # secret), so the client pins the value read back at enrollment time and
-    # requires it to be unchanged. A missing stored hash (e.g. a pre-v2
-    # enrollment row) fails closed into reauthorization.
+    # requires it to be unchanged. A missing stored hash (a pre-v2 enrollment
+    # row) fails closed under its own code so UIs can point the user at
+    # reauthorization rather than implying hosted state drifted.
     expected_scope_hash = enrollment.get("server_scope_hash")
-    if (
-        not isinstance(expected_scope_hash, str)
-        or not expected_scope_hash
-        or remote.get("scope_hash") != expected_scope_hash
-    ):
+    if not isinstance(expected_scope_hash, str) or not expected_scope_hash:
+        raise AutoUploadError(
+            "reauthorization_required",
+            "Reauthorize automatic uploads to accept the updated hosted terms "
+            "(run: clawjournal auto-upload enable).",
+        )
+    if remote.get("scope_hash") != expected_scope_hash:
         raise AutoUploadError(
             "authorization_version_mismatch",
             "The hosted recurring scope no longer matches local state.",

@@ -263,6 +263,19 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
           'Verify your email before loading the recurring authorization.',
           isCurrent,
         );
+      } else if (
+        requestError instanceof ApiError &&
+        requestError.status === 409 &&
+        requestError.body.code === 'authorization_required'
+      ) {
+        // A 409 challenge this build cannot parse means the running daemon
+        // speaks an older protocol than this page (e.g. dist upgraded but the
+        // daemon not restarted). Retrying can never succeed — say so.
+        setError(
+          'The running ClawJournal service is older than this page and returned '
+          + 'an incompatible authorization challenge. Restart the service '
+          + '(clawjournal serve) and reload, then try again.',
+        );
       } else {
         setError(errorMessage(requestError, 'Could not load recurring authorization.'));
       }
@@ -445,8 +458,16 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       setPendingEmail(null);
       setDevCode(null);
       toast('Email verified', 'success');
-      if (challenge && accepted) {
+      if (challenge && accepted && ownershipCertified) {
         await enableWithAcceptedTerms();
+      } else if (challenge) {
+        // Verified but an acceptance box is unchecked: surface which act is
+        // missing instead of a silent dead-end after the code is consumed.
+        setError(
+          accepted
+            ? 'Check the ownership certification box, then press Continue to enable.'
+            : 'Check both acceptance boxes, then press Continue to enable.',
+        );
       } else {
         setVerificationRequired(false);
         requestedRef.current = true;

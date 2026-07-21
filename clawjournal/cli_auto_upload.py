@@ -259,15 +259,20 @@ def run(args) -> None:
         retention_version = args.accept_retention_version
         ownership_version = args.accept_ownership_certification_version
         profile_hash = args.accept_authorization_profile_hash
-        if not output_json:
-            # enable() strict-refreshes every enrolled source log after its
-            # fast hosted checks; on a large history that is minutes of
-            # silent CPU without this notice.
-            print(
-                "Checking the hosted service, then refreshing the enrolled "
-                "source scope (a large history can take a few minutes)…",
-                file=sys.stderr,
-            )
+
+        def scan_notice() -> None:
+            # Every enable() call strict-refreshes the enrolled source logs
+            # after its fast hosted checks; on a large history that is minutes
+            # of silent CPU without this notice — including the re-runs after
+            # typing the acceptance versions and after email verification.
+            if not output_json:
+                print(
+                    "Checking the hosted service, then refreshing the enrolled "
+                    "source scope (a large history can take a few minutes)…",
+                    file=sys.stderr,
+                )
+
+        scan_notice()
         result = auto_upload.enable(
             agent=args.agent,
             accepted_authorization_version=auth_version,
@@ -290,6 +295,7 @@ def run(args) -> None:
                     ownership_version,
                     profile_hash,
                 ) = accepted
+                scan_notice()
                 result = auto_upload.enable(
                     agent=args.agent,
                     accepted_authorization_version=auth_version,
@@ -300,6 +306,7 @@ def run(args) -> None:
         if result.get("code") == "email_verification_required" and not output_json:
             if _fresh_email_verification():
                 # Re-fetching also catches terms changed while the code was in flight.
+                scan_notice()
                 result = auto_upload.enable(
                     agent=args.agent,
                     accepted_authorization_version=auth_version,

@@ -387,6 +387,32 @@ describe('AutoUploadPanel status and controls', () => {
   });
 });
 
+describe('AuthorizationDialog daemon version skew', () => {
+  it('explains a v1-shaped challenge from an older daemon instead of a retry loop', async () => {
+    const enrolled = status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: { sources: ['claude'], projects: ['project-a'] },
+      authorization: { version: 'recurring-v1', text: 'terms' },
+      hooks: [
+        { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
+      ],
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(enrolled);
+    const v1Error = authorizationRequired();
+    delete (v1Error.body as Record<string, unknown>).ownership_certification;
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(v1Error);
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+
+    expect(
+      await screen.findByText(/older than this page/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+  });
+});
+
 describe('AuthorizationDialog focus and dismissal', () => {
   it('moves focus into the dialog and stays dismissable while the challenge loads', async () => {
     const enrolled = status({
