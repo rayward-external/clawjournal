@@ -55,7 +55,6 @@ from .index import (
     add_policy,
     already_shared_revision_blockers,
     apply_share_redactions,
-    build_trufflehog_blocked_sessions,
     create_share,
     export_share_to_disk,
     FAILURE_VALUE_SOURCE_SCOPE,
@@ -1536,15 +1535,32 @@ def _transport_manifest_bytes(manifest_file: Path) -> bytes:
 
 
 def _build_share_zip(export_dir: Path) -> bytes:
-    """Build the finalized share zip expected by hosted submission."""
-    required = ["sessions.jsonl", "manifest.json", "trufflehog.post-pii.json"]
+    """Build the finalized share zip expected by hosted submission.
+
+    `secret-scan.post-pii.json` (the tiered gate's proof marker) is
+    required alongside the legacy `trufflehog.post-pii.json` so a zip
+    can never be built from an export that skipped the combined gate.
+    """
+    required = [
+        "sessions.jsonl",
+        "manifest.json",
+        "trufflehog.post-pii.json",
+        "secret-scan.post-pii.json",
+    ]
     missing = [name for name in required if not (export_dir / name).exists()]
     if missing:
         raise FileNotFoundError(f"Finalized share is missing {', '.join(missing)}")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in ("sessions.jsonl", "manifest.json", "trufflehog.json", "trufflehog.post-pii.json"):
+        for name in (
+            "sessions.jsonl",
+            "manifest.json",
+            "trufflehog.json",
+            "trufflehog.post-pii.json",
+            "secret-scan.json",
+            "secret-scan.post-pii.json",
+        ):
             path = export_dir / name
             if path.exists():
                 payload = (
@@ -1727,6 +1743,7 @@ def finalize_share_export_for_upload(
     export_dir: Path,
     manifest: dict[str, Any],
     *,
+    conn: sqlite3.Connection,
     ai_pii: bool = False,
     ai_backend: str = "auto",
     before_ai_call: Callable[[], None] | None = None,
@@ -1734,9 +1751,10 @@ def finalize_share_export_for_upload(
     """Apply final local-only gates before an export becomes an upload zip.
 
     `export_share_to_disk()` performs deterministic redaction and a first
-    TruffleHog scan. Hosted/browser upload needs the same extra local PII pass
-    that the legacy ingest path used, then a fresh TruffleHog scan over the
-    rewritten `sessions.jsonl`.
+    secret-scan gate. Hosted/browser upload needs the same extra local PII
+    pass that the legacy ingest path used, then a fresh gate run over the
+    rewritten `sessions.jsonl` (`conn` feeds the tier policy's findings-table
+    decisions).
     """
     sessions_file = export_dir / "sessions.jsonl"
     manifest_file = export_dir / "manifest.json"
@@ -1746,10 +1764,11 @@ def finalize_share_export_for_upload(
 
     if manifest.get("blocked"):
         return {
-            "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+            "error": manifest.get("block_message") or "Share blocked by the secret scan",
             "block_reason": manifest.get("block_reason"),
             "blocked_sessions": manifest.get("blocked_sessions", []),
             "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+            "secret_scan_summary": manifest.get("redaction_summary", {}).get("secret_scan"),
             "status": 422,
         }, manifest
 
@@ -1821,56 +1840,95 @@ def finalize_share_export_for_upload(
         }, manifest
 
     try:
+        from ..redaction import scan_policy
         from ..redaction import trufflehog as trufflehog_scanner
+        from .share_gate import build_blocked_sessions, run_share_gate
 
-        post_pii_report = trufflehog_scanner.scan_file(sessions_file)
+        post_pii_gate = run_share_gate(sessions_file, manifest, conn=conn)
     except Exception as exc:
-        logger.warning("Post-PII TruffleHog scan failed: %s", exc)
+        logger.warning("Post-PII secret-scan gate failed: %s", exc)
         return {
             "error": "Post-redaction scan failed — upload aborted.",
             "detail": str(exc),
             "status": 500,
         }, manifest
 
-    # `trufflehog.json` is the authoritative report shipped in the zip.
-    # `trufflehog.post-pii.json` is a compatibility/diagnostic marker that
-    # proves the final artifact passed the post-PII gate.
-    post_pii_report.engine = trufflehog_scanner.engine_fingerprint()
-    trufflehog_scanner.write_report(export_dir / "trufflehog.json", post_pii_report)
-    trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
+    # `secret-scan.json` is the authoritative combined report shipped in
+    # the zip; `secret-scan.post-pii.json` proves the final artifact
+    # passed the post-PII gate. The TruffleHog sub-report keeps its
+    # legacy artifact names (all-clean on every shippable bundle, since
+    # verified findings are block-tier) for pre-tier consumers.
+    scan_policy.write_report(export_dir / "secret-scan.json", post_pii_gate)
+    scan_policy.write_report(export_dir / "secret-scan.post-pii.json", post_pii_gate)
+    th_sub_report = post_pii_gate.trufflehog_report
+    if th_sub_report is not None:
+        trufflehog_scanner.write_report(export_dir / "trufflehog.json", th_sub_report)
+        trufflehog_scanner.write_report(
+            export_dir / "trufflehog.post-pii.json", th_sub_report
+        )
     if isinstance(redaction_summary, dict):
-        summary = post_pii_report.summary()
-        redaction_summary["trufflehog"] = summary
-        redaction_summary["trufflehog_post_pii"] = summary
+        gate_summary = post_pii_gate.summary()
+        redaction_summary["secret_scan"] = gate_summary
+        redaction_summary["secret_scan_post_pii"] = gate_summary
+        th_summary = (
+            th_sub_report.summary()
+            if th_sub_report is not None
+            else {
+                "findings": 0,
+                "bypassed": post_pii_gate.bypassed,
+                "binary_missing": post_pii_gate.binary_missing,
+                "scan_error": post_pii_gate.scan_error,
+                "engine": post_pii_gate.engine,
+            }
+        )
+        redaction_summary["trufflehog"] = th_summary
+        redaction_summary["trufflehog_post_pii"] = th_summary
 
-    if post_pii_report.blocking or post_pii_report.bypassed:
+    if post_pii_gate.blocking or post_pii_gate.bypassed:
         manifest["blocked"] = True
         manifest["block_reason"] = (
-            post_pii_report.block_reason
-            or ("trufflehog-bypassed" if post_pii_report.bypassed else None)
+            post_pii_gate.block_reason
+            or ("secret-scan-bypassed" if post_pii_gate.bypassed else None)
         )
-        manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
-        blocked_sessions = build_trufflehog_blocked_sessions(manifest, post_pii_report)
+        manifest["block_message"] = scan_policy.format_block_message(post_pii_gate)
+        blocked_sessions = build_blocked_sessions(
+            manifest, post_pii_gate.block_review_findings
+        )
         if blocked_sessions:
             manifest["blocked_sessions"] = blocked_sessions
         with open(manifest_file, "w") as f:
             json.dump(manifest, f, indent=2, default=str)
-        if post_pii_report.bypassed:
+        if post_pii_gate.bypassed:
             return {
                 "error": (
-                    "Refusing to prepare upload zip: TruffleHog was bypassed via "
-                    "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable and retry."
+                    "Refusing to prepare upload zip: the secret scanners were "
+                    "bypassed via CLAWJOURNAL_SKIP_BETTERLEAKS/"
+                    "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable(s) and retry."
                 ),
-                "block_reason": "trufflehog-bypassed",
+                "block_reason": "secret-scan-bypassed",
                 "status": 422,
             }, manifest
         return {
-            "error": trufflehog_scanner.format_block_message(post_pii_report),
-            "block_reason": post_pii_report.block_reason,
+            "error": scan_policy.format_block_message(post_pii_gate),
+            "block_reason": post_pii_gate.block_reason,
             "blocked_sessions": manifest.get("blocked_sessions", []),
-            "trufflehog_summary": post_pii_report.summary(),
+            "trufflehog_summary": redaction_summary.get("trufflehog")
+            if isinstance(redaction_summary, dict) else None,
+            "secret_scan_summary": post_pii_gate.summary(),
             "status": 422,
         }, manifest
+
+    # Gate-time span redactions from the post-PII pass fold into the
+    # manifest counters like the export-time ones do.
+    if post_pii_gate.gate_redactions and isinstance(redaction_summary, dict):
+        redaction_summary["total_redactions"] = (
+            redaction_summary.get("total_redactions", 0)
+            + post_pii_gate.gate_redactions
+        )
+        by_type = redaction_summary.setdefault("by_type", {})
+        by_type["gate_secret_scan"] = (
+            by_type.get("gate_secret_scan", 0) + post_pii_gate.gate_redactions
+        )
 
     with open(manifest_file, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
@@ -1941,6 +1999,24 @@ def _manifest_is_finalized_for_upload(
             return False
         if coverage.get("full") != pii_review.get("session_count"):
             return False
+    gate = summary.get("secret_scan_post_pii")
+    if isinstance(gate, dict):
+        # Tier-aware finalized check: warn-tier findings (and gate-time
+        # redactions) ship; block/review tiers, non-convergence, bypass,
+        # and scanner failure do not.
+        tier_counts = gate.get("tier_counts")
+        if not isinstance(tier_counts, dict):
+            return False
+        return (
+            tier_counts.get("block", 0) == 0
+            and tier_counts.get("review", 0) == 0
+            and gate.get("converged") is True
+            and gate.get("bypassed") is False
+            and gate.get("binary_missing") is False
+            and not gate.get("scan_error")
+        )
+    # Legacy manifests (sealed before the tiered gate existed) fall back
+    # to the all-or-nothing TruffleHog check.
     return (
         post_pii_scan.get("findings") == 0
         and post_pii_scan.get("bypassed") is False
@@ -1963,6 +2039,7 @@ def _load_finalized_share_export(
     sessions_file = export_dir / "sessions.jsonl"
     trufflehog_file = export_dir / "trufflehog.json"
     post_pii_file = export_dir / "trufflehog.post-pii.json"
+    gate_post_pii_file = export_dir / "secret-scan.post-pii.json"
     if not (
         manifest_file.exists()
         and sessions_file.exists()
@@ -1970,9 +2047,22 @@ def _load_finalized_share_export(
         and post_pii_file.exists()
     ):
         return None
+    # Exports finalized by the tiered gate carry its post-PII report
+    # both in the manifest summary and on disk. A legacy export (sealed
+    # before the tiered gate existed) has neither — reject it here so it
+    # rebuilds once through the current gate rather than shipping under
+    # retired semantics.
+    if not gate_post_pii_file.exists():
+        return None
     try:
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        return None
+    summary_probe = manifest.get("redaction_summary")
+    if not (
+        isinstance(summary_probe, dict)
+        and isinstance(summary_probe.get("secret_scan_post_pii"), dict)
+    ):
         return None
     if manifest.get("share_id") != share_id and manifest.get("bundle_id") != share_id:
         return None
@@ -2067,6 +2157,7 @@ def _prepare_share_export_for_upload(
     error, manifest = finalize_share_export_for_upload(
         export_dir,
         manifest,
+        conn=conn,
         ai_pii=effective_ai_pii,
         ai_backend=ai_pii_backend,
         before_ai_call=before_ai_call,

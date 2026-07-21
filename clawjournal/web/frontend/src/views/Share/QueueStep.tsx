@@ -28,9 +28,6 @@ export interface QueueStepProps {
   setAiPiiEnabled: (enabled: boolean) => void;
   onRemove: (id: string) => void;
   onAdd: (id: string) => void;
-  onClearAll: () => void;
-  onAddMany: (ids: string[]) => void;
-  onRemoveMany: (ids: string[]) => void;
   onReorder: (fromId: string, overId: string) => void;
   onHelp: () => void;
   onContinue: () => void;
@@ -166,39 +163,6 @@ export function QueueStep(p: QueueStepProps) {
           <option value="90d">Last 90 days</option>
         </select>
       </div>
-      {filteredSessions.length > 0 && (() => {
-        const filteredIds = filteredSessions.map(s => s.session_id);
-        const selectedInFilter = filteredIds.filter(id => selectedIds.has(id)).length;
-        const filterActive = !!(p.searchQuery || p.sourceFilter || p.projectFilter || p.scoreFilter > 0 || p.dateFilter);
-        const allSelected = selectedInFilter === filteredIds.length;
-        const batchBtn = {
-          ...btnGhost, fontSize: 12, padding: '5px 10px',
-          border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white,
-        };
-        return (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={() => p.onAddMany(filteredIds)}
-              disabled={allSelected}
-              style={{ ...batchBtn, opacity: allSelected ? 0.45 : 1, cursor: allSelected ? 'not-allowed' : 'pointer' }}
-            >
-              {filterActive ? `Select ${filteredIds.length} filtered` : `Select all ${filteredIds.length}`}
-            </button>
-            <button
-              type="button"
-              onClick={() => filterActive ? p.onRemoveMany(filteredIds) : p.onClearAll()}
-              disabled={selectedInFilter === 0}
-              style={{ ...batchBtn, color: colors.red700, opacity: selectedInFilter === 0 ? 0.45 : 1, cursor: selectedInFilter === 0 ? 'not-allowed' : 'pointer' }}
-            >
-              {filterActive ? `Deselect ${selectedInFilter} filtered` : 'Deselect all'}
-            </button>
-            <span style={{ fontSize: 11.5, color: colors.gray500 }}>
-              {selectedInFilter} of {filteredIds.length}{filterActive ? ' filtered' : ''} selected
-            </span>
-          </div>
-        );
-      })()}
       <div style={{ maxHeight: '36vh', overflowY: 'auto', border: `1px solid ${colors.gray200}`, borderRadius: 6, background: colors.white }}>
         {filteredSessions.length === 0 ? (
           <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
@@ -377,36 +341,22 @@ export function QueueStep(p: QueueStepProps) {
                 {uniqueProjects.length > 0 && ` · ${uniqueProjects.length} project${uniqueProjects.length !== 1 ? 's' : ''}`}
               </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <button
-                type="button"
-                onClick={p.onClearAll}
-                title="Remove every trace from the bundle"
+            {p.showAddTraces ? (
+              <span style={{ color: colors.gray500, fontSize: 11.5 }}>
+                Use the checkboxes below to deselect traces
+              </span>
+            ) : (
+              <span
                 style={{
-                  ...btnGhost, fontSize: 11.5, color: colors.red700,
-                  padding: '4px 9px', border: `1px solid ${colors.gray300}`,
-                  borderRadius: 6, background: colors.white,
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  color: colors.gray500, fontSize: 11.5,
                 }}
+                title="Drag the handle on the left of each row to reorder"
               >
-                Deselect all
-              </button>
-              {p.showAddTraces ? (
-                <span style={{ color: colors.gray500, fontSize: 11.5 }}>
-                  Use the checkboxes below to deselect traces
-                </span>
-              ) : (
-                <span
-                  style={{
-                    display: 'inline-flex', alignItems: 'center', gap: 6,
-                    color: colors.gray500, fontSize: 11.5,
-                  }}
-                  title="Drag the handle on the left of each row to reorder"
-                >
-                  <Icon name="grip" size={12} />
-                  Drag to reorder
-                </span>
-              )}
-            </div>
+                <Icon name="grip" size={12} />
+                Drag to reorder
+              </span>
+            )}
             </div>
             <div style={{
               padding: '7px 14px 10px',

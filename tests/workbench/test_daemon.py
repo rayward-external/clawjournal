@@ -1308,6 +1308,9 @@ class TestScanner:
         (tmp_path / "trufflehog.post-pii.json").write_text(
             "{}\n", encoding="utf-8"
         )
+        (tmp_path / "secret-scan.post-pii.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
 
         zip_bytes = _build_share_zip(tmp_path)
 
@@ -2731,25 +2734,42 @@ def _share_config(**overrides):
 
 
 def _mock_trufflehog_clean(monkeypatch):
-    """Share-upload tests need to simulate a real, clean TruffleHog scan.
+    """Share-upload tests need to simulate real, clean secret scans.
 
-    The suite-wide autouse fixture bypasses TruffleHog for every test,
-    and the upload path now (correctly) refuses bypassed shares. Unset
-    the bypass and install a mock scan that reports zero findings.
+    The suite-wide autouse fixture bypasses both scanners for every
+    test, and the upload path (correctly) refuses bypassed shares.
+    Unset both bypasses and install mock scans that report zero
+    findings — the share gate consults ``scan_file_with_raws`` on both
+    wrappers, so those are what get stubbed.
     """
-    from clawjournal.redaction import trufflehog
+    from clawjournal.redaction import betterleaks, trufflehog
 
     monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
     monkeypatch.setattr(trufflehog, "is_available", lambda: True)
-    monkeypatch.setattr(
-        trufflehog,
-        "scan_file",
-        lambda path: trufflehog.TruffleHogReport(
+
+    def _clean_th_scan(path, *, results="verified,unknown,unverified"):
+        return trufflehog.TruffleHogReport(
             scanned_path=str(path),
             scanned_sha256="sha256:0",
+        ), []
+
+    monkeypatch.setattr(trufflehog, "scan_file_with_raws", _clean_th_scan)
+    monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+
+    monkeypatch.delenv(betterleaks.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(betterleaks, "is_available", lambda: True)
+    monkeypatch.setattr(
+        betterleaks,
+        "scan_file_with_raws",
+        lambda path: (
+            betterleaks.BetterleaksReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+            ),
+            [],
         ),
     )
-    monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+    monkeypatch.setattr(betterleaks, "_scan_text_for_raw_matches", lambda text: [])
 
 
 def test_redaction_settings_fingerprint_covers_all_inputs():
@@ -3094,6 +3114,7 @@ def test_finalize_reraises_control_gate_instead_of_swallowing(
         daemon_module.finalize_share_export_for_upload(
             export_dir,
             {"redaction_summary": {}},
+            conn=open_index(),
             ai_pii=True,
             ai_backend="codex",
             before_ai_call=lambda: None,
@@ -3163,6 +3184,7 @@ def test_finalize_blocks_rules_only_fallback_when_ai_configured(tmp_path, monkey
     error, manifest = daemon.finalize_share_export_for_upload(
         tmp_path,
         {},
+        conn=open_index(),
         ai_pii=True,
         ai_backend="codex",
     )
@@ -3475,38 +3497,29 @@ class TestShareAPI:
             "retention_policy_version": "retention-v1",
         }
 
-    def test_upload_refuses_when_trufflehog_bypassed(self, server, monkeypatch):
-        """CLAWJOURNAL_SKIP_TRUFFLEHOG is a dev/CI escape hatch for
-        local bundle-export. Uploading an unscanned share to a remote
-        endpoint must fail closed — otherwise the escape hatch is a
-        one-flag ``--ship-secrets-anyway``."""
+    def test_upload_refuses_when_scanners_bypassed(self, server, monkeypatch):
+        """CLAWJOURNAL_SKIP_TRUFFLEHOG / CLAWJOURNAL_SKIP_BETTERLEAKS
+        are dev/CI escape hatches for local bundle-export. Uploading an
+        unscanned share to a remote endpoint must fail closed —
+        otherwise the escape hatch is a one-flag
+        ``--ship-secrets-anyway``. A single bypassed engine is enough:
+        a partially scanned share is not a scanned share."""
         from clawjournal.redaction import trufflehog
 
         WorkbenchHandler._last_share_time = 0.0
         share_id = self._create_and_export_share(server)
 
-        # Unwind the class-level clean mock: simulate an actual bypass.
+        # Unwind the class-level clean mock: simulate an actual bypass
+        # of one engine (the gate treats any bypass as a whole-gate
+        # bypass).
         monkeypatch.setenv(trufflehog.SKIP_ENV_VAR, "1")
-        # Ensure scan_file observes the bypass by exercising the real
-        # path (short-circuits to bypassed=True) rather than the clean
-        # stub from the autouse fixture.
-        from pathlib import Path as _Path
-
-        def _real_bypass_scan(path):
-            return trufflehog.TruffleHogReport(
-                scanned_path=str(path),
-                scanned_sha256="sha256:0",
-                bypassed=True,
-            )
-
-        monkeypatch.setattr(trufflehog, "scan_file", _real_bypass_scan)
 
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
             status, data = _post(server, f"/api/shares/{share_id}/upload", self._consent_body())
 
         assert status == 422, data
-        assert data.get("block_reason") == "trufflehog-bypassed"
+        assert data.get("block_reason") == "secret-scan-bypassed"
         assert "CLAWJOURNAL_SKIP_TRUFFLEHOG" in data.get("error", "")
 
     def test_share_success(self, server, monkeypatch):

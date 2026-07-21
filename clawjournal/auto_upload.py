@@ -4018,7 +4018,7 @@ def _run_cycle_impl(
                             "AI-PII coverage was incomplete; no artifact was submitted.",
                             retryable=True,
                         )
-                    if block_reason == "trufflehog-findings" or blocked:
+                    if block_reason in ("trufflehog-findings", "secret-scan-findings") or blocked:
                         raise AutoUploadError(
                             "unmappable_findings",
                             str(

@@ -361,6 +361,22 @@ def scan_file(path: Path) -> BetterleaksReport:
     ``binary_missing``) so the policy layer can fail closed rather
     than the caller handling a raw exception.
     """
+    report, _raws = scan_file_with_raws(path)
+    return report
+
+
+def scan_file_with_raws(path: Path) -> tuple[BetterleaksReport, list[dict]]:
+    """Gate-internal variant of ``scan_file`` that also returns the raw
+    matches from the same single subprocess, so the share gate's
+    redact-and-rescan loop can replace the exact on-disk byte
+    sequences without a second scan.
+
+    Raw entries are ``[{"raw", "rule_id", "entropy", "line"}]``,
+    deduped per ``(rule_id, raw, line)`` — the same value on two lines
+    stays two entries because tier decisions are per-session. Raw
+    values must never be persisted or returned from public ``scan_*``
+    helpers.
+    """
     try:
         scanned_sha256 = _sha256_file(path)
     except OSError as exc:
@@ -368,21 +384,21 @@ def scan_file(path: Path) -> BetterleaksReport:
             scanned_path=str(path),
             scanned_sha256="",
             scan_error=f"could not hash scan target: {exc.__class__.__name__}",
-        )
+        ), []
 
     if is_bypassed():
         return BetterleaksReport(
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             bypassed=True,
-        )
+        ), []
 
     if not is_available():
         return BetterleaksReport(
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             binary_missing=True,
-        )
+        ), []
 
     parsed_findings, error = _run_report_scan(
         ["dir", str(path)], input_bytes=None, timeout=120
@@ -392,21 +408,33 @@ def scan_file(path: Path) -> BetterleaksReport:
             scanned_path=str(path),
             scanned_sha256=scanned_sha256,
             scan_error=error,
-        )
+        ), []
 
     findings: list[BetterleaksFinding] = []
+    raw_matches: list[dict] = []
     rule_counts: dict[str, int] = {}
     seen_keys: set[tuple] = set()
+    seen_raw_keys: set[tuple] = set()
     for parsed in parsed_findings:
         finding = _parse_finding(parsed)
         if finding is None:
             continue
         key = (finding.rule_id, finding.line, finding.raw_sha256)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        findings.append(finding)
-        rule_counts[finding.rule_id] = rule_counts.get(finding.rule_id, 0) + 1
+        if key not in seen_keys:
+            seen_keys.add(key)
+            findings.append(finding)
+            rule_counts[finding.rule_id] = rule_counts.get(finding.rule_id, 0) + 1
+        raw = parsed.get("Secret")
+        if isinstance(raw, str) and raw:
+            raw_key = (finding.rule_id, raw, finding.line)
+            if raw_key not in seen_raw_keys:
+                seen_raw_keys.add(raw_key)
+                raw_matches.append({
+                    "raw": raw,
+                    "rule_id": finding.rule_id,
+                    "entropy": finding.entropy,
+                    "line": finding.line,
+                })
 
     findings.sort(key=lambda f: (f.line if f.line is not None else 10**9, f.rule_id))
     top = sorted(rule_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
@@ -416,7 +444,7 @@ def scan_file(path: Path) -> BetterleaksReport:
         scanned_sha256=scanned_sha256,
         findings=findings,
         top_rules=[rule for rule, _ in top],
-    )
+    ), raw_matches
 
 
 def _run_report_scan(

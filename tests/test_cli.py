@@ -981,16 +981,35 @@ def bundle_index(tmp_path, monkeypatch):
     monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config")
     monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
 
-    from clawjournal.redaction import trufflehog
+    from clawjournal.redaction import betterleaks, trufflehog
     monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(trufflehog, "is_available", lambda: True)
     monkeypatch.setattr(
         trufflehog,
-        "scan_file",
-        lambda path: trufflehog.TruffleHogReport(
-            scanned_path=str(path),
-            scanned_sha256="sha256:0",
+        "scan_file_with_raws",
+        lambda path, *, results="verified,unknown,unverified": (
+            trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+            ),
+            [],
         ),
     )
+    monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+    monkeypatch.delenv(betterleaks.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(betterleaks, "is_available", lambda: True)
+    monkeypatch.setattr(
+        betterleaks,
+        "scan_file_with_raws",
+        lambda path: (
+            betterleaks.BetterleaksReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+            ),
+            [],
+        ),
+    )
+    monkeypatch.setattr(betterleaks, "_scan_text_for_raw_matches", lambda text: [])
     monkeypatch.setattr(
         "clawjournal.redaction.pii.review_session_pii_hybrid",
         lambda session, **kw: ([], "full") if kw.get("return_coverage") else [],

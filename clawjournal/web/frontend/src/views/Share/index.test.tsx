@@ -109,51 +109,6 @@ describe('Share selection defaults', () => {
     });
   });
 
-  it('keeps a custom queue order when bulk-selecting filtered traces', async () => {
-    mockInitialLoad(readyStats(3));
-
-    render(
-      <MemoryRouter initialEntries={['/share?ids=s2,s1']}>
-        <ToastProvider><Share /></ToastProvider>
-        <LocationProbe />
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
-    fireEvent.change(screen.getByRole('textbox', { name: 'Search traces by title or project' }), {
-      target: { value: 's3' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Select 1 filtered' }));
-
-    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
-    await waitFor(() => {
-      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
-      expect(params.get('ids')).toBe('s2,s1,s3');
-      expect(params.has('selection')).toBe(false);
-    });
-  });
-
-  it('restores default queue order when bulk selection completes a default subset', async () => {
-    mockInitialLoad(readyStats(3));
-
-    render(
-      <MemoryRouter initialEntries={['/share?ids=s1,s3']}>
-        <ToastProvider><Share /></ToastProvider>
-        <LocationProbe />
-      </MemoryRouter>,
-    );
-
-    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Select all 3' }));
-
-    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
-    await waitFor(() => {
-      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
-      expect(params.get('selection')).toBe('all');
-      expect(params.has('ids')).toBe(false);
-    });
-  });
-
   it('bounds large-history rendering while retaining and confirming the full selection', async () => {
     mockInitialLoad(readyStats(125));
 
