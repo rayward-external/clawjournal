@@ -1277,6 +1277,11 @@ def enable(
         response: dict[str, Any] | None = None
         credential_record: dict[str, Any] | None = None
         server_scope_hash: str | None = None
+        # True only once the read-back confirmed the server recorded exactly
+        # the certification version the user accepted. Until then, a definite
+        # PATCH is in an UNVERIFIABLE consent state (the request carries only
+        # a boolean), and any failure must revoke rather than pause.
+        certification_verified = False
         server_reauthorization_succeeded = False
         recovery_only_written = False
         try:
@@ -1488,6 +1493,7 @@ def enable(
                     "The hosted ownership certification changed while enrolling; "
                     "review the updated terms and enable again.",
                 )
+            certification_verified = True
 
             config = load_config()
             config["auto_upload_capability_available"] = True
@@ -1577,6 +1583,7 @@ def enable(
             current_after_failure = get_auto_upload_enrollment(conn)
             if (
                 server_reauthorization_succeeded
+                and certification_verified
                 and isinstance(exc, ControlChanged)
                 and isinstance(response, dict)
                 and isinstance(response.get("enrollment_id"), str)
@@ -1676,19 +1683,24 @@ def enable(
             # recovery tombstone and records revocation_pending.
             response_local = response
             record_local = credential_record
-            # A PATCH recorded under a certification the user never accepted
-            # must not survive as a paused-but-live hosted enrollment: the
-            # server-side consent record misrepresents the user and the client
-            # cannot un-PATCH, so the update path routes into the same revoke
-            # machinery the create path uses. Every other updating failure
-            # keeps the legitimate prior enrollment and merely pauses.
-            revoke_unaccepted_certification = (
-                isinstance(exc, AutoUploadError)
-                and exc.code == "certification_not_accepted"
+            # After a DEFINITE PATCH the request's certification boolean gives
+            # no way to know which certification version the server recorded;
+            # only a successful, matching read-back establishes it. Until that
+            # verification, any failure — an explicit mismatch, a failed or
+            # malformed read-back, a control race before it — leaves a live
+            # hosted enrollment whose consent record cannot be shown to match
+            # what the user accepted, and the client cannot un-PATCH. Route
+            # every such failure into the same revoke machinery the create
+            # path uses. Updating failures after verification (or before the
+            # PATCH was definite) keep the legitimate enrollment and pause.
+            revoke_unverified_certification = (
+                updating
+                and server_reauthorization_succeeded
+                and not certification_verified
                 and isinstance(response_local, dict)
                 and bool(response_local.get("enrollment_id"))
             )
-            if updating and not revoke_unaccepted_certification:
+            if updating and not revoke_unverified_certification:
                 update_auto_upload_enrollment(
                     conn,
                     expected_generation=generation,

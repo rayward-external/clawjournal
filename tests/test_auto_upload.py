@@ -2279,6 +2279,78 @@ def test_certification_rotation_during_patch_revokes_the_live_enrollment(
         conn.close()
 
 
+@pytest.mark.parametrize("failure_mode", ["get_fails", "no_scope_hash"])
+def test_unverifiable_read_back_after_patch_revokes_like_a_mismatch(
+    isolated_auto_upload,
+    monkeypatch,
+    failure_mode,
+):
+    """After a definite PATCH the certification boolean gives no way to know
+    which version the server recorded — only the read-back can establish it.
+    A failed or malformed read-back is therefore an UNVERIFIABLE consent state
+    on a live enrollment and must take the same compensating revoke as a
+    confirmed mismatch, never a pause that leaves the enrollment active."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(
+        auto,
+        "update_enrollment",
+        lambda *_a, **_k: {
+            "enrollment_id": "server-enrollment-1",
+            "enrolled_at": ENROLLED_AT,
+            "authorization_revision": 2,
+        },
+    )
+    if failure_mode == "get_fails":
+        def read_back(*_args, **_kwargs):
+            raise RecurringServiceError(
+                code="server_unavailable", message="down", retryable=True
+            )
+    else:
+        def read_back(*_args, **_kwargs):
+            return {"enrollment_id": "server-enrollment-1"}
+
+    monkeypatch.setattr(auto, "get_enrollment", read_back)
+    revoke_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            enrollment_id
+        )
+        or {},
+    )
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == (
+        "server_unavailable" if failure_mode == "get_fails" else "malformed_enrollment_response"
+    )
+    assert revoke_calls == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
+    finally:
+        conn.close()
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,
