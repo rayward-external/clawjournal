@@ -2082,10 +2082,16 @@ def _ranked_size_prefix(
     per_trace_overhead = 64 * 1024
     used = fixed_overhead
     selected: list[dict[str, Any]] = []
+    missing = 0
     for candidate in candidates:
         detail = get_session_detail(conn, str(candidate.get("session_id") or ""))
         if detail is None:
-            break
+            # The session row vanished between the candidate report and this
+            # read (e.g. the scanner pruned a deleted raw log). It cannot be
+            # packaged; skip it so the remaining ranked candidates can still
+            # ship, and let the caller tell "vanished" apart from "oversized".
+            missing += 1
+            continue
         redacted, _count, _log = apply_share_redactions(
             conn,
             detail,
@@ -2102,7 +2108,8 @@ def _ranked_size_prefix(
             break
         selected.append(dict(candidate))
         used = projected
-    return selected, max(0, len(candidates) - len(selected))
+    deferred_by_size = max(0, len(candidates) - len(selected) - missing)
+    return selected, deferred_by_size, missing
 
 
 def _current_revisions(
@@ -2492,6 +2499,19 @@ def _transition_submission(
             "AND submission_state = ?",
             (to_state, share_id, from_state),
         )
+        if to_state == "submitting" and cursor.rowcount == 1:
+            # Entering 'submitting' means every gate just passed, so any stale
+            # next_retry_at from an earlier unrelated failure is obsolete —
+            # clear it in the same transaction. A crash mid-POST then leaves
+            # 'submitting' with no backoff, keeping the first receipt reconcile
+            # immediately due; only a failure of THIS share's submit/reconcile
+            # can stamp a fresh backoff afterwards, and the hook due-check
+            # rightly waits that one out.
+            conn.execute(
+                "UPDATE auto_upload_enrollment SET next_retry_at = NULL "
+                "WHERE singleton_id = 1 AND generation = ?",
+                (generation,),
+            )
         conn.commit()
         return cursor.rowcount == 1
     except Exception:
@@ -3173,13 +3193,37 @@ def _run_cycle_impl(
                     if enrollment.get("mode") != "enabled":
                         return receipt_probe
                 except RecurringServiceError as exc:
+                    # A failed receipt lookup must stamp backoff: the hook
+                    # due-check forces 'submitting' immediately due, so without
+                    # next_retry_at every SessionStart would relaunch a
+                    # network-calling runner (a spawn storm). Receipt recovery
+                    # is read-only, so it is always safe to retry later —
+                    # record retryable even for normally terminal codes rather
+                    # than action_required, which clears next_retry_at and
+                    # would keep the storm alive.
+                    _record_cycle_result(
+                        conn,
+                        generation=int(enrollment["generation"]),
+                        code=exc.code,
+                        retryable=True,
+                        retry_after=exc.retry_after,
+                    )
                     return exc.as_result()
                 except (AutoUploadError, CredentialStoreError) as exc:
-                    if isinstance(exc, AutoUploadError):
-                        return exc.as_result()
-                    return AutoUploadError(
-                        "credential_store_failed", str(exc)
-                    ).as_result()
+                    error = (
+                        exc
+                        if isinstance(exc, AutoUploadError)
+                        else AutoUploadError("credential_store_failed", str(exc))
+                    )
+                    # Same storm guard as above: stamp backoff so the forced
+                    # 'submitting' due-check waits before the next attempt.
+                    _record_cycle_result(
+                        conn,
+                        generation=int(enrollment["generation"]),
+                        code=error.code,
+                        retryable=True,
+                    )
+                    return error.as_result()
 
             if enrollment.get("mode") == "off":
                 return AutoUploadError(
@@ -3495,7 +3539,7 @@ def _run_cycle_impl(
                     return {"ok": True, "code": "nothing_new", "count": 0}
                 settings = get_effective_share_settings(conn, config)
                 settings["source_filter"] = list(enrollment["enrolled_sources"])
-                selected, deferred_by_size = _ranked_size_prefix(
+                selected, deferred_by_size, missing_candidates = _ranked_size_prefix(
                     conn,
                     report["selected"],
                     settings=settings,
@@ -3504,11 +3548,21 @@ def _run_cycle_impl(
                 report["deferred_by_size"] = deferred_by_size
                 report["exclusion_counts"]["deferred_by_size"] = deferred_by_size
                 if not selected:
-                    # Candidates existed but none fit the hosted size budget —
-                    # a genuine oversize condition worth surfacing to the user.
-                    raise AutoUploadError(
-                        "payload_too_large",
-                        "The highest-ranked trace cannot fit the hosted size limit.",
+                    if deferred_by_size:
+                        # Candidates existed but none fit the hosted size budget
+                        # — a genuine oversize condition worth surfacing to the
+                        # user as a durable action.
+                        raise AutoUploadError(
+                            "payload_too_large",
+                            "The highest-ranked trace cannot fit the hosted size limit.",
+                        )
+                    # Every candidate's session row vanished between the report
+                    # and the size pass — the index changed mid-cycle. That is
+                    # a transient state change, not an oversize condition: back
+                    # off and retry instead of stamping a durable
+                    # action_required that blocks all future cycles.
+                    raise ControlChanged(
+                        "Selected traces disappeared while sizing the bundle."
                     )
                 session_ids = [str(item["session_id"]) for item in selected]
                 expected_revisions = {
@@ -3874,9 +3928,15 @@ def _hook_due_check_on_connection(
     if row is None:
         return DueDecision(False, "index-unavailable")
     # A 'submitting' artifact may already have crossed egress; its receipt must
-    # be reconciled promptly regardless of cadence/backoff, so this stays
-    # immediately due (the runner's recovery step can only look up receipts).
+    # be reconciled promptly regardless of cadence, so this is due immediately
+    # after a crash (the runner's recovery step can only look up receipts). But
+    # a *persistently failing* receipt lookup stamps next_retry_at (see the
+    # recovery branch in _run_cycle_impl); honor it here so a stuck 'submitting'
+    # artifact cannot relaunch a network-calling runner on every SessionStart.
     if row["submitting_pending"]:
+        retry_at = _parse_time(row["next_retry_at"])
+        if retry_at is not None and now < retry_at:
+            return DueDecision(False, "receipt-recovery-backoff")
         return DueDecision(True, "receipt-recovery-pending")
     # A merely 'sealed' artifact is a retryable submit failure with a stamped
     # next_retry_at. It must honor that backoff instead of relaunching a full
