@@ -10,13 +10,13 @@ from clawjournal import auto_upload_client as client
 
 def _caps(**overrides):
     caps = {
-        "recurring_upload_api_version": 1,
+        "recurring_upload_api_version": 2,
         "recurring_enrollment_open": True,
         "maximum_recurring_sessions": 5,
         "maximum_bundle_size": 1_000_000,
         "exact_artifact_idempotency": True,
         "duplicate_revision_enforcement": True,
-        "supported_recurring_client_versions": ["*"],
+        "supported_recurring_client_versions": ["2"],
         "recurring_authorization_url": "/api/recurring-authorization",
         "recurring_enrollment_url": "/api/recurring-enrollments",
         "recurring_submission_url": "/api/recurring-submissions",
@@ -178,15 +178,22 @@ def test_json_request_sends_bearer_without_following_redirect(monkeypatch):
         client.validate_capabilities(_caps(), origin="https://data.rayward.ai"),
         upload_token="one-shot",
         client_enrollment_id="intent-1",
-        scope_hash="scope",
+        scope_entries=[("claude", "clawjournal")],
         authorization_version="auth-v1",
         retention_version="ret-v1",
+        ownership_certification=True,
     )
 
     assert result["enrollment_id"] == "enrollment-1"
     assert seen["authorization"] is None
     assert seen["body"]["upload_token"] == "one-shot"
     assert seen["body"]["client_enrollment_id"] == "intent-1"
+    assert seen["body"]["scope"] == [
+        {"source": "claude", "project": "clawjournal"}
+    ]
+    assert seen["body"]["ownership_certification"] is True
+    assert seen["body"]["client_version"] == "2"
+    assert "scope_hash" not in seen["body"]
 
 
 def test_typed_http_error_preserves_code_and_retryability():

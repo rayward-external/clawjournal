@@ -61,6 +61,10 @@ function authorizationRequired() {
       version: 'retention-v3',
       text: 'Hosted retention terms for recurring uploads.',
     },
+    ownership_certification: {
+      version: 'ownership-v1',
+      text: 'I certify every automatically uploaded bundle is my own lawful content.',
+    },
     scope: { sources: ['claude'], projects: ['project-a'] },
     ai: { enabled: true, backend: 'codex' },
     cap: 5,
@@ -200,7 +204,17 @@ describe('AutoUploadPanel authorization', () => {
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();
     expect(screen.getByText(/can upload without my reviewing each bundle/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('checkbox'));
+    expect(
+      screen.getByText('I certify every automatically uploaded bundle is my own lawful content.'),
+    ).toBeInTheDocument();
+
+    // Both affirmative acts are required: terms acceptance alone must not
+    // enable the button, and the enable POST carries the certification version.
+    const checkboxes = screen.getAllByRole('checkbox');
+    expect(checkboxes).toHaveLength(2);
+    fireEvent.click(checkboxes[0]);
+    expect(screen.getByRole('button', { name: 'Enable automatic upload' })).toBeDisabled();
+    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
@@ -208,6 +222,7 @@ describe('AutoUploadPanel authorization', () => {
       agent: 'claude',
       accepted_authorization_version: 'recurring-v2',
       accepted_retention_version: 'retention-v3',
+      accepted_ownership_certification_version: 'ownership-v1',
       accepted_authorization_profile_hash: 'profile-hash-v2',
     });
     expect(await screen.findByText('recurring-v2')).toBeInTheDocument();

@@ -47,7 +47,8 @@ HOSTED_SUBMISSION_SCHEMA_VERSION = 5
 REVISION_TRACKING_SCHEMA_VERSION = 6
 AUTO_UPLOAD_FOUNDATION_SCHEMA_VERSION = 7
 AUTO_UPLOAD_SCHEMA_VERSION = 8
-WORKBENCH_SCHEMA_VERSION = AUTO_UPLOAD_SCHEMA_VERSION
+RECURRING_PROTOCOL_V2_SCHEMA_VERSION = 9
+WORKBENCH_SCHEMA_VERSION = RECURRING_PROTOCOL_V2_SCHEMA_VERSION
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SHARE_RECOMMENDATION_LIMIT = 10
@@ -205,6 +206,8 @@ CREATE TABLE IF NOT EXISTS auto_upload_enrollment (
     authorization_revision          INTEGER,
     recurring_authorization_version TEXT,
     retention_version               TEXT,
+    ownership_certification_version TEXT,
+    server_scope_hash               TEXT,
     egress_profile_hash             TEXT,
     hook_targets_json               TEXT NOT NULL DEFAULT '[]',
     claude_hook_observed_at         TEXT,
@@ -600,6 +603,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_revision_tracking(conn)
     _migrate_auto_upload_foundation(conn)
     _migrate_auto_upload_recovery_metadata(conn)
+    _migrate_recurring_protocol_v2(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -976,6 +980,38 @@ def _migrate_auto_upload_recovery_metadata(conn: sqlite3.Connection) -> None:
             if "duplicate column" not in str(exc):
                 raise
         conn.execute(f"PRAGMA user_version = {AUTO_UPLOAD_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_recurring_protocol_v2(conn: sqlite3.Connection) -> None:
+    """Advance v8 -> v9 with the hosted recurring-protocol-v2 pin columns.
+
+    Protocol v2 binds an enrollment to the explicit ownership certification
+    the user accepted and to the server-computed scope hash read back at
+    enrollment time. Existing enrollments keep NULLs, which the runner's
+    scope gate treats as fail-closed until the user reauthorizes.
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= RECURRING_PROTOCOL_V2_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for column in ("ownership_certification_version", "server_scope_hash"):
+            try:
+                conn.execute(
+                    f"ALTER TABLE auto_upload_enrollment ADD COLUMN {column} TEXT"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+        conn.execute(
+            f"PRAGMA user_version = {RECURRING_PROTOCOL_V2_SCHEMA_VERSION}"
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -4384,6 +4420,8 @@ def save_auto_upload_enrollment(
     authorization_revision: int | None = None,
     recurring_authorization_version: str | None = None,
     retention_version: str | None = None,
+    ownership_certification_version: str | None = None,
+    server_scope_hash: str | None = None,
     egress_profile_hash: str | None = None,
     hook_targets: Iterable[str] = (),
     claude_hook_observed_at: str | None = None,
@@ -4463,6 +4501,8 @@ def save_auto_upload_enrollment(
         "authorization_revision": authorization_revision,
         "recurring_authorization_version": recurring_authorization_version,
         "retention_version": retention_version,
+        "ownership_certification_version": ownership_certification_version,
+        "server_scope_hash": server_scope_hash,
         "egress_profile_hash": egress_profile_hash,
         "hook_targets_json": json.dumps(
             _canonical_auto_upload_strings(
@@ -4513,7 +4553,8 @@ def update_auto_upload_enrollment(
         "mode", "health", "generation", "enrolled_at",
         "client_enrollment_id", "server_enrollment_id",
         "authorization_revision", "recurring_authorization_version",
-        "retention_version", "egress_profile_hash", "last_completed_at",
+        "retention_version", "ownership_certification_version",
+        "server_scope_hash", "egress_profile_hash", "last_completed_at",
         "next_retry_at", "consecutive_failures", "last_result_code",
         "last_result_count", "last_receipt_reference", "current_run_id",
         "current_run_stage", "revocation_pending",

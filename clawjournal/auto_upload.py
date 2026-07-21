@@ -373,6 +373,15 @@ def _current_scope(
         and not session_matches_excluded_projects(row, excluded)
     ]
     projects = sorted({str(row["project"]) for row in scoped_rows if row.get("project")})
+    # Protocol v2 enrolls the exact observed (source, project) pairs rather
+    # than a client-computed hash; the server normalizes and owns the hash.
+    entries = sorted(
+        {
+            (str(row["source"]), str(row["project"]))
+            for row in scoped_rows
+            if row.get("project")
+        }
+    )
     blockers: list[str] = []
     if not source_confirmed:
         blockers.append("source_confirmation_missing")
@@ -388,6 +397,7 @@ def _current_scope(
     return {
         "sources": sources,
         "projects": projects,
+        "entries": entries,
         "source_confirmed": source_confirmed,
         "projects_confirmed": projects_confirmed,
         "blockers": blockers,
@@ -815,6 +825,7 @@ def _authorization_profile_hash(challenge: Mapping[str, Any]) -> str:
     payload = {
         "authorization": challenge["authorization"],
         "retention": challenge["retention"],
+        "ownership_certification": challenge["ownership_certification"],
         "scope": challenge["scope"],
         "ai": challenge["ai"],
         "cap": challenge["cap"],
@@ -841,6 +852,8 @@ def _authorization_challenge(
     authorization_text = terms.get("authorization_text")
     retention_version = terms.get("retention_policy_version")
     retention_text = terms.get("retention_text")
+    ownership_version = terms.get("ownership_certification_version")
+    ownership_text = terms.get("ownership_certification_text")
     if not all(
         isinstance(value, str) and value.strip()
         for value in (
@@ -848,6 +861,8 @@ def _authorization_challenge(
             authorization_text,
             retention_version,
             retention_text,
+            ownership_version,
+            ownership_text,
         )
     ):
         raise AutoUploadError(
@@ -859,7 +874,10 @@ def _authorization_challenge(
         "ok": False,
         "status": 409,
         "code": "authorization_required",
-        "message": "Review and accept the exact recurring authorization and retention terms.",
+        "message": (
+            "Review and accept the exact recurring authorization, retention, "
+            "and ownership-certification terms."
+        ),
         "authorization": {
             "version": authorization_version,
             "text": authorization_text,
@@ -868,9 +886,14 @@ def _authorization_challenge(
             "version": retention_version,
             "text": retention_text,
         },
+        "ownership_certification": {
+            "version": ownership_version,
+            "text": ownership_text,
+        },
         "scope": {
             "sources": list(scope["sources"]),
             "projects": list(scope["projects"]),
+            "entries": [list(entry) for entry in scope["entries"]],
         },
         "ai": {"enabled": ai_backend is not None, "backend": ai_backend},
         "cap": MAX_SESSIONS,
@@ -924,6 +947,8 @@ def _reconcile_explicit_pause_after_reauthorization(
     authorization_revision: int,
     authorization_version: str,
     retention_version: str,
+    ownership_certification_version: str,
+    server_scope_hash: str,
     egress_profile: str,
     hook_targets: Sequence[AgentName],
     restore_credentials: Mapping[str, Any] | None = None,
@@ -964,6 +989,8 @@ def _reconcile_explicit_pause_after_reauthorization(
             authorization_revision=authorization_revision,
             recurring_authorization_version=authorization_version,
             retention_version=retention_version,
+            ownership_certification_version=ownership_certification_version,
+            server_scope_hash=server_scope_hash,
             egress_profile_hash=egress_profile,
             hook_targets=hook_targets,
             consecutive_failures=0,
@@ -997,6 +1024,7 @@ def enable(
     agent: str = "all",
     accepted_authorization_version: str | None = None,
     accepted_retention_version: str | None = None,
+    accepted_ownership_certification_version: str | None = None,
     accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
 ) -> dict[str, Any]:
@@ -1005,6 +1033,8 @@ def enable(
     ``challenge_only`` always returns the authorization challenge and can
     never enroll, so clients that only want to display the current terms
     are not depending on version mismatch to keep the call non-mutating.
+    Protocol v2 requires the ownership certification to be accepted with the
+    same exact-version discipline as the authorization and retention terms.
     """
 
     targets = _hook_targets(agent)
@@ -1026,6 +1056,15 @@ def enable(
                 "manual_share_required",
                 "Complete one successful hosted manual share before enabling automatic uploads.",
             ).as_result()
+        # Fail fast on the cheap network checks BEFORE the strict scan: the
+        # scan re-parses every enrolled source log (minutes of CPU on a large
+        # history), so an incompatible protocol, closed enrollment, or
+        # unreachable host must be surfaced without paying it. Later steps
+        # (server create/PATCH, the runner's enrollment gate) re-enforce
+        # capability freshness, so a closure during the scan still loses
+        # nothing.
+        capabilities = fetch_capabilities(force=True)
+        terms = fetch_authorization(capabilities)
         from .workbench.daemon import Scanner
 
         scan = Scanner().scan_once_strict(list(scope["sources"]))
@@ -1047,18 +1086,18 @@ def enable(
                 "scope_blockers": scope["blockers"],
             }
         ai_backend = _resolved_ai_backend(config)
-        capabilities = fetch_capabilities(force=True)
-        terms = fetch_authorization(capabilities)
         challenge = _authorization_challenge(
             capabilities, terms, scope, ai_backend
         )
         expected_auth = challenge["authorization"]["version"]
         expected_retention = challenge["retention"]["version"]
+        expected_ownership = challenge["ownership_certification"]["version"]
         expected_profile = challenge["authorization_profile_hash"]
         if (
             challenge_only
             or accepted_authorization_version != expected_auth
             or accepted_retention_version != expected_retention
+            or accepted_ownership_certification_version != expected_ownership
             or accepted_authorization_profile_hash != expected_profile
         ):
             # Non-mutating challenge response.  The HTTP adapter maps this to
@@ -1160,7 +1199,6 @@ def enable(
             ai_backend=ai_backend,
             config=config,
         )
-        scope_digest = scope_hash(scope["sources"], scope["projects"])
         intent_enrolled_at = (
             _parse_time(existing.get("enrolled_at"))
             if updating and existing is not None
@@ -1231,6 +1269,7 @@ def enable(
         # "server enrollment was created" from earlier failures by these.
         response: dict[str, Any] | None = None
         credential_record: dict[str, Any] | None = None
+        server_scope_hash: str | None = None
         server_reauthorization_succeeded = False
         recovery_only_written = False
         try:
@@ -1257,9 +1296,12 @@ def enable(
                     capabilities,
                     enrollment_id=str(existing["server_enrollment_id"]),
                     active_token=active_token,
-                    scope_hash=scope_digest,
+                    scope_entries=scope["entries"],
                     authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
+                    # Reached only after the exact-version acceptance check
+                    # above matched accepted_ownership_certification_version.
+                    ownership_certification=True,
                 )
             else:
                 upload_token = str(config.get("verified_email_token") or "").strip()
@@ -1272,9 +1314,10 @@ def enable(
                     capabilities,
                     upload_token=upload_token,
                     client_enrollment_id=client_enrollment_id,
-                    scope_hash=scope_digest,
+                    scope_entries=scope["entries"],
                     authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
+                    ownership_certification=True,
                 )
 
             enrollment_id = response.get("enrollment_id")
@@ -1370,6 +1413,24 @@ def enable(
                 }
 
             assert credential_record is not None
+            # Protocol v2: the server owns the scope hash (an HMAC with its
+            # own key), so pin the authorized scope by reading it back from
+            # the definite enrollment state; the runner's scope gate compares
+            # against this stored value. A failed read aborts enrollment
+            # before any local authority is persisted (the create path's
+            # compensating revoke still applies).
+            remote_state = get_enrollment(
+                capabilities,
+                enrollment_id=str(enrollment_id),
+                active_token=str(credential_record["active_token"]),
+            )
+            server_scope_hash = remote_state.get("scope_hash")
+            if not isinstance(server_scope_hash, str) or not server_scope_hash:
+                raise AutoUploadError(
+                    "malformed_enrollment_response",
+                    "Hosted service returned no authoritative scope hash.",
+                    retryable=True,
+                )
             recovery_record = {
                 **credential_record,
                 "active_token": None,
@@ -1443,6 +1504,8 @@ def enable(
                     authorization_revision=authorization_revision,
                     recurring_authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
+                    ownership_certification_version=str(expected_ownership),
+                    server_scope_hash=server_scope_hash,
                     egress_profile_hash=profile,
                     hook_targets=targets,
                     last_result_code="enabled",
@@ -1483,6 +1546,7 @@ def enable(
                 and isinstance(response, dict)
                 and isinstance(response.get("enrollment_id"), str)
                 and isinstance(response.get("authorization_revision"), int)
+                and isinstance(server_scope_hash, str)
                 and _reconcile_explicit_pause_after_reauthorization(
                     conn,
                     intent_generation=generation,
@@ -1494,6 +1558,8 @@ def enable(
                     authorization_revision=int(response["authorization_revision"]),
                     authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
+                    ownership_certification_version=str(expected_ownership),
+                    server_scope_hash=str(server_scope_hash),
                     egress_profile=profile,
                     hook_targets=targets,
                     restore_credentials=(
@@ -3131,10 +3197,16 @@ def _server_enrollment_gate(
             "authorization_version_mismatch",
             "Recurring authorization or retention terms changed.",
         )
-    expected_scope_hash = scope_hash(
-        enrollment.get("enrolled_sources", []), enrollment.get("enrolled_projects", [])
-    )
-    if remote.get("scope_hash") != expected_scope_hash:
+    # Protocol v2: the scope hash is server-computed (keyed with the server's
+    # secret), so the client pins the value read back at enrollment time and
+    # requires it to be unchanged. A missing stored hash (e.g. a pre-v2
+    # enrollment row) fails closed into reauthorization.
+    expected_scope_hash = enrollment.get("server_scope_hash")
+    if (
+        not isinstance(expected_scope_hash, str)
+        or not expected_scope_hash
+        or remote.get("scope_hash") != expected_scope_hash
+    ):
         raise AutoUploadError(
             "authorization_version_mismatch",
             "The hosted recurring scope no longer matches local state.",
@@ -3145,6 +3217,13 @@ def _server_enrollment_gate(
         raise AutoUploadError(
             "authorization_version_mismatch",
             "The hosted recurring terms no longer match local state.",
+        )
+    if remote.get("ownership_certification_version") != enrollment.get(
+        "ownership_certification_version"
+    ):
+        raise AutoUploadError(
+            "authorization_version_mismatch",
+            "The hosted ownership certification no longer matches local state.",
         )
     if int(remote.get("authorization_revision") or 0) != int(
         enrollment.get("authorization_revision") or 0

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from clawjournal.workbench.index import (
-    AUTO_UPLOAD_SCHEMA_VERSION,
+    RECURRING_PROTOCOL_V2_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
     already_shared_revision_blockers,
     create_share,
@@ -105,7 +105,8 @@ def _mark_shared(conn, session_id: str) -> str:
 
 def test_fresh_schema_has_auto_upload_foundation(index_conn):
     assert index_conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
-    assert WORKBENCH_SCHEMA_VERSION == AUTO_UPLOAD_SCHEMA_VERSION
+    assert WORKBENCH_SCHEMA_VERSION == RECURRING_PROTOCOL_V2_SCHEMA_VERSION
+    assert RECURRING_PROTOCOL_V2_SCHEMA_VERSION == 9
 
     session_columns = {
         row[1] for row in index_conn.execute("PRAGMA table_info(sessions)")
@@ -133,7 +134,12 @@ def test_fresh_schema_has_auto_upload_foundation(index_conn):
     enrollment_columns = {
         row[1] for row in index_conn.execute("PRAGMA table_info(auto_upload_enrollment)")
     }
-    assert {"claude_hook_observed_at", "codex_hook_observed_at"} <= enrollment_columns
+    assert {
+        "claude_hook_observed_at",
+        "codex_hook_observed_at",
+        "ownership_certification_version",
+        "server_scope_hash",
+    } <= enrollment_columns
     indexes = {
         row[1] for row in index_conn.execute("PRAGMA index_list(shares)")
     }
@@ -175,7 +181,7 @@ def test_v6_migration_backfills_stability_and_adds_share_ledger_fields(
     monkeypatch.setattr("clawjournal.workbench.index._now_iso", lambda: migration_time)
     conn = open_index()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == AUTO_UPLOAD_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
         stable_since = conn.execute(
             "SELECT revision_stable_since FROM sessions WHERE session_id = 'legacy'"
         ).fetchone()[0]
@@ -211,7 +217,7 @@ def test_v7_migration_adds_recovery_metadata_once(tmp_path, monkeypatch):
 
     conn = open_index()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == AUTO_UPLOAD_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
         enrollment_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(auto_upload_enrollment)")
         }
@@ -235,10 +241,10 @@ def test_v7_migration_adds_recovery_metadata_once(tmp_path, monkeypatch):
     finally:
         conn.close()
 
-    # A second open is gated at v8 and must preserve the newly stored values.
+    # A second open is gated at v9 and must preserve the newly stored values.
     conn = open_index()
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == AUTO_UPLOAD_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["claude_hook_observed_at"] == observed_at
         assert enrollment["codex_hook_observed_at"] == observed_at

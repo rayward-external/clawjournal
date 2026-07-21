@@ -3932,6 +3932,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     if body.get("accepted_retention_version") is not None
                     else None
                 ),
+                accepted_ownership_certification_version=(
+                    str(body["accepted_ownership_certification_version"])
+                    if body.get("accepted_ownership_certification_version") is not None
+                    else None
+                ),
                 accepted_authorization_profile_hash=(
                     str(body["accepted_authorization_profile_hash"])
                     if body.get("accepted_authorization_profile_hash") is not None

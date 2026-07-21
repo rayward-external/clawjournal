@@ -18,8 +18,11 @@ from urllib.parse import quote, urljoin, urlsplit
 
 from . import __version__
 
-RECURRING_UPLOAD_API_VERSION = 1
-RECURRING_CLIENT_PROTOCOL_VERSION = "1"
+# Protocol v2 (hosted logical_sessions_v1 rollout): enrollment sends explicit
+# {source, project} scope entries plus an ownership certification the user
+# explicitly accepted; the server computes and owns the scope hash.
+RECURRING_UPLOAD_API_VERSION = 2
+RECURRING_CLIENT_PROTOCOL_VERSION = "2"
 MAX_RECURRING_SESSIONS = 5
 ALLOW_INSECURE_LOOPBACK_ENV = "CLAWJOURNAL_ALLOW_INSECURE_LOOPBACK_RECURRING"
 
@@ -352,26 +355,47 @@ def fetch_authorization(capabilities: Mapping[str, Any]) -> dict[str, Any]:
     return _request_json(str(capabilities["recurring_authorization_url"]))
 
 
+def _scope_payload(scope_entries: Any) -> list[dict[str, str]]:
+    """Encode (source, project) pairs as the protocol-v2 scope entry list."""
+
+    payload: list[dict[str, str]] = []
+    for entry in scope_entries:
+        source, project = entry
+        payload.append({"source": str(source), "project": str(project)})
+    if not payload:
+        raise CapabilityError(
+            "scope_invalid", "A recurring enrollment requires at least one scope entry."
+        )
+    return payload
+
+
 def create_enrollment(
     capabilities: Mapping[str, Any],
     *,
     upload_token: str,
     client_enrollment_id: str,
-    scope_hash: str,
+    scope_entries: Any,
     authorization_version: str,
     retention_version: str,
+    ownership_certification: bool,
 ) -> dict[str, Any]:
+    if ownership_certification is not True:
+        raise CapabilityError(
+            "ownership_certification_required",
+            "Recurring enrollment requires the explicit ownership certification.",
+        )
     return _request_json(
         str(capabilities["recurring_enrollment_url"]),
         method="POST",
         payload={
             "upload_token": upload_token,
             "client_enrollment_id": client_enrollment_id,
-            "scope_hash": scope_hash,
+            "scope": _scope_payload(scope_entries),
             "authorization_version": authorization_version,
             "retention_policy_version": retention_version,
             "client_version": RECURRING_CLIENT_PROTOCOL_VERSION,
             "accept_terms": True,
+            "ownership_certification": True,
         },
     )
 
@@ -395,20 +419,27 @@ def update_enrollment(
     *,
     enrollment_id: str,
     active_token: str,
-    scope_hash: str,
+    scope_entries: Any,
     authorization_version: str,
     retention_version: str,
+    ownership_certification: bool,
 ) -> dict[str, Any]:
+    if ownership_certification is not True:
+        raise CapabilityError(
+            "ownership_certification_required",
+            "Recurring reauthorization requires the explicit ownership certification.",
+        )
     return _request_json(
         _enrollment_endpoint(capabilities, enrollment_id),
         method="PATCH",
         bearer=active_token,
         payload={
-            "scope_hash": scope_hash,
+            "scope": _scope_payload(scope_entries),
             "authorization_version": authorization_version,
             "retention_policy_version": retention_version,
             "client_version": RECURRING_CLIENT_PROTOCOL_VERSION,
             "accept_terms": True,
+            "ownership_certification": True,
         },
     )
 

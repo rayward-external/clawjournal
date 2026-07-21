@@ -23,7 +23,7 @@ import pytest
 
 from clawjournal import agent_hooks, auto_upload as auto
 from clawjournal import config as config_module
-from clawjournal.auto_upload_client import RecurringServiceError
+from clawjournal.auto_upload_client import CapabilityError, RecurringServiceError
 from clawjournal.auto_upload_credentials import (
     CredentialStoreError,
     credential_path,
@@ -49,6 +49,10 @@ ORIGIN = "https://data.rayward.ai"
 ENROLLED_AT = "2026-07-10T12:00:00+00:00"
 AUTH_VERSION = "recurring-v1"
 RETENTION_VERSION = "retention-v1"
+OWNERSHIP_VERSION = "ownership-test.v1"
+# Protocol v2: the server owns the scope hash; the client pins the value read
+# back at enrollment time and the runner's gate requires it unchanged.
+SERVER_SCOPE_HASH = "server-scope-hash-1"
 
 
 @pytest.fixture
@@ -178,6 +182,10 @@ def _terms() -> dict[str, str]:
         "authorization_text": "I authorize a weekly upload of up to five traces.",
         "retention_policy_version": RETENTION_VERSION,
         "retention_text": "Uploaded traces follow the stated retention policy.",
+        "ownership_certification_version": OWNERSHIP_VERSION,
+        "ownership_certification_text": (
+            "I certify I own or am authorized to share the enrolled traces."
+        ),
     }
 
 
@@ -213,6 +221,8 @@ def _save_enabled_enrollment(
         authorization_revision=1,
         recurring_authorization_version=AUTH_VERSION,
         retention_version=RETENTION_VERSION,
+        ownership_certification_version=OWNERSHIP_VERSION,
+        server_scope_hash=SERVER_SCOPE_HASH,
         egress_profile_hash=profile,
         hook_targets=["claude", "codex"],
         current_run_id=current_run_id,
@@ -314,7 +324,8 @@ def _patch_runner_host(monkeypatch, *, origin: str = ORIGIN) -> None:
             "authorization_revision": 1,
             "authorization_version": AUTH_VERSION,
             "retention_policy_version": RETENTION_VERSION,
-            "scope_hash": auto.scope_hash(["claude"], ["project-one"]),
+            "ownership_certification_version": OWNERSHIP_VERSION,
+            "scope_hash": SERVER_SCOPE_HASH,
             "revoked_at": None,
         },
     )
@@ -1895,6 +1906,17 @@ def _patch_enable_dependencies(monkeypatch, *, hook_result: bool = True):
     _patch_strict_scanner(monkeypatch)
     monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
     monkeypatch.setattr(auto, "fetch_authorization", lambda _caps: _terms())
+    # Protocol v2: enable() reads the definite enrollment state back after a
+    # successful create/PATCH and pins the server-computed scope hash.
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "scope_hash": SERVER_SCOPE_HASH,
+            "ownership_certification_version": OWNERSHIP_VERSION,
+        },
+    )
     monkeypatch.setattr(auto, "_snapshot_hook_files", lambda _targets: {})
     monkeypatch.setattr(
         auto,
@@ -1938,6 +1960,34 @@ def _enrollment_response() -> dict[str, Any]:
     }
 
 
+def test_enable_fails_fast_on_capabilities_before_the_strict_scan(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The strict scan re-parses every enrolled source log (minutes of CPU on
+    a large history); an incompatible or unreachable hosted service must be
+    surfaced BEFORE paying it, not after."""
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+
+    def incompatible(**_kwargs):
+        raise CapabilityError(
+            "capability_incompatible",
+            "Hosted recurring-upload capability is unavailable or incompatible.",
+        )
+
+    monkeypatch.setattr(auto, "_has_successful_manual_receipt", lambda _conn: True)
+    monkeypatch.setattr(auto, "fetch_capabilities", incompatible)
+    scan_calls = _patch_strict_scanner(monkeypatch)
+
+    result = auto.enable(agent="claude")
+
+    assert result["code"] == "capability_incompatible"
+    assert scan_calls == []
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,
@@ -1961,6 +2011,9 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
     assert challenge["code"] == "authorization_required"
     assert challenge["authorization"]["version"] == AUTH_VERSION
     assert challenge["retention"]["version"] == RETENTION_VERSION
+    assert challenge["ownership_certification"]["version"] == OWNERSHIP_VERSION
+    assert challenge["ownership_certification"]["text"]
+    assert challenge["scope"]["entries"] == [["claude", "project-one"]]
     assert create_calls == []
     conn = open_index()
     try:
@@ -1973,14 +2026,27 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
     )
     assert versions_only["code"] == "authorization_required"
+    assert create_calls == []
+
+    # Protocol v2: accepting terms and the profile hash without the distinct
+    # ownership certification must remain non-mutating.
+    missing_ownership = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_authorization_profile_hash=challenge["authorization_profile_hash"],
+    )
+    assert missing_ownership["code"] == "authorization_required"
     assert create_calls == []
 
     result = auto.enable(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=challenge["authorization_profile_hash"],
     )
 
@@ -1988,6 +2054,9 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
     assert result["health"] == "ready"
     assert len(create_calls) == 1
     assert create_calls[0]["upload_token"] == "fresh-one-shot"
+    assert list(create_calls[0]["scope_entries"]) == [("claude", "project-one")]
+    assert create_calls[0]["ownership_certification"] is True
+    assert "scope_hash" not in create_calls[0]
     assert load_credentials(required=True)["active_token"] == "active-secret"
     persisted = config_module.load_config()
     assert "verified_email_token" not in persisted
@@ -2036,11 +2105,16 @@ def test_enable_rejects_acceptance_when_displayed_scope_changes(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=displayed["authorization_profile_hash"],
     )
 
     assert result["code"] == "authorization_required"
     assert result["scope"]["projects"] == ["project-one", "project-two"]
+    assert result["scope"]["entries"] == [
+        ["claude", "project-one"],
+        ["claude", "project-two"],
+    ]
     assert (
         result["authorization_profile_hash"]
         != displayed["authorization_profile_hash"]
@@ -2075,6 +2149,7 @@ def test_enable_never_backdates_cutoff_before_durable_local_intent(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2123,6 +2198,7 @@ def test_new_enrollment_after_disable_resets_prior_cadence_and_receipt(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2171,6 +2247,7 @@ def test_reauthorization_rejects_later_future_only_cutoff(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2219,6 +2296,7 @@ def test_reauthorization_accepts_earlier_server_cutoff_from_clock_skew(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2265,6 +2343,7 @@ def test_non_rotating_update_preserves_unused_manual_verified_email_token(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2304,6 +2383,7 @@ def test_reauthorization_discards_same_enrollment_sealed_artifact_after_patch(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2391,6 +2471,7 @@ def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
                     agent="claude",
                     accepted_authorization_version=AUTH_VERSION,
                     accepted_retention_version=RETENTION_VERSION,
+                    accepted_ownership_certification_version=OWNERSHIP_VERSION,
                     accepted_authorization_profile_hash=profile_hash,
                 )
             )
@@ -2475,6 +2556,7 @@ def test_reauthorization_blocks_before_patch_while_receipt_is_ambiguous(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2520,6 +2602,7 @@ def test_enable_snapshot_failure_returns_structured_error_and_stays_off(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2561,6 +2644,7 @@ def test_enable_rolls_back_hook_failure_before_server_or_credentials(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2605,6 +2689,7 @@ def test_enable_revokes_server_enrollment_when_credential_commit_fails(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2661,6 +2746,7 @@ def test_definitely_revoked_first_create_rotates_next_idempotency_key(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=profile_hash,
     )
 
@@ -2678,6 +2764,7 @@ def test_definitely_revoked_first_create_rotates_next_idempotency_key(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=profile_hash,
     )
 
@@ -2736,6 +2823,7 @@ def test_enable_generation_race_cannot_commit_or_restore_over_newer_controls(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -2795,6 +2883,7 @@ def test_disable_cancels_first_enable_while_create_request_is_in_flight(
                     agent="claude",
                     accepted_authorization_version=AUTH_VERSION,
                     accepted_retention_version=RETENTION_VERSION,
+                    accepted_ownership_certification_version=OWNERSHIP_VERSION,
                     accepted_authorization_profile_hash=_current_authorization_profile_hash(),
                 )
             )
@@ -2923,6 +3012,7 @@ def test_disable_waits_for_authority_handoff_and_recovers_after_process_death(
                 agent="claude",
                 accepted_authorization_version=AUTH_VERSION,
                 accepted_retention_version=RETENTION_VERSION,
+                accepted_ownership_certification_version=OWNERSHIP_VERSION,
                 accepted_authorization_profile_hash=_current_authorization_profile_hash(),
             )
         except BaseException as exc:  # expected simulated process death
@@ -3022,6 +3112,7 @@ def test_stale_disable_cannot_erase_later_rollback_recovery_handoff(
                     agent="claude",
                     accepted_authorization_version=AUTH_VERSION,
                     accepted_retention_version=RETENTION_VERSION,
+                    accepted_ownership_certification_version=OWNERSHIP_VERSION,
                     accepted_authorization_profile_hash=_current_authorization_profile_hash(),
                 )
             )
@@ -3139,6 +3230,7 @@ def test_reauthorization_cannot_resurrect_active_token_after_disable_wins(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -3343,7 +3435,8 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
         "authorization_revision": 1,
         "authorization_version": AUTH_VERSION,
         "retention_policy_version": RETENTION_VERSION,
-        "scope_hash": auto.scope_hash(["claude"], ["claude:project-one"]),
+        "ownership_certification_version": OWNERSHIP_VERSION,
+        "scope_hash": SERVER_SCOPE_HASH,
         "revoked_at": None,
     }
     monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: capabilities)
@@ -4096,6 +4189,7 @@ def test_definite_receipt_404_unblocks_explicit_reauthorization(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
         accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
         accepted_authorization_profile_hash=_current_authorization_profile_hash(),
     )
 
@@ -4142,7 +4236,8 @@ def test_config_profile_mutation_before_final_transition_stops_post(
             "authorization_revision": 1,
             "authorization_version": AUTH_VERSION,
             "retention_policy_version": RETENTION_VERSION,
-            "scope_hash": auto.scope_hash(["claude"], ["project-one"]),
+            "ownership_certification_version": OWNERSHIP_VERSION,
+            "scope_hash": SERVER_SCOPE_HASH,
             "revoked_at": None,
         }
 

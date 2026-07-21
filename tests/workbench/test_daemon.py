@@ -253,6 +253,7 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "agent": "codex",
             "accepted_authorization_version": "auth-v1",
             "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
             "accepted_authorization_profile_hash": "profile-sha256",
         },
     )
@@ -264,6 +265,7 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "agent": "codex",
             "accepted_authorization_version": "auth-v1",
             "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
             "accepted_authorization_profile_hash": "profile-sha256",
             "challenge_only": False,
         }
