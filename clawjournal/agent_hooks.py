@@ -27,6 +27,7 @@ from .paths import atomic_write_text
 
 HOOK_EVENT = "SessionStart"
 HOOK_MODULE = "clawjournal.agent_hooks"
+LEGACY_HOOK_PROFILE = "clawjournal-auto-upload-v1"
 SUPPORTED_AGENTS = ("claude", "codex")
 HOOK_TIMEOUT_SECONDS = 5
 
@@ -163,6 +164,8 @@ def _handler_for(client: AgentName) -> dict[str, Any]:
 def _handler_is_ours(handler: Any) -> bool:
     if not isinstance(handler, dict) or handler.get("type") != "command":
         return False
+    if handler.get("clawjournalProfile") == LEGACY_HOOK_PROFILE:
+        return True
     command = str(handler.get("command", ""))
     return f"-m {HOOK_MODULE}" in command and " run " in f" {command} "
 

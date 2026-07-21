@@ -128,10 +128,75 @@ def test_install_is_idempotent_and_collapses_stale_duplicates(isolated_home, mon
     assert any(handler.get("command") == "echo keep" for handler in _handlers(document, "SessionStart"))
 
 
+def test_install_migrates_legacy_profile_hook_and_preserves_foreign_hooks(
+    isolated_home, monkeypatch
+):
+    codex_path = isolated_home / ".codex" / "hooks.json"
+    codex_path.parent.mkdir(parents=True)
+    legacy = {
+        "type": "command",
+        "command": (
+            "old-python -m clawjournal.cli auto-upload hook --client codex"
+        ),
+        "commandWindows": (
+            "old-python -m clawjournal.cli auto-upload hook --client codex"
+        ),
+        "timeout": 5,
+        "statusMessage": "Checking automatic sharing schedule",
+        "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+    }
+    foreign = {
+        "type": "command",
+        "command": "echo keep",
+        "clawjournalProfile": "another-tool",
+    }
+    codex_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [legacy, foreign]},
+                        {"hooks": [legacy]},
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(hooks.sys, "executable", "/tmp/current-python")
+
+    first = hooks.install_agent_hook("codex", home=isolated_home)
+    first_bytes = codex_path.read_bytes()
+    second = hooks.install_agent_hook("codex", home=isolated_home)
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert codex_path.read_bytes() == first_bytes
+    document = _read(codex_path)
+    handlers = _handlers(document, "SessionStart")
+    own = [handler for handler in handlers if hooks._handler_is_ours(handler)]
+    assert own == [hooks._handler_for("codex")]
+    assert "clawjournalProfile" not in own[0]
+    assert foreign in handlers
+
+
 def test_uninstall_removes_only_auto_upload_hook_and_is_idempotent(isolated_home):
     path = isolated_home / ".codex" / "hooks.json"
     hooks.install_agent_hook("codex", home=isolated_home)
     document = _read(path)
+    document["hooks"]["SessionStart"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        "old-python -m clawjournal.cli auto-upload hook "
+                        "--client codex"
+                    ),
+                    "clawjournalProfile": hooks.LEGACY_HOOK_PROFILE,
+                }
+            ]
+        }
+    )
     document["hooks"]["SessionStart"].append(
         {"matcher": "startup", "hooks": [{"type": "command", "command": "echo keep"}]}
     )
