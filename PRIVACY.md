@@ -54,35 +54,42 @@ That second layer can catch identifying text such as:
 
 For manual publishing, review is still your responsibility. The separately authorized recurring path below does not show each bundle, so it uses stricter completion, coverage, findings, hold, revision, and exact-artifact gates instead.
 
-## Mandatory post-redaction scan (TruffleHog)
+## Mandatory post-redaction scan (Betterleaks + TruffleHog)
 
-Every share export runs an independent secrets scanner — [TruffleHog](https://github.com/trufflesecurity/trufflehog) — on the already-redacted `sessions.jsonl` before the export is considered complete. TruffleHog is a separate project with its own ~800 credential detectors and optional live-verification step. It acts as a backstop: if our layered redaction misses something, TruffleHog's independent detectors should catch it.
+Every share export runs two independent secret scanners on the already-redacted `sessions.jsonl` before the export is considered complete, feeding a tiered policy that ClawJournal owns — no third-party scanner decides on its own whether a whole session survives:
 
-The scan is mandatory. Outcomes:
+- **[Betterleaks](https://github.com/betterleaks/betterleaks)** (MIT) is the primary detection layer: ~380 rules plus token-efficiency and entropy filters. It runs **local-only** — its live-validation feature is never enabled, so candidate secrets are never sent to provider APIs by the detection layer.
+- **[TruffleHog](https://github.com/trufflesecurity/trufflehog)** (AGPL-3.0, subprocess-only) runs verified-only as the live-credential check.
 
-- **clean** — export proceeds, summary embedded in `manifest.json` under `redaction_summary.trufflehog`, full report written to `trufflehog.json`.
-- **any finding** (verified, unverified, or unknown) — export is blocked. The share's status is **not** advanced; the directory is preserved with `manifest.blocked=true` and masked examples so you can debug.
-- **binary not installed** — export is blocked with an install hint.
+Each finding is tiered, per finding — not per bundle:
+
+- **block** — a TruffleHog-verified live credential. The trace cannot ship.
+- **review** — private-key material and other unmistakable credential structure, findings that survived redaction rescans, or an allowlisted value that nonetheless verified live. A human decides; on the automatic path the trace moves to `pending_review`.
+- **redact** — a recognizable-but-unverified token (the common case). The exact span is replaced with a `[REDACTED_*]` placeholder in the bundle, the file is rescanned until clean, and the share proceeds.
+- **warn** — soft keyword rules, low-entropy matches, and values you explicitly ignored or allowlisted. Recorded in the manifest, never blocks.
+
+Scanner failure still fails closed: a missing binary or scan error blocks the export with an install hint (`scanner-not-installed` / `scanner-error`). Outcomes land in `manifest.json` under `redaction_summary.secret_scan` (tier counts, gate redactions, convergence) with full reports in `secret-scan.json`; the legacy `redaction_summary.trufflehog` + `trufflehog.json` artifacts remain and show the verified-only view.
 
 Install:
 
 ```bash
-# macOS / Linux / Windows (x86-64 and ARM64) — pinned version, sha256-verified
-# against the official release, installed to ~/.clawjournal/bin (preferred over PATH):
+# macOS / Linux / Windows (x86-64 and ARM64) — pinned versions, sha256-verified
+# against the official releases, installed to ~/.clawjournal/bin (preferred over PATH):
+clawjournal betterleaks install
 clawjournal trufflehog install
 
-# Or install it yourself:
-brew install trufflehog          # macOS
-# Linux / Windows: https://github.com/trufflesecurity/trufflehog#floppy_disk-installation
+# Or install them yourself:
+brew install betterleaks trufflehog          # macOS
+# Linux / Windows: see each project's install docs
 ```
 
-The managed copy is downloaded from TruffleHog's own GitHub release artifacts at your explicit request and is only ever invoked as a subprocess. `clawjournal trufflehog status` shows which binary the gate will use.
+The managed copies are downloaded from each project's own GitHub release artifacts at your explicit request and are only ever invoked as subprocesses with a scrubbed environment. `clawjournal betterleaks status` / `clawjournal trufflehog status` show which binaries the gate will use.
 
-For the upload path, the scan runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the final PII pass rewrites the file. Either scan finding something aborts the upload. The final PII pass always runs deterministic rules. If you opt in to AI-assisted review for a bundle, it also reviews sessions in a small bounded worker pool. A manual share records any per-trace rules-only fallback; an automatic share fails closed unless every trace has full coverage from the exact accepted provider. The manifest records this under `redaction_summary.pii_review.coverage.full` and `.rules_only`. TruffleHog also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first.
+For the upload path, the gate runs at least **twice at share time**: once inside `export_share_to_disk` on the merged `sessions.jsonl`, and again after the final PII pass rewrites the file. The final PII pass always runs deterministic rules. If you opt in to AI-assisted review for a bundle, it also reviews sessions in a small bounded worker pool. A manual share records any per-trace rules-only fallback; an automatic share fails closed unless every trace has full coverage from the exact accepted provider. The manifest records this under `redaction_summary.pii_review.coverage.full` and `.rules_only`. Betterleaks also participates as a deterministic findings engine at scan-ingest time, so a session's existing `findings` rows already carry its detections before any share step — the share-time gates are the final check, not the first. Your findings decisions feed the gate: a value you ignored or allowlisted classifies as warn instead of blocking (unless it verifies as live, which always needs review).
 
-One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks. Every other TruffleHog detector remains active and blocking.
+One detector is excluded at the TruffleHog layer: **`refiner`** (refiner.io user-feedback platform). Its pattern is "the word 'refiner' followed by a UUID", which false-positives on any project name containing that substring paired with the UUIDs present throughout Claude/Codex session JSON. Verification against refiner.io's own API correctly returns `unverified` for those matches, so they are never real leaks.
 
-An escape hatch exists for CI and development: setting `CLAWJOURNAL_SKIP_TRUFFLEHOG=1` disables the gate. This is recorded in the manifest (`redaction_summary.trufflehog.bypassed=true`) so reviewers can tell scanned shares from bypassed ones. Do not use it for real shares.
+An escape hatch exists for CI and development: setting `CLAWJOURNAL_SKIP_BETTERLEAKS=1` / `CLAWJOURNAL_SKIP_TRUFFLEHOG=1` disables the gate. Any bypass is recorded in the manifest (`redaction_summary.secret_scan.bypassed=true`) so reviewers can tell scanned shares from bypassed ones, and the upload path refuses to ship a bypassed bundle. Do not use it for real shares.
 
 ## What a local bundle contains
 
@@ -90,7 +97,8 @@ An escape hatch exists for CI and development: setting `CLAWJOURNAL_SKIP_TRUFFLE
 
 - `sessions.jsonl`
 - `manifest.json`
-- `trufflehog.json` (scan report)
+- `secret-scan.json` (combined scan report)
+- `trufflehog.json` (verified-only sub-report, legacy name)
 
 Depending on how you export, bundle content can include user messages, assistant messages, tool calls, model metadata, token counts, and timestamps. Extended thinking can be excluded from regular exports with `--no-thinking`.
 

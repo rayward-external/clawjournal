@@ -53,7 +53,7 @@ The enrollment command first tries a safe `clawjournal selfupdate`, then writes 
 clawjournal hooks launch openrefinery-failures
 ```
 
-`launch` prefers the browser Share workflow at `http://localhost:8384/share`; if it cannot start or reach the local workbench in auto mode, it falls back to `clawjournal share --interactive --weekly`. The hook never uploads by itself. The Share flow still requires source/project confirmation, local redaction review, and the mandatory TruffleHog gate before anything leaves the machine. Codex may ask you to review/trust the newly installed hook with `/hooks` before it runs.
+`launch` prefers the browser Share workflow at `http://localhost:8384/share`; if it cannot start or reach the local workbench in auto mode, it falls back to `clawjournal share --interactive --weekly`. The hook never uploads by itself. The Share flow still requires source/project confirmation, local redaction review, and the mandatory secret-scan gate before anything leaves the machine. Codex may ask you to review/trust the newly installed hook with `/hooks` before it runs.
 
 Design details: [OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md](OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md).
 
@@ -65,7 +65,7 @@ Design details: [OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md](OPENREFINERY_AGENT
 
 ## If you decide to share
 
-Sharing is fully opt-in and separate from local review. On export, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and your configured strings) on top of the scan-time findings — to both the session traces *and* the `manifest.json` metadata. The workbench Share flow can add optional AI-assisted PII review; home-dir paths and usernames are anonymized locally before anything is sent to an AI backend. A mandatory TruffleHog secrets gate then runs on the redacted output and blocks the share if it finds anything or the binary is missing (not required for local-only use).
+Sharing is fully opt-in and separate from local review. On export, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and your configured strings) on top of the scan-time findings — to both the session traces *and* the `manifest.json` metadata. The workbench Share flow can add optional AI-assisted PII review; home-dir paths and usernames are anonymized locally before anything is sent to an AI backend. A mandatory secret-scan gate (Betterleaks detection + TruffleHog verified-only live check, both local subprocesses) then runs on the redacted output: verified credentials and private-key material block, recognizable unverified tokens are automatically redacted in place, and soft signals are recorded as warnings. Missing scanner binaries block the share (they're not required for local-only use).
 
 See [PRIVACY.md](PRIVACY.md) for the full redaction list and the sharing paths.
 
@@ -144,20 +144,22 @@ Optionally, `npx skills add rayward-external/clawjournal` installs three skills 
 
 ### 1. Install
 
-Use [Quickstart](#quickstart) above (or the install prompt at the top). TruffleHog is **not** required for local use — it's only needed at Stage 6, where every export runs an independent secrets scan and blocks if TruffleHog is missing or finds anything. Your AI installs it when you reach Stage 6.
+Use [Quickstart](#quickstart) above (or the install prompt at the top). The secret scanners (Betterleaks + TruffleHog) are **not** required for local use — they're only needed at Stage 6, where every export runs an independent secret scan; verified credentials block, recognizable tokens are auto-redacted, and a missing scanner blocks the export. Your AI installs them when you reach Stage 6.
 
 <details>
-<summary><b>Show TruffleHog install commands</b></summary>
+<summary><b>Show scanner install commands</b></summary>
 
 ```bash
-# macOS / Linux / Windows (x86-64 and ARM64) — pinned version, sha256-verified,
+# macOS / Linux / Windows (x86-64 and ARM64) — pinned versions, sha256-verified,
 # installed to ~/.clawjournal/bin, no root needed:
+clawjournal betterleaks install
 clawjournal trufflehog install
 
-# Or install it yourself:
-brew install trufflehog                                    # macOS
-curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux
-# Windows: download a release binary from https://github.com/trufflesecurity/trufflehog/releases
+# Or install them yourself:
+brew install betterleaks trufflehog                        # macOS
+curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux (TruffleHog)
+# Betterleaks Linux/Windows: https://github.com/betterleaks/betterleaks#installation
+# Windows: download release binaries from each project's releases page
 ```
 
 </details>
@@ -277,7 +279,7 @@ It lists shareable traces, prioritizes AI-scored high-failure-value sessions, sh
 
 After one successful hosted manual share, the workbench may offer **Automatic uploads** when the hosted recurring-upload capability is open. It is off by default. V1 enrollment supports confirmed **Claude Code** and/or **Codex** source scopes only; other sources remain available for manual review and Share. Enabling it shows separate recurring authorization and retention text, the exact local source/project scope, resolved AI-PII provider (if enabled), destination, seven-day activity-triggered cadence, and five-trace cap. Fresh email verification is required before recurring credentials are issued.
 
-An automatic cycle runs on the next selected Claude Code or Codex `SessionStart` after it is due. It chooses at most five eligible future traces using stored failure-value scores and a deterministic fallback; it never runs scoring synchronously. Only traces completed after the server enrollment time qualify. Append-only sources must have the same revision for at least 24 hours (the eligibility contract also defines an `explicit_close` completion mode, but no supported source uses it yet — Claude Code and Codex both use the 24-hour stable-revision rule), holds/embargoes and findings still block egress, changed traces require fresh approval, and every cycle repeats the normal anonymization, deterministic redaction, optional AI-PII, and mandatory TruffleHog gates. Manual Share is unchanged.
+An automatic cycle runs on the next selected Claude Code or Codex `SessionStart` after it is due. It chooses at most five eligible future traces using stored failure-value scores and a deterministic fallback; it never runs scoring synchronously. Only traces completed after the server enrollment time qualify. Append-only sources must have the same revision for at least 24 hours (the eligibility contract also defines an `explicit_close` completion mode, but no supported source uses it yet — Claude Code and Codex both use the 24-hour stable-revision rule), holds/embargoes and findings still block egress, changed traces require fresh approval, and every cycle repeats the normal anonymization, deterministic redaction, optional AI-PII, and mandatory secret-scan gates. Traces with blocking findings move to pending review individually — the rest of the batch still ships. Manual Share is unchanged.
 
 Manage it in **Settings → Automatic uploads** or from the terminal:
 
@@ -422,7 +424,9 @@ Distill a small `clawjournal-lessons` skill from your own scored sessions and in
 | `clawjournal hooks launch openrefinery-failures` | Open the Share workflow or print the CLI fallback command |
 | `clawjournal hooks snooze openrefinery-failures --days 30` / `disable` | Pause or disable the daily enrollment reminder |
 | `clawjournal selfupdate [--check] [--force]` | Fast-forward to latest from `rayward-external/clawjournal` |
-| `clawjournal trufflehog install [--force]` | Download the pinned, checksum-verified TruffleHog (share-gate dependency) into `~/.clawjournal/bin` |
+| `clawjournal betterleaks install [--force]` | Download the pinned, checksum-verified Betterleaks (primary share-gate scanner) into `~/.clawjournal/bin` |
+| `clawjournal betterleaks status [--json]` | Show which Betterleaks binary the share gate will use |
+| `clawjournal trufflehog install [--force]` | Download the pinned, checksum-verified TruffleHog (share-gate live-credential check) into `~/.clawjournal/bin` |
 | `clawjournal trufflehog status [--json]` | Show which TruffleHog binary the share gate will use |
 
 ### Export & sanitize (advanced)
