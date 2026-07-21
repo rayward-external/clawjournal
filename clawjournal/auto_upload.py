@@ -1332,6 +1332,18 @@ def enable(
                     ownership_certification=True,
                 )
 
+            # The server mutation is definite the moment the create/PATCH
+            # returns 2xx — BEFORE the response body is validated below. On the
+            # updating path a malformed body then leaves a definitely-modified
+            # (and, until the read-back, unverified) hosted enrollment that must
+            # be revoked, not paused; mark it definite here so the failure
+            # handler routes correctly even when the validation just below
+            # raises. (Create keeps this False: the client learns a new
+            # enrollment's id only from the response, so it cannot revoke a
+            # malformed create — the server-expiry / client-id idempotency
+            # path recovers that.)
+            server_reauthorization_succeeded = bool(updating)
+
             enrollment_id = response.get("enrollment_id")
             enrolled_at = response.get("enrolled_at")
             parsed_server_enrolled_at = _parse_time(enrolled_at)
@@ -1379,10 +1391,6 @@ def enable(
                 if updating
                 else max(intent_enrolled_at, parsed_server_enrolled_at)
             )
-            # Both PATCH with a still-valid active token and an idempotent
-            # credential reissue with fresh email verification definitively
-            # advance the same hosted enrollment authorization.
-            server_reauthorization_succeeded = bool(updating)
 
             if updating:
                 # A sealed artifact is durably pre-send.  The successful PATCH
@@ -1683,23 +1691,92 @@ def enable(
             # recovery tombstone and records revocation_pending.
             response_local = response
             record_local = credential_record
-            # After a DEFINITE PATCH the request's certification boolean gives
-            # no way to know which certification version the server recorded;
-            # only a successful, matching read-back establishes it. Until that
-            # verification, any failure — an explicit mismatch, a failed or
-            # malformed read-back, a control race before it — leaves a live
+            # After a DEFINITE server mutation on the updating path the request's
+            # certification boolean gives no way to know which certification
+            # version the server recorded; only a successful, matching read-back
+            # establishes it. Until that verification, any failure — an explicit
+            # mismatch, a malformed 2xx body that raised before the read-back, a
+            # failed/malformed read-back, or a control race — leaves a live
             # hosted enrollment whose consent record cannot be shown to match
-            # what the user accepted, and the client cannot un-PATCH. Route
-            # every such failure into the same revoke machinery the create
-            # path uses. Updating failures after verification (or before the
-            # PATCH was definite) keep the legitimate enrollment and pause.
+            # what the user accepted, and the client cannot un-PATCH. Revoke it.
+            #
+            # The revoke identity must NOT come from the (possibly malformed)
+            # response: on the updating path the enrollment id is the one we
+            # PATCHed (existing.server_enrollment_id) and the recovery token is
+            # the reissued one when it validated, else the pinned credential.
+            updating_revoke_id: str | None = None
+            updating_revoke_recovery: str | None = None
+            updating_revoke_recovery_expiry: str | None = None
+            if updating and existing is not None:
+                known_id = str(existing.get("server_enrollment_id") or "")
+                reissued = (
+                    response_local.get("recovery_token")
+                    if isinstance(response_local, dict)
+                    else None
+                )
+                reissued_expiry = (
+                    response_local.get("recovery_token_expires_at")
+                    if isinstance(response_local, dict)
+                    else None
+                )
+                pinned = (
+                    credentials.get("recovery_token")
+                    if isinstance(credentials, dict)
+                    else None
+                )
+                pinned_expiry = (
+                    credentials.get("recovery_token_expires_at")
+                    if isinstance(credentials, dict)
+                    else None
+                )
+                updating_revoke_id = known_id or None
+                if isinstance(reissued, str) and reissued:
+                    updating_revoke_recovery = reissued
+                    updating_revoke_recovery_expiry = (
+                        str(reissued_expiry) if reissued_expiry else None
+                    )
+                elif isinstance(pinned, str) and pinned:
+                    updating_revoke_recovery = pinned
+                    updating_revoke_recovery_expiry = (
+                        str(pinned_expiry) if pinned_expiry else None
+                    )
             revoke_unverified_certification = (
                 updating
                 and server_reauthorization_succeeded
                 and not certification_verified
-                and isinstance(response_local, dict)
-                and bool(response_local.get("enrollment_id"))
+                and updating_revoke_id is not None
+                and updating_revoke_recovery is not None
             )
+            # Identity for revoking a definite server mutation: known values on
+            # the updating path, the response on the create path (the only path
+            # where the client cannot know the id ahead of the response).
+            if revoke_unverified_certification:
+                revoke_id = updating_revoke_id
+                revoke_recovery = updating_revoke_recovery
+                revoke_recovery_expiry = updating_revoke_recovery_expiry
+            elif (
+                not updating
+                and isinstance(response_local, dict)
+                and response_local.get("enrollment_id")
+            ):
+                revoke_id = str(response_local["enrollment_id"])
+                revoke_recovery = (
+                    record_local.get("recovery_token")
+                    if isinstance(record_local, dict)
+                    else response_local.get("recovery_token")
+                )
+                expiry_source = (
+                    (record_local or {}).get("recovery_token_expires_at")
+                    or response_local.get("recovery_token_expires_at")
+                )
+                revoke_recovery_expiry = (
+                    str(expiry_source) if expiry_source else None
+                )
+            else:
+                revoke_id = None
+                revoke_recovery = None
+                revoke_recovery_expiry = None
+
             if updating and not revoke_unverified_certification:
                 update_auto_upload_enrollment(
                     conn,
@@ -1708,17 +1785,13 @@ def enable(
                     health="action_required",
                     last_result_code=error.code,
                 )
-            elif isinstance(response_local, dict) and response_local.get("enrollment_id"):
-                recovery = (
-                    record_local.get("recovery_token")
-                    if isinstance(record_local, dict)
-                    else response_local.get("recovery_token")
-                )
-                if isinstance(recovery, str) and recovery:
+            elif revoke_id and isinstance(revoke_recovery, str) and revoke_recovery:
+                recovery = revoke_recovery
+                if recovery:
                     try:
                         revoke_enrollment(
                             capabilities,
-                            enrollment_id=str(response_local["enrollment_id"]),
+                            enrollment_id=revoke_id,
                             recovery_token=recovery,
                         )
                         with control_mutation_lock():
@@ -1773,17 +1846,16 @@ def enable(
                             tombstone = {
                                 "issuer": capabilities["origin"],
                                 "api_origin": capabilities["origin"],
-                                "enrollment_id": str(response_local["enrollment_id"]),
+                                "enrollment_id": revoke_id,
                                 "active_token": None,
                                 "active_token_expires_at": None,
                                 "recovery_token": recovery,
-                                # The update path's PATCH response carries no
-                                # token expiry; the credential record does.
-                                "recovery_token_expires_at": str(
-                                    (record_local or {}).get("recovery_token_expires_at")
-                                    or response_local.get("recovery_token_expires_at")
-                                    or "unknown"
-                                ),
+                                # Expiry is resolved with the revoke identity:
+                                # the reissued token's expiry when present, else
+                                # the pinned credential's — never the malformed
+                                # response, which may carry neither.
+                                "recovery_token_expires_at": revoke_recovery_expiry
+                                or "unknown",
                             }
                             with control_mutation_lock():
                                 rollback_enrollment = get_auto_upload_enrollment(conn)
@@ -1814,9 +1886,7 @@ def enable(
                                     generation=rollback_generation + 1,
                                     mode="off",
                                     health="retrying",
-                                    server_enrollment_id=str(
-                                        response_local["enrollment_id"]
-                                    ),
+                                    server_enrollment_id=revoke_id,
                                     revocation_pending=True,
                                     last_result_code="revocation_pending",
                                 ):

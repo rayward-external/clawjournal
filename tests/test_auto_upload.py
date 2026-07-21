@@ -2351,6 +2351,74 @@ def test_unverifiable_read_back_after_patch_revokes_like_a_mismatch(
         conn.close()
 
 
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        {"enrolled_at": ENROLLED_AT},  # missing authorization_revision
+        {"authorization_revision": 2},  # missing enrolled_at
+        {"enrolled_at": ENROLLED_AT, "authorization_revision": 2},  # missing id
+        {},  # empty body
+    ],
+)
+def test_malformed_patch_body_revokes_with_known_identity(
+    isolated_auto_upload,
+    monkeypatch,
+    bad_response,
+):
+    """A PATCH that returns 2xx but a malformed body is a DEFINITE server
+    mutation the read-back never got to verify: it must revoke using the known
+    existing enrollment id and the pinned recovery credential — not the
+    response body, which lacks them — instead of pausing a live enrollment."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    write_credentials(_credentials())
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(auto, "update_enrollment", lambda *_a, **_k: dict(bad_response))
+
+    def read_back_must_not_run(*_args, **_kwargs):
+        raise AssertionError("read-back is unreachable when the PATCH body is malformed")
+
+    monkeypatch.setattr(auto, "get_enrollment", read_back_must_not_run)
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        )
+        or {},
+    )
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "malformed_enrollment_response"
+    # Revoked with the KNOWN enrollment id + pinned recovery token, not the
+    # (malformed, identity-less) response body.
+    assert revoke_calls == [
+        ("server-enrollment-1", _credentials()["recovery_token"]),
+    ]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
+    finally:
+        conn.close()
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,
@@ -2584,7 +2652,12 @@ def test_reauthorization_rejects_later_future_only_cutoff(
     monkeypatch,
 ):
     # Moving the boundary *later* than the committed one is an unexpected
-    # forward move for a fixed enrollment and must be rejected.
+    # forward move for a fixed enrollment and must be rejected. Because it is
+    # detected AFTER the PATCH is definite but BEFORE the certification
+    # read-back, the enrollment's recorded certification is unverifiable — so
+    # the definite PATCH is revoked, not left paused-but-live. (Pre-v2 this
+    # merely paused; that left a live hosted enrollment under an unverified
+    # certification, which the read-back contract now forbids.)
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -2605,6 +2678,15 @@ def test_reauthorization_rejects_later_future_only_cutoff(
             "authorization_revision": 2,
         },
     )
+    revoke_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            (enrollment_id, recovery_token)
+        )
+        or {},
+    )
 
     result = auto.enable(
         agent="claude",
@@ -2615,12 +2697,15 @@ def test_reauthorization_rejects_later_future_only_cutoff(
     )
 
     assert result["code"] == "malformed_enrollment_response"
+    assert revoke_calls == [
+        ("server-enrollment-1", _credentials()["recovery_token"]),
+    ]
     conn = open_index()
     try:
         enrollment = get_auto_upload_enrollment(conn)
-        assert enrollment["mode"] == "paused"
-        assert enrollment["health"] == "action_required"
-        assert enrollment["enrolled_at"] == "2026-07-15T13:00:00+00:00"
+        assert enrollment["mode"] == "off"
+        assert enrollment["server_enrollment_id"] is None
+        assert load_credentials(required=False) is None
     finally:
         conn.close()
 
