@@ -6,14 +6,17 @@ from clawjournal.redaction.anonymizer import Anonymizer
 
 
 @pytest.fixture(autouse=True)
-def _bypass_trufflehog_by_default(monkeypatch):
-    """TruffleHog is a mandatory share-time gate in production, but most
-    tests don't have the binary installed and shouldn't depend on it.
-    Default every test to the bypass path; tests that exercise the
-    gate itself do ``monkeypatch.delenv("CLAWJOURNAL_SKIP_TRUFFLEHOG",
-    raising=False)`` and mock the subprocess.
+def _bypass_secret_scanners_by_default(monkeypatch):
+    """TruffleHog and Betterleaks are mandatory share-time gates in
+    production, but most tests don't have the binaries installed and
+    shouldn't depend on them. Default every test to the bypass path;
+    tests that exercise a gate itself ``monkeypatch.delenv(...)`` the
+    relevant variable and mock the subprocess. Two separate variables
+    (not one unified switch) so each wrapper's ``is_bypassed`` stays
+    self-contained and the manifest records which scanner was bypassed.
     """
     monkeypatch.setenv("CLAWJOURNAL_SKIP_TRUFFLEHOG", "1")
+    monkeypatch.setenv("CLAWJOURNAL_SKIP_BETTERLEAKS", "1")
 
 
 @pytest.fixture

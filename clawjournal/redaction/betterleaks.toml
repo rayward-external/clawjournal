@@ -1,0 +1,27 @@
+# Betterleaks configuration for the clawjournal share gate.
+#
+# Shipped in the wheel (see [tool.setuptools.package-data]) and passed
+# via --config on every scan (betterleaks.py `_base_args`). Extends the
+# full default ruleset — this file must only ever ADD allowlist entries,
+# never disable rules: the wrapper treats a missing config as "scan with
+# defaults", so anything load-bearing for detection must not live here.
+#
+# Tier policy (block / review / redact / warn) deliberately lives in
+# Python (`scan_policy.py`), not in Expr filters here, so the share
+# gate's behavior is reviewable in one place.
+
+title = "clawjournal share-gate config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "clawjournal-emitted redaction placeholders must never re-trigger the gate"
+regexes = [
+    # Every placeholder the redaction layers emit follows this shape:
+    # [REDACTED], [REDACTED_JWT], [REDACTED_SLACK_BOT_TOKEN], ... —
+    # see secrets.SECRET_PLACEHOLDER, findings.PLACEHOLDER_BY_TYPE,
+    # trufflehog.placeholder_for_detector, betterleaks.placeholder_for_rule.
+    # Allowlisting them guarantees the redact-and-rescan loop converges.
+    '''\[REDACTED(?:_[A-Z0-9_]+)?\]''',
+]

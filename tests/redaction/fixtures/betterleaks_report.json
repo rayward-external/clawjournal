@@ -1,0 +1,50 @@
+[
+    {
+        "RuleID": "private-key",
+        "Description": "Identified a Private Key, which may compromise cryptographic security and sensitive data encryption.",
+        "StartLine": 2,
+        "EndLine": 2,
+        "StartColumn": 64,
+        "EndColumn": 257,
+        "Match": "-----BEGIN RSA PRIVATE KEY-----\\nMIIEpAIBAAKCAQEA7ZkFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeF\\nakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake2\\n-----END RSA PRIVATE KEY-----",
+        "Secret": "-----BEGIN RSA PRIVATE KEY-----\\nMIIEpAIBAAKCAQEA7ZkFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeF\\nakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFakeFake2\\n-----END RSA PRIVATE KEY-----",
+        "Attributes": {
+            "path": "sessions.jsonl",
+            "resource": "fs.content"
+        },
+        "Tags": [],
+        "Fingerprint": "sessions.jsonl:private-key:2",
+        "File": "sessions.jsonl",
+        "SymlinkFile": "",
+        "Commit": "",
+        "Entropy": 3.8576245,
+        "Author": "",
+        "Email": "",
+        "Date": "",
+        "Message": ""
+    },
+    {
+        "RuleID": "slack-bot-token",
+        "Description": "Identified a Slack Bot token, which may compromise bot integrations and communication channel security.",
+        "StartLine": 1,
+        "EndLine": 1,
+        "StartColumn": 70,
+        "EndColumn": 126,
+        "Match": "xoxb-FAKE0FAKE0FAKE-FIXTURE0TOKEN-AbCdEfGhIjKlMnOpQrStUvWx",
+        "Secret": "xoxb-FAKE0FAKE0FAKE-FIXTURE0TOKEN-AbCdEfGhIjKlMnOpQrStUvWx",
+        "Attributes": {
+            "path": "sessions.jsonl",
+            "resource": "fs.content"
+        },
+        "Tags": [],
+        "Fingerprint": "sessions.jsonl:slack-bot-token:1",
+        "File": "sessions.jsonl",
+        "SymlinkFile": "",
+        "Commit": "",
+        "Entropy": 4.972898,
+        "Author": "",
+        "Email": "",
+        "Date": "",
+        "Message": ""
+    }
+]
