@@ -2138,6 +2138,68 @@ def test_read_back_failure_keeps_fresh_recovery_token_persisted(
         conn.close()
 
 
+def test_certification_rotation_during_enroll_aborts_and_revokes(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The enrollment request carries only a certification boolean, so the
+    server records its CURRENT version at POST time. If that version rotates
+    between fetch_authorization and the POST, the read-back must catch the
+    mismatch and abort with the compensating revoke — never report enabled
+    under terms the user never reviewed, nor pin a stale version the runner
+    gate could never match."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda *_a, **_k: _enrollment_response()
+    )
+    # The server rotated the certification after the terms fetch: the
+    # read-back reports a version the user did not accept.
+    monkeypatch.setattr(
+        auto,
+        "get_enrollment",
+        lambda *_args, **_kwargs: {
+            "enrollment_id": "server-enrollment-1",
+            "scope_hash": SERVER_SCOPE_HASH,
+            "ownership_certification_version": "ownership-rotated.v2",
+        },
+    )
+    revoke_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "revoke_enrollment",
+        lambda _caps, *, enrollment_id, recovery_token: revoke_calls.append(
+            enrollment_id
+        )
+        or {},
+    )
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "authorization_version_mismatch"
+    assert revoke_calls == ["server-enrollment-1"]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        # Nothing may be pinned under the unreviewed certification.
+        assert enrollment.get("server_scope_hash") is None
+        assert enrollment.get("ownership_certification_version") is None
+    finally:
+        conn.close()
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,

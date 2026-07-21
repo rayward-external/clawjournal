@@ -1465,6 +1465,24 @@ def enable(
                     "Hosted service returned no authoritative scope hash.",
                     retryable=True,
                 )
+            # The enrollment request carries only a certification BOOLEAN; the
+            # server records whatever certification version is current at
+            # POST/PATCH time. A rotation between fetch_authorization and the
+            # enrollment request would otherwise commit authority under terms
+            # the user never reviewed — and pin a stale version the runner
+            # gate could never match. Verify the recorded version equals the
+            # exact one the user accepted before any commit; the create
+            # path's compensating revoke removes the just-created enrollment.
+            # (authorization/retention versions need no read-back check: the
+            # request SENDS them and the server rejects stale values.)
+            if remote_state.get("ownership_certification_version") != str(
+                expected_ownership
+            ):
+                raise AutoUploadError(
+                    "authorization_version_mismatch",
+                    "The hosted ownership certification changed while enrolling; "
+                    "review the updated terms and enable again.",
+                )
 
             config = load_config()
             config["auto_upload_capability_available"] = True
