@@ -128,3 +128,63 @@ def fingerprint_raw_source(raw_path: str | Path) -> RawFingerprint:
 
     _snapshots, fingerprint = read_raw_source_snapshot(raw_path)
     return fingerprint
+
+
+def stat_raw_source(raw_path: str | Path) -> tuple:
+    """Cheap change-detection signature for a parser input — stat metadata only.
+
+    Never reads or hashes file contents, so it is size-independent.  The value
+    is opaque and only meaningful compared against another ``stat_raw_source``
+    result for the *same* path: it changes whenever a tracked file is appended
+    to or replaced, or (for a subagent directory) a member is added, removed,
+    appended to, or replaced.  Callers use it to detect a raw change that
+    happens while they wait to acquire a lock, without paying the
+    size-unbounded re-hash of :func:`fingerprint_raw_source`.
+
+    Raises :class:`RawSourceChanged` if the source is missing or unreadable, so
+    a vanished input is treated as a change rather than silently matching.
+    """
+
+    path = Path(raw_path)
+    if path.is_file():
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise RawSourceChanged("raw source is unavailable") from exc
+        return (
+            "file",
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+        )
+    if not path.is_dir():
+        raise RawSourceChanged("raw source is neither a file nor a directory")
+    try:
+        directory_stat = path.stat()
+    except OSError as exc:
+        raise RawSourceChanged("raw source directory is unavailable") from exc
+    members = _subagent_members(path)
+    if not members:
+        raise RawSourceChanged("raw source directory has no parser inputs")
+    member_signatures: list[tuple[str, int, int, int, int]] = []
+    for member in members:
+        try:
+            member_stat = member.stat()
+        except OSError as exc:
+            raise RawSourceChanged("raw source member is unavailable") from exc
+        member_signatures.append(
+            (
+                member.name,
+                int(member_stat.st_dev),
+                int(member_stat.st_ino),
+                int(member_stat.st_size),
+                int(member_stat.st_mtime_ns),
+            )
+        )
+    return (
+        "dir",
+        int(directory_stat.st_dev),
+        int(directory_stat.st_ino),
+        tuple(member_signatures),
+    )

@@ -56,7 +56,12 @@ from .auto_upload_credentials import (
 )
 from .config import load_config, save_config, source_scope_sources
 from .paths import atomic_write_text, ensure_hash_salt
-from .raw_sources import RawFingerprint, RawSourceChanged, fingerprint_raw_source
+from .raw_sources import (
+    RawFingerprint,
+    RawSourceChanged,
+    fingerprint_raw_source,
+    stat_raw_source,
+)
 from .scoring.backends import resolve_backend
 from .share_flow import build_zip, package, verify_coverage
 from .workbench.index import (
@@ -2066,8 +2071,12 @@ def _ranked_size_prefix(
     *,
     settings: Mapping[str, Any],
     maximum_bundle_size: int,
-) -> tuple[list[dict[str, Any]], int]:
-    """Choose the largest conservative ranked prefix before any AI call."""
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Choose the largest conservative ranked prefix before any AI call.
+
+    Returns ``(selected, deferred_by_size, missing)`` — ``missing`` counts
+    candidates whose session row vanished before the size ``break``.
+    """
 
     # ZIP can fail to compress. Apply the exact deterministic share redaction
     # locally before any AI call, then budget those serialized bytes plus
@@ -2077,10 +2086,16 @@ def _ranked_size_prefix(
     per_trace_overhead = 64 * 1024
     used = fixed_overhead
     selected: list[dict[str, Any]] = []
+    missing = 0
     for candidate in candidates:
         detail = get_session_detail(conn, str(candidate.get("session_id") or ""))
         if detail is None:
-            break
+            # The session row vanished between the candidate report and this
+            # read (e.g. the scanner pruned a deleted raw log). It cannot be
+            # packaged; skip it so the remaining ranked candidates can still
+            # ship, and let the caller tell "vanished" apart from "oversized".
+            missing += 1
+            continue
         redacted, _count, _log = apply_share_redactions(
             conn,
             detail,
@@ -2097,7 +2112,8 @@ def _ranked_size_prefix(
             break
         selected.append(dict(candidate))
         used = projected
-    return selected, max(0, len(candidates) - len(selected))
+    deferred_by_size = max(0, len(candidates) - len(selected) - missing)
+    return selected, deferred_by_size, missing
 
 
 def _current_revisions(
@@ -2257,6 +2273,44 @@ def _record_cycle_result(
         conn,
         expected_generation=generation,
         **changes,
+    )
+
+
+def _record_recovery_backoff(
+    conn: sqlite3.Connection,
+    *,
+    generation: int,
+    retry_after: int | None = None,
+) -> None:
+    """Pace a failed receipt recovery without touching durable status fields.
+
+    The hook due-check forces a 'submitting' share immediately due unless
+    ``next_retry_at`` is in the future, so a failing (or unresolvable) receipt
+    lookup must stamp the retry clock or every SessionStart relaunches a
+    network-calling runner. But receipt recovery deliberately runs before
+    every lifecycle gate — on paused, off, and ``action_required`` enrollments
+    — where ``health``/``last_result_code``/``last_receipt_reference`` carry
+    durable overlays a read-only probe must never rewrite: a durable
+    ``action_required`` gates automatic egress until the user reviews it,
+    Disable owns its revocation overlay, and the Pause-reauthorization merge
+    keys off ``last_result_code``. Stamp ONLY ``consecutive_failures`` and
+    ``next_retry_at`` (the two fields the throttle needs), unlike
+    ``_record_cycle_result`` which rewrites the user-facing status.
+    """
+
+    enrollment = get_auto_upload_enrollment(conn)
+    if enrollment is None or int(enrollment["generation"]) != generation:
+        return
+    failures = int(enrollment.get("consecutive_failures") or 0) + 1
+    delay = retry_after or min(
+        BACKOFF_MAX_SECONDS,
+        BACKOFF_BASE_SECONDS * (2 ** min(failures - 1, 8)),
+    )
+    update_auto_upload_enrollment(
+        conn,
+        expected_generation=generation,
+        consecutive_failures=failures,
+        next_retry_at=_iso(_now() + timedelta(seconds=delay)),
     )
 
 
@@ -2487,6 +2541,21 @@ def _transition_submission(
             "AND submission_state = ?",
             (to_state, share_id, from_state),
         )
+        if to_state == "submitting" and cursor.rowcount == 1:
+            # Entering 'submitting' means every gate just passed, so any stale
+            # next_retry_at (and the failure exponent behind it) from earlier
+            # unrelated failures is obsolete — clear both in the same
+            # transaction. A crash mid-POST then leaves 'submitting' with no
+            # backoff, keeping the first receipt reconcile immediately due;
+            # only a failure of THIS share's submit/reconcile can stamp a
+            # fresh backoff afterwards (starting from a fresh exponent), and
+            # the hook due-check rightly waits that one out.
+            conn.execute(
+                "UPDATE auto_upload_enrollment SET next_retry_at = NULL, "
+                "consecutive_failures = 0, updated_at = ? "
+                "WHERE singleton_id = 1 AND generation = ?",
+                (_iso(_now()), generation),
+            )
         conn.commit()
         return cursor.rowcount == 1
     except Exception:
@@ -2694,6 +2763,15 @@ def _submit_pending_artifact(
     # save_config for the full, size-unbounded re-hash. Only the profile-hash
     # recompute and the submitting transition need the lock for atomicity vs
     # profile writers.
+    # Capture the cheap, read-free stat baseline BEFORE the final fingerprint
+    # validation below, so the baseline describes — at the latest — the very
+    # snapshot validation confirms against the sealed ledger. A raw append or
+    # replace after that snapshot (including one that lands during the possibly
+    # long wait to acquire the egress lock, when the indexed revision stays
+    # unchanged) is then visible to the post-lock stat comparison. Capturing the
+    # baseline after validation would instead bake a change made in that gap
+    # into the baseline, and check_raw_fingerprints=False would let it ship.
+    pre_lock_raw_stats = _raw_stat_signatures(conn, share)
     _validate_raw_fingerprint_ledger(conn, share)
     # The protected server check above can take long enough for a local pause,
     # hold, revision, or privacy-profile edit to win. Profile writers share
@@ -2702,6 +2780,15 @@ def _submit_pending_artifact(
     # recompute and submitting transition have a definite order relative to
     # every supported privacy-setting mutation.
     with config_module.auto_upload_egress_lock():
+        # A raw source that changed after the validated snapshot — including one
+        # that lands while we wait for the lock — must abort before egress. The
+        # comparison is stat-only (no file reads), so the size-unbounded raw
+        # re-hash never runs under the lock (which is why
+        # check_raw_fingerprints=False below).
+        if _raw_stat_signatures(conn, share) != pre_lock_raw_stats:
+            raise ControlChanged(
+                "A selected raw trace changed after its validated snapshot."
+            )
         _validate_pending_for_submission(
             conn,
             share=share,
@@ -2709,6 +2796,7 @@ def _submit_pending_artifact(
             expected_profile_hash=str(enrollment["egress_profile_hash"]),
             api_origin=str(credentials["api_origin"]),
             ai_backend=ai_backend,
+            check_raw_fingerprints=False,
         )
         state = str(share.get("submission_state"))
         if state not in {"sealed", "submitting"} or not _transition_submission(
@@ -2884,8 +2972,17 @@ def _validate_pending_for_submission(
     expected_profile_hash: str,
     api_origin: str,
     ai_backend: str | None,
+    check_raw_fingerprints: bool = True,
 ) -> None:
-    """Re-establish every local safety gate before a recovery POST."""
+    """Re-establish every local safety gate before a recovery POST.
+
+    ``check_raw_fingerprints`` re-hashes the raw parser inputs, which is
+    size-unbounded. The locked submit path already validates the ledger
+    immediately before it acquires the egress lock, so it passes ``False``
+    here to keep that re-hash out of the lock — running it while the lock is
+    held would stall every concurrent ``save_config`` for the full hash of up
+    to five (potentially very large) session logs.
+    """
 
     if share.get("enrollment_id") != enrollment.get("server_enrollment_id"):
         raise AutoUploadError(
@@ -2922,7 +3019,8 @@ def _validate_pending_for_submission(
         api_origin=api_origin,
         ai_backend=ai_backend,
     )
-    _validate_raw_fingerprint_ledger(conn, share)
+    if check_raw_fingerprints:
+        _validate_raw_fingerprint_ledger(conn, share)
 
 
 def _validate_raw_fingerprint_ledger(
@@ -2958,6 +3056,39 @@ def _validate_raw_fingerprint_ledger(
     current_raw = {key: list(value) for key, value in _raw_fingerprints(candidates).items()}
     if stored_raw != current_raw:
         raise ControlChanged("A selected raw trace changed after artifact sealing.")
+
+
+def _raw_stat_signatures(
+    conn: sqlite3.Connection, share: Mapping[str, Any]
+) -> dict[str, tuple]:
+    """Cheap stat-only signatures for a sealed share's raw inputs.
+
+    Detects a raw append/replace that happens while the egress lock is being
+    acquired, without the size-unbounded re-hash of the fingerprint ledger. A
+    vanished or unreadable source counts as a change (raises ``ControlChanged``).
+    """
+
+    rows = conn.execute(
+        "SELECT s.session_id, s.raw_source_path FROM share_sessions ss "
+        "JOIN sessions s ON s.session_id = ss.session_id WHERE ss.share_id = ? "
+        "ORDER BY s.session_id",
+        (share["share_id"],),
+    ).fetchall()
+    signatures: dict[str, tuple] = {}
+    for row in rows:
+        session_id = str(row["session_id"])
+        raw_path = row["raw_source_path"]
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ControlChanged(
+                "A selected trace no longer has a verifiable raw source."
+            )
+        try:
+            signatures[session_id] = stat_raw_source(raw_path)
+        except (OSError, RawSourceChanged) as exc:
+            raise ControlChanged(
+                "A selected raw trace became unavailable while acquiring the egress lock."
+            ) from exc
+    return signatures
 
 
 def _server_enrollment_gate(
@@ -3104,15 +3235,50 @@ def _run_cycle_impl(
                         _checkpoint_recovered_receipt(conn, receipt_probe)
                         return receipt_probe
                     if enrollment.get("mode") != "enabled":
+                        still_pending = _pending_submission(conn)
+                        if (
+                            still_pending is not None
+                            and still_pending.get("submission_state") == "submitting"
+                        ):
+                            # A success-shaped probe can leave the share
+                            # 'submitting' on a non-enabled enrollment (e.g.
+                            # receipt_not_found while Off defers the collapse
+                            # to Disable). With leftover hooks nothing else
+                            # would stamp pacing, so the forced due-check
+                            # would relaunch a runner every SessionStart.
+                            _record_recovery_backoff(
+                                conn,
+                                generation=int(enrollment["generation"]),
+                            )
                         return receipt_probe
                 except RecurringServiceError as exc:
+                    # A failed receipt lookup must pace itself: the hook
+                    # due-check forces 'submitting' immediately due, so without
+                    # next_retry_at every SessionStart would relaunch a
+                    # network-calling runner (a spawn storm). Recovery runs
+                    # before every lifecycle gate, so ONLY the retry clock is
+                    # stamped — health/result codes may carry durable overlays
+                    # (a safety action_required, Disable's revocation state)
+                    # that a read-only probe must never rewrite.
+                    _record_recovery_backoff(
+                        conn,
+                        generation=int(enrollment["generation"]),
+                        retry_after=exc.retry_after,
+                    )
                     return exc.as_result()
                 except (AutoUploadError, CredentialStoreError) as exc:
-                    if isinstance(exc, AutoUploadError):
-                        return exc.as_result()
-                    return AutoUploadError(
-                        "credential_store_failed", str(exc)
-                    ).as_result()
+                    error = (
+                        exc
+                        if isinstance(exc, AutoUploadError)
+                        else AutoUploadError("credential_store_failed", str(exc))
+                    )
+                    # Same pacing guard as above: throttle the forced
+                    # 'submitting' due-check without touching durable status.
+                    _record_recovery_backoff(
+                        conn,
+                        generation=int(enrollment["generation"]),
+                    )
+                    return error.as_result()
 
             if enrollment.get("mode") == "off":
                 return AutoUploadError(
@@ -3428,7 +3594,7 @@ def _run_cycle_impl(
                     return {"ok": True, "code": "nothing_new", "count": 0}
                 settings = get_effective_share_settings(conn, config)
                 settings["source_filter"] = list(enrollment["enrolled_sources"])
-                selected, deferred_by_size = _ranked_size_prefix(
+                selected, deferred_by_size, missing_candidates = _ranked_size_prefix(
                     conn,
                     report["selected"],
                     settings=settings,
@@ -3437,11 +3603,21 @@ def _run_cycle_impl(
                 report["deferred_by_size"] = deferred_by_size
                 report["exclusion_counts"]["deferred_by_size"] = deferred_by_size
                 if not selected:
-                    # Candidates existed but none fit the hosted size budget —
-                    # a genuine oversize condition worth surfacing to the user.
-                    raise AutoUploadError(
-                        "payload_too_large",
-                        "The highest-ranked trace cannot fit the hosted size limit.",
+                    if deferred_by_size:
+                        # Candidates existed but none fit the hosted size budget
+                        # — a genuine oversize condition worth surfacing to the
+                        # user as a durable action.
+                        raise AutoUploadError(
+                            "payload_too_large",
+                            "The highest-ranked trace cannot fit the hosted size limit.",
+                        )
+                    # Every candidate's session row vanished between the report
+                    # and the size pass — the index changed mid-cycle. That is
+                    # a transient state change, not an oversize condition: back
+                    # off and retry instead of stamping a durable
+                    # action_required that blocks all future cycles.
+                    raise ControlChanged(
+                        "Selected traces disappeared while sizing the bundle."
                     )
                 session_ids = [str(item["session_id"]) for item in selected]
                 expected_revisions = {
@@ -3807,9 +3983,15 @@ def _hook_due_check_on_connection(
     if row is None:
         return DueDecision(False, "index-unavailable")
     # A 'submitting' artifact may already have crossed egress; its receipt must
-    # be reconciled promptly regardless of cadence/backoff, so this stays
-    # immediately due (the runner's recovery step can only look up receipts).
+    # be reconciled promptly regardless of cadence, so this is due immediately
+    # after a crash (the runner's recovery step can only look up receipts). But
+    # a *persistently failing* receipt lookup stamps next_retry_at (see the
+    # recovery branch in _run_cycle_impl); honor it here so a stuck 'submitting'
+    # artifact cannot relaunch a network-calling runner on every SessionStart.
     if row["submitting_pending"]:
+        retry_at = _parse_time(row["next_retry_at"])
+        if retry_at is not None and now < retry_at:
+            return DueDecision(False, "receipt-recovery-backoff")
         return DueDecision(True, "receipt-recovery-pending")
     # A merely 'sealed' artifact is a retryable submit failure with a stamped
     # next_retry_at. It must honor that backoff instead of relaunching a full

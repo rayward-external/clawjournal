@@ -7,6 +7,7 @@ agent hook files or the network.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -984,6 +985,526 @@ def test_recovery_rechecks_hold_review_revision_and_raw_fingerprint(
             ai_backend=None,
         )
     conn.close()
+
+
+def test_validate_pending_skips_raw_hash_when_disabled(isolated_auto_upload):
+    """check_raw_fingerprints=False keeps the size-unbounded raw re-hash out of
+    the egress lock: the locked submit path validates the ledger just before the
+    lock, so passing False here must not re-hash (a raw change alone won't raise),
+    while the default still re-hashes and catches the change."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+    raw_path.write_text("changed after sealing\n", encoding="utf-8")
+
+    # Guard against a regression that moves the raw hash back under the lock: with
+    # the check disabled the raw mutation is not re-hashed here, so nothing raises.
+    called = False
+    original = auto._validate_raw_fingerprint_ledger
+
+    def _spy(*args, **kwargs):
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)
+
+    auto._validate_raw_fingerprint_ledger = _spy
+    try:
+        auto._validate_pending_for_submission(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            expected_profile_hash=enrollment["egress_profile_hash"],
+            api_origin=ORIGIN,
+            ai_backend=None,
+            check_raw_fingerprints=False,
+        )
+        assert called is False
+
+        # The default still re-hashes and catches the post-seal raw change.
+        with pytest.raises(auto.ControlChanged):
+            auto._validate_pending_for_submission(
+                conn,
+                share=share,
+                enrollment=enrollment,
+                expected_profile_hash=enrollment["egress_profile_hash"],
+                api_origin=ORIGIN,
+                ai_backend=None,
+            )
+        assert called is True
+    finally:
+        auto._validate_raw_fingerprint_ledger = original
+    conn.close()
+
+
+def test_raw_stat_signatures_detect_append_and_replace(isolated_auto_upload):
+    """The cheap stat-only signature changes on both an append (size/mtime) and
+    a same-size replace (inode), so it can stand in for the full re-hash when
+    detecting a raw change during the lock wait."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    baseline = auto._raw_stat_signatures(conn, share)
+    with raw_path.open("a", encoding="utf-8") as handle:
+        handle.write("appended content\n")
+    after_append = auto._raw_stat_signatures(conn, share)
+    assert after_append != baseline
+
+    # Replace in place with identical content: same size, new inode -> differs.
+    same_content = raw_path.read_text(encoding="utf-8")
+    raw_path.unlink()
+    raw_path.write_text(same_content, encoding="utf-8")
+    assert auto._raw_stat_signatures(conn, share) != after_append
+    conn.close()
+
+
+def test_submit_aborts_on_raw_change_during_lock_wait(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A raw append/replace that lands while _submit_pending_artifact is blocked
+    acquiring the egress lock must abort before egress, even though the indexed
+    revision is unchanged and the in-lock raw re-hash is skipped for liveness."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "_server_enrollment_gate", lambda *_a, **_k: None)
+
+    def _forbidden_submit(*_args, **_kwargs):
+        raise AssertionError("submit_artifact must not run after a lock-wait raw change")
+
+    monkeypatch.setattr(auto, "submit_artifact", _forbidden_submit)
+
+    @contextlib.contextmanager
+    def _lock_that_mutates_raw():
+        # The raw log grows while we "wait" to acquire the lock.
+        with raw_path.open("a", encoding="utf-8") as handle:
+            handle.write("appended during lock wait\n")
+        yield
+
+    monkeypatch.setattr(
+        auto.config_module, "auto_upload_egress_lock", _lock_that_mutates_raw
+    )
+
+    with pytest.raises(auto.ControlChanged):
+        auto._submit_pending_artifact(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            credentials=_credentials(),
+            capabilities=_capabilities(),
+        )
+
+    state = conn.execute(
+        "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()[0]
+    assert state == "sealed"
+    conn.close()
+
+
+def test_submit_aborts_when_raw_changes_right_after_validation(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A raw change that lands immediately after the final fingerprint validation
+    returns (after the validated snapshot, before the lock) must still abort. The
+    stat baseline is captured *before* that validation, so the post-lock
+    comparison sees the change instead of baking it into the baseline."""
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "_server_enrollment_gate", lambda *_a, **_k: None)
+
+    def _forbidden_submit(*_args, **_kwargs):
+        raise AssertionError("submit_artifact must not run after a post-validation raw change")
+
+    monkeypatch.setattr(auto, "submit_artifact", _forbidden_submit)
+
+    # Mutate the raw log the instant the *final* pre-lock validation returns —
+    # i.e. right after the snapshot it validated. There are two pre-lock
+    # validations; only the second one (immediately before the baseline+lock)
+    # appends, so it validates a sealed-matching snapshot and then diverges.
+    real_validate = auto._validate_raw_fingerprint_ledger
+    calls = {"count": 0}
+
+    def _validate_then_mutate_on_final(conn_arg, share_arg):
+        real_validate(conn_arg, share_arg)
+        calls["count"] += 1
+        if calls["count"] == 2:
+            with raw_path.open("a", encoding="utf-8") as handle:
+                handle.write("appended right after the validated snapshot\n")
+
+    monkeypatch.setattr(
+        auto, "_validate_raw_fingerprint_ledger", _validate_then_mutate_on_final
+    )
+
+    with pytest.raises(auto.ControlChanged):
+        auto._submit_pending_artifact(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            credentials=_credentials(),
+            capabilities=_capabilities(),
+        )
+
+    state = conn.execute(
+        "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()[0]
+    assert state == "sealed"
+    conn.close()
+
+
+def test_hook_due_check_honors_backoff_for_submitting_share(isolated_auto_upload):
+    """A stuck 'submitting' share stays immediately due only until a failed
+    reconcile stamps next_retry_at; then the hook waits out the backoff instead
+    of relaunching a network-calling runner on every SessionStart."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    now = datetime.now(timezone.utc)
+
+    decision = auto._hook_due_check_on_connection(conn, now)
+    assert (decision.due, decision.reason) == (True, "receipt-recovery-pending")
+
+    future = (now + timedelta(hours=1)).isoformat()
+    conn.execute(
+        "UPDATE auto_upload_enrollment SET next_retry_at = ? WHERE singleton_id = 1",
+        (future,),
+    )
+    conn.commit()
+    decision = auto._hook_due_check_on_connection(conn, now)
+    assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+
+    past = (now - timedelta(hours=1)).isoformat()
+    conn.execute(
+        "UPDATE auto_upload_enrollment SET next_retry_at = ? WHERE singleton_id = 1",
+        (past,),
+    )
+    conn.commit()
+    decision = auto._hook_due_check_on_connection(conn, now)
+    assert (decision.due, decision.reason) == (True, "receipt-recovery-pending")
+    conn.close()
+
+
+def test_receipt_recovery_failure_stamps_backoff(isolated_auto_upload, monkeypatch):
+    """A failing receipt reconcile must stamp ONLY the retry clock so the
+    forced 'submitting' due-check throttles instead of storming — durable
+    status fields (health, last_result_code) stay untouched because recovery
+    runs before every lifecycle gate."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: None)
+
+    def network_forbidden(*_args, **_kwargs):
+        raise AssertionError("failed credential load must stop before network")
+
+    monkeypatch.setattr(auto, "lookup_receipt", network_forbidden)
+    monkeypatch.setattr(auto, "submit_artifact", network_forbidden)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "credential_invalid"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["consecutive_failures"] == 1
+        assert enrollment["next_retry_at"] is not None
+        # The read-only probe never rewrites user-facing status.
+        assert enrollment["health"] == "ready"
+        assert enrollment["last_result_code"] is None
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_receipt_recovery_failure_preserves_action_required(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A transient reconcile failure must NOT erase a durable action_required:
+    flipping it to 'retrying' would let a later successful receipt commit
+    upgrade to 'ready' and silently re-open automatic egress past a safety
+    stop the user never reviewed."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, health="action_required")
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        last_result_code="unmappable_findings",
+    )
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: None)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "credential_invalid"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] == "action_required"
+        assert enrollment["last_result_code"] == "unmappable_findings"
+        assert enrollment["consecutive_failures"] == 1
+        assert enrollment["next_retry_at"] is not None
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_receipt_recovery_server_error_stamps_backoff(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The RecurringServiceError handler (server down during lookup) must pace
+    itself exactly like the local-failure handler."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    monkeypatch.setattr(
+        auto,
+        "recovery_capabilities",
+        lambda origin: {
+            "origin": origin,
+            "recurring_receipt_lookup_url": (
+                f"{origin}/api/recurring-receipts/{{client_submission_id}}"
+            ),
+        },
+    )
+
+    def server_down(*_args, **_kwargs):
+        raise RecurringServiceError(
+            code="server_unavailable", message="down", retryable=True
+        )
+
+    monkeypatch.setattr(auto, "lookup_receipt", server_down)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "server_unavailable"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["consecutive_failures"] == 1
+        assert enrollment["next_retry_at"] is not None
+        assert enrollment["health"] == "ready"
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_receipt_recovery_preserves_disable_overlay_and_paces_off_mode(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """Recovery failures on a non-enabled enrollment must preserve Disable's
+    revocation overlay (mode/health/last_result_code) while still pacing the
+    forced 'submitting' due-check so leftover hooks cannot storm."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, health="action_required")
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        mode="off",
+        last_result_code="revocation_pending",
+    )
+    _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.close()
+
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: None)
+
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "credential_invalid"
+
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["health"] == "action_required"
+        assert enrollment["last_result_code"] == "revocation_pending"
+        assert enrollment["next_retry_at"] is not None
+        decision = auto._hook_due_check_on_connection(
+            conn, datetime.now(timezone.utc)
+        )
+        assert (decision.due, decision.reason) == (False, "receipt-recovery-backoff")
+    finally:
+        conn.close()
+
+
+def test_ranked_size_prefix_skips_vanished_sessions(isolated_auto_upload):
+    """A candidate whose session row vanished is skipped (not a hard stop), so
+    lower-ranked available candidates still ship; the missing count is reported
+    separately from the size-deferred count."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    settings = {}
+
+    candidates = [
+        {"session_id": "vanished-session"},
+        {"session_id": "session-one"},
+    ]
+    selected, deferred_by_size, missing = auto._ranked_size_prefix(
+        conn, candidates, settings=settings, maximum_bundle_size=5_000_000
+    )
+    assert [item["session_id"] for item in selected] == ["session-one"]
+    assert deferred_by_size == 0
+    assert missing == 1
+
+    selected, deferred_by_size, missing = auto._ranked_size_prefix(
+        conn,
+        [{"session_id": "gone-a"}, {"session_id": "gone-b"}],
+        settings=settings,
+        maximum_bundle_size=5_000_000,
+    )
+    assert selected == []
+    assert deferred_by_size == 0
+    assert missing == 2
+    conn.close()
+
+
+def test_all_candidates_vanished_backs_off_instead_of_action_required(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """If every candidate's session row vanished between the report and the
+    size pass, the cycle records retryable control_changed backoff — not a
+    durable payload_too_large action_required that blocks all future cycles."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(
+        conn,
+        config,
+        enrolled_at="2026-07-10T00:00:00+00:00",
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+    monkeypatch.setattr(auto, "get_session_detail", lambda *_args, **_kwargs: None)
+    post_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "submit_artifact",
+        lambda *_args, **_kwargs: post_calls.append("POST"),
+    )
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] == "control_changed"
+    assert post_calls == []
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] == "retrying"
+        assert enrollment["next_retry_at"] is not None
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize("review_status", ["new", "blocked"])
@@ -3205,33 +3726,68 @@ def test_sealed_backoff_is_respected_by_hook_and_runner(
     assert result["code"] == "retry-wait"
 
 
-def test_submitting_pending_stays_due_despite_backoff(isolated_auto_upload):
-    # A 'submitting' artifact may already have crossed egress; its receipt must
-    # be reconciled promptly regardless of next_retry_at, so it stays due.
+def test_stale_backoff_cleared_at_submitting_so_receipt_stays_prompt(
+    isolated_auto_upload,
+):
+    # A 'submitting' artifact may already have crossed egress; its FIRST receipt
+    # reconcile must be prompt even if an earlier unrelated failure had stamped
+    # next_retry_at. The sealed->submitting transition clears that stale backoff
+    # in the same transaction, so a crash mid-POST leaves 'submitting' with no
+    # backoff (immediately due). Only a failure of this share's own
+    # submit/reconcile stamps a fresh backoff afterwards — and THAT one the
+    # hook due-check honors, so a persistently failing reconcile cannot
+    # relaunch a network-calling runner on every SessionStart.
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
     _save_enabled_enrollment(conn, config, enrolled_at="2026-07-01T00:00:00+00:00")
-    _create_pending_share(
+    share_id, _ = _create_pending_share(
         conn,
         isolated_auto_upload["install"],
         session_id="session-one",
         enrollment_id="server-enrollment-1",
-        state="submitting",
+        state="sealed",
     )
-    retry_at = datetime.now(timezone.utc) + timedelta(hours=6)
+    now = datetime.now(timezone.utc)
+    stale_retry_at = now + timedelta(hours=6)
     assert update_auto_upload_enrollment(
         conn,
         expected_generation=1,
         health="retrying",
         consecutive_failures=1,
-        next_retry_at=retry_at.isoformat(),
+        next_retry_at=stale_retry_at.isoformat(),
     )
+
+    # The organic path into 'submitting' clears the stale backoff atomically.
+    assert auto._transition_submission(
+        conn,
+        share_id=share_id,
+        from_state="sealed",
+        to_state="submitting",
+        generation=1,
+    )
+    enrollment = get_auto_upload_enrollment(conn)
+    assert enrollment["next_retry_at"] is None
     conn.close()
 
     assert auto.hook_session_start_check(
-        "claude", retry_at - timedelta(hours=1)
+        "claude", now
     ) == agent_hooks.DueDecision(True, "receipt-recovery-pending")
+
+    # A fresh backoff stamped AFTER egress (failing submit/reconcile of this
+    # very share) is honored: the hook waits instead of storming.
+    conn = open_index()
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=1,
+        health="retrying",
+        consecutive_failures=2,
+        next_retry_at=(now + timedelta(minutes=30)).isoformat(),
+    )
+    conn.close()
+    assert auto.hook_session_start_check(
+        "claude", now
+    ) == agent_hooks.DueDecision(False, "receipt-recovery-backoff")
 
 
 def test_action_required_submitting_artifact_allows_receipt_lookup_only(
