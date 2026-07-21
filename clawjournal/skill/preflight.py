@@ -10,7 +10,7 @@ from __future__ import annotations
 import shutil
 
 from ..config import load_config
-from ..redaction import trufflehog
+from ..redaction import betterleaks, trufflehog
 from ..scoring.backends import AUTO_BACKEND_FALLBACK_ORDER, BACKEND_COMMANDS
 
 
@@ -52,5 +52,10 @@ def preflight(*, require_trufflehog: bool = True, backend: str = "auto",
         problems.append(
             "TruffleHog is not installed (the secret-scan gate). Run: "
             "clawjournal trufflehog install  (or set CLAWJOURNAL_SKIP_TRUFFLEHOG=1 for dev)."
+        )
+    if require_trufflehog and not betterleaks.is_bypassed() and not betterleaks.is_available():
+        problems.append(
+            "Betterleaks is not installed (the secret-scan gate's primary scanner). Run: "
+            "clawjournal betterleaks install  (or set CLAWJOURNAL_SKIP_BETTERLEAKS=1 for dev)."
         )
     return problems

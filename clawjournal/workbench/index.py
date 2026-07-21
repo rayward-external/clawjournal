@@ -1476,6 +1476,8 @@ def get_effective_share_settings(
         elif policy_type == "block_domain":
             blocked_domains.append(value)
 
+    from ..findings import get_enabled_engines
+
     return {
         "custom_strings": _dedupe_strings(custom_strings),
         "extra_usernames": _dedupe_strings(extra_usernames),
@@ -1485,6 +1487,10 @@ def get_effective_share_settings(
         "ai_pii_review_enabled": bool(resolved.get("ai_pii_review_enabled", False)),
         "source_scope": resolved.get("source"),
         "source_filter": source_scope_sources(resolved.get("source")),
+        # Resolved (default-expanded) engine set: part of the redaction
+        # profile, so it participates in _redaction_settings_fingerprint
+        # and toggling an engine invalidates finalized bundles.
+        "enabled_findings_engines": list(get_enabled_engines(resolved)),
     }
 
 
@@ -1654,6 +1660,7 @@ def _build_deterministic_redaction_log(
 ) -> list[dict[str, Any]]:
     """Build a metadata-only log from the findings-backed redaction substrate."""
     from ..findings import hash_entity
+    from ..redaction.betterleaks import scan_session_for_betterleaks_findings
     from ..redaction.pii import _dedupe_overlapping_pii, scan_text_for_pii
     from ..redaction.secrets import _dedupe_overlapping_matches, _iter_text_locations, scan_text
     from ..redaction.trufflehog import scan_session_for_trufflehog_findings
@@ -1710,6 +1717,24 @@ def _build_deterministic_redaction_log(
             ))
     except Exception:  # noqa: BLE001 — preview/export should fail soft on engine issues
         logger.warning("TruffleHog log build failed", exc_info=True)
+
+    try:
+        for finding in scan_session_for_betterleaks_findings(
+            session,
+            user_allowlist=user_allowlist,
+        ):
+            if decisions.get(hash_entity(finding.entity_text)) == "ignored":
+                continue
+            log.append(_redaction_log_entry(
+                type_name=f"betterleaks_{finding.rule.lower()}",
+                confidence=finding.confidence,
+                original_length=finding.length,
+                field=finding.field,
+                message_index=finding.message_index,
+                tool_field=finding.tool_field,
+            ))
+    except Exception:  # noqa: BLE001 — preview/export should fail soft on engine issues
+        logger.warning("Betterleaks log build failed", exc_info=True)
 
     return log
 

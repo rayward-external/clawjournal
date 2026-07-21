@@ -4,7 +4,13 @@ import json
 
 import pytest
 
-from clawjournal.config import _migrate_excluded_projects, load_config, normalize_excluded_project_names, save_config
+from clawjournal.config import (
+    _migrate_excluded_projects,
+    _migrate_findings_engines,
+    load_config,
+    normalize_excluded_project_names,
+    save_config,
+)
 
 
 class TestLoadConfig:
@@ -128,3 +134,37 @@ class TestSaveConfig:
         captured = capsys.readouterr()
         assert result is False
         assert "Warning" in captured.err
+
+
+class TestMigrateFindingsEngines:
+    def test_missing_key_rides_the_default(self):
+        # No explicit list → get_enabled_engines' default applies; the
+        # migration must not materialize the key.
+        config = {}
+        assert _migrate_findings_engines(config) is False
+        assert "enabled_findings_engines" not in config
+
+    def test_explicit_list_gains_betterleaks(self):
+        config = {"enabled_findings_engines": ["regex_secrets", "trufflehog"]}
+        assert _migrate_findings_engines(config) is True
+        assert config["enabled_findings_engines"] == [
+            "regex_secrets", "trufflehog", "betterleaks",
+        ]
+
+    def test_already_present_is_untouched(self):
+        config = {"enabled_findings_engines": ["betterleaks", "regex_pii"]}
+        assert _migrate_findings_engines(config) is False
+
+    def test_malformed_values_are_left_alone(self):
+        assert _migrate_findings_engines({"enabled_findings_engines": "nope"}) is False
+        assert _migrate_findings_engines({"enabled_findings_engines": [1, 2]}) is False
+
+    def test_load_config_persists_the_migration(self, tmp_config):
+        tmp_config.parent.mkdir(parents=True, exist_ok=True)
+        tmp_config.write_text(json.dumps({
+            "enabled_findings_engines": ["regex_secrets", "regex_pii"],
+        }))
+        config = load_config()
+        assert "betterleaks" in config["enabled_findings_engines"]
+        data = json.loads(tmp_config.read_text())
+        assert "betterleaks" in data["enabled_findings_engines"]

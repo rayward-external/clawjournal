@@ -36,6 +36,10 @@ from ..findings import (
     write_findings_to_db,
 )
 from ..findings import get_enabled_engines
+from ..redaction.betterleaks import (
+    BETTERLEAKS_ENGINE_ID,
+    scan_session_for_betterleaks_findings,
+)
 from ..redaction.pii import (
     PII_ENGINE_ID,
     scan_session_for_pii_findings,
@@ -137,6 +141,18 @@ def run_findings_pipeline(
                 )
             else:
                 logger.warning("TruffleHog engine errored during scan", exc_info=True)
+    if BETTERLEAKS_ENGINE_ID in enabled:
+        try:
+            raw.extend(scan_session_for_betterleaks_findings(session_blob, user_allowlist=user_allowlist))
+        except Exception:
+            # Same fail-soft posture as the trufflehog engine above.
+            if safe_logging:
+                logger.warning(
+                    "Findings engine failure stage=betterleaks code=engine_error",
+                    extra={"strict_scan_safe": True},
+                )
+            else:
+                logger.warning("Betterleaks engine errored during scan", exc_info=True)
 
     conn.execute("BEGIN IMMEDIATE")
     try:

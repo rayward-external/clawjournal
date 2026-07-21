@@ -157,6 +157,22 @@ class TestComputeFindingsRevision:
         rev2 = compute_findings_revision(self._session(project="p2"))
         assert rev1 != rev2
 
+    def test_betterleaks_fingerprint_participates(self, monkeypatch):
+        # Installing/upgrading the betterleaks binary must invalidate
+        # cached findings, same as the trufflehog fingerprint fold.
+        s = self._session()
+        monkeypatch.setattr(
+            "clawjournal.redaction.betterleaks.engine_fingerprint",
+            lambda: "betterleaks 1.6.1",
+        )
+        rev1 = compute_findings_revision(s)
+        monkeypatch.setattr(
+            "clawjournal.redaction.betterleaks.engine_fingerprint",
+            lambda: "betterleaks 1.7.0",
+        )
+        rev2 = compute_findings_revision(s)
+        assert rev1 != rev2
+
     def test_format_prefix(self):
         assert compute_findings_revision(self._session()).startswith("v1:")
 
@@ -448,15 +464,24 @@ class TestAllowlistRetroactive:
 
 
 class TestEnabledEngines:
-    DEFAULT = ("regex_pii", "regex_secrets", "trufflehog")
+    DEFAULT = ("betterleaks", "regex_pii", "regex_secrets")
 
     def test_defaults_to_all_shipped_engines(self):
+        # Betterleaks replaced trufflehog in the default set when it
+        # became the share gate's primary scanner; trufflehog remains
+        # an explicit opt-in.
         assert get_enabled_engines(None) == self.DEFAULT
         assert get_enabled_engines({}) == self.DEFAULT
 
     def test_returns_sorted_tuple(self):
-        result = get_enabled_engines({"enabled_findings_engines": ["trufflehog", "regex_secrets", "regex_pii"]})
+        result = get_enabled_engines({"enabled_findings_engines": ["betterleaks", "regex_secrets", "regex_pii"]})
         assert result == self.DEFAULT
+
+    def test_trufflehog_opt_in_is_preserved(self):
+        result = get_enabled_engines(
+            {"enabled_findings_engines": ["trufflehog", "regex_secrets", "betterleaks"]}
+        )
+        assert result == ("betterleaks", "regex_secrets", "trufflehog")
 
     def test_rejects_non_list(self):
         # Non-list config is treated as "use defaults".
