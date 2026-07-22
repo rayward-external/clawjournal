@@ -220,6 +220,52 @@ def _write_with_mtime(path, content, mtime):
     os.utime(path, (mtime, mtime))
 
 
+@pytest.mark.parametrize(
+    ("result", "expected_status"),
+    [
+        (
+            {
+                "ok": True,
+                "missing": [],
+                "scanners": {
+                    "betterleaks": {"ok": True, "status": "installed"},
+                    "trufflehog": {"ok": True, "status": "already-installed"},
+                },
+            },
+            200,
+        ),
+        (
+            {
+                "ok": False,
+                "missing": ["betterleaks"],
+                "error": "betterleaks: download failed",
+                "scanners": {
+                    "betterleaks": {"ok": False, "status": "download-failed"},
+                },
+            },
+            503,
+        ),
+    ],
+)
+def test_install_share_scanners_endpoint(
+    server,
+    monkeypatch,
+    result,
+    expected_status,
+):
+    calls = []
+    monkeypatch.setattr(
+        "clawjournal.redaction.scanner_install.ensure_share_scanners",
+        lambda **kwargs: calls.append(kwargs) or result,
+    )
+
+    status, body = _post(server, "/api/share/scanners/install")
+
+    assert status == expected_status
+    assert body == result
+    assert calls == [{"prefer_managed": True}]
+
+
 def _patch(port, path, data=None, *, skip_auth=False):
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps(data or {}).encode()

@@ -2134,6 +2134,23 @@ def _prepare_share_export_for_upload(
             export_dir, manifest = cached
             return export_dir, manifest, None
 
+    # Existing participants can receive a new required scanner through a
+    # ClawJournal fast-forward without re-running the installer. Repair that
+    # dependency gap only when building a new artifact: a finalized cached
+    # export has already passed the current gate and is reused byte-for-byte.
+    # Failures stay fail-closed before any export or AI work and carry a stable
+    # reason the workbench can recover from explicitly.
+    from ..redaction.scanner_install import ensure_share_scanners
+
+    scanner_setup = ensure_share_scanners()
+    if not scanner_setup["ok"]:
+        return None, {}, {
+            "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
+            "block_reason": "scanner-not-installed",
+            "scanner_install": scanner_setup,
+            "status": 503,
+        }
+
     export_dir, manifest = export_share_to_disk(
         conn,
         share_id,
@@ -2898,6 +2915,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_verify_email()
         elif path == "/api/share/verify-confirm":
             self._handle_share_verify_confirm()
+        elif path == "/api/share/scanners/install":
+            self._handle_install_share_scanners()
         elif path == "/api/auto-upload/preview":
             self._handle_auto_upload_preview(refresh=True)
         elif path == "/api/auto-upload/enable":
@@ -3989,6 +4008,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_share_upload_status(self) -> None:
         _json_response(self, hosted_upload_status())
 
+    def _handle_install_share_scanners(self) -> None:
+        """Install pinned local scanner binaries and report readiness."""
+        from ..redaction.scanner_install import ensure_share_scanners
+
+        result = ensure_share_scanners(prefer_managed=True)
+        if result["ok"]:
+            _json_response(self, result)
+            return
+        _json_response(self, result, 503)
+
     @staticmethod
     def _auto_upload_http_status(result: dict[str, Any]) -> int:
         if result.get("ok") is not False:
@@ -4472,6 +4501,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_export_share(self, share_id: str) -> None:
         body = _read_body(self)
         output_path = body.get("output_path")
+
+        from ..redaction.scanner_install import ensure_share_scanners
+
+        scanner_setup = ensure_share_scanners()
+        if not scanner_setup["ok"]:
+            _json_response(self, {
+                "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
+                "block_reason": "scanner-not-installed",
+                "scanner_install": scanner_setup,
+            }, 503)
+            return
 
         conn = open_index()
         try:

@@ -10,7 +10,7 @@ Use one of these prompts in Claude Code, Codex, Cursor, or another coding assist
 > **Ordinary workflow — browser workbench**
 >
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. Use the sharing-enabled installer so its managed secret scanners are installed automatically; do not ask me to install them with Homebrew. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
 >
 > Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and open the local browser workbench with `clawjournal serve`.
 >
@@ -25,7 +25,7 @@ Use one of these prompts in Claude Code, Codex, Cursor, or another coding assist
 > **CLI-only workflow — remote terminal or SSH**
 >
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. Use the sharing-enabled installer so its managed secret scanners are installed automatically; do not ask me to install them with Homebrew. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
 >
 > Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and run `clawjournal share --interactive --weekly`.
 >
@@ -42,7 +42,7 @@ The same prompt installs ClawJournal the first time and updates it later. Run it
 
 Open any AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Gemini CLI**, or similar — and paste this:
 
-> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. If it's already installed, pull the latest code from the public GitHub repo and rebuild the browser workbench. Install any missing prerequisites (git, Python 3.10+, Node.js). When you're done, run `clawjournal status` and tell me the version.*
+> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Use the sharing-enabled installer so the managed Betterleaks and TruffleHog scanners are installed automatically. If ClawJournal is already installed, pull the latest code, rebuild the browser workbench, and repair any missing sharing dependencies. Install any missing prerequisites (git, Python 3.10+, Node.js). When you're done, run `clawjournal status` and tell me the version.*
 
 The AI detects your OS, installs what it needs (git, Python, Node.js), runs the installer, and confirms it works.
 
@@ -63,7 +63,7 @@ Research participants who are explicitly enrolled in OpenRefinery Agent Failure 
 clawjournal enroll openrefinery --agent all --ui auto
 ```
 
-The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one gentle nudge per day asking whether to review recent agent failures with ClawJournal — answer **y** to open local review or **n** for later (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). Developers testing the hook can set `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day. If the participant accepts, run:
+The enrollment command first tries a safe `clawjournal selfupdate`, installs pinned and checksum-verified Betterleaks and TruffleHog copies under `~/.clawjournal/bin`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one gentle nudge per day asking whether to review recent agent failures with ClawJournal — answer **y** to open local review or **n** for later (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). Developers testing the hook can set `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day. If the participant accepts, run:
 
 ```bash
 clawjournal hooks launch openrefinery-failures
@@ -116,7 +116,7 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
 ```bash
 git clone https://github.com/rayward-external/clawjournal.git ~/clawjournal
 cd ~/clawjournal
-./scripts/install.sh --with-frontend       # or: sh scripts/install.sh --with-frontend
+./scripts/install.sh --with-frontend --with-sharing
 ```
 
 **Install — native Windows PowerShell** (use `powershell` if `pwsh` isn't installed):
@@ -124,10 +124,10 @@ cd ~/clawjournal
 ```powershell
 git clone https://github.com/rayward-external/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
-pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
+pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend -WithSharing
 ```
 
-`--with-frontend` / `-WithFrontend` builds the workbench at `localhost:8384`. Without Node.js the script warns and continues CLI-only (`serve` will 404 until you install Node and re-run). The script prints `[ok] ClawJournal <version> installed.` on success.
+`--with-frontend` / `-WithFrontend` builds the workbench at `localhost:8384`. `--with-sharing` / `-WithSharing` installs pinned, checksum-verified Betterleaks and TruffleHog copies without root access. Omit the sharing flag for a local-review-only install. Without Node.js the script warns and continues CLI-only (`serve` will 404 until you install Node and re-run). The script prints `[ok] ClawJournal <version> installed.` on success.
 
 **Verify** — the CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows); `status` prints JSON with `"stage"` and `"stage_number"`:
 
@@ -160,23 +160,21 @@ Optionally, `npx skills add rayward-external/clawjournal` installs three skills 
 
 ### 1. Install
 
-Use [Quickstart](#quickstart) above (or the install prompt at the top). The secret scanners (Betterleaks + TruffleHog) are **not** required for local use — they're only needed at Stage 6, where every export runs an independent secret scan; verified credentials block, recognizable tokens are auto-redacted, and a missing scanner blocks the export. Your AI installs them when you reach Stage 6.
+Use [Quickstart](#quickstart) above (or the install prompt at the top). The secret scanners (Betterleaks + TruffleHog) are **not** required for local use. The sharing-enabled installer installs them up front; existing installations repair a missing scanner automatically during enrollment or the first packaging preflight. Every export still runs an independent secret scan: verified credentials block, recognizable tokens are auto-redacted, and a scanner that cannot be installed or resolved blocks the export.
 
 <details>
-<summary><b>Show scanner install commands</b></summary>
+<summary><b>Show scanner recovery commands</b></summary>
 
 ```bash
 # macOS / Linux / Windows (x86-64 and ARM64) — pinned versions, sha256-verified,
 # installed to ~/.clawjournal/bin, no root needed:
 clawjournal betterleaks install
 clawjournal trufflehog install
-
-# Or install them yourself:
-brew install betterleaks trufflehog                        # macOS
-curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux (TruffleHog)
-# Betterleaks Linux/Windows: https://github.com/betterleaks/betterleaks#installation
-# Windows: download release binaries from each project's releases page
 ```
+
+Normal participants do not need these commands: enrollment and packaging run
+the same managed installers automatically. They are included only for retrying
+a failed download or diagnosing an offline machine.
 
 </details>
 
@@ -313,7 +311,7 @@ clawjournal auto-upload disable   # removes upload authority; prior uploads are 
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. Use the sharing-enabled installer so its managed secret scanners are installed automatically; do not ask me to install them with Homebrew. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
 >
 > Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and run `clawjournal share --interactive --weekly`.
 >

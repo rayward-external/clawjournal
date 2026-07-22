@@ -530,6 +530,121 @@ class TestSecretScanGate:
         assert (export_dir / "trufflehog.json").exists()
         assert (export_dir / "secret-scan.json").exists()
 
+    def test_first_share_after_update_auto_installs_new_scanner(
+        self,
+        conn,
+        monkeypatch,
+        tmp_path,
+    ):
+        """An existing install must recover when an update adds Betterleaks.
+
+        This models a participant whose ClawJournal checkout fast-forwarded to
+        the mandatory Betterleaks gate, but whose old installer had only put
+        TruffleHog on the machine.  The first package preflight installs the
+        newly required managed scanner and then completes the same share.
+        """
+        from clawjournal.redaction import betterleaks, betterleaks_install
+        from clawjournal.workbench.daemon import _prepare_share_export_for_upload
+
+        _mock_gate_engines(monkeypatch)
+        managed = tmp_path / "managed-bin" / "betterleaks"
+        scanner_state = {"available": False}
+        installs = []
+        monkeypatch.setattr(
+            betterleaks,
+            "is_available",
+            lambda: scanner_state["available"],
+        )
+        monkeypatch.setattr(betterleaks, "managed_binary_path", lambda: managed)
+        monkeypatch.setattr(
+            betterleaks,
+            "resolve_binary",
+            lambda: str(managed) if scanner_state["available"] else None,
+        )
+
+        def install_betterleaks(**_kwargs):
+            installs.append("betterleaks")
+            scanner_state["available"] = True
+            return {"status": "installed", "version": "1.6.1"}
+
+        monkeypatch.setattr(betterleaks_install, "install", install_betterleaks)
+        share_id, share = self._share(conn, content="ordinary trace content")
+        settings = {
+            "custom_strings": [],
+            "extra_usernames": [],
+            "excluded_projects": [],
+            "blocked_domains": [],
+            "allowlist_entries": [],
+            "source_filter": None,
+            "ai_pii_review_enabled": False,
+        }
+
+        export_dir, manifest, error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+        )
+
+        assert error is None
+        assert installs == ["betterleaks"]
+        assert export_dir is not None
+        assert manifest.get("blocked") is not True
+        assert (export_dir / "manifest.json").exists()
+
+    def test_finalized_export_reuse_does_not_require_live_scanners(
+        self,
+        conn,
+        monkeypatch,
+        tmp_path,
+    ):
+        from clawjournal.workbench import daemon as daemon_module
+        from clawjournal.workbench.daemon import _prepare_share_export_for_upload
+
+        monkeypatch.setattr(daemon_module, "CONFIG_DIR", tmp_path)
+        _mock_gate_engines(monkeypatch)
+        share_id, share = self._share(conn, content="ordinary trace content")
+        settings = {
+            "custom_strings": [],
+            "extra_usernames": [],
+            "excluded_projects": [],
+            "blocked_domains": [],
+            "allowlist_entries": [],
+            "source_filter": None,
+            "ai_pii_review_enabled": False,
+        }
+
+        export_dir, manifest, error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+        assert error is None
+        assert export_dir is not None
+        assert manifest.get("blocked") is not True
+
+        def unexpected_preflight(**_kwargs):
+            raise AssertionError("finalized export reuse must not require scanners")
+
+        monkeypatch.setattr(
+            "clawjournal.redaction.scanner_install.ensure_share_scanners",
+            unexpected_preflight,
+        )
+
+        cached_dir, cached_manifest, cached_error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+
+        assert cached_error is None
+        assert cached_dir == export_dir
+        assert cached_manifest == manifest
+
     def test_unverified_token_is_redacted_and_share_advances(self, conn, monkeypatch):
         # The headline behavior change: a recognizable-but-unverified
         # token no longer rejects the session — the exact span is

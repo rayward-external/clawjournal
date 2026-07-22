@@ -463,6 +463,24 @@ export const api = {
     }> {
       return request('/share/upload-status');
     },
+
+    installScanners(): Promise<{
+      ok: boolean;
+      missing: string[];
+      scanners: Record<string, {
+        ok: boolean;
+        status: string;
+        install_attempted: boolean;
+        available: boolean;
+        managed: boolean;
+      }>;
+    }> {
+      return request('/share/scanners/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+    },
   },
 
   quickShare(sessionIds: string[], note?: string, opts?: { aiPii?: boolean }): Promise<{
