@@ -1657,13 +1657,15 @@ def _build_deterministic_redaction_log(
     session: dict[str, Any],
     *,
     user_allowlist: list[dict[str, Any]] | None = None,
+    include_trufflehog: bool = True,
 ) -> list[dict[str, Any]]:
     """Build a metadata-only log from the findings-backed redaction substrate."""
     from ..findings import hash_entity
     from ..redaction.betterleaks import scan_session_for_betterleaks_findings
     from ..redaction.pii import _dedupe_overlapping_pii, scan_text_for_pii
     from ..redaction.secrets import _dedupe_overlapping_matches, _iter_text_locations, scan_text
-    from ..redaction.trufflehog import scan_session_for_trufflehog_findings
+    if include_trufflehog:
+        from ..redaction.trufflehog import scan_session_for_trufflehog_findings
 
     session_id = str(session.get("session_id") or "")
     if not session_id:
@@ -1700,23 +1702,24 @@ def _build_deterministic_redaction_log(
                 tool_field=tool_field,
             ))
 
-    try:
-        for finding in scan_session_for_trufflehog_findings(
-            session,
-            user_allowlist=user_allowlist,
-        ):
-            if decisions.get(hash_entity(finding.entity_text)) == "ignored":
-                continue
-            log.append(_redaction_log_entry(
-                type_name=f"trufflehog_{finding.rule.lower()}",
-                confidence=finding.confidence,
-                original_length=finding.length,
-                field=finding.field,
-                message_index=finding.message_index,
-                tool_field=finding.tool_field,
-            ))
-    except Exception:  # noqa: BLE001 — preview/export should fail soft on engine issues
-        logger.warning("TruffleHog log build failed", exc_info=True)
+    if include_trufflehog:
+        try:
+            for finding in scan_session_for_trufflehog_findings(
+                session,
+                user_allowlist=user_allowlist,
+            ):
+                if decisions.get(hash_entity(finding.entity_text)) == "ignored":
+                    continue
+                log.append(_redaction_log_entry(
+                    type_name=f"trufflehog_{finding.rule.lower()}",
+                    confidence=finding.confidence,
+                    original_length=finding.length,
+                    field=finding.field,
+                    message_index=finding.message_index,
+                    tool_field=finding.tool_field,
+                ))
+        except Exception:  # noqa: BLE001 — preview/export should fail soft on engine issues
+            logger.warning("TruffleHog log build failed", exc_info=True)
 
     try:
         for finding in scan_session_for_betterleaks_findings(
@@ -1983,11 +1986,16 @@ def apply_share_redactions(
             "cannot attribute decisions without it."
         )
 
+    # Local Share redaction uses Betterleaks and built-in rules. The
+    # independent package gate runs TruffleHog over the sealed redacted bundle
+    # before export or upload, preserving final verification without paying
+    # for the slower scanner during each trace preview.
     redaction_log.extend(
         _build_deterministic_redaction_log(
             conn,
             session,
             user_allowlist=user_allowlist,
+            include_trufflehog=False,
         ),
     )
     session, deterministic_total = apply_findings_to_blob(
@@ -1995,15 +2003,10 @@ def apply_share_redactions(
         conn,
         session_id,
         user_allowlist=user_allowlist,
+        include_trufflehog=False,
     )
     total_redactions += deterministic_total
 
-    # TruffleHog acts as another detection+redaction engine in the
-    # pipeline through apply_findings_to_blob, so the share-time redaction
-    # step respects the same ignored/open decision substrate as the other
-    # deterministic engines. The later Package-step gate still re-scans the
-    # merged output independently before export/upload.
-    #
     # Known tradeoff: ``redaction_log`` is built from a single pre-apply
     # scan (see ``_build_deterministic_redaction_log``); the apply step
     # runs up to ``max_passes=3`` passes that can surface secrets

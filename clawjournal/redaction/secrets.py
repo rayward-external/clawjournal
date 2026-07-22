@@ -1098,6 +1098,7 @@ def apply_findings_to_blob(
     *,
     user_allowlist: list[dict] | None = None,
     max_passes: int = 3,
+    include_trufflehog: bool = True,
 ) -> tuple[dict, int]:
     """Re-scan the blob, apply decisions from the `findings` table.
 
@@ -1122,14 +1123,15 @@ def apply_findings_to_blob(
     # Lazy import to avoid pii.py → secrets.py import cycle.
     from .betterleaks import betterleaks_secret_map_from_blob
     from .pii import pii_secret_map_from_text_decisions
-    from .trufflehog import trufflehog_secret_map_from_blob
 
-    # TruffleHog and Betterleaks are subprocess-backed engines — run
-    # them once on the original blob rather than inside the per-pass
-    # loop. The raws they find don't change after the first
-    # replacement, so re-scanning on every pass would pay N× the
-    # subprocess cost for zero new information.
-    trufflehog_map = trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
+    # Betterleaks is always part of the local redaction pass. TruffleHog is
+    # optional here so the Share path can defer it to its mandatory final
+    # package gate. Each enabled engine runs once on the original blob rather
+    # than inside the per-pass loop.
+    trufflehog_map: dict[str, str] = {}
+    if include_trufflehog:
+        from .trufflehog import trufflehog_secret_map_from_blob
+        trufflehog_map = trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
     betterleaks_map = betterleaks_secret_map_from_blob(blob, decisions, user_allowlist)
 
     total = 0
@@ -1156,7 +1158,7 @@ def apply_findings_to_blob(
         secret_map.update(_collect_infrastructure_secret_map(blob))
         secret_map.update(trufflehog_map)
         secret_map.update(betterleaks_map)
-        # Note on loop termination: once trufflehog_map is non-empty the
+        # Note on loop termination: once an engine map is non-empty the
         # `not secret_map` guard never fires, so the pass loop now
         # relies on the `pass_count == 0 and pass_num > 0` guard below
         # to exit. That guard still works because the second pass's

@@ -227,28 +227,30 @@ class TestExportManifestRedactions:
         assert "[REDACTED_JWT]" in body
         assert n >= 2
 
-    def test_apply_share_redactions_uses_trufflehog_in_data_step(self, conn, monkeypatch):
+    def test_apply_share_redactions_skips_trufflehog_in_local_data_step(self, conn, monkeypatch):
         from clawjournal.redaction import trufflehog as trufflehog_scanner
 
-        raw = "xoxb-0123456789-ABCDEFGHIJKL"
+        raw = "trufflehog test sentinel"
         sess = _settled_session("sess-th", content=f"leak {raw}")
         upsert_sessions(conn, [sess])
         conn.commit()
 
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
-        monkeypatch.setattr(trufflehog_scanner, "is_available", lambda: True)
         monkeypatch.setattr(
             trufflehog_scanner,
-            "_scan_text_for_raw_matches",
-            lambda text: [{"raw": raw, "detector": "Slack", "status": "verified"}],
+            "scan_session_for_trufflehog_findings",
+            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not scan with TruffleHog"),
+        )
+        monkeypatch.setattr(
+            trufflehog_scanner,
+            "trufflehog_secret_map_from_blob",
+            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not apply TruffleHog findings"),
         )
 
         redacted, n, log = apply_share_redactions(conn, sess)
         body = redacted["messages"][0]["content"]
-        assert raw not in body
-        assert "[REDACTED_SLACK]" in body
-        assert n >= 1
-        assert any(entry["type"] == "trufflehog_slack" for entry in log)
+        assert raw in body
+        assert n == 0
+        assert not any(entry["type"].startswith("trufflehog_") for entry in log)
 
     def test_apply_share_redactions_strips_terminal_control_sequences(self, conn):
         """Terminal ANSI escape codes are stripped from shared content so they
@@ -299,10 +301,10 @@ class TestExportManifestRedactions:
         with pytest.raises(ValueError, match="session_id"):
             apply_share_redactions(conn, session)
 
-    def test_apply_share_redactions_honors_ignored_trufflehog_findings(self, conn, monkeypatch):
+    def test_apply_share_redactions_skips_ignored_trufflehog_findings(self, conn, monkeypatch):
         from clawjournal.redaction import trufflehog as trufflehog_scanner
 
-        raw = "xoxb-ignored-at-share-time-ABCDEFGHIJKL"
+        raw = "ignored trufflehog sentinel"
         sess = _settled_session("sess-th-ignore", content=f"keep {raw}")
         upsert_sessions(conn, [sess])
         conn.execute(
@@ -318,12 +320,15 @@ class TestExportManifestRedactions:
         )
         conn.commit()
 
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
-        monkeypatch.setattr(trufflehog_scanner, "is_available", lambda: True)
         monkeypatch.setattr(
             trufflehog_scanner,
-            "_scan_text_for_raw_matches",
-            lambda text: [{"raw": raw, "detector": "Slack", "status": "verified"}],
+            "scan_session_for_trufflehog_findings",
+            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not scan with TruffleHog"),
+        )
+        monkeypatch.setattr(
+            trufflehog_scanner,
+            "trufflehog_secret_map_from_blob",
+            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not apply TruffleHog findings"),
         )
 
         redacted, n, log = apply_share_redactions(conn, sess)
