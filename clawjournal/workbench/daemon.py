@@ -493,6 +493,7 @@ class Scanner:
         self.last_updated_by_source: dict[str, int] = {}
         self.last_unchanged_by_source: dict[str, int] = {}
         self.last_scored_count = 0
+        self._scan_lock = threading.Lock()
         self._score_thread: threading.Thread | None = None
         self._score_lock = threading.Lock()
         self._auto_score_disabled_reason: str | None = None
@@ -513,7 +514,22 @@ class Scanner:
         whose content changed (or remained unchanged) are exposed on the
         ``last_updated_*`` and ``last_unchanged_*`` attributes.
         """
-        return self._scan_once_report(required_sources=None)["new_by_source"]
+        with self._scan_lock:
+            return self._scan_once_report(required_sources=None)["new_by_source"]
+
+    def scan_once_if_idle(self) -> dict[str, int] | None:
+        """Run a normal scan only when no scan is already active.
+
+        HTTP refresh requests use this non-blocking entry point so repeated
+        desktop launches coalesce instead of running concurrent SQLite and
+        findings passes on the same Scanner instance.
+        """
+        if not self._scan_lock.acquire(blocking=False):
+            return None
+        try:
+            return self._scan_once_report(required_sources=None)["new_by_source"]
+        finally:
+            self._scan_lock.release()
 
     def scan_once_strict(self, required_sources: list[str]) -> dict[str, Any]:
         """Run a fail-closed refresh for an automatic-upload source scope.
@@ -541,7 +557,8 @@ class Scanner:
                     for source in unsupported
                 ],
             }
-        return self._scan_once_report(required_sources=set(required))
+        with self._scan_lock:
+            return self._scan_once_report(required_sources=set(required))
 
     def _scan_once_report(
         self,
@@ -2795,8 +2812,36 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
 
+        # The launcher needs to identify this daemon before it is safe to send
+        # the bearer token. Keep the challenge response outside `/api/*` so
+        # the rule that every API endpoint requires bearer auth stays intact.
+        if path == "/.well-known/clawjournal":
+            challenge = params.get("challenge", [""])[0]
+            if len(challenge) != 32 or any(
+                character not in "0123456789abcdefABCDEF" for character in challenge
+            ):
+                _json_response(self, {"error": "invalid challenge"}, status=400)
+                return
+            try:
+                from pathlib import Path as _Path
+                from ..paths import api_health_proof, ensure_api_token
+                from .index import INDEX_DB as _INDEX_DB
+
+                token = ensure_api_token(_Path(str(_INDEX_DB)).parent)
+            except Exception:
+                logger.exception("Could not resolve api_token for health check")
+                _json_response(self, {"error": "health check unavailable"}, status=500)
+                return
+            _json_response(
+                self,
+                {
+                    "ok": True,
+                    "service": "clawjournal",
+                    "proof": api_health_proof(token, challenge),
+                },
+            )
         # API routes
-        if path == "/api/sessions":
+        elif path == "/api/sessions":
             self._handle_list_sessions(params)
         elif path.startswith("/api/sessions/") and path.endswith("/redaction-report"):
             session_id = _api_session_id(path, suffix="/redaction-report")
@@ -2964,6 +3009,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_scoring_warmup()
         elif path == "/api/config":
             self._handle_update_config()
+        elif path == "/api/desktop/opened":
+            self._handle_desktop_opened()
         elif path == "/api/scan":
             force = parse_qs(parsed.query).get("force", [""])[0] in ("1", "true")
             self._handle_trigger_scan(force=force)
@@ -4777,7 +4824,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         """
         scanner = getattr(self.server, "_scanner", None)
         if scanner:
-            results = scanner.scan_once()
+            results = scanner.scan_once_if_idle()
+            if results is None:
+                _json_response(
+                    self,
+                    {
+                        "ok": True,
+                        "status": "already_running",
+                        "new_sessions": {},
+                        "updated_sessions": {},
+                        "unchanged_sessions": {},
+                    },
+                    202,
+                )
+                return
             warmup = trigger_scoring_warmup(scanner)
             payload: dict[str, Any] = {
                 "ok": True,
@@ -4812,6 +4872,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             _json_response(self, payload)
         else:
             _json_response(self, {"error": "Scanner not available"}, 503)
+
+    def _handle_desktop_opened(self) -> None:
+        """Record a real SPA mount without blocking the request on OS tools."""
+        from ..desktop import note_opened_async
+
+        _json_response(self, {"ok": True, "scheduled": note_opened_async()})
 
     # --- Static file serving ---
 
@@ -5248,8 +5314,17 @@ def run_server(
     open_browser: bool = True,
     source_filter: str | None = None,
     remote: bool = False,
+    allow_port_fallback: bool = True,
 ) -> None:
-    """Start the workbench daemon — scanner + HTTP server."""
+    """Start the workbench daemon — scanner + HTTP server.
+
+    `allow_port_fallback` keeps the historical behaviour for `clawjournal
+    serve`: if the requested port is taken, quietly bind an ephemeral one. The
+    desktop launcher passes False, because there a busy port almost always
+    means our own daemon already won the race — silently starting a second one
+    would put two scanners on the same SQLite index and strand the browser on
+    a port that won't be there next time.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
@@ -5263,6 +5338,8 @@ def run_server(
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), WorkbenchHandler)
     except OSError:
+        if not allow_port_fallback:
+            raise
         server = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]

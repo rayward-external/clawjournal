@@ -9,7 +9,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from io import BytesIO
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
@@ -1814,11 +1814,36 @@ class TestScanner:
 
 
 class TestScanAPI:
+    def test_scanner_coalesces_a_scan_request_while_another_scan_is_active(
+        self, monkeypatch
+    ):
+        scanner = Scanner()
+        entered = Event()
+        release = Event()
+        completed: list[dict[str, int]] = []
+
+        def slow_report(*, required_sources):
+            assert required_sources is None
+            entered.set()
+            assert release.wait(timeout=2)
+            return {"new_by_source": {"codex": 1}}
+
+        monkeypatch.setattr(scanner, "_scan_once_report", slow_report)
+        thread = Thread(target=lambda: completed.append(scanner.scan_once()))
+        thread.start()
+        assert entered.wait(timeout=2)
+
+        assert scanner.scan_once_if_idle() is None
+
+        release.set()
+        thread.join(timeout=2)
+        assert completed == [{"codex": 1}]
+
     def test_endpoint_reports_new_updated_and_unchanged_by_source(
         self, server_with_scanner, monkeypatch
     ):
         port, scanner = server_with_scanner
-        scanner.scan_once = lambda: {"codex": 0, "claude": 2}
+        scanner.scan_once_if_idle = lambda: {"codex": 0, "claude": 2}
         scanner.last_updated_by_source = {"codex": 1}
         scanner.last_unchanged_by_source = {"codex": 4, "claude": 3}
         monkeypatch.setattr(
@@ -1832,6 +1857,73 @@ class TestScanAPI:
         assert data["new_sessions"] == {"codex": 0, "claude": 2}
         assert data["updated_sessions"] == {"codex": 1}
         assert data["unchanged_sessions"] == {"codex": 4, "claude": 3}
+
+    def test_endpoint_coalesces_when_a_scan_is_already_running(
+        self, server_with_scanner
+    ):
+        port, scanner = server_with_scanner
+        scanner.scan_once_if_idle = lambda: None
+
+        status, data = _post(port, "/api/scan")
+
+        assert status == 202
+        assert data == {
+            "ok": True,
+            "status": "already_running",
+            "new_sessions": {},
+            "updated_sessions": {},
+            "unchanged_sessions": {},
+        }
+
+
+class TestDesktopAPI:
+    def test_health_probe_identifies_clawjournal_without_disclosing_token(self, server):
+        from pathlib import Path
+        from clawjournal.paths import API_TOKEN_FILENAME, api_health_proof
+        from clawjournal.workbench.index import INDEX_DB
+
+        challenge = "01" * 16
+        status, data = _get(
+            server,
+            f"/.well-known/clawjournal?challenge={challenge}",
+            skip_auth=True,
+        )
+        assert status == 200
+        token = (
+            Path(str(INDEX_DB)).parent / API_TOKEN_FILENAME
+        ).read_text().strip()
+        assert data == {
+            "ok": True,
+            "service": "clawjournal",
+            "proof": api_health_proof(token, challenge),
+        }
+
+        status, body = _get(server, "/.well-known/clawjournal", skip_auth=True)
+        assert status == 400
+        assert body == {"error": "invalid challenge"}
+
+        status, body = _get(server, "/api/stats", skip_auth=True)
+        assert status == 401
+        assert body == ""
+
+    def test_open_notification_is_authenticated_and_scheduled_off_thread(
+        self, server, monkeypatch
+    ):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "clawjournal.desktop.note_opened_async",
+            lambda: calls.append("scheduled") or True,
+        )
+
+        status, data = _post(server, "/api/desktop/opened")
+        assert status == 200
+        assert data == {"ok": True, "scheduled": True}
+        assert calls == ["scheduled"]
+
+        status, body = _post(server, "/api/desktop/opened", skip_auth=True)
+        assert status == 401
+        assert body == ""
+        assert calls == ["scheduled"]
 
 
 class TestScoringWarmupAPI:
@@ -2342,6 +2434,14 @@ class TestStaticServing:
         (dist / "index.html").write_text("<!DOCTYPE html><title>Built UI</title>", encoding="utf-8")
         (dist / "app.js").write_text("console.log('ok');", encoding="utf-8")
         monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+        monkeypatch.setattr(
+            "clawjournal.desktop.note_opened",
+            lambda: pytest.fail("an unauthenticated static GET changed desktop state"),
+        )
+        monkeypatch.setattr(
+            "clawjournal.desktop.note_opened_async",
+            lambda: pytest.fail("an unauthenticated static GET scheduled desktop work"),
+        )
         seeded = _seed_timeline(index_setup)
 
         conn = HTTPConnection("127.0.0.1", server, timeout=5)

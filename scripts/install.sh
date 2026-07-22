@@ -8,8 +8,9 @@
 # Usage:
 #   ./scripts/install.sh                # CLI install (recommended for first run)
 #   ./scripts/install.sh --with-frontend  # also build the browser workbench
+#   ./scripts/install.sh --desktop-shortcut # build workbench + add desktop launcher
 #   ./scripts/install.sh --with-sharing   # also install the managed secret scanners
-#   ./scripts/install.sh --with-frontend --with-sharing
+#   ./scripts/install.sh --desktop-shortcut --with-sharing
 #   ./scripts/install.sh --help
 #
 # Environment:
@@ -25,10 +26,12 @@ ERR_LOG="$(mktemp 2>/dev/null || echo "/tmp/clawjournal-venv.$$.err")"
 trap 'rm -f "$ERR_LOG"' EXIT INT TERM
 
 WITH_FRONTEND=0
+DESKTOP_SHORTCUT=0
 WITH_SHARING=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-frontend) WITH_FRONTEND=1 ;;
+    --desktop-shortcut) DESKTOP_SHORTCUT=1; WITH_FRONTEND=1 ;;
     --with-sharing) WITH_SHARING=1 ;;
     -h|--help)
       sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
@@ -138,7 +141,14 @@ if [ "$WITH_SHARING" -eq 1 ]; then
   CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" trufflehog install
 fi
 
-# 6) Report.
+# 6) Optional desktop launcher. It uses the just-installed venv executable so
+#    the shortcut remains independent of the user's PATH.
+if [ "$DESKTOP_SHORTCUT" -eq 1 ]; then
+  echo "-> Installing desktop shortcut"
+  "$VENV_BIN/clawjournal" desktop install
+fi
+
+# 7) Report.
 echo
 INSTALLED_VERSION="$("$VENV_PY" -c 'import clawjournal; print(clawjournal.__version__)' 2>/dev/null || echo "?")"
 echo "[ok] ClawJournal $INSTALLED_VERSION installed."
@@ -152,7 +162,7 @@ Or add the venv to your PATH:
         export PATH="$VENV_BIN:\$PATH"
 EOF
 
-# 7) Soft hints for optional runtime deps.
+# 8) Soft hints for optional runtime deps.
 FE_DIST_HTML="$REPO_DIR/clawjournal/web/frontend/dist/index.html"
 FE_SRC_DIR="$REPO_DIR/clawjournal/web/frontend/src"
 if [ ! -f "$FE_DIST_HTML" ]; then

@@ -117,6 +117,8 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
 git clone https://github.com/rayward-external/clawjournal.git ~/clawjournal
 cd ~/clawjournal
 ./scripts/install.sh --with-frontend --with-sharing
+# Optional: build the workbench and add a one-click desktop shortcut:
+./scripts/install.sh --desktop-shortcut --with-sharing
 ```
 
 **Install — native Windows PowerShell** (use `powershell` if `pwsh` isn't installed):
@@ -125,6 +127,8 @@ cd ~/clawjournal
 git clone https://github.com/rayward-external/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
 pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend -WithSharing
+# Optional: build the workbench and add a one-click desktop shortcut:
+pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DesktopShortcut -WithSharing
 ```
 
 `--with-frontend` / `-WithFrontend` builds the workbench at `localhost:8384`. `--with-sharing` / `-WithSharing` installs pinned, checksum-verified Betterleaks and TruffleHog copies without root access. Omit the sharing flag for a local-review-only install. Without Node.js the script warns and continues CLI-only (`serve` will 404 until you install Node and re-run). The script prints `[ok] ClawJournal <version> installed.` on success.
@@ -146,6 +150,24 @@ $env:Path = "$HOME\.clawjournal-venv\Scripts;" + $env:Path       # PowerShell
 **Staying current** — installs auto-update via a throttled background fast-forward from `rayward-external/clawjournal` (skipped on dirty trees, diverged histories, or non-`main` branches; opt out with `CLAWJOURNAL_NO_AUTO_UPDATE=1`). Run a synchronous update anytime with `clawjournal selfupdate`. A `pipx install clawjournal` fallback exists for firewalled environments, but the PyPI wheel lags the GitHub source by many releases.
 
 </details>
+
+### One-click desktop shortcut
+
+Install an optional **ClawJournal** shortcut on Windows, macOS, or Linux after the browser workbench has been built:
+
+```bash
+clawjournal desktop install
+```
+
+One click opens the local workbench and starts a fresh background scan. If the daemon is already running, the shortcut reuses it and requests a new scan. Its face is a big smile on the day you open ClawJournal, becomes progressively sadder on local calendar Days 1–9, and reaches a dramatic crying face on Day 10 (and later). Loading the workbench in your browser counts as opening it, so a pinned tab against an already-running daemon resets the face too. The eleven icons are rendered locally, and a user-level daily task keeps the displayed expression current; if that task cannot be registered, the icon still refreshes at login and whenever ClawJournal opens.
+
+```bash
+clawjournal desktop status       # current shortcut, Day number, and mood
+clawjournal desktop refresh      # refresh now
+clawjournal desktop uninstall    # remove the shortcut and refresh task
+```
+
+The last-opened timestamp and generated icons stay under `~/.clawjournal/desktop/`. Opening the workbench never uploads anything.
 
 ## End-to-end flow
 
@@ -361,6 +383,7 @@ clawjournal bundle-share <bundle_id>
 |---------|-------------|
 | `clawjournal scan` | Index local sessions + run findings pipeline |
 | `clawjournal serve` | Open workbench UI at localhost:8384 (`--remote` prints an SSH tunnel) |
+| `clawjournal desktop install` | Add the one-click scan + workbench shortcut with a daily expression icon |
 | `clawjournal config --source all` | Select source scope (required) |
 | `clawjournal config --confirm-projects` | Confirm project selection (required before export) |
 | `clawjournal config --scorer-backend codex` | Confirm background scoring backend (`none` clears) |

@@ -11,6 +11,8 @@ docs/security-refactor.md §Storage sensitivity and §Daemon API surface).
 from __future__ import annotations
 
 import errno
+import hashlib
+import hmac
 import os
 import secrets
 import tempfile
@@ -21,6 +23,22 @@ API_TOKEN_FILENAME = "api_token"
 
 HASH_SALT_BYTES = 32
 API_TOKEN_BYTES = 32
+HEALTH_CHALLENGE_BYTES = 16
+
+
+def api_health_proof(api_token: str, challenge: str) -> str:
+    """Return a challenge response that identifies the local daemon.
+
+    The desktop launcher uses this proof before sending its bearer token to a
+    process on the configured port.  A random local HTTP service can echo a
+    public marker, but it cannot produce this response without the install's
+    API token.
+    """
+    return hmac.new(
+        api_token.encode("ascii"),
+        challenge.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def atomic_write_text(path: Path, text: str, *, parents: bool = False) -> None:
