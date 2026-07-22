@@ -1677,6 +1677,39 @@ def test_stale_sealed_recovery_is_discarded_so_later_revision_can_progress(
         conn.close()
 
 
+def test_run_cycle_reports_scanner_busy_distinctly(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A lock-timeout refresh in a run cycle surfaces as scanner_busy (still
+    retryable) — matching enable()/preview() — instead of the incompleteness
+    code that invites diagnosing healthy source logs."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    monkeypatch.setattr(auto, "load_credentials", lambda **_kwargs: _credentials())
+    _patch_runner_host(monkeypatch)
+    scan_calls = _patch_strict_scanner(
+        monkeypatch, results=[{"ok": False, "busy": True}]
+    )
+
+    result = auto.run_cycle(force=True)
+
+    assert result["ok"] is False
+    assert result["code"] == "scanner_busy"
+    assert result["retryable"] is True
+    assert scan_calls == [["claude"]]
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["last_result_code"] == "scanner_busy"
+        assert enrollment["mode"] == "enabled"
+    finally:
+        conn.close()
+
+
 def test_pending_recovery_requires_a_fresh_strict_scan(
     isolated_auto_upload,
     monkeypatch,

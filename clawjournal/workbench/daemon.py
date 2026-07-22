@@ -136,6 +136,10 @@ SCAN_LOCK_FILENAME = "scan.lock"
 # Longer than a full background pass on a large corpus, so a strict scan
 # waiting on the lock outlives the daemon tick that holds it.
 SCAN_LOCK_WAIT_SECONDS = 300.0
+# Normal scans proceed unlocked after the wait, so theirs is best-effort
+# politeness only — and their interactive callers (`clawjournal recent`,
+# the share preflight) have no wait feedback, so keep the ceiling short.
+SCAN_ONCE_LOCK_WAIT_SECONDS = 15.0
 _SCAN_LOCK_POLL_SECONDS = 0.5
 
 
@@ -190,7 +194,12 @@ def _scan_process_lock(
         acquired = _try_acquire()
         if not acquired and wait_seconds is not None:
             if on_wait is not None:
-                on_wait()
+                try:
+                    on_wait()
+                except Exception:
+                    # A broken wait notice (e.g. a closed stderr pipe) must
+                    # not abort the scan it merely narrates.
+                    pass
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
                 time.sleep(_SCAN_LOCK_POLL_SECONDS)
@@ -599,17 +608,18 @@ class Scanner:
     def scan_once(
         self,
         *,
-        lock_wait_seconds: float | None = SCAN_LOCK_WAIT_SECONDS,
+        lock_wait_seconds: float | None = SCAN_ONCE_LOCK_WAIT_SECONDS,
     ) -> dict[str, int]:
         """Run a scan pass and return ``{source: new_session_count}``.
 
         The return shape is retained for existing callers. Counts for traces
         whose content changed (or remained unchanged) are exposed on the
-        ``last_updated_*`` and ``last_unchanged_*`` attributes. Waits up to
-        ``lock_wait_seconds`` for a scan in another process to finish; if
-        the wait expires, the scan proceeds unlocked — the normal scan is
-        per-project resilient and this can never be worse than the pre-lock
-        behavior. Only strict scans fail closed on contention.
+        ``last_updated_*`` and ``last_unchanged_*`` attributes. Waits
+        briefly for a scan in another process to finish; if the wait
+        expires, the scan proceeds unlocked — the normal scan is per-project
+        resilient, so that matches pre-lock correctness, and the short
+        ceiling keeps interactive callers (which have no wait feedback)
+        from hanging. Only strict scans fail closed on contention.
         """
         with self._scan_lock:
             with _scan_process_lock(wait_seconds=lock_wait_seconds) as acquired:
@@ -865,12 +875,17 @@ class Scanner:
                 except Exception as store_error:
                     # Not a parse problem: the sessions parsed cleanly and the
                     # index write failed. A lock timeout gets its own code so
-                    # contention is diagnosable as contention.
-                    code = (
-                        "index_busy"
-                        if isinstance(store_error, sqlite3.OperationalError)
-                        else "store_failed"
+                    # contention is diagnosable as contention — but only a
+                    # locked/busy OperationalError: the same exception type
+                    # also covers corruption and full disks, which must not
+                    # masquerade as transient contention.
+                    contention = isinstance(
+                        store_error, sqlite3.OperationalError
+                    ) and any(
+                        marker in str(store_error).lower()
+                        for marker in ("locked", "busy")
                     )
+                    code = "index_busy" if contention else "store_failed"
                     if strict:
                         _log_strict_scan_failure(
                             source=source, stage="store", code=code

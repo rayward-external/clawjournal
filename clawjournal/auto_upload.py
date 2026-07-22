@@ -3805,16 +3805,27 @@ def _run_cycle_impl(
                         list(enrollment["enrolled_sources"])
                     )
                     if not strict["ok"]:
+                        # Contention gets its own code, matching enable() and
+                        # preview(): "incomplete" invites diagnosing the logs.
+                        scan_code = (
+                            "scanner_busy"
+                            if strict.get("busy")
+                            else "strict_scan_incomplete"
+                        )
                         _record_cycle_result(
                             conn,
                             generation=generation,
-                            code="strict_scan_incomplete",
+                            code=scan_code,
                             retryable=True,
                         )
                         return {
                             "ok": False,
-                            "code": "strict_scan_incomplete",
-                            "message": "The enrolled source refresh was incomplete.",
+                            "code": scan_code,
+                            "message": (
+                                "Another scan is refreshing the index; the cycle will retry."
+                                if strict.get("busy")
+                                else "The enrolled source refresh was incomplete."
+                            ),
                             "retryable": True,
                             "scan": strict,
                         }
@@ -3905,16 +3916,27 @@ def _run_cycle_impl(
                         list(enrollment["enrolled_sources"])
                     )
                     if not strict["ok"]:
+                        # Contention gets its own code, matching enable() and
+                        # preview(): "incomplete" invites diagnosing the logs.
+                        scan_code = (
+                            "scanner_busy"
+                            if strict.get("busy")
+                            else "strict_scan_incomplete"
+                        )
                         _record_cycle_result(
                             conn,
                             generation=generation,
-                            code="strict_scan_incomplete",
+                            code=scan_code,
                             retryable=True,
                         )
                         return {
                             "ok": False,
-                            "code": "strict_scan_incomplete",
-                            "message": "The enrolled source refresh was incomplete.",
+                            "code": scan_code,
+                            "message": (
+                                "Another scan is refreshing the index; the cycle will retry."
+                                if strict.get("busy")
+                                else "The enrolled source refresh was incomplete."
+                            ),
                             "retryable": True,
                             "scan": strict,
                         }
@@ -3976,16 +3998,25 @@ def _run_cycle_impl(
                     list(enrollment["enrolled_sources"])
                 )
                 if not second_scan["ok"]:
+                    scan_code = (
+                        "scanner_busy"
+                        if second_scan.get("busy")
+                        else "strict_scan_incomplete"
+                    )
                     _record_cycle_result(
                         conn,
                         generation=generation,
-                        code="strict_scan_incomplete",
+                        code=scan_code,
                         retryable=True,
                     )
                     return {
                         "ok": False,
-                        "code": "strict_scan_incomplete",
-                        "message": "The final source refresh was incomplete.",
+                        "code": scan_code,
+                        "message": (
+                            "Another scan is refreshing the index; the cycle will retry."
+                            if second_scan.get("busy")
+                            else "The final source refresh was incomplete."
+                        ),
                         "retryable": True,
                         "scan": second_scan,
                     }

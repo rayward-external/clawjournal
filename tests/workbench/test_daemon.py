@@ -1262,6 +1262,12 @@ class TestScanner:
         [
             (RuntimeError("PRIVATE_STORE_SENTINEL"), "store_failed"),
             (sqlite3.OperationalError("database is locked"), "index_busy"),
+            # OperationalError also covers corruption and full disks, which
+            # must not masquerade as transient contention.
+            (
+                sqlite3.OperationalError("database disk image is malformed"),
+                "store_failed",
+            ),
         ],
     )
     def test_strict_scan_labels_store_failures_distinctly(
