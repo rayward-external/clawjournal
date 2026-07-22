@@ -448,4 +448,35 @@ describe('Share selection defaults', () => {
     expect(screen.queryByRole('heading', { name: 'What would you like to share?' })).not.toBeInTheDocument();
     expect(redactionSpy).not.toHaveBeenCalled();
   });
+
+  it('reports a hosted submission only after its receipt is restored', async () => {
+    mockInitialLoad(readyStats(1));
+    vi.spyOn(api.shares, 'get').mockResolvedValue({
+      share_id: 'submitted-share',
+      created_at: '2026-07-22T12:00:00Z',
+      session_count: 1,
+      status: 'shared',
+      attestation: null,
+      submission_note: null,
+      bundle_hash: 'bundle-hash',
+      manifest: {},
+      shared_at: '2026-07-22T12:01:00Z',
+      hosted_receipt_id: 'receipt-123',
+      hosted_status: 'accepted',
+    });
+    const onSubmittedShareChange = vi.fn();
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=done&share=submitted-share']}>
+        <ToastProvider>
+          <Share onSubmittedShareChange={onSubmittedShareChange} />
+        </ToastProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(onSubmittedShareChange).toHaveBeenLastCalledWith('submitted-share');
+    });
+    expect(await screen.findByRole('heading', { name: 'Submitted' })).toBeInTheDocument();
+  });
 });

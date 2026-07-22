@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom';
 import { Inbox } from './views/Inbox.tsx';
 import { Search } from './views/Search.tsx';
 import SessionDetail from './views/SessionDetail.tsx';
@@ -12,6 +12,8 @@ import { Benchmark } from './views/Benchmark.tsx';
 import { Settings } from './views/Settings.tsx';
 import { ToastProvider } from './components/Toast.tsx';
 import { ConfirmDialog } from './components/ConfirmDialog.tsx';
+import { WorkflowProgress } from './components/WorkflowProgress.tsx';
+import { workflowProgressStageFor } from './components/workflowProgressStage.ts';
 import { colors, fontFamily } from './theme.ts';
 import { api, ApiError } from './api.ts';
 import type { Features } from './types.ts';
@@ -144,6 +146,13 @@ function Sidebar() {
   );
 }
 
+function WorkflowProgressTracker({ submittedShareId }: { submittedShareId: string | null }) {
+  const location = useLocation();
+  const stage = workflowProgressStageFor(location.pathname, location.search, submittedShareId);
+
+  return <WorkflowProgress stage={stage} />;
+}
+
 export default function App() {
   // Feature flags + the persisted auto-scorer decline come from /api/features.
   // benchmark_tab_enabled is initialised true so the common case never flashes;
@@ -153,6 +162,7 @@ export default function App() {
     scoring_warmup_declined: false,
   });
   const benchmarkEnabled = features.benchmark_tab_enabled;
+  const [submittedShareId, setSubmittedShareId] = useState<string | null>(null);
 
   // The same probe doubles as a connectivity check: the loopback daemon going
   // away (e.g. `clawjournal serve` stopped) otherwise just renders zero counts
@@ -236,31 +246,34 @@ export default function App() {
           )}
           <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
             <Sidebar />
-            <main style={{ flex: 1, overflow: 'auto', background: colors.white }}>
-              <Routes>
-                <Route path="/" element={<Inbox />} />
-                <Route path="/search" element={<Search />} />
-                <Route path="/session/:id" element={<SessionDetail />} />
-                {/* Analytics groups the three read-only "understand" views as sub-tabs. */}
-                <Route path="/analytics" element={<Analytics benchmarkEnabled={benchmarkEnabled} />}>
-                  <Route index element={<Dashboard />} />
-                  <Route path="insights" element={<Insights />} />
-                  <Route
-                    path="benchmark"
-                    element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/analytics" replace />}
-                  />
-                </Route>
-                <Route path="/share" element={<Share />} />
-                <Route path="/share/rules" element={<Policies />} />
-                <Route path="/settings" element={<Settings />} />
-                {/* Back-compat redirects for the pre-regroup routes + bookmarks. */}
-                <Route path="/dashboard" element={<Navigate to="/analytics" replace />} />
-                <Route path="/insights" element={<Navigate to="/analytics/insights" replace />} />
-                <Route path="/benchmark" element={<Navigate to="/analytics/benchmark" replace />} />
-                <Route path="/bundles" element={<Navigate to="/share" replace />} />
-                <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
-              </Routes>
-            </main>
+            <div style={{ display: 'flex', flex: 1, flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
+              <main style={{ flex: 1, minHeight: 0, overflow: 'auto', background: colors.white }}>
+                <Routes>
+                  <Route path="/" element={<Inbox />} />
+                  <Route path="/search" element={<Search />} />
+                  <Route path="/session/:id" element={<SessionDetail />} />
+                  {/* Analytics groups the three read-only "understand" views as sub-tabs. */}
+                  <Route path="/analytics" element={<Analytics benchmarkEnabled={benchmarkEnabled} />}>
+                    <Route index element={<Dashboard />} />
+                    <Route path="insights" element={<Insights />} />
+                    <Route
+                      path="benchmark"
+                      element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/analytics" replace />}
+                    />
+                  </Route>
+                  <Route path="/share" element={<Share onSubmittedShareChange={setSubmittedShareId} />} />
+                  <Route path="/share/rules" element={<Policies />} />
+                  <Route path="/settings" element={<Settings />} />
+                  {/* Back-compat redirects for the pre-regroup routes + bookmarks. */}
+                  <Route path="/dashboard" element={<Navigate to="/analytics" replace />} />
+                  <Route path="/insights" element={<Navigate to="/analytics/insights" replace />} />
+                  <Route path="/benchmark" element={<Navigate to="/analytics/benchmark" replace />} />
+                  <Route path="/bundles" element={<Navigate to="/share" replace />} />
+                  <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
+                </Routes>
+              </main>
+              <WorkflowProgressTracker submittedShareId={submittedShareId} />
+            </div>
           </div>
         </div>
         <ConfirmDialog
