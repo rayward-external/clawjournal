@@ -96,6 +96,8 @@ BACKEND_COMMAND_ALIASES: dict[str, tuple[str, ...]] = {
     "openclaw": ("openclaw",),
 }
 
+_TEXT_SUBPROCESS_KW = {"text": True, "encoding": "utf-8", "errors": "replace"}
+
 
 def default_model_for_backend(backend: str) -> str | None:
     """Return ClawJournal's fast default model for a resolved backend."""
@@ -168,7 +170,7 @@ def _get_process_field(pid: int, field: str) -> str:
         proc = subprocess.run(
             ["ps", f"-o{field}=", "-p", str(pid)],
             capture_output=True,
-            text=True,
+            **_TEXT_SUBPROCESS_KW,
             timeout=2,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -266,9 +268,10 @@ def resolve_backend(backend: str = "auto", env: dict[str, str] | None = None) ->
 def require_backend_command(backend: str) -> str:
     """Return the CLI command for a backend, ensuring it is installed."""
     command = BACKEND_COMMANDS[backend]
-    if shutil.which(command) is None:
+    resolved = shutil.which(command)
+    if resolved is None:
         raise RuntimeError(f"{backend} CLI not found. Install it or choose a different --backend.")
-    return command
+    return resolved
 
 
 def check_backend_runtime(backend: str, env: dict[str, str] | None = None) -> None:
@@ -579,7 +582,7 @@ def run_default_agent_task(
                 input=task_prompt,
                 cwd=str(cwd),
                 capture_output=True,
-                text=True,
+                **_TEXT_SUBPROCESS_KW,
                 env=agent_env,
                 timeout=timeout_seconds,
             )
@@ -627,7 +630,7 @@ def run_default_agent_task(
                 cmd,
                 capture_output=True,
                 input=task_prompt,
-                text=True,
+                **_TEXT_SUBPROCESS_KW,
                 env=agent_env,
                 timeout=timeout_seconds,
             )
@@ -666,7 +669,7 @@ def run_default_agent_task(
                 cmd,
                 cwd=str(cwd),
                 capture_output=True,
-                text=True,
+                **_TEXT_SUBPROCESS_KW,
                 env=agent_env,
                 timeout=timeout_seconds + 10,
                 stdin=subprocess.DEVNULL,  # avoid blocking on inherited stdin (see codex note)
@@ -692,7 +695,7 @@ def run_default_agent_task(
                 cmd,
                 cwd=str(cwd),
                 capture_output=True,
-                text=True,
+                **_TEXT_SUBPROCESS_KW,
                 env=agent_env,
                 timeout=timeout_seconds + 10,
                 stdin=subprocess.DEVNULL,  # avoid blocking on inherited stdin (see codex note)

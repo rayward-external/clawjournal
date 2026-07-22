@@ -337,7 +337,10 @@ def install_profile(
     if source_scope:
         config = config_module.load_config()
         config_module.set_source_scope(config, source_scope)
-        config_module.save_config(config)
+        if config_module.save_config(config) is False:
+            raise OSError(
+                "OpenRefinery source scope could not be saved safely; review automatic-upload status."
+            )
 
     return {
         "profile": PROFILE_NAME,
@@ -798,6 +801,11 @@ def enroll_openrefinery(
         from .selfupdate import selfupdate_sync
 
         update_result = dict(selfupdate_sync())
+    from .redaction.scanner_install import ensure_share_scanners
+
+    scanner_result = ensure_share_scanners(prefer_managed=True)
+    if not scanner_result["ok"]:
+        raise HookError(scanner_result.get("error") or "Secret scanner installation failed.")
     install_result = install_profile(
         profile=PROFILE_NAME,
         agent=agent,
@@ -808,6 +816,7 @@ def enroll_openrefinery(
     return {
         "profile": PROFILE_NAME,
         "update": update_result,
+        "scanners": scanner_result,
         "install": install_result,
         "next": {
             "review": f"clawjournal hooks launch {PROFILE_NAME}",

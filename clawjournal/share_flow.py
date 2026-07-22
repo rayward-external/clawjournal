@@ -13,7 +13,7 @@ can adopt these same helpers over time.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .workbench.index import (
     already_shared_revision_blockers,
@@ -214,11 +214,20 @@ def gate_blockers(conn, session_ids: list[str]) -> list[dict]:
 
 def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             note: str | None = None,
-            expected_revisions: dict[str, str] | None = None) -> dict:
+            expected_revisions: dict[str, str] | None = None,
+            ai_backend: str = "auto",
+            before_ai_call: Callable[[], None] | None = None) -> dict:
     """Create a share row and seal the bundle. Returns:
         {ok, share_id, export_dir, manifest, blocked_sessions, error}
     blocked_sessions is the list of sessions TruffleHog/PII blocked (for recovery).
     """
+    release_blockers = gate_blockers(conn, session_ids)
+    if release_blockers:
+        return {
+            "ok": False,
+            "error": "Share contains sessions blocked by the release gate",
+            "blockers": release_blockers,
+        }
     source_blockers = source_scope_blockers(conn, session_ids, settings.get("source_filter"))
     if source_blockers:
         return {
@@ -259,10 +268,19 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
     if share is None:
         return {"ok": False, "error": "Share row could not be loaded after creation."}
     export_dir, manifest, error = _prepare_share_export_for_upload(
-        conn, share_id, share, settings, reuse_finalized=True, ai_pii_review_enabled=ai_pii,
+        conn,
+        share_id,
+        share,
+        settings,
+        reuse_finalized=True,
+        ai_pii_review_enabled=ai_pii,
+        ai_pii_backend=ai_backend,
+        before_ai_call=before_ai_call,
     )
     if error:
         return {"ok": False, "share_id": share_id, "error": error.get("error", "Packaging failed."),
+                "block_reason": error.get("block_reason"),
+                "status": error.get("status"),
                 "blocked_sessions": error.get("blocked_sessions") or []}
     if export_dir is None:
         return {"ok": False, "share_id": share_id, "error": "Packaging failed: no bundle produced."}
@@ -275,7 +293,12 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             "blocked_sessions": []}
 
 
-def verify_coverage(manifest: dict, package_ai: bool) -> tuple[bool, str]:
+def verify_coverage(
+    manifest: dict,
+    package_ai: bool,
+    *,
+    expected_backend: str | None = None,
+) -> tuple[bool, str]:
     """CLI-side guard (no daemon change): the sealed artifact's AI coverage must
     match the preview decision, so we never ship something LESS redacted than
     what the user reviewed. The seal pass uses ignore_llm_errors=True and can
@@ -288,6 +311,8 @@ def verify_coverage(manifest: dict, package_ai: bool) -> tuple[bool, str]:
     pr = summary.get("pii_review") or {}
     if not pr.get("ai_enabled"):
         return False, "preview was AI-reviewed but the sealed bundle ran rules-only"
+    if expected_backend is not None and pr.get("backend") != expected_backend:
+        return False, "sealed bundle used a different AI-PII backend"
     rules_only = (pr.get("coverage") or {}).get("rules_only", 0)
     if rules_only:
         return False, (f"preview was AI-reviewed but AI review failed for {rules_only} "

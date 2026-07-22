@@ -36,6 +36,10 @@ from ..findings import (
     write_findings_to_db,
 )
 from ..findings import get_enabled_engines
+from ..redaction.betterleaks import (
+    BETTERLEAKS_ENGINE_ID,
+    scan_session_for_betterleaks_findings,
+)
 from ..redaction.pii import (
     PII_ENGINE_ID,
     scan_session_for_pii_findings,
@@ -79,6 +83,7 @@ def run_findings_pipeline(
     *,
     config: dict[str, Any] | None = None,
     force: bool = False,
+    safe_logging: bool = False,
 ) -> dict[str, Any]:
     """Scan one session and rebuild its findings if anything changed.
 
@@ -129,7 +134,25 @@ def run_findings_pipeline(
         except Exception:
             # Fail-soft: a flaky subprocess shouldn't abort the whole
             # findings rebuild — regex + PII layers still ran.
-            logger.warning("TruffleHog engine errored during scan", exc_info=True)
+            if safe_logging:
+                logger.warning(
+                    "Findings engine failure stage=trufflehog code=engine_error",
+                    extra={"strict_scan_safe": True},
+                )
+            else:
+                logger.warning("TruffleHog engine errored during scan", exc_info=True)
+    if BETTERLEAKS_ENGINE_ID in enabled:
+        try:
+            raw.extend(scan_session_for_betterleaks_findings(session_blob, user_allowlist=user_allowlist))
+        except Exception:
+            # Same fail-soft posture as the trufflehog engine above.
+            if safe_logging:
+                logger.warning(
+                    "Findings engine failure stage=betterleaks code=engine_error",
+                    extra={"strict_scan_safe": True},
+                )
+            else:
+                logger.warning("Betterleaks engine errored during scan", exc_info=True)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -152,6 +175,7 @@ def drain_findings_backfill(
     *,
     config: dict[str, Any] | None = None,
     progress_every: int = 10,
+    safe_logging: bool = False,
 ) -> dict[str, int]:
     """Process rows flagged with `findings_backfill_needed=1`.
 
@@ -174,7 +198,7 @@ def drain_findings_backfill(
 
     for i, row in enumerate(flagged, start=1):
         session_id = row["session_id"]
-        blob = read_blob(session_id)
+        blob = read_blob(session_id, log_errors=not safe_logging)
         if blob is None:
             conn.execute(
                 "UPDATE sessions SET findings_backfill_needed = 0 WHERE session_id = ?",
@@ -184,7 +208,14 @@ def drain_findings_backfill(
             missing_blob += 1
             continue
         try:
-            run_findings_pipeline(conn, session_id, blob, config=config, force=True)
+            run_findings_pipeline(
+                conn,
+                session_id,
+                blob,
+                config=config,
+                force=True,
+                safe_logging=safe_logging,
+            )
             conn.execute(
                 "UPDATE sessions SET findings_backfill_needed = 0 WHERE session_id = ?",
                 (session_id,),
@@ -192,10 +223,21 @@ def drain_findings_backfill(
             conn.commit()
             processed += 1
         except Exception:  # noqa: BLE001 — drain should continue past per-row failures
-            logger.exception("Findings backfill failed for %s", session_id)
+            if safe_logging:
+                logger.warning(
+                    "Findings backfill failure stage=session code=backfill_failed",
+                    extra={"strict_scan_safe": True},
+                )
+            else:
+                logger.exception("Findings backfill failed for %s", session_id)
             errored += 1
 
         if i % progress_every == 0:
-            logger.info("Findings backfill progress: %d/%d", i, total)
+            logger.info(
+                "Findings backfill progress: %d/%d",
+                i,
+                total,
+                extra={"strict_scan_safe": True} if safe_logging else None,
+            )
 
     return {"processed": processed, "missing_blob": missing_blob, "errored": errored}

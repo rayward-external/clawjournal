@@ -10,14 +10,30 @@ Use one of these prompts in Claude Code, Codex, Cursor, or another coding assist
 > **Ordinary workflow — browser workbench**
 >
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions using the browser workbench. If needed, configure source `all`, confirm projects, and scan first. Open the local workbench with `clawjournal serve`, guide me through Share -> Queue -> Redact -> Review -> Package -> Submit, and stop for my consent before upload. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. Use the sharing-enabled installer so its managed secret scanners are installed automatically; do not ask me to install them with Homebrew. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+>
+> Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and open the local browser workbench with `clawjournal serve`.
+>
+> Guide me through Share → Queue → Redact → Review → Package → Submit. Keep trace review in the local workbench rather than copying raw trace contents or secret values into this chat. Preserve all findings, hold, embargo, redaction, and mandatory secret-scan safeguards. Do not bypass a safety gate. Do not enable optional AI assisted PII review or Automatic uploads unless I specifically choose them.
+>
+> Before submission, summarize the number of selected sessions, included sources and projects, redaction results, AI review status, secret-scan result, and upload destination. Pause once so I can confirm that the final package and scope are correct, then submit it.
+>
+> Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP locally and tell me where it is so I can upload it at https://data.rayward.ai/share.
 > ```
 
 > [!IMPORTANT]
 > **CLI-only workflow — remote terminal or SSH**
 >
 > ```text
-> Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. Use the sharing-enabled installer so its managed secret scanners are installed automatically; do not ask me to install them with Homebrew. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+>
+> Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and run `clawjournal share --interactive --weekly`.
+>
+> Guide me through selecting sessions, reviewing the redacted preview, packaging, and submitting. Do not repeat raw trace contents or secret values in your conversational responses; keep detailed review in the interactive terminal flow. Preserve all findings, hold, embargo, redaction, and mandatory secret-scan safeguards. Do not bypass a safety gate. Do not enable optional AI assisted PII review or Automatic uploads unless I specifically choose them.
+>
+> Before submission, summarize the number of selected sessions, included sources and projects, redaction results, AI review status, secret-scan result, and upload destination. Pause once so I can confirm that the final package and scope are correct, then submit it.
+>
+> Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP locally and tell me where it is so I can upload it at https://data.rayward.ai/share.
 > ```
 
 ## Install or update (no coding required)
@@ -26,7 +42,7 @@ The same prompt installs ClawJournal the first time and updates it later. Run it
 
 Open any AI coding assistant — **Claude Code**, **Codex**, **Cursor**, **OpenCode**, **Gemini CLI**, or similar — and paste this:
 
-> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. If it's already installed, pull the latest code from the public GitHub repo and rebuild the browser workbench. Install any missing prerequisites (git, Python 3.10+, Node.js). When you're done, run `clawjournal status` and tell me the version.*
+> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Use the sharing-enabled installer so the managed Betterleaks and TruffleHog scanners are installed automatically. If ClawJournal is already installed, pull the latest code, rebuild the browser workbench, and repair any missing sharing dependencies. Install any missing prerequisites (git, Python 3.10+, Node.js). When you're done, run `clawjournal status` and tell me the version.*
 
 The AI detects your OS, installs what it needs (git, Python, Node.js), runs the installer, and confirms it works.
 
@@ -47,13 +63,13 @@ Research participants who are explicitly enrolled in OpenRefinery Agent Failure 
 clawjournal enroll openrefinery --agent all --ui auto
 ```
 
-The enrollment command first tries a safe `clawjournal selfupdate`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one gentle nudge per day asking whether to review recent agent failures with ClawJournal — answer **y** to open local review or **n** for later (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). Developers testing the hook can set `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day. If the participant accepts, run:
+The enrollment command first tries a safe `clawjournal selfupdate`, installs pinned and checksum-verified Betterleaks and TruffleHog copies under `~/.clawjournal/bin`, then writes a Stop hook into `~/.claude/settings.json` and `~/.codex/hooks.json`. The hook shows at most one gentle nudge per day asking whether to review recent agent failures with ClawJournal — answer **y** to open local review or **n** for later (preview the exact text any time with `clawjournal hooks run openrefinery-failures --client claude --dry-run`). Developers testing the hook can set `OPENREFINERY_SHARE_HOOK_TEST=1` to raise the cap to 10/day. If the participant accepts, run:
 
 ```bash
 clawjournal hooks launch openrefinery-failures
 ```
 
-`launch` prefers the browser Share workflow at `http://localhost:8384/share`; if it cannot start or reach the local workbench in auto mode, it falls back to `clawjournal share --interactive --weekly`. The hook never uploads by itself. The Share flow still requires source/project confirmation, local redaction review, and the mandatory TruffleHog gate before anything leaves the machine. Codex may ask you to review/trust the newly installed hook with `/hooks` before it runs.
+`launch` prefers the browser Share workflow at `http://localhost:8384/share`; if it cannot start or reach the local workbench in auto mode, it falls back to `clawjournal share --interactive --weekly`. The hook never uploads by itself. The Share flow still requires source/project confirmation, local redaction review, and the mandatory secret-scan gate before anything leaves the machine. Codex may ask you to review/trust the newly installed hook with `/hooks` before it runs.
 
 Design details: [OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md](OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md).
 
@@ -65,7 +81,7 @@ Design details: [OPENREFINERY_AGENT_FAILURE_SHARING_HOOKS.md](OPENREFINERY_AGENT
 
 ## If you decide to share
 
-Sharing is fully opt-in and separate from local review. On export, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and your configured strings) on top of the scan-time findings — to both the session traces *and* the `manifest.json` metadata. The workbench Share flow can add optional AI-assisted PII review; home-dir paths and usernames are anonymized locally before anything is sent to an AI backend. A mandatory TruffleHog secrets gate then runs on the redacted output and blocks the share if it finds anything or the binary is missing (not required for local-only use).
+Sharing is fully opt-in and separate from local review. On export, ClawJournal re-applies regex redaction (paths, usernames, emails, API keys, tokens, private keys, and your configured strings) on top of the scan-time findings — to both the session traces *and* the `manifest.json` metadata. The workbench Share flow can add optional AI-assisted PII review; home-dir paths and usernames are anonymized locally before anything is sent to an AI backend. A mandatory secret-scan gate (Betterleaks detection + TruffleHog verified-only live check, both local subprocesses) then runs on the redacted output: verified credentials and private-key material block, recognizable unverified tokens are automatically redacted in place, and soft signals are recorded as warnings. Missing scanner binaries block the share (they're not required for local-only use).
 
 See [PRIVACY.md](PRIVACY.md) for the full redaction list and the sharing paths.
 
@@ -100,9 +116,9 @@ $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Env
 ```bash
 git clone https://github.com/rayward-external/clawjournal.git ~/clawjournal
 cd ~/clawjournal
-./scripts/install.sh --with-frontend       # or: sh scripts/install.sh --with-frontend
+./scripts/install.sh --with-frontend --with-sharing
 # Optional: build the workbench and add a one-click desktop shortcut:
-./scripts/install.sh --desktop-shortcut
+./scripts/install.sh --desktop-shortcut --with-sharing
 ```
 
 **Install — native Windows PowerShell** (use `powershell` if `pwsh` isn't installed):
@@ -110,12 +126,12 @@ cd ~/clawjournal
 ```powershell
 git clone https://github.com/rayward-external/clawjournal.git "$HOME\clawjournal"
 Set-Location "$HOME\clawjournal"
-pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend
+pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend -WithSharing
 # Optional: build the workbench and add a one-click desktop shortcut:
-pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DesktopShortcut
+pwsh -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DesktopShortcut -WithSharing
 ```
 
-`--with-frontend` / `-WithFrontend` builds the workbench at `localhost:8384`. Without Node.js the script warns and continues CLI-only (`serve` will 404 until you install Node and re-run). The script prints `[ok] ClawJournal <version> installed.` on success.
+`--with-frontend` / `-WithFrontend` builds the workbench at `localhost:8384`. `--with-sharing` / `-WithSharing` installs pinned, checksum-verified Betterleaks and TruffleHog copies without root access. Omit the sharing flag for a local-review-only install. Without Node.js the script warns and continues CLI-only (`serve` will 404 until you install Node and re-run). The script prints `[ok] ClawJournal <version> installed.` on success.
 
 **Verify** — the CLI lives at `~/.clawjournal-venv/bin/clawjournal` (POSIX) or `$HOME\.clawjournal-venv\Scripts\clawjournal.exe` (Windows); `status` prints JSON with `"stage"` and `"stage_number"`:
 
@@ -166,21 +182,21 @@ Optionally, `npx skills add rayward-external/clawjournal` installs three skills 
 
 ### 1. Install
 
-Use [Quickstart](#quickstart) above (or the install prompt at the top). TruffleHog is **not** required for local use — it's only needed at Stage 6, where every export runs an independent secrets scan and blocks if TruffleHog is missing or finds anything. Your AI installs it when you reach Stage 6.
+Use [Quickstart](#quickstart) above (or the install prompt at the top). The secret scanners (Betterleaks + TruffleHog) are **not** required for local use. The sharing-enabled installer installs them up front; existing installations repair a missing scanner automatically during enrollment or the first packaging preflight. Every export still runs an independent secret scan: verified credentials block, recognizable tokens are auto-redacted, and a scanner that cannot be installed or resolved blocks the export.
 
 <details>
-<summary><b>Show TruffleHog install commands</b></summary>
+<summary><b>Show scanner recovery commands</b></summary>
 
 ```bash
-# macOS / Linux / Windows (x86-64 and ARM64) — pinned version, sha256-verified,
+# macOS / Linux / Windows (x86-64 and ARM64) — pinned versions, sha256-verified,
 # installed to ~/.clawjournal/bin, no root needed:
+clawjournal betterleaks install
 clawjournal trufflehog install
-
-# Or install it yourself:
-brew install trufflehog                                    # macOS
-curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin   # Linux
-# Windows: download a release binary from https://github.com/trufflesecurity/trufflehog/releases
 ```
+
+Normal participants do not need these commands: enrollment and packaging run
+the same managed installers automatically. They are included only for retrying
+a failed download or diagnosing an offline machine.
 
 </details>
 
@@ -271,7 +287,7 @@ Scoring uses the current agent's automation CLI by default (`codex exec` in Code
 
 ### 6. Package & Share
 
-Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploading is a **separate, opt-in step**. Only sessions you explicitly add and confirm are ever uploaded; `pending_review` and active `embargoed` sessions are blocked, while `auto_redacted` (default) and `released` are allowed. Redaction (your strings, paths, usernames, secrets) is applied to everything in the bundle — traces *and* `manifest.json`.
+Packaging is **100% local** — it writes a redacted ZIP to your computer. Uploading is a **separate, opt-in step**. Manual Share starts with eligible sessions selected in the queue; you can deselect any of them, and only traces you keep and confirm are uploaded. The separately authorized automatic option below is limited to its exact future scope. `pending_review` and active `embargoed` sessions are blocked in both paths, while `auto_redacted` (default) and `released` are allowed. Redaction (your strings, paths, usernames, secrets) is applied to everything in the bundle — traces *and* `manifest.json`.
 
 > *"Package my approved ClawJournal sessions and export them to a file on my computer."*
 
@@ -295,9 +311,38 @@ It lists shareable traces, prioritizes AI-scored high-failure-value sessions, sh
 
 **Continuing an already-shared trace is supported.** A later `clawjournal scan` reports the existing trace as updated without creating a duplicate ID. Because the new content has not been reviewed, ClawJournal resets that trace to `new` and clears its old AI score. Approve it again in the Inbox; it will then reappear in Share with an **Updated since last share** label. The next bundle keeps the same trace identity and records which earlier revision it replaces.
 
+### Optional automatic daily sharing
+
+After one successful hosted manual share, the workbench may offer **Automatic uploads** when the hosted recurring-upload capability is open. It is off by default. V1 enrollment supports confirmed **Claude Code** and/or **Codex** source scopes only; other sources remain available for manual review and Share. Enabling it shows separate recurring authorization and retention text, the exact local source/project scope, resolved AI-PII provider (if enabled), destination, one-day activity-triggered cadence, and five-trace cap. Fresh email verification is required before recurring credentials are issued.
+
+An automatic cycle runs on the next selected Claude Code or Codex `SessionStart` after it is due. It chooses at most five eligible future traces using stored failure-value scores and a deterministic fallback; it never runs scoring synchronously. Only traces completed after the server enrollment time qualify. Append-only sources must have the same revision for at least 24 hours (the eligibility contract also defines an `explicit_close` completion mode, but no supported source uses it yet — Claude Code and Codex both use the 24-hour stable-revision rule), holds/embargoes and findings still block egress, changed traces require fresh approval, and every cycle repeats the normal anonymization, deterministic redaction, optional AI-PII, and mandatory secret-scan gates. Traces with blocking findings move to pending review individually — the rest of the batch still ships. Manual Share is unchanged.
+
+Manage it in **Settings → Automatic uploads** or from the terminal:
+
+```bash
+clawjournal auto-upload status
+clawjournal auto-upload preview --refresh
+clawjournal auto-upload run       # one extra capped cycle; resets the next due date on success
+clawjournal auto-upload pause
+clawjournal auto-upload resume
+clawjournal auto-upload disable   # removes upload authority; prior uploads are not deleted
+```
+
+`disable` removes local active upload authority before revoking the server enrollment. A request already past the atomic submitting boundary may still finish; ClawJournal retains recovery-only authority until its receipt/revocation is definite. Recurring credentials are kept in a private credential file, never `config.json`.
+
 Or paste this into Claude Code, Codex, or another AI coding assistant on the remote machine:
 
-> *Install or update ClawJournal from https://github.com/rayward-external/clawjournal. Read its README and follow it for my operating system. Then help me share my recent coding-agent sessions from this terminal. If needed, configure source `all`, confirm projects, and scan first. Then run `clawjournal share --interactive --weekly`; guide me through selecting sessions, reviewing redactions, and consenting. Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP and tell me where it is so I can upload it at https://data.rayward.ai/share.*
+> ```text
+> Install or update ClawJournal from https://github.com/rayward-external/clawjournal and follow its README for my operating system. Use the sharing-enabled installer so its managed secret scanners are installed automatically; do not ask me to install them with Homebrew. I am part of this research collaboration and have already agreed to contribute my coding agent traces for our joint research and publication. Installation and the documented local review and sharing workflow are authorized.
+>
+> Configure source `all` if needed, but show me the discovered projects before confirming them so I can exclude unrelated, personal, confidential, or third party work. Then scan and run `clawjournal share --interactive --weekly`.
+>
+> Guide me through selecting sessions, reviewing the redacted preview, packaging, and submitting. Do not repeat raw trace contents or secret values in your conversational responses; keep detailed review in the interactive terminal flow. Preserve all findings, hold, embargo, redaction, and mandatory secret-scan safeguards. Do not bypass a safety gate. Do not enable optional AI assisted PII review or Automatic uploads unless I specifically choose them.
+>
+> Before submission, summarize the number of selected sessions, included sources and projects, redaction results, AI review status, secret-scan result, and upload destination. Pause once so I can confirm that the final package and scope are correct, then submit it.
+>
+> Do not use `clawjournal bundle-share`. If hosted upload is unavailable, save the ZIP locally and tell me where it is so I can upload it at https://data.rayward.ai/share.
+> ```
 
 > ⚠️ **`clawjournal bundle-share` is NOT the Rayward path.** It only uploads to a **self-hosted** ingest server you configure via `CLAWJOURNAL_INGEST_URL`; without it, it reports *"Hosted sharing is not configured."* Rayward / STEM Data Program participants should ignore it and use the workbench above.
 
@@ -405,6 +450,10 @@ Distill a small `clawjournal-lessons` skill from your own scored sessions and in
 | `clawjournal share --preview --status approved` | Preview what would be packaged |
 | `clawjournal share --status approved [--ai-pii-review]` | Package locally + print the Share URL; hosted upload happens in the browser |
 | `clawjournal share --interactive --weekly` / `clawshare --weekly` | Terminal Share wizard for remote/SSH sessions; review redactions, consent, upload or save ZIP |
+| `clawjournal auto-upload enable [--agent claude\|codex\|all]` | Review exact recurring terms/scope and enable future capped sharing |
+| `clawjournal auto-upload status` / `preview [--refresh]` | Read local recurring state / inspect the shared candidate contract |
+| `clawjournal auto-upload run` | Run one extra capped cycle now; all safety gates still apply |
+| `clawjournal auto-upload pause` / `resume` / `disable` | Control or revoke recurring sharing |
 | `clawjournal card <id> [--depth workflow\|full]` | Generate a share card (`workflow` is safe for public channels) |
 
 ### Configuration & maintenance
@@ -422,7 +471,9 @@ Distill a small `clawjournal-lessons` skill from your own scored sessions and in
 | `clawjournal hooks launch openrefinery-failures` | Open the Share workflow or print the CLI fallback command |
 | `clawjournal hooks snooze openrefinery-failures --days 30` / `disable` | Pause or disable the daily enrollment reminder |
 | `clawjournal selfupdate [--check] [--force]` | Fast-forward to latest from `rayward-external/clawjournal` |
-| `clawjournal trufflehog install [--force]` | Download the pinned, checksum-verified TruffleHog (share-gate dependency) into `~/.clawjournal/bin` |
+| `clawjournal betterleaks install [--force]` | Download the pinned, checksum-verified Betterleaks (primary share-gate scanner) into `~/.clawjournal/bin` |
+| `clawjournal betterleaks status [--json]` | Show which Betterleaks binary the share gate will use |
+| `clawjournal trufflehog install [--force]` | Download the pinned, checksum-verified TruffleHog (share-gate live-credential check) into `~/.clawjournal/bin` |
 | `clawjournal trufflehog status [--json]` | Show which TruffleHog binary the share gate will use |
 
 ### Export & sanitize (advanced)

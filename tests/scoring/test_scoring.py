@@ -758,7 +758,9 @@ class TestBackendSelection:
         captured = {}
 
         def fake_run(*, cwd, **kw):
-            captured["session_payload"] = json.loads((cwd / "session.json").read_text())
+            captured["session_payload"] = json.loads(
+                (cwd / "session.json").read_text(encoding="utf-8")
+            )
             scoring = {
                 "substance": 4,
                 **_failure_fields(ai_quality_score=4),

@@ -1120,15 +1120,17 @@ def apply_findings_to_blob(
     decisions: dict[str, str] = {row["entity_hash"]: row["status"] for row in decision_rows}
 
     # Lazy import to avoid pii.py → secrets.py import cycle.
+    from .betterleaks import betterleaks_secret_map_from_blob
     from .pii import pii_secret_map_from_text_decisions
     from .trufflehog import trufflehog_secret_map_from_blob
 
-    # TruffleHog is a subprocess-backed engine — run it once on the
-    # original blob rather than inside the per-pass loop. The raws it
-    # finds don't change after the first replacement, so re-scanning
-    # on every pass would pay N× the subprocess cost for zero new
-    # information.
+    # TruffleHog and Betterleaks are subprocess-backed engines — run
+    # them once on the original blob rather than inside the per-pass
+    # loop. The raws they find don't change after the first
+    # replacement, so re-scanning on every pass would pay N× the
+    # subprocess cost for zero new information.
     trufflehog_map = trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
+    betterleaks_map = betterleaks_secret_map_from_blob(blob, decisions, user_allowlist)
 
     total = 0
     for pass_num in range(max_passes):
@@ -1153,6 +1155,7 @@ def apply_findings_to_blob(
             )
         secret_map.update(_collect_infrastructure_secret_map(blob))
         secret_map.update(trufflehog_map)
+        secret_map.update(betterleaks_map)
         # Note on loop termination: once trufflehog_map is non-empty the
         # `not secret_map` guard never fires, so the pass loop now
         # relies on the `pass_count == 0 and pass_num > 0` guard below

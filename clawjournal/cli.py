@@ -148,11 +148,41 @@ def _parse_pii_provider_arg(value: str) -> str:
 
 
 def _mask_config_for_display(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a copy of config with redact_strings values masked."""
-    out = dict(config)
-    if out.get("redact_strings"):
-        out["redact_strings"] = [_mask_secret(s) for s in out["redact_strings"]]
-    return out
+    """Return a recursively masked display copy of configuration.
+
+    ``redact_strings`` are themselves sensitive policy values.  In addition,
+    mask secret-bearing keys generically so adding a future token field cannot
+    silently turn ``clawjournal config`` into a credential disclosure path.
+    """
+
+    secret_fragments = (
+        "token",
+        "secret",
+        "credential",
+        "password",
+        "api_key",
+        "access_key",
+        "private_key",
+    )
+
+    def copy_value(value: Any, *, key: str | None = None) -> Any:
+        normalized_key = (key or "").lower()
+        if key == "redact_strings" and isinstance(value, list):
+            return [_mask_secret(str(item)) for item in value]
+        if any(fragment in normalized_key for fragment in secret_fragments):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return _mask_secret(value)
+            return "***"
+        if isinstance(value, Mapping):
+            return {str(child_key): copy_value(child, key=str(child_key))
+                    for child_key, child in value.items()}
+        if isinstance(value, list):
+            return [copy_value(item) for item in value]
+        return value
+
+    return {str(key): copy_value(value, key=str(key)) for key, value in config.items()}
 
 
 def _source_label(source_filter: str) -> str:
@@ -450,7 +480,10 @@ def configure(
             # Re-enabling pops the key rather than storing False, keeping
             # config.json clean (mirrors the scorer_backend "none" pattern).
             config.pop("scoring_warmup_declined", None)
-    save_config(config)
+    if save_config(config) is False:
+        raise RuntimeError(
+            "Config persistence could not be confirmed; review automatic-upload status before retrying."
+        )
     if not quiet:
         print(f"Config saved to {CONFIG_FILE}")
         print(json.dumps(_mask_config_for_display(config), indent=2))
@@ -1638,6 +1671,8 @@ def _write_bundle_zip(export_dir: Path) -> Path:
             "manifest.json",
             "trufflehog.json",
             "trufflehog.post-pii.json",
+            "secret-scan.json",
+            "secret-scan.post-pii.json",
         ):
             path = export_dir / name
             if path.exists():
@@ -1647,6 +1682,7 @@ def _write_bundle_zip(export_dir: Path) -> Path:
 
 def _run_bundle_export(args) -> None:
     """Export a bundle to disk as JSONL + manifest."""
+    from .redaction.scanner_install import ensure_share_scanners
     from .workbench.index import (
         export_share_to_disk,
         get_effective_share_settings,
@@ -1656,6 +1692,20 @@ def _run_bundle_export(args) -> None:
     )
 
     config = load_config()
+
+    scanner_setup = ensure_share_scanners(
+        progress=None if getattr(args, "json", False) else print,
+    )
+    if not scanner_setup["ok"]:
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "error": scanner_setup.get("error"),
+                "block_reason": "scanner-not-installed",
+                "scanner_install": scanner_setup,
+            }, indent=2))
+        else:
+            print(scanner_setup.get("error") or "Required secret scanners are not installed.")
+        sys.exit(2)
 
     # AI-PII review only runs inside the uploadable-zip finalize pass, so the
     # flag is a no-op for a plain on-disk export. Warn instead of silently
@@ -1706,11 +1756,11 @@ def _run_bundle_export(args) -> None:
         if manifest.get("blocked"):
             print(f"Share blocked: {manifest.get('block_reason', 'unknown')}")
             print(manifest.get("block_message", ""))
-            print(f"Report: {export_dir}/trufflehog.json")
+            print(f"Report: {export_dir}/secret-scan.json")
             sys.exit(2)
 
         session_count = len(manifest.get("sessions", []))
-        files = ["sessions.jsonl", "manifest.json", "trufflehog.json"]
+        files = ["sessions.jsonl", "manifest.json", "trufflehog.json", "secret-scan.json"]
         zip_path = None
         if getattr(args, "zip", False) is True:
             from .workbench.daemon import finalize_share_export_for_upload
@@ -1718,6 +1768,7 @@ def _run_bundle_export(args) -> None:
             error, manifest = finalize_share_export_for_upload(
                 export_dir,
                 manifest,
+                conn=conn,
                 ai_pii=getattr(args, "ai_pii_review", False) is True,
             )
             if error:
@@ -1725,8 +1776,9 @@ def _run_bundle_export(args) -> None:
                     print(f"Share blocked: {error.get('block_reason')}")
                 print(error.get("error", "Failed to prepare upload zip."))
                 sys.exit(2 if int(error.get("status", 500)) == 422 else 1)
-            if (export_dir / "trufflehog.post-pii.json").exists():
-                files.append("trufflehog.post-pii.json")
+            for extra in ("trufflehog.post-pii.json", "secret-scan.post-pii.json"):
+                if (export_dir / extra).exists():
+                    files.append(extra)
 
         # Optional training-format conversion
         training_summary = None
@@ -2975,6 +3027,12 @@ def _score_single_session(
         if redaction_settings is not None:
             score_kwargs["redaction_settings"] = redaction_settings
         result = score_session(conn, session_id, **score_kwargs)
+    except FileNotFoundError as e:
+        missing = getattr(e, "filename", None) or str(e)
+        return {
+            "session_id": session_id,
+            "error": f"Missing file or command during scoring: {missing}",
+        }
     except RuntimeError as e:
         return {
             "session_id": session_id,
@@ -3931,6 +3989,9 @@ def main() -> None:
     hooks_launch.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     hooks_launch.add_argument("--json", action="store_true", help="Output result as JSON")
 
+    from .cli_auto_upload import add_auto_upload_parser
+    add_auto_upload_parser(sub)
+
     su = sub.add_parser("selfupdate",
                         help="Pull the latest clawjournal from the public repo (manual sync update)")
     su.add_argument("--check", action="store_true",
@@ -3951,6 +4012,19 @@ def main() -> None:
     th_status = th_sub.add_parser(
         "status", help="Show which TruffleHog binary clawjournal will use")
     th_status.add_argument("--json", action="store_true", help="Output result as JSON")
+
+    bl = sub.add_parser("betterleaks",
+                        help="Manage the Betterleaks binary used by the share gate")
+    bl_sub = bl.add_subparsers(dest="betterleaks_command")
+    bl_install = bl_sub.add_parser(
+        "install",
+        help="Download the pinned, checksum-verified Betterleaks into ~/.clawjournal/bin")
+    bl_install.add_argument("--force", action="store_true",
+                            help="Reinstall even if a managed binary already exists")
+    bl_install.add_argument("--json", action="store_true", help="Output result as JSON")
+    bl_status = bl_sub.add_parser(
+        "status", help="Show which Betterleaks binary clawjournal will use")
+    bl_status.add_argument("--json", action="store_true", help="Output result as JSON")
 
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
@@ -4720,6 +4794,11 @@ def main() -> None:
         )
         return
 
+    if command == "auto-upload":
+        from .cli_auto_upload import run as run_auto_upload
+        run_auto_upload(args)
+        return
+
     if command == "scan":
         if args.force or args.all or args.session_ids:
             from .cli_security import run_scan_force
@@ -4968,6 +5047,14 @@ def main() -> None:
             update_status = update.get("status") if isinstance(update, dict) else None
             if update_status:
                 print(f"ClawJournal update status: {update_status}")
+            scanners = result.get("scanners") or {}
+            scanner_states = scanners.get("scanners", {}) if isinstance(scanners, dict) else {}
+            if scanner_states:
+                summary = ", ".join(
+                    f"{name} ({state.get('status', 'unknown')})"
+                    for name, state in scanner_states.items()
+                )
+                print(f"Local secret scanners ready: {summary}.")
             install = result["install"]
             installed = install.get("installed", [])
             agents = ", ".join(item.get("agent", "?") for item in installed)
@@ -5173,6 +5260,10 @@ def main() -> None:
 
     if command == "trufflehog":
         _run_trufflehog_command(args)
+        return
+
+    if command == "betterleaks":
+        _run_betterleaks_command(args)
         return
 
     if command == "list":
@@ -5736,6 +5827,83 @@ def _run_trufflehog_command(args) -> None:
     if not is_managed:
         print(f"A pinned v{PINNED_VERSION} can be installed with "
               "`clawjournal trufflehog install` (managed copy takes precedence).")
+
+
+def _run_betterleaks_command(args) -> None:
+    """`clawjournal betterleaks install|status` — manage the primary share-gate scanner."""
+    from .redaction import betterleaks
+    from .redaction.betterleaks_install import PINNED_VERSION, install
+
+    sub_command = getattr(args, "betterleaks_command", None)
+
+    if sub_command == "install":
+        result = install(force=args.force, progress=None if args.json else print)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            status = result["status"]
+            if status == "installed":
+                print(f"Installed Betterleaks {result['version']} at {result['path']}.")
+            elif status == "already-installed":
+                print(
+                    f"Already installed ({result['version']}) at {result['path']}. "
+                    "Pass --force to reinstall."
+                )
+            else:
+                print(f"Install failed ({status}): {result.get('error', '')}")
+                if result.get("url"):
+                    print(f"  URL: {result['url']}")
+                if result.get("hint"):
+                    print(f"  {result['hint']}")
+        if result["status"] not in ("installed", "already-installed"):
+            sys.exit(1)
+        return
+
+    # Default (and explicit `status`): report what the share gate will use.
+    import shutil
+
+    resolved = betterleaks.resolve_binary()
+    managed = betterleaks.managed_binary_path()
+    fingerprint = betterleaks.engine_fingerprint()
+    version_match = betterleaks._BARE_VERSION_RE.search(fingerprint)
+    off_pin = betterleaks.managed_off_pin()
+    is_managed = resolved == str(managed)
+    shadowed_path = shutil.which("betterleaks") if is_managed else None
+    payload = {
+        "resolved_path": resolved,
+        "managed": is_managed,
+        "managed_path": str(managed),
+        # Bare version (e.g. "1.6.1") to match install --json; the raw
+        # engine fingerprint (e.g. "betterleaks 1.6.1") rides alongside.
+        "version": version_match.group(1) if version_match else None,
+        "fingerprint": fingerprint,
+        "pinned_version": PINNED_VERSION,
+        # True when the managed copy drifted from the source pin (e.g.
+        # selfupdate bumped PINNED_VERSION but install was never re-run).
+        "managed_off_pin": off_pin is not None,
+        "shadowed_path_binary": shadowed_path,
+        "available": resolved is not None,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        if resolved is None:
+            sys.exit(1)
+        return
+    if resolved is None:
+        print("Betterleaks: not installed.")
+        print("Run `clawjournal betterleaks install` to install "
+              f"the pinned v{PINNED_VERSION}.")
+        sys.exit(1)
+    origin = "managed install" if is_managed else "PATH"
+    print(f"Betterleaks: {fingerprint} ({origin}: {resolved})")
+    if off_pin is not None:
+        print(f"Warning: the managed copy is v{off_pin[0]} but this clawjournal "
+              f"pins v{off_pin[1]} — run `clawjournal betterleaks install` to update.")
+    if shadowed_path:
+        print(f"(The managed copy takes precedence over the PATH copy at {shadowed_path}.)")
+    if not is_managed:
+        print(f"A pinned v{PINNED_VERSION} can be installed with "
+              "`clawjournal betterleaks install` (managed copy takes precedence).")
 
 
 def _run_events_features(args) -> None:

@@ -47,6 +47,8 @@ ClawJournal is a local-first tool that scans coding-agent session logs, indexes 
   - `card.py`, `trace_note.py` — share-card rendering and per-session markdown trace notes synced with the DB.
 - `export/` — `markdown.py` (human-readable) and `training_data.py` (JSONL bundle format used by `bundle-export`).
 - `prompts/agents/*/*.md` — canonical runtime prompts shipped in the wheel (referenced from `pyproject.toml` `package-data`). `prompt_sync.py` keeps mirrors in sync.
+- `auto_upload.py`, `auto_upload_client.py`, `auto_upload_credentials.py` — recurring authorization/candidate/runner state machine, exact hosted v1 client, and the private purpose-separated credential store.
+- `agent_hooks.py` — Claude Code/Codex `SessionStart` hook installation and the bounded, fail-open due-check adapter. Hooks never package or upload inline.
 - `web/frontend/` — Vite app; **excluded from the Python package** via `[tool.setuptools.packages.find]`. Only the built `dist/` is packaged.
 
 ### Key invariants
@@ -57,6 +59,9 @@ ClawJournal is a local-first tool that scans coding-agent session logs, indexes 
 - **Anonymization happens before any AI call.** Home-dir paths and usernames are stripped locally before scoring or AI-PII review sends anything to a backend.
 - **Appending config flags.** `--exclude`, `--redact`, `--redact-usernames` append rather than overwrite; preserve this behavior in any config edits.
 - **Mandatory TruffleHog post-redaction gate.** `clawjournal/redaction/trufflehog.py` is invoked from `export_share_to_disk` (and re-invoked from the daemon upload path after the PII rewrite). Any finding or missing binary blocks the share; manifest gains `blocked=true` + `block_reason` and `shares.status` is not advanced. TruffleHog is AGPL-3.0 — we invoke it as a subprocess only, never link in-process. Tests bypass via the autouse fixture in `tests/conftest.py` which sets `CLAWJOURNAL_SKIP_TRUFFLEHOG=1`.
+- **Recurring sharing is a separate authorization.** It is default-off, future-only, capped at five, exact-scope, and unavailable without hosted protocol-v2 discovery plus a successful manual receipt. Protocol v2 enrollment sends explicit (source, project) scope entries and requires a separately accepted, versioned ownership certification; the server owns the scope hash and the client pins the read-back value. Manual Share behavior must not change.
+- **Recovery reuses exact bytes.** Persist/fsync/hash the exact sealed ZIP, client submission ID, included revisions, and raw fingerprints before `submitting`. Ambiguous requests reconcile receipts first and may retry only that exact ledger entry.
+- **Controls win before submitting.** Generation, profile, hold, revision, source, raw-input, terms, and provider checks repeat before AI/egress. Disable removes active authority first; recovery credentials can never upload.
 
 ### Skills + plugin wrapper
 

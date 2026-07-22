@@ -13,7 +13,10 @@ export interface PackageStepProps {
   progress: number;
   log: string;
   failed: string | null;
+  missingScanners: boolean;
+  installingScanners: boolean;
   blockedSessions: BlockedShareSession[];
+  onInstallScannersAndRetry: () => void;
   onRetry: () => void;
   onRemoveBlockedAndRetry: () => void;
   onBack: () => void;
@@ -102,7 +105,9 @@ export function PackageStep(p: PackageStepProps) {
           {p.failed && blockedCount > 0
             ? `${blockedCount} trace${blockedCount === 1 ? '' : 's'} triggered the final secret scan.`
             : p.failed
-            ? p.failed
+            ? p.missingScanners
+              ? 'A required local secret scanner is missing.'
+              : p.failed
             : <>Compressing {p.approvedCount} approved trace{p.approvedCount === 1 ? '' : 's'} into a single redacted zip.</>}
         </p>
         <div style={{
@@ -124,6 +129,20 @@ export function PackageStep(p: PackageStepProps) {
         </div>
         {p.failed && (
           <>
+            {p.missingScanners && (
+              <div style={{
+                margin: '20px auto 0', maxWidth: 560, textAlign: 'left',
+                border: '1px solid #D4AB73', background: '#E9DEC9',
+                borderRadius: 12, padding: '14px 16px', color: '#362815',
+              }}>
+                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 5 }}>
+                  Local scanners required
+                </div>
+                <div style={{ fontSize: 12.5, lineHeight: 1.5, color: '#725E47' }}>
+                  Betterleaks and TruffleHog scan the redacted bundle on this computer before a ZIP is created. Install the pinned, verified copies and retry packaging.
+                </div>
+              </div>
+            )}
             {blockedCount > 0 && (
               <div style={{
                 margin: '20px auto 0', maxWidth: 560, textAlign: 'left',
@@ -145,6 +164,17 @@ export function PackageStep(p: PackageStepProps) {
                           {session?.display_title || blocked.project || blocked.session_id}
                         </div>
                         <div style={{ fontSize: 11.5, color: colors.gray500 }}>
+                          {firstFinding?.tier && (
+                            <span style={{
+                              display: 'inline-block', marginRight: 6, padding: '0 6px',
+                              borderRadius: 8, fontSize: 10.5, fontWeight: 600,
+                              textTransform: 'uppercase', letterSpacing: 0.4,
+                              background: firstFinding.tier === 'block' ? colors.red100 : colors.yellow100,
+                              color: firstFinding.tier === 'block' ? colors.red700 : colors.yellow700,
+                            }}>
+                              {firstFinding.tier}
+                            </span>
+                          )}
                           {session?.project || blocked.project || 'Unknown project'}
                           {firstFinding?.detector ? ` · ${firstFinding.detector}` : ''}
                           {firstFinding?.masked ? ` · ${firstFinding.masked}` : ''}
@@ -157,6 +187,26 @@ export function PackageStep(p: PackageStepProps) {
             )}
             <div style={{ marginTop: 20, display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap' }}>
               <button onClick={p.onBack} style={btnSecondary}>Back to review</button>
+              {p.missingScanners && (
+                <button
+                  onClick={p.onInstallScannersAndRetry}
+                  disabled={p.installingScanners}
+                  style={{
+                    ...btnPrimary,
+                    background: '#EDE2CC', color: '#362815', border: '1px solid #45392C',
+                    cursor: p.installingScanners ? 'wait' : 'pointer',
+                    opacity: p.installingScanners ? 0.7 : 1,
+                  }}
+                >
+                  <span style={{
+                    display: 'inline-flex',
+                    animation: p.installingScanners ? 'clawSpin 900ms linear infinite' : undefined,
+                  }}>
+                    <Icon name={p.installingScanners ? 'retry' : 'lock'} size={13} />
+                  </span>
+                  {p.installingScanners ? 'Installing secure scanners…' : 'Install secure scanners & retry'}
+                </button>
+              )}
               {blockedCount > 0 && (
                 <button onClick={p.onRemoveBlockedAndRetry} style={btnPrimary}>
                   Remove and retry

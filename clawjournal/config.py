@@ -2,13 +2,105 @@
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Iterator, Mapping, TypedDict, cast
 
 CONFIG_DIR = Path.home() / ".clawjournal"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+AUTO_UPLOAD_EGRESS_LOCK_FILENAME = "auto-upload-egress.lock"
+
+
+@contextmanager
+def auto_upload_egress_lock() -> Iterator[None]:
+    """Serialize short profile mutations with the submitting transition."""
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = CONFIG_DIR / AUTO_UPLOAD_EGRESS_LOCK_FILENAME
+    file = path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            file.seek(0, os.SEEK_END)
+            if file.tell() == 0:
+                file.write(b"0")
+                file.flush()
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+    finally:
+        file.close()
+
+
+_AUTO_UPLOAD_PROFILE_CONFIG_KEYS = (
+    "source",
+    "projects_confirmed",
+    "excluded_projects",
+    "redact_strings",
+    "redact_usernames",
+    "allowlist_entries",
+    "ai_pii_review_enabled",
+    # The findings-engine set shapes what leaves the machine (which
+    # scanners feed redaction), so changing it pauses enrollment like
+    # any other redaction-profile change.
+    "enabled_findings_engines",
+)
+
+
+def _auto_upload_profile_projection(config: Mapping[str, object]) -> dict[str, object]:
+    projection = {
+        key: config.get(key)
+        for key in _AUTO_UPLOAD_PROFILE_CONFIG_KEYS
+    }
+    projection["scorer_backend"] = (
+        config.get("scorer_backend")
+        if config.get("ai_pii_review_enabled") is True
+        else None
+    )
+    return projection
+
+
+def mark_auto_upload_profile_changed(conn: sqlite3.Connection) -> bool:
+    """Pause an active enrollment in the caller's current DB transaction."""
+
+    try:
+        cursor = conn.execute(
+            "UPDATE auto_upload_enrollment SET mode = 'paused', "
+            "health = 'action_required', generation = generation + 1, "
+            "next_retry_at = NULL, last_result_code = 'profile_changed', "
+            "updated_at = ? WHERE singleton_id = 1 "
+            "AND mode IN ('enabled', 'paused')",
+            (datetime_now_iso(),),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return False
+        raise
+    return cursor.rowcount == 1
+
+
+def datetime_now_iso() -> str:
+    # Kept local to avoid importing the workbench/index layer from config.
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 class ClawJournalConfig(TypedDict, total=False):
@@ -35,10 +127,15 @@ class ClawJournalConfig(TypedDict, total=False):
     pending_verification_email: str | None
     pending_verification_expires_at: str | int | None
     ai_pii_review_enabled: bool
+    # Deterministic findings engines (see findings.get_enabled_engines);
+    # default lives there: ("betterleaks", "regex_pii", "regex_secrets").
+    enabled_findings_engines: list[str]
     scorer_backend: str | None
     scorer_backend_confirmed_at: str | None
     benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
     scoring_warmup_declined: bool  # user declined the background auto-scorer (suppresses prompt + server-side auto-start)
+    auto_upload_capability_available: bool  # non-authoritative UI offer cache; Enable revalidates live
+    auto_upload_ui_enabled: bool  # internal rollout flag; default hidden
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {
@@ -48,6 +145,7 @@ DEFAULT_CONFIG: ClawJournalConfig = {
     "redact_strings": [],
     "allowlist_entries": [],
     "benchmark_tab_enabled": True,
+    "auto_upload_ui_enabled": False,
 }
 
 
@@ -63,6 +161,7 @@ def load_config() -> ClawJournalConfig:
             config = cast(ClawJournalConfig, {**DEFAULT_CONFIG, **stored})
             changed = _migrate_excluded_projects(config)
             changed |= _migrate_remove_device_credentials(config)
+            changed |= _migrate_findings_engines(config)
             if changed:
                 save_config(config)
             return config
@@ -129,16 +228,89 @@ def _migrate_remove_device_credentials(config: ClawJournalConfig) -> bool:
     return changed
 
 
-def save_config(config: ClawJournalConfig) -> None:
+def _migrate_findings_engines(config: ClawJournalConfig) -> bool:
+    """Add ``betterleaks`` to an explicit ``enabled_findings_engines`` list.
+
+    Users who never set the key ride the default (which now includes
+    betterleaks — see ``findings.get_enabled_engines``); users who
+    pinned an explicit list keep their choices (including a trufflehog
+    opt-in) but gain the new primary engine, since running the share
+    gate's scanner as a findings engine is what keeps the review UI
+    consistent with what the gate will do.
+    """
+    engines = config.get("enabled_findings_engines")
+    if not isinstance(engines, list):
+        return False
+    if any(not isinstance(name, str) for name in engines):
+        return False
+    if "betterleaks" in engines:
+        return False
+    engines.append("betterleaks")
+    return True
+
+
+def save_config(config: ClawJournalConfig) -> bool:
+    """Persist config atomically; return False only when persistence failed."""
+
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(config, f, indent=2)
-            os.replace(tmp_path, CONFIG_FILE)
-        except BaseException:
-            os.unlink(tmp_path)
-            raise
-    except OSError as e:
+        with auto_upload_egress_lock():
+            previous: dict[str, object] = dict(DEFAULT_CONFIG)
+            try:
+                stored = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if isinstance(stored, dict):
+                    previous.update(stored)
+            except (OSError, json.JSONDecodeError):
+                pass
+            profile_changed = _auto_upload_profile_projection(
+                previous
+            ) != _auto_upload_profile_projection(config)
+
+            fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(config, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, CONFIG_FILE)
+                tmp_path = ""
+                if hasattr(os, "O_DIRECTORY"):
+                    dir_fd = os.open(CONFIG_DIR, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+            except BaseException:
+                if tmp_path:
+                    os.unlink(tmp_path)
+                raise
+
+            if profile_changed:
+                # Best-effort pause stamp on a short-lived connection of its
+                # own. The config file is already durably written above, and
+                # the runner re-derives the egress profile hash from config at
+                # selection, AI, and submit time, so a busy index (for example
+                # a caller holding its own write transaction while saving
+                # config) must not stall for long or fail the config write.
+                index_path = CONFIG_DIR / "index.db"
+                if index_path.exists():
+                    try:
+                        conn = sqlite3.connect(index_path, timeout=5)
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            mark_auto_upload_profile_changed(conn)
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+                        finally:
+                            conn.close()
+                    except sqlite3.Error as e:
+                        print(
+                            "Warning: could not pause automatic upload after a "
+                            f"profile change: {e}",
+                            file=sys.stderr,
+                        )
+    except (OSError, sqlite3.Error) as e:
         print(f"Warning: could not save {CONFIG_FILE}: {e}", file=sys.stderr)
+        return False
+    return True

@@ -1,5 +1,7 @@
 import json
 import subprocess
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -336,6 +338,59 @@ def test_review_session_pii_hybrid_passes_agent_timeout(monkeypatch):
     assert captured["timeout_seconds"] == 37
 
 
+def test_gated_hybrid_review_rechecks_before_every_serial_provider_call(
+    monkeypatch,
+):
+    from clawjournal.redaction import pii as pii_module
+
+    original_split = pii_module._split_into_batches
+    monkeypatch.setattr(
+        pii_module,
+        "_split_into_batches",
+        lambda items: original_split(items, char_limit=8),
+    )
+    monkeypatch.setattr(pii_module, "resolve_backend", lambda _backend: "codex")
+    provider_calls: list[str] = []
+    monkeypatch.setattr(
+        pii_module,
+        "run_default_agent_task",
+        lambda **_kwargs: (
+            provider_calls.append("provider")
+            or SimpleNamespace(stdout="[]")
+        ),
+    )
+
+    class ControlChangedDuringFirstCall(RuntimeError):
+        pass
+
+    gate_calls = 0
+
+    def gate() -> None:
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 2:
+            raise ControlChangedDuringFirstCall("generation changed")
+
+    session = {
+        "session_id": "multi-batch",
+        "messages": [
+            {"content": "first batch"},
+            {"content": "second batch"},
+        ],
+    }
+
+    with pytest.raises(ControlChangedDuringFirstCall, match="generation changed"):
+        review_session_pii_hybrid(
+            session,
+            backend="codex",
+            ignore_llm_errors=True,
+            before_agent_call=gate,
+        )
+
+    assert gate_calls == 2
+    assert provider_calls == ["provider"]
+
+
 def test_content_findings_github_url():
     findings = _content_findings_for_text("s1", 0, "content", "See https://github.com/kai-rayward/clawjournal for details")
     entity_texts = {f["entity_text"] for f in findings}
@@ -556,3 +611,32 @@ def test_review_session_pii_with_agent_ignores_errors(monkeypatch):
     monkeypatch.setattr("clawjournal.redaction.pii._review_batch", failing_runner)
     findings = review_session_pii_with_agent(session, backend="claude", ignore_errors=True)
     assert findings == []
+
+
+def test_review_session_pii_with_agent_uses_one_deadline_across_batch_waves(monkeypatch):
+    session = {"session_id": "s1", "messages": [{"content": "test"}]}
+    batches = [[("s1", index, "content", "text")] for index in range(3)]
+    calls = []
+
+    monkeypatch.setattr("clawjournal.redaction.pii._split_into_batches", lambda _items: batches)
+
+    def slow_runner(*args, **kwargs):
+        calls.append(kwargs["timeout_seconds"])
+        time.sleep(0.03)
+        return []
+
+    monkeypatch.setattr("clawjournal.redaction.pii._review_batch", slow_runner)
+
+    with pytest.raises(RuntimeError, match="PII review timed out"):
+        review_session_pii_with_agent(
+            session,
+            backend="claude",
+            ignore_errors=False,
+            max_workers=1,
+            timeout_seconds=0.01,
+        )
+
+    # The old implementation submitted all three batches and restarted the
+    # timeout for each worker wave. Once the one request budget expires, no
+    # second or third agent process is launched.
+    assert calls == [1]

@@ -151,9 +151,13 @@ If user says "looks good" / "share" / "yes" — proceed to Step 4.
 Only after explicit user confirmation:
 
 ```bash
+clawjournal betterleaks status --json >/dev/null 2>&1 || clawjournal betterleaks install
+clawjournal trufflehog status --json >/dev/null 2>&1 || clawjournal trufflehog install
 clawjournal bundle-create --status approved --note "<user's comment>" --json
 clawjournal bundle-export <bundle_id> --zip --json
 ```
+
+Run the scanner checks yourself. The packaging preflight also repairs missing managed scanners, but this explicit check gives the user a clear installation result before the final package step. Never ask the user to install Betterleaks or TruffleHog with Homebrew.
 
 Parse the export result and **always report the redaction summary to the user** (see Communication Guidelines above). For hosted research submission, do not ask the user for `CLAWJOURNAL_INGEST_URL`; use the workbench Share tab's Submit step so email verification, consent, and receipt handling happen in the UI. If the destination is not configured, tell the user the redacted zip is ready on their computer.
 

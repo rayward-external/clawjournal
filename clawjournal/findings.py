@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
+from .config import mark_auto_upload_profile_changed
 from .paths import ensure_hash_salt
 
 ENGINE_VERSION = 2  # round-4 bump: A2 added stripe_key, stripe_webhook_secret,
@@ -67,8 +68,13 @@ def get_enabled_engines(config: dict[str, Any] | None = None) -> tuple[str, ...]
     Participates in `findings_revision` so toggling an engine in config
     automatically triggers a rescan. Both `regex_pii` and `regex_secrets`
     are wired through the findings pipeline + share-time apply path.
+
+    Betterleaks replaced TruffleHog in the default set when it became
+    the share gate's primary scanner; the trufflehog engine remains
+    available for explicit opt-in via ``enabled_findings_engines``
+    (the config migration preserves existing opt-ins).
     """
-    default = ("regex_pii", "regex_secrets", "trufflehog")
+    default = ("betterleaks", "regex_pii", "regex_secrets")
     if not config:
         return default
     engines = config.get("enabled_findings_engines")
@@ -217,11 +223,11 @@ def compute_findings_revision(
         f"project={session.get('project') or ''}",
         f"git_branch={session.get('git_branch') or ''}",
     ]
-    # Fold the TruffleHog binary fingerprint into the revision so
-    # installing the binary (or upgrading it) automatically
-    # invalidates every session's cached findings — a session scanned
-    # when trufflehog was missing or at version X must re-scan once
-    # the presence/version flips.
+    # Fold the scanner binary fingerprints into the revision so
+    # installing a binary (or upgrading it) automatically invalidates
+    # every session's cached findings — a session scanned when the
+    # scanner was missing or at version X must re-scan once the
+    # presence/version flips.
     if "trufflehog" in enabled:
         try:
             from .redaction.trufflehog import engine_fingerprint  # noqa: PLC0415 — lazy
@@ -229,6 +235,15 @@ def compute_findings_revision(
             parts.append(f"trufflehog_fp={engine_fingerprint()}")
         except Exception:  # noqa: BLE001 — revision computation must never raise
             parts.append("trufflehog_fp=error")
+    if "betterleaks" in enabled:
+        try:
+            from .redaction.betterleaks import (  # noqa: PLC0415 — lazy
+                engine_fingerprint as betterleaks_fingerprint,
+            )
+
+            parts.append(f"betterleaks_fp={betterleaks_fingerprint()}")
+        except Exception:  # noqa: BLE001 — revision computation must never raise
+            parts.append("betterleaks_fp=error")
 
     messages = session.get("messages") or []
     if isinstance(messages, list):
@@ -701,6 +716,7 @@ def allowlist_add_by_hash(
         entity_hash=entity_hash,
         reason=reason,
     )
+    mark_auto_upload_profile_changed(conn)
     entry = AllowlistEntry(
         allowlist_id=allowlist_id,
         entity_type=entity_type,
@@ -765,6 +781,7 @@ def allowlist_remove(
         "DELETE FROM findings_allowlist WHERE allowlist_id = ?",
         (allowlist_id,),
     )
+    mark_auto_upload_profile_changed(conn)
 
     now = _now_iso()
     reverted = 0

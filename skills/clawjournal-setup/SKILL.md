@@ -23,7 +23,7 @@ Check if `clawjournal` is already installed:
 
 Use the bundled installer scripts. They detect a Python 3.10+ interpreter, create an isolated venv at `~/.clawjournal-venv`, and `pip install -e` the repo. Idempotent — safe to re-run.
 
-First, ask: "Do you want the browser workbench? (Recommended — it's the primary review surface. Otherwise the CLI works alone.)" Use the answer to pick whether to pass the frontend flag below.
+First, ask: "Do you want the browser workbench? (Recommended — it's the primary review surface. Otherwise the CLI works alone.)" Use the answer to pick whether to pass the frontend flag below. If the user intends to share traces or enroll in OpenRefinery, also pass the sharing flag so the managed secret scanners are ready before packaging. Do not use Homebrew for those scanners.
 
 **macOS / Linux / WSL / Git Bash on Windows:**
 
@@ -37,6 +37,7 @@ fi
 # Pick ONE based on the user's answer above:
 ~/clawjournal/scripts/install.sh                    # CLI only
 ~/clawjournal/scripts/install.sh --with-frontend    # also build the browser workbench (needs Node.js)
+# Add --with-sharing to either command for sharing or OpenRefinery enrollment.
 ```
 
 **Native Windows PowerShell** (no WSL / Git Bash):
@@ -51,6 +52,7 @@ if (Test-Path "$HOME\clawjournal\.git") {
 # Pick ONE based on the user's answer above:
 powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1"                # CLI only
 powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1" -WithFrontend  # also build the browser workbench (needs Node.js)
+# Add -WithSharing to either command for sharing or OpenRefinery enrollment.
 ```
 
 The script's exit code and printed output tell you exactly what to do next. Common failure modes the script surfaces directly:
@@ -58,6 +60,7 @@ The script's exit code and printed output tell you exactly what to do next. Comm
 - **Python 3.10+ not found** — install via the platform hint the script prints, then re-run. macOS users may also need `xcode-select --install` to get a working `python3`.
 - **`python3 -m venv` fails on Debian/Ubuntu** — run `sudo apt install -y python3-venv python3-full`, then re-run the script.
 - **`node` / `npm` missing** when `--with-frontend` was requested — the script skips the frontend with a warning. Install Node.js (macOS: `brew install node`, Linux: `sudo apt-get install -y nodejs npm`, Windows: nodejs.org) and re-run with the flag.
+- **A managed secret scanner download fails** when `--with-sharing` / `-WithSharing` was requested — check the printed network or checksum diagnostic and re-run the same installer. Do not bypass the sharing gate.
 
 Verify (POSIX):
 

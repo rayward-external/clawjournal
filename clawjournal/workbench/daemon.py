@@ -17,16 +17,21 @@ import urllib.request
 import uuid
 import webbrowser
 import zipfile
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
+from ..auto_upload_client import (
+    RECURRING_CADENCE_DAYS,
+    RECURRING_UPLOAD_API_VERSION,
+)
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
 from ..scoring.backends import (
@@ -53,7 +58,6 @@ from .index import (
     add_policy,
     already_shared_revision_blockers,
     apply_share_redactions,
-    build_trufflehog_blocked_sessions,
     create_share,
     export_share_to_disk,
     FAILURE_VALUE_SOURCE_SCOPE,
@@ -78,6 +82,7 @@ from .index import (
     SCORE_SETTLE_SECONDS,
     session_matches_excluded_projects,
     share_predecessor_blockers,
+    share_revision_blockers,
     source_scope_blockers,
     update_session,
     upsert_sessions,
@@ -105,6 +110,75 @@ from ..parsing.parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _StrictScanLogFilter(logging.Filter):
+    """Suppress unbounded log records emitted by one strict-scan thread."""
+
+    def __init__(self, thread_id: int):
+        super().__init__()
+        self.thread_id = thread_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return (
+            record.thread != self.thread_id
+            or getattr(record, "strict_scan_safe", False) is True
+        )
+
+
+@contextmanager
+def _strict_scan_log_guard() -> Iterator[None]:
+    """Allow only explicitly bounded logs from the current strict scan.
+
+    Parser and storage helpers predate strict automatic-upload scans and may
+    log project paths or session identifiers internally. Attach a thread-bound
+    filter to every configured handler while the strict scan runs so those
+    lower-level records cannot escape, without muting ordinary scans or other
+    concurrent threads.
+    """
+
+    log_filter = _StrictScanLogFilter(threading.get_ident())
+    handlers: list[logging.Handler] = []
+    seen: set[int] = set()
+    loggers = [logging.getLogger()]
+    # Snapshot the registry under the logging module lock: a concurrent
+    # first-time getLogger() in another daemon thread mutates loggerDict, and an
+    # unlocked values() iteration would raise "dictionary changed size during
+    # iteration" and abort the strict scan (spurious runner_crash + backoff).
+    with logging._lock:
+        registered = list(logging.Logger.manager.loggerDict.values())
+    loggers.extend(
+        candidate
+        for candidate in registered
+        if isinstance(candidate, logging.Logger)
+    )
+    for configured_logger in loggers:
+        for handler in configured_logger.handlers:
+            if id(handler) in seen:
+                continue
+            seen.add(id(handler))
+            handlers.append(handler)
+            handler.addFilter(log_filter)
+    if logging.lastResort is not None and id(logging.lastResort) not in seen:
+        handlers.append(logging.lastResort)
+        logging.lastResort.addFilter(log_filter)
+    try:
+        yield
+    finally:
+        for handler in handlers:
+            handler.removeFilter(log_filter)
+
+
+def _log_strict_scan_failure(*, source: str, stage: str, code: str) -> None:
+    """Emit only allowlisted telemetry fields for a strict scan failure."""
+
+    logger.warning(
+        "Strict scan failure source=%s stage=%s code=%s",
+        source,
+        stage,
+        code,
+        extra={"strict_scan_safe": True},
+    )
 
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
@@ -134,6 +208,8 @@ _SHARE_GCS_BUCKET = os.environ.get("CLAWJOURNAL_GCS_BUCKET", "clawjournal-traces
 _SHARE_GCS_PREFIX = os.environ.get("CLAWJOURNAL_GCS_PREFIX", "clawjournal")
 _SHARE_UPLOAD_TIMEOUT = 120
 _share_rate_lock = threading.Lock()
+_auto_upload_run_lock = threading.Lock()
+_auto_upload_run_thread: threading.Thread | None = None
 _HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
 _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 
@@ -208,7 +284,8 @@ def _save_confirmed_scoring_backend(backend: str) -> None:
     config = load_config()
     config["scorer_backend"] = backend
     config["scorer_backend_confirmed_at"] = datetime.now(timezone.utc).isoformat()
-    save_config(config)
+    if save_config(config) is False:
+        raise OSError("Scoring backend selection could not be saved safely.")
 
 
 def _scoring_backend_payload(backend: str | None) -> dict[str, Any]:
@@ -436,10 +513,60 @@ class Scanner:
         whose content changed (or remained unchanged) are exposed on the
         ``last_updated_*`` and ``last_unchanged_*`` attributes.
         """
+        return self._scan_once_report(required_sources=None)["new_by_source"]
+
+    def scan_once_strict(self, required_sources: list[str]) -> dict[str, Any]:
+        """Run a fail-closed refresh for an automatic-upload source scope.
+
+        Unlike :meth:`scan_once`, this returns a structured report and never
+        turns a partial parse/findings pass into success.  Project names,
+        paths, session IDs, and exception text are intentionally omitted so
+        the report is safe to persist as scheduler telemetry.
+        """
+        required = sorted({source.strip() for source in required_sources if source.strip()})
+        if not required:
+            raise ValueError("required_sources must not be empty")
+        unsupported = [source for source in required if source not in WORKBENCH_SOURCES]
+        if unsupported:
+            return {
+                "ok": False,
+                "required_sources": required,
+                "discovered_sources": [],
+                "missing_sources": unsupported,
+                "new_by_source": {},
+                "updated_by_source": {},
+                "unchanged_by_source": {},
+                "failures": [
+                    {"source": source, "stage": "source", "code": "unsupported_source"}
+                    for source in unsupported
+                ],
+            }
+        return self._scan_once_report(required_sources=set(required))
+
+    def _scan_once_report(
+        self,
+        *,
+        required_sources: set[str] | None,
+    ) -> dict[str, Any]:
+        if required_sources is None:
+            return self._scan_once_report_impl(required_sources=None)
+        with _strict_scan_log_guard():
+            return self._scan_once_report_impl(required_sources=required_sources)
+
+    def _scan_once_report_impl(
+        self,
+        *,
+        required_sources: set[str] | None,
+    ) -> dict[str, Any]:
+        strict = required_sources is not None
         self.last_updated_count = 0
         self.last_unchanged_count = 0
         self.last_updated_by_source = {}
         self.last_unchanged_by_source = {}
+        results: dict[str, int] = {}
+        discovered_sources: set[str] = set()
+        failures: list[dict[str, str]] = []
+        strict_raw_fingerprints: dict[str, list[Any]] = {}
         conn = open_index()
         try:
             config = load_config()
@@ -450,17 +577,44 @@ class Scanner:
             # Drain any sessions flagged by the security-refactor migration
             # before running the normal parse/scan loop. Per-row updates so
             # a crash mid-drain leaves remaining rows for the next tick.
-            drain_findings_backfill(conn, config=config)
+            try:
+                drain_findings_backfill(
+                    conn, config=config, safe_logging=strict
+                )
+            except Exception:
+                if strict:
+                    _log_strict_scan_failure(
+                        source="*", stage="findings", code="backfill_failed"
+                    )
+                else:
+                    logger.exception("Findings backfill failed during scan")
+                failures.append(
+                    {"source": "*", "stage": "findings", "code": "backfill_failed"}
+                )
 
-            results: dict[str, int] = {}
-            projects = discover_projects(source_filter=self.source_filter)
+            try:
+                projects = discover_projects(source_filter=self.source_filter)
+            except Exception:
+                if strict:
+                    _log_strict_scan_failure(
+                        source="*", stage="discovery", code="discovery_failed"
+                    )
+                else:
+                    logger.exception("Source discovery failed during scan")
+                projects = []
+                failures.append(
+                    {"source": "*", "stage": "discovery", "code": "discovery_failed"}
+                )
 
             for project in projects:
                 source = project.get("source", "")
                 if source not in WORKBENCH_SOURCES:
                     continue
+                if required_sources is not None and source not in required_sources:
+                    continue
                 if self.source_filter and source != self.source_filter:
                     continue
+                discovered_sources.add(source)
 
                 try:
                     sessions = parse_project_sessions(
@@ -469,8 +623,30 @@ class Scanner:
                         include_thinking=True,
                         source=source,
                         locator=project.get("locator"),
+                        strict_jsonl=strict,
                     )
                     if sessions:
+                        if strict:
+                            for session in sessions:
+                                snapshot = session.pop(
+                                    "_raw_source_fingerprint", None
+                                )
+                                session_id = session.get("session_id")
+                                if (
+                                    source in {"claude", "codex"}
+                                    and (
+                                        not session_id
+                                        or not isinstance(snapshot, tuple)
+                                        or len(snapshot) != 5
+                                    )
+                                ):
+                                    raise ValueError(
+                                        "strict parser did not return a raw-source snapshot"
+                                    )
+                                if session_id and snapshot is not None:
+                                    strict_raw_fingerprints[str(session_id)] = list(
+                                        snapshot
+                                    )
                         upsert_stats: dict[str, int] = {}
                         new_count = upsert_sessions(conn, sessions, stats=upsert_stats)
                         results[source] = results.get(source, 0) + new_count
@@ -493,14 +669,82 @@ class Scanner:
                             if not sid:
                                 continue
                             try:
-                                run_findings_pipeline(conn, sid, session, config=config)
+                                run_findings_pipeline(
+                                    conn,
+                                    sid,
+                                    session,
+                                    config=config,
+                                    safe_logging=strict,
+                                )
                             except Exception:
-                                logger.exception("Findings pipeline failed for %s", sid)
+                                if strict:
+                                    _log_strict_scan_failure(
+                                        source=source,
+                                        stage="findings",
+                                        code="findings_failed",
+                                    )
+                                else:
+                                    logger.exception(
+                                        "Findings pipeline failed for %s", sid
+                                    )
+                                failures.append(
+                                    {
+                                        "source": source,
+                                        "stage": "findings",
+                                        "code": "findings_failed",
+                                    }
+                                )
                 except Exception:
-                    logger.exception("Error parsing project %s", project["dir_name"])
+                    if strict:
+                        _log_strict_scan_failure(
+                            source=source, stage="parse", code="parse_failed"
+                        )
+                    else:
+                        logger.exception(
+                            "Error parsing project %s", project["dir_name"]
+                        )
+                    failures.append(
+                        {"source": source, "stage": "parse", "code": "parse_failed"}
+                    )
 
-            self.last_linked_count = link_subagent_hierarchy(conn)
-            return results
+            try:
+                self.last_linked_count = link_subagent_hierarchy(conn)
+            except Exception:
+                if strict:
+                    _log_strict_scan_failure(
+                        source="*", stage="link", code="link_failed"
+                    )
+                else:
+                    logger.exception("Subagent hierarchy linking failed during scan")
+                self.last_linked_count = 0
+                failures.append(
+                    {"source": "*", "stage": "link", "code": "link_failed"}
+                )
+
+            required = sorted(required_sources or ())
+            missing_sources = sorted(set(required) - discovered_sources)
+            for source in missing_sources:
+                failures.append(
+                    {"source": source, "stage": "discovery", "code": "source_not_discovered"}
+                )
+            relevant_failures = [
+                failure
+                for failure in failures
+                if required_sources is None
+                or failure["source"] == "*"
+                or failure["source"] in required_sources
+            ]
+            return {
+                "ok": not relevant_failures,
+                "required_sources": required,
+                "discovered_sources": sorted(discovered_sources),
+                "missing_sources": missing_sources,
+                "new_by_source": results,
+                "updated_by_source": dict(self.last_updated_by_source),
+                "unchanged_by_source": dict(self.last_unchanged_by_source),
+                "failures": relevant_failures,
+                "raw_fingerprints": strict_raw_fingerprints if strict else {},
+            }
         finally:
             conn.close()
 
@@ -854,9 +1098,11 @@ def _email_domain_allowed(
     capabilities: dict[str, Any] | None = None,
 ) -> bool:
     normalized = _normalize_email(email)
-    if "@" not in normalized:
+    if normalized.count("@") != 1:
         return False
-    domain = normalized.rsplit("@", 1)[1]
+    local_part, domain = normalized.rsplit("@", 1)
+    if not local_part or not domain or any(character.isspace() for character in normalized):
+        return False
     policy = (capabilities or {}).get("supported_institution_email_policy")
     suffixes = _HOSTED_EMAIL_SUFFIXES_DEFAULT
     if isinstance(policy, dict) and isinstance(policy.get("domain_suffixes"), list):
@@ -868,7 +1114,10 @@ def _email_domain_allowed(
         bare_suffix = normalized_suffix[1:] if normalized_suffix.startswith(".") else normalized_suffix
         if domain == bare_suffix or domain.endswith(f".{bare_suffix}"):
             return True
-    return False
+    return bool(
+        isinstance(policy, dict)
+        and policy.get("explicit_collaborators_supported") is True
+    )
 
 
 def _expiry_timestamp(value: Any) -> float | None:
@@ -912,11 +1161,18 @@ def _validated_hosted_share_url() -> tuple[str | None, str]:
     """Return a configured hosted share URL, or a user-facing disabled reason."""
     if not _HOSTED_SHARE_URL:
         return None, "Hosted submission is not configured for this install."
-    parsed = urlparse(_HOSTED_SHARE_URL)
-    is_https = parsed.scheme == "https" and bool(parsed.netloc)
+    try:
+        parsed = urlparse(_HOSTED_SHARE_URL)
+        parsed.port
+    except ValueError:
+        return None, "CLAWJOURNAL_SHARE_URL must be a valid HTTPS URL, or localhost."
+    hostname = (parsed.hostname or "").lower()
+    has_credentials = parsed.username is not None or parsed.password is not None
+    is_https = parsed.scheme == "https" and bool(hostname) and not has_credentials
     is_local_dev = (
         parsed.scheme == "http"
-        and parsed.hostname in {"localhost", "127.0.0.1"}
+        and hostname in {"localhost", "127.0.0.1", "::1"}
+        and not has_credentials
     )
     if is_https or is_local_dev:
         return _HOSTED_SHARE_URL, "Hosted submission is configured for browser zip upload."
@@ -990,6 +1246,18 @@ def _fetch_hosted_share_capabilities(*, force: bool = False) -> dict[str, Any]:
         ttl = 300
     _hosted_capabilities_cache = (api_base, now + ttl, dict(capabilities))
     return capabilities
+
+
+def _recurring_offer_available(capabilities: dict[str, Any]) -> bool:
+    """Return whether the live capability document offers this protocol."""
+
+    return bool(
+        capabilities.get("recurring_upload_api_version")
+        == RECURRING_UPLOAD_API_VERSION
+        and capabilities.get("recurring_cadence_days")
+        == RECURRING_CADENCE_DAYS
+        and capabilities.get("recurring_enrollment_open") is True
+    )
 
 
 def _validate_ingest_url() -> None:
@@ -1066,7 +1334,8 @@ def _clear_stored_upload_token() -> None:
             del config[key]
             changed = True
     if changed:
-        save_config(config)
+        if save_config(config) is False:
+            raise OSError("Stored upload authority could not be cleared safely.")
 
 
 def _http_error_message(exc: urllib.error.HTTPError) -> str:
@@ -1138,7 +1407,8 @@ def request_email_verification(email: str) -> dict:
     config["pending_verification_id"] = verification_id
     config["pending_verification_email"] = normalized
     config["pending_verification_expires_at"] = result.get("expires_at")
-    save_config(config)
+    if save_config(config) is False:
+        raise OSError("Email verification state could not be saved safely.")
     return result
 
 
@@ -1174,7 +1444,8 @@ def confirm_pending_email_verification(code: str) -> dict:
         "pending_verification_expires_at",
     ):
         config.pop(key, None)
-    save_config(config)
+    if save_config(config) is False:
+        raise OSError("Verified upload authority could not be saved safely.")
 
     return result
 
@@ -1248,19 +1519,61 @@ def _build_multipart_body(
     return body, content_type
 
 
+def _transport_manifest_bytes(manifest_file: Path) -> bytes:
+    """Return a manifest safe to place on an egress transport.
+
+    The persisted manifest includes ``export_path`` so the local workbench can
+    reopen custom exports.  That absolute path is local control metadata, not
+    bundle provenance, and can reveal the participant's home directory or
+    username.  Keep the on-disk manifest intact while stripping the field from
+    every uploaded/downloaded transport artifact.
+    """
+
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("Finalized share manifest must be a JSON object")
+    transport_manifest = dict(manifest)
+    transport_manifest.pop("export_path", None)
+    return (
+        json.dumps(transport_manifest, indent=2, default=str) + "\n"
+    ).encode("utf-8")
+
+
 def _build_share_zip(export_dir: Path) -> bytes:
-    """Build the finalized share zip expected by hosted submission."""
-    required = ["sessions.jsonl", "manifest.json", "trufflehog.post-pii.json"]
+    """Build the finalized share zip expected by hosted submission.
+
+    `secret-scan.post-pii.json` (the tiered gate's proof marker) is
+    required alongside the legacy `trufflehog.post-pii.json` so a zip
+    can never be built from an export that skipped the combined gate.
+    """
+    required = [
+        "sessions.jsonl",
+        "manifest.json",
+        "trufflehog.post-pii.json",
+        "secret-scan.post-pii.json",
+    ]
     missing = [name for name in required if not (export_dir / name).exists()]
     if missing:
         raise FileNotFoundError(f"Finalized share is missing {', '.join(missing)}")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in ("sessions.jsonl", "manifest.json", "trufflehog.json", "trufflehog.post-pii.json"):
+        for name in (
+            "sessions.jsonl",
+            "manifest.json",
+            "trufflehog.json",
+            "trufflehog.post-pii.json",
+            "secret-scan.json",
+            "secret-scan.post-pii.json",
+        ):
             path = export_dir / name
             if path.exists():
-                zf.writestr(name, path.read_bytes())
+                payload = (
+                    _transport_manifest_bytes(path)
+                    if name == "manifest.json"
+                    else path.read_bytes()
+                )
+                zf.writestr(name, payload)
     return buf.getvalue()
 
 
@@ -1331,6 +1644,8 @@ def _apply_upload_pii_redactions(
     sessions_file: Path,
     *,
     ai_pii: bool = False,
+    backend: str = "auto",
+    before_ai_call: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Run upload-time PII review over a JSONL export, preserving row order."""
     from ..redaction.pii import (
@@ -1346,6 +1661,11 @@ def _apply_upload_pii_redactions(
                 sessions.append(json.loads(line))
 
     workers = _upload_pii_worker_count(len(sessions)) if ai_pii else 0
+    if ai_pii and before_ai_call is not None:
+        # Auto-upload controls must be rechecked in a deterministic sequence
+        # before every provider call.  Parallel sessions could otherwise all
+        # pass the gate before a pause or hold applied during the first call.
+        workers = 1
     timeout_seconds = _upload_pii_timeout_seconds() if ai_pii else 0
     coverage = {"full": 0, "rules_only": 0}
     if not sessions:
@@ -1357,6 +1677,10 @@ def _apply_upload_pii_redactions(
             "workers": 0,
             "agent_timeout_seconds": timeout_seconds,
             "ai_enabled": ai_pii,
+            # No session was reviewed, so no AI backend ran. Callers read
+            # pii_summary["backend"] unconditionally; omitting it raises
+            # KeyError('backend') on an all-excluded (zero-row) share.
+            "backend": None,
         }
 
     def redact_one(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
@@ -1364,8 +1688,10 @@ def _apply_upload_pii_redactions(
             findings, cov = review_session_pii_hybrid(
                 session,
                 ignore_llm_errors=True,
+                backend=backend,
                 return_coverage=True,
                 timeout_seconds=timeout_seconds,
+                before_agent_call=before_ai_call,
             )
         else:
             findings = review_session_pii(session)
@@ -1414,6 +1740,7 @@ def _apply_upload_pii_redactions(
         "workers": workers,
         "agent_timeout_seconds": timeout_seconds,
         "ai_enabled": ai_pii,
+        "backend": backend if ai_pii else None,
     }
 
 
@@ -1421,14 +1748,18 @@ def finalize_share_export_for_upload(
     export_dir: Path,
     manifest: dict[str, Any],
     *,
+    conn: sqlite3.Connection,
     ai_pii: bool = False,
+    ai_backend: str = "auto",
+    before_ai_call: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Apply final local-only gates before an export becomes an upload zip.
 
     `export_share_to_disk()` performs deterministic redaction and a first
-    TruffleHog scan. Hosted/browser upload needs the same extra local PII pass
-    that the legacy ingest path used, then a fresh TruffleHog scan over the
-    rewritten `sessions.jsonl`.
+    secret-scan gate. Hosted/browser upload needs the same extra local PII
+    pass that the legacy ingest path used, then a fresh gate run over the
+    rewritten `sessions.jsonl` (`conn` feeds the tier policy's findings-table
+    decisions).
     """
     sessions_file = export_dir / "sessions.jsonl"
     manifest_file = export_dir / "manifest.json"
@@ -1438,15 +1769,21 @@ def finalize_share_export_for_upload(
 
     if manifest.get("blocked"):
         return {
-            "error": manifest.get("block_message") or "Share blocked by TruffleHog",
+            "error": manifest.get("block_message") or "Share blocked by the secret scan",
             "block_reason": manifest.get("block_reason"),
             "blocked_sessions": manifest.get("blocked_sessions", []),
             "trufflehog_summary": manifest.get("redaction_summary", {}).get("trufflehog"),
+            "secret_scan_summary": manifest.get("redaction_summary", {}).get("secret_scan"),
             "status": 422,
         }, manifest
 
     try:
-        pii_summary = _apply_upload_pii_redactions(sessions_file, ai_pii=ai_pii)
+        pii_summary = _apply_upload_pii_redactions(
+            sessions_file,
+            ai_pii=ai_pii,
+            backend=ai_backend,
+            before_ai_call=before_ai_call,
+        )
         if pii_summary["finding_count"]:
             logger.info(
                 "PII redaction applied: %d findings / %d replacements across %d sessions "
@@ -1459,6 +1796,20 @@ def finalize_share_export_for_upload(
                 pii_summary["agent_timeout_seconds"],
             )
     except Exception as exc:
+        from ..auto_upload import ControlChanged
+        from ..redaction.pii import _AgentCallGateError
+
+        # A before_ai_call control gate (pause/disable/profile/revision/
+        # generation change) fired during AI-PII review. review_session_pii_hybrid
+        # UNWRAPS _AgentCallGateError to its .cause before it reaches here, so the
+        # exception that actually propagates is a bare ControlChanged; catch that
+        # (and the wrapper defensively) and re-propagate the original control
+        # exception to the runner's dedicated handler instead of collapsing a
+        # deliberate control stop into a retryable "packaging failed".
+        if isinstance(exc, _AgentCallGateError):
+            raise exc.cause
+        if isinstance(exc, ControlChanged):
+            raise
         logger.warning("PII redaction pass failed: %s", exc)
         return {
             "error": "PII redaction failed — upload aborted. Try again or report this issue.",
@@ -1475,59 +1826,114 @@ def finalize_share_export_for_upload(
             "workers": pii_summary["workers"],
             "agent_timeout_seconds": pii_summary["agent_timeout_seconds"],
             "ai_enabled": pii_summary["ai_enabled"],
+            "backend": pii_summary["backend"],
+            "coverage": dict(pii_summary["coverage"]),
         }
 
-    try:
-        from ..redaction import trufflehog as trufflehog_scanner
+    if ai_pii and pii_summary["coverage"].get("rules_only", 0):
+        with open(manifest_file, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, default=str)
+        return {
+            "error": (
+                "AI-assisted PII review was configured but did not cover every "
+                "trace. Upload remains blocked; retry when the configured backend "
+                "is available."
+            ),
+            "block_reason": "ai-pii-incomplete",
+            "coverage": dict(pii_summary["coverage"]),
+            "status": 503,
+        }, manifest
 
-        post_pii_report = trufflehog_scanner.scan_file(sessions_file)
+    try:
+        from ..redaction import scan_policy
+        from ..redaction import trufflehog as trufflehog_scanner
+        from .share_gate import build_blocked_sessions, run_share_gate
+
+        post_pii_gate = run_share_gate(sessions_file, manifest, conn=conn)
     except Exception as exc:
-        logger.warning("Post-PII TruffleHog scan failed: %s", exc)
+        logger.warning("Post-PII secret-scan gate failed: %s", exc)
         return {
             "error": "Post-redaction scan failed — upload aborted.",
             "detail": str(exc),
             "status": 500,
         }, manifest
 
-    # `trufflehog.json` is the authoritative report shipped in the zip.
-    # `trufflehog.post-pii.json` is a compatibility/diagnostic marker that
-    # proves the final artifact passed the post-PII gate.
-    post_pii_report.engine = trufflehog_scanner.engine_fingerprint()
-    trufflehog_scanner.write_report(export_dir / "trufflehog.json", post_pii_report)
-    trufflehog_scanner.write_report(export_dir / "trufflehog.post-pii.json", post_pii_report)
+    # `secret-scan.json` is the authoritative combined report shipped in
+    # the zip; `secret-scan.post-pii.json` proves the final artifact
+    # passed the post-PII gate. The TruffleHog sub-report keeps its
+    # legacy artifact names (all-clean on every shippable bundle, since
+    # verified findings are block-tier) for pre-tier consumers.
+    scan_policy.write_report(export_dir / "secret-scan.json", post_pii_gate)
+    scan_policy.write_report(export_dir / "secret-scan.post-pii.json", post_pii_gate)
+    th_sub_report = post_pii_gate.trufflehog_report
+    if th_sub_report is not None:
+        trufflehog_scanner.write_report(export_dir / "trufflehog.json", th_sub_report)
+        trufflehog_scanner.write_report(
+            export_dir / "trufflehog.post-pii.json", th_sub_report
+        )
     if isinstance(redaction_summary, dict):
-        summary = post_pii_report.summary()
-        redaction_summary["trufflehog"] = summary
-        redaction_summary["trufflehog_post_pii"] = summary
+        gate_summary = post_pii_gate.summary()
+        redaction_summary["secret_scan"] = gate_summary
+        redaction_summary["secret_scan_post_pii"] = gate_summary
+        th_summary = (
+            th_sub_report.summary()
+            if th_sub_report is not None
+            else {
+                "findings": 0,
+                "bypassed": post_pii_gate.bypassed,
+                "binary_missing": post_pii_gate.binary_missing,
+                "scan_error": post_pii_gate.scan_error,
+                "engine": post_pii_gate.engine,
+            }
+        )
+        redaction_summary["trufflehog"] = th_summary
+        redaction_summary["trufflehog_post_pii"] = th_summary
 
-    if post_pii_report.blocking or post_pii_report.bypassed:
+    if post_pii_gate.blocking or post_pii_gate.bypassed:
         manifest["blocked"] = True
         manifest["block_reason"] = (
-            post_pii_report.block_reason
-            or ("trufflehog-bypassed" if post_pii_report.bypassed else None)
+            post_pii_gate.block_reason
+            or ("secret-scan-bypassed" if post_pii_gate.bypassed else None)
         )
-        manifest["block_message"] = trufflehog_scanner.format_block_message(post_pii_report)
-        blocked_sessions = build_trufflehog_blocked_sessions(manifest, post_pii_report)
+        manifest["block_message"] = scan_policy.format_block_message(post_pii_gate)
+        blocked_sessions = build_blocked_sessions(
+            manifest, post_pii_gate.block_review_findings
+        )
         if blocked_sessions:
             manifest["blocked_sessions"] = blocked_sessions
         with open(manifest_file, "w") as f:
             json.dump(manifest, f, indent=2, default=str)
-        if post_pii_report.bypassed:
+        if post_pii_gate.bypassed:
             return {
                 "error": (
-                    "Refusing to prepare upload zip: TruffleHog was bypassed via "
-                    "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable and retry."
+                    "Refusing to prepare upload zip: the secret scanners were "
+                    "bypassed via CLAWJOURNAL_SKIP_BETTERLEAKS/"
+                    "CLAWJOURNAL_SKIP_TRUFFLEHOG. Unset the variable(s) and retry."
                 ),
-                "block_reason": "trufflehog-bypassed",
+                "block_reason": "secret-scan-bypassed",
                 "status": 422,
             }, manifest
         return {
-            "error": trufflehog_scanner.format_block_message(post_pii_report),
-            "block_reason": post_pii_report.block_reason,
+            "error": scan_policy.format_block_message(post_pii_gate),
+            "block_reason": post_pii_gate.block_reason,
             "blocked_sessions": manifest.get("blocked_sessions", []),
-            "trufflehog_summary": post_pii_report.summary(),
+            "trufflehog_summary": redaction_summary.get("trufflehog")
+            if isinstance(redaction_summary, dict) else None,
+            "secret_scan_summary": post_pii_gate.summary(),
             "status": 422,
         }, manifest
+
+    # Gate-time span redactions from the post-PII pass fold into the
+    # manifest counters like the export-time ones do.
+    if post_pii_gate.gate_redactions and isinstance(redaction_summary, dict):
+        redaction_summary["total_redactions"] = (
+            redaction_summary.get("total_redactions", 0)
+            + post_pii_gate.gate_redactions
+        )
+        by_type = redaction_summary.setdefault("by_type", {})
+        by_type["gate_secret_scan"] = (
+            by_type.get("gate_secret_scan", 0) + post_pii_gate.gate_redactions
+        )
 
     with open(manifest_file, "w") as f:
         json.dump(manifest, f, indent=2, default=str)
@@ -1565,6 +1971,7 @@ def _redaction_settings_fingerprint(settings: dict[str, Any]) -> str:
         "blocked_domains": _norm(settings.get("blocked_domains")),
         "allowlist_entries": _norm(settings.get("allowlist_entries")),
         "source_filter": _norm(settings.get("source_filter")),
+        "enabled_findings_engines": _norm(settings.get("enabled_findings_engines")),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1575,6 +1982,7 @@ def _manifest_is_finalized_for_upload(
     manifest: dict[str, Any],
     *,
     ai_pii: bool | None = None,
+    ai_backend: str | None = None,
 ) -> bool:
     if manifest.get("blocked"):
         return False
@@ -1587,6 +1995,34 @@ def _manifest_is_finalized_for_upload(
         return False
     if ai_pii is not None and pii_review.get("ai_enabled") is not ai_pii:
         return False
+    if ai_backend is not None and pii_review.get("backend") != ai_backend:
+        return False
+    if pii_review.get("ai_enabled") is True:
+        coverage = pii_review.get("coverage")
+        if not isinstance(coverage, dict):
+            return False
+        if coverage.get("rules_only") != 0:
+            return False
+        if coverage.get("full") != pii_review.get("session_count"):
+            return False
+    gate = summary.get("secret_scan_post_pii")
+    if isinstance(gate, dict):
+        # Tier-aware finalized check: warn-tier findings (and gate-time
+        # redactions) ship; block/review tiers, non-convergence, bypass,
+        # and scanner failure do not.
+        tier_counts = gate.get("tier_counts")
+        if not isinstance(tier_counts, dict):
+            return False
+        return (
+            tier_counts.get("block", 0) == 0
+            and tier_counts.get("review", 0) == 0
+            and gate.get("converged") is True
+            and gate.get("bypassed") is False
+            and gate.get("binary_missing") is False
+            and not gate.get("scan_error")
+        )
+    # Legacy manifests (sealed before the tiered gate existed) fall back
+    # to the all-or-nothing TruffleHog check.
     return (
         post_pii_scan.get("findings") == 0
         and post_pii_scan.get("bypassed") is False
@@ -1599,6 +2035,7 @@ def _load_finalized_share_export(
     share_id: str,
     *,
     ai_pii: bool | None = None,
+    ai_backend: str | None = None,
     expected_fingerprint: str | None = None,
 ) -> tuple[Path, dict[str, Any]] | None:
     # Finalized exports are point-in-time artifacts: a later config change
@@ -1608,6 +2045,7 @@ def _load_finalized_share_export(
     sessions_file = export_dir / "sessions.jsonl"
     trufflehog_file = export_dir / "trufflehog.json"
     post_pii_file = export_dir / "trufflehog.post-pii.json"
+    gate_post_pii_file = export_dir / "secret-scan.post-pii.json"
     if not (
         manifest_file.exists()
         and sessions_file.exists()
@@ -1615,13 +2053,30 @@ def _load_finalized_share_export(
         and post_pii_file.exists()
     ):
         return None
+    # Exports finalized by the tiered gate carry its post-PII report
+    # both in the manifest summary and on disk. A legacy export (sealed
+    # before the tiered gate existed) has neither — reject it here so it
+    # rebuilds once through the current gate rather than shipping under
+    # retired semantics.
+    if not gate_post_pii_file.exists():
+        return None
     try:
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    summary_probe = manifest.get("redaction_summary")
+    if not (
+        isinstance(summary_probe, dict)
+        and isinstance(summary_probe.get("secret_scan_post_pii"), dict)
+    ):
+        return None
     if manifest.get("share_id") != share_id and manifest.get("bundle_id") != share_id:
         return None
-    if not _manifest_is_finalized_for_upload(manifest, ai_pii=ai_pii):
+    if not _manifest_is_finalized_for_upload(
+        manifest,
+        ai_pii=ai_pii,
+        ai_backend=ai_backend,
+    ):
         return None
     if (
         expected_fingerprint is not None
@@ -1643,6 +2098,8 @@ def _prepare_share_export_for_upload(
     *,
     reuse_finalized: bool = False,
     ai_pii_review_enabled: bool | None = None,
+    ai_pii_backend: str = "auto",
+    before_ai_call: Callable[[], None] | None = None,
 ) -> tuple[Path | None, dict[str, Any], dict[str, Any] | None]:
     effective_ai_pii = (
         bool(settings.get("ai_pii_review_enabled", False))
@@ -1670,11 +2127,29 @@ def _prepare_share_export_for_upload(
         cached = _load_finalized_share_export(
             share_id,
             ai_pii=ai_pii_review_enabled,
+            ai_backend=(ai_pii_backend if ai_pii_review_enabled else None),
             expected_fingerprint=settings_fingerprint,
         )
         if cached is not None:
             export_dir, manifest = cached
             return export_dir, manifest, None
+
+    # Existing participants can receive a new required scanner through a
+    # ClawJournal fast-forward without re-running the installer. Repair that
+    # dependency gap only when building a new artifact: a finalized cached
+    # export has already passed the current gate and is reused byte-for-byte.
+    # Failures stay fail-closed before any export or AI work and carry a stable
+    # reason the workbench can recover from explicitly.
+    from ..redaction.scanner_install import ensure_share_scanners
+
+    scanner_setup = ensure_share_scanners()
+    if not scanner_setup["ok"]:
+        return None, {}, {
+            "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
+            "block_reason": "scanner-not-installed",
+            "scanner_install": scanner_setup,
+            "status": 503,
+        }
 
     export_dir, manifest = export_share_to_disk(
         conn,
@@ -1705,11 +2180,61 @@ def _prepare_share_export_for_upload(
     error, manifest = finalize_share_export_for_upload(
         export_dir,
         manifest,
+        conn=conn,
         ai_pii=effective_ai_pii,
+        ai_backend=ai_pii_backend,
+        before_ai_call=before_ai_call,
     )
     if error:
         return export_dir, manifest, error
     return export_dir, manifest, None
+
+
+def _final_manual_share_egress_gate(
+    conn: sqlite3.Connection,
+    share_id: str,
+    session_ids: list[str],
+    source_filter: str | list[str] | tuple[str, ...] | None,
+) -> dict[str, Any] | None:
+    """Re-check mutable share gates immediately before manual upload egress."""
+    release_blockers = release_gate_blockers(conn, session_ids)
+    if release_blockers:
+        return {
+            "error": "Share contains sessions that are not released",
+            "blockers": release_blockers,
+            "status": 409,
+        }
+
+    source_blockers = source_scope_blockers(conn, session_ids, source_filter)
+    if source_blockers:
+        return {
+            "error": "Share contains sessions outside the confirmed source scope",
+            "blockers": source_blockers,
+            "status": 409,
+        }
+
+    revision_blockers = share_revision_blockers(conn, share_id)
+    if revision_blockers:
+        return {
+            "error": "Trace revisions changed after review.",
+            "block_reason": "revision_conflict",
+            "blocked_sessions": revision_blockers,
+            "status": 409,
+        }
+
+    # Predecessor/duplicate-revision state is mutable during the minutes-long
+    # AI-PII pass between the pre-flight check and this gate (e.g. a sibling
+    # share in the same revision chain lands first), so re-check it here too —
+    # otherwise a stale-predecessor duplicate that #109 added this gate to
+    # refuse could still cross egress.
+    predecessor_blockers = share_predecessor_blockers(conn, share_id)
+    if predecessor_blockers:
+        return {
+            "error": "Share revisions are duplicate or based on a stale predecessor",
+            "blockers": predecessor_blockers,
+            "status": 409,
+        }
+    return None
 
 
 def upload_share_to_self_hosted_ingest(
@@ -1825,7 +2350,11 @@ def upload_share_to_self_hosted_ingest(
         "sessions": ("sessions.jsonl", sessions_bytes, "application/jsonl"),
     }
     if manifest_file.exists():
-        files["manifest"] = ("manifest.json", manifest_file.read_bytes(), "application/json")
+        files["manifest"] = (
+            "manifest.json",
+            _transport_manifest_bytes(manifest_file),
+            "application/json",
+        )
 
     upload_body, content_type = _build_multipart_body(
         fields={
@@ -1847,6 +2376,12 @@ def upload_share_to_self_hosted_ingest(
         },
         method="POST",
     )
+
+    final_gate_error = _final_manual_share_egress_gate(
+        conn, share_id, session_ids, source_filter
+    )
+    if final_gate_error:
+        return final_gate_error
 
     try:
         with urllib.request.urlopen(req, timeout=_SHARE_UPLOAD_TIMEOUT) as resp:
@@ -2105,6 +2640,12 @@ def submit_share_to_hosted(
         "ambiguous": True,
         "status": 504,
     }
+    final_gate_error = _final_manual_share_egress_gate(
+        conn, share_id, session_ids, settings.get("source_filter")
+    )
+    if final_gate_error:
+        return final_gate_error
+
     try:
         with urllib.request.urlopen(req, timeout=_SHARE_UPLOAD_TIMEOUT) as resp:
             hosted_result = json.loads(resp.read())
@@ -2295,6 +2836,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_consent()
         elif path == "/api/share/upload-status":
             self._handle_share_upload_status()
+        elif path == "/api/auto-upload/status":
+            self._handle_auto_upload_status()
+        elif path == "/api/auto-upload/preview":
+            self._handle_auto_upload_preview(refresh=False)
         elif path == "/api/scoring/backend":
             self._handle_scoring_backend()
         elif path == "/api/bundles":
@@ -2370,6 +2915,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_verify_email()
         elif path == "/api/share/verify-confirm":
             self._handle_share_verify_confirm()
+        elif path == "/api/share/scanners/install":
+            self._handle_install_share_scanners()
+        elif path == "/api/auto-upload/preview":
+            self._handle_auto_upload_preview(refresh=True)
+        elif path == "/api/auto-upload/enable":
+            self._handle_auto_upload_enable()
+        elif path == "/api/auto-upload/run":
+            self._handle_auto_upload_run()
+        elif path == "/api/auto-upload/pause":
+            self._handle_auto_upload_pause()
+        elif path == "/api/auto-upload/resume":
+            self._handle_auto_upload_resume()
+        elif path == "/api/auto-upload/disable":
+            self._handle_auto_upload_disable()
         elif path == "/api/bundles":
             self._handle_create_share()
         elif path.startswith("/api/bundles/") and path.endswith("/export"):
@@ -3112,7 +3671,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     # Use AI-only detection (skip redundant rule-based PII scan
                     # since redact_session() already handles regex patterns)
                     findings = review_session_pii_with_agent(
-                        detail, ignore_errors=False, backend="auto",
+                        detail,
+                        ignore_errors=False,
+                        backend="auto",
+                        timeout_seconds=_upload_pii_timeout_seconds(),
                     )
                     ai_coverage = "full"
                     if findings:
@@ -3267,7 +3829,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         entries = config.get("allowlist_entries", [])
         entries.append(entry)
         config["allowlist_entries"] = entries
-        save_config(config)
+        if save_config(config) is False:
+            _json_response(
+                self,
+                {"error": "Allowlist persistence could not be confirmed; review automatic-upload status."},
+                500,
+            )
+            return
         _json_response(self, {"ok": True, "entry": entry})
 
     def _handle_remove_allowlist(self, entry_id: str) -> None:
@@ -3280,7 +3848,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             _json_response(self, {"error": "Entry not found"}, 404)
             return
         config["allowlist_entries"] = new_entries
-        save_config(config)
+        if save_config(config) is False:
+            _json_response(
+                self,
+                {"error": "Allowlist persistence could not be confirmed; review automatic-upload status."},
+                500,
+            )
+            return
         _json_response(self, {"ok": True})
 
     def _handle_scoring_backend(self) -> None:
@@ -3433,6 +4007,175 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_share_upload_status(self) -> None:
         _json_response(self, hosted_upload_status())
+
+    def _handle_install_share_scanners(self) -> None:
+        """Install pinned local scanner binaries and report readiness."""
+        from ..redaction.scanner_install import ensure_share_scanners
+
+        result = ensure_share_scanners(prefer_managed=True)
+        if result["ok"]:
+            _json_response(self, result)
+            return
+        _json_response(self, result, 503)
+
+    @staticmethod
+    def _auto_upload_http_status(result: dict[str, Any]) -> int:
+        if result.get("ok") is not False:
+            return 200
+        if result.get("status") == 409 or result.get("code") in {
+            "action_required",
+            "authorization_required",
+            "already_running",
+            "control_conflict",
+        }:
+            return 409
+        if result.get("code") in {"not_enabled", "paused", "not_enrolled"}:
+            return 409
+        if result.get("code") in {"credential_invalid", "credential_revoked"}:
+            return 401
+        if result.get("retryable"):
+            return 503
+        return 400
+
+    def _send_auto_upload_result(self, result: dict[str, Any]) -> None:
+        payload = dict(result)
+        payload.pop("status", None)
+        _json_response(self, payload, self._auto_upload_http_status(result))
+
+    def _handle_auto_upload_status(self) -> None:
+        from ..auto_upload import status
+
+        self._send_auto_upload_result(status())
+
+    def _handle_auto_upload_preview(self, *, refresh: bool) -> None:
+        from ..auto_upload import preview
+
+        self._send_auto_upload_result(preview(refresh=refresh))
+
+    def _handle_auto_upload_enable(self) -> None:
+        from ..auto_upload import enable
+
+        body = _read_body(self) or {}
+        self._send_auto_upload_result(
+            enable(
+                agent=str(body.get("agent") or "all"),
+                accepted_authorization_version=(
+                    str(body["accepted_authorization_version"])
+                    if body.get("accepted_authorization_version") is not None
+                    else None
+                ),
+                accepted_retention_version=(
+                    str(body["accepted_retention_version"])
+                    if body.get("accepted_retention_version") is not None
+                    else None
+                ),
+                accepted_ownership_certification_version=(
+                    str(body["accepted_ownership_certification_version"])
+                    if body.get("accepted_ownership_certification_version") is not None
+                    else None
+                ),
+                accepted_authorization_profile_hash=(
+                    str(body["accepted_authorization_profile_hash"])
+                    if body.get("accepted_authorization_profile_hash") is not None
+                    else None
+                ),
+                challenge_only=bool(body.get("challenge_only")),
+            )
+        )
+
+    def _handle_auto_upload_run(self) -> None:
+        global _auto_upload_run_thread
+
+        from ..auto_upload import run_cycle, status, whole_run_lock
+
+        with _auto_upload_run_lock:
+            current = status()
+            mode = current.get("mode")
+            if mode == "off":
+                self._send_auto_upload_result(
+                    {
+                        "ok": False,
+                        "code": "not_enabled",
+                        "message": "Automatic upload is not enabled.",
+                        "retryable": False,
+                    }
+                )
+                return
+            if mode == "paused":
+                self._send_auto_upload_result(
+                    {
+                        "ok": False,
+                        "code": "paused",
+                        "message": "Automatic upload is paused.",
+                        "retryable": False,
+                    }
+                )
+                return
+            if (
+                current.get("health") == "action_required"
+                and current.get("run_now_allowed") is not True
+            ):
+                self._send_auto_upload_result(
+                    {
+                        "ok": False,
+                        "code": "action_required",
+                        "message": "Review the automatic-upload status before running again.",
+                        "retryable": False,
+                    }
+                )
+                return
+            if _auto_upload_run_thread is not None and _auto_upload_run_thread.is_alive():
+                self._send_auto_upload_result(
+                    {
+                        "ok": False,
+                        "code": "already_running",
+                        "message": "An automatic-upload cycle is already running.",
+                        "retryable": True,
+                    }
+                )
+                return
+            with whole_run_lock(blocking=False) as acquired:
+                if not acquired:
+                    self._send_auto_upload_result(
+                        {
+                            "ok": False,
+                            "code": "already_running",
+                            "message": "An automatic-upload cycle is already running.",
+                            "retryable": True,
+                        }
+                    )
+                    return
+
+            def run_background() -> None:
+                try:
+                    run_cycle(force=True)
+                except Exception:
+                    logger.exception("Explicit automatic-upload cycle crashed")
+
+            _auto_upload_run_thread = threading.Thread(
+                target=run_background,
+                name="clawjournal-auto-upload",
+                daemon=True,
+            )
+            _auto_upload_run_thread.start()
+        payload = dict(current)
+        payload["overlay"] = "running"
+        self._send_auto_upload_result(payload)
+
+    def _handle_auto_upload_pause(self) -> None:
+        from ..auto_upload import pause
+
+        self._send_auto_upload_result(pause())
+
+    def _handle_auto_upload_resume(self) -> None:
+        from ..auto_upload import resume
+
+        self._send_auto_upload_result(resume())
+
+    def _handle_auto_upload_disable(self) -> None:
+        from ..auto_upload import disable
+
+        self._send_auto_upload_result(disable())
 
     def _handle_share_ready(self, params: dict[str, list[str]]) -> None:
         """Return stats for sessions ready to share.
@@ -3759,6 +4502,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         body = _read_body(self)
         output_path = body.get("output_path")
 
+        from ..redaction.scanner_install import ensure_share_scanners
+
+        scanner_setup = ensure_share_scanners()
+        if not scanner_setup["ok"]:
+            _json_response(self, {
+                "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
+                "block_reason": "scanner-not-installed",
+                "scanner_install": scanner_setup,
+            }, 503)
+            return
+
         conn = open_index()
         try:
             share = get_share(conn, share_id)
@@ -3956,6 +4710,18 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 retention_policy_version=str(body.get("retention_policy_version") or ""),
             )
             if result.get("ok"):
+                # Cache only the non-authoritative offer bit after a successful
+                # manual receipt.  Automatic Enable still performs a fresh,
+                # fail-closed capability validation before changing state.
+                try:
+                    capabilities = _fetch_hosted_share_capabilities()
+                    config = load_config()
+                    config["auto_upload_capability_available"] = (
+                        _recurring_offer_available(capabilities)
+                    )
+                    save_config(config)
+                except Exception:
+                    pass
                 with _share_rate_lock:
                     WorkbenchHandler._last_share_time = time.time()
                 _json_response(self, result)

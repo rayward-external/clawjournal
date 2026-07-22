@@ -9,6 +9,8 @@
 #   ./scripts/install.sh                # CLI install (recommended for first run)
 #   ./scripts/install.sh --with-frontend  # also build the browser workbench
 #   ./scripts/install.sh --desktop-shortcut # build workbench + add desktop launcher
+#   ./scripts/install.sh --with-sharing   # also install the managed secret scanners
+#   ./scripts/install.sh --desktop-shortcut --with-sharing
 #   ./scripts/install.sh --help
 #
 # Environment:
@@ -25,12 +27,14 @@ trap 'rm -f "$ERR_LOG"' EXIT INT TERM
 
 WITH_FRONTEND=0
 DESKTOP_SHORTCUT=0
+WITH_SHARING=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-frontend) WITH_FRONTEND=1 ;;
     --desktop-shortcut) DESKTOP_SHORTCUT=1; WITH_FRONTEND=1 ;;
+    --with-sharing) WITH_SHARING=1 ;;
     -h|--help)
-      sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *)
       echo "Unknown option: $1" >&2
@@ -129,14 +133,22 @@ EOF
   fi
 fi
 
-# 5) Optional desktop launcher. It uses the just-installed venv executable so
+# 5) Optional sharing dependencies. These are pinned, checksum-verified, and
+# installed under ~/.clawjournal/bin without root access.
+if [ "$WITH_SHARING" -eq 1 ]; then
+  echo "-> Installing managed secret scanners"
+  CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" betterleaks install
+  CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" trufflehog install
+fi
+
+# 6) Optional desktop launcher. It uses the just-installed venv executable so
 #    the shortcut remains independent of the user's PATH.
 if [ "$DESKTOP_SHORTCUT" -eq 1 ]; then
   echo "-> Installing desktop shortcut"
   "$VENV_BIN/clawjournal" desktop install
 fi
 
-# 6) Report.
+# 7) Report.
 echo
 INSTALLED_VERSION="$("$VENV_PY" -c 'import clawjournal; print(clawjournal.__version__)' 2>/dev/null || echo "?")"
 echo "[ok] ClawJournal $INSTALLED_VERSION installed."
@@ -150,7 +162,7 @@ Or add the venv to your PATH:
         export PATH="$VENV_BIN:\$PATH"
 EOF
 
-# 7) Soft hints for optional runtime deps.
+# 8) Soft hints for optional runtime deps.
 FE_DIST_HTML="$REPO_DIR/clawjournal/web/frontend/dist/index.html"
 FE_SRC_DIR="$REPO_DIR/clawjournal/web/frontend/src"
 if [ ! -f "$FE_DIST_HTML" ]; then
@@ -170,11 +182,20 @@ elif [ -d "$FE_SRC_DIR" ] && [ -n "$(find "$FE_SRC_DIR" -type f -newer "$FE_DIST
 EOF
 fi
 
-if ! command -v trufflehog >/dev/null 2>&1 && [ ! -x "$HOME/.clawjournal/bin/trufflehog" ]; then
+if [ "$WITH_SHARING" -eq 0 ] && ! CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" betterleaks status --json >/dev/null 2>&1; then
+  cat <<EOF
+
+[i] Betterleaks is required when sharing exports. Install it with:
+    $VENV_BIN/clawjournal betterleaks install      (pinned version, sha256-verified, no root needed)
+    Or re-run: ./scripts/install.sh --with-sharing
+EOF
+fi
+
+if [ "$WITH_SHARING" -eq 0 ] && ! CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" trufflehog status --json >/dev/null 2>&1; then
   cat <<EOF
 
 [i] TruffleHog is required when sharing exports. Install it before 'bundle-export':
     $VENV_BIN/clawjournal trufflehog install      (pinned version, sha256-verified, no root needed)
-    Or: brew install trufflehog (macOS) / https://github.com/trufflesecurity/trufflehog/releases
+    Or re-run: ./scripts/install.sh --with-sharing
 EOF
 fi

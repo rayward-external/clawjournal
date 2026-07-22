@@ -445,14 +445,62 @@ class TestAiTextRedaction:
         assert secret not in redacted["messages"][0]["content"]
 
 
-class TestTruffleHogGate:
-    """The post-redaction TruffleHog scan is mandatory on every share
-    export. These tests disable the test-suite-wide bypass and mock
-    the scan to cover the three gate outcomes (clean / findings /
-    missing binary)."""
+def _mock_gate_engines(monkeypatch, *, bl_passes=None, th_passes=None):
+    """Enable a real (non-bypassed) share gate with both engines mocked.
 
-    def _share(self, conn):
-        sess = _settled_session("sess-1")
+    ``bl_passes`` / ``th_passes`` are per-scan-pass lists of raw-match
+    dicts (betterleaks: ``{"raw","rule_id","entropy","line"}``;
+    trufflehog: ``{"raw","detector","status","line"}``). Passes beyond
+    the end of a list return no matches, which is how a redact loop
+    converges. The findings-engine hooks are stubbed empty so the
+    apply path never spawns a real subprocess.
+    """
+    from clawjournal.redaction import betterleaks, trufflehog
+
+    monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+    monkeypatch.delenv(betterleaks.SKIP_ENV_VAR, raising=False)
+    monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+    monkeypatch.setattr(betterleaks, "is_available", lambda: True)
+    monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
+    monkeypatch.setattr(betterleaks, "_scan_text_for_raw_matches", lambda text: [])
+
+    calls = {"bl": 0, "th": 0}
+
+    def fake_bl(path):
+        i = calls["bl"]
+        calls["bl"] += 1
+        raws = bl_passes[i] if bl_passes and i < len(bl_passes) else []
+        report = betterleaks.BetterleaksReport(
+            scanned_path=str(path), scanned_sha256="sha256:0"
+        )
+        return report, [dict(r) for r in raws]
+
+    def fake_th(path, *, results="verified,unknown,unverified"):
+        # The tiered gate must run TruffleHog verified-only.
+        assert results == "verified", f"gate must scan verified-only, got {results!r}"
+        i = calls["th"]
+        calls["th"] += 1
+        raws = th_passes[i] if th_passes and i < len(th_passes) else []
+        report = trufflehog.TruffleHogReport(
+            scanned_path=str(path), scanned_sha256="sha256:0"
+        )
+        return report, [dict(r) for r in raws]
+
+    monkeypatch.setattr(betterleaks, "scan_file_with_raws", fake_bl)
+    monkeypatch.setattr(trufflehog, "scan_file_with_raws", fake_th)
+    return calls
+
+
+class TestSecretScanGate:
+    """The post-redaction secret-scan gate is mandatory on every share
+    export. Tier semantics: TruffleHog-verified → block; private-key
+    rules → review; recognizable unverified tokens → span-redacted and
+    the share proceeds; soft/ignored findings → warn-only."""
+
+    RAW = "tok-A1b2C3d4E5f6G7h8I9j0K1l2M3n4"
+
+    def _share(self, conn, content=None):
+        sess = _settled_session("sess-1", content=content)
         upsert_sessions(conn, [sess])
         raw = scan_session_for_findings(sess)
         write_findings_to_db(conn, "sess-1", raw, revision="v1:t")
@@ -463,160 +511,373 @@ class TestTruffleHogGate:
         share_id = create_share(conn, ["sess-1"], note="t")
         return share_id, get_share(conn, share_id)
 
+    def _status(self, conn, share_id):
+        return conn.execute(
+            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
+        ).fetchone()["status"]
+
     def test_clean_scan_advances_share_status(self, conn, monkeypatch):
-        from clawjournal.redaction import trufflehog as trufflehog_scanner
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
-
-        def fake_scan(path):
-            return trufflehog_scanner.TruffleHogReport(
-                scanned_path=str(path), scanned_sha256="sha256:0",
-            )
-
-        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
+        _mock_gate_engines(monkeypatch)
         share_id, share = self._share(conn)
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
         assert export_dir is not None
         assert manifest.get("blocked") is not True
-        status_row = conn.execute(
-            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
-        ).fetchone()
-        assert status_row["status"] in ("shared", "exported")
-        th = manifest["redaction_summary"]["trufflehog"]
-        assert th["findings"] == 0
+        assert self._status(conn, share_id) in ("shared", "exported")
+        assert manifest["redaction_summary"]["trufflehog"]["findings"] == 0
+        scan = manifest["redaction_summary"]["secret_scan"]
+        assert scan["findings"] == 0
+        assert scan["converged"] is True
         assert (export_dir / "trufflehog.json").exists()
+        assert (export_dir / "secret-scan.json").exists()
 
-    def test_findings_block_and_do_not_advance_status(self, conn, monkeypatch):
-        from clawjournal.redaction import trufflehog as trufflehog_scanner
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+    def test_first_share_after_update_auto_installs_new_scanner(
+        self,
+        conn,
+        monkeypatch,
+        tmp_path,
+    ):
+        """An existing install must recover when an update adds Betterleaks.
 
-        def fake_scan(path):
-            return trufflehog_scanner.TruffleHogReport(
-                scanned_path=str(path),
-                scanned_sha256="sha256:0",
-                findings=[
-                    trufflehog_scanner.TruffleHogFinding(
-                        detector="GitHub", status="verified",
-                        line=3, masked="ghp_a***4567",
-                        raw_sha256="sha256:x",
-                    )
-                ],
-                verified=1,
-                top_detectors=["GitHub"],
-            )
+        This models a participant whose ClawJournal checkout fast-forwarded to
+        the mandatory Betterleaks gate, but whose old installer had only put
+        TruffleHog on the machine.  The first package preflight installs the
+        newly required managed scanner and then completes the same share.
+        """
+        from clawjournal.redaction import betterleaks, betterleaks_install
+        from clawjournal.workbench.daemon import _prepare_share_export_for_upload
 
-        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
-        share_id, share = self._share(conn)
-        pre_status_row = conn.execute(
-            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
-        ).fetchone()
-        pre_status = pre_status_row["status"]
+        _mock_gate_engines(monkeypatch)
+        managed = tmp_path / "managed-bin" / "betterleaks"
+        scanner_state = {"available": False}
+        installs = []
+        monkeypatch.setattr(
+            betterleaks,
+            "is_available",
+            lambda: scanner_state["available"],
+        )
+        monkeypatch.setattr(betterleaks, "managed_binary_path", lambda: managed)
+        monkeypatch.setattr(
+            betterleaks,
+            "resolve_binary",
+            lambda: str(managed) if scanner_state["available"] else None,
+        )
+
+        def install_betterleaks(**_kwargs):
+            installs.append("betterleaks")
+            scanner_state["available"] = True
+            return {"status": "installed", "version": "1.6.1"}
+
+        monkeypatch.setattr(betterleaks_install, "install", install_betterleaks)
+        share_id, share = self._share(conn, content="ordinary trace content")
+        settings = {
+            "custom_strings": [],
+            "extra_usernames": [],
+            "excluded_projects": [],
+            "blocked_domains": [],
+            "allowlist_entries": [],
+            "source_filter": None,
+            "ai_pii_review_enabled": False,
+        }
+
+        export_dir, manifest, error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+        )
+
+        assert error is None
+        assert installs == ["betterleaks"]
+        assert export_dir is not None
+        assert manifest.get("blocked") is not True
+        assert (export_dir / "manifest.json").exists()
+
+    def test_finalized_export_reuse_does_not_require_live_scanners(
+        self,
+        conn,
+        monkeypatch,
+        tmp_path,
+    ):
+        from clawjournal.workbench import daemon as daemon_module
+        from clawjournal.workbench.daemon import _prepare_share_export_for_upload
+
+        monkeypatch.setattr(daemon_module, "CONFIG_DIR", tmp_path)
+        _mock_gate_engines(monkeypatch)
+        share_id, share = self._share(conn, content="ordinary trace content")
+        settings = {
+            "custom_strings": [],
+            "extra_usernames": [],
+            "excluded_projects": [],
+            "blocked_domains": [],
+            "allowlist_entries": [],
+            "source_filter": None,
+            "ai_pii_review_enabled": False,
+        }
+
+        export_dir, manifest, error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+        assert error is None
+        assert export_dir is not None
+        assert manifest.get("blocked") is not True
+
+        def unexpected_preflight(**_kwargs):
+            raise AssertionError("finalized export reuse must not require scanners")
+
+        monkeypatch.setattr(
+            "clawjournal.redaction.scanner_install.ensure_share_scanners",
+            unexpected_preflight,
+        )
+
+        cached_dir, cached_manifest, cached_error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+
+        assert cached_error is None
+        assert cached_dir == export_dir
+        assert cached_manifest == manifest
+
+    def test_unverified_token_is_redacted_and_share_advances(self, conn, monkeypatch):
+        # The headline behavior change: a recognizable-but-unverified
+        # token no longer rejects the session — the exact span is
+        # replaced and the share ships.
+        _mock_gate_engines(
+            monkeypatch,
+            bl_passes=[[{
+                "raw": self.RAW, "rule_id": "slack-bot-token",
+                "entropy": 4.4, "line": 1,
+            }]],
+        )
+        share_id, share = self._share(conn, content=f"leak {self.RAW} in log")
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert export_dir is not None
+        assert manifest.get("blocked") is not True
+        assert self._status(conn, share_id) in ("shared", "exported")
+        body = (export_dir / "sessions.jsonl").read_text()
+        assert self.RAW not in body
+        assert "[REDACTED_SLACK_BOT_TOKEN]" in body
+        scan = manifest["redaction_summary"]["secret_scan"]
+        # The raw can occur more than once in the exported line (e.g.
+        # message content plus a derived preview field) — every
+        # occurrence is replaced and counted.
+        assert scan["gate_redactions"] >= 1
+        assert scan["tier_counts"].get("redact") == 1
+        assert scan["converged"] is True
+        # Folded into the manifest counters and the per-session entry.
+        assert (
+            manifest["redaction_summary"]["by_type"]["gate_secret_scan"]
+            == scan["gate_redactions"]
+        )
+        assert manifest["sessions"][0]["gate_redactions"] == scan["gate_redactions"]
+        # The redacted line is still valid JSON.
+        json.loads(body.splitlines()[0])
+
+    def test_verified_credential_blocks_and_does_not_advance(self, conn, monkeypatch):
+        _mock_gate_engines(
+            monkeypatch,
+            th_passes=[[{
+                "raw": self.RAW, "detector": "GitHub",
+                "status": "verified", "line": 1,
+            }]],
+        )
+        share_id, share = self._share(conn, content=f"leak {self.RAW}")
+        pre_status = self._status(conn, share_id)
 
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
         assert export_dir is not None
         assert manifest["blocked"] is True
-        assert manifest["block_reason"] == "trufflehog-findings"
-        assert "ghp_a***4567" in manifest["block_message"]
-        assert manifest.get("blocked_sessions") is None
-        # Status must not advance — the share is not clean.
-        post_status_row = conn.execute(
-            "SELECT status FROM shares WHERE share_id = ?", (share_id,)
-        ).fetchone()
-        assert post_status_row["status"] == pre_status
-        # Export dir preserved for debugging; report on disk.
-        assert (export_dir / "sessions.jsonl").exists()
-        assert (export_dir / "trufflehog.json").exists()
-        # Manifest-on-disk matches the returned manifest (blocked=true).
+        assert manifest["block_reason"] == "secret-scan-findings"
+        assert "block" in manifest["block_message"]
+        assert self._status(conn, share_id) == pre_status
+        blocked = manifest["blocked_sessions"]
+        assert blocked[0]["session_id"] == "sess-1"
+        finding = blocked[0]["findings"][0]
+        assert finding["tier"] == "block"
+        assert finding["engine"] == "trufflehog"
+        assert finding["detector"] == "GitHub"  # legacy key preserved
+        # Defense in depth: even a blocked export's on-disk artifact
+        # has the live credential redacted.
+        assert self.RAW not in (export_dir / "sessions.jsonl").read_text()
         disk = json.loads((export_dir / "manifest.json").read_text())
         assert disk["blocked"] is True
 
-    def test_findings_block_maps_jsonl_line_to_session(self, conn, monkeypatch):
-        from clawjournal.redaction import trufflehog as trufflehog_scanner
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+    def test_private_key_rule_requires_review(self, conn, monkeypatch):
+        fake_key = "-----BEGIN RSA PRIVATE KEY-----\\nFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\\n-----END RSA PRIVATE KEY-----"
+        _mock_gate_engines(
+            monkeypatch,
+            bl_passes=[[{
+                "raw": fake_key, "rule_id": "private-key",
+                "entropy": 3.9, "line": 1,
+            }]],
+        )
+        share_id, share = self._share(conn, content=f"key: {fake_key}")
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
 
-        def fake_scan(path):
-            return trufflehog_scanner.TruffleHogReport(
-                scanned_path=str(path),
-                scanned_sha256="sha256:0",
-                findings=[
-                    trufflehog_scanner.TruffleHogFinding(
-                        detector="NpmToken", status="unverified",
-                        line=1, masked="407e***c7fa",
-                        raw_sha256="sha256:x",
-                    )
-                ],
-                unverified=1,
-                top_detectors=["NpmToken"],
-            )
+        assert manifest["blocked"] is True
+        assert manifest["block_reason"] == "secret-scan-findings"
+        finding = manifest["blocked_sessions"][0]["findings"][0]
+        assert finding["tier"] == "review"
+        assert finding["rule"] == "private-key"
 
-        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
-        share_id, share = self._share(conn)
+    def test_ignored_decision_downgrades_to_warn_and_ships(self, conn, monkeypatch):
+        # Allowlisting/ignoring a value used to make the redactor skip
+        # it and the gate then re-found and blocked it. Now it warns.
+        _mock_gate_engines(
+            monkeypatch,
+            bl_passes=[[{
+                "raw": self.RAW, "rule_id": "slack-bot-token",
+                "entropy": 4.4, "line": 1,
+            }]],
+        )
+        share_id, share = self._share(conn, content=f"keep {self.RAW}")
+        conn.execute(
+            "INSERT INTO findings (finding_id, session_id, revision, engine, rule,"
+            " entity_type, entity_hash, entity_length, field, message_index,"
+            " offset, length, confidence, status, decided_by, created_at)"
+            " VALUES ('f-allow', 'sess-1', 'v1:t', 'betterleaks', 'slack-bot-token',"
+            " 'slack-bot-token', ?, ?, 'content', 0, 5, ?, 0.9, 'ignored', 'user',"
+            " '2026-07-01T00:00:00+00:00')",
+            (hash_entity(self.RAW), len(self.RAW), len(self.RAW)),
+        )
+        conn.commit()
 
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
 
-        assert export_dir is not None
-        blocked = manifest["blocked_sessions"]
-        assert blocked == [{
-            "session_id": "sess-1",
-            "project": "demo",
-            "source": "claude",
-            "model": "claude-sonnet-4",
-            "line": 1,
-            "findings": [{
-                "line": 1,
-                "detector": "NpmToken",
-                "status": "unverified",
-                "masked": "407e***c7fa",
-            }],
-        }]
+        assert manifest.get("blocked") is not True
+        assert self._status(conn, share_id) in ("shared", "exported")
+        # The ignored value survives in the bundle (user's standing
+        # decision) and is recorded as a warning.
+        assert self.RAW in (export_dir / "sessions.jsonl").read_text()
+        scan = manifest["redaction_summary"]["secret_scan"]
+        assert scan["tier_counts"].get("warn") == 1
+        assert scan["examples"][0]["tier_reason"] == "decision_ignored"
+
+    def test_allowlisted_but_verified_requires_review(self, conn, monkeypatch):
+        # A confirmed-live credential never ships silently, even when
+        # the user allowlisted the value — it earns a human checkpoint
+        # instead of a hard wall.
+        _mock_gate_engines(
+            monkeypatch,
+            th_passes=[[{
+                "raw": self.RAW, "detector": "GitHub",
+                "status": "verified", "line": 1,
+            }]],
+        )
+        share_id, share = self._share(conn, content=f"keep {self.RAW}")
+        conn.execute(
+            "INSERT INTO findings (finding_id, session_id, revision, engine, rule,"
+            " entity_type, entity_hash, entity_length, field, message_index,"
+            " offset, length, confidence, status, decided_by, created_at)"
+            " VALUES ('f-allow', 'sess-1', 'v1:t', 'trufflehog', 'GitHub',"
+            " 'GitHub', ?, ?, 'content', 0, 5, ?, 1.0, 'ignored', 'allowlist',"
+            " '2026-07-01T00:00:00+00:00')",
+            (hash_entity(self.RAW), len(self.RAW), len(self.RAW)),
+        )
+        conn.commit()
+
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert manifest["blocked"] is True
+        finding = manifest["blocked_sessions"][0]["findings"][0]
+        assert finding["tier"] == "review"
+        scan = manifest["redaction_summary"]["secret_scan"]
+        assert scan["examples"][0]["tier_reason"] == "allowlisted_but_verified"
+
+    def test_soft_rule_warns_and_ships(self, conn, monkeypatch):
+        _mock_gate_engines(
+            monkeypatch,
+            bl_passes=[[{
+                "raw": self.RAW, "rule_id": "generic-api-key",
+                "entropy": 4.4, "line": 1,
+            }]],
+        )
+        share_id, share = self._share(conn, content=f"cfg {self.RAW}")
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert manifest.get("blocked") is not True
+        scan = manifest["redaction_summary"]["secret_scan"]
+        assert scan["tier_counts"].get("warn") == 1
+        assert scan["examples"][0]["tier_reason"] == "soft_rule"
+
+    def test_non_convergent_redaction_escalates_to_review(self, conn, monkeypatch):
+        # An engine that keeps reporting the same finding after redaction
+        # (placeholder collision, scanner quirk) must never loop forever
+        # or silently ship — the stragglers escalate to review.
+        finding = {
+            "raw": self.RAW, "rule_id": "slack-bot-token",
+            "entropy": 4.4, "line": 1,
+        }
+        _mock_gate_engines(
+            monkeypatch, bl_passes=[[finding], [finding], [finding], [finding]]
+        )
+        share_id, share = self._share(conn, content=f"leak {self.RAW}")
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert manifest["blocked"] is True
+        scan = manifest["redaction_summary"]["secret_scan"]
+        assert scan["converged"] is False
+        assert scan["rescan_passes"] == 3
+        entry = manifest["blocked_sessions"][0]["findings"][0]
+        assert entry["tier"] == "review"
 
     def test_missing_binary_blocks_with_install_hint(self, conn, monkeypatch):
-        from clawjournal.redaction import trufflehog as trufflehog_scanner
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
-        monkeypatch.setattr(trufflehog_scanner, "is_available", lambda: False)
+        from clawjournal.redaction import betterleaks, trufflehog
+
+        monkeypatch.delenv(trufflehog.SKIP_ENV_VAR, raising=False)
+        monkeypatch.delenv(betterleaks.SKIP_ENV_VAR, raising=False)
+        monkeypatch.setattr(trufflehog, "is_available", lambda: True)
+        monkeypatch.setattr(betterleaks, "is_available", lambda: False)
+        monkeypatch.setattr(trufflehog, "_scan_text_for_raw_matches", lambda text: [])
 
         share_id, share = self._share(conn)
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
         assert manifest["blocked"] is True
-        assert manifest["block_reason"] == "trufflehog-not-installed"
-        assert "brew install trufflehog" in manifest["block_message"]
+        assert manifest["block_reason"] == "scanner-not-installed"
+        assert "clawjournal betterleaks install" in manifest["block_message"]
 
     def test_scan_error_blocks_with_deterministic_reason(self, conn, monkeypatch):
-        from clawjournal.redaction import trufflehog as trufflehog_scanner
-        monkeypatch.delenv(trufflehog_scanner.SKIP_ENV_VAR, raising=False)
+        from clawjournal.redaction import betterleaks, trufflehog
 
-        def fake_scan(path):
-            return trufflehog_scanner.TruffleHogReport(
-                scanned_path=str(path),
-                scanned_sha256="sha256:0",
-                scan_error="unexpected exit status 2",
-            )
-
-        monkeypatch.setattr(trufflehog_scanner, "scan_file", fake_scan)
+        _mock_gate_engines(monkeypatch)
+        monkeypatch.setattr(
+            betterleaks,
+            "scan_file_with_raws",
+            lambda path: (
+                betterleaks.BetterleaksReport(
+                    scanned_path=str(path),
+                    scanned_sha256="sha256:0",
+                    scan_error="unexpected exit status 2",
+                ),
+                [],
+            ),
+        )
         share_id, share = self._share(conn)
-        pre_status = conn.execute(
-            "SELECT status FROM shares WHERE share_id = ?",
-            (share_id,),
-        ).fetchone()["status"]
+        pre_status = self._status(conn, share_id)
 
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
         assert export_dir is not None
         assert manifest["blocked"] is True
-        assert manifest["block_reason"] == "trufflehog-error"
+        assert manifest["block_reason"] == "scanner-error"
         assert "unexpected exit status 2" in manifest["block_message"]
-        assert manifest["redaction_summary"]["trufflehog"]["scan_error"] == "unexpected exit status 2"
-        post_status = conn.execute(
-            "SELECT status FROM shares WHERE share_id = ?",
-            (share_id,),
-        ).fetchone()["status"]
-        assert post_status == pre_status
-        assert (export_dir / "trufflehog.json").exists()
+        assert self._status(conn, share_id) == pre_status
+        assert (export_dir / "secret-scan.json").exists()
 
     def test_bypass_env_var_recorded_in_manifest(self, conn):
-        # Autouse fixture sets the bypass var — verify the manifest
+        # Autouse fixture sets the bypass vars — verify the manifest
         # records the bypass so reviewers can tell scanned shares from
         # bypassed ones.
         share_id, share = self._share(conn)
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
         assert manifest.get("blocked") is not True
-        th = manifest["redaction_summary"]["trufflehog"]
-        assert th["bypassed"] is True
+        scan = manifest["redaction_summary"]["secret_scan"]
+        assert scan["bypassed"] is True
+        assert manifest["redaction_summary"]["trufflehog"]["bypassed"] is True

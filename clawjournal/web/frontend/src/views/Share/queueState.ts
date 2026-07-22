@@ -1,6 +1,7 @@
 const IDS_PARAM = 'ids';
 const SELECTION_PARAM = 'selection';
 const EXCLUDE_PARAM = 'exclude';
+const LEGACY_EXCLUDE_PARAM = 'exclude_ids';
 const QUEUE_REF_PARAM = 'queue_ref';
 const STORAGE_PREFIX = 'clawjournal.share.queue.';
 
@@ -50,6 +51,7 @@ function replaceQueueParams(target: URLSearchParams, source: URLSearchParams): v
   target.delete(IDS_PARAM);
   target.delete(SELECTION_PARAM);
   target.delete(EXCLUDE_PARAM);
+  target.delete(LEGACY_EXCLUDE_PARAM);
   target.delete(QUEUE_REF_PARAM);
   source.forEach((value, key) => target.set(key, value));
 }
@@ -67,8 +69,15 @@ export function queueSelectionFromSearchParams(
   // an absent parameter, which means "use the default".
   if (params.has(IDS_PARAM)) return parseIds(params.get(IDS_PARAM));
 
-  if (params.get(SELECTION_PARAM) === 'all') {
-    const excluded = new Set(parseIds(params.get(EXCLUDE_PARAM)));
+  if (
+    params.get(SELECTION_PARAM) === 'all'
+    || params.has(EXCLUDE_PARAM)
+    || params.has(LEGACY_EXCLUDE_PARAM)
+  ) {
+    const excluded = new Set([
+      ...parseIds(params.get(EXCLUDE_PARAM)),
+      ...parseIds(params.get(LEGACY_EXCLUDE_PARAM)),
+    ]);
     return defaultQueue.filter((id) => !excluded.has(id));
   }
 
@@ -78,6 +87,16 @@ export function queueSelectionFromSearchParams(
   if (params.has(QUEUE_REF_PARAM)) return parseStoredQueue(params, storage) ?? [];
 
   return null;
+}
+
+/** Return whether an explicit URL selection can be restored exactly. */
+export function isQueueSelectionRestorable(
+  params: URLSearchParams,
+  storage: QueueSelectionStorage | null = null,
+): boolean {
+  if (params.has(IDS_PARAM)) return true;
+  if (params.has(QUEUE_REF_PARAM)) return parseStoredQueue(params, storage) !== null;
+  return params.get(SELECTION_PARAM) === 'all';
 }
 
 /**

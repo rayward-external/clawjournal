@@ -11,12 +11,14 @@ until LLM-PII gets a no-plaintext deterministic apply design.
 from __future__ import annotations
 
 import json
+import math
 import re
 import tempfile
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any
+from time import monotonic
+from typing import Any, Callable
 
 from ..findings import (
     ALLOWED_ENTITY_TYPES,
@@ -296,7 +298,23 @@ def _split_into_batches(work_items: list[tuple[str, int, str, str]], char_limit:
     return batches
 
 
-def _review_batch(session_id: str, work_items: list[tuple[str, int, str, str]], *, rubric: str | None, backend: str = "auto", timeout_seconds: int = 180) -> list[PIIFinding]:
+class _AgentCallGateError(Exception):
+    """Preserve a caller's control-gate failure across hybrid fallback logic."""
+
+    def __init__(self, cause: Exception):
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+def _review_batch(
+    session_id: str,
+    work_items: list[tuple[str, int, str, str]],
+    *,
+    rubric: str | None,
+    backend: str = "auto",
+    timeout_seconds: int = 180,
+    before_agent_call: Callable[[], None] | None = None,
+) -> list[PIIFinding]:
     """Review a batch of text chunks via the shared agent runner."""
     resolved = resolve_backend(backend)
     with tempfile.TemporaryDirectory() as tmp:
@@ -314,6 +332,14 @@ def _review_batch(session_id: str, work_items: list[tuple[str, int, str, str]], 
             )
 
         try:
+            # This is the external-egress boundary.  Automatic sharing uses
+            # it to recheck generation, hold, revision, scope, and profile for
+            # every provider call, including each batch of a long session.
+            if before_agent_call is not None:
+                try:
+                    before_agent_call()
+                except Exception as exc:
+                    raise _AgentCallGateError(exc) from exc
             result = run_default_agent_task(
                 backend=resolved,
                 cwd=tmp_path,
@@ -420,6 +446,7 @@ def review_session_pii_with_agent(
     rubric: str | None = None,
     max_workers: int = 4,
     timeout_seconds: int = 180,
+    before_agent_call: Callable[[], None] | None = None,
 ) -> list[PIIFinding]:
     """Review a session for PII using session-level batching (one agent call per batch)."""
     work_items = _collect_text_work_items(session)
@@ -432,41 +459,107 @@ def review_session_pii_with_agent(
     findings: list[PIIFinding] = []
     errors: list[RuntimeError] = []
 
-    if len(batches) == 1:
-        # Single batch — no parallelism needed
-        try:
-            findings.extend(
-                _review_batch(
-                    session_id,
-                    batches[0],
-                    rubric=rubric,
-                    backend=backend,
-                    timeout_seconds=timeout_seconds,
+    # A mutable control gate must be observed in a strict sequence.  Starting
+    # all batches concurrently would let later provider calls cross egress
+    # before a pause/hold applied during the first call can be seen.  An
+    # ungated max_workers<=1 call stays on the pooled path below: one worker
+    # is already strictly sequential and must share the one request deadline.
+    if len(batches) == 1 or before_agent_call is not None:
+        for batch in batches:
+            try:
+                gate_kwargs = (
+                    {"before_agent_call": before_agent_call}
+                    if before_agent_call is not None
+                    else {}
                 )
-            )
-        except RuntimeError as exc:
-            if not ignore_errors:
-                raise
+                findings.extend(
+                    _review_batch(
+                        session_id,
+                        batch,
+                        rubric=rubric,
+                        backend=backend,
+                        timeout_seconds=timeout_seconds,
+                        **gate_kwargs,
+                    )
+                )
+            except RuntimeError:
+                if not ignore_errors:
+                    raise
     else:
-        # Multiple batches — run in parallel
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
-            futures = {
-                pool.submit(
+        # Multiple batches share ONE request budget. Submitting every batch up
+        # front made timeout_seconds apply once per worker wave, so a large trace
+        # could keep the HTTP handler and agent CLIs alive long after the browser
+        # deadline. Refill only while time remains and pass each new worker the
+        # remaining budget. Backend wrappers retain their existing 10-second
+        # process-cleanup grace, so total wall time is bounded by budget + grace.
+        deadline = monotonic() + max(0.001, float(timeout_seconds))
+        worker_count = min(max(1, max_workers), len(batches))
+        pool = ThreadPoolExecutor(max_workers=worker_count)
+        futures: dict[Any, list[tuple[str, int, str, str]]] = {}
+        next_batch = 0
+        timed_out = False
+
+        def fill_workers() -> None:
+            nonlocal next_batch
+            while len(futures) < worker_count and next_batch < len(batches):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return
+                batch = batches[next_batch]
+                next_batch += 1
+                future = pool.submit(
                     _review_batch,
                     session_id,
                     batch,
                     rubric=rubric,
                     backend=backend,
-                    timeout_seconds=timeout_seconds,
-                ): batch
-                for batch in batches
-            }
-            for future in as_completed(futures):
-                try:
-                    findings.extend(future.result())
-                except RuntimeError as exc:
-                    if not ignore_errors:
-                        errors.append(exc)
+                    timeout_seconds=max(1, math.ceil(remaining)),
+                )
+                futures[future] = batch
+
+        try:
+            fill_workers()
+            while futures:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                # OpenClaw/Hermes wrappers allow ten seconds after their own
+                # deadline to terminate and collect output.
+                done, _ = wait(
+                    futures,
+                    timeout=remaining + 10,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    timed_out = True
+                    break
+                for future in done:
+                    futures.pop(future, None)
+                    try:
+                        findings.extend(future.result())
+                    except RuntimeError as exc:
+                        if not ignore_errors:
+                            errors.append(exc)
+                if errors:
+                    break
+                if next_batch < len(batches) and monotonic() >= deadline:
+                    timed_out = True
+                    break
+                fill_workers()
+            if next_batch < len(batches):
+                timed_out = True
+        finally:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        if timed_out and not ignore_errors:
+            errors.append(
+                RuntimeError(
+                    f"PII review timed out after {timeout_seconds}s for session {session_id}"
+                )
+            )
         if errors:
             raise errors[0]
 
@@ -481,6 +574,7 @@ def review_session_pii_hybrid(
     backend: str = "auto",
     return_coverage: bool = False,
     timeout_seconds: int = 180,
+    before_agent_call: Callable[[], None] | None = None,
 ) -> list[PIIFinding] | tuple[list[PIIFinding], str]:
     """Run hybrid PII detection (rule-based + AI agent).
 
@@ -497,7 +591,10 @@ def review_session_pii_hybrid(
             ignore_errors=False,
             rubric=rubric,
             timeout_seconds=timeout_seconds,
+            before_agent_call=before_agent_call,
         )
+    except _AgentCallGateError as exc:
+        raise exc.cause from exc
     except Exception:
         if not ignore_llm_errors:
             raise

@@ -61,6 +61,48 @@ def test_effective_ai_pii_keeps_preview_consistent():
     assert sf.effective_ai_pii([{"ai_coverage": "full"}, {"ai_coverage": "rules_only"}], True) == (False, False)
 
 
+def test_package_checks_release_gate_before_creating_share(monkeypatch):
+    blockers = [{"session_id": "held", "hold_state": "pending_review"}]
+    monkeypatch.setattr(sf, "gate_blockers", lambda _conn, _ids: blockers)
+    monkeypatch.setattr(
+        sf,
+        "create_share",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create")),
+    )
+
+    result = sf.package(
+        None,
+        ["held"],
+        {"source_filter": ["codex"]},
+        ai_pii=True,
+        ai_backend="codex",
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"] == blockers
+
+
+def test_verify_coverage_rejects_wrong_backend():
+    manifest = {
+        "redaction_summary": {
+            "pii_review": {
+                "ai_enabled": True,
+                "backend": "claude",
+                "coverage": {"full": 1, "rules_only": 0},
+            }
+        }
+    }
+
+    ok, reason = sf.verify_coverage(
+        manifest,
+        package_ai=True,
+        expected_backend="codex",
+    )
+
+    assert ok is False
+    assert "different AI-PII backend" in reason
+
+
 def test_hosted_destination_unreachable(monkeypatch):
     def boom():
         raise RuntimeError("network down")

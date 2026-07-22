@@ -92,7 +92,7 @@ def test_caps_installed_set_by_support():
     # distinct wording per rule so the paraphrase dedup doesn't collapse them
     merged = merge_rules([], [_r(f"topic{i} action{i} lesson", support=i) for i in range(13)], set())
     assert len(merged) == MAX_INSTALLED_RULES
-    assert [r.support for r in merged] == list(range(12, 2, -1))   # top 10 by support
+    assert [r.support for r in merged] == list(range(12, 7, -1))   # top 5 by support
 
 
 def test_dedupe_prefers_higher_support():
@@ -141,8 +141,8 @@ def test_preserves_good_bad_mix():
     do = [_r("alpha task workflow", support=0, kind="do"), _r("bravo chore routine", support=0, kind="do")]
     merged = merge_rules([], avoid + do, set())
     kinds = [r.kind for r in merged]
-    assert len(merged) == MAX_INSTALLED_RULES                     # 9 avoid + 2 do -> capped
-    assert kinds.count("do") == 2 and kinds.count("avoid") == 8   # both kinds survive
+    assert len(merged) == MAX_INSTALLED_RULES                     # 9 avoid + 2 do -> active cap
+    assert kinds.count("do") == 2 and kinds.count("avoid") == 3   # both kinds survive
     assert kinds[:4] == ["avoid", "do", "avoid", "do"]            # interleaved head
 
 

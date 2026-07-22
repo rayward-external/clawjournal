@@ -30,6 +30,9 @@ tests/
 - `clawjournal/workbench/`: local SQLite-backed workbench API and browser UI server.
 - `clawjournal/export/`: renders export formats such as JSONL and Markdown.
 - `clawjournal/prompts/`: canonical runtime prompt assets used by scoring and PII review.
+- `clawjournal/auto_upload.py`: SQLite-owned recurring authorization state, candidate selection, cadence, exact-artifact sealing, crash recovery, and the fail-closed runner.
+- `clawjournal/auto_upload_client.py` and `auto_upload_credentials.py`: the typed hosted v1 protocol and purpose-separated private credential boundary.
+- `clawjournal/agent_hooks.py`: semantics-preserving Claude Code/Codex `SessionStart` configuration plus the bounded due-check adapter.
 
 ## Data Flow
 
@@ -40,6 +43,8 @@ The core flow is:
 3. index and review locally
 4. optionally score and redact
 5. export or bundle-share the sanitized result
+
+When recurring sharing is explicitly enabled, `SessionStart` only performs a bounded due check and detaches the runner. The runner strictly refreshes the enrolled sources, selects at most five future eligible revisions, packages through the same redaction path, seals and hashes the exact ZIP, persists its recovery ledger, repeats mutable gates, and then crosses the atomic `submitting` boundary. An ambiguous request is reconciled by receipt lookup and can retry only the identical ZIP and client submission ID.
 
 ## Frontend
 
@@ -73,6 +78,14 @@ Optional self-hosted path:
 
 - Hosted research submission happens from the local workbench Submit step after email verification and consent.
 - `clawjournal bundle-share` can upload to a self-hosted ingest backend only when `CLAWJOURNAL_INGEST_URL` is explicitly configured.
+
+Optional hosted recurring path:
+
+- It remains unavailable unless hosted discovery advertises protocol v2 and the participant has a successful manual receipt.
+- Enrollment sends the explicit (source, project) scope entries and requires two distinct affirmative acts: the versioned recurring authorization/retention acceptance and the versioned ownership certification. The server computes and owns the scope hash; the client pins the value read back at enrollment and fails closed on any drift.
+- The local SQLite singleton owns mode, generation, accepted exact scope/profile, cadence, health, and run overlay. Private files own active/recovery credentials; `config.json` never does.
+- The hosted service owns versioned recurring authorization, credential hashes, exact-byte idempotency, cross-enrollment duplicate-revision rejection, storage, and receipts.
+- Public discovery can close or go dark without stranding recovery: fixed, origin-pinned receipt and revocation routes remain recovery-only. No content egress occurs while the capability is unavailable.
 
 The default configuration is local-first and does not require any hosted backend.
 

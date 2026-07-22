@@ -16,6 +16,11 @@ export interface BlockedShareFinding {
   detector?: string | null;
   status?: string | null;
   masked?: string | null;
+  // Tiered-gate fields (daemon ≥ scan-policy rewrite); older manifests
+  // carry only the legacy keys above.
+  engine?: string | null;
+  rule?: string | null;
+  tier?: 'block' | 'review' | 'redact' | 'warn' | null;
 }
 
 export interface BlockedShareSession {
@@ -76,7 +81,10 @@ export interface ShareDestination {
   submit_page_url?: string | null;
   maximum_bundle_size?: number | null;
   accepted_manifest_schema_versions?: string[];
-  supported_institution_email_policy?: { domain_suffixes?: string[] } | null;
+  supported_institution_email_policy?: {
+    domain_suffixes?: string[];
+    explicit_collaborators_supported?: boolean;
+  } | null;
   support_contact?: string | null;
   message?: string;
 }
@@ -128,3 +136,4 @@ export interface RedactedSessionData {
 }
 
 export const CONFIDENCE_THRESHOLD = 0.85;
+export const LARGE_BUNDLE_CONFIRM_THRESHOLD = 100;
