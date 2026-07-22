@@ -30,8 +30,30 @@ export const globalStyles = (
     @keyframes clawChipPop { from { opacity: 0; transform: translateY(4px) scale(.85); } to { opacity: 1; transform: translateY(0) scale(1); } }
     @keyframes clawRingOut { to { transform: scale(2); opacity: 0; } }
     @keyframes clawCheckIn { from { transform: scale(0); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-    @keyframes clawConfetti { 0% { transform: translate(0,0) rotate(0); opacity: 1; } 100% { transform: translate(var(--cdx), var(--cdy)) rotate(var(--cr)); opacity: 0; } }
+    @keyframes clawSuccessFlash {
+      0% { opacity: 0; transform: translateY(-100px) scale(.72); }
+      16% { opacity: 1; }
+      58% { opacity: .45; transform: translateY(40px) scale(1); }
+      100% { opacity: 0; transform: translateY(120px) scale(1.08); }
+    }
+    @keyframes clawConfettiDrop {
+      0% { transform: translate3d(0,-36px,0) rotate(0) scale(.7); opacity: 0; }
+      8% { opacity: 1; }
+      76% { opacity: 1; }
+      100% { transform: translate3d(var(--cdx),var(--cdy),0) rotate(var(--cr)) scale(1); opacity: 0; }
+    }
+    .claw-success-flash {
+      animation: clawSuccessFlash 1500ms cubic-bezier(.16,.72,.24,1) forwards;
+      animation-delay: var(--flash-delay, 0ms);
+    }
+    .claw-success-confetti span {
+      animation: clawConfettiDrop var(--cduration) cubic-bezier(.18,.68,.28,1) forwards;
+      animation-delay: var(--cdelay);
+    }
     @keyframes clawPkgDrop { 0% { opacity: 0; transform: translate(-50%,-30px) scale(.85); } 15% { opacity: 1; } 70% { opacity: 1; transform: translate(-50%, 80px) scale(.85); } 100% { opacity: 0; transform: translate(-50%, 120px) scale(.3); } }
     @keyframes clawThump { 0% { transform: scale(1); } 40% { transform: scale(1.02) translateY(2px); } 100% { transform: scale(1); } }
+    @media (prefers-reduced-motion: reduce) {
+      .claw-success-flash, .claw-success-confetti span { animation: none !important; }
+    }
   `}</style>
 );
