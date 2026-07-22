@@ -1,8 +1,26 @@
 """Shared fixtures for clawjournal tests."""
 
+import sys
+
 import pytest
 
 from clawjournal.redaction.anonymizer import Anonymizer
+
+
+@pytest.fixture(autouse=True)
+def _reset_strict_scan_reuse():
+    """auto_upload.enable() memoizes a completed strict refresh at module
+    level so one interactive enrollment only re-parses the history once. A
+    test's refresh must never satisfy another test's, so clear the memo
+    around every test (lazily — most tests never import auto_upload).
+    """
+    auto_upload = sys.modules.get("clawjournal.auto_upload")
+    if auto_upload is not None:
+        auto_upload._reset_strict_scan_reuse()
+    yield
+    auto_upload = sys.modules.get("clawjournal.auto_upload")
+    if auto_upload is not None:
+        auto_upload._reset_strict_scan_reuse()
 
 
 @pytest.fixture(autouse=True)

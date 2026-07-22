@@ -241,7 +241,7 @@ def _patch_strict_scanner(
     calls: list[list[str]] = []
 
     class StrictScanner:
-        def scan_once_strict(self, required_sources):
+        def scan_once_strict(self, required_sources, *, progress=None):
             calls.append(list(required_sources))
             index = len(calls) - 1
             if index < len(actions) and actions[index] is not None:
@@ -2775,6 +2775,182 @@ def test_enable_rejects_acceptance_when_displayed_scope_changes(
         assert get_auto_upload_enrollment(conn) is None
     finally:
         conn.close()
+
+
+def test_enable_defers_the_strict_scan_until_acceptance(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """Displaying the challenge must not pay the full-history refresh (minutes
+    of CPU on a large history); only the call whose acceptance matches the
+    displayed profile scans, so one interactive enrollment re-parses the
+    history once, not once per step."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda _caps, **_kwargs: _enrollment_response()
+    )
+    scan_calls = _patch_strict_scanner(monkeypatch)
+
+    challenge = auto.enable(agent="claude")
+    assert challenge["code"] == "authorization_required"
+    assert scan_calls == []
+
+    displayed = auto.enable(agent="claude", challenge_only=True)
+    assert displayed["code"] == "authorization_required"
+    assert scan_calls == []
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=challenge["authorization_profile_hash"],
+    )
+    assert result["mode"] == "enabled"
+    assert scan_calls == [["claude"]]
+
+
+def test_enable_reuses_the_refresh_across_the_email_verification_retry(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """The retry after fresh email verification replays the exact accepted
+    profile; the refresh that just completed is reused, not repeated."""
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[str] = []
+
+    def create(_capabilities, **_kwargs):
+        create_calls.append("create")
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+    scan_calls = _patch_strict_scanner(monkeypatch)
+    profile_hash = _current_authorization_profile_hash()
+    assert scan_calls == []
+    accepted = {
+        "agent": "claude",
+        "accepted_authorization_version": AUTH_VERSION,
+        "accepted_retention_version": RETENTION_VERSION,
+        "accepted_ownership_certification_version": OWNERSHIP_VERSION,
+        "accepted_authorization_profile_hash": profile_hash,
+    }
+
+    first = auto.enable(**accepted)
+
+    assert first["code"] == "email_verification_required"
+    assert create_calls == []
+    assert scan_calls == [["claude"]]
+
+    config = config_module.load_config()
+    config["verified_email_token"] = "fresh-one-shot"
+    config["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    config_module.save_config(config)
+
+    second = auto.enable(**accepted)
+
+    assert second["mode"] == "enabled"
+    assert create_calls == ["create"]
+    assert scan_calls == [["claude"]]
+
+
+def test_enable_requires_reacceptance_when_the_refresh_changes_scope(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A project that only shows up during the accepting call's refresh must
+    bounce back for re-acceptance of the refreshed exact scope — and the
+    re-accepted call reuses the completed refresh instead of scanning again."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[str] = []
+
+    def create(_capabilities, **_kwargs):
+        create_calls.append("create")
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+
+    def reveal_project_two():
+        conn = open_index()
+        try:
+            session, _raw_path = _session(
+                isolated_auto_upload["root"], "session-two", project="project-two"
+            )
+            assert upsert_sessions(conn, [session]) == 1
+        finally:
+            conn.close()
+
+    scan_calls = _patch_strict_scanner(monkeypatch, callbacks=[reveal_project_two])
+
+    displayed = auto.enable(agent="claude", challenge_only=True)
+    assert displayed["scope"]["projects"] == ["project-one"]
+
+    bounced = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=displayed["authorization_profile_hash"],
+    )
+
+    assert bounced["code"] == "authorization_required"
+    assert bounced["scope"]["projects"] == ["project-one", "project-two"]
+    assert create_calls == []
+    assert scan_calls == [["claude"]]
+
+    final = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=bounced["authorization_profile_hash"],
+    )
+
+    assert final["mode"] == "enabled"
+    assert create_calls == ["create"]
+    assert scan_calls == [["claude"]]
+
+
+def test_strict_scan_reuse_window_scope_and_expiry(monkeypatch):
+    scan_calls = _patch_strict_scanner(monkeypatch)
+
+    assert auto._strict_scan_for_enable(["claude"])["ok"] is True
+    reused = auto._strict_scan_for_enable(["claude"])
+    assert reused == {"ok": True, "reused": True, "required_sources": ["claude"]}
+    assert scan_calls == [["claude"]]
+
+    # A superset requirement is not satisfied by the recorded subset...
+    assert auto._strict_scan_for_enable(["codex", "claude"])["ok"] is True
+    assert scan_calls == [["claude"], ["claude", "codex"]]
+    # ...but a subset is satisfied by the recorded superset.
+    assert auto._strict_scan_for_enable(["codex"])["reused"] is True
+    assert scan_calls == [["claude"], ["claude", "codex"]]
+
+    # Expiry forces a fresh refresh.
+    monkeypatch.setattr(auto, "STRICT_SCAN_REUSE_SECONDS", 0.0)
+    assert auto._strict_scan_for_enable(["claude"])["ok"] is True
+    assert scan_calls == [["claude"], ["claude", "codex"], ["claude"]]
+
+
+def test_strict_scan_reuse_ignores_failed_refreshes(monkeypatch):
+    scan_calls = _patch_strict_scanner(
+        monkeypatch, results=[{"ok": False}, {"ok": True, "sources": ["claude"]}]
+    )
+
+    assert auto._strict_scan_for_enable(["claude"])["ok"] is False
+    assert auto._strict_scan_for_enable(["claude"])["ok"] is True
+    assert scan_calls == [["claude"], ["claude"]]
 
 
 def test_enable_never_backdates_cutoff_before_durable_local_intent(

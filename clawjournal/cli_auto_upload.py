@@ -277,27 +277,59 @@ def run(args) -> None:
         ownership_version = args.accept_ownership_certification_version
         profile_hash = args.accept_authorization_profile_hash
 
-        def scan_notice() -> None:
-            # Every enable() call strict-refreshes the enrolled source logs
-            # after its fast hosted checks; on a large history that is minutes
-            # of silent CPU without this notice — including the re-runs after
-            # typing the acceptance versions and after email verification.
+        def hosted_notice() -> None:
             if not output_json:
                 print(
-                    "Checking the hosted service, then refreshing the enrolled "
-                    "source scope (a large history can take a few minutes)…",
+                    "Checking the hosted service and current terms…",
                     file=sys.stderr,
                 )
 
-        scan_notice()
-        result = auto_upload.enable(
-            agent=args.agent,
-            accepted_authorization_version=auth_version,
-            accepted_retention_version=retention_version,
-            accepted_ownership_certification_version=ownership_version,
-            accepted_authorization_profile_hash=profile_hash,
-        )
-        if result.get("code") == "authorization_required" and not output_json:
+        scan_started = False
+
+        def scan_progress(source: str, done: int, total: int) -> None:
+            # The strict refresh reports sources and counters only, never
+            # project names or paths; the values below are locally derived,
+            # not hosted-controlled. Only the call whose acceptance matches
+            # actually refreshes, so this appears at most once per flow.
+            nonlocal scan_started
+            if output_json:
+                return
+            if sys.stderr.isatty():
+                print(
+                    f"\rRefreshing source logs: {done}/{total} projects "
+                    f"({source})  ",
+                    end="\n" if done >= total else "",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif not scan_started:
+                scan_started = True
+                print(
+                    "Refreshing the enrolled source logs "
+                    "(a large history can take a few minutes)…",
+                    file=sys.stderr,
+                )
+
+        def call_enable() -> dict[str, Any]:
+            hosted_notice()
+            return auto_upload.enable(
+                agent=args.agent,
+                accepted_authorization_version=auth_version,
+                accepted_retention_version=retention_version,
+                accepted_ownership_certification_version=ownership_version,
+                accepted_authorization_profile_hash=profile_hash,
+                scan_progress=scan_progress,
+            )
+
+        result = call_enable()
+        # The refresh on the accepting call can change the displayed scope
+        # (a project appeared since the challenge was shown), which bounces
+        # back with the refreshed challenge; one extra acceptance round
+        # covers it, and that call reuses the completed refresh instead of
+        # scanning again.
+        for _ in range(2):
+            if output_json or result.get("code") != "authorization_required":
+                break
             accepted = _interactive_accept(args, result)
             if accepted is None:
                 result = {
@@ -305,35 +337,22 @@ def run(args) -> None:
                     "code": "authorization_not_accepted",
                     "message": "Exact recurring authorization versions were not accepted.",
                 }
-            else:
-                (
-                    auth_version,
-                    retention_version,
-                    ownership_version,
-                    profile_hash,
-                ) = accepted
-                scan_notice()
-                result = auto_upload.enable(
-                    agent=args.agent,
-                    accepted_authorization_version=auth_version,
-                    accepted_retention_version=retention_version,
-                    accepted_ownership_certification_version=ownership_version,
-                    accepted_authorization_profile_hash=profile_hash,
-                )
+                break
+            (
+                auth_version,
+                retention_version,
+                ownership_version,
+                profile_hash,
+            ) = accepted
+            result = call_enable()
         if result.get("code") in {
             "email_verification_required",
             "enrollment_response_ambiguous",
         } and not output_json:
             if _fresh_email_verification():
-                # Re-fetching also catches terms changed while the code was in flight.
-                scan_notice()
-                result = auto_upload.enable(
-                    agent=args.agent,
-                    accepted_authorization_version=auth_version,
-                    accepted_retention_version=retention_version,
-                    accepted_ownership_certification_version=ownership_version,
-                    accepted_authorization_profile_hash=profile_hash,
-                )
+                # Re-fetching also catches terms changed while the code was
+                # in flight; the completed refresh is reused, not repeated.
+                result = call_enable()
             else:
                 result = {
                     "ok": False,
