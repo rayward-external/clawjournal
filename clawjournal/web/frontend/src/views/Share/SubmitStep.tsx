@@ -5,6 +5,7 @@ import { Spinner } from '../../components/Spinner.tsx';
 import type { HostedConsent, ShareDestination } from './types.ts';
 import { SHARE_SHELL_WIDTH, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, Icon } from './shared.tsx';
+import { cancelSuccessChime, playSuccessChime, primeSuccessChime } from './successChime.ts';
 
 export interface SubmitStepProps {
   stepperHeader: React.ReactNode;
@@ -184,6 +185,8 @@ export function SubmitStep(p: SubmitStepProps) {
 
   const submit = async () => {
     if (!p.shareId) return;
+    let submitted = false;
+    primeSuccessChime();
     setBusy(true);
     setSubmitting(true);
     setError(null);
@@ -200,7 +203,9 @@ export function SubmitStep(p: SubmitStepProps) {
         retention_policy_version: consentData.retention_policy_version,
         ai_pii: p.aiPiiEnabled,
       });
+      submitted = true;
       p.toast('Submitted', 'success');
+      playSuccessChime();
       p.onSubmitted(result.receipt_id, result.hosted_status || null, consentData.support_contact || p.shareDestination?.support_contact || null);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Submission failed';
@@ -219,6 +224,7 @@ export function SubmitStep(p: SubmitStepProps) {
         void loadSubmitState();
       }
     } finally {
+      if (!submitted) cancelSuccessChime();
       setBusy(false);
       setSubmitting(false);
     }
