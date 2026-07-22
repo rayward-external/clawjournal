@@ -173,8 +173,10 @@ def _interactive_accept(
     print("Exact authorized source/project pairs:")
     for source, project in entries:
         print(_sanitize_terminal_line(f"  {source} -> {project}"))
+    cadence_days = challenge["cadence_days"]
+    cadence_unit = "day" if cadence_days == 1 else "days"
     print(_sanitize_terminal_line(
-        f"Cycle cap: {challenge['cap']}; cadence: {challenge['cadence_days']} days"
+        f"Cycle cap: {challenge['cap']}; cadence: {cadence_days} {cadence_unit}"
     ))
     print(_sanitize_terminal_line(
         f"Maximum bundle size: {challenge['maximum_bundle_size']} bytes"

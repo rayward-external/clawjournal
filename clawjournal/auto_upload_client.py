@@ -158,7 +158,12 @@ def validate_capabilities(
         "duplicate_revision_enforcement": True,
     }
     for field, expected in required_equals.items():
-        if capabilities.get(field) != expected:
+        actual = capabilities.get(field)
+        if actual != expected or (
+            isinstance(expected, int)
+            and not isinstance(expected, bool)
+            and (not isinstance(actual, int) or isinstance(actual, bool))
+        ):
             raise CapabilityError(
                 "capability_incompatible",
                 f"Hosted recurring-upload capability {field} is unavailable or incompatible.",

@@ -156,6 +156,8 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
     assert "\x1b" not in output + "".join(prompts)
     assert "\x07" not in output + "".join(prompts)
     assert "Exact authorized source/project pairs:" in output
+    assert "cadence: 1 day" in output
+    assert "cadence: 1 days" not in output
     assert all("\n" not in prompt for prompt in prompts)
 
 

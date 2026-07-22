@@ -49,6 +49,12 @@ def test_capabilities_require_every_safety_contract():
             origin="https://data.rayward.ai",
         )
 
+    with pytest.raises(client.CapabilityError, match="recurring_cadence_days"):
+        client.validate_capabilities(
+            _caps(recurring_cadence_days=True),
+            origin="https://data.rayward.ai",
+        )
+
 
 def test_capabilities_reject_cross_origin_endpoint():
     with pytest.raises(client.CapabilityError, match="different origin"):
