@@ -153,3 +153,27 @@ def test_bypassed_scanner_is_never_installed(monkeypatch, tmp_path):
 
     assert result["ok"] is True
     assert result["scanners"]["betterleaks"]["status"] == "bypassed"
+
+
+def test_noncanonical_skip_value_does_not_bypass_install(monkeypatch, tmp_path):
+    state, _managed = _scanner_state(
+        monkeypatch,
+        tmp_path,
+        better=False,
+        truffle=True,
+    )
+    monkeypatch.setenv(betterleaks.SKIP_ENV_VAR, "true")
+    installs: list[str] = []
+
+    def install_betterleaks(**_kwargs):
+        installs.append("betterleaks")
+        state["betterleaks"] = True
+        return {"status": "installed", "version": "1.6.1"}
+
+    monkeypatch.setattr(betterleaks_install, "install", install_betterleaks)
+
+    result = scanner_install.ensure_share_scanners()
+
+    assert result["ok"] is True
+    assert installs == ["betterleaks"]
+    assert result["scanners"]["betterleaks"]["status"] == "installed"

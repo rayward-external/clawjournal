@@ -9,7 +9,6 @@ checksum-verified installers.
 
 from __future__ import annotations
 
-import os
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -17,10 +16,6 @@ from typing import Any
 
 _INSTALL_LOCK = threading.Lock()
 _INSTALL_OK = frozenset({"installed", "already-installed"})
-
-
-def _truthy(value: str | None) -> bool:
-    return bool(value) and value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def ensure_share_scanners(
@@ -55,7 +50,11 @@ def ensure_share_scanners(
         for name, scanner, installer in scanners:
             before = scanner.resolve_binary()
             available_before = scanner.is_available()
-            if _truthy(os.environ.get(scanner.SKIP_ENV_VAR)):
+            # Keep preflight and gate semantics identical.  The scanners own
+            # their development-bypass contract (currently the exact value
+            # ``"1"``); accepting broader truthy spellings here would skip an
+            # install that the gate still requires and strand recovery retries.
+            if scanner.is_bypassed():
                 outcomes[name] = {
                     "ok": True,
                     "status": "bypassed",

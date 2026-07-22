@@ -2096,20 +2096,6 @@ def _prepare_share_export_for_upload(
     ai_pii_backend: str = "auto",
     before_ai_call: Callable[[], None] | None = None,
 ) -> tuple[Path | None, dict[str, Any], dict[str, Any] | None]:
-    # Existing participants can receive a new required scanner through a
-    # ClawJournal fast-forward without re-running the installer.  Repair that
-    # dependency gap before any export or AI work; failures stay fail-closed and
-    # carry a stable reason the workbench can recover from explicitly.
-    from ..redaction.scanner_install import ensure_share_scanners
-
-    scanner_setup = ensure_share_scanners()
-    if not scanner_setup["ok"]:
-        return None, {}, {
-            "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
-            "block_reason": "scanner-not-installed",
-            "scanner_install": scanner_setup,
-            "status": 503,
-        }
     effective_ai_pii = (
         bool(settings.get("ai_pii_review_enabled", False))
         if ai_pii_review_enabled is None
@@ -2142,6 +2128,23 @@ def _prepare_share_export_for_upload(
         if cached is not None:
             export_dir, manifest = cached
             return export_dir, manifest, None
+
+    # Existing participants can receive a new required scanner through a
+    # ClawJournal fast-forward without re-running the installer. Repair that
+    # dependency gap only when building a new artifact: a finalized cached
+    # export has already passed the current gate and is reused byte-for-byte.
+    # Failures stay fail-closed before any export or AI work and carry a stable
+    # reason the workbench can recover from explicitly.
+    from ..redaction.scanner_install import ensure_share_scanners
+
+    scanner_setup = ensure_share_scanners()
+    if not scanner_setup["ok"]:
+        return None, {}, {
+            "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
+            "block_reason": "scanner-not-installed",
+            "scanner_install": scanner_setup,
+            "status": 503,
+        }
 
     export_dir, manifest = export_share_to_disk(
         conn,
