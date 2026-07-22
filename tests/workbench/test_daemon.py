@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sqlite3
 import time
 import urllib.error
 import zipfile
@@ -18,6 +19,7 @@ import pytest
 from clawjournal.workbench.daemon import (
     Scanner,
     WorkbenchHandler,
+    _scan_process_lock,
     run_server,
     _SHARE_COOLDOWN_SECONDS,
     _apply_upload_pii_redactions,
@@ -1254,6 +1256,98 @@ class TestScanner:
         assert report["failures"] == []
         assert seen == [("claude", 1, 2)]
         assert "PRIVATE_CALLBACK_SENTINEL" not in json.dumps(report)
+
+    @pytest.mark.parametrize(
+        ("store_error", "expected_code"),
+        [
+            (RuntimeError("PRIVATE_STORE_SENTINEL"), "store_failed"),
+            (sqlite3.OperationalError("database is locked"), "index_busy"),
+        ],
+    )
+    def test_strict_scan_labels_store_failures_distinctly(
+        self, tmp_path, monkeypatch, store_error, expected_code
+    ):
+        """A failed index write is not a parse problem: it gets stage=store,
+        and a lock timeout gets its own code so cross-process contention is
+        diagnosable as contention instead of sending someone at the logs."""
+        self._patch_progress_scan_environment(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.parse_project_sessions",
+            lambda dir_name, **kwargs: [
+                {
+                    "session_id": f"session-{dir_name[-12:]}",
+                    "_raw_source_fingerprint": ("a", "b", "c", "d", "e"),
+                }
+            ],
+        )
+
+        def failing_upsert(_conn, _sessions, stats=None):
+            raise store_error
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.upsert_sessions", failing_upsert
+        )
+
+        report = Scanner().scan_once_strict(["claude"])
+
+        assert report["ok"] is False
+        assert report["failures"] == [
+            {"source": "claude", "stage": "store", "code": expected_code},
+            {"source": "claude", "stage": "store", "code": expected_code},
+        ]
+        assert "PRIVATE_STORE_SENTINEL" not in json.dumps(report)
+
+    def test_strict_scan_fails_closed_busy_when_lock_held(
+        self, tmp_path, monkeypatch
+    ):
+        """A refresh that cannot get the cross-process scan lock within its
+        wait fails closed with a busy report — it must not contend for
+        SQLite writes it would lose — and fires on_wait exactly once."""
+        self._patch_progress_scan_environment(tmp_path, monkeypatch)
+        waits: list[str] = []
+
+        with _scan_process_lock(wait_seconds=None) as held:
+            assert held is True
+            report = Scanner().scan_once_strict(
+                ["claude"],
+                on_wait=lambda: waits.append("waited"),
+                lock_wait_seconds=0.0,
+            )
+
+        assert report["ok"] is False
+        assert report["busy"] is True
+        assert report["failures"] == [
+            {"source": "*", "stage": "lock", "code": "scanner_busy"}
+        ]
+        assert waits == ["waited"]
+        # With the lock free again the same call succeeds.
+        clean = Scanner().scan_once_strict(["claude"])
+        assert clean["ok"] is True
+
+    def test_background_tick_skips_while_another_process_scans(
+        self, tmp_path, monkeypatch
+    ):
+        """The background loop must yield to a CLI scan, not contend with it;
+        the next tick catches up."""
+        self._patch_progress_scan_environment(tmp_path, monkeypatch)
+
+        with _scan_process_lock(wait_seconds=None) as held:
+            assert held is True
+            assert Scanner()._scan_tick() is None
+
+        assert Scanner()._scan_tick() == {}
+
+    def test_scan_once_proceeds_unlocked_after_wait_expires(
+        self, tmp_path, monkeypatch
+    ):
+        """Normal scans degrade to pre-lock behavior after the bounded wait:
+        per-project resilience makes proceeding strictly better than failing,
+        and only strict scans must fail closed."""
+        self._patch_progress_scan_environment(tmp_path, monkeypatch)
+
+        with _scan_process_lock(wait_seconds=None) as held:
+            assert held is True
+            assert Scanner().scan_once(lock_wait_seconds=0.0) == {}
 
     @pytest.mark.parametrize("source", ["claude", "codex"])
     def test_strict_scan_rejects_malformed_jsonl_without_partial_upsert(

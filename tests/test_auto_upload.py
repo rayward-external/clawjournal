@@ -241,7 +241,9 @@ def _patch_strict_scanner(
     calls: list[list[str]] = []
 
     class StrictScanner:
-        def scan_once_strict(self, required_sources, *, progress=None):
+        def scan_once_strict(
+            self, required_sources, *, progress=None, on_wait=None
+        ):
             calls.append(list(required_sources))
             index = len(calls) - 1
             if index < len(actions) and actions[index] is not None:
@@ -409,7 +411,7 @@ def test_enable_requires_a_successful_hosted_manual_receipt_before_network(
     forbidden_calls: list[str] = []
 
     class ScannerForbidden:
-        def scan_once_strict(self, _required_sources):
+        def scan_once_strict(self, _required_sources, **_kwargs):
             forbidden_calls.append("scan")
             raise AssertionError("manual-receipt gate must run before strict scan")
 
@@ -2951,6 +2953,75 @@ def test_strict_scan_reuse_ignores_failed_refreshes(monkeypatch):
     assert auto._strict_scan_for_enable(["claude"])["ok"] is False
     assert auto._strict_scan_for_enable(["claude"])["ok"] is True
     assert scan_calls == [["claude"], ["claude"]]
+
+
+def test_enable_surfaces_scanner_busy_and_does_not_memoize_it(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A lock-timeout refresh must fail closed with its own retryable code —
+    not the log-diagnosis-inviting strict_scan_incomplete — and must not
+    poison the reuse window: the retry scans for real."""
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto, "create_enrollment", lambda _caps, **_kwargs: _enrollment_response()
+    )
+    scan_calls = _patch_strict_scanner(
+        monkeypatch,
+        results=[
+            {"ok": False, "busy": True},
+            {"ok": True, "sources": ["claude"]},
+        ],
+    )
+    profile_hash = _current_authorization_profile_hash()
+    accepted = {
+        "agent": "claude",
+        "accepted_authorization_version": AUTH_VERSION,
+        "accepted_retention_version": RETENTION_VERSION,
+        "accepted_ownership_certification_version": OWNERSHIP_VERSION,
+        "accepted_authorization_profile_hash": profile_hash,
+    }
+
+    busy = auto.enable(**accepted)
+
+    assert busy["ok"] is False
+    assert busy["code"] == "scanner_busy"
+    assert busy["retryable"] is True
+    conn = open_index()
+    try:
+        assert get_auto_upload_enrollment(conn) is None
+    finally:
+        conn.close()
+
+    retry = auto.enable(**accepted)
+
+    assert retry["mode"] == "enabled"
+    assert scan_calls == [["claude"], ["claude"]]
+
+
+def test_preview_refresh_surfaces_scanner_busy(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config)
+    conn.close()
+    scan_calls = _patch_strict_scanner(
+        monkeypatch, results=[{"ok": False, "busy": True}]
+    )
+
+    result = auto.preview(refresh=True)
+
+    assert result["ok"] is False
+    assert result["code"] == "scanner_busy"
+    assert result["retryable"] is True
+    assert scan_calls == [["claude"]]
 
 
 def test_enable_never_backdates_cutoff_before_durable_local_intent(

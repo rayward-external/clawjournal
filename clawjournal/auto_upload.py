@@ -803,6 +803,12 @@ def preview(*, refresh: bool = False, now: datetime | None = None) -> dict[str, 
             from .workbench.daemon import Scanner
 
             scan = Scanner().scan_once_strict(list(enrollment["enrolled_sources"]))
+            if scan.get("busy"):
+                return AutoUploadError(
+                    "scanner_busy",
+                    "Another scan is refreshing the index; try again in a few minutes.",
+                    retryable=True,
+                ).as_result()
             if not scan["ok"]:
                 return {
                     "ok": False,
@@ -1043,6 +1049,7 @@ def _strict_scan_for_enable(
     sources: Sequence[str],
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_wait: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     from .workbench.daemon import Scanner
     from .workbench.index import INDEX_DB
@@ -1061,7 +1068,9 @@ def _strict_scan_for_enable(
                 "reused": True,
                 "required_sources": sorted(required),
             }
-    scan = Scanner().scan_once_strict(sorted(required), progress=progress)
+    scan = Scanner().scan_once_strict(
+        sorted(required), progress=progress, on_wait=on_wait
+    )
     if scan.get("ok"):
         with _strict_scan_reuse_lock:
             _strict_scan_reuse[key] = (required, time.monotonic())
@@ -1077,6 +1086,7 @@ def enable(
     accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
     scan_progress: Callable[[str, int, int], None] | None = None,
+    scan_wait_notice: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Review or transactionally create/update a recurring enrollment.
 
@@ -1087,7 +1097,8 @@ def enable(
     same exact-version discipline as the authorization and retention terms.
     ``scan_progress`` is forwarded to the strict refresh (sources and
     counters only), which runs only on a call whose acceptance matches the
-    displayed profile.
+    displayed profile; ``scan_wait_notice`` fires once if that refresh has
+    to wait for a scan in another process.
     """
 
     targets = _hook_targets(agent)
@@ -1155,7 +1166,18 @@ def enable(
         # enroll: refresh the index now — a refresh that just completed for
         # the same index and sources is reused, so one interactive flow pays
         # for at most one full re-parse.
-        scan = _strict_scan_for_enable(scope["sources"], progress=scan_progress)
+        scan = _strict_scan_for_enable(
+            scope["sources"], progress=scan_progress, on_wait=scan_wait_notice
+        )
+        if scan.get("busy"):
+            # Fail closed with an honest code: another process held the scan
+            # lock past the bounded wait, so nothing was refreshed and there
+            # is nothing to diagnose in the source logs.
+            return AutoUploadError(
+                "scanner_busy",
+                "Another scan is refreshing the index; try again in a few minutes.",
+                retryable=True,
+            ).as_result()
         if not scan["ok"]:
             return {
                 "ok": False,

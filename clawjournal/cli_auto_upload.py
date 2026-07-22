@@ -310,6 +310,16 @@ def run(args) -> None:
                     file=sys.stderr,
                 )
 
+        def scan_wait_notice() -> None:
+            # Fires once when the strict refresh must wait for a scan in
+            # another process (usually the daemon's background pass).
+            if not output_json:
+                print(
+                    "Waiting for another scan to finish before refreshing "
+                    "(the background scanner may be mid-pass)…",
+                    file=sys.stderr,
+                )
+
         def call_enable() -> dict[str, Any]:
             hosted_notice()
             return auto_upload.enable(
@@ -319,6 +329,7 @@ def run(args) -> None:
                 accepted_ownership_certification_version=ownership_version,
                 accepted_authorization_profile_hash=profile_hash,
                 scan_progress=scan_progress,
+                scan_wait_notice=scan_wait_notice,
             )
 
         result = call_enable()

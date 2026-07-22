@@ -233,6 +233,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
 
     for call in calls:
         assert callable(call.pop("scan_progress"))
+        assert callable(call.pop("scan_wait_notice"))
     accepted = {
         "agent": "all",
         "accepted_authorization_version": "auth-v1",
@@ -286,6 +287,7 @@ def test_interactive_enable_reprompts_once_when_the_refresh_changes_scope(
 
     def enable(**kwargs):
         kwargs.pop("scan_progress", None)
+        kwargs.pop("scan_wait_notice", None)
         calls.append(kwargs)
         if len(calls) == 1:
             return challenge("profile-one", ["project"])

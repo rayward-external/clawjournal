@@ -126,6 +126,95 @@ class _StrictScanLogFilter(logging.Filter):
         )
 
 
+# Serializes scan passes ACROSS processes (CLI commands vs the serve daemon):
+# SQLite allows one writer at a time, and a daemon background pass can hold
+# write transactions long enough that a concurrent CLI scan's upserts blow
+# through the busy timeout and fail. The lock file lives next to the index
+# database — the contended resource — which also isolates monkeypatched test
+# indexes from each other.
+SCAN_LOCK_FILENAME = "scan.lock"
+# Longer than a full background pass on a large corpus, so a strict scan
+# waiting on the lock outlives the daemon tick that holds it.
+SCAN_LOCK_WAIT_SECONDS = 300.0
+_SCAN_LOCK_POLL_SECONDS = 0.5
+
+
+@contextmanager
+def _scan_process_lock(
+    *,
+    wait_seconds: float | None,
+    on_wait: Callable[[], None] | None = None,
+) -> Iterator[bool]:
+    """Acquire the cross-process scan lock; yields whether it was acquired.
+
+    Mirrors ``auto_upload.whole_run_lock``: an OS-level lock the kernel
+    releases on process death, so a crashed scan can never wedge future
+    scans. ``wait_seconds=None`` makes a single non-blocking attempt;
+    otherwise attempts are polled until the deadline passes. ``on_wait``
+    fires once if the first attempt fails, before any waiting starts.
+    """
+
+    from .index import INDEX_DB
+
+    path = Path(str(INDEX_DB)).parent / SCAN_LOCK_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file = path.open("a+b")
+    acquired = False
+
+    def _try_acquire() -> bool:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                # Byte-range locking needs at least one byte; unlike the
+                # single-attempt whole_run_lock this is retried in a poll
+                # loop, so guard on the real size instead of appending a
+                # byte per attempt.
+                if os.fstat(file.fileno()).st_size == 0:
+                    file.write(b"0")
+                    file.flush()
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+        import fcntl
+
+        try:
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    try:
+        acquired = _try_acquire()
+        if not acquired and wait_seconds is not None:
+            if on_wait is not None:
+                on_wait()
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                time.sleep(_SCAN_LOCK_POLL_SECONDS)
+                acquired = _try_acquire()
+                if acquired:
+                    break
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    file.seek(0)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        file.close()
+
+
 @contextmanager
 def _strict_scan_log_guard() -> Iterator[None]:
     """Allow only explicitly bounded logs from the current strict scan.
@@ -507,27 +596,59 @@ class Scanner:
         if self._thread:
             self._thread.join(timeout=5)
 
-    def scan_once(self) -> dict[str, int]:
+    def scan_once(
+        self,
+        *,
+        lock_wait_seconds: float | None = SCAN_LOCK_WAIT_SECONDS,
+    ) -> dict[str, int]:
         """Run a scan pass and return ``{source: new_session_count}``.
 
         The return shape is retained for existing callers. Counts for traces
         whose content changed (or remained unchanged) are exposed on the
-        ``last_updated_*`` and ``last_unchanged_*`` attributes.
+        ``last_updated_*`` and ``last_unchanged_*`` attributes. Waits up to
+        ``lock_wait_seconds`` for a scan in another process to finish; if
+        the wait expires, the scan proceeds unlocked — the normal scan is
+        per-project resilient and this can never be worse than the pre-lock
+        behavior. Only strict scans fail closed on contention.
         """
         with self._scan_lock:
-            return self._scan_once_report(required_sources=None)["new_by_source"]
+            with _scan_process_lock(wait_seconds=lock_wait_seconds) as acquired:
+                if not acquired:
+                    logger.warning(
+                        "Scan lock wait expired; scanning alongside another process"
+                    )
+                return self._scan_once_report(required_sources=None)["new_by_source"]
+
+    def _scan_tick(self) -> dict[str, int] | None:
+        """One background-loop pass; skips when another process is scanning.
+
+        The loop reruns within a minute, so a skipped tick just catches up on
+        the next one instead of contending with a CLI scan for SQLite writes.
+        """
+        with self._scan_lock:
+            with _scan_process_lock(wait_seconds=None) as acquired:
+                if not acquired:
+                    logger.info(
+                        "Skipping background scan: another process holds the scan lock"
+                    )
+                    return None
+                return self._scan_once_report(required_sources=None)["new_by_source"]
 
     def scan_once_if_idle(self) -> dict[str, int] | None:
         """Run a normal scan only when no scan is already active.
 
         HTTP refresh requests use this non-blocking entry point so repeated
         desktop launches coalesce instead of running concurrent SQLite and
-        findings passes on the same Scanner instance.
+        findings passes on the same Scanner instance — or against a scan in
+        another process.
         """
         if not self._scan_lock.acquire(blocking=False):
             return None
         try:
-            return self._scan_once_report(required_sources=None)["new_by_source"]
+            with _scan_process_lock(wait_seconds=None) as acquired:
+                if not acquired:
+                    return None
+                return self._scan_once_report(required_sources=None)["new_by_source"]
         finally:
             self._scan_lock.release()
 
@@ -536,6 +657,8 @@ class Scanner:
         required_sources: list[str],
         *,
         progress: Callable[[str, int, int], None] | None = None,
+        on_wait: Callable[[], None] | None = None,
+        lock_wait_seconds: float | None = SCAN_LOCK_WAIT_SECONDS,
     ) -> dict[str, Any]:
         """Run a fail-closed refresh for an automatic-upload source scope.
 
@@ -545,6 +668,10 @@ class Scanner:
         the report is safe to persist as scheduler telemetry.  ``progress``
         receives ``(source, position, total)`` per project under the same
         discipline — sources and counters only, never names or paths.
+        ``on_wait`` fires once if a scan in another process holds the lock;
+        if the lock is still held after ``lock_wait_seconds``, the refresh
+        fails closed with a ``busy`` report instead of contending for SQLite
+        writes it would lose.
         """
         required = sorted({source.strip() for source in required_sources if source.strip()})
         if not required:
@@ -565,9 +692,26 @@ class Scanner:
                 ],
             }
         with self._scan_lock:
-            return self._scan_once_report(
-                required_sources=set(required), progress=progress
-            )
+            with _scan_process_lock(
+                wait_seconds=lock_wait_seconds, on_wait=on_wait
+            ) as acquired:
+                if not acquired:
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "required_sources": required,
+                        "discovered_sources": [],
+                        "missing_sources": [],
+                        "new_by_source": {},
+                        "updated_by_source": {},
+                        "unchanged_by_source": {},
+                        "failures": [
+                            {"source": "*", "stage": "lock", "code": "scanner_busy"}
+                        ],
+                    }
+                return self._scan_once_report(
+                    required_sources=set(required), progress=progress
+                )
 
     def _scan_once_report(
         self,
@@ -668,74 +812,26 @@ class Scanner:
                         locator=project.get("locator"),
                         strict_jsonl=strict,
                     )
-                    if sessions:
-                        if strict:
-                            for session in sessions:
-                                snapshot = session.pop(
-                                    "_raw_source_fingerprint", None
-                                )
-                                session_id = session.get("session_id")
-                                if (
-                                    source in {"claude", "codex"}
-                                    and (
-                                        not session_id
-                                        or not isinstance(snapshot, tuple)
-                                        or len(snapshot) != 5
-                                    )
-                                ):
-                                    raise ValueError(
-                                        "strict parser did not return a raw-source snapshot"
-                                    )
-                                if session_id and snapshot is not None:
-                                    strict_raw_fingerprints[str(session_id)] = list(
-                                        snapshot
-                                    )
-                        upsert_stats: dict[str, int] = {}
-                        new_count = upsert_sessions(conn, sessions, stats=upsert_stats)
-                        results[source] = results.get(source, 0) + new_count
-                        updated_count = upsert_stats.get("updated", 0)
-                        unchanged_count = upsert_stats.get("unchanged", 0)
-                        self.last_updated_count += updated_count
-                        self.last_unchanged_count += unchanged_count
-                        self.last_updated_by_source[source] = (
-                            self.last_updated_by_source.get(source, 0) + updated_count
-                        )
-                        self.last_unchanged_by_source[source] = (
-                            self.last_unchanged_by_source.get(source, 0) + unchanged_count
-                        )
-                        # Drive each freshly-upserted session through the
-                        # findings pipeline. Settle-threshold + revision
-                        # check inside the driver keep this cheap on steady
-                        # state; errors per session don't abort the loop.
+                    if sessions and strict:
                         for session in sessions:
-                            sid = session.get("session_id")
-                            if not sid:
-                                continue
-                            try:
-                                run_findings_pipeline(
-                                    conn,
-                                    sid,
-                                    session,
-                                    config=config,
-                                    safe_logging=strict,
+                            snapshot = session.pop(
+                                "_raw_source_fingerprint", None
+                            )
+                            session_id = session.get("session_id")
+                            if (
+                                source in {"claude", "codex"}
+                                and (
+                                    not session_id
+                                    or not isinstance(snapshot, tuple)
+                                    or len(snapshot) != 5
                                 )
-                            except Exception:
-                                if strict:
-                                    _log_strict_scan_failure(
-                                        source=source,
-                                        stage="findings",
-                                        code="findings_failed",
-                                    )
-                                else:
-                                    logger.exception(
-                                        "Findings pipeline failed for %s", sid
-                                    )
-                                failures.append(
-                                    {
-                                        "source": source,
-                                        "stage": "findings",
-                                        "code": "findings_failed",
-                                    }
+                            ):
+                                raise ValueError(
+                                    "strict parser did not return a raw-source snapshot"
+                                )
+                            if session_id and snapshot is not None:
+                                strict_raw_fingerprints[str(session_id)] = list(
+                                    snapshot
                                 )
                 except Exception:
                     if strict:
@@ -749,6 +845,78 @@ class Scanner:
                     failures.append(
                         {"source": source, "stage": "parse", "code": "parse_failed"}
                     )
+                    continue
+                if not sessions:
+                    continue
+                try:
+                    upsert_stats: dict[str, int] = {}
+                    new_count = upsert_sessions(conn, sessions, stats=upsert_stats)
+                    results[source] = results.get(source, 0) + new_count
+                    updated_count = upsert_stats.get("updated", 0)
+                    unchanged_count = upsert_stats.get("unchanged", 0)
+                    self.last_updated_count += updated_count
+                    self.last_unchanged_count += unchanged_count
+                    self.last_updated_by_source[source] = (
+                        self.last_updated_by_source.get(source, 0) + updated_count
+                    )
+                    self.last_unchanged_by_source[source] = (
+                        self.last_unchanged_by_source.get(source, 0) + unchanged_count
+                    )
+                except Exception as store_error:
+                    # Not a parse problem: the sessions parsed cleanly and the
+                    # index write failed. A lock timeout gets its own code so
+                    # contention is diagnosable as contention.
+                    code = (
+                        "index_busy"
+                        if isinstance(store_error, sqlite3.OperationalError)
+                        else "store_failed"
+                    )
+                    if strict:
+                        _log_strict_scan_failure(
+                            source=source, stage="store", code=code
+                        )
+                    else:
+                        logger.exception(
+                            "Error storing project %s", project["dir_name"]
+                        )
+                    failures.append(
+                        {"source": source, "stage": "store", "code": code}
+                    )
+                    continue
+                # Drive each freshly-upserted session through the findings
+                # pipeline. Settle-threshold + revision check inside the
+                # driver keep this cheap on steady state; errors per session
+                # don't abort the loop.
+                for session in sessions:
+                    sid = session.get("session_id")
+                    if not sid:
+                        continue
+                    try:
+                        run_findings_pipeline(
+                            conn,
+                            sid,
+                            session,
+                            config=config,
+                            safe_logging=strict,
+                        )
+                    except Exception:
+                        if strict:
+                            _log_strict_scan_failure(
+                                source=source,
+                                stage="findings",
+                                code="findings_failed",
+                            )
+                        else:
+                            logger.exception(
+                                "Findings pipeline failed for %s", sid
+                            )
+                        failures.append(
+                            {
+                                "source": source,
+                                "stage": "findings",
+                                "code": "findings_failed",
+                            }
+                        )
 
             try:
                 self.last_linked_count = link_subagent_hierarchy(conn)
@@ -928,7 +1096,10 @@ class Scanner:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                results = self.scan_once()
+                results = self._scan_tick()
+                if results is None:
+                    self._stop_event.wait(SCAN_INTERVAL)
+                    continue
                 trigger_scoring_warmup(self)
                 total_new = sum(results.values())
                 if (
