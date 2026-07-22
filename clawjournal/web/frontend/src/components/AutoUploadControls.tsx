@@ -551,7 +551,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
         <div style={summaryGridStyle}>
           <SummaryItem label="Sources" value={compactList(scope.sources, 'No confirmed sources')} />
           <SummaryItem label="Projects" value={compactList(scope.projects, 'No confirmed projects')} />
-          <SummaryItem label="Schedule" value={`Every ${cadence} days, on the next supported agent session`} />
+          <SummaryItem label="Schedule" value={`Every ${cadence} day${cadence === 1 ? '' : 's'}, on the next supported agent session`} />
           <SummaryItem label="Per-cycle cap" value={`Up to ${cap} selected traces`} />
           {challenge && (
             <SummaryItem
@@ -1005,7 +1005,7 @@ export function AutoUploadPanel() {
         <SummaryItem label="Sources" value={compactList(status.scope.sources, status.mode === 'off' ? 'Set when enabled' : 'None')} />
         <SummaryItem label="Projects" value={compactList(status.scope.projects, status.mode === 'off' ? 'Set when enabled' : 'None')} />
         <SummaryItem label="Future-only cutoff" value={status.enrolled_at ? formatTimestamp(status.enrolled_at) : 'Begins when enabled'} />
-        <SummaryItem label="Cycle" value={`Up to ${status.cap} traces every ${status.cadence_days} days`} />
+        <SummaryItem label="Cycle" value={`Up to ${status.cap} traces every ${status.cadence_days} day${status.cadence_days === 1 ? '' : 's'}`} />
         <SummaryItem label="AI-assisted PII" value={status.ai.enabled ? `On · ${status.ai.backend ?? 'configured provider'}` : 'Off'} />
         <SummaryItem label="Authorization" value={status.authorization.version ?? 'Not accepted'} />
         <SummaryItem label="Next due" value={formatTimestamp(status.next_due_at)} />

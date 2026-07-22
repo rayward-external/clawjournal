@@ -39,7 +39,7 @@ def test_noninteractive_enable_requires_exact_versions(monkeypatch, capsys):
         },
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
-        "cadence_days": 7,
+        "cadence_days": 1,
         "maximum_bundle_size": 5_000_000,
     }
     monkeypatch.setattr("clawjournal.auto_upload.enable", lambda **kwargs: challenge)
@@ -133,7 +133,7 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
         },
         "ai": {"enabled": True, "backend": attack},
         "cap": 5,
-        "cadence_days": 7,
+        "cadence_days": 1,
         "maximum_bundle_size": 5_000_000,
         "destination_origin": attack,
     }
@@ -156,6 +156,8 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
     assert "\x1b" not in output + "".join(prompts)
     assert "\x07" not in output + "".join(prompts)
     assert "Exact authorized source/project pairs:" in output
+    assert "cadence: 1 day" in output
+    assert "cadence: 1 days" not in output
     assert all("\n" not in prompt for prompt in prompts)
 
 
@@ -195,7 +197,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
         },
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
-        "cadence_days": 7,
+        "cadence_days": 1,
         "maximum_bundle_size": 5_000_000,
     }
     calls = []
@@ -265,7 +267,7 @@ def test_interactive_accept_handles_keyboard_interrupt(monkeypatch):
         },
         "ai": {"enabled": False, "backend": None},
         "cap": 5,
-        "cadence_days": 7,
+        "cadence_days": 1,
         "maximum_bundle_size": 5_000_000,
     }
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())

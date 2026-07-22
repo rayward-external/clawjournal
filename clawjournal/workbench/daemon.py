@@ -28,7 +28,10 @@ from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import __version__
-from ..auto_upload_client import RECURRING_UPLOAD_API_VERSION
+from ..auto_upload_client import (
+    RECURRING_CADENCE_DAYS,
+    RECURRING_UPLOAD_API_VERSION,
+)
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
 from ..scoring.backends import (
@@ -1251,6 +1254,8 @@ def _recurring_offer_available(capabilities: dict[str, Any]) -> bool:
     return bool(
         capabilities.get("recurring_upload_api_version")
         == RECURRING_UPLOAD_API_VERSION
+        and capabilities.get("recurring_cadence_days")
+        == RECURRING_CADENCE_DAYS
         and capabilities.get("recurring_enrollment_open") is True
     )
 

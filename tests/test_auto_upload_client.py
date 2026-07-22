@@ -11,6 +11,7 @@ from clawjournal import auto_upload_client as client
 def _caps(**overrides):
     caps = {
         "recurring_upload_api_version": 2,
+        "recurring_cadence_days": 1,
         "recurring_enrollment_open": True,
         "maximum_recurring_sessions": 5,
         "maximum_bundle_size": 1_000_000,
@@ -39,6 +40,18 @@ def test_capabilities_require_every_safety_contract():
     with pytest.raises(client.CapabilityError, match="duplicate_revision_enforcement"):
         client.validate_capabilities(
             _caps(duplicate_revision_enforcement=False),
+            origin="https://data.rayward.ai",
+        )
+
+    with pytest.raises(client.CapabilityError, match="recurring_cadence_days"):
+        client.validate_capabilities(
+            _caps(recurring_cadence_days=7),
+            origin="https://data.rayward.ai",
+        )
+
+    with pytest.raises(client.CapabilityError, match="recurring_cadence_days"):
+        client.validate_capabilities(
+            _caps(recurring_cadence_days=True),
             origin="https://data.rayward.ai",
         )
 

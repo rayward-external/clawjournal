@@ -23,6 +23,7 @@ from . import __version__
 # explicitly accepted; the server computes and owns the scope hash.
 RECURRING_UPLOAD_API_VERSION = 2
 RECURRING_CLIENT_PROTOCOL_VERSION = "2"
+RECURRING_CADENCE_DAYS = 1
 # Mirrors the hosted RECURRING_SCOPE_MAX_ENTRIES contract limit so oversized
 # scopes fail fast locally instead of as a server-worded enrollment rejection.
 MAX_SCOPE_ENTRIES = 200
@@ -151,12 +152,18 @@ def validate_capabilities(
     )
     required_equals = {
         "recurring_upload_api_version": RECURRING_UPLOAD_API_VERSION,
+        "recurring_cadence_days": RECURRING_CADENCE_DAYS,
         "maximum_recurring_sessions": MAX_RECURRING_SESSIONS,
         "exact_artifact_idempotency": True,
         "duplicate_revision_enforcement": True,
     }
     for field, expected in required_equals.items():
-        if capabilities.get(field) != expected:
+        actual = capabilities.get(field)
+        if actual != expected or (
+            isinstance(expected, int)
+            and not isinstance(expected, bool)
+            and (not isinstance(actual, int) or isinstance(actual, bool))
+        ):
             raise CapabilityError(
                 "capability_incompatible",
                 f"Hosted recurring-upload capability {field} is unavailable or incompatible.",

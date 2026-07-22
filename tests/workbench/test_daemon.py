@@ -34,15 +34,23 @@ from clawjournal.workbench.index import add_policy, open_index, set_hold_state, 
 def test_recurring_offer_uses_current_protocol_version():
     assert _recurring_offer_available({
         "recurring_upload_api_version": 2,
+        "recurring_cadence_days": 1,
         "recurring_enrollment_open": True,
     }) is True
     assert _recurring_offer_available({
         "recurring_upload_api_version": 1,
+        "recurring_cadence_days": 1,
         "recurring_enrollment_open": True,
     }) is False
     assert _recurring_offer_available({
         "recurring_upload_api_version": 2,
+        "recurring_cadence_days": 1,
         "recurring_enrollment_open": False,
+    }) is False
+    assert _recurring_offer_available({
+        "recurring_upload_api_version": 2,
+        "recurring_cadence_days": 7,
+        "recurring_enrollment_open": True,
     }) is False
 
 
@@ -56,6 +64,7 @@ def test_successful_v2_manual_share_caches_offer_available(server, monkeypatch):
     # A capability document shaped like the live v2 /.well-known response.
     live_v2_capabilities = {
         "recurring_upload_api_version": 2,
+        "recurring_cadence_days": 1,
         "recurring_enrollment_open": True,
         "supported_recurring_client_versions": ["2"],
         "maximum_bundle_size": 52428800,

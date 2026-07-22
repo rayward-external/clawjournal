@@ -125,7 +125,7 @@ function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadSt
       projects: Array.isArray(scope.projects) ? scope.projects : [],
     },
     cap: typeof raw.cap === 'number' ? raw.cap : 5,
-    cadence_days: typeof raw.cadence_days === 'number' ? raw.cadence_days : 7,
+    cadence_days: typeof raw.cadence_days === 'number' ? raw.cadence_days : 1,
     ai: {
       enabled: ai.enabled === true,
       backend: typeof ai.backend === 'string' ? ai.backend : null,

@@ -34,7 +34,7 @@ def _sanitize_terminal_line(text: Any) -> str:
 
 def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
-        "auto-upload", help="Manage authorized automatic weekly sharing"
+        "auto-upload", help="Manage authorized automatic daily sharing"
     )
     commands = parser.add_subparsers(dest="auto_upload_command", required=True)
 
@@ -173,8 +173,10 @@ def _interactive_accept(
     print("Exact authorized source/project pairs:")
     for source, project in entries:
         print(_sanitize_terminal_line(f"  {source} -> {project}"))
+    cadence_days = challenge["cadence_days"]
+    cadence_unit = "day" if cadence_days == 1 else "days"
     print(_sanitize_terminal_line(
-        f"Cycle cap: {challenge['cap']}; cadence: {challenge['cadence_days']} days"
+        f"Cycle cap: {challenge['cap']}; cadence: {cadence_days} {cadence_unit}"
     ))
     print(_sanitize_terminal_line(
         f"Maximum bundle size: {challenge['maximum_bundle_size']} bytes"
