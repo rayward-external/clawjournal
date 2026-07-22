@@ -674,7 +674,11 @@ export const api = {
     return request(`/advisor${qs(params)}`);
   },
 
-  scan(opts: { force?: boolean } = {}): Promise<{ ok: boolean; new_sessions: Record<string, number>; updated_sessions?: Record<string, number>; unchanged_sessions?: Record<string, number>; force_rescan?: { processed: number; errored: { session_id: string; error: string }[] } }> {
+  desktopOpened(): Promise<{ ok: boolean; scheduled: boolean }> {
+    return request('/desktop/opened', { method: 'POST' });
+  },
+
+  scan(opts: { force?: boolean } = {}): Promise<{ ok: boolean; status?: 'already_running'; new_sessions: Record<string, number>; updated_sessions?: Record<string, number>; unchanged_sessions?: Record<string, number>; force_rescan?: { processed: number; errored: { session_id: string; error: string }[] } }> {
     const path = opts.force ? '/scan?force=true' : '/scan';
     return request(path, { method: 'POST' });
   },

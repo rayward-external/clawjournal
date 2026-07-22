@@ -17,11 +17,13 @@ import json
 import math
 import os
 import plistlib
+import secrets
 import shlex
 import shutil
 import struct
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 import webbrowser
@@ -32,7 +34,12 @@ from typing import Any
 
 from . import config as _config
 from .config import load_config
-from .paths import atomic_write_text, ensure_api_token
+from .paths import (
+    HEALTH_CHALLENGE_BYTES,
+    api_health_proof,
+    atomic_write_text,
+    ensure_api_token,
+)
 
 
 # Every path below is resolved on each call rather than bound at import time.
@@ -80,6 +87,14 @@ ICON_SIZE = 256
 # The shortcut redirects the daemon's stdout/stderr here, and the daemon logs
 # every HTTP request, so the log needs a ceiling to stay bounded over months.
 LOG_MAX_BYTES = 1_000_000
+DESKTOP_COMMAND_TIMEOUT_SECONDS = 30.0
+
+_PORT_FREE = "free"
+_PORT_WORKBENCH = "workbench"
+_PORT_OCCUPIED = "occupied"
+_NOTE_OPENED_LOCK = threading.Lock()
+_NOTE_OPENED_THREAD_LOCK = threading.Lock()
+_note_opened_thread: threading.Thread | None = None
 
 
 class DesktopError(RuntimeError):
@@ -448,11 +463,23 @@ def _powershell_quote(value: str | Path) -> str:
 
 
 def _run_quiet(command: list[str]) -> subprocess.CompletedProcess[str]:
-    kwargs: dict[str, Any] = {"capture_output": True, "text": True, "check": False}
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": DESKTOP_COMMAND_TIMEOUT_SECONDS,
+    }
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         return subprocess.run(command, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            command,
+            124,
+            "",
+            f"Command timed out after {DESKTOP_COMMAND_TIMEOUT_SECONDS:g} seconds",
+        )
     except OSError as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
 
@@ -987,30 +1014,77 @@ def note_opened() -> None:
 
     Cheap to call repeatedly: the icon only ever changes on a calendar-day
     boundary, so an open already recorded for today needs no shortcut rewrite.
-    That keeps this safe on the daemon's page-serving path.
+    That keeps repeated launcher and background notification calls cheap.
     """
-    if _read_state() is None or opened_today():
-        return
-    _write_last_opened()
-    try:
-        refresh(quiet=True)
-    except (DesktopError, OSError):
-        # Opening the workbench must never fail because Explorer/Finder is busy.
-        pass
+    with _NOTE_OPENED_LOCK:
+        if _read_state() is None or opened_today():
+            return
+        _write_last_opened()
+        try:
+            refresh(quiet=True)
+        except (DesktopError, OSError):
+            # Opening the workbench must never fail because Explorer/Finder is busy.
+            pass
 
 
-def _workbench_running(port: int) -> bool:
-    """Whether anything already holds the workbench port.
+def note_opened_async() -> bool:
+    """Schedule the desktop refresh without blocking an HTTP request thread.
 
-    Deliberately a bare TCP connect, not an API call. This used to request
-    `/api/stats` — a real SQL aggregate over the index — with a 0.6s timeout,
-    so a daemon that was merely busy scanning read as "not running" and the
-    launcher started a second one. Liveness here only needs to answer "is the
-    port taken", and `_daemon_port_is_open` already answers exactly that.
+    Repeated SPA mounts are coalesced while the first notification is active.
+    `note_opened()` retains its own lock because manual `serve` and launcher
+    paths can call it directly at the same time.
     """
+    global _note_opened_thread
+
+    with _NOTE_OPENED_THREAD_LOCK:
+        if _note_opened_thread is not None and _note_opened_thread.is_alive():
+            return False
+        _note_opened_thread = threading.Thread(
+            target=note_opened,
+            name="clawjournal-desktop-open",
+            daemon=True,
+        )
+        _note_opened_thread.start()
+        return True
+
+
+def _daemon_port_is_open(port: int) -> bool:
     from .cli import _daemon_port_is_open
 
     return _daemon_port_is_open(port)
+
+
+def _workbench_port_state(port: int) -> str:
+    """Classify the configured port without mistaking another service for us."""
+    if not _daemon_port_is_open(port):
+        return _PORT_FREE
+
+    token = ensure_api_token(_config_dir())
+    challenge = secrets.token_hex(HEALTH_CHALLENGE_BYTES)
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/.well-known/clawjournal?challenge={challenge}",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.75) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
+        return _PORT_OCCUPIED
+    expected_proof = api_health_proof(token, challenge)
+    if (
+        isinstance(payload, dict)
+        and payload.get("service") == "clawjournal"
+        and isinstance(payload.get("proof"), str)
+        and secrets.compare_digest(payload["proof"], expected_proof)
+    ):
+        return _PORT_WORKBENCH
+    return _PORT_OCCUPIED
+
+
+def _occupied_port_error(port: int) -> DesktopError:
+    return DesktopError(
+        f"Port {port} is already in use by another local service. Stop that "
+        "service or configure a different ClawJournal daemon_port."
+    )
 
 
 def _request_scan(port: int) -> None:
@@ -1043,10 +1117,13 @@ def launch() -> None:
     config = load_config()
     port = int(config.get("daemon_port") or 8384)
     url = f"http://localhost:{port}/"
-    if _workbench_running(port):
+    port_state = _workbench_port_state(port)
+    if port_state == _PORT_WORKBENCH:
         _request_scan(port)
         webbrowser.open(url)
         return
+    if port_state == _PORT_OCCUPIED:
+        raise _occupied_port_error(port)
 
     from .pricing import ensure_pricing_fresh
     from .workbench.daemon import run_server
@@ -1054,12 +1131,18 @@ def launch() -> None:
     ensure_pricing_fresh()
     try:
         run_server(port=port, open_browser=True, allow_port_fallback=False)
-    except OSError:
+    except OSError as exc:
         # Another click won the race between the probe above and the bind.
-        # That process owns the port, so join it instead of quietly starting a
-        # duplicate daemon on an ephemeral port.
-        _request_scan(port)
-        webbrowser.open(url)
+        # Verify that the winner is ClawJournal before joining it; another
+        # local service must never be opened under the ClawJournal name.
+        port_state = _workbench_port_state(port)
+        if port_state == _PORT_WORKBENCH:
+            _request_scan(port)
+            webbrowser.open(url)
+            return
+        if port_state == _PORT_OCCUPIED:
+            raise _occupied_port_error(port) from exc
+        raise DesktopError(f"Could not start the workbench on port {port}: {exc}") from exc
 
 
 def _remove_file(path: Path) -> None:

@@ -7,6 +7,7 @@ import json
 import socket
 import struct
 import subprocess
+import threading
 import zlib
 from pathlib import Path
 
@@ -197,6 +198,28 @@ def test_note_opened_rewrites_only_on_a_new_day(
     assert desktop.opened_today() is True
 
 
+def test_note_opened_async_coalesces_an_active_refresh(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def slow_note_opened() -> None:
+        calls.append("opened")
+        started.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(desktop, "note_opened", slow_note_opened)
+    assert desktop.note_opened_async() is True
+    assert started.wait(timeout=2)
+    assert desktop.note_opened_async() is False
+    release.set()
+    assert desktop._note_opened_thread is not None
+    desktop._note_opened_thread.join(timeout=2)
+    assert calls == ["opened"]
+
+
 def test_install_refuses_to_clobber_a_foreign_file_despite_stale_state(
     isolated_desktop: Path,
 ) -> None:
@@ -280,6 +303,20 @@ def test_trim_log_keeps_a_newline_free_log(isolated_desktop: Path) -> None:
     assert kept, "the whole log was thrown away"
     assert len(kept) <= desktop.LOG_MAX_BYTES // 2
     assert set(kept) == {"y"}
+
+
+def test_quiet_platform_commands_have_a_finite_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def time_out(command, **kwargs):
+        assert kwargs["timeout"] == desktop.DESKTOP_COMMAND_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(desktop.subprocess, "run", time_out)
+    result = desktop._run_quiet(["slow-platform-tool"])
+
+    assert result.returncode == 124
+    assert "timed out" in result.stderr
 
 
 def test_ico_directory_states_a_non_256_dimension(isolated_desktop: Path) -> None:
@@ -462,13 +499,68 @@ def test_launchers_start_outside_home_shadow_package(isolated_desktop: Path) -> 
     compile(bootstrap, str(desktop._windows_bootstrap()), "exec")
 
 
+def test_port_probe_requires_a_valid_health_challenge_response(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests = []
+
+    class Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode()
+
+    def urlopen(request, timeout):
+        requests.append((request, timeout))
+        challenge = request.full_url.rsplit("=", 1)[1]
+        token = desktop.ensure_api_token(desktop._config_dir())
+        return Response({
+            "ok": True,
+            "service": "clawjournal",
+            "proof": desktop.api_health_proof(token, challenge),
+        })
+
+    monkeypatch.setattr(desktop, "_daemon_port_is_open", lambda _port: True)
+    monkeypatch.setattr(desktop.urllib.request, "urlopen", urlopen)
+
+    assert desktop._workbench_port_state(8384) == desktop._PORT_WORKBENCH
+    request, timeout = requests[0]
+    assert request.full_url.startswith(
+        "http://127.0.0.1:8384/.well-known/clawjournal?challenge="
+    )
+    assert request.get_header("Authorization") is None
+    assert timeout == 0.75
+
+    monkeypatch.setattr(
+        desktop.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: Response({
+            "ok": True,
+            "service": "clawjournal",
+            "proof": "0" * 64,
+        }),
+    )
+    assert desktop._workbench_port_state(8384) == desktop._PORT_OCCUPIED
+
+
 def test_launch_reuses_live_workbench(
     isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[object] = []
     monkeypatch.setattr(desktop, "note_opened", lambda: calls.append("opened"))
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
-    monkeypatch.setattr(desktop, "_workbench_running", lambda port: port == 9001)
+    monkeypatch.setattr(
+        desktop,
+        "_workbench_port_state",
+        lambda port: desktop._PORT_WORKBENCH if port == 9001 else desktop._PORT_FREE,
+    )
     monkeypatch.setattr(desktop, "_request_scan", lambda port: calls.append(("scan", port)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda url: calls.append(("browser", url)))
 
@@ -481,15 +573,13 @@ def test_launch_reuses_live_workbench(
     ]
 
 
-def test_busy_daemon_is_reused_instead_of_starting_a_second_one(
+def test_occupied_unknown_port_is_not_opened_or_replaced(
     isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression: liveness was an /api/stats call with a 0.6s timeout, so a
-    daemon busy scanning read as 'not running' and a duplicate was started."""
+    """A bare listener is not proof that the port belongs to ClawJournal."""
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
-    # Never accepts, exactly like a daemon too busy to answer. The backlog
-    # must exceed the number of probes: each unaccepted connect holds a slot.
+    # Never accepts, so the TCP probe succeeds but authenticated health cannot.
     listener.listen(64)
     port = listener.getsockname()[1]
 
@@ -503,13 +593,14 @@ def test_busy_daemon_is_reused_instead_of_starting_a_second_one(
 
     monkeypatch.setattr("clawjournal.workbench.daemon.run_server", must_not_run)
     try:
-        assert desktop._workbench_running(port) is True
-        desktop.launch()
+        assert desktop._workbench_port_state(port) == desktop._PORT_OCCUPIED
+        with pytest.raises(desktop.DesktopError, match="another local service"):
+            desktop.launch()
     finally:
         listener.close()
 
-    assert calls == [("scan", port), ("browser", f"http://localhost:{port}/")]
-    assert desktop._workbench_running(port) is False  # closed again
+    assert calls == []
+    assert desktop._daemon_port_is_open(port) is False
 
 
 def test_losing_the_startup_race_does_not_spawn_a_duplicate(
@@ -518,7 +609,8 @@ def test_losing_the_startup_race_does_not_spawn_a_duplicate(
     """Two fast clicks: the loser must join the winner, not take a random port."""
     calls: list[object] = []
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 8384})
-    monkeypatch.setattr(desktop, "_workbench_running", lambda p: False)
+    states = iter((desktop._PORT_FREE, desktop._PORT_WORKBENCH))
+    monkeypatch.setattr(desktop, "_workbench_port_state", lambda _p: next(states))
     monkeypatch.setattr(desktop, "_request_scan", lambda p: calls.append(("scan", p)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
     monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda *a, **k: None)
@@ -531,6 +623,26 @@ def test_losing_the_startup_race_does_not_spawn_a_duplicate(
     desktop.launch()
 
     assert calls == [("scan", 8384), ("browser", "http://localhost:8384/")]
+
+
+def test_losing_startup_race_to_another_service_reports_an_error(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 8384})
+    states = iter((desktop._PORT_FREE, desktop._PORT_OCCUPIED))
+    monkeypatch.setattr(desktop, "_workbench_port_state", lambda _p: next(states))
+    monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
+    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon.run_server",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError(48, "Address already in use")),
+    )
+
+    with pytest.raises(desktop.DesktopError, match="another local service"):
+        desktop.launch()
+
+    assert calls == []
 
 
 def test_run_server_can_refuse_the_ephemeral_port_fallback() -> None:
