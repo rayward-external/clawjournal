@@ -2,10 +2,10 @@
 
 ``run_share_gate`` is the single chokepoint both export paths call on
 the merged ``sessions.jsonl`` (post-deterministic-redaction, and again
-post-PII-rewrite). Each pass:
+post-PII-rewrite). The gate:
 
-1. Betterleaks scans (broad detection, local-only) and TruffleHog
-   scans verified-only (live-credential check) — one subprocess each,
+1. Betterleaks scans (broad detection, local-only) and TruffleHog scans
+   verified-only (live-credential check) on the initial merged artifact,
    returning raw matches in *file-level* form (JSONL-escaped bytes as
    they appear on disk).
 2. Every finding is tiered by ``scan_policy.classify`` against the
@@ -16,8 +16,10 @@ post-PII-rewrite). Each pass:
    report the escaped on-disk form, not the decoded value. A
    replacement that breaks a line's JSON is rolled back and its
    finding escalated to review.
-4. The file is rescanned until a pass finds nothing left to redact
+4. Betterleaks alone rescans until no broad finding remains to redact
    (bounded by ``max_passes``; non-convergence escalates and blocks).
+5. If any bytes changed, TruffleHog performs one final verified-only
+   scan so a credential revealed by rewriting cannot leave the machine.
 
 Block/review findings accumulate across passes (their raws get
 redacted too — a best-effort scrub of the on-disk export dir that also
@@ -315,7 +317,7 @@ def _rewrite_sessions_file(
     return total, by_line, failed_pairs
 
 
-def _rawless_backstop_findings(bl_report, th_report) -> list[PolicyFinding]:
+def _rawless_backstop_findings(bl_report=None, th_report=None) -> list[PolicyFinding]:
     """Sticky findings for scanner hits that returned no usable raw.
 
     ``scan_file_with_raws`` only surfaces raw matches with a non-empty
@@ -327,39 +329,89 @@ def _rawless_backstop_findings(bl_report, th_report) -> list[PolicyFinding]:
     credential ship whenever TruffleHog omits ``Raw``.
     """
     out: list[PolicyFinding] = []
-    for f in th_report.findings:
-        if f.raw_sha256 is None:
-            out.append(
-                PolicyFinding(
-                    engine=trufflehog.TRUFFLEHOG_ENGINE_ID,
-                    rule=f.detector,
-                    status=f.status,
-                    line=f.line,
-                    masked=f.masked,
-                    raw_sha256=None,
-                    entropy=None,
-                    tier="block" if f.status == "verified" else "review",
-                    tier_reason="finding_without_raw",
-                    raw=None,
+    if th_report is not None:
+        for f in th_report.findings:
+            if f.raw_sha256 is None:
+                out.append(
+                    PolicyFinding(
+                        engine=trufflehog.TRUFFLEHOG_ENGINE_ID,
+                        rule=f.detector,
+                        status=f.status,
+                        line=f.line,
+                        masked=f.masked,
+                        raw_sha256=None,
+                        entropy=None,
+                        tier="block" if f.status == "verified" else "review",
+                        tier_reason="finding_without_raw",
+                        raw=None,
+                    )
                 )
-            )
-    for f in bl_report.findings:
-        if f.raw_sha256 is None:
-            out.append(
-                PolicyFinding(
-                    engine=betterleaks.BETTERLEAKS_ENGINE_ID,
-                    rule=f.rule_id,
-                    status="none",
-                    line=f.line,
-                    masked=f.masked,
-                    raw_sha256=None,
-                    entropy=f.entropy,
-                    tier="review",
-                    tier_reason="finding_without_raw",
-                    raw=None,
+    if bl_report is not None:
+        for f in bl_report.findings:
+            if f.raw_sha256 is None:
+                out.append(
+                    PolicyFinding(
+                        engine=betterleaks.BETTERLEAKS_ENGINE_ID,
+                        rule=f.rule_id,
+                        status="none",
+                        line=f.line,
+                        masked=f.masked,
+                        raw_sha256=None,
+                        entropy=f.entropy,
+                        tier="review",
+                        tier_reason="finding_without_raw",
+                        raw=None,
+                    )
                 )
-            )
     return out
+
+
+def _accumulate_policy_findings(
+    findings: list[PolicyFinding],
+    sticky: dict[tuple, PolicyFinding],
+    warns: dict[tuple, PolicyFinding],
+) -> None:
+    for finding in findings:
+        if finding.tier in ("block", "review"):
+            sticky.setdefault(_finding_key(finding), finding)
+        elif finding.tier == "warn":
+            warns.setdefault(_finding_key(finding), finding)
+
+
+def _rewrite_policy_findings(
+    sessions_file: Path,
+    findings: list[PolicyFinding],
+    *,
+    sticky: dict[tuple, PolicyFinding],
+    redacted_keys: set[tuple],
+) -> tuple[list[PolicyFinding], int, dict[int, int]]:
+    redactable = [
+        finding
+        for finding in findings
+        if finding.tier in ("redact", "review", "block")
+        and finding.raw is not None
+        and len(finding.raw) >= _MIN_RAW_LENGTH
+    ]
+    if not redactable:
+        return [], 0, {}
+
+    replaced, by_line, failed_pairs = _rewrite_sessions_file(
+        sessions_file, redactable
+    )
+    failed_raws = {raw for _line, raw in failed_pairs}
+    for finding in redactable:
+        failed_here = (
+            (finding.line, finding.raw) in failed_pairs
+            or (finding.line is None and finding.raw in failed_raws)
+        )
+        if failed_here and finding.tier not in ("block", "review"):
+            escalated = dataclasses.replace(
+                finding, tier="review", tier_reason="unredactable_span"
+            )
+            sticky.setdefault(_finding_key(escalated), escalated)
+        elif finding.tier == "redact" and not failed_here:
+            redacted_keys.add(_finding_key(finding))
+    return redactable, replaced, by_line
 
 
 def run_share_gate(
@@ -374,6 +426,9 @@ def run_share_gate(
     Never raises on scanner trouble — failures surface on the report
     (``binary_missing`` / ``scan_error``) so callers fail closed.
     """
+    if max_passes < 1:
+        raise ValueError("max_passes must be at least 1")
+
     bl_bypassed = betterleaks.is_bypassed()
     th_bypassed = trufflehog.is_bypassed()
     if bl_bypassed or th_bypassed:
@@ -416,14 +471,22 @@ def run_share_gate(
     while passes < max_passes:
         passes += 1
         bl_report, bl_raws = betterleaks.scan_file_with_raws(sessions_file)
-        th_report, th_raws = trufflehog.scan_file_with_raws(
-            sessions_file, results="verified"
-        )
+        th_raws = []
+        current_th_report = None
+        if passes == 1:
+            current_th_report, th_raws = trufflehog.scan_file_with_raws(
+                sessions_file, results="verified"
+            )
+            th_report = current_th_report
         error = (
             bl_report.scan_error
-            or th_report.scan_error
+            or (current_th_report.scan_error if current_th_report else None)
             or ("betterleaks binary disappeared mid-gate" if bl_report.binary_missing else None)
-            or ("trufflehog binary disappeared mid-gate" if th_report.binary_missing else None)
+            or (
+                "trufflehog binary disappeared mid-gate"
+                if current_th_report and current_th_report.binary_missing
+                else None
+            )
         )
         if error:
             return _finalize_report(
@@ -438,12 +501,8 @@ def run_share_gate(
             )
 
         findings = _policy_findings_for_pass(bl_raws, th_raws, decision_cache)
-        for f in findings:
-            if f.tier in ("block", "review"):
-                sticky.setdefault(_finding_key(f), f)
-            elif f.tier == "warn":
-                warns.setdefault(_finding_key(f), f)
-        for f in _rawless_backstop_findings(bl_report, th_report):
+        _accumulate_policy_findings(findings, sticky, warns)
+        for f in _rawless_backstop_findings(bl_report, current_th_report):
             sticky.setdefault(_finding_key(f), f)
 
         # Redact-tier raws are replaced so the share can proceed;
@@ -453,37 +512,19 @@ def run_share_gate(
         # span stays in the blocked export dir). Warn-tier values
         # are deliberately left alone — an ignored/allowlisted value is
         # the user's standing decision to keep it.
-        redactable = [
-            f for f in findings
-            if f.tier in ("redact", "review", "block")
-            and f.raw is not None and len(f.raw) >= _MIN_RAW_LENGTH
-        ]
+        redactable, replaced, by_line = _rewrite_policy_findings(
+            sessions_file,
+            findings,
+            sticky=sticky,
+            redacted_keys=redacted_keys,
+        )
         last_redactable = [f for f in redactable if f.tier == "redact"]
         if not redactable:
             converged = True
             break
-
-        replaced, by_line, failed_pairs = _rewrite_sessions_file(
-            sessions_file, redactable
-        )
         total_redactions += replaced
         for line_no, count in by_line.items():
             redactions_by_line[line_no] = redactions_by_line.get(line_no, 0) + count
-        failed_raws = {raw for _line, raw in failed_pairs}
-        for f in redactable:
-            failed_here = (
-                (f.line, f.raw) in failed_pairs
-                # A line-less finding was applied globally; a failure
-                # on any line is its failure.
-                or (f.line is None and f.raw in failed_raws)
-            )
-            if failed_here and f.tier not in ("block", "review"):
-                escalated = dataclasses.replace(
-                    f, tier="review", tier_reason="unredactable_span"
-                )
-                sticky.setdefault(_finding_key(escalated), escalated)
-            elif f.tier == "redact" and not failed_here:
-                redacted_keys.add(_finding_key(f))
 
     if not converged:
         # Pass budget exhausted with redactable findings still turning
@@ -495,6 +536,51 @@ def run_share_gate(
             )
             sticky.setdefault(_finding_key(escalated), escalated)
             redacted_keys.discard(_finding_key(f))
+
+    # Rewriting can reveal a credential hidden behind an earlier matched span.
+    # Verify the final bytes once, rather than repeating a network-backed
+    # TruffleHog pass during every Betterleaks convergence iteration.
+    if total_redactions:
+        th_report, final_th_raws = trufflehog.scan_file_with_raws(
+            sessions_file, results="verified"
+        )
+        error = (
+            th_report.scan_error
+            or (
+                "trufflehog binary disappeared mid-gate"
+                if th_report.binary_missing
+                else None
+            )
+        )
+        if error:
+            return _finalize_report(
+                GateReport(
+                    scanned_path=str(sessions_file),
+                    scanned_sha256=_hash_or_empty(sessions_file),
+                    scan_error=error,
+                    rescan_passes=passes,
+                ),
+                bl_report,
+                th_report,
+            )
+
+        final_findings = _policy_findings_for_pass(
+            [], final_th_raws, decision_cache
+        )
+        _accumulate_policy_findings(final_findings, sticky, warns)
+        for finding in _rawless_backstop_findings(th_report=th_report):
+            sticky.setdefault(_finding_key(finding), finding)
+        _final_redactable, replaced, by_line = _rewrite_policy_findings(
+            sessions_file,
+            final_findings,
+            sticky=sticky,
+            redacted_keys=redacted_keys,
+        )
+        total_redactions += replaced
+        for line_no, count in by_line.items():
+            redactions_by_line[line_no] = (
+                redactions_by_line.get(line_no, 0) + count
+            )
 
     all_findings = sorted(
         list(sticky.values()) + list(warns.values()),
