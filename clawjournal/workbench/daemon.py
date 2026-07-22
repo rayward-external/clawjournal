@@ -531,13 +531,20 @@ class Scanner:
         finally:
             self._scan_lock.release()
 
-    def scan_once_strict(self, required_sources: list[str]) -> dict[str, Any]:
+    def scan_once_strict(
+        self,
+        required_sources: list[str],
+        *,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> dict[str, Any]:
         """Run a fail-closed refresh for an automatic-upload source scope.
 
         Unlike :meth:`scan_once`, this returns a structured report and never
         turns a partial parse/findings pass into success.  Project names,
         paths, session IDs, and exception text are intentionally omitted so
-        the report is safe to persist as scheduler telemetry.
+        the report is safe to persist as scheduler telemetry.  ``progress``
+        receives ``(source, position, total)`` per project under the same
+        discipline — sources and counters only, never names or paths.
         """
         required = sorted({source.strip() for source in required_sources if source.strip()})
         if not required:
@@ -558,22 +565,28 @@ class Scanner:
                 ],
             }
         with self._scan_lock:
-            return self._scan_once_report(required_sources=set(required))
+            return self._scan_once_report(
+                required_sources=set(required), progress=progress
+            )
 
     def _scan_once_report(
         self,
         *,
         required_sources: set[str] | None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> dict[str, Any]:
         if required_sources is None:
             return self._scan_once_report_impl(required_sources=None)
         with _strict_scan_log_guard():
-            return self._scan_once_report_impl(required_sources=required_sources)
+            return self._scan_once_report_impl(
+                required_sources=required_sources, progress=progress
+            )
 
     def _scan_once_report_impl(
         self,
         *,
         required_sources: set[str] | None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> dict[str, Any]:
         strict = required_sources is not None
         self.last_updated_count = 0
@@ -623,6 +636,7 @@ class Scanner:
                     {"source": "*", "stage": "discovery", "code": "discovery_failed"}
                 )
 
+            relevant_projects = []
             for project in projects:
                 source = project.get("source", "")
                 if source not in WORKBENCH_SOURCES:
@@ -631,7 +645,19 @@ class Scanner:
                     continue
                 if self.source_filter and source != self.source_filter:
                     continue
+                relevant_projects.append(project)
+
+            total_projects = len(relevant_projects)
+            for position, project in enumerate(relevant_projects, start=1):
+                source = project.get("source", "")
                 discovered_sources.add(source)
+                if progress is not None:
+                    try:
+                        progress(source, position, total_projects)
+                    except Exception:
+                        # A broken progress callback must not fail the
+                        # fail-closed scan or leak into its failure report.
+                        progress = None
 
                 try:
                     sessions = parse_project_sessions(

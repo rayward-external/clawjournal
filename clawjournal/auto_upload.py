@@ -22,7 +22,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import __version__, config as config_module
 from .agent_hooks import (
@@ -1023,6 +1023,51 @@ def _reconcile_explicit_pause_after_reauthorization(
         return True
 
 
+# An interactive enrollment invokes enable() up to three times (challenge,
+# post-acceptance, post-email-verification).  The index only has to be fresh
+# for the call that actually mutates, so a strict refresh that just completed
+# for the same index and a superset of the sources is reused instead of
+# re-parsing the whole history again.  Only enable() consults this; every run
+# cycle still performs its own strict scan before packaging.
+STRICT_SCAN_REUSE_SECONDS = 600.0
+_strict_scan_reuse_lock = threading.Lock()
+_strict_scan_reuse: dict[str, tuple[frozenset[str], float]] = {}
+
+
+def _reset_strict_scan_reuse() -> None:
+    with _strict_scan_reuse_lock:
+        _strict_scan_reuse.clear()
+
+
+def _strict_scan_for_enable(
+    sources: Sequence[str],
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> dict[str, Any]:
+    from .workbench.daemon import Scanner
+    from .workbench.index import INDEX_DB
+
+    required = frozenset(sources)
+    key = str(INDEX_DB)
+    with _strict_scan_reuse_lock:
+        entry = _strict_scan_reuse.get(key)
+        if (
+            entry is not None
+            and required <= entry[0]
+            and time.monotonic() - entry[1] < STRICT_SCAN_REUSE_SECONDS
+        ):
+            return {
+                "ok": True,
+                "reused": True,
+                "required_sources": sorted(required),
+            }
+    scan = Scanner().scan_once_strict(sorted(required), progress=progress)
+    if scan.get("ok"):
+        with _strict_scan_reuse_lock:
+            _strict_scan_reuse[key] = (required, time.monotonic())
+    return scan
+
+
 def enable(
     *,
     agent: str = "all",
@@ -1031,6 +1076,7 @@ def enable(
     accepted_ownership_certification_version: str | None = None,
     accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
+    scan_progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Review or transactionally create/update a recurring enrollment.
 
@@ -1039,6 +1085,9 @@ def enable(
     are not depending on version mismatch to keep the call non-mutating.
     Protocol v2 requires the ownership certification to be accepted with the
     same exact-version discipline as the authorization and retention terms.
+    ``scan_progress`` is forwarded to the strict refresh (sources and
+    counters only), which runs only on a call whose acceptance matches the
+    displayed profile.
     """
 
     targets = _hook_targets(agent)
@@ -1069,18 +1118,44 @@ def enable(
                 "manual_share_required",
                 "Complete one successful hosted manual share before enabling automatic uploads.",
             ).as_result()
-        # Fail fast on the cheap network checks BEFORE the strict scan: the
-        # scan re-parses every enrolled source log (minutes of CPU on a large
-        # history), so an incompatible protocol, closed enrollment, or
-        # unreachable host must be surfaced without paying it. Later steps
-        # (server create/PATCH, the runner's enrollment gate) re-enforce
-        # capability freshness, so a closure during the scan still loses
-        # nothing.
+        # Only cheap work until acceptance is proven: the strict refresh
+        # re-parses every enrolled source log (minutes of CPU on a large
+        # history) and the interactive flow calls enable() up to three times
+        # (challenge, post-acceptance, post-email-verification), so the
+        # challenge is built from the current index and the refresh is
+        # deferred to the call whose acceptance matches. Network checks still
+        # run first so an incompatible protocol, closed enrollment, or
+        # unreachable host is surfaced immediately; later steps (server
+        # create/PATCH, the runner's enrollment gate) re-enforce capability
+        # freshness.
         capabilities = fetch_capabilities(force=True)
         terms = fetch_authorization(capabilities)
-        from .workbench.daemon import Scanner
+        ai_backend = _resolved_ai_backend(config)
 
-        scan = Scanner().scan_once_strict(list(scope["sources"]))
+        def _acceptance_matches(candidate: Mapping[str, Any]) -> bool:
+            return (
+                accepted_authorization_version
+                == candidate["authorization"]["version"]
+                and accepted_retention_version == candidate["retention"]["version"]
+                and accepted_ownership_certification_version
+                == candidate["ownership_certification"]["version"]
+                and accepted_authorization_profile_hash
+                == candidate["authorization_profile_hash"]
+            )
+
+        challenge = _authorization_challenge(
+            capabilities, terms, scope, ai_backend
+        )
+        if challenge_only or not _acceptance_matches(challenge):
+            # Non-mutating challenge response.  The HTTP adapter maps this to
+            # 409 so CLI/GUI cannot replace exact-version acceptance with --yes.
+            return challenge
+
+        # Acceptance matches the displayed profile, so this call intends to
+        # enroll: refresh the index now — a refresh that just completed for
+        # the same index and sources is reused, so one interactive flow pays
+        # for at most one full re-parse.
+        scan = _strict_scan_for_enable(scope["sources"], progress=scan_progress)
         if not scan["ok"]:
             return {
                 "ok": False,
@@ -1098,23 +1173,17 @@ def enable(
                 "message": "The refreshed source/project scope is not eligible.",
                 "scope_blockers": scope["blockers"],
             }
-        ai_backend = _resolved_ai_backend(config)
         challenge = _authorization_challenge(
             capabilities, terms, scope, ai_backend
         )
         expected_auth = challenge["authorization"]["version"]
         expected_retention = challenge["retention"]["version"]
         expected_ownership = challenge["ownership_certification"]["version"]
-        expected_profile = challenge["authorization_profile_hash"]
-        if (
-            challenge_only
-            or accepted_authorization_version != expected_auth
-            or accepted_retention_version != expected_retention
-            or accepted_ownership_certification_version != expected_ownership
-            or accepted_authorization_profile_hash != expected_profile
-        ):
-            # Non-mutating challenge response.  The HTTP adapter maps this to
-            # 409 so CLI/GUI cannot replace exact-version acceptance with --yes.
+        if not _acceptance_matches(challenge):
+            # The refresh changed the displayed profile (for example a new
+            # project appeared in an enrolled source): the exact-scope
+            # discipline requires accepting the refreshed challenge. The
+            # re-accepted call reuses this refresh instead of scanning again.
             return challenge
 
         # Serialize enrollment mutations with running cycles.  Controls still

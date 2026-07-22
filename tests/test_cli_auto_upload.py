@@ -231,6 +231,8 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
 
     main()
 
+    for call in calls:
+        assert callable(call.pop("scan_progress"))
     accepted = {
         "agent": "all",
         "accepted_authorization_version": "auth-v1",
@@ -250,6 +252,63 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
         accepted,
     ]
     assert "Automatic upload: enabled / ready" in capsys.readouterr().out
+
+
+def test_interactive_enable_reprompts_once_when_the_refresh_changes_scope(
+    monkeypatch, capsys
+):
+    """The accepting call's refresh can reveal a new project; the CLI must
+    re-display the refreshed challenge for one more acceptance round instead
+    of failing the enrollment."""
+
+    def challenge(profile_hash: str, projects: list[str]) -> dict:
+        return {
+            "ok": False,
+            "status": 409,
+            "code": "authorization_required",
+            "message": "review",
+            "authorization_profile_hash": profile_hash,
+            "authorization": {"version": "auth-v1", "text": "future uploads"},
+            "retention": {"version": "ret-v1", "text": "retention"},
+            "ownership_certification": {"version": "own-v1", "text": "ownership"},
+            "scope": {
+                "sources": ["codex"],
+                "projects": projects,
+                "entries": [["codex", project] for project in projects],
+            },
+            "ai": {"enabled": False, "backend": None},
+            "cap": 5,
+            "cadence_days": 1,
+            "maximum_bundle_size": 5_000_000,
+        }
+
+    calls = []
+
+    def enable(**kwargs):
+        kwargs.pop("scan_progress", None)
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return challenge("profile-one", ["project"])
+        if len(calls) == 2:
+            return challenge("profile-two", ["project", "project-two"])
+        return {"ok": True, "mode": "enabled", "health": "ready"}
+
+    answers = iter(
+        ["auth-v1", "ret-v1", "own-v1", "auth-v1", "ret-v1", "own-v1"]
+    )
+    monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
+    monkeypatch.setattr(sys, "argv", ["clawjournal", "auto-upload", "enable"])
+
+    main()
+
+    assert [
+        call["accepted_authorization_profile_hash"] for call in calls
+    ] == [None, "profile-one", "profile-two"]
+    out = capsys.readouterr().out
+    assert "project-two" in out
+    assert "Automatic upload: enabled / ready" in out
 
 
 def test_interactive_accept_handles_keyboard_interrupt(monkeypatch):

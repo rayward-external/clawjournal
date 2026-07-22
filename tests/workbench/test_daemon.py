@@ -1182,6 +1182,79 @@ class TestScanner:
         assert "Traceback" not in caplog.text
         assert "parse_failed" in caplog.text
 
+    def _patch_progress_scan_environment(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "clawjournal_config"
+        )
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.discover_projects",
+            lambda source_filter=None: [
+                {
+                    "source": "claude",
+                    "dir_name": "PRIVATE_PROJECT_ONE_SENTINEL",
+                    "locator": None,
+                },
+                {
+                    "source": "claude",
+                    "dir_name": "PRIVATE_PROJECT_TWO_SENTINEL",
+                    "locator": None,
+                },
+                {
+                    "source": "codex",
+                    "dir_name": "EXCLUDED_PROJECT_SENTINEL",
+                    "locator": None,
+                },
+            ],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.parse_project_sessions",
+            lambda dir_name, **kwargs: [],
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.link_subagent_hierarchy", lambda conn: 0
+        )
+
+    def test_strict_scan_progress_reports_only_sources_and_counters(
+        self, tmp_path, monkeypatch
+    ):
+        """Excluded sources don't inflate the total, and each report carries
+        the source and counters only — never project names or paths."""
+        self._patch_progress_scan_environment(tmp_path, monkeypatch)
+        seen: list[tuple[str, int, int]] = []
+
+        report = Scanner().scan_once_strict(
+            ["claude"], progress=lambda *args: seen.append(args)
+        )
+
+        assert report["ok"] is True
+        assert seen == [("claude", 1, 2), ("claude", 2, 2)]
+
+    def test_strict_scan_survives_a_broken_progress_callback(
+        self, tmp_path, monkeypatch
+    ):
+        """A raising progress callback is dropped after its first failure and
+        must neither fail the fail-closed scan nor leak into its report."""
+        self._patch_progress_scan_environment(tmp_path, monkeypatch)
+        seen: list[tuple[str, int, int]] = []
+
+        def broken(source, position, total):
+            seen.append((source, position, total))
+            raise RuntimeError("PRIVATE_CALLBACK_SENTINEL")
+
+        report = Scanner().scan_once_strict(["claude"], progress=broken)
+
+        assert report["ok"] is True
+        assert report["failures"] == []
+        assert seen == [("claude", 1, 2)]
+        assert "PRIVATE_CALLBACK_SENTINEL" not in json.dumps(report)
+
     @pytest.mark.parametrize("source", ["claude", "codex"])
     def test_strict_scan_rejects_malformed_jsonl_without_partial_upsert(
         self, tmp_path, monkeypatch, source
