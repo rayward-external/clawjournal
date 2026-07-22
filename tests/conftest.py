@@ -7,6 +7,17 @@ import pytest
 from clawjournal.redaction.anonymizer import Anonymizer
 
 
+def _clear_strict_scan_reuse() -> None:
+    # getattr-guarded so a mixed setup (this conftest running against an
+    # older installed clawjournal without the memo, e.g. the editable
+    # install's console script inside a worktree) errors in the tests that
+    # actually exercise the new behavior instead of at every test's setup.
+    auto_upload = sys.modules.get("clawjournal.auto_upload")
+    reset = getattr(auto_upload, "_reset_strict_scan_reuse", None)
+    if reset is not None:
+        reset()
+
+
 @pytest.fixture(autouse=True)
 def _reset_strict_scan_reuse():
     """auto_upload.enable() memoizes a completed strict refresh at module
@@ -14,13 +25,9 @@ def _reset_strict_scan_reuse():
     test's refresh must never satisfy another test's, so clear the memo
     around every test (lazily — most tests never import auto_upload).
     """
-    auto_upload = sys.modules.get("clawjournal.auto_upload")
-    if auto_upload is not None:
-        auto_upload._reset_strict_scan_reuse()
+    _clear_strict_scan_reuse()
     yield
-    auto_upload = sys.modules.get("clawjournal.auto_upload")
-    if auto_upload is not None:
-        auto_upload._reset_strict_scan_reuse()
+    _clear_strict_scan_reuse()
 
 
 @pytest.fixture(autouse=True)
