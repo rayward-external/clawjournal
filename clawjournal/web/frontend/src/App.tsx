@@ -43,14 +43,14 @@ function Sidebar() {
     return () => clearInterval(iv);
   }, []);
 
-  // Three intent-based items — "browse my sessions", "understand my sessions"
-  // (Analytics wraps Dashboard/Insights/Benchmark), "share my sessions" (Share
-  // owns the redaction Rules sub-route). Settings is pinned separately below as
+  // Three intent-based items — "browse my sessions", "share my sessions" (Share
+  // owns the redaction Rules sub-route), "understand my sessions" (Analytics
+  // wraps Dashboard/Insights/Benchmark). Settings is pinned separately below as
   // a gear. Search folds into the Sessions toolbar; Rules lives inside Share.
   const NAV_ITEMS: { to: string; label: string; badge: number | null; end?: boolean }[] = [
     { to: '/', label: 'Sessions', badge: counts.toReview > 0 ? counts.toReview : null },
-    { to: '/analytics', label: 'Analytics', badge: counts.recommendations > 0 ? counts.recommendations : null },
     { to: '/share', label: 'Share', badge: null },
+    { to: '/analytics', label: 'Analytics', badge: counts.recommendations > 0 ? counts.recommendations : null },
   ];
 
   return (
