@@ -17,6 +17,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from clawjournal.workbench.daemon import (
+    ScanBusyError,
     Scanner,
     WorkbenchHandler,
     _scan_process_lock,
@@ -1343,17 +1344,22 @@ class TestScanner:
 
         assert Scanner()._scan_tick() == {}
 
-    def test_scan_once_proceeds_unlocked_after_wait_expires(
+    def test_scan_once_fails_closed_when_lock_wait_expires(
         self, tmp_path, monkeypatch
     ):
-        """Normal scans degrade to pre-lock behavior after the bounded wait:
-        per-project resilience makes proceeding strictly better than failing,
-        and only strict scans must fail closed."""
+        """A normal scan must not bypass a lock held by a strict scan."""
         self._patch_progress_scan_environment(tmp_path, monkeypatch)
+        scanner = Scanner()
+        monkeypatch.setattr(
+            scanner,
+            "_scan_once_report",
+            lambda **_kwargs: pytest.fail("a busy scan must not touch the index"),
+        )
 
         with _scan_process_lock(wait_seconds=None) as held:
             assert held is True
-            assert Scanner().scan_once(lock_wait_seconds=0.0) == {}
+            with pytest.raises(ScanBusyError, match="Another scan"):
+                scanner.scan_once(lock_wait_seconds=0.0)
 
     @pytest.mark.parametrize("source", ["claude", "codex"])
     def test_strict_scan_rejects_malformed_jsonl_without_partial_upsert(
@@ -1988,8 +1994,11 @@ class TestScanner:
 
 class TestScanAPI:
     def test_scanner_coalesces_a_scan_request_while_another_scan_is_active(
-        self, monkeypatch
+        self, tmp_path, monkeypatch
     ):
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db"
+        )
         scanner = Scanner()
         entered = Event()
         release = Event()

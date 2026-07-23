@@ -143,6 +143,10 @@ SCAN_ONCE_LOCK_WAIT_SECONDS = 15.0
 _SCAN_LOCK_POLL_SECONDS = 0.5
 
 
+class ScanBusyError(RuntimeError):
+    """Raised when a normal scan cannot acquire the cross-process scan lock."""
+
+
 @contextmanager
 def _scan_process_lock(
     *,
@@ -616,16 +620,15 @@ class Scanner:
         whose content changed (or remained unchanged) are exposed on the
         ``last_updated_*`` and ``last_unchanged_*`` attributes. Waits
         briefly for a scan in another process to finish; if the wait
-        expires, the scan proceeds unlocked — the normal scan is per-project
-        resilient, so that matches pre-lock correctness, and the short
-        ceiling keeps interactive callers (which have no wait feedback)
-        from hanging. Only strict scans fail closed on contention.
+        expires, raises :class:`ScanBusyError` without touching the index.
+        Normal scans must never bypass the process lock because doing so
+        could disrupt a strict scan that already holds it.
         """
         with self._scan_lock:
             with _scan_process_lock(wait_seconds=lock_wait_seconds) as acquired:
                 if not acquired:
-                    logger.warning(
-                        "Scan lock wait expired; scanning alongside another process"
+                    raise ScanBusyError(
+                        "Another scan is still refreshing the index; try again shortly."
                     )
                 return self._scan_once_report(required_sources=None)["new_by_source"]
 
@@ -5581,16 +5584,23 @@ def run_server(
     # Run initial scan in background, then start periodic scanner
     def _initial_scan() -> None:
         logger.info("Running initial scan...")
-        results = scanner.scan_once()
-        trigger_scoring_warmup(scanner)
-        total = sum(results.values())
-        logger.info(
-            "Initial scan complete: %d new sessions indexed, %d existing traces updated, "
-            "%d subagent relationships linked",
-            total,
-            scanner.last_updated_count,
-            scanner.last_linked_count,
-        )
+        try:
+            results = scanner.scan_once()
+        except ScanBusyError:
+            logger.info(
+                "Initial scan skipped: another process is refreshing the index"
+            )
+        else:
+            trigger_scoring_warmup(scanner)
+            total = sum(results.values())
+            logger.info(
+                "Initial scan complete: %d new sessions indexed, "
+                "%d existing traces updated, "
+                "%d subagent relationships linked",
+                total,
+                scanner.last_updated_count,
+                scanner.last_linked_count,
+            )
         scanner.start()
         logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
 

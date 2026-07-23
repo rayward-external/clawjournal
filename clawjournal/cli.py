@@ -1261,14 +1261,18 @@ def prep(source_filter: str = "auto") -> None:
 
 def _run_scan(source_filter: str | None = None) -> None:
     """One-shot scan: index sessions into the workbench database."""
-    from .workbench.daemon import Scanner
+    from .workbench.daemon import ScanBusyError, Scanner
     from .workbench.index import get_stats, open_index
     from .pricing import ensure_pricing_fresh
 
     ensure_pricing_fresh()
     scanner = Scanner(source_filter=source_filter)
     print("Scanning sessions...")
-    results = scanner.scan_once()
+    try:
+        results = scanner.scan_once()
+    except ScanBusyError as exc:
+        print(f"Scan not run: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
     total_new = sum(results.values())
     total_updated = scanner.last_updated_count
@@ -3467,7 +3471,7 @@ def _run_segment(args: argparse.Namespace) -> None:
 
 def _run_recent(args: argparse.Namespace) -> None:
     """Show recent sessions, auto-scanning if the index is stale."""
-    from .workbench.daemon import Scanner
+    from .workbench.daemon import ScanBusyError, Scanner
     from .workbench.index import open_index, query_sessions
 
     conn = open_index()
@@ -3489,8 +3493,14 @@ def _run_recent(args: argparse.Namespace) -> None:
     if stale:
         conn.close()
         scanner = Scanner(source_filter=args.source)
-        scanner.scan_once()
-        auto_scanned = True
+        try:
+            scanner.scan_once()
+            auto_scanned = True
+        except ScanBusyError:
+            print(
+                "Another scan is refreshing the index; showing current results.",
+                file=sys.stderr,
+            )
         conn = open_index()
 
     # Query recent sessions
