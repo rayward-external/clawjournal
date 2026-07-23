@@ -23,13 +23,15 @@ export interface DoneStepProps {
 
 export function DoneStep(p: DoneStepProps) {
   const [confettiPieces] = useState(() => {
-    const palette = ['#b47d08', '#558745', '#5f7191', '#df9d10', '#7aa568', '#c9655c', '#8a7555'];
-    const piecesPerWave = 42;
+    const palette = ['#D4AB73', '#45392C', '#725E47', '#E9DEC9', '#EDE2CC'];
+    const piecesPerWave = 48;
     return Array.from({ length: piecesPerWave * SUCCESS_WAVE_DELAYS.length }, (_, i) => ({
       id: i,
+      wave: Math.floor(i / piecesPerWave),
       left: 3 + Math.random() * 94,
-      dx: (Math.random() - 0.5) * 180,
-      dy: 360 + Math.random() * 300,
+      dx: (Math.random() - 0.5) * 24,
+      dy: 105 + Math.random() * 20,
+      staticY: 28 + Math.random() * 150,
       r: (Math.random() > 0.5 ? 1 : -1) * (540 + Math.random() * 720),
       width: 5 + Math.random() * 5,
       height: 8 + Math.random() * 9,
@@ -62,33 +64,48 @@ export function DoneStep(p: DoneStepProps) {
       {p.globalStyles}
       {p.stepperHeader}
       <div style={{ position: 'relative', padding: '56px 24px 24px', maxWidth: 680, margin: '0 auto', textAlign: 'center' }}>
-        {SUCCESS_WAVE_DELAYS.map((delay) => (
-          <div
-            key={delay}
-            className="claw-success-flash"
-            style={{
-              position: 'absolute', top: -24, left: '5%', right: '5%', height: 260,
-              pointerEvents: 'none', borderRadius: '50%',
-              background: 'radial-gradient(ellipse at top, rgba(85,135,69,.3) 0%, rgba(180,125,8,.13) 38%, rgba(255,255,255,0) 72%)',
-              opacity: 0,
-              ['--flash-delay' as string]: `${delay}ms`,
-            } as React.CSSProperties}
-          />
-        ))}
-        <div className="claw-success-confetti" style={{ position: 'absolute', inset: 0, zIndex: 1, pointerEvents: 'none', overflow: 'hidden' }}>
-          {confettiPieces.map((c) => (
-            <span key={c.id} style={{
-              position: 'absolute', top: -20, left: `${c.left}%`,
-              width: c.width, height: c.height, borderRadius: c.id % 4 === 0 ? '50%' : 1,
-              background: c.color, opacity: 0,
-              ['--cdx' as string]: `${c.dx}px`,
-              ['--cdy' as string]: `${c.dy}px`,
-              ['--cr' as string]: `${c.r}deg`,
-              ['--cduration' as string]: `${c.duration}ms`,
-              ['--cdelay' as string]: `${c.delay}ms`,
-            } as React.CSSProperties} />
-          ))}
-        </div>
+        {submitted && (
+          <>
+            {SUCCESS_WAVE_DELAYS.map((delay) => (
+              <div
+                key={delay}
+                aria-hidden="true"
+                className="claw-success-flash"
+                style={{
+                  position: 'fixed', top: -36, left: '8vw', right: '8vw', height: 96,
+                  zIndex: 99, pointerEvents: 'none', borderRadius: 48,
+                  background: 'rgba(212, 171, 115, .18)', filter: 'blur(18px)',
+                  opacity: 0,
+                  ['--flash-delay' as string]: `${delay}ms`,
+                } as React.CSSProperties}
+              />
+            ))}
+            <div
+              aria-hidden="true"
+              className="claw-success-confetti"
+              data-testid="success-confetti"
+              style={{ position: 'fixed', inset: 0, zIndex: 100, pointerEvents: 'none', overflow: 'hidden' }}
+            >
+              {confettiPieces.map((c) => (
+                <span
+                  key={c.id}
+                  className={c.wave > 0 ? 'claw-confetti-later' : undefined}
+                  style={{
+                    position: 'absolute', top: -20, left: `${c.left}%`,
+                    width: c.width, height: c.height, borderRadius: c.id % 4 === 0 ? '50%' : 1,
+                    background: c.color, opacity: 0,
+                    ['--cdx' as string]: `${c.dx}vw`,
+                    ['--cdy' as string]: `${c.dy}vh`,
+                    ['--cstatic-y' as string]: `${c.staticY}px`,
+                    ['--cr' as string]: `${c.r}deg`,
+                    ['--cduration' as string]: `${c.duration}ms`,
+                    ['--cdelay' as string]: `${c.delay}ms`,
+                  } as React.CSSProperties}
+                />
+              ))}
+            </div>
+          </>
+        )}
 
         <div style={{
           width: 72, height: 72, margin: '0 auto 24px',
@@ -317,4 +334,4 @@ const doneMiniRow: React.CSSProperties = {
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11.5,
 };
 
-const SUCCESS_WAVE_DELAYS = [0, 2300, 4600, 6900];
+const SUCCESS_WAVE_DELAYS = [0, 900, 1800];

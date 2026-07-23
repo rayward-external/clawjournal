@@ -47,13 +47,20 @@ export const globalStyles = (
       animation-delay: var(--flash-delay, 0ms);
     }
     .claw-success-confetti span {
-      animation: clawConfettiDrop var(--cduration) cubic-bezier(.18,.68,.28,1) forwards;
+      animation: clawConfettiDrop var(--cduration) cubic-bezier(.18,.68,.28,1) both;
       animation-delay: var(--cdelay);
+      will-change: transform, opacity;
     }
     @keyframes clawPkgDrop { 0% { opacity: 0; transform: translate(-50%,-30px) scale(.85); } 15% { opacity: 1; } 70% { opacity: 1; transform: translate(-50%, 80px) scale(.85); } 100% { opacity: 0; transform: translate(-50%, 120px) scale(.3); } }
     @keyframes clawThump { 0% { transform: scale(1); } 40% { transform: scale(1.02) translateY(2px); } 100% { transform: scale(1); } }
     @media (prefers-reduced-motion: reduce) {
-      .claw-success-flash, .claw-success-confetti span { animation: none !important; }
+      .claw-success-flash { display: none; }
+      .claw-success-confetti .claw-confetti-later { display: none; }
+      .claw-success-confetti span {
+        animation: none !important;
+        opacity: .72 !important;
+        transform: translate3d(0,var(--cstatic-y),0) rotate(var(--cr));
+      }
     }
   `}</style>
 );
