@@ -258,6 +258,7 @@ export interface AutoUploadStatus {
   pending_submission_state: 'sealed' | 'submitting' | null;
   ui_visible: boolean;
   offer_available: boolean;
+  enrollment_grant_available: boolean;
   scope: {
     sources: string[];
     projects: string[];

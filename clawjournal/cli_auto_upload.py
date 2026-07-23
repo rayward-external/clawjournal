@@ -39,7 +39,12 @@ def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="auto_upload_command", required=True)
 
     enable = commands.add_parser("enable", help="Review terms and enable automatic sharing")
-    enable.add_argument("--agent", choices=["claude", "codex", "all"], default="all")
+    enable.add_argument(
+        "--agent",
+        choices=["auto", "claude", "codex", "all"],
+        default="auto",
+        help="SessionStart agent hook (default: infer from the accepted source scope)",
+    )
     enable.add_argument("--accept-authorization-version", default=None)
     enable.add_argument("--accept-retention-version", default=None)
     enable.add_argument("--accept-ownership-certification-version", default=None)
@@ -190,37 +195,28 @@ def _interactive_accept(
         + (f"enabled via {ai.get('backend')}" if ai.get("enabled") else "disabled")
     ))
     try:
-        entered_auth = input(
-            _sanitize_terminal_line(
-                f"Type authorization version {authorization['version']} to accept: "
-            )
-        ).strip()
-        if entered_auth != authorization["version"]:
+        accepted_scope = input(
+            "Authorize this exact scope and accept the displayed recurring "
+            "authorization and retention terms? [y/N] "
+        ).strip().lower()
+        if accepted_scope not in {"y", "yes"}:
             return None
-        entered_retention = input(
-            _sanitize_terminal_line(
-                f"Type retention version {retention['version']} to accept: "
-            )
-        ).strip()
-        if entered_retention != retention["version"]:
-            return None
-        # The ownership certification is a distinct affirmative act, like the
-        # manual share's --certify-ownership: it is typed separately and never
-        # bundled into the terms acceptance above.
-        entered_ownership = input(
-            _sanitize_terminal_line(
-                f"Type ownership certification version {ownership['version']} "
-                "to certify: "
-            )
-        ).strip()
+        accepted_ownership = input(
+            "Separately certify the displayed ownership statement? [y/N] "
+        ).strip().lower()
     except (EOFError, OSError, KeyboardInterrupt):
         return None
-    if entered_ownership != ownership["version"]:
+    if accepted_ownership not in {"y", "yes"}:
         return None
     profile_hash = challenge.get("authorization_profile_hash")
     if not isinstance(profile_hash, str) or not profile_hash:
         return None
-    return entered_auth, entered_retention, entered_ownership, profile_hash
+    return (
+        str(authorization["version"]),
+        str(retention["version"]),
+        str(ownership["version"]),
+        profile_hash,
+    )
 
 
 def _fresh_email_verification() -> bool:

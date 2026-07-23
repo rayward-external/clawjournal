@@ -15,6 +15,7 @@ function status(overrides: Partial<AutoUploadStatus> = {}): AutoUploadStatus {
     pending_submission_state: null,
     ui_visible: true,
     offer_available: false,
+    enrollment_grant_available: false,
     scope: { sources: [], projects: [] },
     cap: 5,
     cadence_days: 1,
@@ -102,6 +103,7 @@ describe('AutoUploadOffer', () => {
 
   it('requires a manual receipt and server capability, then persists dismissal', async () => {
     const statusSpy = vi.spyOn(api.autoUpload, 'status');
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(authorizationRequired());
 
     const withoutReceipt = renderControl(<AutoUploadOffer manualReceiptId={null} />);
     expect(statusSpy).not.toHaveBeenCalled();
@@ -116,7 +118,8 @@ describe('AutoUploadOffer', () => {
     statusSpy.mockResolvedValueOnce(status({ offer_available: true }));
     const dismissible = renderControl(<AutoUploadOffer manualReceiptId="receipt-2" />);
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
-    expect(screen.getByText(/upload without individual review/i)).toBeInTheDocument();
+    expect(await screen.findByText(/exact source\/project pairs/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review and enable' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
 
@@ -136,6 +139,47 @@ describe('AutoUploadOffer', () => {
     statusSpy.mockResolvedValueOnce(status({ offer_available: true }));
     renderControl(<AutoUploadOffer manualReceiptId="receipt-3" />);
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
+  });
+
+  it('enables inline with the receipt grant and infers the only agent', async () => {
+    const initial = status({
+      offer_available: true,
+      enrollment_grant_available: true,
+      scope: { sources: ['codex'], projects: ['project-a'] },
+    });
+    const enabled = status({
+      mode: 'enabled',
+      scope: { sources: ['codex'], projects: ['project-a'] },
+    });
+    const grantChallenge = authorizationRequired();
+    (grantChallenge.body.scope as Record<string, unknown>).sources = ['codex'];
+    (grantChallenge.body.scope as Record<string, unknown>).entries = [
+      ['codex', 'project-a'],
+    ];
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(initial);
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(grantChallenge)
+      .mockResolvedValueOnce(enabled);
+    const uploadStatusSpy = vi.spyOn(api.share, 'uploadStatus').mockResolvedValue({
+      verified_email: null,
+      token_valid: false,
+      expires_at: null,
+      pending_email: null,
+    });
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-grant" />);
+
+    expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
+    expect(await screen.findByText('Exact recurring scope · 1 source/project pair')).toBeInTheDocument();
+    const boxes = screen.getAllByRole('checkbox');
+    expect(boxes).toHaveLength(2);
+    fireEvent.click(boxes[0]);
+    fireEvent.click(boxes[1]);
+    fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
+
+    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
+    expect(enableSpy.mock.calls[1][0].agent).toBe('codex');
+    expect(uploadStatusSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -199,10 +243,9 @@ describe('AutoUploadPanel authorization', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     fireEvent.click(screen.getByRole('button', { name: 'Review scope and terms' }));
 
-    const agentSelect = await screen.findByLabelText('Run on agent sessions');
-    expect(agentSelect).toHaveValue('claude');
+    await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
+    expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
     expect(enableSpy).toHaveBeenNthCalledWith(1, { agent: 'claude', challenge_only: true });
-    expect(screen.getByRole('heading', { name: 'Authorize future automatic uploads' })).toBeInTheDocument();
     expect(screen.getByText(/separate from the consent you gave/i)).toBeInTheDocument();
     expect(screen.getByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();

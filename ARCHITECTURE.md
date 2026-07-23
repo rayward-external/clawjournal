@@ -31,7 +31,7 @@ tests/
 - `clawjournal/export/`: renders export formats such as JSONL and Markdown.
 - `clawjournal/prompts/`: canonical runtime prompt assets used by scoring and PII review.
 - `clawjournal/auto_upload.py`: SQLite-owned recurring authorization state, candidate selection, cadence, exact-artifact sealing, crash recovery, and the fail-closed runner.
-- `clawjournal/auto_upload_client.py` and `auto_upload_credentials.py`: the typed hosted v1 protocol and purpose-separated private credential boundary.
+- `clawjournal/auto_upload_client.py` and `auto_upload_credentials.py`: the typed hosted v2 protocol and purpose-separated private credential boundary.
 - `clawjournal/agent_hooks.py`: semantics-preserving Claude Code/Codex `SessionStart` configuration plus the bounded due-check adapter.
 
 ## Data Flow
@@ -82,6 +82,7 @@ Optional self-hosted path:
 Optional hosted recurring path:
 
 - It remains unavailable unless hosted discovery advertises protocol v2 and the participant has a successful manual receipt.
+- A successful manual share may return a short-lived, single-use enrollment grant bound to that receipt and participant. The client prefers that grant for immediate enrollment and falls back to fresh email verification when it is unavailable, expired, or rejected.
 - Enrollment sends the explicit (source, project) scope entries and requires two distinct affirmative acts: the versioned recurring authorization/retention acceptance and the versioned ownership certification. The server computes and owns the scope hash; the client pins the value read back at enrollment and fails closed on any drift.
 - The local SQLite singleton owns mode, generation, accepted exact scope/profile, cadence, health, and run overlay. Private files own active/recovery credentials; `config.json` never does.
 - The hosted service owns versioned recurring authorization, credential hashes, exact-byte idempotency, cross-enrollment duplicate-revision rejection, storage, and receipts.

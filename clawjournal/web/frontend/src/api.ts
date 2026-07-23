@@ -120,6 +120,7 @@ function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadSt
       : null,
     ui_visible: raw.ui_visible === true,
     offer_available: raw.offer_available === true,
+    enrollment_grant_available: raw.enrollment_grant_available === true,
     scope: {
       sources: Array.isArray(scope.sources) ? scope.sources : [],
       projects: Array.isArray(scope.projects) ? scope.projects : [],

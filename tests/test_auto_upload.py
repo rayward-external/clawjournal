@@ -82,7 +82,11 @@ def isolated_auto_upload(tmp_path, monkeypatch):
     }
 
 
-def _save_scope_config(*, upload_token: str | None = None) -> dict[str, Any]:
+def _save_scope_config(
+    *,
+    upload_token: str | None = None,
+    enrollment_grant: str | None = None,
+) -> dict[str, Any]:
     config: dict[str, Any] = {
         **config_module.DEFAULT_CONFIG,
         "source": "claude",
@@ -92,6 +96,13 @@ def _save_scope_config(*, upload_token: str | None = None) -> dict[str, Any]:
     if upload_token is not None:
         config["verified_email_token"] = upload_token
         config["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    if enrollment_grant is not None:
+        config["recurring_enrollment_grant"] = enrollment_grant
+        config["recurring_enrollment_grant_expires_at"] = (
+            "2099-01-01T00:00:00+00:00"
+        )
+        config["recurring_enrollment_grant_receipt_id"] = "manual-receipt-1"
+        config["recurring_enrollment_grant_issuer"] = ORIGIN
     config_module.save_config(config)
     return config
 
@@ -167,6 +178,7 @@ def _credentials(enrollment_id: str = "server-enrollment-1") -> dict[str, str]:
 def _capabilities(origin: str = ORIGIN) -> dict[str, Any]:
     return {
         "origin": origin,
+        "manual_share_enrollment_grant_version": 1,
         "maximum_bundle_size": 5_000_000,
         "recurring_cadence_days": 1,
         "recurring_enrollment_url": f"{origin}/api/recurring-enrollments",
@@ -2708,6 +2720,76 @@ def test_ambiguous_credential_rotation_never_uses_invalidated_old_recovery(
     disabled = auto.disable()
     assert disabled["mode"] == "off"
     assert revoke_calls == [("server-enrollment-1", "recovery-secret")]
+
+
+def test_enable_prefers_manual_share_grant_without_email_verification(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(enrollment_grant="cj_enroll_one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+
+    def create(_capabilities, **kwargs):
+        create_calls.append(dict(kwargs))
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["mode"] == "enabled"
+    assert len(create_calls) == 1
+    assert create_calls[0]["enrollment_grant"] == "cj_enroll_one-shot"
+    assert create_calls[0]["upload_token"] is None
+    persisted = config_module.load_config()
+    assert "recurring_enrollment_grant" not in persisted
+    assert "recurring_enrollment_grant_expires_at" not in persisted
+    assert "recurring_enrollment_grant_receipt_id" not in persisted
+    assert "recurring_enrollment_grant_issuer" not in persisted
+
+
+def test_rejected_manual_share_grant_falls_back_to_email_verification(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(enrollment_grant="cj_enroll_expired")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+
+    def reject(_capabilities, **_kwargs):
+        raise RecurringServiceError(
+            "email_verification_required",
+            "Fresh verified identity is required.",
+        )
+
+    monkeypatch.setattr(auto, "create_enrollment", reject)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["code"] == "email_verification_required"
+    persisted = config_module.load_config()
+    assert "recurring_enrollment_grant" not in persisted
+    assert auto.status()["enrollment_grant_available"] is False
 
 
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(

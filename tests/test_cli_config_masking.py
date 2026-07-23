@@ -6,6 +6,7 @@ def test_config_display_masks_secret_keys_recursively():
         {
             "verified_email": "person@example.edu",
             "verified_email_token": "abcdefghijklmnop",
+            "recurring_enrollment_grant": "grant-abcdefghijklmnop",
             "nested": {
                 "api_key": "sk-super-secret-value",
                 "safe": "visible",
@@ -16,6 +17,7 @@ def test_config_display_masks_secret_keys_recursively():
 
     assert displayed["verified_email"] == "person@example.edu"
     assert displayed["verified_email_token"] == "abcd...mnop"
+    assert displayed["recurring_enrollment_grant"] == "gran...mnop"
     assert displayed["nested"] == {
         "api_key": "sk-s...alue",
         "safe": "visible",

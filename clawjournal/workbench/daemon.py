@@ -1605,6 +1605,59 @@ def _clear_stored_upload_token() -> None:
             raise OSError("Stored upload authority could not be cleared safely.")
 
 
+_RECURRING_ENROLLMENT_GRANT_KEYS = (
+    "recurring_enrollment_grant",
+    "recurring_enrollment_grant_expires_at",
+    "recurring_enrollment_grant_receipt_id",
+    "recurring_enrollment_grant_issuer",
+)
+
+
+def _clear_stored_recurring_enrollment_grant() -> None:
+    config = load_config()
+    changed = False
+    for key in _RECURRING_ENROLLMENT_GRANT_KEYS:
+        if key in config:
+            del config[key]
+            changed = True
+    if changed and save_config(config) is False:
+        raise OSError(
+            "Stored recurring-enrollment convenience credential could not be cleared safely."
+        )
+
+
+def _store_recurring_enrollment_grant(
+    hosted_result: dict[str, Any],
+    *,
+    receipt_id: str,
+) -> bool:
+    grant = hosted_result.get("recurring_enrollment_grant")
+    expires_at = hosted_result.get("recurring_enrollment_grant_expires_at")
+    grant_receipt_id = hosted_result.get("recurring_enrollment_grant_receipt_id")
+    if (
+        not isinstance(grant, str)
+        or not grant
+        or not _expiry_is_valid(expires_at, grace_seconds=0)
+        or grant_receipt_id != receipt_id
+    ):
+        return False
+    try:
+        config = load_config()
+        config["recurring_enrollment_grant"] = grant
+        config["recurring_enrollment_grant_expires_at"] = expires_at
+        config["recurring_enrollment_grant_receipt_id"] = receipt_id
+        config["recurring_enrollment_grant_issuer"] = _hosted_api_base()
+        if save_config(config) is False:
+            raise OSError("config save returned false")
+    except (OSError, RuntimeError):
+        logger.warning(
+            "Manual share succeeded, but its recurring-enrollment grant "
+            "could not be cached; email verification remains available."
+        )
+        return False
+    return True
+
+
 def _http_error_message(exc: urllib.error.HTTPError) -> str:
     body = exc.read().decode("utf-8", errors="replace")
     try:
@@ -1669,6 +1722,7 @@ def request_email_verification(email: str) -> dict:
             "verified_email",
             "verified_email_token",
             "verified_email_token_expires_at",
+            *_RECURRING_ENROLLMENT_GRANT_KEYS,
         ):
             config.pop(key, None)
     config["pending_verification_id"] = verification_id
@@ -2954,6 +3008,7 @@ def submit_share_to_hosted(
     )
     conn.commit()
 
+    _store_recurring_enrollment_grant(hosted_result, receipt_id=receipt_id)
     _clear_stored_upload_token()
     redaction_summary = manifest.get("redaction_summary", {}) if manifest else {}
     return {

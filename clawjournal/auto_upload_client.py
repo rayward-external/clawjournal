@@ -24,6 +24,7 @@ from . import __version__
 RECURRING_UPLOAD_API_VERSION = 2
 RECURRING_CLIENT_PROTOCOL_VERSION = "2"
 RECURRING_CADENCE_DAYS = 1
+MANUAL_SHARE_ENROLLMENT_GRANT_VERSION = 1
 # Mirrors the hosted RECURRING_SCOPE_MAX_ENTRIES contract limit so oversized
 # scopes fail fast locally instead of as a server-worded enrollment rejection.
 MAX_SCOPE_ENTRIES = 200
@@ -168,6 +169,12 @@ def validate_capabilities(
                 "capability_incompatible",
                 f"Hosted recurring-upload capability {field} is unavailable or incompatible.",
             )
+    grant_version = capabilities.get("manual_share_enrollment_grant_version")
+    if grant_version is not None and grant_version != MANUAL_SHARE_ENROLLMENT_GRANT_VERSION:
+        raise CapabilityError(
+            "capability_incompatible",
+            "Hosted recurring-upload enrollment-grant capability is incompatible.",
+        )
     if require_enrollment_open and capabilities.get("recurring_enrollment_open") is not True:
         raise CapabilityError(
             "enrollment_closed",
@@ -397,23 +404,36 @@ def _scope_payload(scope_entries: Any) -> list[dict[str, str]]:
 def create_enrollment(
     capabilities: Mapping[str, Any],
     *,
-    upload_token: str,
     client_enrollment_id: str,
     scope_entries: Any,
     authorization_version: str,
     retention_version: str,
     ownership_certification: bool,
+    upload_token: str | None = None,
+    enrollment_grant: str | None = None,
 ) -> dict[str, Any]:
     if ownership_certification is not True:
         raise CapabilityError(
             "ownership_certification_required",
             "Recurring enrollment requires the explicit ownership certification.",
         )
+    normalized_upload_token = (upload_token or "").strip()
+    normalized_enrollment_grant = (enrollment_grant or "").strip()
+    if bool(normalized_upload_token) == bool(normalized_enrollment_grant):
+        raise CapabilityError(
+            "email_verification_required",
+            "Recurring enrollment requires exactly one verified identity credential.",
+        )
+    identity_payload = (
+        {"enrollment_grant": normalized_enrollment_grant}
+        if normalized_enrollment_grant
+        else {"upload_token": normalized_upload_token}
+    )
     return _request_json(
         str(capabilities["recurring_enrollment_url"]),
         method="POST",
         payload={
-            "upload_token": upload_token,
+            **identity_payload,
             "client_enrollment_id": client_enrollment_id,
             "scope": _scope_payload(scope_entries),
             "authorization_version": authorization_version,

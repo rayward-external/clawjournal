@@ -172,7 +172,7 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
 
     def answer(prompt):
         prompts.append(prompt)
-        return attack
+        return "yes"
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", answer)
@@ -245,7 +245,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
             }
         return {"ok": True, "mode": "enabled", "health": "ready"}
 
-    answers = iter(["auth-v1", "ret-v1", "own-v1", "student@uni.edu"])
+    answers = iter(["yes", "yes", "student@uni.edu"])
     monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
     monkeypatch.setattr(sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
@@ -266,7 +266,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
         assert callable(call.pop("scan_progress"))
         assert callable(call.pop("scan_wait_notice"))
     accepted = {
-        "agent": "all",
+        "agent": "auto",
         "accepted_authorization_version": "auth-v1",
         "accepted_retention_version": "ret-v1",
         "accepted_ownership_certification_version": "own-v1",
@@ -274,7 +274,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
     }
     assert calls == [
         {
-            "agent": "all",
+            "agent": "auto",
             "accepted_authorization_version": None,
             "accepted_retention_version": None,
             "accepted_ownership_certification_version": None,
@@ -326,9 +326,7 @@ def test_interactive_enable_reprompts_once_when_the_refresh_changes_scope(
             return challenge("profile-two", ["project", "project-two"])
         return {"ok": True, "mode": "enabled", "health": "ready"}
 
-    answers = iter(
-        ["auth-v1", "ret-v1", "own-v1", "auth-v1", "ret-v1", "own-v1"]
-    )
+    answers = iter(["yes", "yes", "yes", "yes"])
     monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
     monkeypatch.setattr(sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
