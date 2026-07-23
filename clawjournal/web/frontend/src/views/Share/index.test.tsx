@@ -517,6 +517,11 @@ describe('Share selection defaults', () => {
 
     await waitFor(() => expect(api.shares.get).toHaveBeenCalledWith('first-share'));
     expect(await screen.findByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    // Let initial queue hydration finish so this test isolates the receipt race.
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Navigate' }));
     await waitFor(() => expect(api.shares.get).toHaveBeenCalledWith('second-share'));
     await waitFor(() => {
