@@ -11,24 +11,46 @@ Copy the prompt that matches what you want to do into your coding assistant.
 ### Set it up for me
 
 ```text
-Set up or update ClawJournal from
+Set up or safely update ClawJournal from
 https://github.com/rayward-external/clawjournal.
 
-Install the browser workbench and its sharing safety tools using the
-project's installer. Look across all supported coding agents unless I tell
-you otherwise. Show me the projects you find before confirming them, so I
-can exclude personal, confidential, third-party, or unrelated work.
+I have joined the ClawJournal research program. Any data I later explicitly
+choose to contribute through ClawJournal is for research purposes. Program
+participation does not by itself authorize an upload or Automatic uploads.
 
-Then scan my coding-agent sessions, open the local workbench, and tell me
-what to do next.
+First determine whether this machine supports a local browser UI or is
+CLI-only/headless. If that is unclear, ask me before installing.
 
-Use ClawJournal only for local indexing and review. Do not run AI scoring or
-AI-assisted review, and do not enable or trigger Automatic uploads. If any
-of those features is already enabled, tell me before opening the workbench.
-Do not upload anything.
+For UI mode, install the browser workbench and managed sharing safety tools.
+For CLI-only mode, skip the browser build but install the CLI and managed
+sharing safety tools. Use the project's installer for my operating system.
+
+If ClawJournal is already installed, safely update its repository and rerun
+the installer. Never discard local changes or force-reset the checkout. If
+an update is blocked, explain why and stop.
+
+Look across all supported coding agents unless I tell you otherwise. Show me
+the discovered projects before confirming them so I can exclude personal,
+confidential, third-party, or unrelated work.
+
+Use the exact ClawJournal executable printed by the installer; do not assume
+it is on PATH. Scan my sessions and run `clawjournal status`.
+
+For UI mode, start and open the local workbench. For CLI-only mode, show me
+my recent sessions and explain the main review commands. Do not start a
+sharing flow yet. If I later request terminal sharing, use
+`clawjournal share --interactive --weekly --no-score` unless I explicitly
+opt into AI scoring.
+
+Keep this setup local. Do not run AI scoring, AI-assisted review, or
+Automatic uploads. If any of those features is already enabled, tell me
+before continuing. Do not upload anything.
+
+Finish by reporting the selected mode, installed version, executable path,
+scan result, and the exact command I should use next.
 ```
 
-This prompt allows installation and local review only. You can decide about sharing later.
+This prompt confirms research-program participation and research intent, but it allows installation and local review only. You can decide whether to contribute data later.
 
 ### Open it for me
 
@@ -61,8 +83,10 @@ every hold, embargo, finding, redaction, consent, and secret-scan safeguard.
 Do not bypass a failed or missing safety check.
 
 Use the built-in redaction rules unless I separately ask for AI-assisted
-review. This request authorizes one manual share only; it does not authorize
-Automatic uploads.
+review. I have joined the ClawJournal research program, and this one-time
+package is intended as a research contribution. This statement does not
+replace the consent shown at Submit. This request authorizes one manual share
+only; it does not authorize Automatic uploads.
 
 Before anything is uploaded, tell me:
 - how many sessions are selected;
@@ -101,7 +125,7 @@ These are the main commands:
 
 ```bash
 clawjournal serve                        # open the local workbench
-clawjournal share --interactive --weekly # guided sharing over SSH or without a browser
+clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring
 clawjournal status                       # check your setup
 clawjournal --help                       # see every command
 ```
