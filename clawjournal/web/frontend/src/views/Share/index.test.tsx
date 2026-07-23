@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../../api.ts';
@@ -478,5 +478,64 @@ describe('Share selection defaults', () => {
       expect(onSubmittedShareChange).toHaveBeenLastCalledWith('submitted-share');
     });
     expect(await screen.findByRole('heading', { name: 'Submitted' })).toBeInTheDocument();
+  });
+
+  it('ignores a stale receipt response after navigating to another share', async () => {
+    mockInitialLoad(readyStats(1));
+    type ShareResult = Awaited<ReturnType<typeof api.shares.get>>;
+    let resolveFirst!: (share: ShareResult) => void;
+    const firstRequest = new Promise<ShareResult>((resolve) => { resolveFirst = resolve; });
+    const shareResult = (shareId: string, receiptId: string | null): ShareResult => ({
+      share_id: shareId,
+      created_at: '2026-07-22T12:00:00Z',
+      session_count: 1,
+      status: receiptId ? 'shared' : 'draft',
+      attestation: null,
+      submission_note: null,
+      bundle_hash: 'bundle-hash',
+      manifest: {},
+      shared_at: receiptId ? '2026-07-22T12:01:00Z' : null,
+      hosted_receipt_id: receiptId,
+      hosted_status: receiptId ? 'accepted' : null,
+    });
+    vi.spyOn(api.shares, 'get').mockImplementation((shareId) => (
+      shareId === 'first-share'
+        ? firstRequest
+        : Promise.resolve(shareResult('second-share', null))
+    ));
+    const onSubmittedShareChange = vi.fn();
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=done&share=first-share']}>
+        <ToastProvider>
+          <Share onSubmittedShareChange={onSubmittedShareChange} />
+        </ToastProvider>
+        <NavigationProbe to="/share?step=done&share=second-share" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(api.shares.get).toHaveBeenCalledWith('first-share'));
+    expect(await screen.findByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    // Let initial queue hydration finish so this test isolates the receipt race.
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('selection')).toBe('all');
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Navigate' }));
+    await waitFor(() => expect(api.shares.get).toHaveBeenCalledWith('second-share'));
+    await waitFor(() => {
+      const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
+      expect(params.get('share')).toBe('second-share');
+    });
+
+    await act(async () => {
+      resolveFirst(shareResult('first-share', 'receipt-first'));
+      await firstRequest;
+    });
+
+    expect(screen.getByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Submitted' })).not.toBeInTheDocument();
+    expect(onSubmittedShareChange).not.toHaveBeenCalledWith('second-share');
   });
 });

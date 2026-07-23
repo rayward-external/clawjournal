@@ -483,7 +483,9 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   useEffect(() => {
     if (!packagedShareId) return;
+    let cancelled = false;
     api.shares.get(packagedShareId).then((share) => {
+      if (cancelled) return;
       const piiReview = (share.manifest?.redaction_summary as { pii_review?: { ai_enabled?: unknown } } | undefined)?.pii_review;
       if (!searchParams.get('ai_pii') && typeof piiReview?.ai_enabled === 'boolean') {
         setAiPiiEnabled(piiReview.ai_enabled);
@@ -502,6 +504,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         });
       }
     }).catch(() => { });
+    return () => { cancelled = true; };
   }, [packagedShareId, searchParams]);
 
   // =================================================
