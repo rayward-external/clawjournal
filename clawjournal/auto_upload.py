@@ -580,13 +580,16 @@ def _has_successful_manual_receipt(conn: sqlite3.Connection) -> bool:
 def _auto_upload_ui_visible(
     config: Mapping[str, Any],
     enrollment: Mapping[str, Any] | None = None,
+    *,
+    successful_manual_receipt: bool = False,
 ) -> bool:
     # A successful manual hosted share caches this non-authoritative offer bit
     # only after the service advertises the current recurring-upload protocol.
     # It is safe to use for visibility: Enable still revalidates the live
     # capability document before granting any recurring authority.
     hosted_offer_available = (
-        config.get("auto_upload_capability_available") is True
+        successful_manual_receipt
+        and config.get("auto_upload_capability_available") is True
     )
     explicitly_enabled = (
         os.environ.get(AUTO_UPLOAD_UI_ENV) == "1"
@@ -718,7 +721,11 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             ),
             "overlay": overlay,
             "pending_submission_state": pending_submission_state,
-            "ui_visible": _auto_upload_ui_visible(config, enrollment),
+            "ui_visible": _auto_upload_ui_visible(
+                config,
+                enrollment,
+                successful_manual_receipt=successful_manual,
+            ),
             "offer_available": bool(
                 mode == "off"
                 and successful_manual
