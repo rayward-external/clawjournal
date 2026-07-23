@@ -31,6 +31,7 @@ from .. import __version__
 from ..auto_upload_client import (
     RECURRING_CADENCE_DAYS,
     RECURRING_UPLOAD_API_VERSION,
+    comparable_origin,
 )
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
@@ -1646,7 +1647,12 @@ def _store_recurring_enrollment_grant(
         config["recurring_enrollment_grant"] = grant
         config["recurring_enrollment_grant_expires_at"] = expires_at
         config["recurring_enrollment_grant_receipt_id"] = receipt_id
-        config["recurring_enrollment_grant_issuer"] = _hosted_api_base()
+        # Store the issuer in the same normalized form the enrollment path
+        # compares against, so an operator's casing or explicit :443 in
+        # CLAWJOURNAL_SHARE_URL cannot make a valid grant permanently unusable.
+        config["recurring_enrollment_grant_issuer"] = comparable_origin(
+            _hosted_api_base()
+        )
         if save_config(config) is False:
             raise OSError("config save returned false")
     except (OSError, RuntimeError):

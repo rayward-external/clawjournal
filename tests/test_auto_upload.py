@@ -2782,6 +2782,99 @@ def test_rejected_manual_share_grant_falls_back_to_email_verification(
     assert auto.status()["enrollment_grant_available"] is False
 
 
+@pytest.mark.parametrize(
+    "issuer",
+    [ORIGIN, "https://DATA.RAYWARD.AI", "https://data.rayward.ai/"],
+)
+def test_grant_issuer_survives_equivalent_origin_spellings(
+    isolated_auto_upload,
+    monkeypatch,
+    issuer,
+):
+    """A valid grant must not be lost to host casing or a trailing slash.
+
+    Both sides start from the same CLAWJOURNAL_SHARE_URL, but the issuer keeps
+    whatever the operator wrote while capability validation lowercases the host.
+    Comparing the raw spellings would silently force email verification forever
+    on an install that only differs cosmetically. Note this normalizes case, not
+    authority: a differing port is still a differing origin, as the port case in
+    ``test_grant_from_a_different_origin_is_never_offered_or_sent`` locks in.
+    """
+
+    _save_scope_config(enrollment_grant="cj_enroll_one-shot")
+    config = config_module.load_config()
+    config["recurring_enrollment_grant_issuer"] = issuer
+    config_module.save_config(config)
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+
+    def create(_capabilities, **kwargs):
+        create_calls.append(dict(kwargs))
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+
+    assert auto.status()["enrollment_grant_available"] is True
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["mode"] == "enabled"
+    assert create_calls[0]["enrollment_grant"] == "cj_enroll_one-shot"
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    ["https://evil.example.test", "https://data.rayward.ai:8443"],
+)
+def test_grant_from_a_different_origin_is_never_offered_or_sent(
+    isolated_auto_upload,
+    monkeypatch,
+    issuer,
+):
+    """A grant issued by another origin must not be advertised or put on the wire.
+
+    The workbench reads ``enrollment_grant_available`` to decide whether it can
+    skip email verification, so a status that ignores the issuer would send the
+    participant down a path enable is bound to refuse. A differing port is a
+    differing origin here, exactly as the capability endpoint pinning treats it.
+    """
+
+    _save_scope_config(enrollment_grant="cj_enroll_other-host")
+    config = config_module.load_config()
+    config["recurring_enrollment_grant_issuer"] = issuer
+    config_module.save_config(config)
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto,
+        "create_enrollment",
+        lambda *_a, **_k: pytest.fail("enrollment must not be attempted"),
+    )
+
+    assert auto.status()["enrollment_grant_available"] is False
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "email_verification_required"
+
+
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(
     isolated_auto_upload,
     monkeypatch,

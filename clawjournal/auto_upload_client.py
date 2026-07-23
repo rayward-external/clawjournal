@@ -114,6 +114,26 @@ def _normalized_origin(
     return f"{scheme}://{rendered_host}{port}"
 
 
+def comparable_origin(value: str) -> str:
+    """Render an origin so two spellings of the same host compare equal.
+
+    The enrollment-grant issuer is derived from the configured share URL, which
+    preserves whatever casing and explicit port the operator wrote, while
+    capability validation lowercases the host and re-renders the port. Comparing
+    those two spellings directly makes a perfectly valid grant silently
+    unusable, so both sides normalize through here first. A value this module
+    cannot parse as an origin is returned trimmed rather than raising: the
+    caller is comparing two strings for equality, not authorizing egress.
+    """
+
+    try:
+        return _normalized_origin(
+            value, allow_local_http=_allow_insecure_loopback_http()
+        )
+    except CapabilityError:
+        return value.strip().rstrip("/")
+
+
 def _endpoint(
     origin: str,
     value: Any,

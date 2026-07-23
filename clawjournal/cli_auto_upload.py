@@ -194,29 +194,44 @@ def _interactive_accept(
         "AI-PII: "
         + (f"enabled via {ai.get('backend')}" if ai.get("enabled") else "disabled")
     ))
+    # Transcribing each version is the affirmative act itself, not decoration.
+    # A bare [y/N] can be answered without reading the text it is attached to,
+    # and it makes the accepted version a value the client echoes back from the
+    # challenge rather than one the participant attested to. Recurring sharing
+    # uploads future traces without per-bundle review, so its acceptance keeps
+    # the deliberate friction even though the web checkboxes are lighter.
     try:
-        accepted_scope = input(
-            "Authorize this exact scope and accept the displayed recurring "
-            "authorization and retention terms? [y/N] "
-        ).strip().lower()
-        if accepted_scope not in {"y", "yes"}:
+        entered_auth = input(
+            _sanitize_terminal_line(
+                f"Type authorization version {authorization['version']} to accept: "
+            )
+        ).strip()
+        if entered_auth != authorization["version"]:
             return None
-        accepted_ownership = input(
-            "Separately certify the displayed ownership statement? [y/N] "
-        ).strip().lower()
+        entered_retention = input(
+            _sanitize_terminal_line(
+                f"Type retention version {retention['version']} to accept: "
+            )
+        ).strip()
+        if entered_retention != retention["version"]:
+            return None
+        # The ownership certification is a distinct affirmative act, like the
+        # manual share's --certify-ownership: it is typed separately and never
+        # bundled into the terms acceptance above.
+        entered_ownership = input(
+            _sanitize_terminal_line(
+                f"Type ownership certification version {ownership['version']} "
+                "to certify: "
+            )
+        ).strip()
     except (EOFError, OSError, KeyboardInterrupt):
         return None
-    if accepted_ownership not in {"y", "yes"}:
+    if entered_ownership != ownership["version"]:
         return None
     profile_hash = challenge.get("authorization_profile_hash")
     if not isinstance(profile_hash, str) or not profile_hash:
         return None
-    return (
-        str(authorization["version"]),
-        str(retention["version"]),
-        str(ownership["version"]),
-        profile_hash,
-    )
+    return entered_auth, entered_retention, entered_ownership, profile_hash
 
 
 def _fresh_email_verification() -> bool:

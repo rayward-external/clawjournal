@@ -4092,6 +4092,61 @@ class TestShareAPI:
         assert "verified_email_token" not in persisted
         assert "verified_email_token_expires_at" not in persisted
 
+    def test_cached_grant_issuer_is_stored_normalized(self, server, monkeypatch):
+        """The issuer must be written in the form the enrollment path compares.
+
+        ``_hosted_api_base`` echoes the operator's CLAWJOURNAL_SHARE_URL casing,
+        while capability validation lowercases the host. Storing the raw spelling
+        would leave a valid grant permanently unusable on a mixed-case install.
+        """
+        WorkbenchHandler._last_share_time = 0.0
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon._HOSTED_SHARE_URL",
+            "https://Hosted.Example.TEST/share",
+        )
+        share_id = self._create_and_export_share(server)
+        config = _share_config()
+        snapshots: list[dict] = []
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(minutes=30)
+        ).isoformat()
+        upload_response = {
+            "receipt_id": "rcpt-test-456",
+            "status": "received",
+            "recurring_enrollment_grant": "cj_enroll_one-shot",
+            "recurring_enrollment_grant_expires_at": expires_at,
+            "recurring_enrollment_grant_receipt_id": "rcpt-test-456",
+        }
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config", lambda: config
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.save_config",
+            lambda updated: snapshots.append(dict(updated)) or True,
+        )
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                upload_response=upload_response,
+                capabilities={
+                    "recurring_upload_api_version": 2,
+                    "recurring_cadence_days": 1,
+                    "recurring_enrollment_open": True,
+                    "manual_share_enrollment_grant_version": 1,
+                },
+            ),
+        ):
+            status, _ = _post(
+                server, f"/api/shares/{share_id}/upload", self._consent_body()
+            )
+
+        assert status == 200
+        assert snapshots[-1]["recurring_enrollment_grant_issuer"] == (
+            "https://hosted.example.test"
+        )
+
     def test_share_rate_limiting(self, server, monkeypatch):
         """Two shares within cooldown → second gets 429."""
         WorkbenchHandler._last_share_time = 0.0

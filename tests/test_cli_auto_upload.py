@@ -172,7 +172,7 @@ def test_interactive_challenge_sanitizes_versions_scope_and_backend(
 
     def answer(prompt):
         prompts.append(prompt)
-        return "yes"
+        return attack
 
     monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", answer)
@@ -245,7 +245,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
             }
         return {"ok": True, "mode": "enabled", "health": "ready"}
 
-    answers = iter(["yes", "yes", "student@uni.edu"])
+    answers = iter(["auth-v1", "ret-v1", "own-v1", "student@uni.edu"])
     monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
     monkeypatch.setattr(sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
@@ -326,7 +326,9 @@ def test_interactive_enable_reprompts_once_when_the_refresh_changes_scope(
             return challenge("profile-two", ["project", "project-two"])
         return {"ok": True, "mode": "enabled", "health": "ready"}
 
-    answers = iter(["yes", "yes", "yes", "yes"])
+    answers = iter(
+        ["auth-v1", "ret-v1", "own-v1", "auth-v1", "ret-v1", "own-v1"]
+    )
     monkeypatch.setattr("clawjournal.auto_upload.enable", enable)
     monkeypatch.setattr(sys, "stdin", _FakeStdin())
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: next(answers))
