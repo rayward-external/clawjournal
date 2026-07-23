@@ -373,6 +373,41 @@ def test_auto_upload_ui_is_hidden_unless_internal_rollout_is_enabled(
     assert auto.status()["ui_visible"] is True
 
 
+def test_successful_manual_receipt_and_hosted_offer_reveal_auto_upload_ui(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
+    config = _save_scope_config()
+    config["auto_upload_capability_available"] = True
+    assert config_module.save_config(config)
+
+    # A stale config cache without the receipt database must not reveal the
+    # controls after a partial reinstall.
+    assert auto.status()["ui_visible"] is False
+
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    share_id = create_share(conn, ["session-one"])
+    conn.execute(
+        "UPDATE shares SET status = 'shared', shared_at = ?, "
+        "hosted_receipt_id = ?, submission_channel = 'manual' "
+        "WHERE share_id = ?",
+        (
+            "2026-07-23T12:00:00+00:00",
+            "manual-receipt-after-reinstall",
+            share_id,
+        ),
+    )
+    conn.commit()
+
+    result = auto.status(conn=conn)
+    conn.close()
+
+    assert result["offer_available"] is True
+    assert result["ui_visible"] is True
+
+
 def test_existing_auto_upload_authority_keeps_controls_visible(
     isolated_auto_upload,
     monkeypatch,
