@@ -168,6 +168,7 @@ describe('Share selection defaults', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Select first 50 (50 max)' }));
 
     expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(screen.queryByText(/Added 50 traces/)).not.toBeInTheDocument();
     await waitFor(() => {
       const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
       expect(params.get('selection')).toBe('all');
@@ -187,6 +188,7 @@ describe('Share selection defaults', () => {
     expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
     expect(screen.getAllByRole('checkbox', { name: /Include trace:/ })).toHaveLength(50);
     expect(screen.getByText(/Showing 50 of 125 matching traces/)).toBeInTheDocument();
+    expect(screen.getByText(/Only selected traces are in this bundle \(50 maximum\)/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '50 trace limit reached' })).toBeDisabled();
 
     fireEvent.click(screen.getByRole('button', { name: /Show 50 more/ }));
@@ -200,6 +202,40 @@ describe('Share selection defaults', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' }));
     expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeChecked();
+  });
+
+  it('prunes stale queue ids when eligibility refreshes after a completed bundle', async () => {
+    const initialStats = readyStats(50);
+    const refreshedSessions = ['s51', 's52', 's53'].map(readySession);
+    const refreshedStats: ShareReadyStats = {
+      ...readyStats(0),
+      count: refreshedSessions.length,
+      total_approved: refreshedSessions.length,
+      recommended_session_ids: ['s51'],
+      sessions: refreshedSessions,
+    };
+    mockInitialLoad(initialStats);
+    vi.mocked(api.shareReady)
+      .mockResolvedValueOnce(initialStats as Awaited<ReturnType<typeof api.shareReady>>)
+      .mockResolvedValueOnce(refreshedStats as Awaited<ReturnType<typeof api.shareReady>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=done&share=completed-share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Your bundle is ready' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Start a new bundle' }));
+
+    await waitFor(() => expect(api.shareReady).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    const replacement = screen.getByRole('checkbox', { name: 'Include trace: Trace s51' });
+    expect(replacement).toBeEnabled();
+
+    fireEvent.click(replacement);
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    expect(replacement).toBeChecked();
   });
 
   it('sanitizes duplicate and ineligible ids from deep links after ready state loads', async () => {

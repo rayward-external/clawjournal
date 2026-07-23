@@ -146,7 +146,21 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       ? new Set(queueSelectionFromSearchParams(searchParams, [], queueStorage) || [])
       : null
   ));
-  const queueSet = useMemo(() => new Set(queueOrder), [queueOrder]);
+  const eligibleQueueOrder = useMemo(
+    () => readyStats
+      ? sanitizeQueueSelection(readyStats, queueOrder)
+      : [...new Set(queueOrder)].slice(0, MAX_SHARE_QUEUE_SIZE),
+    [readyStats, queueOrder],
+  );
+  const queueSet = useMemo(() => new Set(eligibleQueueOrder), [eligibleQueueOrder]);
+
+  // Eligibility can shrink after a successful share or a hold/config refresh.
+  // Keep the stored queue canonical so stale IDs never consume the 50 slots.
+  useEffect(() => {
+    const unchanged = queueOrder.length === eligibleQueueOrder.length
+      && queueOrder.every((id, index) => id === eligibleQueueOrder[index]);
+    if (!unchanged) setQueueOrder(eligibleQueueOrder);
+  }, [eligibleQueueOrder, queueOrder]);
 
   const [note, setNote] = useState(() => searchParams.get('note') || '');
   const [aiPiiEnabled, setAiPiiEnabled] = useState(() => searchParams.get('ai_pii') === '1');
@@ -367,7 +381,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       else next.set('step', activeStep);
       if (selectionInitialized) {
         const defaultQueue = !locked && readyStats ? queueFromStats(readyStats) : null;
-        syncQueueSelectionToSearchParams(next, queueOrder, defaultQueue, queueStorage);
+        syncQueueSelectionToSearchParams(next, eligibleQueueOrder, defaultQueue, queueStorage);
         if (locked) next.set('selection', 'locked');
       }
       if (note) next.set('note', note); else next.delete('note');
@@ -376,7 +390,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       internalSearchRef.current = next.toString();
       return next;
     }, { replace: true });
-  }, [activeStep, queueOrder, selectionInitialized, selectionLocked, readyStats, queueStorage, note, aiPiiEnabled, packagedShareId, setSearchParams]);
+  }, [activeStep, eligibleQueueOrder, selectionInitialized, selectionLocked, readyStats, queueStorage, note, aiPiiEnabled, packagedShareId, setSearchParams]);
 
   // Drop cached redacted entries when sessions leave the queue.
   useEffect(() => {
@@ -421,11 +435,11 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   }, [readyStats]);
 
   const queuedSessions = useMemo(
-    () => queueOrder.map((id) => sessionById[id]).filter((s): s is ReadySession => !!s),
-    [queueOrder, sessionById],
+    () => eligibleQueueOrder.map((id) => sessionById[id]).filter((s): s is ReadySession => !!s),
+    [eligibleQueueOrder, sessionById],
   );
   const confirmedLargeQueueCoversCurrent = confirmedLargeQueueIds !== null
-    && queueOrder.every((id) => confirmedLargeQueueIds.has(id));
+    && eligibleQueueOrder.every((id) => confirmedLargeQueueIds.has(id));
   const largeBundleNeedsConfirmation = queuedSessions.length > LARGE_BUNDLE_CONFIRM_THRESHOLD
     && !confirmedLargeQueueCoversCurrent;
   // Only a locked exact-ID snapshot can restore an unpackaged downstream step.
@@ -514,29 +528,32 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   const removeFromQueue = (id: string) => {
     cancelAiRetries();
-    const next = queueOrder.filter((x) => x !== id);
+    const next = eligibleQueueOrder.filter((x) => x !== id);
     setQueueOrder(next);
   };
 
   const addToQueue = (id: string) => {
-    if (!queueOrder.includes(id) && queueOrder.length >= MAX_SHARE_QUEUE_SIZE) {
+    if (!eligibleQueueOrder.includes(id) && eligibleQueueOrder.length >= MAX_SHARE_QUEUE_SIZE) {
       toast(`A share can include at most ${MAX_SHARE_QUEUE_SIZE} traces. Remove one before adding another.`, 'error');
       return;
     }
     cancelAiRetries();
     setQueueOrder((prev) => {
-      if (prev.includes(id)) return prev;
-      if (prev.length >= MAX_SHARE_QUEUE_SIZE) return prev;
+      const current = readyStats
+        ? sanitizeQueueSelection(readyStats, prev)
+        : [...new Set(prev)].slice(0, MAX_SHARE_QUEUE_SIZE);
+      if (current.includes(id)) return current;
+      if (current.length >= MAX_SHARE_QUEUE_SIZE) return current;
       const defaults = readyStats ? queueFromStats(readyStats) : [];
-      const previousIds = new Set(prev);
+      const previousIds = new Set(current);
       const defaultOrderedSubset = defaults.filter((sessionId) => previousIds.has(sessionId));
-      const followsDefaultOrder = defaultOrderedSubset.length === prev.length
-        && defaultOrderedSubset.every((sessionId, index) => sessionId === prev[index]);
+      const followsDefaultOrder = defaultOrderedSubset.length === current.length
+        && defaultOrderedSubset.every((sessionId, index) => sessionId === current[index]);
       if (followsDefaultOrder && defaults.includes(id)) {
         previousIds.add(id);
         return defaults.filter((sessionId) => previousIds.has(sessionId));
       }
-      return [...prev, id];
+      return [...current, id];
     });
   };
 
@@ -550,39 +567,31 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   const addManyToQueue = (ids: string[]) => {
     if (ids.length === 0) return;
-    const currentIds = new Set(queueOrder);
-    const uniqueNewIds = [...new Set(ids)].filter((id) => !currentIds.has(id));
-    const remainingSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - queueOrder.length);
-    if (uniqueNewIds.length > remainingSlots) {
-      toast(
-        remainingSlots > 0
-          ? `Added ${remainingSlots} traces. A share can include at most ${MAX_SHARE_QUEUE_SIZE}.`
-          : `A share can include at most ${MAX_SHARE_QUEUE_SIZE} traces. Remove one before adding another.`,
-        'error',
-      );
-    }
     cancelAiRetries();
     setQueueOrder((prev) => {
+      const current = readyStats
+        ? sanitizeQueueSelection(readyStats, prev)
+        : [...new Set(prev)].slice(0, MAX_SHARE_QUEUE_SIZE);
       const defaults = readyStats ? queueFromStats(readyStats) : [];
       const defaultIds = new Set(defaults);
-      const selectedIds = new Set(prev);
-      const availableSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - prev.length);
+      const selectedIds = new Set(current);
+      const availableSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - current.length);
       const newIds = [...new Set(ids)]
         .filter((id) => !selectedIds.has(id))
         .slice(0, availableSlots);
-      if (newIds.length === 0) return prev;
+      if (newIds.length === 0) return current;
 
       // Keep the compact default order only while the user has not manually
       // reordered the queue. Once the order is custom, batch additions must
       // behave like single additions and leave the existing sequence intact.
       const defaultOrderedSubset = defaults.filter((id) => selectedIds.has(id));
-      const followsDefaultOrder = defaultOrderedSubset.length === prev.length
-        && defaultOrderedSubset.every((id, index) => id === prev[index]);
+      const followsDefaultOrder = defaultOrderedSubset.length === current.length
+        && defaultOrderedSubset.every((id, index) => id === current[index]);
       if (followsDefaultOrder && newIds.every((id) => defaultIds.has(id))) {
         newIds.forEach((id) => selectedIds.add(id));
         return defaults.filter((id) => selectedIds.has(id));
       }
-      return [...prev, ...newIds];
+      return [...current, ...newIds];
     });
   };
 
@@ -843,7 +852,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   const handleStartRedaction = () => {
     // Confirmation covers this exact set and any later subset (for example,
     // removing a blocked trace during review), but never newly added traces.
-    setConfirmedLargeQueueIds(new Set(queueOrder));
+    setConfirmedLargeQueueIds(new Set(eligibleQueueOrder));
     lockQueueSelection();
     setCompletedKeys((prev) => new Set([...prev, 'queue']));
     setActiveStep('redact');
@@ -1272,7 +1281,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         shares={shares}
         candidates={candidates}
         scoringBackend={scoringBackend}
-        queueOrder={queueOrder}
+        queueOrder={eligibleQueueOrder}
         queuedSessions={queuedSessions}
         note={note}
         setNote={setNote}

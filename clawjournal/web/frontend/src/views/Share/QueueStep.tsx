@@ -283,7 +283,7 @@ export function QueueStep(p: QueueStepProps) {
       </div>
       {filteredSessions.length > TRACE_RENDER_BATCH && (
         <div style={{ marginTop: 7, fontSize: 11.5, color: colors.gray500 }}>
-          Showing {visiblePickerSessions.length} of {filteredSessions.length} matching traces. All eligible traces remain selected unless you uncheck them.
+          Showing {visiblePickerSessions.length} of {filteredSessions.length} matching traces. Only selected traces are in this bundle ({MAX_SHARE_QUEUE_SIZE} maximum); unselected matches remain available to swap in.
         </div>
       )}
     </div>
