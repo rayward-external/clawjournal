@@ -29,8 +29,9 @@ If ClawJournal is already installed, safely update its repository and rerun
 the installer. Never discard local changes or force-reset the checkout. If
 an update is blocked, explain why and stop.
 
-Look across all supported coding agents unless I tell you otherwise. Show me
-the discovered projects before confirming them so I can exclude personal,
+Look across all supported coding agents unless I tell you otherwise. Set that
+scope explicitly with `clawjournal config --source all`, then show me the
+discovered projects before confirming them so I can exclude personal,
 confidential, third-party, or unrelated work.
 
 Use the exact ClawJournal executable printed by the installer; do not assume
@@ -124,6 +125,7 @@ For the complete details, see [PRIVACY.md](PRIVACY.md).
 These are the main commands:
 
 ```bash
+clawjournal config --source all           # explicitly include all supported agent sources
 clawjournal serve                        # open the local workbench
 clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring
 clawjournal status                       # check your setup
