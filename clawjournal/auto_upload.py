@@ -757,7 +757,12 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             db.close()
 
 
-def preview(*, refresh: bool = False, now: datetime | None = None) -> dict[str, Any]:
+def preview(
+    *,
+    refresh: bool = False,
+    now: datetime | None = None,
+    scan_wait_notice: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     if not refresh:
         # GET preview is a read-only surface just like GET status: do not create
         # the index, run migrations, or repair state merely because Settings
@@ -802,7 +807,10 @@ def preview(*, refresh: bool = False, now: datetime | None = None) -> dict[str, 
                 return AutoUploadError("not_enrolled", "Automatic upload is not enabled.").as_result()
             from .workbench.daemon import Scanner
 
-            scan = Scanner().scan_once_strict(list(enrollment["enrolled_sources"]))
+            scan = Scanner().scan_once_strict(
+                list(enrollment["enrolled_sources"]),
+                on_wait=scan_wait_notice,
+            )
             if scan.get("busy"):
                 return AutoUploadError(
                     "scanner_busy",

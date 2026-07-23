@@ -22,6 +22,37 @@ def test_auto_upload_status_json_is_pure_stdout(monkeypatch, capsys):
     assert captured.err == ""
 
 
+@pytest.mark.parametrize("output_json", [False, True])
+def test_preview_refresh_reports_lock_wait_without_breaking_json(
+    monkeypatch, capsys, output_json
+):
+    def preview(*, refresh, scan_wait_notice):
+        assert refresh is True
+        scan_wait_notice()
+        return {
+            "ok": True,
+            "selected": [],
+            "eligible_count": 0,
+            "selected_count": 0,
+            "deferred_by_cap": 0,
+        }
+
+    monkeypatch.setattr("clawjournal.auto_upload.preview", preview)
+    argv = ["clawjournal", "auto-upload", "preview", "--refresh"]
+    if output_json:
+        argv.append("--json")
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main()
+
+    captured = capsys.readouterr()
+    if output_json:
+        assert json.loads(captured.out)["ok"] is True
+        assert captured.err == ""
+    else:
+        assert "Waiting for another scan to finish" in captured.err
+
+
 def test_noninteractive_enable_requires_exact_versions(monkeypatch, capsys):
     challenge = {
         "ok": False,
