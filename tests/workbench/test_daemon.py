@@ -27,11 +27,52 @@ from clawjournal.workbench.daemon import (
     _build_share_zip,
     _reload_child_command,
     _missing_ingest_url_error,
+    _next_scan_delay,
     _recurring_offer_available,
     _warn_if_frontend_stale,
     trigger_scoring_warmup,
 )
+from clawjournal.workbench.daemon import MAX_SCAN_BACKOFF, SCAN_INTERVAL
 from clawjournal.workbench.index import add_policy, open_index, set_hold_state, upsert_sessions
+
+
+@pytest.mark.parametrize(
+    "elapsed,expected",
+    [
+        (0.0, SCAN_INTERVAL),
+        (1.0, SCAN_INTERVAL),
+        (SCAN_INTERVAL, SCAN_INTERVAL),
+        (SCAN_INTERVAL + 0.5, SCAN_INTERVAL + 0.5),
+        (123.0, 123.0),
+        (MAX_SCAN_BACKOFF * 2, MAX_SCAN_BACKOFF),
+    ],
+)
+def test_next_scan_delay_backs_off_for_slow_passes(elapsed, expected):
+    """A pass slower than the interval idles at least as long as it ran."""
+    assert _next_scan_delay(elapsed) == expected
+
+
+def test_next_scan_delay_halves_duty_cycle_up_to_the_backoff_cap():
+    """Scanning stays at or below half the loop's wall-clock, up to the cap.
+
+    A 123s pass on a 60s interval previously idled a flat 60s, leaving the
+    daemon scanning ~67% of the time — enough to pin a core indefinitely.
+    """
+    for elapsed in (30.0, 60.0, 123.0, 400.0, float(MAX_SCAN_BACKOFF)):
+        cycle = elapsed + _next_scan_delay(elapsed)
+        assert elapsed / cycle <= 0.5
+
+
+def test_next_scan_delay_lets_duty_cycle_rise_past_the_backoff_cap():
+    """Past the cap the duty cycle climbs again, by design.
+
+    Idling proportionally forever would let a pathologically slow corpus fall
+    arbitrarily far behind, so the cap deliberately wins over the duty-cycle
+    target. This pins that trade so it is not mistaken for the guarantee above.
+    """
+    elapsed = float(MAX_SCAN_BACKOFF) * 3
+    assert _next_scan_delay(elapsed) == MAX_SCAN_BACKOFF
+    assert elapsed / (elapsed + _next_scan_delay(elapsed)) > 0.5
 
 
 def test_recurring_offer_uses_current_protocol_version():

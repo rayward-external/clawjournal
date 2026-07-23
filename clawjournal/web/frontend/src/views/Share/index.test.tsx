@@ -592,3 +592,35 @@ describe('Share selection defaults', () => {
     expect(onSubmittedShareChange).not.toHaveBeenCalledWith('second-share');
   });
 });
+
+describe('Redaction completion', () => {
+  it('settles every queued trace when reloading a locked redact deep link', async () => {
+    mockInitialLoad(readyStats(2));
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'full',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share?step=redact&ids=s1,s2&selection=locked']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { name: 'Redacting your traces' })).toBeInTheDocument();
+
+    // The reports resolve, but the run releases its slot before React applies
+    // their state updates. Re-checking liveness inside the updater dropped
+    // them, pinning the trace at `loading` with no request left in flight.
+    await waitFor(() => {
+      expect(document.body.textContent || '').toContain('Redaction complete');
+    }, { timeout: 3000 });
+
+    // And it must settle without spinning: one report per queued trace.
+    expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual(['s1', 's2']);
+  });
+});

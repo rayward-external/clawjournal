@@ -284,6 +284,15 @@ def _log_strict_scan_failure(*, source: str, stage: str, code: str) -> None:
 
 DEFAULT_PORT = 8384
 SCAN_INTERVAL = 60  # seconds
+# A scan pass over a large corpus can take longer than SCAN_INTERVAL. Waiting a
+# flat interval after such a tick leaves the scanner running nearly
+# back-to-back, which pins a core and churns the session list the workbench is
+# rendering. Back off to at least the tick's own duration, which holds scanning
+# to half the loop's wall-clock for any pass up to MAX_SCAN_BACKOFF. Past that
+# the cap wins and the duty cycle climbs again — a deliberate trade so a
+# pathologically slow corpus still gets rechecked a few times an hour rather
+# than falling arbitrarily far behind.
+MAX_SCAN_BACKOFF = 900  # seconds
 AUTO_SCORE_BATCH_SIZE = 20
 _NO_MATCHING_WARMUP_SOURCE = "__clawjournal_no_matching_warmup_source__"
 SCORING_DISPLAY_NAMES = {
@@ -579,6 +588,19 @@ def _maybe_create_trace_note(conn: sqlite3.Connection, session_id: str) -> None:
             logger.debug("created trace note at %s", created)
     except Exception:
         logger.exception("Failed to create trace note for %s", session_id)
+
+
+def _next_scan_delay(elapsed_seconds: float) -> float:
+    """Return how long the background scanner should idle after a pass.
+
+    A pass that finishes within ``SCAN_INTERVAL`` keeps the normal cadence. A
+    slower pass — large corpora routinely exceed a minute — idles for at least
+    its own duration so scanning never occupies more than half the loop's
+    wall-clock, bounded by ``MAX_SCAN_BACKOFF``.
+    """
+    if not elapsed_seconds or elapsed_seconds <= SCAN_INTERVAL:
+        return SCAN_INTERVAL
+    return min(elapsed_seconds, MAX_SCAN_BACKOFF)
 
 
 class Scanner:
@@ -1113,10 +1135,13 @@ class Scanner:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
+            tick_started = time.monotonic()
             try:
                 results = self._scan_tick()
                 if results is None:
-                    self._stop_event.wait(SCAN_INTERVAL)
+                    self._stop_event.wait(
+                        _next_scan_delay(time.monotonic() - tick_started)
+                    )
                     continue
                 trigger_scoring_warmup(self)
                 total_new = sum(results.values())
@@ -1136,7 +1161,17 @@ class Scanner:
                     )
             except Exception:
                 logger.exception("Scanner error")
-            self._stop_event.wait(SCAN_INTERVAL)
+            elapsed = time.monotonic() - tick_started
+            delay = _next_scan_delay(elapsed)
+            if delay > SCAN_INTERVAL:
+                logger.info(
+                    "Scan pass took %.0fs (longer than the %ds interval); "
+                    "waiting %.0fs before the next pass",
+                    elapsed,
+                    SCAN_INTERVAL,
+                    delay,
+                )
+            self._stop_event.wait(delay)
 
 
 _LOCALHOST_ORIGINS = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")

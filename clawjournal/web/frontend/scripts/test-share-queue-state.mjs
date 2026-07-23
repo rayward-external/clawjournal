@@ -150,7 +150,19 @@ assert.match(shareIndex, /isRedactionRetryActive\(redactionRetryRef\.current, id
 assert.match(shareIndex, /signal: run\.controller\.signal/);
 assert.match(shareIndex, /cancelRedactionRetries\(redactionRetryRef\.current\)/);
 assert.match(shareIndex, /if \(activeStep !== 'review'\) cancelAiRetries\(\)/);
-assert.match(shareIndex, /\[queuedSessions, aiPiiEnabled, cancelAiRetries\]/);
+// Cancel on a real queue change, not on a re-derived-but-equal array. Keying
+// these on `queuedSessions` identity aborted the run that had just started,
+// because `queueOrder` syncs to `eligibleQueueOrder` one render later.
+assert.match(shareIndex, /\[queuedSessionKey, aiPiiEnabled, cancelAiRetries\]/);
+assert.match(shareIndex, /\[queuedSessionKey, aiPiiEnabled, cancelRedaction\]/);
+assert.match(shareIndex, /const queuedSessionKey = useMemo\(/);
+// Staleness must be judged by the run's own abort signal, never by
+// `isActive()`. React applies updaters lazily, so an `isActive()` re-check
+// inside one runs after `finishRedactionRun` released the slot and would
+// discard a report that succeeded, pinning the trace at `loading` forever.
+assert.doesNotMatch(shareIndex, /setRedactedSessions\(\(prev\) => \{\s*if \(!isActive\(\)\) return prev;/);
+assert.match(shareIndex, /run\.controller\.signal\.aborted \? prev :/);
+assert.match(shareIndex, /settleFinishedRun\(/);
 assert.match(shareIndex, /\(\) => cancelRedactionRetries\(redactionRetryRef\.current\)/);
 assert.match(shareIndex, /const approvedSessions = useMemo\(/);
 assert.match(shareIndex, /approvedList=\{approvedSessions\}/);
