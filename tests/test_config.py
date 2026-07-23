@@ -7,6 +7,7 @@ import pytest
 from clawjournal.config import (
     _migrate_excluded_projects,
     _migrate_findings_engines,
+    _migrate_remove_auto_upload_ui_flag,
     load_config,
     normalize_excluded_project_names,
     save_config,
@@ -168,3 +169,23 @@ class TestMigrateFindingsEngines:
         assert "betterleaks" in config["enabled_findings_engines"]
         data = json.loads(tmp_config.read_text())
         assert "betterleaks" in data["enabled_findings_engines"]
+
+
+class TestRemoveAutoUploadUiFlag:
+    def test_missing_key_is_unchanged(self):
+        config = {}
+        assert _migrate_remove_auto_upload_ui_flag(config) is False
+
+    def test_retired_rollout_flag_is_removed(self):
+        config = {"auto_upload_ui_enabled": False}
+        assert _migrate_remove_auto_upload_ui_flag(config) is True
+        assert "auto_upload_ui_enabled" not in config
+
+    def test_load_config_persists_removal(self, tmp_config):
+        tmp_config.parent.mkdir(parents=True, exist_ok=True)
+        tmp_config.write_text(json.dumps({"auto_upload_ui_enabled": True}))
+
+        config = load_config()
+
+        assert "auto_upload_ui_enabled" not in config
+        assert "auto_upload_ui_enabled" not in json.loads(tmp_config.read_text())

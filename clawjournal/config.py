@@ -139,7 +139,6 @@ class ClawJournalConfig(TypedDict, total=False):
     benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
     scoring_warmup_declined: bool  # user declined the background auto-scorer (suppresses prompt + server-side auto-start)
     auto_upload_capability_available: bool  # non-authoritative UI offer cache; Enable revalidates live
-    auto_upload_ui_enabled: bool  # internal override; a cached eligible offer also reveals the UI
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {
@@ -149,7 +148,6 @@ DEFAULT_CONFIG: ClawJournalConfig = {
     "redact_strings": [],
     "allowlist_entries": [],
     "benchmark_tab_enabled": True,
-    "auto_upload_ui_enabled": False,
 }
 
 
@@ -165,6 +163,7 @@ def load_config() -> ClawJournalConfig:
             config = cast(ClawJournalConfig, {**DEFAULT_CONFIG, **stored})
             changed = _migrate_excluded_projects(config)
             changed |= _migrate_remove_device_credentials(config)
+            changed |= _migrate_remove_auto_upload_ui_flag(config)
             changed |= _migrate_findings_engines(config)
             if changed:
                 save_config(config)
@@ -230,6 +229,14 @@ def _migrate_remove_device_credentials(config: ClawJournalConfig) -> bool:
             del config[key]  # type: ignore[misc]
             changed = True
     return changed
+
+
+def _migrate_remove_auto_upload_ui_flag(config: ClawJournalConfig) -> bool:
+    """Remove the retired internal rollout flag from persisted config."""
+    if "auto_upload_ui_enabled" not in config:
+        return False
+    del config["auto_upload_ui_enabled"]  # type: ignore[misc]
+    return True
 
 
 def _migrate_findings_engines(config: ClawJournalConfig) -> bool:

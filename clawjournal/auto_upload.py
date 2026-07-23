@@ -95,7 +95,6 @@ TELEMETRY_MAX_BYTES = 512 * 1024
 TELEMETRY_BACKUPS = 2
 SUPPORTED_HOOK_TARGETS = ("claude", "codex")
 HOOK_DB_BUSY_TIMEOUT_MS = 0
-AUTO_UPLOAD_UI_ENV = "CLAWJOURNAL_ENABLE_AUTO_UPLOAD_UI"
 _CONTROL_THREAD_LOCK = threading.Lock()
 
 # V1 supports only sources with both a SessionStart trigger and an audited,
@@ -611,35 +610,6 @@ def _has_successful_manual_receipt(conn: sqlite3.Connection) -> bool:
     )
 
 
-def _auto_upload_ui_visible(
-    config: Mapping[str, Any],
-    enrollment: Mapping[str, Any] | None = None,
-    *,
-    successful_manual_receipt: bool = False,
-) -> bool:
-    # A successful manual hosted share caches this non-authoritative offer bit
-    # only after the service advertises the current recurring-upload protocol.
-    # It is safe to use for visibility: Enable still revalidates the live
-    # capability document before granting any recurring authority.
-    hosted_offer_available = (
-        successful_manual_receipt
-        and config.get("auto_upload_capability_available") is True
-    )
-    explicitly_enabled = (
-        os.environ.get(AUTO_UPLOAD_UI_ENV) == "1"
-        or config.get("auto_upload_ui_enabled") is True
-    )
-    existing_authority = bool(
-        enrollment
-        and (
-            enrollment.get("mode") != "off"
-            or enrollment.get("server_enrollment_id")
-            or enrollment.get("revocation_pending")
-        )
-    )
-    return hosted_offer_available or explicitly_enabled or existing_authority
-
-
 def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
     hooks = []
     for target in SUPPORTED_HOOK_TARGETS:
@@ -653,7 +623,7 @@ def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
         "run_now_allowed": False,
         "overlay": None,
         "pending_submission_state": None,
-        "ui_visible": _auto_upload_ui_visible(config),
+        "ui_visible": True,
         "offer_available": False,
         "scope": {"sources": [], "projects": []},
         "cap": MAX_SESSIONS,
@@ -758,11 +728,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             ),
             "overlay": overlay,
             "pending_submission_state": pending_submission_state,
-            "ui_visible": _auto_upload_ui_visible(
-                config,
-                enrollment,
-                successful_manual_receipt=successful_manual,
-            ),
+            "ui_visible": True,
             "offer_available": bool(
                 mode == "off"
                 and successful_manual

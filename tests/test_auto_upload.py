@@ -374,29 +374,21 @@ def test_status_is_read_only_without_an_install(
     assert not isolated_auto_upload["install"].exists()
 
 
-def test_auto_upload_ui_is_hidden_unless_internal_rollout_is_enabled(
-    isolated_auto_upload,
-    monkeypatch,
-):
-    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
-    assert auto.status()["ui_visible"] is False
-
-    monkeypatch.setenv(auto.AUTO_UPLOAD_UI_ENV, "1")
+def test_auto_upload_ui_is_visible_by_default(isolated_auto_upload):
     assert auto.status()["ui_visible"] is True
 
 
-def test_successful_manual_receipt_and_hosted_offer_reveal_auto_upload_ui(
+def test_hosted_offer_requires_the_receipt_database_not_just_config_cache(
     isolated_auto_upload,
-    monkeypatch,
 ):
-    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
     config = _save_scope_config()
     config["auto_upload_capability_available"] = True
     assert config_module.save_config(config)
 
-    # A stale config cache without the receipt database must not reveal the
-    # controls after a partial reinstall.
-    assert auto.status()["ui_visible"] is False
+    # A stale config cache without the receipt database must not surface the
+    # offer after a partial reinstall. (The Settings panel itself is always
+    # visible now; only the receipt-page offer stays gated.)
+    assert auto.status()["offer_available"] is False
 
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -422,9 +414,7 @@ def test_successful_manual_receipt_and_hosted_offer_reveal_auto_upload_ui(
 
 def test_existing_auto_upload_authority_keeps_controls_visible(
     isolated_auto_upload,
-    monkeypatch,
 ):
-    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
