@@ -119,6 +119,7 @@ describe('AutoUploadOffer', () => {
     const dismissible = renderControl(<AutoUploadOffer manualReceiptId="receipt-2" />);
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
     expect(await screen.findByText(/exact source\/project pairs/i)).toBeInTheDocument();
+    expect(screen.getByText(/you will verify your email before enabling/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Review and enable' })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Not now' }));
@@ -170,6 +171,7 @@ describe('AutoUploadOffer', () => {
     renderControl(<AutoUploadOffer manualReceiptId="receipt-grant" />);
 
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
+    expect(screen.getByText(/without verifying your email again/i)).toBeInTheDocument();
     expect(await screen.findByText('Exact recurring scope · 1 source/project pair')).toBeInTheDocument();
     const boxes = screen.getAllByRole('checkbox');
     expect(boxes).toHaveLength(2);

@@ -225,6 +225,29 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _parse_expiry_time(value: Any) -> datetime | None:
+    """Parse config expiry values accepted by the manual-share boundary."""
+
+    parsed = _parse_time(value)
+    if parsed is not None:
+        return parsed
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            timestamp = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 _RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS = (
     "recurring_enrollment_grant",
     "recurring_enrollment_grant_expires_at",
@@ -240,7 +263,9 @@ def _available_recurring_enrollment_grant(
     capability_version: Any = MANUAL_SHARE_ENROLLMENT_GRANT_VERSION,
 ) -> str | None:
     grant = str(config.get("recurring_enrollment_grant") or "").strip()
-    expires_at = _parse_time(config.get("recurring_enrollment_grant_expires_at"))
+    expires_at = _parse_expiry_time(
+        config.get("recurring_enrollment_grant_expires_at")
+    )
     issuer = str(config.get("recurring_enrollment_grant_issuer") or "").strip()
     if (
         not grant
@@ -1920,7 +1945,7 @@ def enable(
                     ambiguous=True,
                 )
             elif isinstance(exc, RecurringServiceError):
-                if (
+                enrollment_grant_rejected = (
                     sent_identity_kind == "enrollment_grant"
                     and not exc.ambiguous
                     and exc.code
@@ -1930,14 +1955,21 @@ def enable(
                         "credential_expired",
                         "credential_revoked",
                     }
-                ):
+                )
+                if enrollment_grant_rejected:
                     try:
                         failure_config = load_config()
                         _remove_recurring_enrollment_grant(failure_config)
                         save_config(failure_config)
                     except Exception:
                         pass
-                if updating and exc.code in {
+                if enrollment_grant_rejected:
+                    error = AutoUploadError(
+                        "email_verification_required",
+                        "The receipt-issued enrollment grant is unavailable. "
+                        "Verify your email to continue.",
+                    )
+                elif updating and exc.code in {
                     "credential_invalid",
                     "credential_expired",
                     "credential_revoked",

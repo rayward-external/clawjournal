@@ -2749,9 +2749,19 @@ def test_enable_prefers_manual_share_grant_without_email_verification(
     assert "recurring_enrollment_grant_issuer" not in persisted
 
 
+@pytest.mark.parametrize(
+    "rejection_code",
+    [
+        "email_verification_required",
+        "credential_invalid",
+        "credential_expired",
+        "credential_revoked",
+    ],
+)
 def test_rejected_manual_share_grant_falls_back_to_email_verification(
     isolated_auto_upload,
     monkeypatch,
+    rejection_code,
 ):
     _save_scope_config(enrollment_grant="cj_enroll_expired")
     conn = open_index()
@@ -2761,7 +2771,7 @@ def test_rejected_manual_share_grant_falls_back_to_email_verification(
 
     def reject(_capabilities, **_kwargs):
         raise RecurringServiceError(
-            "email_verification_required",
+            rejection_code,
             "Fresh verified identity is required.",
         )
 
@@ -2780,6 +2790,32 @@ def test_rejected_manual_share_grant_falls_back_to_email_verification(
     persisted = config_module.load_config()
     assert "recurring_enrollment_grant" not in persisted
     assert auto.status()["enrollment_grant_available"] is False
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [4102444800, 4102444800.0, "4102444800"],
+)
+def test_manual_share_grant_accepts_supported_epoch_expirations(
+    isolated_auto_upload,
+    monkeypatch,
+    expires_at,
+):
+    _save_scope_config(enrollment_grant="cj_enroll_epoch")
+    config = config_module.load_config()
+    config["recurring_enrollment_grant_expires_at"] = expires_at
+    config_module.save_config(config)
+    monkeypatch.setattr(auto, "_configured_hosted_origin", lambda: ORIGIN)
+
+    assert auto.status()["enrollment_grant_available"] is True
+    assert (
+        auto._available_recurring_enrollment_grant(
+            config_module.load_config(),
+            origin=ORIGIN,
+            capability_version=1,
+        )
+        == "cj_enroll_epoch"
+    )
 
 
 @pytest.mark.parametrize(

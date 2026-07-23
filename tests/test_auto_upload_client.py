@@ -57,6 +57,18 @@ def test_capabilities_require_every_safety_contract():
         )
 
 
+@pytest.mark.parametrize(
+    "grant_version",
+    [True, 1.0, "1", 2],
+)
+def test_capabilities_require_an_exact_integer_grant_version(grant_version):
+    with pytest.raises(client.CapabilityError, match="enrollment-grant"):
+        client.validate_capabilities(
+            _caps(manual_share_enrollment_grant_version=grant_version),
+            origin="https://data.rayward.ai",
+        )
+
+
 def test_capabilities_reject_cross_origin_endpoint():
     with pytest.raises(client.CapabilityError, match="different origin"):
         client.validate_capabilities(

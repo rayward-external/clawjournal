@@ -554,7 +554,11 @@ function AuthorizationDialog({
         </h3>
         <p style={{ margin: '0 0 18px', fontSize: 13, lineHeight: 1.55, color: colors.gray600 }}>
           {inline
-            ? `Enable up to ${cap} eligible future traces every ${cadence} day${cadence === 1 ? '' : 's'} from the exact scope below. The receipt from this share lets you enable it without verifying your email again.`
+            ? `Enable up to ${cap} eligible future traces every ${cadence} day${cadence === 1 ? '' : 's'} from the exact scope below. ${
+              initialStatus.enrollment_grant_available
+                ? 'The receipt from this share lets you enable it without verifying your email again.'
+                : 'If its receipt-issued enrollment grant is unavailable or expires, you will verify your email before enabling.'
+            }`
             : 'Future selected traces in this exact scope may be uploaded without you reviewing each bundle. This is separate from the consent you gave for the bundle you just reviewed.'}
         </p>
 

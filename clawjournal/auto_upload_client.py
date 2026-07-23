@@ -190,7 +190,11 @@ def validate_capabilities(
                 f"Hosted recurring-upload capability {field} is unavailable or incompatible.",
             )
     grant_version = capabilities.get("manual_share_enrollment_grant_version")
-    if grant_version is not None and grant_version != MANUAL_SHARE_ENROLLMENT_GRANT_VERSION:
+    if grant_version is not None and (
+        not isinstance(grant_version, int)
+        or isinstance(grant_version, bool)
+        or grant_version != MANUAL_SHARE_ENROLLMENT_GRANT_VERSION
+    ):
         raise CapabilityError(
             "capability_incompatible",
             "Hosted recurring-upload enrollment-grant capability is incompatible.",
