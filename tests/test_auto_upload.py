@@ -362,7 +362,7 @@ def test_status_is_read_only_without_an_install(
     assert not isolated_auto_upload["install"].exists()
 
 
-def test_auto_upload_ui_is_hidden_unless_internal_rollout_is_enabled(
+def test_auto_upload_ui_is_hidden_until_rollout_or_hosted_offer_is_available(
     isolated_auto_upload,
     monkeypatch,
 ):
@@ -370,6 +370,13 @@ def test_auto_upload_ui_is_hidden_unless_internal_rollout_is_enabled(
     assert auto.status()["ui_visible"] is False
 
     monkeypatch.setenv(auto.AUTO_UPLOAD_UI_ENV, "1")
+    assert auto.status()["ui_visible"] is True
+
+    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV)
+    config = _save_scope_config()
+    config["auto_upload_capability_available"] = True
+    assert config_module.save_config(config)
+
     assert auto.status()["ui_visible"] is True
 
 

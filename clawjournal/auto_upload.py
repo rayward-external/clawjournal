@@ -581,6 +581,13 @@ def _auto_upload_ui_visible(
     config: Mapping[str, Any],
     enrollment: Mapping[str, Any] | None = None,
 ) -> bool:
+    # A successful manual hosted share caches this non-authoritative offer bit
+    # only after the service advertises the current recurring-upload protocol.
+    # It is safe to use for visibility: Enable still revalidates the live
+    # capability document before granting any recurring authority.
+    hosted_offer_available = (
+        config.get("auto_upload_capability_available") is True
+    )
     explicitly_enabled = (
         os.environ.get(AUTO_UPLOAD_UI_ENV) == "1"
         or config.get("auto_upload_ui_enabled") is True
@@ -593,7 +600,7 @@ def _auto_upload_ui_visible(
             or enrollment.get("revocation_pending")
         )
     )
-    return explicitly_enabled or existing_authority
+    return hosted_offer_available or explicitly_enabled or existing_authority
 
 
 def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
