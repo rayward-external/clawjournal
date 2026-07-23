@@ -259,10 +259,24 @@ def run(args) -> None:
 
     command = args.auto_upload_command
     output_json = bool(getattr(args, "json", False))
+
+    def scan_wait_notice() -> None:
+        # Fires once when a strict refresh must wait for a scan in another
+        # process (usually the daemon's background pass).
+        if not output_json:
+            print(
+                "Waiting for another scan to finish before refreshing "
+                "(the background scanner may be mid-pass)…",
+                file=sys.stderr,
+            )
+
     if command == "status":
         result = auto_upload.status()
     elif command == "preview":
-        result = auto_upload.preview(refresh=bool(args.refresh))
+        result = auto_upload.preview(
+            refresh=bool(args.refresh),
+            scan_wait_notice=scan_wait_notice,
+        )
     elif command == "run":
         result = auto_upload.run_cycle(force=True)
     elif command == "pause":
@@ -319,6 +333,7 @@ def run(args) -> None:
                 accepted_ownership_certification_version=ownership_version,
                 accepted_authorization_profile_hash=profile_hash,
                 scan_progress=scan_progress,
+                scan_wait_notice=scan_wait_notice,
             )
 
         result = call_enable()

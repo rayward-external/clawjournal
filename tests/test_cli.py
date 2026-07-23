@@ -1468,6 +1468,29 @@ class TestScanOutput:
 
         assert "No new or updated sessions found." in output
 
+    def test_reports_busy_scan_without_a_traceback(self, monkeypatch, capsys):
+        from clawjournal.workbench.daemon import ScanBusyError
+
+        class FakeScanner:
+            def __init__(self, source_filter=None):
+                pass
+
+            def scan_once(self):
+                raise ScanBusyError("Another scan is still refreshing the index.")
+
+        self._patch_scan_dependencies(monkeypatch, FakeScanner)
+
+        from clawjournal.cli import _run_scan
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_scan()
+
+        assert exc_info.value.code == 1
+        assert (
+            "Scan not run: Another scan is still refreshing the index."
+            in capsys.readouterr().err
+        )
+
 
 class TestWorkbenchSourceChoices:
     def test_scan_accepts_cursor_source(self, monkeypatch):
@@ -1536,6 +1559,39 @@ class TestRecentOutput:
         out = capsys.readouterr().out
         assert "FV 4/5" in out
         assert "1/5" not in out
+
+    def test_recent_shows_current_index_when_refresh_is_busy(
+        self, monkeypatch, capsys
+    ):
+        from clawjournal.cli import _run_recent
+        from clawjournal.workbench.daemon import ScanBusyError
+
+        conn = MagicMock()
+
+        class BusyScanner:
+            def __init__(self, source_filter=None):
+                pass
+
+            def scan_once(self):
+                raise ScanBusyError("busy")
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.Scanner", BusyScanner
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.open_index", lambda: conn
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.query_sessions",
+            lambda _conn, **_kwargs: [],
+        )
+
+        _run_recent(MagicMock(source=None, since=None, limit=5, json=False))
+
+        assert (
+            "Another scan is refreshing the index; showing current results."
+            in capsys.readouterr().err
+        )
 
 
 class TestEventsCLI:

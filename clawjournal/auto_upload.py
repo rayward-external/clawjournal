@@ -757,7 +757,12 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             db.close()
 
 
-def preview(*, refresh: bool = False, now: datetime | None = None) -> dict[str, Any]:
+def preview(
+    *,
+    refresh: bool = False,
+    now: datetime | None = None,
+    scan_wait_notice: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     if not refresh:
         # GET preview is a read-only surface just like GET status: do not create
         # the index, run migrations, or repair state merely because Settings
@@ -802,7 +807,16 @@ def preview(*, refresh: bool = False, now: datetime | None = None) -> dict[str, 
                 return AutoUploadError("not_enrolled", "Automatic upload is not enabled.").as_result()
             from .workbench.daemon import Scanner
 
-            scan = Scanner().scan_once_strict(list(enrollment["enrolled_sources"]))
+            scan = Scanner().scan_once_strict(
+                list(enrollment["enrolled_sources"]),
+                on_wait=scan_wait_notice,
+            )
+            if scan.get("busy"):
+                return AutoUploadError(
+                    "scanner_busy",
+                    "Another scan is refreshing the index; try again in a few minutes.",
+                    retryable=True,
+                ).as_result()
             if not scan["ok"]:
                 return {
                     "ok": False,
@@ -1043,6 +1057,7 @@ def _strict_scan_for_enable(
     sources: Sequence[str],
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_wait: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     from .workbench.daemon import Scanner
     from .workbench.index import INDEX_DB
@@ -1061,7 +1076,9 @@ def _strict_scan_for_enable(
                 "reused": True,
                 "required_sources": sorted(required),
             }
-    scan = Scanner().scan_once_strict(sorted(required), progress=progress)
+    scan = Scanner().scan_once_strict(
+        sorted(required), progress=progress, on_wait=on_wait
+    )
     if scan.get("ok"):
         with _strict_scan_reuse_lock:
             _strict_scan_reuse[key] = (required, time.monotonic())
@@ -1077,6 +1094,7 @@ def enable(
     accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
     scan_progress: Callable[[str, int, int], None] | None = None,
+    scan_wait_notice: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Review or transactionally create/update a recurring enrollment.
 
@@ -1087,7 +1105,8 @@ def enable(
     same exact-version discipline as the authorization and retention terms.
     ``scan_progress`` is forwarded to the strict refresh (sources and
     counters only), which runs only on a call whose acceptance matches the
-    displayed profile.
+    displayed profile; ``scan_wait_notice`` fires once if that refresh has
+    to wait for a scan in another process.
     """
 
     targets = _hook_targets(agent)
@@ -1155,7 +1174,18 @@ def enable(
         # enroll: refresh the index now — a refresh that just completed for
         # the same index and sources is reused, so one interactive flow pays
         # for at most one full re-parse.
-        scan = _strict_scan_for_enable(scope["sources"], progress=scan_progress)
+        scan = _strict_scan_for_enable(
+            scope["sources"], progress=scan_progress, on_wait=scan_wait_notice
+        )
+        if scan.get("busy"):
+            # Fail closed with an honest code: another process held the scan
+            # lock past the bounded wait, so nothing was refreshed and there
+            # is nothing to diagnose in the source logs.
+            return AutoUploadError(
+                "scanner_busy",
+                "Another scan is refreshing the index; try again in a few minutes.",
+                retryable=True,
+            ).as_result()
         if not scan["ok"]:
             return {
                 "ok": False,
@@ -3783,16 +3813,27 @@ def _run_cycle_impl(
                         list(enrollment["enrolled_sources"])
                     )
                     if not strict["ok"]:
+                        # Contention gets its own code, matching enable() and
+                        # preview(): "incomplete" invites diagnosing the logs.
+                        scan_code = (
+                            "scanner_busy"
+                            if strict.get("busy")
+                            else "strict_scan_incomplete"
+                        )
                         _record_cycle_result(
                             conn,
                             generation=generation,
-                            code="strict_scan_incomplete",
+                            code=scan_code,
                             retryable=True,
                         )
                         return {
                             "ok": False,
-                            "code": "strict_scan_incomplete",
-                            "message": "The enrolled source refresh was incomplete.",
+                            "code": scan_code,
+                            "message": (
+                                "Another scan is refreshing the index; the cycle will retry."
+                                if strict.get("busy")
+                                else "The enrolled source refresh was incomplete."
+                            ),
                             "retryable": True,
                             "scan": strict,
                         }
@@ -3883,16 +3924,27 @@ def _run_cycle_impl(
                         list(enrollment["enrolled_sources"])
                     )
                     if not strict["ok"]:
+                        # Contention gets its own code, matching enable() and
+                        # preview(): "incomplete" invites diagnosing the logs.
+                        scan_code = (
+                            "scanner_busy"
+                            if strict.get("busy")
+                            else "strict_scan_incomplete"
+                        )
                         _record_cycle_result(
                             conn,
                             generation=generation,
-                            code="strict_scan_incomplete",
+                            code=scan_code,
                             retryable=True,
                         )
                         return {
                             "ok": False,
-                            "code": "strict_scan_incomplete",
-                            "message": "The enrolled source refresh was incomplete.",
+                            "code": scan_code,
+                            "message": (
+                                "Another scan is refreshing the index; the cycle will retry."
+                                if strict.get("busy")
+                                else "The enrolled source refresh was incomplete."
+                            ),
                             "retryable": True,
                             "scan": strict,
                         }
@@ -3954,16 +4006,25 @@ def _run_cycle_impl(
                     list(enrollment["enrolled_sources"])
                 )
                 if not second_scan["ok"]:
+                    scan_code = (
+                        "scanner_busy"
+                        if second_scan.get("busy")
+                        else "strict_scan_incomplete"
+                    )
                     _record_cycle_result(
                         conn,
                         generation=generation,
-                        code="strict_scan_incomplete",
+                        code=scan_code,
                         retryable=True,
                     )
                     return {
                         "ok": False,
-                        "code": "strict_scan_incomplete",
-                        "message": "The final source refresh was incomplete.",
+                        "code": scan_code,
+                        "message": (
+                            "Another scan is refreshing the index; the cycle will retry."
+                            if second_scan.get("busy")
+                            else "The final source refresh was incomplete."
+                        ),
                         "retryable": True,
                         "scan": second_scan,
                     }
