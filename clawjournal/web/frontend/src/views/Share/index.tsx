@@ -7,6 +7,7 @@ import { Spinner } from '../../components/Spinner.tsx';
 import { Stepper } from '../../components/Stepper.tsx';
 import {
   LARGE_BUNDLE_CONFIRM_THRESHOLD,
+  MAX_SHARE_QUEUE_SIZE,
   STEPS,
 } from './types.ts';
 import type {
@@ -518,9 +519,14 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   };
 
   const addToQueue = (id: string) => {
+    if (!queueOrder.includes(id) && queueOrder.length >= MAX_SHARE_QUEUE_SIZE) {
+      toast(`A share can include at most ${MAX_SHARE_QUEUE_SIZE} traces. Remove one before adding another.`, 'error');
+      return;
+    }
     cancelAiRetries();
     setQueueOrder((prev) => {
       if (prev.includes(id)) return prev;
+      if (prev.length >= MAX_SHARE_QUEUE_SIZE) return prev;
       const defaults = readyStats ? queueFromStats(readyStats) : [];
       const previousIds = new Set(prev);
       const defaultOrderedSubset = defaults.filter((sessionId) => previousIds.has(sessionId));
@@ -534,9 +540,9 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     });
   };
 
-  // Batch selection helpers. With 1000s of eligible sessions, unchecking traces
-  // one at a time is impractical, so the queue exposes select-all / deselect-all
-  // controls (scoped to whatever filters are active in the picker).
+  // Batch selection helpers fill only the remaining slots in the bounded
+  // queue. Filters still make it practical to swap among 1000s of eligible
+  // sessions without ever selecting the full local corpus.
   const clearQueue = () => {
     cancelAiRetries();
     setQueueOrder([]);
@@ -544,12 +550,26 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   const addManyToQueue = (ids: string[]) => {
     if (ids.length === 0) return;
+    const currentIds = new Set(queueOrder);
+    const uniqueNewIds = [...new Set(ids)].filter((id) => !currentIds.has(id));
+    const remainingSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - queueOrder.length);
+    if (uniqueNewIds.length > remainingSlots) {
+      toast(
+        remainingSlots > 0
+          ? `Added ${remainingSlots} traces. A share can include at most ${MAX_SHARE_QUEUE_SIZE}.`
+          : `A share can include at most ${MAX_SHARE_QUEUE_SIZE} traces. Remove one before adding another.`,
+        'error',
+      );
+    }
     cancelAiRetries();
     setQueueOrder((prev) => {
       const defaults = readyStats ? queueFromStats(readyStats) : [];
       const defaultIds = new Set(defaults);
       const selectedIds = new Set(prev);
-      const newIds = ids.filter((id) => !selectedIds.has(id));
+      const availableSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - prev.length);
+      const newIds = [...new Set(ids)]
+        .filter((id) => !selectedIds.has(id))
+        .slice(0, availableSlots);
       if (newIds.length === 0) return prev;
 
       // Keep the compact default order only while the user has not manually

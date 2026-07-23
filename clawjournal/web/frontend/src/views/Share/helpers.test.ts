@@ -44,10 +44,11 @@ export function readyStats(count = 12): ShareReadyStats {
 }
 
 describe('Share queue selection encoding', () => {
-  it('defaults to every eligible trace, including queues larger than the old cap', () => {
-    const stats = readyStats();
-    expect(queueFromStats(stats)).toEqual(stats.sessions.map((session) => session.session_id));
-    expect(queueFromSelectionParams(stats, new URLSearchParams())).toHaveLength(12);
+  it('defaults to the first 50 ranked eligible traces', () => {
+    const stats = readyStats(75);
+    const expected = stats.sessions.slice(0, 50).map((session) => session.session_id);
+    expect(queueFromStats(stats)).toEqual(expected);
+    expect(queueFromSelectionParams(stats, new URLSearchParams())).toEqual(expected);
   });
 
   it('keeps default and exclusion URLs compact while preserving explicit empty and ordered subsets', () => {
@@ -79,6 +80,15 @@ describe('Share queue selection encoding', () => {
     const params = new URLSearchParams('ids=s2,blocked,s2,s1,missing');
 
     expect(queueFromSelectionParams(stats, params)).toEqual(['s2', 's1']);
+  });
+
+  it('caps explicit selections at 50 while retaining eligible traces outside the default queue', () => {
+    const stats = readyStats(75);
+    const reversed = stats.sessions.map((session) => session.session_id).reverse();
+    const params = new URLSearchParams({ ids: reversed.join(',') });
+
+    expect(queueFromSelectionParams(stats, params)).toEqual(reversed.slice(0, 50));
+    expect(queueFromSelectionParams(stats, params)[0]).toBe('s75');
   });
 
   it('materializes and marks an exact downstream snapshot', () => {

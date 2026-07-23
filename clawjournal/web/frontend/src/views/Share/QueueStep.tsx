@@ -6,7 +6,7 @@ import { colors } from '../../theme.ts';
 import { ConfirmDialog } from '../../components/ConfirmDialog.tsx';
 import { SessionDrawer } from '../../components/SessionDrawer.tsx';
 import { TraceCard } from '../../components/TraceCard.tsx';
-import { LARGE_BUNDLE_CONFIRM_THRESHOLD } from './types.ts';
+import { LARGE_BUNDLE_CONFIRM_THRESHOLD, MAX_SHARE_QUEUE_SIZE } from './types.ts';
 import type { ReadySession, ShareReadyStats } from './types.ts';
 import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip, sessionTotalTokens, sourceFullLabel } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
@@ -77,6 +77,7 @@ export function QueueStep(p: QueueStepProps) {
 
   const allSessions = p.readyStats?.sessions || [];
   const selectedIds = new Set(p.queueOrder);
+  const selectionLimitReached = p.queueOrder.length >= MAX_SHARE_QUEUE_SIZE;
   // `total_approved` counts every approved session; `allSessions` only holds the
   // ones actually eligible to share. When approved > 0 but eligible == 0, the
   // sessions exist but are all held/embargoed/excluded/already-shared — say so
@@ -171,6 +172,20 @@ export function QueueStep(p: QueueStepProps) {
         const selectedInFilter = filteredIds.filter(id => selectedIds.has(id)).length;
         const filterActive = !!(p.searchQuery || p.sourceFilter || p.projectFilter || p.scoreFilter > 0 || p.dateFilter);
         const allSelected = selectedInFilter === filteredIds.length;
+        const batchDisabled = allSelected || selectionLimitReached;
+        const remainingSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - p.queueOrder.length);
+        const unselectedInFilter = filteredIds.length - selectedInFilter;
+        const batchSelectionWouldBeCapped = unselectedInFilter > remainingSlots;
+        let batchLabel = filterActive
+          ? `Select ${filteredIds.length} filtered`
+          : `Select all ${filteredIds.length}`;
+        if (selectionLimitReached && !allSelected) {
+          batchLabel = `${MAX_SHARE_QUEUE_SIZE} trace limit reached`;
+        } else if (batchSelectionWouldBeCapped) {
+          batchLabel = filterActive
+            ? `Select ${remainingSlots} more filtered (${MAX_SHARE_QUEUE_SIZE} max)`
+            : `Select first ${remainingSlots} (${MAX_SHARE_QUEUE_SIZE} max)`;
+        }
         const batchBtn = {
           ...btnGhost, fontSize: 12, padding: '5px 10px',
           border: `1px solid ${colors.gray300}`, borderRadius: 6, background: colors.white,
@@ -180,10 +195,10 @@ export function QueueStep(p: QueueStepProps) {
             <button
               type="button"
               onClick={() => p.onAddMany(filteredIds)}
-              disabled={allSelected}
-              style={{ ...batchBtn, opacity: allSelected ? 0.45 : 1, cursor: allSelected ? 'not-allowed' : 'pointer' }}
+              disabled={batchDisabled}
+              style={{ ...batchBtn, opacity: batchDisabled ? 0.45 : 1, cursor: batchDisabled ? 'not-allowed' : 'pointer' }}
             >
-              {filterActive ? `Select ${filteredIds.length} filtered` : `Select all ${filteredIds.length}`}
+              {batchLabel}
             </button>
             <button
               type="button"
@@ -195,6 +210,7 @@ export function QueueStep(p: QueueStepProps) {
             </button>
             <span style={{ fontSize: 11.5, color: colors.gray500 }}>
               {selectedInFilter} of {filteredIds.length}{filterActive ? ' filtered' : ''} selected
+              {' · '}{MAX_SHARE_QUEUE_SIZE} trace maximum
             </span>
           </div>
         );
@@ -204,43 +220,52 @@ export function QueueStep(p: QueueStepProps) {
           <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
             No sessions match your filters.
           </div>
-        ) : visiblePickerSessions.map((s, i) => (
-          <label key={s.session_id} style={{
-            display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 10,
-            alignItems: 'center', padding: '8px 12px',
-            borderBottom: i < visiblePickerSessions.length - 1 ? `1px solid ${colors.gray100}` : 'none',
-            cursor: 'pointer',
-          }}>
-            <input
-              type="checkbox"
-              checked={selectedIds.has(s.session_id)}
-              aria-label={`Include trace: ${s.display_title || 'Untitled'}`}
-              onChange={(e) => e.target.checked ? p.onAdd(s.session_id) : p.onRemove(s.session_id)}
-              style={{ width: 15, height: 15, accentColor: colors.gray900 }}
-            />
-            <div style={{ minWidth: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
-                <span style={{
-                  minWidth: 0, fontSize: 13, color: colors.gray900, fontWeight: 500,
-                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-                }}>
-                  {s.display_title || 'Untitled'}
-                </span>
-                <UpdatedSinceShareBadge session={s} />
-              </div>
-              <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
-                <SourceBadge s={s} />
-                <span>{s.project}</span>
-                <span style={{ opacity: 0.5 }}>&middot;</span>
-                <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
-                {s.review_status && s.review_status !== 'approved' && (<>
+        ) : visiblePickerSessions.map((s, i) => {
+          const selected = selectedIds.has(s.session_id);
+          const blockedByLimit = selectionLimitReached && !selected;
+          return (
+            <label
+              key={s.session_id}
+              title={blockedByLimit ? 'Remove a selected trace before adding another.' : undefined}
+              style={{
+                display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 10,
+                alignItems: 'center', padding: '8px 12px',
+                borderBottom: i < visiblePickerSessions.length - 1 ? `1px solid ${colors.gray100}` : 'none',
+                cursor: blockedByLimit ? 'not-allowed' : 'pointer',
+                opacity: blockedByLimit ? 0.55 : 1,
+              }}>
+              <input
+                type="checkbox"
+                checked={selected}
+                disabled={blockedByLimit}
+                aria-label={`Include trace: ${s.display_title || 'Untitled'}`}
+                onChange={(e) => e.target.checked ? p.onAdd(s.session_id) : p.onRemove(s.session_id)}
+                style={{ width: 15, height: 15, accentColor: colors.gray900 }}
+              />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                  <span style={{
+                    minWidth: 0, fontSize: 13, color: colors.gray900, fontWeight: 500,
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                  }}>
+                    {s.display_title || 'Untitled'}
+                  </span>
+                  <UpdatedSinceShareBadge session={s} />
+                </div>
+                <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <SourceBadge s={s} />
+                  <span>{s.project}</span>
                   <span style={{ opacity: 0.5 }}>&middot;</span>
-                  <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
-                </>)}
+                  <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
+                  {s.review_status && s.review_status !== 'approved' && (<>
+                    <span style={{ opacity: 0.5 }}>&middot;</span>
+                    <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
+                  </>)}
+                </div>
               </div>
-            </div>
-          </label>
-        ))}
+            </label>
+          );
+        })}
         {filteredSessions.length > visiblePickerSessions.length && (
           <button
             onClick={() => setPickerRenderLimit((current) => current + TRACE_RENDER_BATCH)}
