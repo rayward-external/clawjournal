@@ -1614,19 +1614,6 @@ _RECURRING_ENROLLMENT_GRANT_KEYS = (
 )
 
 
-def _clear_stored_recurring_enrollment_grant() -> None:
-    config = load_config()
-    changed = False
-    for key in _RECURRING_ENROLLMENT_GRANT_KEYS:
-        if key in config:
-            del config[key]
-            changed = True
-    if changed and save_config(config) is False:
-        raise OSError(
-            "Stored recurring-enrollment convenience credential could not be cleared safely."
-        )
-
-
 def _store_recurring_enrollment_grant(
     hosted_result: dict[str, Any],
     *,

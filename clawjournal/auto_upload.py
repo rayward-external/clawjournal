@@ -259,9 +259,19 @@ _RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS = (
 def _available_recurring_enrollment_grant(
     config: Mapping[str, Any],
     *,
-    origin: str | None = None,
+    origin: str,
     capability_version: Any = MANUAL_SHARE_ENROLLMENT_GRANT_VERSION,
 ) -> str | None:
+    """Return the cached grant only if it is usable against ``origin``.
+
+    ``origin`` is required rather than defaulted: a grant is authority to create
+    a recurring enrollment, and an optional binding is one a caller can forget.
+    ``capability_version`` does default to the supported version, because the
+    local status path has no discovery document to check it against and treats
+    ``enable`` as the authority; that default is permissive, so it must never
+    grow a second one beside it.
+    """
+
     grant = str(config.get("recurring_enrollment_grant") or "").strip()
     expires_at = _parse_expiry_time(
         config.get("recurring_enrollment_grant_expires_at")
@@ -272,10 +282,7 @@ def _available_recurring_enrollment_grant(
         or expires_at is None
         or expires_at <= _now() + timedelta(seconds=60)
         or capability_version != MANUAL_SHARE_ENROLLMENT_GRANT_VERSION
-        or (
-            origin is not None
-            and comparable_origin(issuer) != comparable_origin(origin)
-        )
+        or comparable_origin(issuer) != comparable_origin(origin)
     ):
         return None
     return grant

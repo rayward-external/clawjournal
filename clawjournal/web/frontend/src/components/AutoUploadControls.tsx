@@ -698,9 +698,14 @@ function AuthorizationDialog({
             <div style={{ fontSize: 13, fontWeight: 650, color: colors.gray900 }}>
               Verify your email
             </div>
+            {/* This block is also reached from the settings panel while
+                rotating an active enrollment's credentials, where no grant was
+                ever issued. Naming one unconditionally would tell those users
+                a receipt grant expired when they never had one. */}
             <div style={{ fontSize: 12, lineHeight: 1.45, color: colors.gray600 }}>
-              The receipt-issued enrollment grant is unavailable or expired. Verify your email
-              to continue; your recurring terms selection above remains unchanged.
+              {initialStatus.enrollment_grant_available
+                ? 'The receipt-issued enrollment grant is unavailable or expired. Verify your email to continue; your recurring terms selection above remains unchanged.'
+                : 'Recurring enrollment needs its own single-use email verification. Verify to continue; your recurring terms selection above remains unchanged.'}
             </div>
             {tokenValid ? (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>

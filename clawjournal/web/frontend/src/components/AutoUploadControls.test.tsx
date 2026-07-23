@@ -287,6 +287,44 @@ describe('AutoUploadPanel authorization', () => {
     expect(screen.getByText('recurring-v2')).toBeInTheDocument();
     expect(screen.queryByText('recurring-v1')).not.toBeInTheDocument();
   });
+
+  it('never blames a receipt grant when rotating an active enrollment', async () => {
+    // Rotating credentials on a live enrollment returns email_verification_required
+    // and opens the same verification block the receipt offer uses. No grant was
+    // ever issued on this path, so it must not claim one expired.
+    const initial = status({
+      mode: 'enabled',
+      scope: { sources: ['claude'], projects: ['project-a'] },
+      hooks: [
+        { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
+        { agent: 'codex', selected: false, configured: true, installed: true, last_observed_at: null },
+      ],
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(initial);
+    vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(authorizationRequired())
+      .mockRejectedValueOnce(new ApiError(409, 'Verify your email again to rotate recurring credentials.', {
+        code: 'email_verification_required',
+      }));
+    vi.spyOn(api.share, 'uploadStatus').mockResolvedValue({
+      verified_email: null,
+      token_valid: false,
+      expires_at: null,
+      pending_email: null,
+    });
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+    await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
+
+    const checkboxes = screen.getAllByRole('checkbox');
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
+
+    expect(await screen.findByText(/single-use email verification/i)).toBeInTheDocument();
+    expect(screen.queryByText(/receipt-issued enrollment grant/i)).not.toBeInTheDocument();
+  });
 });
 
 describe('AutoUploadPanel status and controls', () => {
