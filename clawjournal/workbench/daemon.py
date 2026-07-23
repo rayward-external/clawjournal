@@ -136,9 +136,9 @@ SCAN_LOCK_FILENAME = "scan.lock"
 # Longer than a full background pass on a large corpus, so a strict scan
 # waiting on the lock outlives the daemon tick that holds it.
 SCAN_LOCK_WAIT_SECONDS = 300.0
-# Normal scans proceed unlocked after the wait, so theirs is best-effort
-# politeness only — and their interactive callers (`clawjournal recent`,
-# the share preflight) have no wait feedback, so keep the ceiling short.
+# Normal scans fail closed after this wait instead of bypassing the lock.
+# Their interactive callers (`clawjournal recent`, the share preflight) have
+# limited wait feedback, so keep the ceiling short.
 SCAN_ONCE_LOCK_WAIT_SECONDS = 15.0
 _SCAN_LOCK_POLL_SECONDS = 0.5
 

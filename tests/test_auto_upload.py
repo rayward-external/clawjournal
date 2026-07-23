@@ -248,7 +248,10 @@ def _patch_strict_scanner(
             index = len(calls) - 1
             if index < len(actions) and actions[index] is not None:
                 actions[index]()
-            return responses[min(index, len(responses) - 1)]
+            response = responses[min(index, len(responses) - 1)]
+            if response.get("busy") and on_wait is not None:
+                on_wait()
+            return response
 
     monkeypatch.setattr("clawjournal.workbench.daemon.Scanner", StrictScanner)
     return calls
@@ -3048,13 +3051,18 @@ def test_preview_refresh_surfaces_scanner_busy(
     scan_calls = _patch_strict_scanner(
         monkeypatch, results=[{"ok": False, "busy": True}]
     )
+    wait_notices = []
 
-    result = auto.preview(refresh=True)
+    result = auto.preview(
+        refresh=True,
+        scan_wait_notice=lambda: wait_notices.append("waiting"),
+    )
 
     assert result["ok"] is False
     assert result["code"] == "scanner_busy"
     assert result["retryable"] is True
     assert scan_calls == [["claude"]]
+    assert wait_notices == ["waiting"]
 
 
 def test_enable_never_backdates_cutoff_before_durable_local_intent(
