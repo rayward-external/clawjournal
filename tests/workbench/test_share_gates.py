@@ -227,10 +227,88 @@ class TestExportManifestRedactions:
         assert "[REDACTED_JWT]" in body
         assert n >= 2
 
-    def test_apply_share_redactions_skips_trufflehog_in_local_data_step(self, conn, monkeypatch):
+    @pytest.mark.parametrize("serialized", [False, True])
+    def test_complete_findings_profile_still_runs_trufflehog(
+        self, conn, monkeypatch, serialized
+    ):
+        from clawjournal.redaction import betterleaks, trufflehog
+        from clawjournal.redaction.secrets import (
+            FindingsScannerProfile,
+            apply_findings_to_blob,
+        )
+
+        seen = []
+        monkeypatch.setattr(
+            betterleaks,
+            "betterleaks_secret_map_from_blob",
+            lambda *_args, **_kwargs: {},
+        )
+        monkeypatch.setattr(
+            trufflehog,
+            "trufflehog_secret_map_from_blob",
+            lambda *_args, **_kwargs: seen.append("trufflehog") or {},
+        )
+        sess = _settled_session("complete-profile", content="ordinary text")
+        scanner_profile = FindingsScannerProfile.COMPLETE
+        if serialized:
+            scanner_profile = scanner_profile.value
+
+        apply_findings_to_blob(
+            sess,
+            conn,
+            "complete-profile",
+            scanner_profile=scanner_profile,
+        )
+
+        assert seen == ["trufflehog"]
+
+    def test_unknown_findings_profile_is_rejected(self, conn):
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+
+        sess = _settled_session("unknown-profile", content="ordinary text")
+
+        with pytest.raises(ValueError, match="Unknown findings scanner profile"):
+            apply_findings_to_blob(
+                sess,
+                conn,
+                "unknown-profile",
+                scanner_profile="typo",
+            )
+
+    def test_serialized_complete_log_profile_runs_trufflehog(
+        self, conn, monkeypatch
+    ):
+        from clawjournal.redaction import betterleaks, trufflehog
+        from clawjournal.redaction.secrets import FindingsScannerProfile
+        from clawjournal.workbench.index import _build_deterministic_redaction_log
+
+        seen = []
+        monkeypatch.setattr(
+            betterleaks,
+            "scan_session_for_betterleaks_findings",
+            lambda *_args, **_kwargs: [],
+        )
+        monkeypatch.setattr(
+            trufflehog,
+            "scan_session_for_trufflehog_findings",
+            lambda *_args, **_kwargs: seen.append("trufflehog") or [],
+        )
+        sess = _settled_session("serialized-log", content="ordinary text")
+
+        _build_deterministic_redaction_log(
+            conn,
+            sess,
+            scanner_profile=FindingsScannerProfile.COMPLETE.value,
+        )
+
+        assert seen == ["trufflehog"]
+
+    def test_apply_share_redactions_defers_trufflehog_to_final_gate(
+        self, conn, monkeypatch
+    ):
         from clawjournal.redaction import trufflehog as trufflehog_scanner
 
-        raw = "trufflehog test sentinel"
+        raw = "trufflehog local share sentinel"
         sess = _settled_session("sess-th", content=f"leak {raw}")
         upsert_sessions(conn, [sess])
         conn.commit()
@@ -238,12 +316,16 @@ class TestExportManifestRedactions:
         monkeypatch.setattr(
             trufflehog_scanner,
             "scan_session_for_trufflehog_findings",
-            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not scan with TruffleHog"),
+            lambda *_args, **_kwargs: pytest.fail(
+                "local Share logging must defer TruffleHog to the final gate"
+            ),
         )
         monkeypatch.setattr(
             trufflehog_scanner,
             "trufflehog_secret_map_from_blob",
-            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not apply TruffleHog findings"),
+            lambda *_args, **_kwargs: pytest.fail(
+                "local Share redaction must defer TruffleHog to the final gate"
+            ),
         )
 
         redacted, n, log = apply_share_redactions(conn, sess)
@@ -301,10 +383,12 @@ class TestExportManifestRedactions:
         with pytest.raises(ValueError, match="session_id"):
             apply_share_redactions(conn, session)
 
-    def test_apply_share_redactions_skips_ignored_trufflehog_findings(self, conn, monkeypatch):
+    def test_apply_share_redactions_does_not_consult_trufflehog_decisions_locally(
+        self, conn, monkeypatch
+    ):
         from clawjournal.redaction import trufflehog as trufflehog_scanner
 
-        raw = "ignored trufflehog sentinel"
+        raw = "ignored trufflehog local sentinel"
         sess = _settled_session("sess-th-ignore", content=f"keep {raw}")
         upsert_sessions(conn, [sess])
         conn.execute(
@@ -323,12 +407,16 @@ class TestExportManifestRedactions:
         monkeypatch.setattr(
             trufflehog_scanner,
             "scan_session_for_trufflehog_findings",
-            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not scan with TruffleHog"),
+            lambda *_args, **_kwargs: pytest.fail(
+                "local Share logging must not consult TruffleHog"
+            ),
         )
         monkeypatch.setattr(
             trufflehog_scanner,
             "trufflehog_secret_map_from_blob",
-            lambda *_args, **_kwargs: pytest.fail("local Share redaction must not apply TruffleHog findings"),
+            lambda *_args, **_kwargs: pytest.fail(
+                "local Share redaction must not consult TruffleHog"
+            ),
         )
 
         redacted, n, log = apply_share_redactions(conn, sess)
@@ -453,12 +541,10 @@ class TestAiTextRedaction:
 def _mock_gate_engines(monkeypatch, *, bl_passes=None, th_passes=None):
     """Enable a real (non-bypassed) share gate with both engines mocked.
 
-    ``bl_passes`` / ``th_passes`` are per-scan-pass lists of raw-match
-    dicts (betterleaks: ``{"raw","rule_id","entropy","line"}``;
-    trufflehog: ``{"raw","detector","status","line"}``). Passes beyond
-    the end of a list return no matches, which is how a redact loop
-    converges. The findings-engine hooks are stubbed empty so the
-    apply path never spawns a real subprocess.
+    ``bl_passes`` contains each broad convergence scan; ``th_passes``
+    contains the initial and optional final live-verification scans. Passes
+    beyond either list return no matches. The findings-engine hooks are
+    stubbed empty so the apply path never spawns a real subprocess.
     """
     from clawjournal.redaction import betterleaks, trufflehog
 
@@ -522,7 +608,7 @@ class TestSecretScanGate:
         ).fetchone()["status"]
 
     def test_clean_scan_advances_share_status(self, conn, monkeypatch):
-        _mock_gate_engines(monkeypatch)
+        calls = _mock_gate_engines(monkeypatch)
         share_id, share = self._share(conn)
         export_dir, manifest = export_share_to_disk(conn, share_id, share)
         assert export_dir is not None
@@ -532,6 +618,7 @@ class TestSecretScanGate:
         scan = manifest["redaction_summary"]["secret_scan"]
         assert scan["findings"] == 0
         assert scan["converged"] is True
+        assert calls == {"bl": 1, "th": 1}
         assert (export_dir / "trufflehog.json").exists()
         assert (export_dir / "secret-scan.json").exists()
 
@@ -654,7 +741,7 @@ class TestSecretScanGate:
         # The headline behavior change: a recognizable-but-unverified
         # token no longer rejects the session — the exact span is
         # replaced and the share ships.
-        _mock_gate_engines(
+        calls = _mock_gate_engines(
             monkeypatch,
             bl_passes=[[{
                 "raw": self.RAW, "rule_id": "slack-bot-token",
@@ -677,6 +764,7 @@ class TestSecretScanGate:
         assert scan["gate_redactions"] >= 1
         assert scan["tier_counts"].get("redact") == 1
         assert scan["converged"] is True
+        assert calls == {"bl": 2, "th": 2}
         # Folded into the manifest counters and the per-session entry.
         assert (
             manifest["redaction_summary"]["by_type"]["gate_secret_scan"]
@@ -687,7 +775,7 @@ class TestSecretScanGate:
         json.loads(body.splitlines()[0])
 
     def test_verified_credential_blocks_and_does_not_advance(self, conn, monkeypatch):
-        _mock_gate_engines(
+        calls = _mock_gate_engines(
             monkeypatch,
             th_passes=[[{
                 "raw": self.RAW, "detector": "GitHub",
@@ -712,8 +800,85 @@ class TestSecretScanGate:
         # Defense in depth: even a blocked export's on-disk artifact
         # has the live credential redacted.
         assert self.RAW not in (export_dir / "sessions.jsonl").read_text()
+        assert calls == {"bl": 2, "th": 2}
         disk = json.loads((export_dir / "manifest.json").read_text())
         assert disk["blocked"] is True
+
+    def test_final_verification_catches_credential_revealed_by_rewrite(
+        self, conn, monkeypatch
+    ):
+        prefix = "wrapper-prefix-"
+        calls = _mock_gate_engines(
+            monkeypatch,
+            bl_passes=[[
+                {
+                    "raw": prefix,
+                    "rule_id": "slack-bot-token",
+                    "entropy": 4.4,
+                    "line": 1,
+                }
+            ]],
+            th_passes=[[], [
+                {
+                    "raw": self.RAW,
+                    "detector": "GitHub",
+                    "status": "verified",
+                    "line": 1,
+                }
+            ]],
+        )
+        share_id, share = self._share(
+            conn, content=f"nested {prefix}{self.RAW}"
+        )
+
+        export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert manifest["blocked"] is True
+        assert calls == {"bl": 2, "th": 2}
+        assert self.RAW not in (export_dir / "sessions.jsonl").read_text()
+        findings = manifest["blocked_sessions"][0]["findings"]
+        assert any(
+            finding["engine"] == "trufflehog" and finding["tier"] == "block"
+            for finding in findings
+        )
+
+    def test_final_verification_error_fails_closed(self, conn, monkeypatch):
+        from clawjournal.redaction import trufflehog
+
+        _mock_gate_engines(
+            monkeypatch,
+            bl_passes=[[
+                {
+                    "raw": self.RAW,
+                    "rule_id": "slack-bot-token",
+                    "entropy": 4.4,
+                    "line": 1,
+                }
+            ]],
+        )
+        th_calls = 0
+
+        def scan_trufflehog(path, *, results):
+            nonlocal th_calls
+            th_calls += 1
+            report = trufflehog.TruffleHogReport(
+                scanned_path=str(path),
+                scanned_sha256="sha256:0",
+                scan_error=(
+                    "verification transport failed" if th_calls == 2 else None
+                ),
+            )
+            return report, []
+
+        monkeypatch.setattr(trufflehog, "scan_file_with_raws", scan_trufflehog)
+        share_id, share = self._share(conn, content=f"leak {self.RAW}")
+
+        _export_dir, manifest = export_share_to_disk(conn, share_id, share)
+
+        assert th_calls == 2
+        assert manifest["blocked"] is True
+        assert manifest["block_reason"] == "scanner-error"
+        assert "verification transport failed" in manifest["block_message"]
 
     def test_private_key_rule_requires_review(self, conn, monkeypatch):
         fake_key = "-----BEGIN RSA PRIVATE KEY-----\\nFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE\\n-----END RSA PRIVATE KEY-----"

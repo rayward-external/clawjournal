@@ -20,12 +20,33 @@ import math
 import re
 import sqlite3
 from collections.abc import Iterable
+from enum import Enum
 from typing import Any
 
 from ..findings import RawFinding, hash_entity
 from ..parsing.widened import iter_widened_text_locations
 
 REDACTED = "[REDACTED]"
+
+
+class FindingsScannerProfile(str, Enum):
+    """External scanner set used by findings-backed blob redaction."""
+
+    COMPLETE = "complete"
+    LOCAL_SHARE = "local_share"
+
+
+def _normalize_findings_scanner_profile(
+    scanner_profile: FindingsScannerProfile | str,
+) -> FindingsScannerProfile:
+    """Accept serialized profiles and reject unknown values fail-closed."""
+    try:
+        return FindingsScannerProfile(scanner_profile)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unknown findings scanner profile: {scanner_profile!r}"
+        ) from exc
+
 
 # Ordered from most specific to least specific
 SECRET_PATTERNS = [
@@ -1098,7 +1119,7 @@ def apply_findings_to_blob(
     *,
     user_allowlist: list[dict] | None = None,
     max_passes: int = 3,
-    include_trufflehog: bool = True,
+    scanner_profile: FindingsScannerProfile | str = FindingsScannerProfile.COMPLETE,
 ) -> tuple[dict, int]:
     """Re-scan the blob, apply decisions from the `findings` table.
 
@@ -1111,6 +1132,8 @@ def apply_findings_to_blob(
     revealed by earlier replacements. Byte-equivalent to `redact_session`
     when only secrets are present and every decision is open/accepted.
     """
+    scanner_profile = _normalize_findings_scanner_profile(scanner_profile)
+
     # Decisions are engine-agnostic at the apply step — same hash, same
     # answer. The pipeline guarantees that hashes are unique per
     # (session, entity), so collapsing to a single dict is safe.
@@ -1124,14 +1147,16 @@ def apply_findings_to_blob(
     from .betterleaks import betterleaks_secret_map_from_blob
     from .pii import pii_secret_map_from_text_decisions
 
-    # Betterleaks is always part of the local redaction pass. TruffleHog is
-    # optional here so the Share path can defer it to its mandatory final
-    # package gate. Each enabled engine runs once on the original blob rather
-    # than inside the per-pass loop.
+    # Betterleaks is the broad local detector. The Share path deliberately
+    # defers live credential verification to the mandatory merged-artifact
+    # gate; other callers retain the complete two-scanner behavior.
     trufflehog_map: dict[str, str] = {}
-    if include_trufflehog:
+    if scanner_profile is FindingsScannerProfile.COMPLETE:
         from .trufflehog import trufflehog_secret_map_from_blob
-        trufflehog_map = trufflehog_secret_map_from_blob(blob, decisions, user_allowlist)
+
+        trufflehog_map = trufflehog_secret_map_from_blob(
+            blob, decisions, user_allowlist
+        )
     betterleaks_map = betterleaks_secret_map_from_blob(blob, decisions, user_allowlist)
 
     total = 0
@@ -1158,7 +1183,7 @@ def apply_findings_to_blob(
         secret_map.update(_collect_infrastructure_secret_map(blob))
         secret_map.update(trufflehog_map)
         secret_map.update(betterleaks_map)
-        # Note on loop termination: once an engine map is non-empty the
+        # Note on loop termination: once an external scanner map is non-empty the
         # `not secret_map` guard never fires, so the pass loop now
         # relies on the `pass_count == 0 and pass_num > 0` guard below
         # to exit. That guard still works because the second pass's

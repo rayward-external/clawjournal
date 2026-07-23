@@ -14,7 +14,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from ..redaction.secrets import redact_text
+from ..redaction.secrets import (
+    FindingsScannerProfile,
+    _normalize_findings_scanner_profile,
+    redact_text,
+)
 from ..scoring.badges import compute_all_badges
 from ..config import (
     CONFIG_DIR,
@@ -1657,15 +1661,15 @@ def _build_deterministic_redaction_log(
     session: dict[str, Any],
     *,
     user_allowlist: list[dict[str, Any]] | None = None,
-    include_trufflehog: bool = True,
+    scanner_profile: FindingsScannerProfile | str = FindingsScannerProfile.COMPLETE,
 ) -> list[dict[str, Any]]:
     """Build a metadata-only log from the findings-backed redaction substrate."""
+    scanner_profile = _normalize_findings_scanner_profile(scanner_profile)
+
     from ..findings import hash_entity
     from ..redaction.betterleaks import scan_session_for_betterleaks_findings
     from ..redaction.pii import _dedupe_overlapping_pii, scan_text_for_pii
     from ..redaction.secrets import _dedupe_overlapping_matches, _iter_text_locations, scan_text
-    if include_trufflehog:
-        from ..redaction.trufflehog import scan_session_for_trufflehog_findings
 
     session_id = str(session.get("session_id") or "")
     if not session_id:
@@ -1702,7 +1706,9 @@ def _build_deterministic_redaction_log(
                 tool_field=tool_field,
             ))
 
-    if include_trufflehog:
+    if scanner_profile is FindingsScannerProfile.COMPLETE:
+        from ..redaction.trufflehog import scan_session_for_trufflehog_findings
+
         try:
             for finding in scan_session_for_trufflehog_findings(
                 session,
@@ -1995,7 +2001,7 @@ def apply_share_redactions(
             conn,
             session,
             user_allowlist=user_allowlist,
-            include_trufflehog=False,
+            scanner_profile=FindingsScannerProfile.LOCAL_SHARE,
         ),
     )
     session, deterministic_total = apply_findings_to_blob(
@@ -2003,10 +2009,9 @@ def apply_share_redactions(
         conn,
         session_id,
         user_allowlist=user_allowlist,
-        include_trufflehog=False,
+        scanner_profile=FindingsScannerProfile.LOCAL_SHARE,
     )
     total_redactions += deterministic_total
-
     # Known tradeoff: ``redaction_log`` is built from a single pre-apply
     # scan (see ``_build_deterministic_redaction_log``); the apply step
     # runs up to ``max_passes=3`` passes that can surface secrets
