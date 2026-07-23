@@ -36,6 +36,18 @@ class FindingsScannerProfile(str, Enum):
     LOCAL_SHARE = "local_share"
 
 
+def _normalize_findings_scanner_profile(
+    scanner_profile: FindingsScannerProfile | str,
+) -> FindingsScannerProfile:
+    """Accept serialized profiles and reject unknown values fail-closed."""
+    try:
+        return FindingsScannerProfile(scanner_profile)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Unknown findings scanner profile: {scanner_profile!r}"
+        ) from exc
+
+
 # Ordered from most specific to least specific
 SECRET_PATTERNS = [
     # JWT tokens — full 3-segment form
@@ -1107,7 +1119,7 @@ def apply_findings_to_blob(
     *,
     user_allowlist: list[dict] | None = None,
     max_passes: int = 3,
-    scanner_profile: FindingsScannerProfile = FindingsScannerProfile.COMPLETE,
+    scanner_profile: FindingsScannerProfile | str = FindingsScannerProfile.COMPLETE,
 ) -> tuple[dict, int]:
     """Re-scan the blob, apply decisions from the `findings` table.
 
@@ -1120,6 +1132,8 @@ def apply_findings_to_blob(
     revealed by earlier replacements. Byte-equivalent to `redact_session`
     when only secrets are present and every decision is open/accepted.
     """
+    scanner_profile = _normalize_findings_scanner_profile(scanner_profile)
+
     # Decisions are engine-agnostic at the apply step — same hash, same
     # answer. The pipeline guarantees that hashes are unique per
     # (session, entity), so collapsing to a single dict is safe.

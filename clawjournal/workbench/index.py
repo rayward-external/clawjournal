@@ -14,7 +14,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from ..redaction.secrets import FindingsScannerProfile, redact_text
+from ..redaction.secrets import (
+    FindingsScannerProfile,
+    _normalize_findings_scanner_profile,
+    redact_text,
+)
 from ..scoring.badges import compute_all_badges
 from ..config import (
     CONFIG_DIR,
@@ -1657,9 +1661,11 @@ def _build_deterministic_redaction_log(
     session: dict[str, Any],
     *,
     user_allowlist: list[dict[str, Any]] | None = None,
-    scanner_profile: FindingsScannerProfile = FindingsScannerProfile.COMPLETE,
+    scanner_profile: FindingsScannerProfile | str = FindingsScannerProfile.COMPLETE,
 ) -> list[dict[str, Any]]:
     """Build a metadata-only log from the findings-backed redaction substrate."""
+    scanner_profile = _normalize_findings_scanner_profile(scanner_profile)
+
     from ..findings import hash_entity
     from ..redaction.betterleaks import scan_session_for_betterleaks_findings
     from ..redaction.pii import _dedupe_overlapping_pii, scan_text_for_pii

@@ -227,11 +227,15 @@ class TestExportManifestRedactions:
         assert "[REDACTED_JWT]" in body
         assert n >= 2
 
+    @pytest.mark.parametrize("serialized", [False, True])
     def test_complete_findings_profile_still_runs_trufflehog(
-        self, conn, monkeypatch
+        self, conn, monkeypatch, serialized
     ):
         from clawjournal.redaction import betterleaks, trufflehog
-        from clawjournal.redaction.secrets import apply_findings_to_blob
+        from clawjournal.redaction.secrets import (
+            FindingsScannerProfile,
+            apply_findings_to_blob,
+        )
 
         seen = []
         monkeypatch.setattr(
@@ -245,8 +249,57 @@ class TestExportManifestRedactions:
             lambda *_args, **_kwargs: seen.append("trufflehog") or {},
         )
         sess = _settled_session("complete-profile", content="ordinary text")
+        scanner_profile = FindingsScannerProfile.COMPLETE
+        if serialized:
+            scanner_profile = scanner_profile.value
 
-        apply_findings_to_blob(sess, conn, "complete-profile")
+        apply_findings_to_blob(
+            sess,
+            conn,
+            "complete-profile",
+            scanner_profile=scanner_profile,
+        )
+
+        assert seen == ["trufflehog"]
+
+    def test_unknown_findings_profile_is_rejected(self, conn):
+        from clawjournal.redaction.secrets import apply_findings_to_blob
+
+        sess = _settled_session("unknown-profile", content="ordinary text")
+
+        with pytest.raises(ValueError, match="Unknown findings scanner profile"):
+            apply_findings_to_blob(
+                sess,
+                conn,
+                "unknown-profile",
+                scanner_profile="typo",
+            )
+
+    def test_serialized_complete_log_profile_runs_trufflehog(
+        self, conn, monkeypatch
+    ):
+        from clawjournal.redaction import betterleaks, trufflehog
+        from clawjournal.redaction.secrets import FindingsScannerProfile
+        from clawjournal.workbench.index import _build_deterministic_redaction_log
+
+        seen = []
+        monkeypatch.setattr(
+            betterleaks,
+            "scan_session_for_betterleaks_findings",
+            lambda *_args, **_kwargs: [],
+        )
+        monkeypatch.setattr(
+            trufflehog,
+            "scan_session_for_trufflehog_findings",
+            lambda *_args, **_kwargs: seen.append("trufflehog") or [],
+        )
+        sess = _settled_session("serialized-log", content="ordinary text")
+
+        _build_deterministic_redaction_log(
+            conn,
+            sess,
+            scanner_profile=FindingsScannerProfile.COMPLETE.value,
+        )
 
         assert seen == ["trufflehog"]
 
