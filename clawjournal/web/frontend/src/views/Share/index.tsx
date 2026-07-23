@@ -96,7 +96,11 @@ function restoredQueueFromParams(
 const PACKAGE_LOG_TRACE_LIMIT = 20;
 const PACKAGE_ANIMATION_MAX_MS = 10_000;
 
-export function Share() {
+export interface ShareProps {
+  onSubmittedShareChange?: (shareId: string | null) => void;
+}
+
+export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   const { toast } = useToast();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -211,6 +215,10 @@ export function Share() {
   const [receiptId, setReceiptId] = useState<string | null>(null);
   const [hostedStatus, setHostedStatus] = useState<string | null>(null);
   const [supportContact, setSupportContact] = useState<string | null>(null);
+
+  useEffect(() => {
+    onSubmittedShareChange?.(receiptId ? packagedShareId : null);
+  }, [onSubmittedShareChange, packagedShareId, receiptId]);
 
   // Candidates (empty queue hint)
   const [candidates, setCandidates] = useState<Session[]>([]);
@@ -475,7 +483,9 @@ export function Share() {
 
   useEffect(() => {
     if (!packagedShareId) return;
+    let cancelled = false;
     api.shares.get(packagedShareId).then((share) => {
+      if (cancelled) return;
       const piiReview = (share.manifest?.redaction_summary as { pii_review?: { ai_enabled?: unknown } } | undefined)?.pii_review;
       if (!searchParams.get('ai_pii') && typeof piiReview?.ai_enabled === 'boolean') {
         setAiPiiEnabled(piiReview.ai_enabled);
@@ -494,6 +504,7 @@ export function Share() {
         });
       }
     }).catch(() => { });
+    return () => { cancelled = true; };
   }, [packagedShareId, searchParams]);
 
   // =================================================
