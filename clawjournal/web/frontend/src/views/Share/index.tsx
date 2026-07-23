@@ -44,6 +44,7 @@ import {
   beginRedactionRun,
   cancelRedactionRetries,
   cancelRedactionRun,
+  settleFinishedRun,
   finishRedactionRetry,
   finishRedactionRun,
   isRedactionRetryActive,
@@ -454,6 +455,15 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     && (!lockedSelectionReady || largeBundleNeedsConfirmation)
     ? 'queue'
     : activeStep;
+  // Cancel redaction on a real queue change, never on a re-derived-but-equal
+  // one. `queuedSessions` is rebuilt whenever `queueOrder` syncs to
+  // `eligibleQueueOrder`, which happens one render after redaction starts — so
+  // keying the cancel effects on array identity aborted the run that had just
+  // begun and discarded the reports it had already fetched.
+  const queuedSessionKey = useMemo(
+    () => queuedSessions.map((s) => s.session_id).join(','),
+    [queuedSessions],
+  );
   const approvedSessions = useMemo(
     () => queuedSessions.filter((s) => approvedIds.has(s.session_id)),
     [queuedSessions, approvedIds],
@@ -706,7 +716,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   useEffect(() => {
     cancelRedaction();
-  }, [queuedSessions, aiPiiEnabled, cancelRedaction]);
+  }, [queuedSessionKey, aiPiiEnabled, cancelRedaction]);
 
   useEffect(() => () => cancelRedaction(), [cancelRedaction]);
 
@@ -716,7 +726,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   useEffect(() => {
     cancelAiRetries();
-  }, [queuedSessions, aiPiiEnabled, cancelAiRetries]);
+  }, [queuedSessionKey, aiPiiEnabled, cancelAiRetries]);
 
   useEffect(() => () => cancelRedactionRetries(redactionRetryRef.current), []);
 
@@ -732,9 +742,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     });
 
     // mark missing ones as loading up-front so the per-trace list renders
-    if (missing.length > 0) {
+    if (missing.length > 0 && isActive()) {
       setRedactedSessions((prev) => {
-        if (!isActive()) return prev;
         const next = { ...prev };
         missing.forEach((s) => {
           if (!next[s.session_id]) next[s.session_id] = { messages: [], loading: true };
@@ -786,39 +795,40 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         const trufflehogHits = (report.redaction_log || [])
           .filter((entry) => entry.type && entry.type.startsWith('trufflehog'))
           .length;
-        setRedactedSessions((prev) => {
-          if (!isActive()) return prev;
-          return {
-            ...prev,
-            [s.session_id]: {
-              messages: msgs, loading: false,
-              redactionCount: report.redaction_count,
-              aiPiiFindings: report.ai_pii_findings || [],
-              aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
-              buckets,
-              trufflehogHits,
-            },
-          };
-        });
+        // Test the run's own abort signal, not `isActive()`. React applies
+        // updaters lazily at render time, by which point the run has usually
+        // finished and `finishRedactionRun` has released the slot — so
+        // `isActive()` reads false for a run that completed perfectly well and
+        // would discard its report, pinning the trace at `loading` with
+        // nothing left to fetch it again. The abort signal is scoped to this
+        // run, so it still rejects writes from a superseded one.
+        setRedactedSessions((prev) => (run.controller.signal.aborted ? prev : {
+          ...prev,
+          [s.session_id]: {
+            messages: msgs, loading: false,
+            redactionCount: report.redaction_count,
+            aiPiiFindings: report.ai_pii_findings || [],
+            aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
+            buckets,
+            trufflehogHits,
+          },
+        }));
       } catch (error) {
         // A browser deadline is a queue-level stop condition. Let the outer
         // loop abort its sibling request and settle every unstarted trace
         // instead of spending another full deadline on each later batch.
         if (error instanceof ApiError && error.status === 408) throw error;
         if (!isActive()) return;
-        setRedactedSessions((prev) => {
-          if (!isActive()) return prev;
-          return {
-            ...prev,
-            [s.session_id]: {
-              messages: [{ role: 'system', content: '(unable to load redacted content)' }],
-              loading: false,
-              redactionCount: 0,
-              aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
-              buckets: emptyBuckets(),
-            },
-          };
-        });
+        setRedactedSessions((prev) => (run.controller.signal.aborted ? prev : {
+          ...prev,
+          [s.session_id]: {
+            messages: [{ role: 'system', content: '(unable to load redacted content)' }],
+            loading: false,
+            redactionCount: 0,
+            aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
+            buckets: emptyBuckets(),
+          },
+        }));
       }
     };
 
@@ -846,6 +856,15 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       }
     } finally {
       finishRedactionRun(redactionRunRef, run);
+      // A canceled run abandons its reports without settling them. Hand those
+      // traces back as outstanding so the kick-off effect re-evaluates and
+      // refetches them instead of leaving them spinning with no request in
+      // flight — unless a successor run already owns the slot and is doing so.
+      setRedactedSessions((prev) => settleFinishedRun(
+        redactionRunRef,
+        prev,
+        missing.map((session) => session.session_id),
+      ));
     }
   }, [queuedSessions, redactedSessions, aiPiiEnabled, toast]);
 
