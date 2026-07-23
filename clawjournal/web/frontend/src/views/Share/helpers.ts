@@ -1,6 +1,7 @@
 import type { Share as ShareType } from '../../types.ts';
 import {
   CONFIDENCE_THRESHOLD,
+  MAX_SHARE_QUEUE_SIZE,
   STEPS,
 } from './types.ts';
 import type {
@@ -141,13 +142,14 @@ export function queueFromStats(stats: ShareReadyStats): string[] {
   const recommended = (stats.recommended_session_ids || [])
     .filter((id) => validIds.has(id));
 
-  // Start with the server's highest-value recommendations, then include every
-  // other eligible trace. Share is opt-out: users remove traces they do not
-  // want in the bundle instead of adding a hidden pool one at a time.
+  // Start with the server's highest-value recommendations, then fill the
+  // bounded queue from the remaining eligible traces. The complete eligible
+  // pool stays available in the picker, but a share never starts with the
+  // user's entire local history selected.
   return [...new Set([
     ...recommended,
     ...stats.sessions.map((s) => s.session_id).filter(Boolean),
-  ])];
+  ])].slice(0, MAX_SHARE_QUEUE_SIZE);
 }
 
 function csvParam(params: URLSearchParams, name: string): string[] | null {
@@ -177,13 +179,16 @@ export function sanitizeQueueSelection(
   stats: ShareReadyStats,
   selection: string[],
 ): string[] {
-  const eligibleIds = new Set(queueFromStats(stats));
+  const eligibleIds = new Set(stats.sessions.map((session) => session.session_id));
   const seen = new Set<string>();
-  return selection.filter((id) => {
-    if (!eligibleIds.has(id) || seen.has(id)) return false;
+  const sanitized: string[] = [];
+  for (const id of selection) {
+    if (!eligibleIds.has(id) || seen.has(id)) continue;
     seen.add(id);
-    return true;
-  });
+    sanitized.push(id);
+    if (sanitized.length >= MAX_SHARE_QUEUE_SIZE) break;
+  }
+  return sanitized;
 }
 
 export function hasLockedQueueSelection(params: URLSearchParams): boolean {
