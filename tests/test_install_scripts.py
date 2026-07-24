@@ -273,3 +273,99 @@ def test_posix_installer_syncs_linked_worktree(tmp_path):
     assert after == expected
     assert result.returncode == 1
     assert "Active Python is not executable" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_posix_installer_stops_when_fast_forward_cannot_apply(tmp_path):
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["git", "init", "--quiet", "--bare", "-b", "main", str(remote)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "init", "--quiet", "-b", "main", str(repo)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    for name in ("install.sh", "install_lock.py"):
+        (scripts / name).write_text((ROOT / "scripts" / name).read_text())
+    (repo / "pyproject.toml").write_text(
+        "[project]\nname='collision-test'\nversion='0'\n"
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--quiet", "-m", "published"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "push", "--quiet", "-u", "origin", "main"],
+        check=True,
+    )
+    before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    (repo / "COLLISION").write_text("local untracked\n")
+
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "--quiet", str(remote), str(other)], check=True)
+    subprocess.run(
+        ["git", "-C", str(other), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(other), "config", "user.name", "Test"],
+        check=True,
+    )
+    (other / "COLLISION").write_text("published\n")
+    subprocess.run(["git", "-C", str(other), "add", "COLLISION"], check=True)
+    subprocess.run(
+        ["git", "-C", str(other), "commit", "--quiet", "-m", "collision"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(other), "push", "--quiet", "origin", "main"],
+        check=True,
+    )
+    venv = tmp_path / "must-not-exist"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path / "home"),
+        "CLAWJOURNAL_VENV": str(venv),
+    }
+
+    result = subprocess.run(
+        ["sh", str(scripts / "install.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    assert result.returncode == 1
+    assert "latest published version could not be applied" in result.stderr
+    assert after == before
+    assert not venv.exists()

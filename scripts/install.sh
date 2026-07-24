@@ -85,8 +85,8 @@ sync_checkout() {
       echo "[ok] Checkout is on the latest published version."
       return 0
     fi
-    echo "[i] Could not apply the latest published version. Installing the current code."
-    return 0
+    echo "[x] Not installing: the latest published version could not be applied. Retry after checking the checkout." >&2
+    return 1
   fi
   if git -C "$sc_repo" merge-base --is-ancestor "$sc_upstream" "$sc_before" 2>/dev/null; then
     echo "[x] Not installing: this main checkout has unpublished local commits. Move them to a branch, then retry." >&2
