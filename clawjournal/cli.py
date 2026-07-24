@@ -4088,6 +4088,10 @@ def main() -> None:
     su.add_argument("--reinstall", action="store_true",
                     help="Update, then rerun the installer so dependencies, the workbench "
                          "build, and the pinned scanners match the checkout")
+    su.add_argument("--with-frontend", action="store_true",
+                    help="With --reinstall, add or rebuild the browser workbench")
+    su.add_argument("--with-sharing", action="store_true",
+                    help="With --reinstall, install the managed sharing safety scanners")
     su.add_argument("--clear-pending", action="store_true",
                     help="Dismiss the pending-reinstall notice manually")
     su.add_argument("--finalize-install", action="store_true", help=argparse.SUPPRESS)
@@ -5354,6 +5358,12 @@ def main() -> None:
             print("error: --check and --reinstall are mutually exclusive",
                   file=sys.stderr)
             sys.exit(2)
+        if (args.with_frontend or args.with_sharing) and not args.reinstall:
+            print(
+                "error: --with-frontend and --with-sharing require --reinstall",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
         result = selfupdate_sync(check_only=args.check, force=args.force)
 
@@ -5364,7 +5374,11 @@ def main() -> None:
             # drift untouched while claiming the install was aligned.
             result = {
                 **result,
-                "reinstall_result": run_reinstall(capture=args.json),
+                "reinstall_result": run_reinstall(
+                    capture=args.json,
+                    with_frontend=args.with_frontend,
+                    with_sharing=args.with_sharing,
+                ),
             }
 
         exit_code = _selfupdate_exit_code(result)

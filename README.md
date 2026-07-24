@@ -31,11 +31,12 @@ CLI-only mode, and include the managed sharing safety tools in both. If
 something the installer needs (such as Git, Python, or Node.js) is missing,
 help me install that first.
 
-If it is already installed, run `clawjournal selfupdate --reinstall` once.
-That single command brings everything — code, dependencies, workbench, and
-safety scanners — to the latest published version. It reruns the installer
-even when the checkout is already current so older unrecorded dependency or
-scanner drift is repaired too.
+If it is already installed, run one command for the selected mode:
+`clawjournal selfupdate --reinstall --with-frontend --with-sharing` in UI
+mode, or `clawjournal selfupdate --reinstall --with-sharing` in CLI-only
+mode. That command brings the selected components to the latest published
+version. It reruns the installer even when the checkout is already current
+so older unrecorded dependency or scanner drift is repaired too.
 
 Either way I must end up on the latest published version; verify that and
 tell me if I am not. Never use force options, and never delete or overwrite
@@ -167,6 +168,7 @@ clawjournal share --interactive --weekly --no-score # guided sharing without AI 
 clawjournal status                       # check your setup
 clawjournal selfupdate --check           # see whether a newer version is available
 clawjournal selfupdate --reinstall       # update and rerun the installer in one step
+clawjournal selfupdate --reinstall --with-frontend --with-sharing # also add UI + managed scanners
 clawjournal --help                       # see every command
 ```
 

@@ -230,66 +230,43 @@ def test_concurrent_invocation_is_excluded_by_lock(
 ):
     """If a parallel CLI invocation already holds the lock, this one
     must bail out as throttled and NOT spawn a second update."""
+    import fcntl
+
     monkeypatch.delenv("CLAWJOURNAL_NO_AUTO_UPDATE", raising=False)
     lock = isolated_config_dir / "last_update_check.lock"
-    # Simulate a peer that just claimed the slot.
-    lock.write_bytes(b"")
+    peer_fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(peer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     spawned: list[Path] = []
     _stub_spawn_ok(monkeypatch, spawned)
-    assert selfupdate.maybe_self_update() == "throttled"
+    try:
+        assert selfupdate.maybe_self_update() == "throttled"
+    finally:
+        fcntl.flock(peer_fd, fcntl.LOCK_UN)
+        os.close(peer_fd)
     assert spawned == []
 
 
-def test_stale_lock_is_reclaimed(monkeypatch, isolated_config_dir, fake_repo):
-    """A lock older than LOCK_STALE_SECONDS came from a crashed CLI —
-    the next invocation must adopt it instead of being permanently
-    stuck behind a dead peer."""
+def test_persistent_unlocked_update_file_is_reused(
+    monkeypatch, isolated_config_dir, fake_repo
+):
+    """The file persists; only the kernel lock represents an active owner."""
     monkeypatch.delenv("CLAWJOURNAL_NO_AUTO_UPDATE", raising=False)
     lock = isolated_config_dir / "last_update_check.lock"
     lock.write_bytes(b"")
-    very_old = time.time() - selfupdate.LOCK_STALE_SECONDS * 10
-    os.utime(lock, (very_old, very_old))
 
     spawned: list[Path] = []
     _stub_spawn_ok(monkeypatch, spawned)
     assert selfupdate.maybe_self_update() == "spawned"
     assert spawned == [fake_repo]
+    assert lock.exists()
 
 
-def test_lock_younger_than_stale_window_blocks_reclaim(
+def test_update_lock_only_one_winner_under_contention(
     monkeypatch, isolated_config_dir, fake_repo
 ):
-    """A lock that's older than nothing (a real peer mid-spawn) must
-    block reclaim even though it's much younger than THROTTLE_SECONDS.
-    Confirms LOCK_STALE_SECONDS is the cutoff, not THROTTLE_SECONDS."""
+    """Concurrent invocations must spawn exactly one background updater."""
     monkeypatch.delenv("CLAWJOURNAL_NO_AUTO_UPDATE", raising=False)
-    lock = isolated_config_dir / "last_update_check.lock"
-    lock.write_bytes(b"")
-    # 10 seconds old — peer just started a spawn. Well within
-    # LOCK_STALE_SECONDS (60s) but way under THROTTLE_SECONDS (3600s).
-    recent = time.time() - 10
-    os.utime(lock, (recent, recent))
-
-    spawned: list[Path] = []
-    _stub_spawn_ok(monkeypatch, spawned)
-    assert selfupdate.maybe_self_update() == "throttled"
-    assert spawned == []
-
-
-def test_stale_lock_reclaim_only_one_winner_under_contention(
-    monkeypatch, isolated_config_dir, fake_repo
-):
-    """Two threads simultaneously reclaim a stale lock — exactly one
-    must win. The os.link atomicity is what makes this safe; an
-    unlink-then-O_EXCL implementation would have let both proceed."""
-    import threading
-
-    monkeypatch.delenv("CLAWJOURNAL_NO_AUTO_UPDATE", raising=False)
-    lock = isolated_config_dir / "last_update_check.lock"
-    lock.write_bytes(b"")
-    very_old = time.time() - selfupdate.LOCK_STALE_SECONDS * 10
-    os.utime(lock, (very_old, very_old))
 
     spawned: list[Path] = []
     spawn_lock = threading.Lock()
@@ -606,7 +583,7 @@ def test_cli_selfupdate_failure_exits_nonzero(
 def test_cli_explicit_reinstall_runs_even_when_checkout_is_current(
     monkeypatch, capsys
 ):
-    """Legacy installs have no pending record, so explicit means explicit."""
+    """Legacy installs can request optional components that are still absent."""
     from clawjournal import cli
 
     monkeypatch.setattr(
@@ -625,12 +602,24 @@ def test_cli_explicit_reinstall_runs_even_when_checkout_is_current(
         lambda **kwargs: calls.append(kwargs) or {"status": "reinstalled"},
     )
     monkeypatch.setattr(
-        "sys.argv", ["clawjournal", "selfupdate", "--reinstall", "--json"]
+        "sys.argv",
+        [
+            "clawjournal",
+            "selfupdate",
+            "--reinstall",
+            "--with-frontend",
+            "--with-sharing",
+            "--json",
+        ],
     )
 
     cli.main()
 
-    assert calls == [{"capture": True}]
+    assert calls == [{
+        "capture": True,
+        "with_frontend": True,
+        "with_sharing": True,
+    }]
     assert '"status": "reinstalled"' in capsys.readouterr().out
 
 
@@ -917,6 +906,22 @@ def test_installer_command_preserves_pending_optional_intent(
     )
 
     command = selfupdate._installer_command(fake_repo)
+
+    assert "--with-frontend" in command
+    assert "--with-sharing" in command
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_installer_command_can_add_absent_optional_components(
+    isolated_config_dir, fake_repo
+):
+    _make_installer(fake_repo)
+
+    command = selfupdate._installer_command(
+        fake_repo,
+        with_frontend=True,
+        with_sharing=True,
+    )
 
     assert "--with-frontend" in command
     assert "--with-sharing" in command

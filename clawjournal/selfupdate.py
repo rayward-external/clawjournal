@@ -41,17 +41,14 @@ DIFF_TIMEOUT_SECONDS = 5
 # An npm install + Vite build on a cold cache is the long pole here.
 REINSTALL_TIMEOUT_SECONDS = 15 * 60
 REINSTALL_LOCK_FILENAME = "reinstall.lock"
-# The lock is held only across the brief spawn window (parent releases
-# immediately after Popen returns). 60s is generous for that; using the
-# full THROTTLE_SECONDS would mean a crashed CLI blocks updates for an
-# hour instead of for the lifetime of one spawn.
-LOCK_STALE_SECONDS = 60
 DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE = "origin"
 
 OPT_OUT_ENV = "CLAWJOURNAL_NO_AUTO_UPDATE"
 DEBUG_ENV = "CLAWJOURNAL_AUTO_UPDATE_DEBUG"
 
+_update_lock_guard = threading.Lock()
+_update_lock_fd: int | None = None
 _reinstall_lock_guard = threading.Lock()
 _reinstall_lock_fd: int | None = None
 
@@ -97,98 +94,67 @@ def _throttle_fresh(now: float, *, window: int = THROTTLE_SECONDS) -> bool:
     return delta < window
 
 
+def _acquire_advisory_lock(path: Path) -> int | None:
+    """Return a locked fd, or None when another process owns the lock."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (ImportError, OSError):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+def _release_advisory_lock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except (ImportError, OSError):
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _claim_throttle_slot(now: float) -> bool:
-    """Atomically claim the throttle slot. Returns True if we won the race.
+    """Claim the brief update-spawn slot with a crash-safe OS lock."""
+    del now  # retained for the testable/public helper signature
+    global _update_lock_fd
 
-    Two-layer atomicity:
-      1. ``O_CREAT|O_EXCL`` for the common "no lock yet" case.
-      2. For stale-lock reclaim, ``os.rename`` the stale lock to a
-         unique parked name. ``rename`` is atomic on POSIX: if two
-         threads race the same source path, only one rename succeeds;
-         the loser gets ENOENT. The winner then claims the now-empty
-         lock_path via ``O_EXCL``.
-
-    The earlier "unlink + link" sequence had a race window where two
-    racers could each take and re-take the lock in sequence — both
-    "won" because ``unlink`` is not atomic with respect to subsequent
-    ``link`` calls from other threads.
-
-    The lock is only meant to exclude during the brief spawn window;
-    the parent releases it as soon as ``Popen`` returns. The throttle
-    stamp's mtime is what gates the next invocation's hour-long
-    throttle.
-    """
-    stamp = _stamp_path()
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        _debug(f"could not create stamp dir: {exc}")
-        return False
-
-    lock_path = stamp.with_suffix(".lock")
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    with _update_lock_guard:
+        if _update_lock_fd is not None:
+            return False
+        fd = _acquire_advisory_lock(_stamp_path().with_suffix(".lock"))
+        if fd is None:
+            return False
+        _update_lock_fd = fd
         return True
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        _debug(f"could not open lock: {exc}")
-        return False
-
-    # Lock exists. Is it stale (from a crashed CLI)? If so, try an
-    # atomic reclaim. Otherwise a peer is currently spawning — bail.
-    try:
-        lock_age = now - lock_path.stat().st_mtime
-    except OSError:
-        return False
-    if lock_age < 0 or lock_age < LOCK_STALE_SECONDS:
-        return False
-
-    # Atomic reclaim: rename the stale lock out of the way. Only one
-    # thread's rename can succeed (POSIX guarantee: rename moves the
-    # source inode and the source path then no longer exists for
-    # subsequent renames). The winner then claims the empty path.
-    parked = lock_path.with_suffix(
-        f".lock.stale.{os.getpid()}.{threading.get_ident()}.{int(now * 1e6)}"
-    )
-    try:
-        os.rename(str(lock_path), str(parked))
-    except FileNotFoundError:
-        # Another reclaimer parked it first — we lost the race.
-        _debug("lost stale-reclaim race (rename source gone)")
-        return False
-    except OSError as exc:
-        _debug(f"could not park stale lock: {exc}")
-        return False
-
-    # We won the parking race. Claim the lock atomically.
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        claimed = True
-    except FileExistsError:
-        # A different thread snuck in via the fast path between our
-        # rename and our open. They hold the lock now.
-        _debug("lost stale-reclaim race (fast-path racer beat us)")
-        claimed = False
-    except OSError as exc:
-        _debug(f"could not claim reclaimed lock: {exc}")
-        claimed = False
-
-    # Discard the parked stale file — it's served its purpose.
-    try:
-        os.unlink(str(parked))
-    except OSError:
-        pass
-
-    return claimed
 
 
 def _write_stamp(now: float) -> None:
@@ -203,12 +169,13 @@ def _write_stamp(now: float) -> None:
 
 
 def _release_lock() -> None:
-    try:
-        os.unlink(str(_stamp_path().with_suffix(".lock")))
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        _debug(f"could not release lock: {exc}")
+    global _update_lock_fd
+
+    with _update_lock_guard:
+        fd = _update_lock_fd
+        _update_lock_fd = None
+    if fd is not None:
+        _release_advisory_lock(fd)
 
 
 def _git(repo: Path, *args: str, timeout: float | None = None,
@@ -524,13 +491,18 @@ def _managed_scanners_installed() -> bool:
     return betterleaks and trufflehog
 
 
-def _installer_command(repo: Path) -> list[str] | None:
+def _installer_command(
+    repo: Path,
+    *,
+    with_frontend: bool = False,
+    with_sharing: bool = False,
+) -> list[str] | None:
     """Build the installer invocation that matches this machine's setup.
 
-    The flags are inferred from what is already installed rather than
-    remembered from the original run: rerunning without ``--with-frontend``
-    on a machine that has a built workbench would leave exactly the stale
-    UI this whole mechanism exists to prevent.
+    Optional flags come from an explicit request, an existing installation,
+    or a pending record from an earlier failed attempt. Rerunning without
+    ``--with-frontend`` on a machine that has a built workbench would leave
+    exactly the stale UI this mechanism exists to prevent.
     """
     if os.name == "nt":
         script = repo / "scripts" / "install.ps1"
@@ -550,10 +522,10 @@ def _installer_command(repo: Path) -> list[str] | None:
     reasons = set(raw_reasons) if isinstance(raw_reasons, list) else set()
     # A failed build can remove dist/index.html. Preserve the intent recorded
     # before the attempt so the retry still asks the installer to rebuild it.
-    if _frontend_is_built(repo) or "frontend" in reasons:
+    if with_frontend or _frontend_is_built(repo) or "frontend" in reasons:
         cmd.append(frontend_flag)
     # Likewise, a failed scanner reinstall may leave only one managed binary.
-    if _sharing_is_installed() or "scanners" in reasons:
+    if with_sharing or _sharing_is_installed() or "scanners" in reasons:
         cmd.append(sharing_flag)
     return cmd
 
@@ -649,29 +621,8 @@ def _claim_reinstall_lock() -> bool:
     with _reinstall_lock_guard:
         if _reinstall_lock_fd is not None:
             return False
-        try:
-            lock.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError:
-            return False
-
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"\0")
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (ImportError, OSError):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        fd = _acquire_advisory_lock(lock)
+        if fd is None:
             return False
 
         _reinstall_lock_fd = fd
@@ -684,29 +635,18 @@ def _release_reinstall_lock() -> None:
     with _reinstall_lock_guard:
         fd = _reinstall_lock_fd
         _reinstall_lock_fd = None
-    if fd is None:
-        return
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    except (ImportError, OSError):
-        pass
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    if fd is not None:
+        _release_advisory_lock(fd)
 
 
-def reinstall(repo: Path | None = None, *, capture: bool = False,
-              timeout: float = REINSTALL_TIMEOUT_SECONDS) -> dict[str, object]:
+def reinstall(
+    repo: Path | None = None,
+    *,
+    capture: bool = False,
+    timeout: float = REINSTALL_TIMEOUT_SECONDS,
+    with_frontend: bool = False,
+    with_sharing: bool = False,
+) -> dict[str, object]:
     """Rerun the project's installer against the current checkout.
 
     Runs in the foreground for `selfupdate --reinstall` and in the detached
@@ -718,7 +658,11 @@ def reinstall(repo: Path | None = None, *, capture: bool = False,
     if target is None:
         return {"status": "not-a-checkout", "repo": None}
 
-    cmd = _installer_command(target)
+    cmd = _installer_command(
+        target,
+        with_frontend=with_frontend,
+        with_sharing=with_sharing,
+    )
     if cmd is None:
         return {"status": "installer-missing", "repo": str(target)}
 
@@ -966,9 +910,9 @@ def maybe_self_update(*, now: float | None = None) -> str:
         return "throttled"
 
     # A racer can pass the pre-lock freshness check, wait while another
-    # thread claims a stale lock, and then acquire the lock after that
-    # winner releases it. Re-check under the lock so only one contender
-    # can spawn for a freshly written stamp.
+    # thread holds the lock, and then acquire it after that winner releases
+    # it. Re-check under the lock so only one contender can spawn for a
+    # freshly written stamp.
     post_claim_when = time.time() if now is None else now
     if _throttle_fresh(post_claim_when):
         _release_lock()
