@@ -7,6 +7,8 @@ import type {
   AutoUploadAuthorizationChallenge,
   AutoUploadCandidateReport,
   AutoUploadStatus,
+  ProjectSummary,
+  WorkbenchConfig,
 } from '../types.ts';
 import { colors, btnDanger, btnGhost, btnPrimary, btnSecondary, selectStyle } from '../theme.ts';
 import { ConfirmDialog } from './ConfirmDialog.tsx';
@@ -34,6 +36,17 @@ const reviewReasons = new Set([
   'blocked_review_status',
   'changed_revision_needing_approval',
 ]);
+
+const scopeSetupBlockers = new Set([
+  'source_confirmation_missing',
+  'project_confirmation_missing',
+  'source_scope_empty',
+  'project_scope_empty',
+  'unsupported_source',
+]);
+
+const automaticUploadSourceChoices = ['both', 'claude', 'codex'] as const;
+const automaticUploadSources = new Set<string>(automaticUploadSourceChoices);
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
@@ -122,6 +135,20 @@ function challengeFromError(error: unknown): AutoUploadAuthorizationChallenge | 
   };
 }
 
+function needsScopeSetup(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  const blockers = stringList(error.body, 'scope_blockers');
+  const code = stringField(error.body, 'code');
+  return blockers.some(blocker => scopeSetupBlockers.has(blocker))
+    || (code !== null && scopeSetupBlockers.has(code));
+}
+
+function hasScopeBlocker(error: unknown, blocker: string): boolean {
+  if (!(error instanceof ApiError)) return false;
+  return stringList(error.body, 'scope_blockers').includes(blocker)
+    || stringField(error.body, 'code') === blocker;
+}
+
 function requiresEmailVerification(error: unknown): boolean {
   return error instanceof ApiError && (
     error.body.code === 'email_verification_required' ||
@@ -147,6 +174,26 @@ function compactList(values: string[], empty: string): string {
   if (!values.length) return empty;
   if (values.length <= 4) return values.join(', ');
   return `${values.slice(0, 4).join(', ')} +${values.length - 4} more`;
+}
+
+function sourceLabel(source: string): string {
+  const labels: Record<string, string> = {
+    all: 'All agents',
+    aider: 'Aider',
+    both: 'Claude Code and Codex',
+    claude: 'Claude Code',
+    'claude-science': 'Claude Science',
+    codex: 'Codex',
+    copilot: 'GitHub Copilot',
+    cursor: 'Cursor',
+    custom: 'Custom',
+    gemini: 'Gemini',
+    kimi: 'Kimi',
+    openclaw: 'OpenClaw',
+    opencode: 'OpenCode',
+    workbuddy: 'WorkBuddy',
+  };
+  return labels[source] ?? source;
 }
 
 function disabledStyle(disabled: boolean): CSSProperties {
@@ -220,6 +267,7 @@ interface AuthorizationDialogProps {
   initialStatus: AutoUploadStatus;
   onClose: () => void;
   onEnabled: (status: AutoUploadStatus) => void;
+  onScopeSaved?: (config: WorkbenchConfig) => void;
   inline?: boolean;
 }
 
@@ -228,6 +276,7 @@ function AuthorizationDialog({
   initialStatus,
   onClose,
   onEnabled,
+  onScopeSaved,
   inline = false,
 }: AuthorizationDialogProps) {
   const { toast } = useToast();
@@ -256,6 +305,10 @@ function AuthorizationDialog({
   const [email, setEmail] = useState('');
   const [code, setCode] = useState('');
   const [devCode, setDevCode] = useState<string | null>(null);
+  const [scopeConfig, setScopeConfig] = useState<WorkbenchConfig | null>(null);
+  const [scopeProjects, setScopeProjects] = useState<ProjectSummary[]>([]);
+  const [scopeSource, setScopeSource] = useState('');
+  const [scopeProjectsConfirmed, setScopeProjectsConfirmed] = useState(false);
 
   const showEmailVerification = useCallback(async (
     message: string,
@@ -285,6 +338,8 @@ function AuthorizationDialog({
     setAccepted(false);
     setOwnershipCertified(false);
     setChallenge(null);
+    setScopeConfig(null);
+    setScopeProjects([]);
     try {
       // challenge_only can never enroll by contract, so a success here means
       // the daemon violated that contract; refuse to treat it as enabled.
@@ -298,6 +353,33 @@ function AuthorizationDialog({
       if (next) {
         setChallenge(next);
         setAgent(current => inferredAgent(next.scope.sources, current));
+      } else if (needsScopeSetup(requestError)) {
+        try {
+          const [config, projects] = await Promise.all([
+            api.config.get(),
+            api.projects(),
+          ]);
+          if (!isCurrent()) return;
+          const configuredSource = config.source ?? '';
+          const supportedSource = automaticUploadSources.has(configuredSource)
+            ? configuredSource
+            : '';
+          setScopeConfig(config);
+          setScopeProjects(projects);
+          setScopeSource(supportedSource);
+          // Always start unchecked, even when config already says confirmed:
+          // that stored confirmation may predate the project list shown here,
+          // and this checkbox attests to reviewing exactly this list.
+          setScopeProjectsConfirmed(false);
+          setError(null);
+        } catch (configError) {
+          if (isCurrent()) {
+            setError(errorMessage(
+              configError,
+              'Could not load the source and project settings.',
+            ));
+          }
+        }
       } else if (requiresEmailVerification(requestError)) {
         await showEmailVerification(
           'Verify your email before loading the recurring authorization.',
@@ -315,6 +397,15 @@ function AuthorizationDialog({
           'The running ClawJournal service is older than this page and returned '
           + 'an incompatible authorization challenge. Restart the service '
           + '(clawjournal serve) and reload, then try again.',
+        );
+      } else if (hasScopeBlocker(requestError, 'scope_too_large')) {
+        // The guided step cannot shrink an oversized scope: that needs project
+        // exclusions, which have no controls here. Say what to do instead of
+        // echoing the CLI-worded server message.
+        setError(
+          'This scope has too many source and project combinations for the '
+          + 'hosted service. Exclude projects from sharing (clawjournal config '
+          + '--exclude "<project>") or choose a single source, then try again.',
         );
       } else {
         setError(errorMessage(requestError, 'Could not load recurring authorization.'));
@@ -344,6 +435,10 @@ function AuthorizationDialog({
       setEmail('');
       setCode('');
       setDevCode(null);
+      setScopeConfig(null);
+      setScopeProjects([]);
+      setScopeSource('');
+      setScopeProjectsConfirmed(false);
       return;
     }
     if (!requestedRef.current) {
@@ -405,6 +500,63 @@ function AuthorizationDialog({
   const ai = challenge?.ai ?? initialStatus.ai;
   const cap = challenge?.cap ?? initialStatus.cap;
   const cadence = challenge?.cadence_days ?? initialStatus.cadence_days;
+  const selectedSourceProjects = scopeSource
+    ? scopeProjects.filter(project => (
+        scopeSource === 'both'
+          ? project.source === 'claude' || project.source === 'codex'
+          : project.source === scopeSource
+      ))
+    : [];
+  const visibleScopeProjects = selectedSourceProjects.filter(project => !project.excluded);
+  const excludedProjectCount = selectedSourceProjects.length - visibleScopeProjects.length;
+  const canSaveScope = Boolean(
+    scopeConfig
+    && scopeSource
+    && scopeProjectsConfirmed
+    && visibleScopeProjects.length > 0
+    && !loading,
+  );
+
+  const saveScopeAndContinue = async () => {
+    if (!canSaveScope) return;
+    const requestId = challengeRequestRef.current + 1;
+    challengeRequestRef.current = requestId;
+    const isCurrent = () => challengeRequestRef.current === requestId;
+    setLoading(true);
+    setSubmitting(true);
+    setError(null);
+    try {
+      // Save both values atomically. Changing source intentionally clears the
+      // prior project confirmation, so a split write would recreate the exact
+      // dead-end this guided step is meant to remove.
+      const nextConfig = await api.config.update({
+        source: scopeSource,
+        confirm_projects: true,
+      });
+      // Notify Settings even if the dialog was dismissed mid-save: the config
+      // write already happened, and a stale Settings view is worse than a
+      // callback from a closed dialog.
+      onScopeSaved?.(nextConfig);
+      if (!isCurrent()) return;
+      setSubmitting(false);
+      // Match the hook trigger to the scope just saved instead of the stale
+      // agent state: a claude-only scope must not install a codex hook.
+      const scopeAgent: AutoUploadAgent = scopeSource === 'both'
+        ? 'all'
+        : scopeSource as AutoUploadAgent;
+      setAgent(scopeAgent);
+      await requestChallenge(scopeAgent);
+    } catch (scopeError) {
+      if (isCurrent()) {
+        setError(errorMessage(scopeError, 'Could not save the automatic-upload scope.'));
+      }
+    } finally {
+      if (isCurrent()) {
+        setLoading(false);
+        setSubmitting(false);
+      }
+    }
+  };
 
   const enableWithAcceptedTerms = async () => {
     if (!challenge || !accepted || !ownershipCertified) return;
@@ -553,72 +705,208 @@ function AuthorizationDialog({
           {inline ? 'Share future traces automatically?' : 'Authorize future automatic uploads'}
         </h3>
         <p style={{ margin: '0 0 18px', fontSize: 13, lineHeight: 1.55, color: colors.gray600 }}>
-          {inline
-            ? `Enable up to ${cap} eligible future traces every ${cadence} day${cadence === 1 ? '' : 's'} from the exact scope below. ${
-              initialStatus.enrollment_grant_available
-                ? 'The receipt from this share lets you enable it without verifying your email again.'
-                : 'If its receipt-issued enrollment grant is unavailable or expires, you will verify your email before enabling.'
-            }`
-            : 'Future selected traces in this exact scope may be uploaded without you reviewing each bundle. This is separate from the consent you gave for the bundle you just reviewed.'}
+          {scopeConfig
+            ? 'Choose and confirm the source and project scope first. You will review the exact recurring scope and terms before anything is enabled.'
+            : inline
+              ? `Enable up to ${cap} eligible future traces every ${cadence} day${cadence === 1 ? '' : 's'} from the exact scope below. ${
+                initialStatus.enrollment_grant_available
+                  ? 'The receipt from this share lets you enable it without verifying your email again.'
+                  : 'If its receipt-issued enrollment grant is unavailable or expires, you will verify your email before enabling.'
+              }`
+              : 'Future selected traces in this exact scope may be uploaded without you reviewing each bundle. This is separate from the consent you gave for the bundle you just reviewed.'}
         </p>
 
-        {new Set(scope.sources.filter(source => source === 'claude' || source === 'codex')).size === 1 ? (
-          <SummaryItem
-            label="Run on agent sessions"
-            value={scope.sources.includes('codex') ? 'Codex' : 'Claude Code'}
-          />
-        ) : (
-          <label style={{ display: 'block', marginBottom: 14, fontSize: 12.5, color: colors.gray700 }}>
-            Run on agent sessions
-            <select
-              value={agent}
-              disabled={loading}
-              onChange={event => setAgent(event.target.value as AutoUploadAgent)}
-              style={{ ...selectStyle, display: 'block', marginTop: 5, minWidth: 220 }}
-            >
-              <option value="all">Claude Code and Codex</option>
-              <option value="claude">Claude Code</option>
-              <option value="codex">Codex</option>
-            </select>
-          </label>
+        {/* Hidden during scope setup: its options carry the same labels as the
+            source-scope select below and answer a later question (which agent
+            sessions trigger runs, not what may be exported). */}
+        {!scopeConfig && (
+          new Set(scope.sources.filter(source => source === 'claude' || source === 'codex')).size === 1 ? (
+            <SummaryItem
+              label="Run on agent sessions"
+              value={scope.sources.includes('codex') ? 'Codex' : 'Claude Code'}
+            />
+          ) : (
+            <label style={{ display: 'block', marginBottom: 14, fontSize: 12.5, color: colors.gray700 }}>
+              Run on agent sessions
+              <select
+                value={agent}
+                disabled={loading}
+                onChange={event => setAgent(event.target.value as AutoUploadAgent)}
+                style={{ ...selectStyle, display: 'block', marginTop: 5, minWidth: 220 }}
+              >
+                <option value="all">Claude Code and Codex</option>
+                <option value="claude">Claude Code</option>
+                <option value="codex">Codex</option>
+              </select>
+            </label>
+          )
         )}
 
-        <div style={summaryGridStyle}>
-          <SummaryItem label="Sources" value={compactList(scope.sources, 'No confirmed sources')} />
-          <SummaryItem label="Projects" value={compactList(scope.projects, 'No confirmed projects')} />
-          <SummaryItem label="Schedule" value={`Every ${cadence} day${cadence === 1 ? '' : 's'}, on the next supported agent session`} />
-          <SummaryItem label="Per-cycle cap" value={`Up to ${cap} selected traces`} />
-          {challenge && (
-            <SummaryItem
-              label="Hosted bundle limit"
-              value={`${(challenge.maximum_bundle_size / (1024 * 1024)).toFixed(1)} MiB`}
-            />
-          )}
-          {challenge?.destination_origin && (
-            <SummaryItem label="Destination" value={challenge.destination_origin} />
-          )}
-          <SummaryItem
-            label="Future-only boundary"
-            value={initialStatus.enrolled_at
-              ? `Traces completed after ${formatTimestamp(initialStatus.enrolled_at)}`
-              : 'Only traces completed after enrollment'}
-          />
-          <SummaryItem
-            label="AI-assisted PII review"
-            value={ai.enabled ? `On · ${ai.backend ?? 'configured provider'}` : 'Off'}
-          />
-        </div>
+        {scopeConfig ? (
+          <div style={{
+            padding: '16px 18px',
+            border: '1px solid #E9DEC9',
+            borderRadius: 12,
+            background: '#F7F3E8',
+            color: '#362815',
+          }}>
+            <div style={{
+              marginBottom: 4,
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+              color: '#725E47',
+            }}>
+              Scope · step 1 of 2
+            </div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>
+              Choose what automatic uploads may include
+            </div>
+            <p style={{ margin: '5px 0 14px', fontSize: 12.5, lineHeight: 1.5, color: '#725E47' }}>
+              Automatic upload currently supports Claude Code and Codex. This also updates the
+              export scope in Settings. Excluded projects aren’t listed or authorized.
+            </p>
 
-        <div style={{ margin: '14px 0', fontSize: 12.5, lineHeight: 1.55, color: colors.gray600 }}>
-          <ul style={{ margin: 0, paddingLeft: 19 }}>
-            <li>ClawJournal anonymizes and redacts locally, then runs the existing findings and secret-scan gates.</li>
-            <li>Run now is an extra capped cycle and resets the next scheduled date.</li>
-            <li>You can preview, pause, review the scope, or turn this off in Settings.</li>
-            <li>Turning it off does not delete prior uploads. A request already being submitted may finish.</li>
-          </ul>
-        </div>
+            <label style={{ display: 'block', fontSize: 12.5, fontWeight: 650 }}>
+              Export source scope
+              <select
+                aria-label="Export source scope"
+                value={scopeSource}
+                disabled={loading}
+                onChange={event => {
+                  setScopeSource(event.target.value);
+                  // Any change shows a different project list, so the
+                  // review-confirmation below no longer applies.
+                  setScopeProjectsConfirmed(false);
+                }}
+                style={{
+                  ...selectStyle,
+                  display: 'block',
+                  width: '100%',
+                  marginTop: 6,
+                  background: '#FBF9F4',
+                  borderColor: '#E1D5BE',
+                  color: '#362815',
+                }}
+              >
+                <option value="" disabled>Choose a source…</option>
+                {automaticUploadSourceChoices.map(source => (
+                  <option key={source} value={source}>{sourceLabel(source)}</option>
+                ))}
+              </select>
+            </label>
 
-        {loading && !challenge && !verificationRequired && (
+            <div style={{ marginTop: 14, fontSize: 12.5, fontWeight: 650 }}>
+              Current projects in this scope
+            </div>
+            <div
+              role="list"
+              aria-label="Projects eligible for automatic upload"
+              style={{
+                maxHeight: 150,
+                marginTop: 6,
+                padding: '9px 11px',
+                overflow: 'auto',
+                border: '1px solid #E1D5BE',
+                borderRadius: 8,
+                background: '#FBF9F4',
+                fontSize: 12,
+                lineHeight: 1.5,
+                color: '#725E47',
+              }}
+            >
+              {!scopeSource ? (
+                <span>Choose a source to see its indexed projects.</span>
+              ) : visibleScopeProjects.length === 0 ? (
+                <span>
+                  {excludedProjectCount > 0
+                    ? 'Every indexed project for this source is excluded. Review project exclusions before continuing.'
+                    : 'No indexed projects were found for this source. Run an agent session, refresh the workbench, and try again.'}
+                </span>
+              ) : (
+                visibleScopeProjects.map(project => (
+                  <div
+                    key={`${project.source}:${project.project}`}
+                    role="listitem"
+                    aria-label={`${sourceLabel(project.source)} · ${project.project} · ${project.session_count} session${project.session_count === 1 ? '' : 's'}`}
+                  >
+                    <strong style={{ color: '#362815' }}>{sourceLabel(project.source)}</strong>
+                    {' · '}{project.project}
+                    <span> · {project.session_count} session{project.session_count === 1 ? '' : 's'}</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <label style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 9,
+              marginTop: 13,
+              fontSize: 12.5,
+              lineHeight: 1.5,
+              color: '#362815',
+            }}>
+              <input
+                type="checkbox"
+                aria-label="Confirm all eligible projects for automatic upload"
+                checked={scopeProjectsConfirmed}
+                disabled={loading || visibleScopeProjects.length === 0}
+                onChange={event => setScopeProjectsConfirmed(event.target.checked)}
+                style={{ marginTop: 3 }}
+              />
+              <span>
+                <strong style={{ display: 'block', marginBottom: 2 }}>
+                  Confirm all eligible projects
+                </strong>
+                <span style={{ color: '#725E47' }}>
+                  I reviewed all {visibleScopeProjects.length} project{visibleScopeProjects.length === 1 ? '' : 's'} listed
+                  above. Only these projects may enter this automatic-upload scope.
+                </span>
+              </span>
+            </label>
+          </div>
+        ) : (
+          <>
+            <div style={summaryGridStyle}>
+              <SummaryItem label="Sources" value={compactList(scope.sources, 'No confirmed sources')} />
+              <SummaryItem label="Projects" value={compactList(scope.projects, 'No confirmed projects')} />
+              <SummaryItem label="Schedule" value={`Every ${cadence} day${cadence === 1 ? '' : 's'}, on the next supported agent session`} />
+              <SummaryItem label="Per-cycle cap" value={`Up to ${cap} selected traces`} />
+              {challenge && (
+                <SummaryItem
+                  label="Hosted bundle limit"
+                  value={`${(challenge.maximum_bundle_size / (1024 * 1024)).toFixed(1)} MiB`}
+                />
+              )}
+              {challenge?.destination_origin && (
+                <SummaryItem label="Destination" value={challenge.destination_origin} />
+              )}
+              <SummaryItem
+                label="Future-only boundary"
+                value={initialStatus.enrolled_at
+                  ? `Traces completed after ${formatTimestamp(initialStatus.enrolled_at)}`
+                  : 'Only traces completed after enrollment'}
+              />
+              <SummaryItem
+                label="AI-assisted PII review"
+                value={ai.enabled ? `On · ${ai.backend ?? 'configured provider'}` : 'Off'}
+              />
+            </div>
+
+            <div style={{ margin: '14px 0', fontSize: 12.5, lineHeight: 1.55, color: colors.gray600 }}>
+              <ul style={{ margin: 0, paddingLeft: 19 }}>
+                <li>ClawJournal anonymizes and redacts locally, then runs the existing findings and secret-scan gates.</li>
+                <li>Run now is an extra capped cycle and resets the next scheduled date.</li>
+                <li>You can preview, pause, review the scope, or turn this off in Settings.</li>
+                <li>Turning it off does not delete prior uploads. A request already being submitted may finish.</li>
+              </ul>
+            </div>
+          </>
+        )}
+
+        {loading && !challenge && !verificationRequired && !scopeConfig && (
           <div role="status" style={noticeStyle}>Loading the current authorization and retention terms…</div>
         )}
         {error && (
@@ -626,7 +914,7 @@ function AuthorizationDialog({
             {error}
           </div>
         )}
-        {error && !challenge && !loading && !verificationRequired && (
+        {error && !challenge && !loading && !verificationRequired && !scopeConfig && (
           <button onClick={() => void requestChallenge()} style={{ ...btnSecondary, marginBottom: 12 }}>
             Retry
           </button>
@@ -787,7 +1075,21 @@ function AuthorizationDialog({
           <button disabled={submitting} onClick={dismissDialog} style={{ ...btnSecondary, ...disabledStyle(submitting) }}>
             {inline ? 'Not now' : 'Cancel'}
           </button>
-          {!verificationRequired && (
+          {scopeConfig ? (
+            <button
+              disabled={!canSaveScope}
+              onClick={() => void saveScopeAndContinue()}
+              style={{
+                ...btnPrimary,
+                background: '#EDE2CC',
+                color: '#362815',
+                border: '1px solid #D4AB73',
+                ...disabledStyle(!canSaveScope),
+              }}
+            >
+              {submitting ? 'Saving scope…' : 'Save scope and continue'}
+            </button>
+          ) : !verificationRequired && (
             <button
               disabled={!challenge || !accepted || !ownershipCertified || loading}
               onClick={() => void accept()}
@@ -877,7 +1179,9 @@ export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string |
   );
 }
 
-export function AutoUploadPanel() {
+export function AutoUploadPanel({ onConfigUpdated }: {
+  onConfigUpdated?: (config: WorkbenchConfig) => void;
+} = {}) {
   const { toast } = useToast();
   const [status, setStatus] = useState<AutoUploadStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -1202,6 +1506,7 @@ export function AutoUploadPanel() {
         initialStatus={status}
         onClose={() => setDialogOpen(false)}
         onEnabled={commitActionStatus}
+        onScopeSaved={onConfigUpdated}
       />
       <ConfirmDialog
         open={disableOpen}

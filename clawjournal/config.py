@@ -198,9 +198,10 @@ def set_source_scope(config: ClawJournalConfig, source: str) -> None:
 def source_scope_sources(source: str | None) -> tuple[str, ...] | None:
     """Return allowed session sources for a confirmed source scope.
 
-    ``None`` means unrestricted/all sources. Legacy ``both`` means the
-    original Claude+Codex pair, while ``all`` intentionally means every
-    supported indexed source.
+    ``None`` means unrestricted/all sources. ``both`` means the Claude+Codex
+    pair — it predates ``all`` and is also what the Auto Upload guided scope
+    setup writes, since those are exactly the recurring-capable sources —
+    while ``all`` intentionally means every supported indexed source.
     """
     normalized = (source or "").strip().lower()
     if normalized in ("", "auto", "all"):

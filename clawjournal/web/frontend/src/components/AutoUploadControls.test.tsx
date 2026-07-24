@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError } from '../api.ts';
-import type { AutoUploadStatus } from '../types.ts';
+import type { AutoUploadStatus, WorkbenchConfig } from '../types.ts';
 import { AutoUploadOffer, AutoUploadPanel } from './AutoUploadControls.tsx';
 import { ToastProvider } from './Toast.tsx';
 
@@ -28,6 +28,22 @@ function status(overrides: Partial<AutoUploadStatus> = {}): AutoUploadStatus {
     hooks: [],
     eligibility: { selected_count: 0, eligible_count: 0, exclusion_counts: {} },
     last_result: null,
+    ...overrides,
+  };
+}
+
+function workbenchConfig(overrides: Partial<WorkbenchConfig> = {}): WorkbenchConfig {
+  return {
+    source: null,
+    projects_confirmed: false,
+    ai_pii_review_enabled: false,
+    scorer_backend: null,
+    scorer_backend_confirmed_at: null,
+    benchmark_tab_enabled: true,
+    scoring_warmup_declined: false,
+    source_choices: ['all', 'claude', 'codex'],
+    scorer_backend_choices: [],
+    scorer_backend_detected: null,
     ...overrides,
   };
 }
@@ -76,6 +92,28 @@ function authorizationRequired() {
     cadence_days: 1,
     maximum_bundle_size: 5_000_000,
     destination_origin: 'https://share.example.test',
+  });
+}
+
+function scopeRequired() {
+  return new ApiError(400, 'Scope confirmation required', {
+    code: 'source_confirmation_missing',
+    message: 'Confirm a non-empty source and project scope before enabling.',
+    scope_blockers: [
+      'source_confirmation_missing',
+      'project_confirmation_missing',
+      'source_scope_empty',
+      'project_scope_empty',
+    ],
+  });
+}
+
+function unsupportedScopeRequired() {
+  return new ApiError(400, 'Unsupported source', {
+    code: 'unsupported_source',
+    message: 'Confirm a non-empty source and project scope before enabling.',
+    scope_blockers: ['unsupported_source'],
+    unsupported_sources: ['gemini'],
   });
 }
 
@@ -140,6 +178,296 @@ describe('AutoUploadOffer', () => {
     statusSpy.mockResolvedValueOnce(status({ offer_available: true }));
     renderControl(<AutoUploadOffer manualReceiptId="receipt-3" />);
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
+  });
+
+  it('keeps missing scope setup inside the enable flow and continues to authorization', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(scopeRequired())
+      .mockRejectedValueOnce(authorizationRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
+    const updateSpy = vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
+      source: 'both',
+      projects_confirmed: true,
+      source_choices: ['all', 'both', 'claude', 'codex'],
+    }));
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'research-notes',
+        session_count: 2,
+        total_tokens: 1_200,
+      },
+      {
+        source: 'codex',
+        project: 'analysis-pipeline',
+        session_count: 1,
+        total_tokens: 800,
+      },
+    ]);
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-needs-scope" />);
+
+    expect(await screen.findByText('Choose what automatic uploads may include')).toBeInTheDocument();
+    expect(screen.queryByText('Confirm a non-empty source and project scope before enabling.')).not.toBeInTheDocument();
+    // Inline presentation: still dismissible, and the run-trigger select stays
+    // hidden while its labels would duplicate the source-scope options below.
+    expect(screen.getByRole('heading', { name: 'Share future traces automatically?' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Not now' })).toBeInTheDocument();
+    expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Export source scope')).toHaveValue('');
+
+    fireEvent.change(screen.getByLabelText('Export source scope'), {
+      target: { value: 'both' },
+    });
+    expect(screen.getByLabelText('Claude Code · research-notes · 2 sessions')).toBeInTheDocument();
+    expect(screen.getByLabelText('Codex · analysis-pipeline · 1 session')).toBeInTheDocument();
+
+    const projectConfirmation = screen.getByLabelText('Confirm all eligible projects for automatic upload');
+    expect(projectConfirmation).not.toBeChecked();
+    expect(screen.getByText('Confirm all eligible projects')).toBeInTheDocument();
+    expect(screen.getByText('I reviewed all 2 projects listed above. Only these projects may enter this automatic-upload scope.')).toBeInTheDocument();
+    fireEvent.click(projectConfirmation);
+    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
+
+    await waitFor(() => expect(updateSpy).toHaveBeenCalledWith({
+      source: 'both',
+      confirm_projects: true,
+    }));
+    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
+    expect(enableSpy).toHaveBeenNthCalledWith(2, {
+      agent: 'all',
+      challenge_only: true,
+    });
+    expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
+    expect(screen.getByText('claude → project-a')).toBeInTheDocument();
+  });
+
+  it('retries with the hook matching a single-source scope after saving', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(scopeRequired())
+      .mockRejectedValueOnce(authorizationRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
+    vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
+      source: 'claude',
+      projects_confirmed: true,
+    }));
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'research-notes',
+        session_count: 2,
+        total_tokens: 1_200,
+      },
+    ]);
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-claude-only-scope" />);
+    fireEvent.change(await screen.findByLabelText('Export source scope'), {
+      target: { value: 'claude' },
+    });
+    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
+
+    // A claude-only scope must not schedule a codex SessionStart hook.
+    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
+    expect(enableSpy).toHaveBeenNthCalledWith(2, {
+      agent: 'claude',
+      challenge_only: true,
+    });
+  });
+
+  it('keeps scope setup open when saving the scope fails', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(scopeRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
+    vi.spyOn(api.config, 'update').mockRejectedValueOnce(
+      new ApiError(500, 'Config persistence could not be confirmed.'),
+    );
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'research-notes',
+        session_count: 2,
+        total_tokens: 1_200,
+      },
+    ]);
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-scope-save-fails" />);
+    fireEvent.change(await screen.findByLabelText('Export source scope'), {
+      target: { value: 'claude' },
+    });
+    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Config persistence could not be confirmed.',
+    );
+    expect(screen.getByText('Choose what automatic uploads may include')).toBeInTheDocument();
+    expect(screen.getByLabelText('Confirm all eligible projects for automatic upload')).toBeChecked();
+    expect(screen.getByRole('button', { name: 'Save scope and continue' })).toBeEnabled();
+    expect(enableSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('guides unsupported export scopes to the supported recurring sources', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(unsupportedScopeRequired())
+      .mockRejectedValueOnce(authorizationRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig({
+      source: 'all',
+      projects_confirmed: true,
+      source_choices: ['aider', 'all', 'claude', 'codex', 'gemini'],
+    }));
+    const updateSpy = vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
+      source: 'both',
+      projects_confirmed: true,
+      source_choices: ['all', 'both', 'claude', 'codex'],
+    }));
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'research-notes',
+        session_count: 2,
+        total_tokens: 1_200,
+      },
+      {
+        source: 'gemini',
+        project: 'unsupported-project',
+        session_count: 1,
+        total_tokens: 500,
+      },
+    ]);
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-unsupported-scope" />);
+
+    const source = await screen.findByLabelText('Export source scope');
+    expect(source).toHaveValue('');
+    expect(within(source).getByRole('option', { name: 'Claude Code and Codex' })).toBeInTheDocument();
+    expect(within(source).getByRole('option', { name: 'Claude Code' })).toBeInTheDocument();
+    expect(within(source).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
+    expect(within(source).queryByRole('option', { name: 'All agents' })).not.toBeInTheDocument();
+    expect(within(source).queryByRole('option', { name: 'Gemini' })).not.toBeInTheDocument();
+
+    fireEvent.change(source, { target: { value: 'both' } });
+    expect(screen.getByLabelText('Claude Code · research-notes · 2 sessions')).toBeInTheDocument();
+    expect(screen.queryByText('unsupported-project')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
+
+    await waitFor(() => expect(updateSpy).toHaveBeenCalledWith({
+      source: 'both',
+      confirm_projects: true,
+    }));
+    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
+  });
+
+  it('omits excluded projects from the project confirmation step', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(scopeRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'eligible-project',
+        session_count: 2,
+        total_tokens: 1_200,
+        excluded: false,
+      },
+      {
+        source: 'claude',
+        project: 'excluded-project',
+        session_count: 1,
+        total_tokens: 500,
+        excluded: true,
+      },
+    ]);
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-with-exclusion" />);
+    fireEvent.change(await screen.findByLabelText('Export source scope'), {
+      target: { value: 'claude' },
+    });
+
+    expect(screen.getByLabelText('Claude Code · eligible-project · 2 sessions')).toBeInTheDocument();
+    expect(screen.queryByText('excluded-project')).not.toBeInTheDocument();
+  });
+
+  it('requires fresh project confirmation when the source selection changes', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(scopeRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig({
+      source: 'both',
+      projects_confirmed: true,
+      source_choices: ['all', 'both', 'claude', 'codex'],
+    }));
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'claude-project',
+        session_count: 1,
+        total_tokens: 500,
+      },
+      {
+        source: 'codex',
+        project: 'codex-project',
+        session_count: 1,
+        total_tokens: 500,
+      },
+    ]);
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-change-source" />);
+
+    const source = await screen.findByLabelText('Export source scope');
+    const projectConfirmation = screen.getByLabelText('Confirm all eligible projects for automatic upload');
+    expect(source).toHaveValue('both');
+    // A stored projects_confirmed never pre-checks the box: the confirmation
+    // attests to the list rendered here, not to an older one.
+    expect(projectConfirmation).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Save scope and continue' })).toBeDisabled();
+    expect(screen.getByLabelText('Claude Code · claude-project · 1 session')).toBeInTheDocument();
+    expect(screen.getByLabelText('Codex · codex-project · 1 session')).toBeInTheDocument();
+
+    fireEvent.click(projectConfirmation);
+    expect(projectConfirmation).toBeChecked();
+    fireEvent.change(source, { target: { value: 'codex' } });
+
+    expect(projectConfirmation).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Save scope and continue' })).toBeDisabled();
+    expect(screen.queryByLabelText('Claude Code · claude-project · 1 session')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Codex · codex-project · 1 session')).toBeInTheDocument();
+  });
+
+  it('explains an oversized scope instead of echoing the CLI-worded error', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(new ApiError(400, 'Scope too large', {
+      code: 'scope_too_large',
+      message: 'The source x project scope exceeds the hosted limit of 200 entries; '
+        + 'exclude projects (config --exclude) or narrow the source scope first.',
+      scope_blockers: ['scope_too_large'],
+    }));
+
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-oversized-scope" />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This scope has too many source and project combinations',
+    );
+    expect(screen.queryByText('Choose what automatic uploads may include')).not.toBeInTheDocument();
   });
 
   it('enables inline with the receipt grant and infers the only agent', async () => {
@@ -216,6 +544,43 @@ describe('AutoUploadPanel visibility', () => {
 });
 
 describe('AutoUploadPanel authorization', () => {
+  it('reports an inline scope save so Settings can update without a reload', async () => {
+    const savedConfig = workbenchConfig({
+      source: 'both',
+      projects_confirmed: true,
+      source_choices: ['all', 'both', 'claude', 'codex'],
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      offer_available: true,
+    }));
+    vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(scopeRequired())
+      .mockRejectedValueOnce(authorizationRequired());
+    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
+    vi.spyOn(api.config, 'update').mockResolvedValueOnce(savedConfig);
+    vi.spyOn(api, 'projects').mockResolvedValueOnce([
+      {
+        source: 'claude',
+        project: 'research-notes',
+        session_count: 2,
+        total_tokens: 1_200,
+      },
+    ]);
+    const onConfigUpdated = vi.fn();
+
+    renderControl(<AutoUploadPanel onConfigUpdated={onConfigUpdated} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review and enable' }));
+    fireEvent.change(await screen.findByLabelText('Export source scope'), {
+      target: { value: 'both' },
+    });
+    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
+
+    await waitFor(() => expect(onConfigUpdated).toHaveBeenCalledWith(savedConfig));
+    expect(onConfigUpdated).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
+  });
+
   it('shows the distinct recurring wording, retains the selected hook, and rejects a stale GET after enable', async () => {
     const initial = status({
       mode: 'enabled',
