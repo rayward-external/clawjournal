@@ -1149,6 +1149,8 @@ class Scanner:
                         _next_scan_delay(time.monotonic() - tick_started)
                     )
                     continue
+                if self._stop_event.is_set():
+                    break
                 trigger_scoring_warmup(self)
                 total_new = sum(results.values())
                 if (
@@ -3037,7 +3039,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         # In-flight/mutation accounting for the update self-restart monitor:
         # a restart only happens when nothing is being served and no
         # mutating request landed recently.
-        _note_request_start()
+        if not _note_request_start():
+            # The update watcher has atomically frozen admission before
+            # stopping the listening loops.  A connection accepted in that
+            # narrow hand-off window must not begin work in the old process.
+            self.close_connection = True
+            return
         try:
             super().handle_one_request()
         finally:
@@ -5488,11 +5495,15 @@ _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 _activity_lock = threading.Lock()
 _activity = {"in_flight": 0, "last_mutation": 0.0}
+_request_admission_open = True
 
 
-def _note_request_start() -> None:
+def _note_request_start() -> bool:
     with _activity_lock:
+        if not _request_admission_open:
+            return False
         _activity["in_flight"] += 1
+        return True
 
 
 def _note_request_end(method: str | None) -> None:
@@ -5505,6 +5516,43 @@ def _note_request_end(method: str | None) -> None:
 def _snapshot_activity() -> dict[str, float]:
     with _activity_lock:
         return dict(_activity)
+
+
+def _open_request_admission() -> None:
+    """Allow handlers to begin requests for a newly started server."""
+    global _request_admission_open
+    with _activity_lock:
+        _request_admission_open = True
+
+
+def _freeze_request_admission(*, now: float | None = None) -> bool:
+    """Atomically close admission if the daemon is still restart-safe.
+
+    ``_update_restart_due`` is a pre-flight check.  A request can start or
+    finish after that snapshot, so the watcher must repeat the request and
+    mutation gates while holding the same lock used by handlers.  Once this
+    succeeds, no new handler can enter the old process.
+    """
+    global _request_admission_open
+    with _activity_lock:
+        if not _request_admission_open or _activity["in_flight"] > 0:
+            return False
+        t = time.time() if now is None else now
+        last_mutation = _activity["last_mutation"]
+        if (
+            last_mutation
+            and t - last_mutation < _RESTART_MUTATION_IDLE_SECONDS
+        ):
+            return False
+        _request_admission_open = False
+        return True
+
+
+def _resume_request_admission() -> None:
+    """Undo a tentative freeze when a background worker wins the race."""
+    global _request_admission_open
+    with _activity_lock:
+        _request_admission_open = True
 
 
 def _background_workers_active(scanner: Scanner | None = None) -> bool:
@@ -5766,6 +5814,7 @@ def run_server(
     )
 
     scanner = Scanner(source_filter=source_filter)
+    _open_request_admission()
 
     # Start HTTP server first so it's responsive immediately. The primary socket
     # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
@@ -5811,7 +5860,8 @@ def run_server(
                 "Initial scan skipped: another process is refreshing the index"
             )
         else:
-            trigger_scoring_warmup(scanner)
+            if not scanner._stop_event.is_set():
+                trigger_scoring_warmup(scanner)
             total = sum(results.values())
             logger.info(
                 "Initial scan complete: %d new sessions indexed, "
@@ -5821,8 +5871,9 @@ def run_server(
                 scanner.last_updated_count,
                 scanner.last_linked_count,
             )
-        scanner.start()
-        logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
+        if not scanner._stop_event.is_set():
+            scanner.start()
+            logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
 
     threading.Thread(target=_initial_scan, daemon=True).start()
 
@@ -5849,12 +5900,25 @@ def run_server(
                 logger.debug("update-restart check failed", exc_info=True)
                 continue
             if head:
+                # The earlier activity snapshot is only advisory.  Atomically
+                # close handler admission before committing so a request
+                # cannot enter between the quietness check and shutdown.
+                if not _freeze_request_admission():
+                    continue
+                if _background_workers_active(scanner):
+                    _resume_request_admission()
+                    continue
                 restart_to["head"] = head
+                # Prevent the periodic/initial scanner from starting another
+                # pass or scoring batch while the listening loops stop.
+                scanner._stop_event.set()
                 logger.info(
                     "ClawJournal updated (%s -> %s) — restarting the workbench "
                     "to serve the new version",
                     initial_head[:7], head[:7],
                 )
+                if v6_server is not None:
+                    v6_server.shutdown()
                 server.shutdown()
                 return
 
@@ -5885,4 +5949,9 @@ def run_server(
         if v6_server is not None:
             v6_server.shutdown()
         if restart_to["head"]:
+            # A scan that began just before admission froze may outlive
+            # Scanner.stop()'s bounded join.  Never exec over any durable or
+            # expensive worker; with admission frozen, no new one can start.
+            while _background_workers_active(scanner):
+                time.sleep(0.05)
             _exec_restart(server, v6_server)

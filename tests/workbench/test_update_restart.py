@@ -121,7 +121,7 @@ def test_no_restart_under_the_reload_supervisor(quiet_env, monkeypatch):
 def test_request_accounting_tracks_in_flight_and_mutations(monkeypatch):
     monkeypatch.setattr(daemon, "_activity", {"in_flight": 0, "last_mutation": 0.0})
 
-    daemon._note_request_start()
+    assert daemon._note_request_start() is True
     assert daemon._snapshot_activity()["in_flight"] == 1
 
     # GETs finish without moving the mutation clock.
@@ -131,9 +131,57 @@ def test_request_accounting_tracks_in_flight_and_mutations(monkeypatch):
     assert snap["last_mutation"] == 0.0
 
     # Mutating methods stamp the clock on completion.
-    daemon._note_request_start()
+    assert daemon._note_request_start() is True
     daemon._note_request_end("POST")
     assert daemon._snapshot_activity()["last_mutation"] > 0.0
+
+
+def test_request_admission_freezes_atomically_only_when_idle(monkeypatch):
+    monkeypatch.setattr(daemon, "_activity", {"in_flight": 0, "last_mutation": 0.0})
+    monkeypatch.setattr(daemon, "_request_admission_open", True)
+
+    assert daemon._note_request_start() is True
+    assert daemon._freeze_request_admission(now=1000.0) is False
+
+    daemon._note_request_end("GET")
+    assert daemon._freeze_request_admission(now=1000.0) is True
+    assert daemon._note_request_start() is False
+    assert daemon._snapshot_activity()["in_flight"] == 0
+
+
+def test_request_admission_rechecks_mutation_window(monkeypatch):
+    monkeypatch.setattr(
+        daemon,
+        "_activity",
+        {"in_flight": 0, "last_mutation": 995.0},
+    )
+    monkeypatch.setattr(daemon, "_request_admission_open", True)
+
+    # A mutation that completed after the pre-flight snapshot must cancel the
+    # commit even though no request remains in flight.
+    assert daemon._freeze_request_admission(now=1000.0) is False
+    assert daemon._note_request_start() is True
+    daemon._note_request_end("GET")
+
+
+def test_scanner_stop_prevents_post_scan_scoring(monkeypatch):
+    scanner = daemon.Scanner()
+    scoring_started = False
+
+    def finish_scan_after_restart_commit():
+        scanner._stop_event.set()
+        return {}
+
+    def record_scoring(_scanner):
+        nonlocal scoring_started
+        scoring_started = True
+
+    monkeypatch.setattr(scanner, "_scan_tick", finish_scan_after_restart_commit)
+    monkeypatch.setattr(daemon, "trigger_scoring_warmup", record_scoring)
+
+    scanner._run()
+
+    assert scoring_started is False
 
 
 def test_request_accounting_never_goes_negative(monkeypatch):
