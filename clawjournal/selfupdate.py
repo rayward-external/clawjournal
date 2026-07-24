@@ -632,10 +632,12 @@ def finalize_install(
     record = read_pending_reinstall() or {}
     raw_reasons = record.get("reasons")
     remaining = set(raw_reasons) if isinstance(raw_reasons, list) else set()
+    current_revision = _rev_parse(target, "HEAD") or ""
     pending_revision = str(record.get("to") or "")
+    required_pending_revision = pending_revision or current_revision
     checkout_current = (
         not remaining
-        or _checkout_covers_revision(target, pending_revision)
+        or _checkout_covers_revision(target, required_pending_revision)
     )
     if checkout_current:
         remaining.discard("deps")
@@ -643,9 +645,9 @@ def finalize_install(
     frontend_current = _frontend_is_built(target) and not _frontend_stale(target)
     if frontend_requested:
         required_revision = (
-            pending_revision
+            required_pending_revision
             if "frontend" in remaining
-            else (_rev_parse(target, "HEAD") or "")
+            else current_revision
         )
         frontend_current = (
             frontend_current
@@ -676,6 +678,17 @@ def finalize_install(
     ):
         remaining.discard("unknown")
 
+    if remaining and not pending_revision and current_revision:
+        # A first explicit optional-install failure has no update range yet.
+        # Pin its fallback record to the checkout that was actually attempted
+        # so a later successful build/install can prove it reconciled the same
+        # revision. The required_pending_revision fallback above also repairs
+        # records written by older versions without this target.
+        record = {
+            **record,
+            "from": record.get("from") or current_revision,
+            "to": current_revision,
+        }
     _replace_pending_reinstall(record, sorted(remaining))
     return {
         "status": "finalized" if not remaining else "finalized-partial",

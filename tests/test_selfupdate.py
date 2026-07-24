@@ -1173,6 +1173,38 @@ def test_frontend_deletion_stays_pending_until_new_revision_is_built(
     assert selfupdate.read_pending_reinstall()["reasons"] == ["frontend"]
 
 
+def test_first_frontend_failure_records_head_and_successful_retry_clears(
+    isolated_config_dir, fake_repo
+):
+    """A fallback created without an update range must remain retryable."""
+    html = _build_fake_dist(fake_repo)
+    source = fake_repo / "clawjournal" / "web" / "frontend" / "src" / "App.tsx"
+    source.parent.mkdir(parents=True)
+    source.write_text("current\n")
+    now = time.time()
+    os.utime(source, (now - 100, now - 100))
+    os.utime(html, (now, now))
+    head = _head(fake_repo)
+
+    failed = selfupdate.finalize_install(
+        repo=fake_repo,
+        frontend_requested=True,
+    )
+
+    assert failed["remaining"] == ["frontend"]
+    record = selfupdate.read_pending_reinstall()
+    assert record["from"] == head
+    assert record["to"] == head
+
+    assert selfupdate.record_frontend_build(fake_repo, head) is True
+    retried = selfupdate.finalize_install(
+        repo=fake_repo,
+        frontend_requested=True,
+    )
+    assert retried["remaining"] == []
+    assert selfupdate.read_pending_reinstall() is None
+
+
 def test_direct_sync_records_optional_changes_before_finalization(
     isolated_config_dir, fake_repo
 ):
