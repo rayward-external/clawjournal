@@ -151,7 +151,7 @@ If you are unsure at any point, stop before **Submit**. Your review and package 
 - **AI features are optional.** If you enable them, ClawJournal removes home-folder paths and usernames locally first. The remaining session text is sent to the AI service you choose and may still contain identifying details.
 - **Sharing has safety checks.** Redaction and secret scans run before a package can be submitted. One scanner may contact a credential provider to check whether a suspected secret is live. A missing or failed required scan blocks sharing.
 - **Automatic uploads are off by default.** They require a separate setup and authorization after a successful manual share.
-- **ClawJournal keeps itself current.** Installs from a git checkout quietly fast-forward to the latest published version (at most once an hour) and, when an update changes dependencies, the workbench, or the pinned scanners, rerun the installer in the background. Updates never touch your local changes, and updating never uploads anything. Set `CLAWJOURNAL_NO_AUTO_UPDATE=1` to opt out.
+- **ClawJournal keeps itself current.** Installs from a git checkout quietly fast-forward to the latest published version (at most once an hour) and, when an update changes dependencies, the workbench, or the pinned scanners, rerun the installer in the background. A running workbench switches to the new version at the next quiet moment (never during a request or right after you changed something) — just reload the page. Updates never touch your local changes, and updating never uploads anything. Set `CLAWJOURNAL_NO_AUTO_UPDATE=1` to opt out.
 
 For the complete details, see [PRIVACY.md](PRIVACY.md).
 

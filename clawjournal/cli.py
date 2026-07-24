@@ -4842,13 +4842,19 @@ def main() -> None:
         return
 
     if command == "serve":
-        from .workbench.daemon import RELOAD_CHILD_ENV, RELOAD_OPEN_BROWSER_ENV
+        from .workbench.daemon import (
+            RELOAD_CHILD_ENV,
+            RELOAD_OPEN_BROWSER_ENV,
+            RESTART_CHILD_ENV,
+        )
         is_reload_child = os.environ.get(RELOAD_CHILD_ENV) == "1"
+        is_restart_child = os.environ.get(RESTART_CHILD_ENV) == "1"
 
         # A manual `clawjournal serve` counts as opening the journal too, but
         # does not create desktop state unless the optional shortcut exists.
-        # Reload children are restarts of one session, not new opens.
-        if not is_reload_child:
+        # Reload/update-restart children are restarts of one session, not new
+        # opens.
+        if not is_reload_child and not is_restart_child:
             from .desktop import note_opened
             note_opened()
 
@@ -4866,6 +4872,10 @@ def main() -> None:
         if is_reload_child:
             # Only the first child gets the browser; restarts must not open tabs.
             open_browser = os.environ.get(RELOAD_OPEN_BROWSER_ENV) == "1"
+        elif is_restart_child:
+            # Post-update self-restart: the user's tab is already open and the
+            # SPA reconnects on its own — opening another would be noise.
+            open_browser = False
         else:
             open_browser = not args.no_browser
         run_server(

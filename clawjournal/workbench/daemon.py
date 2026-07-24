@@ -3033,6 +3033,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     _last_share_time: float = 0.0
 
+    def handle_one_request(self) -> None:
+        # In-flight/mutation accounting for the update self-restart monitor:
+        # a restart only happens when nothing is being served and no
+        # mutating request landed recently.
+        _note_request_start()
+        try:
+            super().handle_one_request()
+        finally:
+            _note_request_end(getattr(self, "command", None))
+
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug(format, *args)
 
@@ -5456,6 +5466,103 @@ def _newest_frontend_build_input_mtime(frontend_root: Path) -> float:
     return newest
 
 
+# ---------- update self-restart ----------------------------------------------
+#
+# The background auto-update (clawjournal/selfupdate.py) fast-forwards the
+# checkout and reruns the installer, but a running daemon keeps executing the
+# Python it imported at startup — the *frontend* refreshes on the next browser
+# reload (dist/ is read off disk per request, index.html is no-store), while
+# the *backend* would stay old forever. So the daemon watches its own
+# checkout: when HEAD has moved AND the install is fully reconciled (no
+# pending reinstall, workbench build current), it re-execs itself at a quiet
+# moment. Restarting is equivalent to the user's Ctrl-C + rerun, which the
+# daemon already supports; the SQLite index and the upload ledger are built
+# to survive it.
+
+RESTART_CHILD_ENV = "CLAWJOURNAL_RESTART_CHILD"  # set on the re-exec'd process: don't reopen the browser
+_RESTART_POLL_SECONDS = 60.0
+# Don't restart within this window of a mutating request — a user mid-flow
+# (queueing a share, changing hold state) shouldn't have the rug moved.
+_RESTART_MUTATION_IDLE_SECONDS = 600.0
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+_activity_lock = threading.Lock()
+_activity = {"in_flight": 0, "last_mutation": 0.0}
+
+
+def _note_request_start() -> None:
+    with _activity_lock:
+        _activity["in_flight"] += 1
+
+
+def _note_request_end(method: str | None) -> None:
+    with _activity_lock:
+        _activity["in_flight"] = max(0, _activity["in_flight"] - 1)
+        if method in _MUTATING_METHODS:
+            _activity["last_mutation"] = time.time()
+
+
+def _snapshot_activity() -> dict[str, float]:
+    with _activity_lock:
+        return dict(_activity)
+
+
+def _update_restart_due(
+    repo: Path,
+    startup_head: str,
+    *,
+    now: float | None = None,
+    activity: dict[str, float] | None = None,
+) -> str | None:
+    """Return the new HEAD when a graceful restart should happen, else None.
+
+    Deliberately conservative: any doubt (can't read HEAD, install not yet
+    reconciled, requests in flight, recent mutation) defers to the next poll.
+    """
+    from .. import selfupdate
+
+    if os.environ.get(RELOAD_CHILD_ENV) == "1":
+        return None  # the --reload supervisor owns restarts in dev
+    head = selfupdate._rev_parse(repo, "HEAD")
+    if not head or head == startup_head:
+        return None
+    if selfupdate.reinstall_needed(repo):
+        return None  # wait for the background reinstall to finish the job
+    snap = activity if activity is not None else _snapshot_activity()
+    if snap["in_flight"] > 0:
+        return None
+    t = time.time() if now is None else now
+    if snap["last_mutation"] and t - snap["last_mutation"] < _RESTART_MUTATION_IDLE_SECONDS:
+        return None
+    return head
+
+
+def _exec_restart(server: ThreadingHTTPServer,
+                  v6_server: ThreadingHTTPServer | None) -> None:
+    """Replace this process with a fresh `clawjournal serve`. Never returns
+    on success — argv is preserved, so port/source/remote flags carry over.
+
+    The listening sockets are closed *before* the exec so the new process
+    can rebind the same port (on Windows, where exec is emulated as
+    spawn+exit, this matters even more).
+    """
+    for srv in (server, v6_server):
+        if srv is None:
+            continue
+        try:
+            srv.server_close()
+        except OSError:
+            pass
+    os.environ[RESTART_CHILD_ENV] = "1"
+    try:
+        os.execv(sys.executable, _reload_child_command())
+    except OSError:
+        logger.error(
+            "Could not restart after update — run `clawjournal serve` again manually.",
+            exc_info=True,
+        )
+
+
 # Env vars that coordinate the --reload supervisor with its server child.
 RELOAD_CHILD_ENV = "CLAWJOURNAL_RELOAD_CHILD"  # set on the child: "run the server, don't supervise"
 RELOAD_OPEN_BROWSER_ENV = "CLAWJOURNAL_RELOAD_OPEN_BROWSER"  # set only on the first child
@@ -5698,6 +5805,41 @@ def run_server(
 
     threading.Thread(target=_initial_scan, daemon=True).start()
 
+    # Watch the editable checkout: once the background auto-update has both
+    # moved HEAD and reconciled the install, restart at a quiet moment so the
+    # backend serves the new version too (the frontend already refreshes per
+    # request). No-op for wheel installs and under the --reload supervisor.
+    restart_to: dict[str, str | None] = {"head": None}
+
+    def _watch_for_update() -> None:
+        from .. import selfupdate
+
+        repo = selfupdate._package_repo_root()
+        if repo is None:
+            return  # wheel install — nothing to watch
+        startup_head = selfupdate._rev_parse(repo, "HEAD")
+        if not startup_head:
+            return
+        while True:
+            time.sleep(_RESTART_POLL_SECONDS)
+            try:
+                head = _update_restart_due(repo, startup_head)
+            except Exception:
+                logger.debug("update-restart check failed", exc_info=True)
+                continue
+            if head:
+                restart_to["head"] = head
+                logger.info(
+                    "ClawJournal updated (%s -> %s) — restarting the workbench "
+                    "to serve the new version",
+                    startup_head[:7], head[:7],
+                )
+                server.shutdown()
+                return
+
+    threading.Thread(target=_watch_for_update, daemon=True,
+                     name="update-restart").start()
+
     # Reconcile benchmark rows orphaned in 'generating' by a previous crash/restart
     # (the only normal exit from 'generating' is the in-process worker).
     try:
@@ -5721,3 +5863,5 @@ def run_server(
         server.shutdown()
         if v6_server is not None:
             v6_server.shutdown()
+        if restart_to["head"]:
+            _exec_restart(server, v6_server)
