@@ -211,14 +211,18 @@ if ($DesktopShortcut) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# 7) Report. The install just reconciled everything a background auto-update
-#    could have left stale, so retire any pending-reinstall notice.
+# 7) Retire only the pending reasons this run actually reconciled. Frontend
+# failures are non-fatal above, so the CLI verifies the built assets before
+# clearing that reason; unrequested optional components remain pending.
 $previousNoAutoUpdate = $env:CLAWJOURNAL_NO_AUTO_UPDATE
 $env:CLAWJOURNAL_NO_AUTO_UPDATE = '1'
 try {
-    & $ClawJournalExe selfupdate --clear-pending *> $null
+    $finalizeArgs = @('selfupdate', '--finalize-install')
+    if ($WithFrontend) { $finalizeArgs += '--frontend-requested' }
+    if ($WithSharing) { $finalizeArgs += '--scanners-installed' }
+    & $ClawJournalExe @finalizeArgs *> $null
 } catch {
-    # A missing notice is not an install failure.
+    # Finalization is best-effort; any unresolved notice remains in place.
 } finally {
     if ($null -eq $previousNoAutoUpdate) {
         Remove-Item Env:CLAWJOURNAL_NO_AUTO_UPDATE -ErrorAction SilentlyContinue

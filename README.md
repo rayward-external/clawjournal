@@ -33,8 +33,9 @@ help me install that first.
 
 If it is already installed, run `clawjournal selfupdate --reinstall` once.
 That single command brings everything — code, dependencies, workbench, and
-safety scanners — to the latest published version, and does nothing if it is
-already current.
+safety scanners — to the latest published version. It reruns the installer
+even when the checkout is already current so older unrecorded dependency or
+scanner drift is repaired too.
 
 Either way I must end up on the latest published version; verify that and
 tell me if I am not. Never use force options, and never delete or overwrite

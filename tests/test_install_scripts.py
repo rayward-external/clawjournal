@@ -13,6 +13,8 @@ def test_posix_installer_supports_managed_sharing_dependencies():
     assert "--with-sharing" in script
     assert '"$VENV_BIN/clawjournal" betterleaks install' in script
     assert '"$VENV_BIN/clawjournal" trufflehog install' in script
+    assert "--finalize-install" in script
+    assert "--clear-pending" not in script
 
     help_result = subprocess.run(
         ["sh", str(ROOT / "scripts" / "install.sh"), "--help"],
@@ -30,3 +32,5 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     assert "[switch]$WithSharing" in script
     assert "& $ClawJournalExe betterleaks install" in script
     assert "& $ClawJournalExe trufflehog install" in script
+    assert "--finalize-install" in script
+    assert "--clear-pending" not in script

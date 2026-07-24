@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -571,6 +572,68 @@ def test_cli_should_auto_update_skips_help_and_version():
     assert _should_auto_update(["clawjournal", "scan", "--help"]) is True
 
 
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_cli_selfupdate_failure_exits_nonzero(
+    monkeypatch, capsys, json_mode
+):
+    """Automation must not continue after either update stage failed."""
+    from clawjournal import cli
+
+    monkeypatch.setattr(
+        selfupdate,
+        "selfupdate_sync",
+        lambda **kwargs: {"status": "fetch-failed", "stderr": "offline"},
+    )
+    monkeypatch.setattr(
+        selfupdate,
+        "reinstall",
+        lambda **kwargs: {"status": "installer-failed", "stderr": "pip failed"},
+    )
+    argv = ["clawjournal", "selfupdate", "--reinstall"]
+    if json_mode:
+        argv.append("--json")
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "fetch-failed" in output.out or "Fetch failed" in output.out
+    assert "installer-failed" in output.out or "Reinstall failed" in output.out
+
+
+def test_cli_explicit_reinstall_runs_even_when_checkout_is_current(
+    monkeypatch, capsys
+):
+    """Legacy installs have no pending record, so explicit means explicit."""
+    from clawjournal import cli
+
+    monkeypatch.setattr(
+        selfupdate,
+        "selfupdate_sync",
+        lambda **kwargs: {
+            "status": "up-to-date",
+            "head": "a" * 40,
+            "upstream": "a" * 40,
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        selfupdate,
+        "reinstall",
+        lambda **kwargs: calls.append(kwargs) or {"status": "reinstalled"},
+    )
+    monkeypatch.setattr(
+        "sys.argv", ["clawjournal", "selfupdate", "--reinstall", "--json"]
+    )
+
+    cli.main()
+
+    assert calls == [{"capture": True}]
+    assert '"status": "reinstalled"' in capsys.readouterr().out
+
+
 # ---------- pending reinstall -------------------------------------------------
 
 
@@ -844,6 +907,39 @@ def test_installer_command_matches_what_is_installed(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_installer_command_preserves_pending_optional_intent(
+    isolated_config_dir, fake_repo
+):
+    """A failed attempt may remove the artifact that originally set the flag."""
+    _make_installer(fake_repo)
+    selfupdate.record_pending_reinstall(
+        "a" * 40, "b" * 40, ["frontend", "scanners"]
+    )
+
+    command = selfupdate._installer_command(fake_repo)
+
+    assert "--with-frontend" in command
+    assert "--with-sharing" in command
+
+
+def test_finalize_install_preserves_unrequested_optional_reasons(
+    isolated_config_dir, fake_repo
+):
+    selfupdate.record_pending_reinstall(
+        "a" * 40, "b" * 40, ["deps", "frontend", "scanners"]
+    )
+
+    result = selfupdate.finalize_install(repo=fake_repo)
+
+    assert result["status"] == "finalized-partial"
+    assert result["remaining"] == ["frontend", "scanners"]
+    assert selfupdate.read_pending_reinstall()["reasons"] == [
+        "frontend",
+        "scanners",
+    ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_runs_installer_and_clears_notice(isolated_config_dir, fake_repo):
     marker = _make_installer(fake_repo)
     selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
@@ -910,6 +1006,37 @@ def test_reinstall_partial_when_workbench_build_is_still_stale(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_partial_when_failed_build_removes_dist(
+    isolated_config_dir, fake_repo
+):
+    """Missing output is worse than stale output and must remain pending."""
+    html = _build_fake_dist(fake_repo)
+    src = fake_repo / "clawjournal" / "web" / "frontend" / "src"
+    src.mkdir(parents=True)
+    newer = src / "App.tsx"
+    newer.write_text("x")
+    now = time.time()
+    os.utime(html, (now - 100, now - 100))
+    os.utime(newer, (now, now))
+    scripts = fake_repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "install.sh").write_text(
+        "#!/bin/sh\n"
+        f'rm -f "{html}"\n'
+    )
+    selfupdate.record_pending_reinstall(
+        "a" * 40, "b" * 40, ["frontend"]
+    )
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled-partial"
+    assert result["remaining"] == ["frontend"]
+    assert not html.exists()
+    assert selfupdate.read_pending_reinstall()["reasons"] == ["frontend"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_clears_when_workbench_build_is_current(
     isolated_config_dir, fake_repo
 ):
@@ -933,28 +1060,61 @@ def test_reinstall_clears_when_workbench_build_is_current(
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_refuses_to_race_another_installer(isolated_config_dir, fake_repo):
     """Concurrent pip/npm runs corrupt each other — one installer at a time."""
-    marker = _make_installer(fake_repo)
-    (isolated_config_dir / selfupdate.REINSTALL_LOCK_FILENAME).write_text("")
+    import fcntl
 
-    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+    marker = _make_installer(fake_repo)
+    lock = isolated_config_dir / selfupdate.REINSTALL_LOCK_FILENAME
+    peer_fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(peer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    try:
+        result = selfupdate.reinstall(repo=fake_repo, capture=True)
+    finally:
+        fcntl.flock(peer_fd, fcntl.LOCK_UN)
+        os.close(peer_fd)
 
     assert result["status"] == "reinstall-in-progress"
     assert not marker.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
-def test_stale_reinstall_lock_is_reclaimed(isolated_config_dir, fake_repo):
+def test_persistent_unlocked_reinstall_file_is_reused(isolated_config_dir, fake_repo):
     marker = _make_installer(fake_repo)
     lock = isolated_config_dir / selfupdate.REINSTALL_LOCK_FILENAME
     lock.write_text("")
-    old = time.time() - selfupdate.REINSTALL_LOCK_STALE_SECONDS - 10
-    os.utime(lock, (old, old))
 
     result = selfupdate.reinstall(repo=fake_repo, capture=True)
 
     assert result["status"] == "reinstalled"
     assert marker.exists()
-    assert not lock.exists()
+    assert lock.exists()
+
+
+def test_reinstall_lock_has_one_winner_under_contention(isolated_config_dir):
+    """The persistent lock file must never admit two simultaneous owners."""
+    barrier = threading.Barrier(16)
+    claimed = threading.Barrier(16)
+    results = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        won = selfupdate._claim_reinstall_lock()
+        with results_lock:
+            results.append(won)
+        # Keep the winner's OS lock held until every contender has tried.
+        claimed.wait()
+        if won:
+            selfupdate._release_reinstall_lock()
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == 15
 
 
 def test_reinstall_without_installer_script_reports_cleanly(

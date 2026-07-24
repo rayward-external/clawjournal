@@ -3881,8 +3881,6 @@ def _render_reinstall_status(result: dict) -> str:
     status = result.get("status")
     if status == "reinstalled":
         return "Reinstall complete — dependencies, workbench build, and scanners match the checkout."
-    if status == "already-aligned":
-        return "Everything already matches the latest published version — nothing to reinstall."
     if status == "reinstalled-partial":
         hint = str(result.get("hint") or "the workbench build is still stale.")
         return f"Reinstall completed, but not everything: {hint}"
@@ -3898,6 +3896,18 @@ def _render_reinstall_status(result: dict) -> str:
         suffix = f": {detail}" if detail else "."
         return f"Reinstall failed (`{result.get('command')}`){suffix}"
     return f"reinstall status: {status}"
+
+
+def _selfupdate_exit_code(result: dict) -> int:
+    """Return nonzero when an update or requested reinstall did not finish."""
+    status = result.get("status")
+    if status not in {"not-a-checkout", "up-to-date", "behind", "updated"}:
+        return 1
+    install_result = result.get("reinstall_result")
+    if isinstance(install_result, dict):
+        if install_result.get("status") != "reinstalled":
+            return 1
+    return 0
 
 
 _AUTO_UPDATE_SKIP_FLAGS = frozenset({"-h", "--help", "--version"})
@@ -4079,7 +4089,10 @@ def main() -> None:
                     help="Update, then rerun the installer so dependencies, the workbench "
                          "build, and the pinned scanners match the checkout")
     su.add_argument("--clear-pending", action="store_true",
-                    help="Dismiss the pending-reinstall notice (the installer does this itself)")
+                    help="Dismiss the pending-reinstall notice manually")
+    su.add_argument("--finalize-install", action="store_true", help=argparse.SUPPRESS)
+    su.add_argument("--frontend-requested", action="store_true", help=argparse.SUPPRESS)
+    su.add_argument("--scanners-installed", action="store_true", help=argparse.SUPPRESS)
     su.add_argument("--json", action="store_true", help="Output result as JSON")
 
     th = sub.add_parser("trufflehog",
@@ -5314,10 +5327,20 @@ def main() -> None:
     if command == "selfupdate":
         from .selfupdate import (
             clear_pending_reinstall,
+            finalize_install,
             pending_reinstall_notice,
             reinstall as run_reinstall,
             selfupdate_sync,
         )
+
+        if args.finalize_install:
+            result = finalize_install(
+                frontend_requested=args.frontend_requested,
+                scanners_installed=args.scanners_installed,
+            )
+            if args.json:
+                print(json.dumps(result, indent=2))
+            return
 
         if args.clear_pending:
             clear_pending_reinstall()
@@ -5335,21 +5358,20 @@ def main() -> None:
         result = selfupdate_sync(check_only=args.check, force=args.force)
 
         if args.reinstall:
-            from .selfupdate import reinstall_needed
+            # An explicit reinstall is authoritative even when HEAD is
+            # already current. Older auto-updaters had no pending record, so
+            # skipping here could leave historical dependency or scanner
+            # drift untouched while claiming the install was aligned.
+            result = {
+                **result,
+                "reinstall_result": run_reinstall(capture=args.json),
+            }
 
-            # Skip the minutes-long installer run when the pull found
-            # nothing new and nothing is pending or stale — this makes
-            # `selfupdate --reinstall` cheap to run unconditionally. For
-            # every other outcome (updated, or a blocked pull: dirty tree,
-            # no network) the reinstall is best-effort: it still reconciles
-            # the install with whatever the checkout holds right now.
-            if result.get("status") in {"up-to-date", "updated"} and not reinstall_needed():
-                result = {**result, "reinstall_result": {"status": "already-aligned"}}
-            else:
-                result = {**result, "reinstall_result": run_reinstall(capture=args.json)}
-
+        exit_code = _selfupdate_exit_code(result)
         if args.json:
             print(json.dumps(result, indent=2))
+            if exit_code:
+                sys.exit(exit_code)
             return
 
         print(_render_selfupdate_status(result))
@@ -5360,6 +5382,8 @@ def main() -> None:
             notice = pending_reinstall_notice()
             if notice:
                 print(notice)
+        if exit_code:
+            sys.exit(exit_code)
         return
 
     if command == "trufflehog":

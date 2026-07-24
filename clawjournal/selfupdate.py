@@ -41,9 +41,6 @@ DIFF_TIMEOUT_SECONDS = 5
 # An npm install + Vite build on a cold cache is the long pole here.
 REINSTALL_TIMEOUT_SECONDS = 15 * 60
 REINSTALL_LOCK_FILENAME = "reinstall.lock"
-# Reclaim a lock left behind by a crashed installer one minute past the
-# longest run we would ever wait for.
-REINSTALL_LOCK_STALE_SECONDS = REINSTALL_TIMEOUT_SECONDS + 60
 # The lock is held only across the brief spawn window (parent releases
 # immediately after Popen returns). 60s is generous for that; using the
 # full THROTTLE_SECONDS would mean a crashed CLI blocks updates for an
@@ -54,6 +51,9 @@ DEFAULT_REMOTE = "origin"
 
 OPT_OUT_ENV = "CLAWJOURNAL_NO_AUTO_UPDATE"
 DEBUG_ENV = "CLAWJOURNAL_AUTO_UPDATE_DEBUG"
+
+_reinstall_lock_guard = threading.Lock()
+_reinstall_lock_fd: int | None = None
 
 
 def _truthy(value: str | None) -> bool:
@@ -404,6 +404,32 @@ def clear_pending_reinstall() -> None:
         _debug(f"could not clear pending reinstall: {exc}")
 
 
+def _replace_pending_reinstall(
+    record: dict[str, object], reasons: list[str]
+) -> None:
+    """Replace a pending record with a verified remainder, or remove it."""
+    if not reasons:
+        clear_pending_reinstall()
+        return
+    payload = {
+        "from": record.get("from") or "",
+        "to": record.get("to") or "",
+        "reasons": sorted(set(reasons)),
+    }
+    path = _pending_reinstall_path()
+    tmp = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        _debug(f"could not narrow pending reinstall: {exc}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _record_reinstall_needs(repo: Path, old_sha: str, new_sha: str) -> list[str]:
     """Classify an applied update and persist what it means. Returns reasons.
 
@@ -484,6 +510,20 @@ def _sharing_is_installed() -> bool:
     )
 
 
+def _managed_scanners_installed() -> bool:
+    """True only when both managed share scanners are present."""
+    bin_dir = CONFIG_DIR / "bin"
+    betterleaks = any(
+        (bin_dir / name).exists()
+        for name in ("betterleaks", "betterleaks.exe")
+    )
+    trufflehog = any(
+        (bin_dir / name).exists()
+        for name in ("trufflehog", "trufflehog.exe")
+    )
+    return betterleaks and trufflehog
+
+
 def _installer_command(repo: Path) -> list[str] | None:
     """Build the installer invocation that matches this machine's setup.
 
@@ -505,11 +545,75 @@ def _installer_command(repo: Path) -> list[str] | None:
         # Invoke via `sh` so a checkout without the exec bit still works.
         cmd = ["sh", str(script)]
         frontend_flag, sharing_flag = "--with-frontend", "--with-sharing"
-    if _frontend_is_built(repo):
+    pending = read_pending_reinstall() or {}
+    raw_reasons = pending.get("reasons")
+    reasons = set(raw_reasons) if isinstance(raw_reasons, list) else set()
+    # A failed build can remove dist/index.html. Preserve the intent recorded
+    # before the attempt so the retry still asks the installer to rebuild it.
+    if _frontend_is_built(repo) or "frontend" in reasons:
         cmd.append(frontend_flag)
-    if _sharing_is_installed():
+    # Likewise, a failed scanner reinstall may leave only one managed binary.
+    if _sharing_is_installed() or "scanners" in reasons:
         cmd.append(sharing_flag)
     return cmd
+
+
+def finalize_install(
+    repo: Path | None = None,
+    *,
+    frontend_requested: bool = False,
+    scanners_installed: bool = False,
+    clear_unknown: bool = False,
+) -> dict[str, object]:
+    """Retire only pending reasons that an installer verifiably reconciled.
+
+    Both platform installers call this after pip succeeds. Frontend failures
+    are intentionally non-fatal in those scripts, so a requested workbench is
+    cleared only when the built index exists and is current. Scanner reasons
+    are cleared only after both managed binaries exist.
+    """
+    target = repo or _package_repo_root()
+    if target is None:
+        return {"status": "not-a-checkout", "remaining": []}
+
+    record = read_pending_reinstall() or {}
+    raw_reasons = record.get("reasons")
+    remaining = set(raw_reasons) if isinstance(raw_reasons, list) else set()
+    remaining.discard("deps")
+
+    frontend_current = (
+        _frontend_is_built(target) and not _frontend_stale(target)
+    )
+    if frontend_requested:
+        if frontend_current:
+            remaining.discard("frontend")
+        else:
+            remaining.add("frontend")
+    elif _frontend_is_built(target) and not frontend_current:
+        # A direct installer may have self-synced frontend sources without
+        # being asked to rebuild the already-installed workbench.
+        remaining.add("frontend")
+
+    scanners_current = _managed_scanners_installed()
+    if scanners_installed:
+        if scanners_current:
+            remaining.discard("scanners")
+        else:
+            remaining.add("scanners")
+
+    if clear_unknown and (
+        (not frontend_requested or frontend_current)
+        and (not scanners_installed or scanners_current)
+    ):
+        remaining.discard("unknown")
+
+    _replace_pending_reinstall(record, sorted(remaining))
+    return {
+        "status": "finalized" if not remaining else "finalized-partial",
+        "remaining": sorted(remaining),
+        "frontend_current": frontend_current,
+        "scanners_current": scanners_current,
+    }
 
 
 def reinstall_needed(repo: Path | None = None) -> bool:
@@ -533,42 +637,72 @@ def _reinstall_lock_path() -> Path:
 
 
 def _claim_reinstall_lock() -> bool:
-    """One installer at a time — concurrent pip/npm runs corrupt each other.
+    """Claim a crash-safe OS lock for the installer.
 
-    The contenders are the detached background child and a user-invoked
-    `selfupdate --reinstall`. The loser reports and leaves the pending
-    record in place for the winner to clear.
+    Advisory locks are released by the kernel when a process exits, so there
+    is no stale-file deletion window in which two contenders can both win.
+    The lock file itself intentionally persists between runs.
     """
+    global _reinstall_lock_fd
+
     lock = _reinstall_lock_path()
-    for _ in range(2):
+    with _reinstall_lock_guard:
+        if _reinstall_lock_fd is not None:
+            return False
         try:
             lock.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(fd)
-            return True
-        except FileExistsError:
-            try:
-                age = time.time() - lock.stat().st_mtime
-            except FileNotFoundError:
-                continue  # holder released between open and stat — retry
-            except OSError:
-                return False
-            if age <= REINSTALL_LOCK_STALE_SECONDS:
-                return False
-            try:
-                lock.unlink()  # crashed holder; reclaim on the next pass
-            except OSError:
-                return False
+            fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
         except OSError:
             return False
-    return False
+
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (ImportError, OSError):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return False
+
+        _reinstall_lock_fd = fd
+        return True
 
 
 def _release_reinstall_lock() -> None:
+    global _reinstall_lock_fd
+
+    with _reinstall_lock_guard:
+        fd = _reinstall_lock_fd
+        _reinstall_lock_fd = None
+    if fd is None:
+        return
     try:
-        _reinstall_lock_path().unlink()
-    except OSError:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except (ImportError, OSError):
         pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def reinstall(repo: Path | None = None, *, capture: bool = False,
@@ -589,6 +723,12 @@ def reinstall(repo: Path | None = None, *, capture: bool = False,
         return {"status": "installer-missing", "repo": str(target)}
 
     info: dict[str, object] = {"repo": str(target), "command": " ".join(cmd)}
+    frontend_requested = any(
+        arg in {"--with-frontend", "-WithFrontend"} for arg in cmd
+    )
+    scanners_installed = any(
+        arg in {"--with-sharing", "-WithSharing"} for arg in cmd
+    )
 
     if not _claim_reinstall_lock():
         info["status"] = "reinstall-in-progress"
@@ -620,28 +760,37 @@ def reinstall(repo: Path | None = None, *, capture: bool = False,
             info["status"] = "installer-failed"
             return info
 
-        # The installer reports success even when the optional workbench
-        # build was skipped (no npm) or failed — that step is deliberately
-        # non-fatal there. Clearing the record on exit code alone would
-        # retire the fix-it notice exactly when it is still needed, so
-        # verify the build and keep a narrowed record when it is behind.
-        prior = read_pending_reinstall() or {}
-        clear_pending_reinstall()
-        if _frontend_is_built(target) and _frontend_stale(target):
-            record_pending_reinstall(
-                str(prior.get("from") or ""), str(prior.get("to") or ""),
-                ["frontend"])
+        # The installer reports success even when an optional workbench build
+        # was skipped or failed. Finalize only the components that can be
+        # verified, and keep every unresolved reason visible.
+        finalized = finalize_install(
+            target,
+            frontend_requested=frontend_requested,
+            scanners_installed=scanners_installed,
+            clear_unknown=True,
+        )
+        remaining = finalized["remaining"]
+        if remaining:
             info["status"] = "reinstalled-partial"
-            if shutil.which("npm") is None:
+            info["remaining"] = remaining
+            if "frontend" in remaining and shutil.which("npm") is None:
                 info["hint"] = (
                     "Node.js (npm) was not found, so the workbench was not "
                     "rebuilt. Install Node.js, then run "
                     "`clawjournal selfupdate --reinstall` again.")
-            else:
+            elif "frontend" in remaining:
                 info["hint"] = (
                     "The workbench build did not complete; run "
                     "`scripts/install.sh --with-frontend` to see the build "
                     "error.")
+            elif "scanners" in remaining:
+                info["hint"] = (
+                    "The managed secret scanners are still incomplete; run "
+                    "`scripts/install.sh --with-sharing` to see the error.")
+            else:
+                info["hint"] = (
+                    "The update could not be fully verified; run the project "
+                    "installer directly to inspect the remaining issue.")
             return info
 
         info["status"] = "reinstalled"

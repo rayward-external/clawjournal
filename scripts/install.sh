@@ -173,9 +173,17 @@ if [ "$DESKTOP_SHORTCUT" -eq 1 ]; then
   "$VENV_BIN/clawjournal" desktop install
 fi
 
-# 7) Report. The install just reconciled everything a background auto-update
-#    could have left stale, so retire any pending-reinstall notice.
-CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" selfupdate --clear-pending >/dev/null 2>&1 || true
+# 7) Retire only the pending reasons this run actually reconciled. Frontend
+#    failures are non-fatal above, so the CLI verifies the built assets before
+#    clearing that reason; unrequested optional components remain pending.
+set -- --finalize-install
+if [ "$WITH_FRONTEND" -eq 1 ]; then
+  set -- "$@" --frontend-requested
+fi
+if [ "$WITH_SHARING" -eq 1 ]; then
+  set -- "$@" --scanners-installed
+fi
+CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" selfupdate "$@" >/dev/null 2>&1 || true
 
 echo
 INSTALLED_VERSION="$("$VENV_PY" -c 'import clawjournal; print(clawjournal.__version__)' 2>/dev/null || echo "?")"
