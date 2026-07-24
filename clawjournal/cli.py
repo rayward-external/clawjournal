@@ -3918,6 +3918,12 @@ def _selfupdate_exit_code(result: dict) -> int:
 _AUTO_UPDATE_SKIP_FLAGS = frozenset({"-h", "--help", "--version"})
 
 
+def _requested_subcommand(argv: list[str] | None = None) -> str | None:
+    """Return the first non-flag token, which is argparse's subcommand."""
+    tokens = (sys.argv if argv is None else argv)[1:]
+    return next((token for token in tokens if not token.startswith("-")), None)
+
+
 def _should_auto_update(argv: list[str] | None = None) -> bool:
     """Return False for commands where a pre-parse update changes semantics.
 
@@ -3932,17 +3938,28 @@ def _should_auto_update(argv: list[str] | None = None) -> bool:
     like `clawjournal export --output ./selfupdate`.
     """
     tokens = (sys.argv if argv is None else argv)[1:]
-    if not tokens:
-        return True
-    for token in tokens:
-        if token.startswith("-"):
-            continue
-        return token != "selfupdate"
-    # All tokens were flags — no subcommand. Skip when any are help/version.
-    return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
+    command = _requested_subcommand(argv)
+    if command is None:
+        if not tokens:
+            return True
+        # All tokens were flags — no subcommand. Skip when any are help/version.
+        return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
+    return command != "selfupdate"
 
 
 def main() -> None:
+    # A workbench process must remember the revision its already-imported
+    # Python belongs to before the detached updater can fast-forward checkout.
+    daemon_startup_head: str | None = None
+    if _requested_subcommand() in {"serve", "desktop"}:
+        try:
+            from .selfupdate import _package_repo_root, _rev_parse
+            startup_repo = _package_repo_root()
+            if startup_repo is not None:
+                daemon_startup_head = _rev_parse(startup_repo, "HEAD")
+        except Exception:
+            pass
+
     # Fire the silent, throttled auto-update before any work. Returns
     # immediately on opt-out, non-git installs, or throttle hits.
     if _should_auto_update():
@@ -4858,6 +4875,7 @@ def main() -> None:
 
     if command == "desktop":
         from .desktop import run_desktop_command
+        args.daemon_startup_head = daemon_startup_head
         exit_code = run_desktop_command(args)
         if exit_code:
             raise SystemExit(exit_code)
@@ -4905,6 +4923,7 @@ def main() -> None:
             open_browser=open_browser,
             source_filter=args.source,
             remote=args.remote,
+            startup_head=daemon_startup_head,
         )
         return
 

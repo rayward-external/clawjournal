@@ -50,6 +50,17 @@ def test_no_restart_with_requests_in_flight(quiet_env):
     assert daemon._update_restart_due(quiet_env, OLD, now=1000.0, activity=busy) is None
 
 
+def test_no_restart_during_benchmark_generation(quiet_env):
+    """The restart must not terminate the expensive background worker."""
+    assert daemon._BENCHMARK_GEN_LOCK.acquire(blocking=False)
+    try:
+        assert daemon._update_restart_due(
+            quiet_env, OLD, now=1000.0, activity=IDLE
+        ) is None
+    finally:
+        daemon._BENCHMARK_GEN_LOCK.release()
+
+
 def test_no_restart_soon_after_a_mutation(quiet_env):
     recent = {"in_flight": 0, "last_mutation": 990.0}
     assert daemon._update_restart_due(quiet_env, OLD, now=1000.0, activity=recent) is None
@@ -96,3 +107,35 @@ def test_request_accounting_never_goes_negative(monkeypatch):
     monkeypatch.setattr(daemon, "_activity", {"in_flight": 0, "last_mutation": 0.0})
     daemon._note_request_end(None)  # e.g. a connection that never parsed
     assert daemon._snapshot_activity()["in_flight"] == 0
+
+
+def test_serve_captures_head_before_starting_auto_update(monkeypatch):
+    """A fast updater must not hide the old backend revision from the watcher."""
+    from clawjournal import cli, selfupdate
+
+    events: list[str] = []
+    captured: dict[str, object] = {}
+    repo = Path("/nonexistent-repo")
+
+    monkeypatch.setattr("sys.argv", ["clawjournal", "serve", "--no-browser"])
+    monkeypatch.setattr(selfupdate, "_package_repo_root", lambda: repo)
+
+    def read_head(_repo: Path, _rev: str) -> str:
+        events.append("head")
+        return OLD
+
+    monkeypatch.setattr(selfupdate, "_rev_parse", read_head)
+    monkeypatch.setattr(
+        selfupdate, "maybe_self_update", lambda: events.append("update")
+    )
+    monkeypatch.setattr(selfupdate, "pending_reinstall_notice", lambda: None)
+    monkeypatch.setattr("clawjournal.desktop.note_opened", lambda: None)
+    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda: None)
+    monkeypatch.setattr(
+        daemon, "run_server", lambda **kwargs: captured.update(kwargs)
+    )
+
+    cli.main()
+
+    assert events[:2] == ["head", "update"]
+    assert captured["startup_head"] == OLD

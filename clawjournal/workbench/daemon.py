@@ -5531,6 +5531,8 @@ def _update_restart_due(
     snap = activity if activity is not None else _snapshot_activity()
     if snap["in_flight"] > 0:
         return None
+    if _BENCHMARK_GEN_LOCK.locked():
+        return None  # never terminate the long-running, expensive worker
     t = time.time() if now is None else now
     if snap["last_mutation"] and t - snap["last_mutation"] < _RESTART_MUTATION_IDLE_SECONDS:
         return None
@@ -5729,6 +5731,7 @@ def run_server(
     source_filter: str | None = None,
     remote: bool = False,
     allow_port_fallback: bool = True,
+    startup_head: str | None = None,
 ) -> None:
     """Start the workbench daemon — scanner + HTTP server.
 
@@ -5737,7 +5740,8 @@ def run_server(
     desktop launcher passes False, because there a busy port almost always
     means our own daemon already won the race — silently starting a second one
     would put two scanners on the same SQLite index and strand the browser on
-    a port that won't be there next time.
+    a port that won't be there next time. ``startup_head`` is captured by the
+    CLI before its detached updater can move the checkout.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -5817,13 +5821,13 @@ def run_server(
         repo = selfupdate._package_repo_root()
         if repo is None:
             return  # wheel install — nothing to watch
-        startup_head = selfupdate._rev_parse(repo, "HEAD")
-        if not startup_head:
+        initial_head = startup_head or selfupdate._rev_parse(repo, "HEAD")
+        if not initial_head:
             return
         while True:
             time.sleep(_RESTART_POLL_SECONDS)
             try:
-                head = _update_restart_due(repo, startup_head)
+                head = _update_restart_due(repo, initial_head)
             except Exception:
                 logger.debug("update-restart check failed", exc_info=True)
                 continue
@@ -5832,7 +5836,7 @@ def run_server(
                 logger.info(
                     "ClawJournal updated (%s -> %s) — restarting the workbench "
                     "to serve the new version",
-                    startup_head[:7], head[:7],
+                    initial_head[:7], head[:7],
                 )
                 server.shutdown()
                 return

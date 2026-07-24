@@ -1101,7 +1101,7 @@ def _request_scan(port: int) -> None:
         pass
 
 
-def launch() -> None:
+def launch(*, startup_head: str | None = None) -> None:
     """Open the workbench and ensure a scan happens, reusing a live daemon."""
     # pythonw.exe gives Windows a true no-console launcher. Preserve diagnostics
     # by supplying streams before logging and the daemon are initialized.
@@ -1130,7 +1130,12 @@ def launch() -> None:
 
     ensure_pricing_fresh()
     try:
-        run_server(port=port, open_browser=True, allow_port_fallback=False)
+        run_server(
+            port=port,
+            open_browser=True,
+            allow_port_fallback=False,
+            startup_head=startup_head,
+        )
     except OSError as exc:
         # Another click won the race between the probe above and the bind.
         # Verify that the winner is ClawJournal before joining it; another
@@ -1226,7 +1231,7 @@ def run_desktop_command(args: Any) -> int:
             print(json.dumps(status(), indent=2))
             return 0
         if args.desktop_command == "launch":
-            launch()
+            launch(startup_head=getattr(args, "daemon_startup_head", None))
             return 0
     except DesktopError as exc:
         print(f"[x] {exc}", file=sys.stderr)
