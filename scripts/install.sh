@@ -46,7 +46,9 @@ SYNC_FROM=""
 SYNC_TO=""
 sync_checkout() {
   sc_repo="$1"
-  [ -d "$sc_repo/.git" ] || return 0
+  if ! git -C "$sc_repo" rev-parse --git-dir >/dev/null 2>&1; then
+    return 0
+  fi
   if [ -n "${CLAWJOURNAL_NO_AUTO_UPDATE:-}" ]; then
     # Set by `clawjournal selfupdate --reinstall`, which already synced.
     return 0
@@ -103,7 +105,7 @@ if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
 fi
 if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/pyproject.toml" ]; then
   TARGET="${CLAWJOURNAL_REPO:-$HOME/clawjournal}"
-  if [ ! -d "$TARGET/.git" ]; then
+  if ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
     echo "-> Cloning ClawJournal to $TARGET"
     git clone --quiet https://github.com/rayward-external/clawjournal.git "$TARGET"
   fi
