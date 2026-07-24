@@ -2064,14 +2064,10 @@ def test_enable_fails_fast_on_capabilities_before_the_strict_scan(
     assert scan_calls == []
 
 
-def test_scope_entries_are_the_full_source_project_cross_product(
+def test_scope_entries_are_only_observed_source_project_pairs(
     isolated_auto_upload,
 ):
-    """Certification must cover exactly what the candidate filter enforces
-    (source IN sources AND project IN projects): a later session in a NEW
-    combination of already-enrolled source and project must already be inside
-    the server-certified scope, so entries are the full cross product — not
-    just the pairs observed at enrollment time."""
+    """Certification must not invent cross-source project combinations."""
     config = _save_scope_config()
     config["source"] = "all"
     config_module.save_config(config)
@@ -2087,10 +2083,34 @@ def test_scope_entries_are_the_full_source_project_cross_product(
     assert scope["projects"] == ["alpha", "beta"]
     assert scope["entries"] == [
         ("claude", "alpha"),
-        ("claude", "beta"),
-        ("codex", "alpha"),
         ("codex", "beta"),
     ]
+    conn.close()
+
+
+def test_observed_pair_scope_avoids_false_cartesian_limit(
+    isolated_auto_upload,
+):
+    config = _save_scope_config()
+    config["source"] = "all"
+    config_module.save_config(config)
+    conn = open_index()
+    sessions = []
+    for index in range((auto.MAX_SCOPE_ENTRIES // 2) + 1):
+        session, _ = _session(
+            isolated_auto_upload["root"],
+            f"session-{index}",
+            project=f"project-{index}",
+        )
+        session["source"] = "claude" if index % 2 else "codex"
+        sessions.append(session)
+    assert upsert_sessions(conn, sessions) == len(sessions)
+
+    scope = auto._current_scope(conn, config_module.load_config())
+
+    assert len(scope["sources"]) * len(scope["projects"]) > auto.MAX_SCOPE_ENTRIES
+    assert len(scope["entries"]) == len(sessions)
+    assert "scope_too_large" not in scope["blockers"]
     conn.close()
 
 
@@ -3073,6 +3093,9 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
         assert enrollment["mode"] == "enabled"
         assert enrollment["server_enrollment_id"] == "server-enrollment-1"
         assert enrollment["hook_targets"] == ["claude"]
+        assert enrollment["enrolled_scope_entries"] == [
+            ("claude", "project-one")
+        ]
     finally:
         conn.close()
 

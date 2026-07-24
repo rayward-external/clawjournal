@@ -25,6 +25,7 @@ const exclusionLabels: Record<string, string> = {
   already_shared: 'Already shared',
   source_excluded: 'Outside enrolled sources',
   project_excluded: 'Outside enrolled projects',
+  scope_pair_excluded: 'Outside exact enrolled scope',
   missing_blob: 'Local trace unavailable',
   raw_source_unavailable: 'Original trace unavailable',
   scope_confirmation_changed: 'Scope confirmation changed',
@@ -403,7 +404,7 @@ function AuthorizationDialog({
         // exclusions, which have no controls here. Say what to do instead of
         // echoing the CLI-worded server message.
         setError(
-          'This scope has too many source and project combinations for the '
+          'This scope has too many exact source/project pairs for the '
           + 'hosted service. Exclude projects from sharing (clawjournal config '
           + '--exclude "<project>") or choose a single source, then try again.',
         );

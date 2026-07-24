@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from clawjournal.workbench.index import (
+    EXACT_SCOPE_PAIRS_SCHEMA_VERSION,
     RECURRING_PROTOCOL_V2_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
     already_shared_revision_blockers,
@@ -74,6 +75,7 @@ def _enroll(
     *,
     sources=("claude",),
     projects=("project-one",),
+    scope_entries=None,
 ):
     return save_auto_upload_enrollment(
         conn,
@@ -84,6 +86,7 @@ def _enroll(
         client_enrollment_id="client-enrollment-1",
         enrolled_sources=sources,
         enrolled_projects=projects,
+        enrolled_scope_entries=scope_entries,
         server_enrollment_id="server-enrollment-1",
         authorization_revision=1,
         recurring_authorization_version="recurring-v1",
@@ -105,7 +108,8 @@ def _mark_shared(conn, session_id: str) -> str:
 
 def test_fresh_schema_has_auto_upload_foundation(index_conn):
     assert index_conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
-    assert WORKBENCH_SCHEMA_VERSION == RECURRING_PROTOCOL_V2_SCHEMA_VERSION
+    assert WORKBENCH_SCHEMA_VERSION == EXACT_SCOPE_PAIRS_SCHEMA_VERSION
+    assert EXACT_SCOPE_PAIRS_SCHEMA_VERSION == 10
     assert RECURRING_PROTOCOL_V2_SCHEMA_VERSION == 9
 
     session_columns = {
@@ -139,6 +143,7 @@ def test_fresh_schema_has_auto_upload_foundation(index_conn):
         "codex_hook_observed_at",
         "ownership_certification_version",
         "server_scope_hash",
+        "enrolled_scope_entries_json",
     } <= enrollment_columns
     indexes = {
         row[1] for row in index_conn.execute("PRAGMA index_list(shares)")
@@ -241,7 +246,7 @@ def test_v7_migration_adds_recovery_metadata_once(tmp_path, monkeypatch):
     finally:
         conn.close()
 
-    # A second open is gated at v9 and must preserve the newly stored values.
+    # A second open is gated at v10 and must preserve the newly stored values.
     conn = open_index()
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
@@ -252,6 +257,55 @@ def test_v7_migration_adds_recovery_metadata_once(tmp_path, monkeypatch):
             "SELECT sealed_raw_fingerprints FROM shares WHERE share_id = ?",
             (share_id,),
         ).fetchone()[0] == fingerprints
+    finally:
+        conn.close()
+
+
+def test_v9_migration_preserves_existing_cross_product_scope(tmp_path, monkeypatch):
+    db_path = tmp_path / "index.db"
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", db_path)
+    monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+
+    conn = open_index()
+    _enroll(
+        conn,
+        sources=("claude", "codex"),
+        projects=("alpha", "beta"),
+    )
+    conn.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute(
+        "ALTER TABLE auto_upload_enrollment "
+        "DROP COLUMN enrolled_scope_entries_json"
+    )
+    raw.execute(f"PRAGMA user_version = {RECURRING_PROTOCOL_V2_SCHEMA_VERSION}")
+    raw.commit()
+    raw.close()
+
+    readonly = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+    readonly.row_factory = sqlite3.Row
+    try:
+        assert get_auto_upload_enrollment(readonly)["enrolled_scope_entries"] == [
+            ("claude", "alpha"),
+            ("claude", "beta"),
+            ("codex", "alpha"),
+            ("codex", "beta"),
+        ]
+    finally:
+        readonly.close()
+
+    conn = open_index()
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["enrolled_scope_entries"] == [
+            ("claude", "alpha"),
+            ("claude", "beta"),
+            ("codex", "alpha"),
+            ("codex", "beta"),
+        ]
     finally:
         conn.close()
 
@@ -290,9 +344,18 @@ def test_enrollment_helpers_canonicalize_scope_and_support_generation_cas(index_
         index_conn,
         sources=("codex", "claude", "codex"),
         projects=("project-two", "project-one", "project-one"),
+        scope_entries=(
+            ("codex", "project-two"),
+            ("claude", "project-one"),
+            ("codex", "project-two"),
+        ),
     )
     assert enrollment["enrolled_sources"] == ["claude", "codex"]
     assert enrollment["enrolled_projects"] == ["project-one", "project-two"]
+    assert enrollment["enrolled_scope_entries"] == [
+        ("claude", "project-one"),
+        ("codex", "project-two"),
+    ]
     assert enrollment["hook_targets"] == ["claude", "codex"]
     assert enrollment["revocation_pending"] is False
     assert index_conn.execute(
@@ -439,6 +502,7 @@ def test_candidate_report_explains_each_safety_exclusion(index_conn):
         "already_shared": 1,
         "source_excluded": 1,
         "project_excluded": 1,
+        "scope_pair_excluded": 0,
         "missing_blob": 1,
         "raw_source_unavailable": 1,
         "scope_confirmation_changed": 0,
@@ -485,6 +549,38 @@ def test_candidate_report_uses_cheap_blob_presence_not_full_parse(
 
     assert [row["session_id"] for row in report["selected"]] == ["eligible"]
     assert report["exclusion_counts"]["missing_blob"] == 0
+
+
+def test_candidate_report_rejects_unenrolled_source_project_combination(index_conn):
+    _enroll(
+        index_conn,
+        sources=("claude", "codex"),
+        projects=("alpha", "beta"),
+        scope_entries=(("claude", "alpha"), ("codex", "beta")),
+    )
+    upsert_sessions(
+        index_conn,
+        [
+            _session("authorized", source="claude", project="alpha"),
+            _session("cross-product-only", source="claude", project="beta"),
+        ],
+    )
+
+    report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("claude", "codex"),
+        current_projects=("alpha", "beta"),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"claude": "explicit_close", "codex": "stable_revision"},
+        now=NOW,
+    )
+
+    assert [row["session_id"] for row in report["selected"]] == ["authorized"]
+    assert report["exclusion_counts"]["scope_pair_excluded"] == 1
+    assert {
+        item["session_id"]: item["reason"] for item in report["exclusions"]
+    }["cross-product-only"] == "scope_pair_excluded"
 
 
 def test_candidate_excludes_any_previously_shared_exact_revision(index_conn):

@@ -457,7 +457,7 @@ describe('AutoUploadOffer', () => {
     }));
     vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(new ApiError(400, 'Scope too large', {
       code: 'scope_too_large',
-      message: 'The source x project scope exceeds the hosted limit of 200 entries; '
+      message: 'The exact source/project scope exceeds the hosted limit of 200 entries; '
         + 'exclude projects (config --exclude) or narrow the source scope first.',
       scope_blockers: ['scope_too_large'],
     }));
@@ -465,7 +465,7 @@ describe('AutoUploadOffer', () => {
     renderControl(<AutoUploadOffer manualReceiptId="receipt-oversized-scope" />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This scope has too many source and project combinations',
+      'This scope has too many exact source/project pairs',
     );
     expect(screen.queryByText('Choose what automatic uploads may include')).not.toBeInTheDocument();
   });
@@ -813,7 +813,11 @@ describe('AutoUploadPanel status and controls', () => {
       eligibility: {
         selected_count: 1,
         eligible_count: 3,
-        exclusion_counts: { held_or_embargoed: 2, source_excluded: 4 },
+        exclusion_counts: {
+          held_or_embargoed: 2,
+          source_excluded: 4,
+          scope_pair_excluded: 1,
+        },
       },
     }));
 
@@ -822,6 +826,7 @@ describe('AutoUploadPanel status and controls', () => {
     const reviewLink = await screen.findByRole('link', { name: 'Review 2 in Share' });
     expect(reviewLink).toHaveAttribute('href', '/share');
     expect(screen.getByText('Outside enrolled sources: 4')).toBeInTheDocument();
+    expect(screen.getByText('Outside exact enrolled scope: 1')).toBeInTheDocument();
   });
 
   it('requires an explicit retry for pending revocation and calls disable again', async () => {

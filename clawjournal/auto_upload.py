@@ -482,14 +482,15 @@ def _current_scope(
         and not session_matches_excluded_projects(row, excluded)
     ]
     projects = sorted({str(row["project"]) for row in scoped_rows if row.get("project")})
-    # Protocol v2 enrolls explicit (source, project) entries. Certify the FULL
-    # cross product of the confirmed sources and projects — exactly the scope
-    # the candidate filter enforces (source IN sources AND project IN
-    # projects) and exactly what the consent surfaces display as two lists.
-    # Enrolling only the currently-observed pairs would let a later session in
-    # a new combination of already-enrolled source and project egress outside
-    # the server-certified scope.
-    entries = sorted((source, project) for source in sources for project in projects)
+    # Protocol v2 enrolls explicit (source, project) entries. Keep only pairs
+    # actually observed inside the confirmed policy. The durable enrollment
+    # snapshot and candidate filter enforce these exact pairs, so a later new
+    # combination remains local until the user expands the authorization.
+    entries = sorted({
+        (str(row["source"]), str(row["project"]))
+        for row in scoped_rows
+        if row.get("source") and row.get("project")
+    })
     blockers: list[str] = []
     if len(entries) > MAX_SCOPE_ENTRIES:
         # The hosted service caps enrollment scope entries; surface it before
@@ -694,7 +695,7 @@ def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
         "pending_submission_state": None,
         "ui_visible": True,
         "offer_available": False,
-        "scope": {"sources": [], "projects": []},
+        "scope": {"sources": [], "projects": [], "entries": []},
         "cap": MAX_SESSIONS,
         "cadence_days": CADENCE_DAYS,
         "ai": {
@@ -804,6 +805,10 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             "scope": {
                 "sources": list(enrollment.get("enrolled_sources", [])) if enrollment else [],
                 "projects": list(enrollment.get("enrolled_projects", [])) if enrollment else [],
+                "entries": [
+                    list(entry)
+                    for entry in enrollment.get("enrolled_scope_entries", [])
+                ] if enrollment else [],
             },
             "cap": MAX_SESSIONS,
             "cadence_days": CADENCE_DAYS,
@@ -1068,6 +1073,7 @@ def _reconcile_explicit_pause_after_reauthorization(
     enrolled_at: datetime,
     enrolled_sources: Sequence[str],
     enrolled_projects: Sequence[str],
+    enrolled_scope_entries: Sequence[Sequence[str]],
     authorization_revision: int,
     authorization_version: str,
     retention_version: str,
@@ -1109,6 +1115,7 @@ def _reconcile_explicit_pause_after_reauthorization(
             client_enrollment_id=client_enrollment_id,
             enrolled_sources=enrolled_sources,
             enrolled_projects=enrolled_projects,
+            enrolled_scope_entries=enrolled_scope_entries,
             server_enrollment_id=server_enrollment_id,
             authorization_revision=authorization_revision,
             recurring_authorization_version=authorization_version,
@@ -1224,7 +1231,7 @@ def enable(
             first_blocker = scope["blockers"][0]
             if first_blocker == "scope_too_large":
                 message = (
-                    "The source x project scope exceeds the hosted limit of "
+                    "The exact source/project scope exceeds the hosted limit of "
                     f"{MAX_SCOPE_ENTRIES} entries; exclude projects "
                     "(config --exclude) or narrow the source scope first."
                 )
@@ -1455,6 +1462,7 @@ def enable(
                 client_enrollment_id=client_enrollment_id,
                 enrolled_sources=scope["sources"],
                 enrolled_projects=scope["projects"],
+                enrolled_scope_entries=scope["entries"],
                 server_enrollment_id=None,
                 authorization_revision=None,
                 recurring_authorization_version=str(expected_auth),
@@ -1475,6 +1483,7 @@ def enable(
                 client_enrollment_id=client_enrollment_id,
                 enrolled_sources=scope["sources"],
                 enrolled_projects=scope["projects"],
+                enrolled_scope_entries=scope["entries"],
                 recurring_authorization_version=str(expected_auth),
                 retention_version=str(expected_retention),
                 egress_profile_hash=profile,
@@ -1817,6 +1826,7 @@ def enable(
                     client_enrollment_id=client_enrollment_id,
                     enrolled_sources=scope["sources"],
                     enrolled_projects=scope["projects"],
+                    enrolled_scope_entries=scope["entries"],
                     server_enrollment_id=enrollment_id,
                     authorization_revision=authorization_revision,
                     recurring_authorization_version=str(expected_auth),
@@ -1873,6 +1883,7 @@ def enable(
                     enrolled_at=effective_enrolled_at,
                     enrolled_sources=scope["sources"],
                     enrolled_projects=scope["projects"],
+                    enrolled_scope_entries=scope["entries"],
                     authorization_revision=int(response["authorization_revision"]),
                     authorization_version=str(expected_auth),
                     retention_version=str(expected_retention),
@@ -2736,6 +2747,10 @@ def _assert_control_state(
             set(current_scope["sources"])
         ) or not set(enrollment["enrolled_projects"]).issubset(
             set(current_scope["projects"])
+        ) or not {
+            tuple(entry) for entry in enrollment["enrolled_scope_entries"]
+        }.issubset(
+            set(current_scope["entries"])
         ):
             raise ControlChanged("The confirmed source/project scope changed during the run.")
         current_profile = egress_profile_hash(
