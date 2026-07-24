@@ -5591,6 +5591,8 @@ def _update_restart_due(
     head = selfupdate._rev_parse(repo, "HEAD")
     if not head or head == startup_head:
         return None
+    if selfupdate.reinstall_in_progress():
+        return None  # HEAD may have moved before the pending record was written
     if selfupdate.reinstall_needed(repo):
         return None  # wait for the background reinstall to finish the job
     snap = activity if activity is not None else _snapshot_activity()

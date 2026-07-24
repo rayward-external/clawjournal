@@ -19,6 +19,9 @@ def quiet_env(monkeypatch):
     """No --reload supervisor, HEAD moved, install fully reconciled."""
     monkeypatch.delenv(daemon.RELOAD_CHILD_ENV, raising=False)
     monkeypatch.setattr("clawjournal.selfupdate._rev_parse", lambda repo, rev: NEW)
+    monkeypatch.setattr(
+        "clawjournal.selfupdate.reinstall_in_progress", lambda: False
+    )
     monkeypatch.setattr("clawjournal.selfupdate.reinstall_needed", lambda repo: False)
     return Path("/nonexistent-repo")
 
@@ -43,6 +46,18 @@ def test_no_restart_while_install_is_not_reconciled(quiet_env, monkeypatch):
     """A half-done update (pending reinstall, stale build) must not be served."""
     monkeypatch.setattr("clawjournal.selfupdate.reinstall_needed", lambda repo: True)
     assert daemon._update_restart_due(quiet_env, OLD, now=1000.0, activity=IDLE) is None
+
+
+def test_no_restart_while_installer_owns_critical_section(
+    quiet_env, monkeypatch
+):
+    """HEAD can move just before the updater persists its pending record."""
+    monkeypatch.setattr(
+        "clawjournal.selfupdate.reinstall_in_progress", lambda: True
+    )
+    assert daemon._update_restart_due(
+        quiet_env, OLD, now=1000.0, activity=IDLE
+    ) is None
 
 
 def test_no_restart_with_requests_in_flight(quiet_env):

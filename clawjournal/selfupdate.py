@@ -652,6 +652,21 @@ def _release_reinstall_lock() -> None:
         _release_advisory_lock(fd)
 
 
+def reinstall_in_progress() -> bool:
+    """Return whether any process currently owns the install critical section."""
+    with _reinstall_lock_guard:
+        if _reinstall_lock_fd is not None:
+            return True
+        # Probe the same kernel lock used by automatic and direct installers. A
+        # successful temporary claim proves the section is idle; release it
+        # immediately without publishing it as this process's owned lock.
+        fd = _acquire_advisory_lock(_reinstall_lock_path())
+        if fd is None:
+            return True
+        _release_advisory_lock(fd)
+        return False
+
+
 def _terminate_installer_tree(
     process: subprocess.Popen[bytes],
     *,

@@ -1285,6 +1285,16 @@ def test_reinstall_lock_has_one_winner_under_contention(isolated_config_dir):
     assert results.count(False) == 15
 
 
+def test_reinstall_in_progress_probes_the_shared_lock(isolated_config_dir):
+    assert selfupdate.reinstall_in_progress() is False
+    assert selfupdate._claim_reinstall_lock() is True
+    try:
+        assert selfupdate.reinstall_in_progress() is True
+    finally:
+        selfupdate._release_reinstall_lock()
+    assert selfupdate.reinstall_in_progress() is False
+
+
 def test_reinstall_without_installer_script_reports_cleanly(
     isolated_config_dir, fake_repo
 ):
