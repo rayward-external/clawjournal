@@ -29,8 +29,8 @@ export function DoneStep(p: DoneStepProps) {
       id: i,
       wave: Math.floor(i / piecesPerWave),
       left: 3 + Math.random() * 94,
-      dx: (Math.random() - 0.5) * 24,
-      dy: 105 + Math.random() * 20,
+      dx: (Math.random() - 0.5) * 180,
+      dy: 360 + Math.random() * 300,
       staticY: 28 + Math.random() * 150,
       r: (Math.random() > 0.5 ? 1 : -1) * (540 + Math.random() * 720),
       width: 5 + Math.random() * 5,
@@ -60,52 +60,55 @@ export function DoneStep(p: DoneStepProps) {
   ];
 
   return (
-    <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
+    <div
+      data-testid="share-done-shell"
+      style={{ position: 'relative', padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}
+    >
       {p.globalStyles}
       {p.stepperHeader}
-      <div style={{ position: 'relative', padding: '56px 24px 24px', maxWidth: 680, margin: '0 auto', textAlign: 'center' }}>
-        {submitted && (
-          <>
-            {SUCCESS_WAVE_DELAYS.map((delay) => (
-              <div
-                key={delay}
-                aria-hidden="true"
-                className="claw-success-flash"
+      {submitted && (
+        <>
+          {SUCCESS_WAVE_DELAYS.map((delay) => (
+            <div
+              key={delay}
+              aria-hidden="true"
+              className="claw-success-flash"
+              style={{
+                position: 'absolute', top: -36, left: '5%', right: '5%', height: 96,
+                zIndex: 1, pointerEvents: 'none', borderRadius: 48,
+                background: 'rgba(212, 171, 115, .18)', filter: 'blur(18px)',
+                opacity: 0,
+                ['--flash-delay' as string]: `${delay}ms`,
+              } as React.CSSProperties}
+            />
+          ))}
+          <div
+            aria-hidden="true"
+            className="claw-success-confetti"
+            data-testid="success-confetti"
+            style={{ position: 'absolute', inset: 0, zIndex: 2, pointerEvents: 'none', overflow: 'hidden' }}
+          >
+            {confettiPieces.map((c) => (
+              <span
+                key={c.id}
+                className={c.wave > 0 ? 'claw-confetti-later' : undefined}
                 style={{
-                  position: 'fixed', top: -36, left: '8vw', right: '8vw', height: 96,
-                  zIndex: 99, pointerEvents: 'none', borderRadius: 48,
-                  background: 'rgba(212, 171, 115, .18)', filter: 'blur(18px)',
-                  opacity: 0,
-                  ['--flash-delay' as string]: `${delay}ms`,
+                  position: 'absolute', top: -20, left: `${c.left}%`,
+                  width: c.width, height: c.height, borderRadius: c.id % 4 === 0 ? '50%' : 1,
+                  background: c.color, opacity: 0,
+                  ['--cdx' as string]: `${c.dx}px`,
+                  ['--cdy' as string]: `${c.dy}px`,
+                  ['--cstatic-y' as string]: `${c.staticY}px`,
+                  ['--cr' as string]: `${c.r}deg`,
+                  ['--cduration' as string]: `${c.duration}ms`,
+                  ['--cdelay' as string]: `${c.delay}ms`,
                 } as React.CSSProperties}
               />
             ))}
-            <div
-              aria-hidden="true"
-              className="claw-success-confetti"
-              data-testid="success-confetti"
-              style={{ position: 'fixed', inset: 0, zIndex: 100, pointerEvents: 'none', overflow: 'hidden' }}
-            >
-              {confettiPieces.map((c) => (
-                <span
-                  key={c.id}
-                  className={c.wave > 0 ? 'claw-confetti-later' : undefined}
-                  style={{
-                    position: 'absolute', top: -20, left: `${c.left}%`,
-                    width: c.width, height: c.height, borderRadius: c.id % 4 === 0 ? '50%' : 1,
-                    background: c.color, opacity: 0,
-                    ['--cdx' as string]: `${c.dx}vw`,
-                    ['--cdy' as string]: `${c.dy}vh`,
-                    ['--cstatic-y' as string]: `${c.staticY}px`,
-                    ['--cr' as string]: `${c.r}deg`,
-                    ['--cduration' as string]: `${c.duration}ms`,
-                    ['--cdelay' as string]: `${c.delay}ms`,
-                  } as React.CSSProperties}
-                />
-              ))}
-            </div>
-          </>
-        )}
+          </div>
+        </>
+      )}
+      <div style={{ position: 'relative', padding: '56px 24px 24px', maxWidth: 680, margin: '0 auto', textAlign: 'center' }}>
 
         <div style={{
           width: 72, height: 72, margin: '0 auto 24px',

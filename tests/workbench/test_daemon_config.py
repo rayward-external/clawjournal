@@ -85,6 +85,38 @@ class TestGetConfig:
             assert secret not in body
 
 
+class TestProjects:
+    def test_marks_projects_excluded_by_effective_share_policy(self, api):
+        save_config({"excluded_projects": ["claude:private-project"]})
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [
+                {
+                    "session_id": "public-session",
+                    "project": "claude:public-project",
+                    "source": "claude",
+                    "messages": [{"role": "user", "content": "public"}],
+                    "stats": {"input_tokens": 10, "output_tokens": 5},
+                },
+                {
+                    "session_id": "private-session",
+                    "project": "claude:private-project",
+                    "source": "claude",
+                    "messages": [{"role": "user", "content": "private"}],
+                    "stats": {"input_tokens": 10, "output_tokens": 5},
+                },
+            ])
+        finally:
+            conn.close()
+
+        status, body = _get(api, "/api/projects")
+
+        assert status == 200
+        projects = {row["project"]: row for row in body}
+        assert projects["claude:public-project"]["excluded"] is False
+        assert projects["claude:private-project"]["excluded"] is True
+
+
 class TestUpdateConfig:
     def test_source_persisted(self, api):
         status, body = _post(api, "/api/config", {"source": "all"})

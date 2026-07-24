@@ -3954,7 +3954,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "SUM(input_tokens + output_tokens) as total_tokens "
                 "FROM sessions GROUP BY project, source ORDER BY project"
             ).fetchall()
-            _json_response(self, [dict(r) for r in rows])
+            settings = get_effective_share_settings(conn, load_config())
+            excluded_projects = settings["excluded_projects"]
+            projects = []
+            for row in rows:
+                project = dict(row)
+                project["excluded"] = session_matches_excluded_projects(
+                    project,
+                    excluded_projects,
+                )
+                projects.append(project)
+            _json_response(self, projects)
         finally:
             conn.close()
 
@@ -4066,8 +4076,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         from ..cli import EXPLICIT_SOURCE_CHOICES
         from ..scoring.scoring import SUPPORTED_SCORING_BACKENDS
         config = load_config()
-        # 'both' is deprecated and hidden from the picker, but surface it if it is
-        # the currently-stored value so the select shows the real value rather
+        # 'both' is hidden from the manual picker ('claude' + 'codex' cover it
+        # more explicitly), but the Auto Upload guided scope setup writes it as
+        # the recurring claude+codex pair — so surface it whenever it is the
+        # currently-stored value, keeping the select on the real value rather
         # than a misleading "Select a source…" placeholder.
         stored_source = config.get("source")
         source_choices = sorted(

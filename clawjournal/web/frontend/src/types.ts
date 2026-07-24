@@ -323,6 +323,8 @@ export interface ProjectSummary {
   source: string;
   session_count: number;
   total_tokens: number;
+  /** Whether the effective share policy excludes this project. */
+  excluded?: boolean;
 }
 
 export type ReviewStatus = 'new' | 'shortlisted' | 'approved' | 'blocked';  // shortlisted kept for DB compat

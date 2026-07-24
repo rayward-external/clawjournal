@@ -25,18 +25,30 @@ function props(receiptId: string | null): DoneStepProps {
 }
 
 describe('DoneStep success celebration', () => {
-  it('showers viewport confetti after a hosted submission succeeds', () => {
+  it('showers main-content confetti after a hosted submission succeeds', () => {
     render(<DoneStep {...props('receipt-123')} />);
 
+    const shell = screen.getByTestId('share-done-shell');
     const confetti = screen.getByTestId('success-confetti');
+    const flashes = shell.querySelectorAll('.claw-success-flash');
+    expect(shell).toHaveStyle({ position: 'relative' });
+    expect(flashes).toHaveLength(3);
+    flashes.forEach((flash) => {
+      expect(flash.parentElement).toBe(shell);
+      expect(flash).toHaveStyle({ position: 'absolute' });
+    });
+    expect(confetti.parentElement).toBe(shell);
     expect(confetti).toHaveAttribute('aria-hidden', 'true');
     expect(confetti).toHaveStyle({
-      position: 'fixed',
+      position: 'absolute',
       inset: '0',
       overflow: 'hidden',
     });
     expect(confetti.querySelectorAll('span')).toHaveLength(144);
     expect(confetti.querySelectorAll('.claw-confetti-later')).toHaveLength(96);
+    const firstPiece = confetti.querySelector('span') as HTMLElement;
+    expect(firstPiece.style.getPropertyValue('--cdx')).toMatch(/px$/);
+    expect(firstPiece.style.getPropertyValue('--cdy')).toMatch(/px$/);
   });
 
   it('does not celebrate a bundle that stayed local', () => {

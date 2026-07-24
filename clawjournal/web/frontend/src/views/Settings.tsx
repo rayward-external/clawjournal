@@ -138,7 +138,7 @@ export function Settings() {
         </label>
       </div>
 
-      <AutoUploadPanel />
+      <AutoUploadPanel onConfigUpdated={setCfg} />
 
       {/* Advanced — scoring + UI toggles most users never change. Collapsed by
           default so the page leads with the export-gate essentials above. */}
