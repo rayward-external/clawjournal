@@ -1058,7 +1058,7 @@ def test_finalize_install_preserves_unrequested_optional_reasons(
     isolated_config_dir, fake_repo
 ):
     selfupdate.record_pending_reinstall(
-        "a" * 40, "b" * 40, ["deps", "frontend", "scanners"]
+        "a" * 40, _head(fake_repo), ["deps", "frontend", "scanners"]
     )
 
     result = selfupdate.finalize_install(repo=fake_repo)
@@ -1069,6 +1069,68 @@ def test_finalize_install_preserves_unrequested_optional_reasons(
         "frontend",
         "scanners",
     ]
+
+
+def test_finalize_install_keeps_pending_work_on_an_older_branch(
+    isolated_config_dir, fake_repo
+):
+    """Installing a branch without main's target cannot clear pending work."""
+    bin_dir = isolated_config_dir / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "betterleaks").write_text("")
+    (bin_dir / "trufflehog").write_text("")
+    old_sha = _head(fake_repo)
+    pending_sha = _commit_file(
+        fake_repo,
+        "pyproject.toml",
+        "[project]\ndependencies = ['new-package']\n",
+        "add dependency",
+    )
+    selfupdate.record_pending_reinstall(
+        old_sha,
+        pending_sha,
+        ["deps", "scanners", "unknown"],
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(fake_repo),
+            "checkout",
+            "--quiet",
+            "-b",
+            "older",
+            old_sha,
+        ],
+        check=True,
+    )
+
+    result = selfupdate.finalize_install(
+        repo=fake_repo,
+        scanners_installed=True,
+        clear_unknown=True,
+    )
+
+    assert result["checkout_current"] is False
+    assert result["remaining"] == ["deps", "scanners", "unknown"]
+    assert selfupdate.read_pending_reinstall()["reasons"] == [
+        "deps",
+        "scanners",
+        "unknown",
+    ]
+
+    subprocess.run(
+        ["git", "-C", str(fake_repo), "checkout", "--quiet", "main"],
+        check=True,
+    )
+    result = selfupdate.finalize_install(
+        repo=fake_repo,
+        scanners_installed=True,
+        clear_unknown=True,
+    )
+    assert result["checkout_current"] is True
+    assert result["remaining"] == []
+    assert selfupdate.read_pending_reinstall() is None
 
 
 def test_frontend_deletion_stays_pending_until_new_revision_is_built(
@@ -1137,7 +1199,7 @@ def test_direct_sync_records_optional_changes_before_finalization(
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_runs_installer_and_clears_notice(isolated_config_dir, fake_repo):
     marker = _make_installer(fake_repo)
-    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
+    selfupdate.record_pending_reinstall("a" * 40, _head(fake_repo), ["deps"])
 
     result = selfupdate.reinstall(repo=fake_repo, capture=True)
 
@@ -1251,7 +1313,9 @@ def test_reinstall_partial_when_workbench_build_is_still_stale(
     now = time.time()
     os.utime(html, (now - 100, now - 100))
     os.utime(newer, (now, now))
-    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps", "frontend"])
+    selfupdate.record_pending_reinstall(
+        "a" * 40, _head(fake_repo), ["deps", "frontend"]
+    )
 
     result = selfupdate.reinstall(repo=fake_repo, capture=True)
 

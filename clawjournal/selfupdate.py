@@ -559,6 +559,16 @@ def _managed_scanners_installed() -> bool:
     return betterleaks and trufflehog
 
 
+def _checkout_covers_revision(repo: Path, revision: str) -> bool:
+    """Return whether the installed checkout contains ``revision``."""
+    head = _rev_parse(repo, "HEAD") or ""
+    if not head or not revision:
+        return False
+    if head == revision:
+        return True
+    return _is_ancestor(repo, revision, head) is True
+
+
 def _installer_command(
     repo: Path,
     *,
@@ -610,8 +620,10 @@ def finalize_install(
     Both platform installers call this after first recording any checkout range
     they synchronized and then completing pip. Frontend failures are
     intentionally non-fatal in those scripts, so a requested workbench is
-    cleared only when the built index exists and is current. Scanner reasons
-    are cleared only after both managed binaries exist.
+    cleared only when the built index exists and is current. Dependency,
+    scanner, and unknown reasons are retired only when this checkout contains
+    the pending target revision, so installing an older branch cannot erase
+    work that still belongs to main.
     """
     target = repo or _package_repo_root()
     if target is None:
@@ -620,11 +632,21 @@ def finalize_install(
     record = read_pending_reinstall() or {}
     raw_reasons = record.get("reasons")
     remaining = set(raw_reasons) if isinstance(raw_reasons, list) else set()
-    remaining.discard("deps")
+    pending_revision = str(record.get("to") or "")
+    checkout_current = (
+        not remaining
+        or _checkout_covers_revision(target, pending_revision)
+    )
+    if checkout_current:
+        remaining.discard("deps")
 
     frontend_current = _frontend_is_built(target) and not _frontend_stale(target)
     if frontend_requested:
-        required_revision = str(record.get("to") or _rev_parse(target, "HEAD") or "")
+        required_revision = (
+            pending_revision
+            if "frontend" in remaining
+            else (_rev_parse(target, "HEAD") or "")
+        )
         frontend_current = (
             frontend_current
             and bool(required_revision)
@@ -641,13 +663,15 @@ def finalize_install(
 
     scanners_current = _managed_scanners_installed()
     if scanners_installed:
-        if scanners_current:
+        scanner_revision_current = "scanners" not in remaining or checkout_current
+        if scanners_current and scanner_revision_current:
             remaining.discard("scanners")
         else:
             remaining.add("scanners")
 
     if clear_unknown and (
-        (not frontend_requested or frontend_current)
+        checkout_current
+        and (not frontend_requested or frontend_current)
         and (not scanners_installed or scanners_current)
     ):
         remaining.discard("unknown")
@@ -656,6 +680,7 @@ def finalize_install(
     return {
         "status": "finalized" if not remaining else "finalized-partial",
         "remaining": sorted(remaining),
+        "checkout_current": checkout_current,
         "frontend_current": frontend_current,
         "scanners_current": scanners_current,
     }
