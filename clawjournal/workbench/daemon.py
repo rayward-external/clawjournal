@@ -60,6 +60,7 @@ from .findings_pipeline import (
     drain_findings_backfill,
     run_findings_pipeline,
 )
+from .frontend_snapshot import DEFAULT_FRONTEND_DIST, FrontendSnapshot
 from .index import (
     add_policy,
     already_shared_revision_blockers,
@@ -338,7 +339,7 @@ WORKBENCH_SOURCES = {
 }
 
 # Path to the built frontend dist directory.
-FRONTEND_DIST = Path(__file__).resolve().parent.parent / "web" / "frontend" / "dist"
+FRONTEND_DIST = DEFAULT_FRONTEND_DIST
 _FRONTEND_BUILD_INPUT_DIRS = ("src", "public")
 _FRONTEND_BUILD_INPUT_FILES = (
     "index.html",
@@ -5215,18 +5216,38 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if path == "/" or path == "":
             path = "/index.html"
 
-        file_path = (FRONTEND_DIST / path.lstrip("/")).resolve()
+        relative_path = path.lstrip("/")
+        file_path = (FRONTEND_DIST / relative_path).resolve()
         if not file_path.is_relative_to(FRONTEND_DIST.resolve()):
             self.send_error(403)
             return
 
-        # SPA fallback: if file doesn't exist, serve index.html
-        if not file_path.exists() or not file_path.is_file():
-            file_path = FRONTEND_DIST / "index.html"
-
-        if not file_path.exists():
-            # No frontend built yet — serve a placeholder
-            self._serve_placeholder()
+        snapshot: FrontendSnapshot | None = getattr(
+            self.server, "_frontend_snapshot", None
+        )
+        served_path = relative_path
+        try:
+            if snapshot is not None:
+                data = snapshot.read(served_path)
+                if data is None:
+                    served_path = "index.html"
+                    data = snapshot.read(served_path)
+                if data is None:
+                    self._serve_placeholder()
+                    return
+            else:
+                # Direct run_server callers and development tests retain the
+                # historical disk-backed behavior. The CLI supplies an
+                # immutable startup snapshot before its updater can touch dist.
+                if not file_path.exists() or not file_path.is_file():
+                    file_path = FRONTEND_DIST / "index.html"
+                if not file_path.exists():
+                    self._serve_placeholder()
+                    return
+                served_path = file_path.name
+                data = file_path.read_bytes()
+        except OSError:
+            self.send_error(404)
             return
 
         content_types = {
@@ -5241,11 +5262,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             ".woff": "font/woff",
             ".map": "application/json",
         }
-        ext = file_path.suffix.lower()
+        ext = Path(served_path).suffix.lower()
         content_type = content_types.get(ext, "application/octet-stream")
 
         try:
-            data = file_path.read_bytes()
             if content_type == "text/html":
                 data = self._inject_api_token(data)
             self.send_response(200)
@@ -5477,14 +5497,14 @@ def _newest_frontend_build_input_mtime(frontend_root: Path) -> float:
 #
 # The background auto-update (clawjournal/selfupdate.py) fast-forwards the
 # checkout and reruns the installer, but a running daemon keeps executing the
-# Python it imported at startup — the *frontend* refreshes on the next browser
-# reload (dist/ is read off disk per request, index.html is no-store), while
-# the *backend* would stay old forever. So the daemon watches its own
-# checkout: when HEAD has moved AND the install is fully reconciled (no
-# pending reinstall, workbench build current), it re-execs itself at a quiet
-# moment. Restarting is equivalent to the user's Ctrl-C + rerun, which the
-# daemon already supports; the SQLite index and the upload ledger are built
-# to survive it.
+# Python it imported at startup. The CLI pins an immutable frontend snapshot
+# before starting that updater, so the old process continues serving one
+# compatible frontend/backend pair while ``dist/`` is rebuilt. When HEAD has
+# moved AND the install is fully reconciled (no pending reinstall, workbench
+# build current), the daemon re-execs itself at a quiet moment and the new
+# process captures the new pair together. Restarting is equivalent to the
+# user's Ctrl-C + rerun, which the daemon already supports; the SQLite index
+# and the upload ledger are built to survive it.
 
 RESTART_CHILD_ENV = "CLAWJOURNAL_RESTART_CHILD"  # set on the re-exec'd process: don't reopen the browser
 _RESTART_POLL_SECONDS = 60.0
@@ -5766,7 +5786,11 @@ def run_with_reload(open_browser: bool = True) -> None:
         _terminate_child(proc)
 
 
-def _try_serve_ipv6_loopback(port: int, scanner: "Scanner") -> ThreadingHTTPServer | None:
+def _try_serve_ipv6_loopback(
+    port: int,
+    scanner: "Scanner",
+    frontend_snapshot: FrontendSnapshot | None = None,
+) -> ThreadingHTTPServer | None:
     """Start a companion IPv6 (``::1``) loopback server on ``port``, serving in a
     daemon thread with the same handler/scanner as the primary IPv4 server.
 
@@ -5788,6 +5812,7 @@ def _try_serve_ipv6_loopback(port: int, scanner: "Scanner") -> ThreadingHTTPServ
         )
         return None
     v6._scanner = scanner  # type: ignore[attr-defined]
+    v6._frontend_snapshot = frontend_snapshot  # type: ignore[attr-defined]
     threading.Thread(target=v6.serve_forever, daemon=True).start()
     return v6
 
@@ -5799,6 +5824,7 @@ def run_server(
     remote: bool = False,
     allow_port_fallback: bool = True,
     startup_head: str | None = None,
+    frontend_snapshot: FrontendSnapshot | None = None,
 ) -> None:
     """Start the workbench daemon — scanner + HTTP server.
 
@@ -5807,8 +5833,9 @@ def run_server(
     desktop launcher passes False, because there a busy port almost always
     means our own daemon already won the race — silently starting a second one
     would put two scanners on the same SQLite index and strand the browser on
-    a port that won't be there next time. ``startup_head`` is captured by the
-    CLI before its detached updater can move the checkout.
+    a port that won't be there next time. ``startup_head`` and
+    ``frontend_snapshot`` are captured by the CLI before its detached updater
+    can move the checkout or rebuild the workbench.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -5829,13 +5856,14 @@ def run_server(
         server = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]
+    server._frontend_snapshot = frontend_snapshot  # type: ignore[attr-defined]
 
     # Companion IPv6 loopback socket on the same port. Browsers resolve
     # `localhost` to ::1 (IPv6) first and don't all fall back to IPv4, so an
     # IPv4-only daemon leaves the workbench unreachable via localhost on
     # IPv6-preferring systems. Each family is its own ::1 / 127.0.0.1 loopback
     # socket — nothing is exposed beyond the local host.
-    v6_server = _try_serve_ipv6_loopback(port, scanner)
+    v6_server = _try_serve_ipv6_loopback(port, scanner, frontend_snapshot)
 
     url = f"http://localhost:{port}/"
     logger.info("Workbench running at %s", url)
@@ -5881,8 +5909,8 @@ def run_server(
 
     # Watch the editable checkout: once the background auto-update has both
     # moved HEAD and reconciled the install, restart at a quiet moment so the
-    # backend serves the new version too (the frontend already refreshes per
-    # request). No-op for wheel installs and under the --reload supervisor.
+    # new frontend/backend pair becomes visible together. No-op for wheel
+    # installs and under the --reload supervisor.
     restart_to: dict[str, str | None] = {"head": None}
 
     def _watch_for_update() -> None:

@@ -4002,14 +4002,22 @@ def _should_auto_update(argv: list[str] | None = None) -> bool:
 
 def main() -> None:
     # A workbench process must remember the revision its already-imported
-    # Python belongs to before the detached updater can fast-forward checkout.
+    # Python belongs to and pin its matching frontend before the detached
+    # updater can fast-forward the checkout or rebuild dist/.
     daemon_startup_head: str | None = None
+    daemon_frontend_snapshot: Any = None
     if _requested_subcommand() in {"serve", "desktop"}:
         try:
             from .selfupdate import _package_repo_root, _rev_parse
+            from .workbench.frontend_snapshot import capture_frontend_snapshot
+
             startup_repo = _package_repo_root()
             if startup_repo is not None:
                 daemon_startup_head = _rev_parse(startup_repo, "HEAD")
+            if "--reload" not in sys.argv:
+                daemon_frontend_snapshot = capture_frontend_snapshot(
+                    revision=daemon_startup_head
+                )
         except Exception:
             pass
 
@@ -4929,6 +4937,7 @@ def main() -> None:
     if command == "desktop":
         from .desktop import run_desktop_command
         args.daemon_startup_head = daemon_startup_head
+        args.daemon_frontend_snapshot = daemon_frontend_snapshot
         exit_code = run_desktop_command(args)
         if exit_code:
             raise SystemExit(exit_code)
@@ -4977,6 +4986,7 @@ def main() -> None:
             source_filter=args.source,
             remote=args.remote,
             startup_head=daemon_startup_head,
+            frontend_snapshot=daemon_frontend_snapshot,
         )
         return
 

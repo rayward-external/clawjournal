@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from clawjournal.workbench import daemon
+from clawjournal.workbench.frontend_snapshot import capture_frontend_snapshot
 
 
 OLD = "a" * 40
@@ -30,6 +31,33 @@ def test_restarts_when_updated_reconciled_and_idle(quiet_env):
     assert daemon._update_restart_due(
         quiet_env, OLD, now=1000.0, activity=IDLE
     ) == NEW
+
+
+def test_frontend_snapshot_stays_on_the_startup_build(tmp_path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<script src="/assets/app-old.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "app-old.js").write_bytes(b"old frontend")
+
+    snapshot = capture_frontend_snapshot(dist, revision=OLD)
+
+    (dist / "index.html").write_text(
+        '<script src="/assets/app-new.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "app-old.js").unlink()
+    (assets / "app-new.js").write_bytes(b"new frontend")
+
+    assert snapshot.revision == OLD
+    assert snapshot.read("index.html") == (
+        b'<script src="/assets/app-old.js"></script>'
+    )
+    assert snapshot.read("/assets/app-old.js") == b"old frontend"
+    assert snapshot.read("/assets/app-new.js") is None
 
 
 def test_no_restart_when_head_unchanged(quiet_env, monkeypatch):
@@ -208,10 +236,12 @@ def test_request_accounting_never_goes_negative(monkeypatch):
 def test_serve_captures_head_before_starting_auto_update(monkeypatch):
     """A fast updater must not hide the old backend revision from the watcher."""
     from clawjournal import cli, selfupdate
+    from clawjournal.workbench import frontend_snapshot
 
     events: list[str] = []
     captured: dict[str, object] = {}
     repo = Path("/nonexistent-repo")
+    snapshot = object()
 
     monkeypatch.setattr(
         "sys.argv",
@@ -225,6 +255,11 @@ def test_serve_captures_head_before_starting_auto_update(monkeypatch):
 
     monkeypatch.setattr(selfupdate, "_rev_parse", read_head)
     monkeypatch.setattr(
+        frontend_snapshot,
+        "capture_frontend_snapshot",
+        lambda **kwargs: events.append("frontend") or snapshot,
+    )
+    monkeypatch.setattr(
         selfupdate, "maybe_self_update", lambda: events.append("update")
     )
     monkeypatch.setattr(selfupdate, "pending_reinstall_notice", lambda: None)
@@ -236,5 +271,6 @@ def test_serve_captures_head_before_starting_auto_update(monkeypatch):
 
     cli.main()
 
-    assert events[:2] == ["head", "update"]
+    assert events[:3] == ["head", "frontend", "update"]
     assert captured["startup_head"] == OLD
+    assert captured["frontend_snapshot"] is snapshot

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_posix_installer_supports_managed_sharing_dependencies():
-    script = (ROOT / "scripts" / "install.sh").read_text()
+    script = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
 
     assert "--with-sharing" in script
     assert "run_clawjournal betterleaks install" in script
@@ -35,8 +35,11 @@ def test_posix_installer_supports_managed_sharing_dependencies():
     assert script.index("record_install_sync") < script.index("pip install")
     assert "--clear-pending" not in script
 
+    shell = shutil.which("sh")
+    if shell is None:
+        return
     help_result = subprocess.run(
-        ["sh", str(ROOT / "scripts" / "install.sh"), "--help"],
+        [shell, str(ROOT / "scripts" / "install.sh"), "--help"],
         check=False,
         capture_output=True,
         text=True,
@@ -46,7 +49,7 @@ def test_posix_installer_supports_managed_sharing_dependencies():
 
 
 def test_powershell_installer_supports_managed_sharing_dependencies():
-    script = (ROOT / "scripts" / "install.ps1").read_text()
+    script = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
 
     assert "[switch]$WithSharing" in script
     assert "Invoke-ClawJournal betterleaks install" in script
