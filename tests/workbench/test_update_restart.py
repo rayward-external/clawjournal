@@ -61,6 +61,39 @@ def test_no_restart_during_benchmark_generation(quiet_env):
         daemon._BENCHMARK_GEN_LOCK.release()
 
 
+def test_no_restart_during_scoring_or_auto_upload(quiet_env, monkeypatch):
+    """All expensive daemon workers must finish before a re-exec."""
+
+    class ActiveThread:
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+    scanner = daemon.Scanner()
+    scanner._score_thread = ActiveThread()  # type: ignore[assignment]
+    assert daemon._update_restart_due(
+        quiet_env, OLD, now=1000.0, activity=IDLE, scanner=scanner
+    ) is None
+
+    scanner._score_thread = None
+    monkeypatch.setattr(daemon, "_auto_upload_run_thread", ActiveThread())
+    assert daemon._update_restart_due(
+        quiet_env, OLD, now=1000.0, activity=IDLE, scanner=scanner
+    ) is None
+
+
+def test_no_restart_during_background_scan(quiet_env):
+    """Do not interrupt a scan while it may be writing the SQLite index."""
+    scanner = daemon.Scanner()
+    assert scanner._scan_lock.acquire(blocking=False)
+    try:
+        assert daemon._update_restart_due(
+            quiet_env, OLD, now=1000.0, activity=IDLE, scanner=scanner
+        ) is None
+    finally:
+        scanner._scan_lock.release()
+
+
 def test_no_restart_soon_after_a_mutation(quiet_env):
     recent = {"in_flight": 0, "last_mutation": 990.0}
     assert daemon._update_restart_due(quiet_env, OLD, now=1000.0, activity=recent) is None
@@ -117,7 +150,10 @@ def test_serve_captures_head_before_starting_auto_update(monkeypatch):
     captured: dict[str, object] = {}
     repo = Path("/nonexistent-repo")
 
-    monkeypatch.setattr("sys.argv", ["clawjournal", "serve", "--no-browser"])
+    monkeypatch.setattr(
+        "sys.argv",
+        ["clawjournal", "--source", "codex", "serve", "--no-browser"],
+    )
     monkeypatch.setattr(selfupdate, "_package_repo_root", lambda: repo)
 
     def read_head(_repo: Path, _rev: str) -> str:

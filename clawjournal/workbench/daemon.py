@@ -5507,12 +5507,29 @@ def _snapshot_activity() -> dict[str, float]:
         return dict(_activity)
 
 
+def _background_workers_active(scanner: Scanner | None = None) -> bool:
+    """Whether re-exec would interrupt durable or expensive background work."""
+    if _BENCHMARK_GEN_LOCK.locked():
+        return True
+    upload_thread = _auto_upload_run_thread
+    if upload_thread is not None and upload_thread.is_alive():
+        return True
+    if scanner is not None:
+        score_thread = scanner._score_thread
+        if score_thread is not None and score_thread.is_alive():
+            return True
+        if scanner._scan_lock.locked():
+            return True
+    return False
+
+
 def _update_restart_due(
     repo: Path,
     startup_head: str,
     *,
     now: float | None = None,
     activity: dict[str, float] | None = None,
+    scanner: Scanner | None = None,
 ) -> str | None:
     """Return the new HEAD when a graceful restart should happen, else None.
 
@@ -5531,8 +5548,8 @@ def _update_restart_due(
     snap = activity if activity is not None else _snapshot_activity()
     if snap["in_flight"] > 0:
         return None
-    if _BENCHMARK_GEN_LOCK.locked():
-        return None  # never terminate the long-running, expensive worker
+    if _background_workers_active(scanner):
+        return None
     t = time.time() if now is None else now
     if snap["last_mutation"] and t - snap["last_mutation"] < _RESTART_MUTATION_IDLE_SECONDS:
         return None
@@ -5827,7 +5844,7 @@ def run_server(
         while True:
             time.sleep(_RESTART_POLL_SECONDS)
             try:
-                head = _update_restart_due(repo, initial_head)
+                head = _update_restart_due(repo, initial_head, scanner=scanner)
             except Exception:
                 logger.debug("update-restart check failed", exc_info=True)
                 continue

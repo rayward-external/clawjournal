@@ -3916,12 +3916,34 @@ def _selfupdate_exit_code(result: dict) -> int:
 
 
 _AUTO_UPDATE_SKIP_FLAGS = frozenset({"-h", "--help", "--version"})
+_GLOBAL_OPTIONS_WITH_VALUES = frozenset({
+    "--output",
+    "-o",
+    "--repo",
+    "-r",
+    "--source",
+    "--format",
+    "--pii-provider",
+    "--pii-findings-output",
+    "--pii-sanitized-output",
+    "--pii-backend",
+})
 
 
 def _requested_subcommand(argv: list[str] | None = None) -> str | None:
-    """Return the first non-flag token, which is argparse's subcommand."""
+    """Return argparse's subcommand without mistaking global option values."""
     tokens = (sys.argv if argv is None else argv)[1:]
-    return next((token for token in tokens if not token.startswith("-")), None)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _GLOBAL_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
 
 
 def _should_auto_update(argv: list[str] | None = None) -> bool:

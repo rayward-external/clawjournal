@@ -536,6 +536,20 @@ def test_cli_should_auto_update_ignores_selfupdate_in_arg_values():
     assert _should_auto_update(["clawjournal"]) is True
 
 
+def test_cli_requested_subcommand_skips_global_option_values():
+    from clawjournal.cli import _requested_subcommand
+
+    assert _requested_subcommand(
+        ["clawjournal", "--source", "codex", "serve"]
+    ) == "serve"
+    assert _requested_subcommand(
+        ["clawjournal", "--output", "selfupdate", "export"]
+    ) == "export"
+    assert _requested_subcommand(
+        ["clawjournal", "--format=md", "selfupdate"]
+    ) == "selfupdate"
+
+
 def test_cli_should_auto_update_skips_help_and_version():
     """argparse prints and exits in milliseconds for -h/--help/--version;
     a background fetch is wasted work."""
