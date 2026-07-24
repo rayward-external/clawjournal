@@ -3844,7 +3844,137 @@ def _run_note(args: argparse.Namespace) -> None:
     sys.exit(2)
 
 
+def _render_selfupdate_status(result: dict) -> str:
+    """Human-readable one-liner for a `selfupdate_sync` result."""
+    status = result.get("status")
+    head = str(result.get("head", ""))[:7]
+    upstream = str(result.get("upstream", ""))[:7]
+    if status == "not-a-checkout":
+        return "clawjournal is not installed from an editable git checkout — nothing to update."
+    if status == "up-to-date":
+        return f"Already up to date ({head})."
+    if status == "behind":
+        return (f"Update available: {head} -> {upstream}. "
+                "Run `clawjournal selfupdate` to apply.")
+    if status == "updated":
+        return f"Updated {head} -> {upstream}."
+    if status == "dirty":
+        return "Skipped: the checkout has local changes. Commit/stash or pass --force."
+    if isinstance(status, str) and status.startswith("branch-"):
+        return (f"Skipped: not on the main branch ({status[len('branch-'):]}). "
+                "Check out main first.")
+    if status == "ahead":
+        return "Skipped: local main has commits not present on origin/main. Update manually."
+    if status == "diverged":
+        return "Skipped: local main has diverged from origin/main. Update manually."
+    if status == "ancestry-failed":
+        return "Skipped: could not compare local main with origin/main."
+    if status == "fetch-failed":
+        return f"Fetch failed: {result.get('stderr', '')}".rstrip()
+    if status == "update-failed":
+        return f"Update failed: {result.get('stderr', '')}".rstrip()
+    if status == "reinstall-in-progress":
+        return (
+            "Skipped: another checkout update or install is already running. "
+            "Try again in a few minutes."
+        )
+    return f"selfupdate status: {status}"
+
+
+def _render_reinstall_status(result: dict) -> str:
+    """Human-readable one-liner for a `selfupdate.reinstall` result."""
+    status = result.get("status")
+    if status == "reinstalled":
+        return "Reinstall complete — dependencies, workbench build, and scanners match the checkout."
+    if status == "reinstalled-partial":
+        hint = str(result.get("hint") or "the workbench build is still stale.")
+        return f"Reinstall completed, but not everything: {hint}"
+    if status == "reinstall-in-progress":
+        return ("Another reinstall is already running (likely the background "
+                "auto-update). Try again in a few minutes.")
+    if status == "not-a-checkout":
+        return "Reinstall skipped: clawjournal is not installed from a git checkout."
+    if status == "installer-missing":
+        return f"Reinstall skipped: no installer script found in {result.get('repo')}."
+    if status == "installer-failed":
+        detail = str(result.get("stderr") or "").strip()
+        suffix = f": {detail}" if detail else "."
+        return f"Reinstall failed (`{result.get('command')}`){suffix}"
+    if status == "skipped-update-blocked":
+        return (
+            "Reinstall skipped because the checkout could not be synchronized "
+            f"({result.get('update_status')})."
+        )
+    return f"reinstall status: {status}"
+
+
+def _selfupdate_exit_code(result: dict) -> int:
+    """Return nonzero when an update or requested reinstall did not finish."""
+    status = result.get("status")
+    if status not in {"not-a-checkout", "up-to-date", "behind", "updated"}:
+        return 1
+    install_result = result.get("reinstall_result")
+    if isinstance(install_result, dict):
+        if install_result.get("status") != "reinstalled":
+            return 1
+    return 0
+
+
 _AUTO_UPDATE_SKIP_FLAGS = frozenset({"-h", "--help", "--version"})
+_GLOBAL_OPTIONS_WITH_VALUES = frozenset({
+    "--output",
+    "-o",
+    "--repo",
+    "-r",
+    "--source",
+    "--format",
+    "--pii-provider",
+    "--pii-findings-output",
+    "--pii-sanitized-output",
+    "--pii-backend",
+})
+_GLOBAL_OPTIONS_WITHOUT_VALUES = frozenset({
+    "--all-projects",
+    "--no-thinking",
+    "--pii-review",
+    "--pii-apply",
+    "--help",
+    "--version",
+})
+_GLOBAL_LONG_OPTIONS = frozenset(
+    option
+    for option in _GLOBAL_OPTIONS_WITH_VALUES | _GLOBAL_OPTIONS_WITHOUT_VALUES
+    if option.startswith("--")
+)
+
+
+def _global_option_consumes_next(token: str) -> bool:
+    """Mirror argparse abbreviation for root options that take a value."""
+    if token in _GLOBAL_OPTIONS_WITH_VALUES:
+        return True
+    if not token.startswith("--") or "=" in token:
+        return False
+    matches = [option for option in _GLOBAL_LONG_OPTIONS if option.startswith(token)]
+    return (
+        len(matches) == 1
+        and matches[0] in _GLOBAL_OPTIONS_WITH_VALUES
+    )
+
+
+def _requested_subcommand(argv: list[str] | None = None) -> str | None:
+    """Return argparse's subcommand without mistaking global option values."""
+    tokens = (sys.argv if argv is None else argv)[1:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _global_option_consumes_next(token):
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
 
 
 def _should_auto_update(argv: list[str] | None = None) -> bool:
@@ -3861,17 +3991,28 @@ def _should_auto_update(argv: list[str] | None = None) -> bool:
     like `clawjournal export --output ./selfupdate`.
     """
     tokens = (sys.argv if argv is None else argv)[1:]
-    if not tokens:
-        return True
-    for token in tokens:
-        if token.startswith("-"):
-            continue
-        return token != "selfupdate"
-    # All tokens were flags — no subcommand. Skip when any are help/version.
-    return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
+    command = _requested_subcommand(argv)
+    if command is None:
+        if not tokens:
+            return True
+        # All tokens were flags — no subcommand. Skip when any are help/version.
+        return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
+    return command != "selfupdate"
 
 
 def main() -> None:
+    # A workbench process must remember the revision its already-imported
+    # Python belongs to before the detached updater can fast-forward checkout.
+    daemon_startup_head: str | None = None
+    if _requested_subcommand() in {"serve", "desktop"}:
+        try:
+            from .selfupdate import _package_repo_root, _rev_parse
+            startup_repo = _package_repo_root()
+            if startup_repo is not None:
+                daemon_startup_head = _rev_parse(startup_repo, "HEAD")
+        except Exception:
+            pass
+
     # Fire the silent, throttled auto-update before any work. Returns
     # immediately on opt-out, non-git installs, or throttle hits.
     if _should_auto_update():
@@ -3880,6 +4021,16 @@ def main() -> None:
             maybe_self_update()
         except Exception:
             # Auto-update must never block the CLI. Swallow anything.
+            pass
+        # A previous update may have pulled source that the installed tool
+        # can't act on yet (new deps, stale workbench build, bumped scanner
+        # pins). Say so on stderr so `--json` stdout stays machine-readable.
+        try:
+            from .selfupdate import pending_reinstall_notice
+            reinstall_notice = pending_reinstall_notice()
+            if reinstall_notice:
+                print(reinstall_notice, file=sys.stderr)
+        except Exception:
             pass
 
     parser = argparse.ArgumentParser(description="ClawJournal — coding agent conversation exporter")
@@ -4009,6 +4160,18 @@ def main() -> None:
                     help="Report whether updates are available without applying them")
     su.add_argument("--force", action="store_true",
                     help="Discard local changes on main before applying a fast-forward update")
+    su.add_argument("--reinstall", action="store_true",
+                    help="Update, then rerun the installer so dependencies, the workbench "
+                         "build, and the pinned scanners match the checkout")
+    su.add_argument("--with-frontend", action="store_true",
+                    help="With --reinstall, add or rebuild the browser workbench")
+    su.add_argument("--with-sharing", action="store_true",
+                    help="With --reinstall, install the managed sharing safety scanners")
+    su.add_argument("--clear-pending", action="store_true",
+                    help="Dismiss the pending-reinstall notice manually")
+    su.add_argument("--finalize-install", action="store_true", help=argparse.SUPPRESS)
+    su.add_argument("--frontend-requested", action="store_true", help=argparse.SUPPRESS)
+    su.add_argument("--scanners-installed", action="store_true", help=argparse.SUPPRESS)
     su.add_argument("--json", action="store_true", help="Output result as JSON")
 
     th = sub.add_parser("trufflehog",
@@ -4765,19 +4928,26 @@ def main() -> None:
 
     if command == "desktop":
         from .desktop import run_desktop_command
+        args.daemon_startup_head = daemon_startup_head
         exit_code = run_desktop_command(args)
         if exit_code:
             raise SystemExit(exit_code)
         return
 
     if command == "serve":
-        from .workbench.daemon import RELOAD_CHILD_ENV, RELOAD_OPEN_BROWSER_ENV
+        from .workbench.daemon import (
+            RELOAD_CHILD_ENV,
+            RELOAD_OPEN_BROWSER_ENV,
+            RESTART_CHILD_ENV,
+        )
         is_reload_child = os.environ.get(RELOAD_CHILD_ENV) == "1"
+        is_restart_child = os.environ.get(RESTART_CHILD_ENV) == "1"
 
         # A manual `clawjournal serve` counts as opening the journal too, but
         # does not create desktop state unless the optional shortcut exists.
-        # Reload children are restarts of one session, not new opens.
-        if not is_reload_child:
+        # Reload/update-restart children are restarts of one session, not new
+        # opens.
+        if not is_reload_child and not is_restart_child:
             from .desktop import note_opened
             note_opened()
 
@@ -4795,6 +4965,10 @@ def main() -> None:
         if is_reload_child:
             # Only the first child gets the browser; restarts must not open tabs.
             open_browser = os.environ.get(RELOAD_OPEN_BROWSER_ENV) == "1"
+        elif is_restart_child:
+            # Post-update self-restart: the user's tab is already open and the
+            # SPA reconnects on its own — opening another would be noise.
+            open_browser = False
         else:
             open_browser = not args.no_browser
         run_server(
@@ -4802,6 +4976,7 @@ def main() -> None:
             open_browser=open_browser,
             source_filter=args.source,
             remote=args.remote,
+            startup_head=daemon_startup_head,
         )
         return
 
@@ -5231,42 +5406,71 @@ def main() -> None:
         sys.exit(2)
 
     if command == "selfupdate":
-        from .selfupdate import selfupdate_sync
-        result = selfupdate_sync(check_only=args.check, force=args.force)
+        from .selfupdate import (
+            clear_pending_reinstall,
+            finalize_install,
+            pending_reinstall_notice,
+            selfupdate_and_reinstall,
+            selfupdate_sync,
+        )
+
+        if args.finalize_install:
+            result = finalize_install(
+                frontend_requested=args.frontend_requested,
+                scanners_installed=args.scanners_installed,
+            )
+            if args.json:
+                print(json.dumps(result, indent=2))
+            return
+
+        if args.clear_pending:
+            clear_pending_reinstall()
+            if args.json:
+                print(json.dumps({"status": "cleared"}, indent=2))
+            else:
+                print("Pending-reinstall notice cleared.")
+            return
+
+        if args.reinstall and args.check:
+            print("error: --check and --reinstall are mutually exclusive",
+                  file=sys.stderr)
+            sys.exit(2)
+        if (args.with_frontend or args.with_sharing) and not args.reinstall:
+            print(
+                "error: --with-frontend and --with-sharing require --reinstall",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        if args.reinstall:
+            # Keep checkout movement, pending-reason recording, and the
+            # requested install inside one shared critical section.
+            result = selfupdate_and_reinstall(
+                force=args.force,
+                capture=args.json,
+                with_frontend=args.with_frontend,
+                with_sharing=args.with_sharing,
+            )
+        else:
+            result = selfupdate_sync(check_only=args.check, force=args.force)
+
+        exit_code = _selfupdate_exit_code(result)
         if args.json:
             print(json.dumps(result, indent=2))
+            if exit_code:
+                sys.exit(exit_code)
+            return
+
+        print(_render_selfupdate_status(result))
+        install_result = result.get("reinstall_result")
+        if isinstance(install_result, dict):
+            print(_render_reinstall_status(install_result))
         else:
-            selfupdate_status = result.get("status")
-            if selfupdate_status == "not-a-checkout":
-                print("clawjournal is not installed from an editable git checkout — nothing to update.")
-            elif selfupdate_status == "up-to-date":
-                print(f"Already up to date ({str(result.get('head', ''))[:7]}).")
-            elif selfupdate_status == "behind":
-                print(
-                    f"Update available: {str(result.get('head', ''))[:7]} -> "
-                    f"{str(result.get('upstream', ''))[:7]}. Run `clawjournal selfupdate` to apply."
-                )
-            elif selfupdate_status == "updated":
-                print(
-                    f"Updated {str(result.get('head', ''))[:7]} -> "
-                    f"{str(result.get('upstream', ''))[:7]}."
-                )
-            elif selfupdate_status == "dirty":
-                print("Skipped: the checkout has local changes. Commit/stash or pass --force.")
-            elif isinstance(selfupdate_status, str) and selfupdate_status.startswith("branch-"):
-                print(f"Skipped: not on the main branch ({selfupdate_status[len('branch-'):]}). Check out main first.")
-            elif selfupdate_status == "ahead":
-                print("Skipped: local main has commits not present on origin/main. Update manually.")
-            elif selfupdate_status == "diverged":
-                print("Skipped: local main has diverged from origin/main. Update manually.")
-            elif selfupdate_status == "ancestry-failed":
-                print("Skipped: could not compare local main with origin/main.")
-            elif selfupdate_status == "fetch-failed":
-                print(f"Fetch failed: {result.get('stderr', '')}".rstrip())
-            elif selfupdate_status == "update-failed":
-                print(f"Update failed: {result.get('stderr', '')}".rstrip())
-            else:
-                print(f"selfupdate status: {selfupdate_status}")
+            notice = pending_reinstall_notice()
+            if notice:
+                print(notice)
+        if exit_code:
+            sys.exit(exit_code)
         return
 
     if command == "trufflehog":

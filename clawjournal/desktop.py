@@ -88,6 +88,10 @@ ICON_SIZE = 256
 # every HTTP request, so the log needs a ceiling to stay bounded over months.
 LOG_MAX_BYTES = 1_000_000
 DESKTOP_COMMAND_TIMEOUT_SECONDS = 30.0
+# Shared environment contract with workbench.daemon.RESTART_CHILD_ENV.  Keep
+# this lightweight launcher independent of importing the full daemon merely
+# to detect its own post-update re-exec.
+_UPDATE_RESTART_CHILD_ENV = "CLAWJOURNAL_RESTART_CHILD"
 
 _PORT_FREE = "free"
 _PORT_WORKBENCH = "workbench"
@@ -1101,7 +1105,7 @@ def _request_scan(port: int) -> None:
         pass
 
 
-def launch() -> None:
+def launch(*, startup_head: str | None = None) -> None:
     """Open the workbench and ensure a scan happens, reusing a live daemon."""
     # pythonw.exe gives Windows a true no-console launcher. Preserve diagnostics
     # by supplying streams before logging and the daemon are initialized.
@@ -1113,14 +1117,17 @@ def launch() -> None:
             sys.stdout = log_stream
         if sys.stderr is None:
             sys.stderr = log_stream
-    note_opened()
+    is_restart_child = os.environ.get(_UPDATE_RESTART_CHILD_ENV) == "1"
+    if not is_restart_child:
+        note_opened()
     config = load_config()
     port = int(config.get("daemon_port") or 8384)
     url = f"http://localhost:{port}/"
     port_state = _workbench_port_state(port)
     if port_state == _PORT_WORKBENCH:
-        _request_scan(port)
-        webbrowser.open(url)
+        if not is_restart_child:
+            _request_scan(port)
+            webbrowser.open(url)
         return
     if port_state == _PORT_OCCUPIED:
         raise _occupied_port_error(port)
@@ -1130,15 +1137,21 @@ def launch() -> None:
 
     ensure_pricing_fresh()
     try:
-        run_server(port=port, open_browser=True, allow_port_fallback=False)
+        run_server(
+            port=port,
+            open_browser=not is_restart_child,
+            allow_port_fallback=False,
+            startup_head=startup_head,
+        )
     except OSError as exc:
         # Another click won the race between the probe above and the bind.
         # Verify that the winner is ClawJournal before joining it; another
         # local service must never be opened under the ClawJournal name.
         port_state = _workbench_port_state(port)
         if port_state == _PORT_WORKBENCH:
-            _request_scan(port)
-            webbrowser.open(url)
+            if not is_restart_child:
+                _request_scan(port)
+                webbrowser.open(url)
             return
         if port_state == _PORT_OCCUPIED:
             raise _occupied_port_error(port) from exc
@@ -1226,7 +1239,7 @@ def run_desktop_command(args: Any) -> int:
             print(json.dumps(status(), indent=2))
             return 0
         if args.desktop_command == "launch":
-            launch()
+            launch(startup_head=getattr(args, "daemon_startup_head", None))
             return 0
     except DesktopError as exc:
         print(f"[x] {exc}", file=sys.stderr)

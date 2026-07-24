@@ -21,13 +21,29 @@ participation does not by itself authorize an upload or Automatic uploads.
 First determine whether this machine supports a local browser UI or is
 CLI-only/headless. If that is unclear, ask me before installing.
 
-For UI mode, install the browser workbench and managed sharing safety tools.
-For CLI-only mode, skip the browser build but install the CLI and managed
-sharing safety tools. Use the project's installer for my operating system.
+ClawJournal may already be installed even if `clawjournal` is not on my
+PATH — check the default locations (`~/.clawjournal-venv` and
+`~/clawjournal`) before treating this as a fresh install.
 
-If ClawJournal is already installed, safely update its repository and rerun
-the installer. Never discard local changes or force-reset the checkout. If
-an update is blocked, explain why and stop.
+If it is not installed yet, install it with the project's installer for my
+operating system: include the browser workbench in UI mode, skip it in
+CLI-only mode, and include the managed sharing safety tools in both. If
+something the installer needs (such as Git, Python, or Node.js) is missing,
+help me install that first.
+
+If it is already installed, run one command for the selected mode:
+`clawjournal selfupdate --reinstall --with-frontend --with-sharing` in UI
+mode, or `clawjournal selfupdate --reinstall --with-sharing` in CLI-only
+mode. That command brings the selected components to the latest published
+version. It reruns the installer even when the checkout is already current
+so older unrecorded dependency or scanner drift is repaired too.
+
+Either way I must end up on the latest published version; verify that and
+tell me if I am not. Never use force options, and never delete or overwrite
+anything of mine to make an update succeed. If the installer or updater
+reports a problem, show me its message, explain it in plain words, and stop.
+After this setup, ClawJournal keeps itself up to date automatically, so I
+should not need to repeat any of this.
 
 Look across all supported coding agents unless I tell you otherwise. Set that
 scope explicitly with `clawjournal config --source all`, then show me the
@@ -47,8 +63,10 @@ Keep this setup local. Do not run AI scoring, AI-assisted review, or
 Automatic uploads. If any of those features is already enabled, tell me
 before continuing. Do not upload anything.
 
-Finish by reporting the selected mode, installed version, executable path,
-scan result, and the exact command I should use next.
+Finish by reporting: the selected mode; the installed version and whether it
+is the latest published one; the exact executable path; the scan result;
+confirmation that automatic updates are active (or the plain-words reason
+they are not); and the exact command I should use next.
 ```
 
 This prompt confirms research-program participation and research intent, but it allows installation and local review only. You can decide whether to contribute data later.
@@ -59,12 +77,24 @@ This prompt confirms research-program participation and research intent, but it 
 Open my local ClawJournal workbench, make sure its session index is current,
 and help me find the work I did recently. Do not run AI features or upload
 anything. If either is already enabled, tell me before opening the workbench.
+
+Before you run any ClawJournal command, make sure my install is current:
+run `clawjournal selfupdate --check`, and if it is behind, bring it up to
+date with `clawjournal selfupdate --reinstall`. Never discard local changes
+or pass `--force`. If the update is blocked, tell me why and carry on with
+the version I have.
 ```
 
 ### Help me review my work
 
 ```text
 Open ClawJournal and help me review my recent coding-agent sessions.
+
+Before you run any ClawJournal command, make sure my install is current:
+run `clawjournal selfupdate --check`, and if it is behind, bring it up to
+date with `clawjournal selfupdate --reinstall`. Never discard local changes
+or pass `--force`. If the update is blocked, tell me why and carry on with
+the version I have.
 
 Keep the original session text in the local workbench, not in chat. Help me
 identify useful sessions, exclude anything unrelated, and place anything
@@ -77,6 +107,12 @@ upload anything.
 ```text
 Open ClawJournal and help me prepare a small share from sessions I have
 already reviewed.
+
+Before you run any ClawJournal command, make sure my install is current:
+run `clawjournal selfupdate --check`, and if it is behind, bring it up to
+date with `clawjournal selfupdate --reinstall` so the redaction rules and
+secret scanners are the latest ones. Never discard local changes or pass
+`--force`. If the update is blocked, tell me why before you prepare anything.
 
 Keep raw traces and secret values in the local workbench or terminal, not in
 chat. Guide me through Queue, Redact, Review, Package, and Submit. Preserve
@@ -117,6 +153,7 @@ If you are unsure at any point, stop before **Submit**. Your review and package 
 - **AI features are optional.** If you enable them, ClawJournal removes home-folder paths and usernames locally first. The remaining session text is sent to the AI service you choose and may still contain identifying details.
 - **Sharing has safety checks.** Redaction and secret scans run before a package can be submitted. One scanner may contact a credential provider to check whether a suspected secret is live. A missing or failed required scan blocks sharing.
 - **Automatic uploads are off by default.** They require a separate setup and authorization after a successful manual share.
+- **ClawJournal keeps itself current.** Installs from a git checkout quietly fast-forward to the latest published version (at most once an hour) and, when an update changes dependencies, the workbench, or the pinned scanners, rerun the installer in the background. A running workbench switches to the new version at the next quiet moment (never during a request or right after you changed something) — just reload the page. Updates never touch your local changes, and updating never uploads anything. Set `CLAWJOURNAL_NO_AUTO_UPDATE=1` to opt out.
 
 For the complete details, see [PRIVACY.md](PRIVACY.md).
 
@@ -129,6 +166,9 @@ clawjournal config --source all           # explicitly include all supported age
 clawjournal serve                        # open the local workbench
 clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring
 clawjournal status                       # check your setup
+clawjournal selfupdate --check           # see whether a newer version is available
+clawjournal selfupdate --reinstall       # update and rerun the installer in one step
+clawjournal selfupdate --reinstall --with-frontend --with-sharing # also add UI + managed scanners
 clawjournal --help                       # see every command
 ```
 
@@ -159,6 +199,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend -Wi
 
 When installation finishes, use the exact `clawjournal serve` command it prints, then open [http://localhost:8384](http://localhost:8384).
 
+Re-running the installer safely updates an existing install to the latest published version. It never overwrites your local changes; if your checkout can't be updated cleanly, it says why and installs the code you already have.
+
 </details>
 
 ## A few useful prompts
@@ -167,15 +209,20 @@ When installation finishes, use the exact `clawjournal serve` command it prints,
 
 ```text
 Install or refresh the ClawJournal desktop shortcut, then open the local
-workbench. Do not upload anything.
+workbench. Check first with `clawjournal selfupdate --check` and run
+`clawjournal selfupdate --reinstall` if it is behind, without discarding
+local changes. Do not upload anything.
 ```
 
 **Find missing WorkBuddy sessions**
 
 ```text
-ClawJournal is not finding my WorkBuddy sessions. Locate the local WorkBuddy
-export or trace folder, add it to ClawJournal's supported import location,
-rescan, and show me what was found. Keep everything local.
+ClawJournal is not finding my WorkBuddy sessions. First check I am on the
+latest version with `clawjournal selfupdate --check` and run
+`clawjournal selfupdate --reinstall` if I am behind, since source discovery
+improves between versions. Then locate the
+local WorkBuddy export or trace folder, add it to ClawJournal's supported
+import location, rescan, and show me what was found. Keep everything local.
 ```
 
 **OpenRefinery participants**

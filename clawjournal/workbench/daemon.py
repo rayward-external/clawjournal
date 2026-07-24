@@ -1149,6 +1149,8 @@ class Scanner:
                         _next_scan_delay(time.monotonic() - tick_started)
                     )
                     continue
+                if self._stop_event.is_set():
+                    break
                 trigger_scoring_warmup(self)
                 total_new = sum(results.values())
                 if (
@@ -3032,6 +3034,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     """
 
     _last_share_time: float = 0.0
+
+    def handle_one_request(self) -> None:
+        # In-flight/mutation accounting for the update self-restart monitor:
+        # a restart only happens when nothing is being served and no
+        # mutating request landed recently.
+        if not _note_request_start():
+            # The update watcher has atomically frozen admission before
+            # stopping the listening loops.  A connection accepted in that
+            # narrow hand-off window must not begin work in the old process.
+            self.close_connection = True
+            return
+        try:
+            super().handle_one_request()
+        finally:
+            _note_request_end(getattr(self, "command", None))
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug(format, *args)
@@ -5456,6 +5473,165 @@ def _newest_frontend_build_input_mtime(frontend_root: Path) -> float:
     return newest
 
 
+# ---------- update self-restart ----------------------------------------------
+#
+# The background auto-update (clawjournal/selfupdate.py) fast-forwards the
+# checkout and reruns the installer, but a running daemon keeps executing the
+# Python it imported at startup — the *frontend* refreshes on the next browser
+# reload (dist/ is read off disk per request, index.html is no-store), while
+# the *backend* would stay old forever. So the daemon watches its own
+# checkout: when HEAD has moved AND the install is fully reconciled (no
+# pending reinstall, workbench build current), it re-execs itself at a quiet
+# moment. Restarting is equivalent to the user's Ctrl-C + rerun, which the
+# daemon already supports; the SQLite index and the upload ledger are built
+# to survive it.
+
+RESTART_CHILD_ENV = "CLAWJOURNAL_RESTART_CHILD"  # set on the re-exec'd process: don't reopen the browser
+_RESTART_POLL_SECONDS = 60.0
+# Don't restart within this window of a mutating request — a user mid-flow
+# (queueing a share, changing hold state) shouldn't have the rug moved.
+_RESTART_MUTATION_IDLE_SECONDS = 600.0
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+_activity_lock = threading.Lock()
+_activity = {"in_flight": 0, "last_mutation": 0.0}
+_request_admission_open = True
+
+
+def _note_request_start() -> bool:
+    with _activity_lock:
+        if not _request_admission_open:
+            return False
+        _activity["in_flight"] += 1
+        return True
+
+
+def _note_request_end(method: str | None) -> None:
+    with _activity_lock:
+        _activity["in_flight"] = max(0, _activity["in_flight"] - 1)
+        if method in _MUTATING_METHODS:
+            _activity["last_mutation"] = time.time()
+
+
+def _snapshot_activity() -> dict[str, float]:
+    with _activity_lock:
+        return dict(_activity)
+
+
+def _open_request_admission() -> None:
+    """Allow handlers to begin requests for a newly started server."""
+    global _request_admission_open
+    with _activity_lock:
+        _request_admission_open = True
+
+
+def _freeze_request_admission(*, now: float | None = None) -> bool:
+    """Atomically close admission if the daemon is still restart-safe.
+
+    ``_update_restart_due`` is a pre-flight check.  A request can start or
+    finish after that snapshot, so the watcher must repeat the request and
+    mutation gates while holding the same lock used by handlers.  Once this
+    succeeds, no new handler can enter the old process.
+    """
+    global _request_admission_open
+    with _activity_lock:
+        if not _request_admission_open or _activity["in_flight"] > 0:
+            return False
+        t = time.time() if now is None else now
+        last_mutation = _activity["last_mutation"]
+        if (
+            last_mutation
+            and t - last_mutation < _RESTART_MUTATION_IDLE_SECONDS
+        ):
+            return False
+        _request_admission_open = False
+        return True
+
+
+def _resume_request_admission() -> None:
+    """Undo a tentative freeze when a background worker wins the race."""
+    global _request_admission_open
+    with _activity_lock:
+        _request_admission_open = True
+
+
+def _background_workers_active(scanner: Scanner | None = None) -> bool:
+    """Whether re-exec would interrupt durable or expensive background work."""
+    if _BENCHMARK_GEN_LOCK.locked():
+        return True
+    upload_thread = _auto_upload_run_thread
+    if upload_thread is not None and upload_thread.is_alive():
+        return True
+    if scanner is not None:
+        score_thread = scanner._score_thread
+        if score_thread is not None and score_thread.is_alive():
+            return True
+        if scanner._scan_lock.locked():
+            return True
+    return False
+
+
+def _update_restart_due(
+    repo: Path,
+    startup_head: str,
+    *,
+    now: float | None = None,
+    activity: dict[str, float] | None = None,
+    scanner: Scanner | None = None,
+) -> str | None:
+    """Return the new HEAD when a graceful restart should happen, else None.
+
+    Deliberately conservative: any doubt (can't read HEAD, install not yet
+    reconciled, requests in flight, recent mutation) defers to the next poll.
+    """
+    from .. import selfupdate
+
+    if os.environ.get(RELOAD_CHILD_ENV) == "1":
+        return None  # the --reload supervisor owns restarts in dev
+    head = selfupdate._rev_parse(repo, "HEAD")
+    if not head or head == startup_head:
+        return None
+    if selfupdate.reinstall_in_progress():
+        return None  # HEAD may have moved before the pending record was written
+    if selfupdate.reinstall_needed(repo):
+        return None  # wait for the background reinstall to finish the job
+    snap = activity if activity is not None else _snapshot_activity()
+    if snap["in_flight"] > 0:
+        return None
+    if _background_workers_active(scanner):
+        return None
+    t = time.time() if now is None else now
+    if snap["last_mutation"] and t - snap["last_mutation"] < _RESTART_MUTATION_IDLE_SECONDS:
+        return None
+    return head
+
+
+def _exec_restart(server: ThreadingHTTPServer,
+                  v6_server: ThreadingHTTPServer | None) -> None:
+    """Replace this process with a fresh `clawjournal serve`. Never returns
+    on success — argv is preserved, so port/source/remote flags carry over.
+
+    The listening sockets are closed *before* the exec so the new process
+    can rebind the same port (on Windows, where exec is emulated as
+    spawn+exit, this matters even more).
+    """
+    for srv in (server, v6_server):
+        if srv is None:
+            continue
+        try:
+            srv.server_close()
+        except OSError:
+            pass
+    os.environ[RESTART_CHILD_ENV] = "1"
+    try:
+        os.execv(sys.executable, _reload_child_command())
+    except OSError:
+        logger.error(
+            "Could not restart after update — run `clawjournal serve` again manually.",
+            exc_info=True,
+        )
+
+
 # Env vars that coordinate the --reload supervisor with its server child.
 RELOAD_CHILD_ENV = "CLAWJOURNAL_RELOAD_CHILD"  # set on the child: "run the server, don't supervise"
 RELOAD_OPEN_BROWSER_ENV = "CLAWJOURNAL_RELOAD_OPEN_BROWSER"  # set only on the first child
@@ -5622,6 +5798,7 @@ def run_server(
     source_filter: str | None = None,
     remote: bool = False,
     allow_port_fallback: bool = True,
+    startup_head: str | None = None,
 ) -> None:
     """Start the workbench daemon — scanner + HTTP server.
 
@@ -5630,7 +5807,8 @@ def run_server(
     desktop launcher passes False, because there a busy port almost always
     means our own daemon already won the race — silently starting a second one
     would put two scanners on the same SQLite index and strand the browser on
-    a port that won't be there next time.
+    a port that won't be there next time. ``startup_head`` is captured by the
+    CLI before its detached updater can move the checkout.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -5638,6 +5816,7 @@ def run_server(
     )
 
     scanner = Scanner(source_filter=source_filter)
+    _open_request_admission()
 
     # Start HTTP server first so it's responsive immediately. The primary socket
     # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
@@ -5683,7 +5862,8 @@ def run_server(
                 "Initial scan skipped: another process is refreshing the index"
             )
         else:
-            trigger_scoring_warmup(scanner)
+            if not scanner._stop_event.is_set():
+                trigger_scoring_warmup(scanner)
             total = sum(results.values())
             logger.info(
                 "Initial scan complete: %d new sessions indexed, "
@@ -5693,10 +5873,59 @@ def run_server(
                 scanner.last_updated_count,
                 scanner.last_linked_count,
             )
-        scanner.start()
-        logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
+        if not scanner._stop_event.is_set():
+            scanner.start()
+            logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
 
     threading.Thread(target=_initial_scan, daemon=True).start()
+
+    # Watch the editable checkout: once the background auto-update has both
+    # moved HEAD and reconciled the install, restart at a quiet moment so the
+    # backend serves the new version too (the frontend already refreshes per
+    # request). No-op for wheel installs and under the --reload supervisor.
+    restart_to: dict[str, str | None] = {"head": None}
+
+    def _watch_for_update() -> None:
+        from .. import selfupdate
+
+        repo = selfupdate._package_repo_root()
+        if repo is None:
+            return  # wheel install — nothing to watch
+        initial_head = startup_head or selfupdate._rev_parse(repo, "HEAD")
+        if not initial_head:
+            return
+        while True:
+            time.sleep(_RESTART_POLL_SECONDS)
+            try:
+                head = _update_restart_due(repo, initial_head, scanner=scanner)
+            except Exception:
+                logger.debug("update-restart check failed", exc_info=True)
+                continue
+            if head:
+                # The earlier activity snapshot is only advisory.  Atomically
+                # close handler admission before committing so a request
+                # cannot enter between the quietness check and shutdown.
+                if not _freeze_request_admission():
+                    continue
+                if _background_workers_active(scanner):
+                    _resume_request_admission()
+                    continue
+                restart_to["head"] = head
+                # Prevent the periodic/initial scanner from starting another
+                # pass or scoring batch while the listening loops stop.
+                scanner._stop_event.set()
+                logger.info(
+                    "ClawJournal updated (%s -> %s) — restarting the workbench "
+                    "to serve the new version",
+                    initial_head[:7], head[:7],
+                )
+                if v6_server is not None:
+                    v6_server.shutdown()
+                server.shutdown()
+                return
+
+    threading.Thread(target=_watch_for_update, daemon=True,
+                     name="update-restart").start()
 
     # Reconcile benchmark rows orphaned in 'generating' by a previous crash/restart
     # (the only normal exit from 'generating' is the in-process worker).
@@ -5721,3 +5950,10 @@ def run_server(
         server.shutdown()
         if v6_server is not None:
             v6_server.shutdown()
+        if restart_to["head"]:
+            # A scan that began just before admission froze may outlive
+            # Scanner.stop()'s bounded join.  Never exec over any durable or
+            # expensive worker; with admission frozen, no new one can start.
+            while _background_workers_active(scanner):
+                time.sleep(0.05)
+            _exec_restart(server, v6_server)
