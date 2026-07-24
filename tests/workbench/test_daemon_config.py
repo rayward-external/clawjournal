@@ -70,10 +70,18 @@ class TestGetConfig:
         assert "both" not in body["source_choices"]
 
     def test_never_exposes_secrets(self, api):
-        save_config({"verified_email_token": "SECRET", "publish_attestation": "X"})
+        save_config({
+            "verified_email_token": "SECRET",
+            "recurring_enrollment_grant": "ONE-TIME-GRANT",
+            "publish_attestation": "X",
+        })
         _, body = _get(api, "/api/config")
-        for secret in ("verified_email_token", "publish_attestation",
-                       "pending_verification_email"):
+        for secret in (
+            "verified_email_token",
+            "recurring_enrollment_grant",
+            "publish_attestation",
+            "pending_verification_email",
+        ):
             assert secret not in body
 
 

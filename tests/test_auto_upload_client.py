@@ -11,6 +11,7 @@ from clawjournal import auto_upload_client as client
 def _caps(**overrides):
     caps = {
         "recurring_upload_api_version": 2,
+        "manual_share_enrollment_grant_version": 1,
         "recurring_cadence_days": 1,
         "recurring_enrollment_open": True,
         "maximum_recurring_sessions": 5,
@@ -54,6 +55,33 @@ def test_capabilities_require_every_safety_contract():
             _caps(recurring_cadence_days=True),
             origin="https://data.rayward.ai",
         )
+
+
+@pytest.mark.parametrize(
+    "grant_version",
+    [True, 1.0, "1", 2, None],
+)
+def test_unknown_grant_version_never_fails_the_capability_document(grant_version):
+    """The grant is a convenience on top of email verification.
+
+    A server advertising a different (or malformed) grant version must only
+    disable the grant shortcut — failing validation here would block every
+    enrollment path, email verification included, until a client upgrade.
+    """
+
+    validated = client.validate_capabilities(
+        _caps(manual_share_enrollment_grant_version=grant_version),
+        origin="https://data.rayward.ai",
+    )
+
+    assert validated["recurring_enrollment_url"]
+    assert not client.grant_capability_version_supported(grant_version)
+
+
+def test_grant_version_support_requires_the_exact_integer():
+    assert client.grant_capability_version_supported(1) is True
+    # Python bools compare equal to ints; True must not pass as version 1.
+    assert client.grant_capability_version_supported(True) is False
 
 
 def test_capabilities_reject_cross_origin_endpoint():
@@ -207,6 +235,56 @@ def test_json_request_sends_bearer_without_following_redirect(monkeypatch):
     assert seen["body"]["ownership_certification"] is True
     assert seen["body"]["client_version"] == "2"
     assert "scope_hash" not in seen["body"]
+
+
+def test_create_enrollment_accepts_manual_share_grant_without_upload_token(
+    monkeypatch,
+):
+    seen = {}
+
+    def fake_open(request, *, timeout):
+        seen["body"] = json.loads(request.data)
+        return b'{"enrollment_id":"enrollment-1"}'
+
+    monkeypatch.setattr(client, "_open_request", fake_open)
+    result = client.create_enrollment(
+        client.validate_capabilities(_caps(), origin="https://data.rayward.ai"),
+        enrollment_grant="cj_enroll_one-shot",
+        client_enrollment_id="intent-1",
+        scope_entries=[("codex", "clawjournal")],
+        authorization_version="auth-v1",
+        retention_version="ret-v1",
+        ownership_certification=True,
+    )
+
+    assert result["enrollment_id"] == "enrollment-1"
+    assert seen["body"]["enrollment_grant"] == "cj_enroll_one-shot"
+    assert "upload_token" not in seen["body"]
+
+
+def test_create_enrollment_requires_exactly_one_identity_credential():
+    capabilities = client.validate_capabilities(
+        _caps(), origin="https://data.rayward.ai"
+    )
+    common = {
+        "client_enrollment_id": "intent-1",
+        "scope_entries": [("codex", "clawjournal")],
+        "authorization_version": "auth-v1",
+        "retention_version": "ret-v1",
+        "ownership_certification": True,
+    }
+    with pytest.raises(client.CapabilityError) as missing:
+        client.create_enrollment(capabilities, **common)
+    assert missing.value.code == "email_verification_required"
+
+    with pytest.raises(client.CapabilityError) as duplicate:
+        client.create_enrollment(
+            capabilities,
+            upload_token="upload",
+            enrollment_grant="grant",
+            **common,
+        )
+    assert duplicate.value.code == "email_verification_required"
 
 
 def test_typed_http_error_preserves_code_and_retryability():

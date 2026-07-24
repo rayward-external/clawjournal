@@ -123,6 +123,10 @@ class ClawJournalConfig(TypedDict, total=False):
     verified_email: str | None
     verified_email_token: str | None
     verified_email_token_expires_at: str | int | float | None
+    recurring_enrollment_grant: str | None
+    recurring_enrollment_grant_expires_at: str | int | float | None
+    recurring_enrollment_grant_receipt_id: str | None
+    recurring_enrollment_grant_issuer: str | None
     pending_verification_id: str | None
     pending_verification_email: str | None
     pending_verification_expires_at: str | int | None
@@ -135,7 +139,6 @@ class ClawJournalConfig(TypedDict, total=False):
     benchmark_tab_enabled: bool  # show/hide the Benchmark tab in the workbench UI (default on)
     scoring_warmup_declined: bool  # user declined the background auto-scorer (suppresses prompt + server-side auto-start)
     auto_upload_capability_available: bool  # non-authoritative UI offer cache; Enable revalidates live
-    auto_upload_ui_enabled: bool  # internal override; a cached eligible offer also reveals the UI
 
 
 DEFAULT_CONFIG: ClawJournalConfig = {
@@ -145,12 +148,21 @@ DEFAULT_CONFIG: ClawJournalConfig = {
     "redact_strings": [],
     "allowlist_entries": [],
     "benchmark_tab_enabled": True,
-    "auto_upload_ui_enabled": False,
 }
 
 
 _KNOWN_PREFIXES = ("claude:", "claude-science:", "codex:", "gemini:", "opencode:", "openclaw:", "kimi:", "cline:", "workbuddy:", "custom:")
 _BOTH_SOURCES = ("claude", "codex")
+
+# The receipt-issued recurring-enrollment grant travels as one unit: the
+# secret, its expiry, the receipt it is bound to, and the issuing origin.
+# Every writer that stores or clears it must touch all four keys.
+RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS = (
+    "recurring_enrollment_grant",
+    "recurring_enrollment_grant_expires_at",
+    "recurring_enrollment_grant_receipt_id",
+    "recurring_enrollment_grant_issuer",
+)
 
 
 def load_config() -> ClawJournalConfig:
@@ -161,6 +173,7 @@ def load_config() -> ClawJournalConfig:
             config = cast(ClawJournalConfig, {**DEFAULT_CONFIG, **stored})
             changed = _migrate_excluded_projects(config)
             changed |= _migrate_remove_device_credentials(config)
+            changed |= _migrate_remove_auto_upload_ui_flag(config)
             changed |= _migrate_findings_engines(config)
             if changed:
                 save_config(config)
@@ -226,6 +239,14 @@ def _migrate_remove_device_credentials(config: ClawJournalConfig) -> bool:
             del config[key]  # type: ignore[misc]
             changed = True
     return changed
+
+
+def _migrate_remove_auto_upload_ui_flag(config: ClawJournalConfig) -> bool:
+    """Remove the retired internal rollout flag from persisted config."""
+    if "auto_upload_ui_enabled" not in config:
+        return False
+    del config["auto_upload_ui_enabled"]  # type: ignore[misc]
+    return True
 
 
 def _migrate_findings_engines(config: ClawJournalConfig) -> bool:

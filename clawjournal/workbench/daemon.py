@@ -31,6 +31,7 @@ from .. import __version__
 from ..auto_upload_client import (
     RECURRING_CADENCE_DAYS,
     RECURRING_UPLOAD_API_VERSION,
+    comparable_origin,
 )
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
@@ -49,7 +50,12 @@ from ..scoring.overrides import (
     normalize_failure_evidence,
     requires_failure_evidence,
 )
-from ..config import CONFIG_DIR, load_config, save_config
+from ..config import (
+    CONFIG_DIR,
+    RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
+    load_config,
+    save_config,
+)
 from .findings_pipeline import (
     drain_findings_backfill,
     run_findings_pipeline,
@@ -1605,6 +1611,43 @@ def _clear_stored_upload_token() -> None:
             raise OSError("Stored upload authority could not be cleared safely.")
 
 
+def _store_recurring_enrollment_grant(
+    hosted_result: dict[str, Any],
+    *,
+    receipt_id: str,
+) -> bool:
+    grant = hosted_result.get("recurring_enrollment_grant")
+    expires_at = hosted_result.get("recurring_enrollment_grant_expires_at")
+    grant_receipt_id = hosted_result.get("recurring_enrollment_grant_receipt_id")
+    if (
+        not isinstance(grant, str)
+        or not grant
+        or not _expiry_is_valid(expires_at, grace_seconds=0)
+        or grant_receipt_id != receipt_id
+    ):
+        return False
+    try:
+        config = load_config()
+        config["recurring_enrollment_grant"] = grant
+        config["recurring_enrollment_grant_expires_at"] = expires_at
+        config["recurring_enrollment_grant_receipt_id"] = receipt_id
+        # Store the issuer in the same normalized form the enrollment path
+        # compares against, so an operator's casing or explicit :443 in
+        # CLAWJOURNAL_SHARE_URL cannot make a valid grant permanently unusable.
+        config["recurring_enrollment_grant_issuer"] = comparable_origin(
+            _hosted_api_base()
+        )
+        if save_config(config) is False:
+            raise OSError("config save returned false")
+    except (OSError, RuntimeError):
+        logger.warning(
+            "Manual share succeeded, but its recurring-enrollment grant "
+            "could not be cached; email verification remains available."
+        )
+        return False
+    return True
+
+
 def _http_error_message(exc: urllib.error.HTTPError) -> str:
     body = exc.read().decode("utf-8", errors="replace")
     try:
@@ -1669,6 +1712,7 @@ def request_email_verification(email: str) -> dict:
             "verified_email",
             "verified_email_token",
             "verified_email_token_expires_at",
+            *RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
         ):
             config.pop(key, None)
     config["pending_verification_id"] = verification_id
@@ -2954,6 +2998,7 @@ def submit_share_to_hosted(
     )
     conn.commit()
 
+    _store_recurring_enrollment_grant(hosted_result, receipt_id=receipt_id)
     _clear_stored_upload_token()
     redaction_summary = manifest.get("redaction_summary", {}) if manifest else {}
     return {

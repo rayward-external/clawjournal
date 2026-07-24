@@ -266,7 +266,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
         assert callable(call.pop("scan_progress"))
         assert callable(call.pop("scan_wait_notice"))
     accepted = {
-        "agent": "all",
+        "agent": "auto",
         "accepted_authorization_version": "auth-v1",
         "accepted_retention_version": "ret-v1",
         "accepted_ownership_certification_version": "own-v1",
@@ -274,7 +274,7 @@ def test_interactive_enable_replays_exact_profile_after_email_verification(
     }
     assert calls == [
         {
-            "agent": "all",
+            "agent": "auto",
             "accepted_authorization_version": None,
             "accepted_retention_version": None,
             "accepted_ownership_certification_version": None,

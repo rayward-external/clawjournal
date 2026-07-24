@@ -34,14 +34,17 @@ from .agent_hooks import (
     uninstall_agent_hook,
 )
 from .auto_upload_client import (
+    MANUAL_SHARE_ENROLLMENT_GRANT_VERSION,
     MAX_SCOPE_ENTRIES,
     RECURRING_CADENCE_DAYS,
     CapabilityError,
     RecurringServiceError,
+    comparable_origin,
     create_enrollment,
     fetch_authorization,
     fetch_capabilities,
     get_enrollment,
+    grant_capability_version_supported,
     lookup_receipt,
     recovery_capabilities,
     revoke_enrollment,
@@ -56,7 +59,12 @@ from .auto_upload_credentials import (
     remove_active_token,
     write_credentials,
 )
-from .config import load_config, save_config, source_scope_sources
+from .config import (
+    RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
+    load_config,
+    save_config,
+    source_scope_sources,
+)
 from .paths import atomic_write_text, ensure_hash_salt
 from .raw_sources import (
     RawFingerprint,
@@ -94,7 +102,6 @@ TELEMETRY_MAX_BYTES = 512 * 1024
 TELEMETRY_BACKUPS = 2
 SUPPORTED_HOOK_TARGETS = ("claude", "codex")
 HOOK_DB_BUSY_TIMEOUT_MS = 0
-AUTO_UPLOAD_UI_ENV = "CLAWJOURNAL_ENABLE_AUTO_UPLOAD_UI"
 _CONTROL_THREAD_LOCK = threading.Lock()
 
 # V1 supports only sources with both a SessionStart trigger and an audited,
@@ -222,6 +229,101 @@ def _parse_time(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _parse_expiry_time(value: Any) -> datetime | None:
+    """Parse config expiry values accepted by the manual-share boundary."""
+
+    parsed = _parse_time(value)
+    if parsed is not None:
+        return parsed
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            timestamp = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _available_recurring_enrollment_grant(
+    config: Mapping[str, Any],
+    *,
+    origin: str,
+    capability_version: Any = MANUAL_SHARE_ENROLLMENT_GRANT_VERSION,
+) -> str | None:
+    """Return the cached grant only if it is usable against ``origin``.
+
+    ``origin`` is required rather than defaulted: a grant is authority to create
+    a recurring enrollment, and an optional binding is one a caller can forget.
+    ``capability_version`` does default to the supported version, because the
+    local status path has no discovery document to check it against and treats
+    ``enable`` as the authority; that default is permissive, so it must never
+    grow a second one beside it.
+    """
+
+    grant = str(config.get("recurring_enrollment_grant") or "").strip()
+    expires_at = _parse_expiry_time(
+        config.get("recurring_enrollment_grant_expires_at")
+    )
+    issuer = str(config.get("recurring_enrollment_grant_issuer") or "").strip()
+    if (
+        not grant
+        or expires_at is None
+        or expires_at <= _now() + timedelta(seconds=60)
+        or not grant_capability_version_supported(capability_version)
+        or comparable_origin(issuer) != comparable_origin(origin)
+    ):
+        return None
+    return grant
+
+
+def _configured_hosted_origin() -> str | None:
+    """The origin this install would enroll against, without a network call.
+
+    The lazy import avoids a module-level cycle (daemon already imports this
+    module); RuntimeError is how ``_hosted_api_base`` reports a missing or
+    invalid share URL. Anything else should surface — a swallowed bug here
+    would silently report "no grant" forever.
+    """
+
+    try:
+        from .workbench.daemon import _hosted_api_base
+
+        return _hosted_api_base()
+    except (ImportError, RuntimeError):
+        return None
+
+
+def _status_grant_available(config: Mapping[str, Any]) -> bool:
+    """Whether ``enable`` would actually accept the cached enrollment grant.
+
+    Mirrors the origin binding ``enable`` applies so the status field cannot
+    advertise a grant that enable will refuse — the UI reads this to decide
+    whether to skip the email-verification step, and a grant bound to a
+    different hosted origin must not send it down that path. An install with no
+    resolvable hosted origin can never enroll, so it reports no grant at all.
+    The hosted capability version is deliberately not checked here: that needs
+    discovery, and ``enable`` remains the authority on it.
+    """
+
+    origin = _configured_hosted_origin()
+    if origin is None:
+        return False
+    return bool(_available_recurring_enrollment_grant(config, origin=origin))
+
+
+def _remove_recurring_enrollment_grant(config: dict[str, Any]) -> None:
+    for key in RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS:
+        config.pop(key, None)
 
 
 def _due_at(enrollment: Mapping[str, Any]) -> datetime | None:
@@ -577,35 +679,6 @@ def _has_successful_manual_receipt(conn: sqlite3.Connection) -> bool:
     )
 
 
-def _auto_upload_ui_visible(
-    config: Mapping[str, Any],
-    enrollment: Mapping[str, Any] | None = None,
-    *,
-    successful_manual_receipt: bool = False,
-) -> bool:
-    # A successful manual hosted share caches this non-authoritative offer bit
-    # only after the service advertises the current recurring-upload protocol.
-    # It is safe to use for visibility: Enable still revalidates the live
-    # capability document before granting any recurring authority.
-    hosted_offer_available = (
-        successful_manual_receipt
-        and config.get("auto_upload_capability_available") is True
-    )
-    explicitly_enabled = (
-        os.environ.get(AUTO_UPLOAD_UI_ENV) == "1"
-        or config.get("auto_upload_ui_enabled") is True
-    )
-    existing_authority = bool(
-        enrollment
-        and (
-            enrollment.get("mode") != "off"
-            or enrollment.get("server_enrollment_id")
-            or enrollment.get("revocation_pending")
-        )
-    )
-    return hosted_offer_available or explicitly_enabled or existing_authority
-
-
 def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
     hooks = []
     for target in SUPPORTED_HOOK_TARGETS:
@@ -619,7 +692,7 @@ def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
         "run_now_allowed": False,
         "overlay": None,
         "pending_submission_state": None,
-        "ui_visible": _auto_upload_ui_visible(config),
+        "ui_visible": True,
         "offer_available": False,
         "scope": {"sources": [], "projects": []},
         "cap": MAX_SESSIONS,
@@ -646,6 +719,7 @@ def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
         },
         "last_result": None,
         "generation": None,
+        "enrollment_grant_available": _status_grant_available(config),
     }
 
 
@@ -721,11 +795,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             ),
             "overlay": overlay,
             "pending_submission_state": pending_submission_state,
-            "ui_visible": _auto_upload_ui_visible(
-                config,
-                enrollment,
-                successful_manual_receipt=successful_manual,
-            ),
+            "ui_visible": True,
             "offer_available": bool(
                 mode == "off"
                 and successful_manual
@@ -765,6 +835,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             },
             "last_result": last_result,
             "generation": enrollment.get("generation") if enrollment else None,
+            "enrollment_grant_available": _status_grant_available(config),
         }
     finally:
         if own_connection:
@@ -937,8 +1008,29 @@ def _authorization_challenge(
     return challenge
 
 
-def _hook_targets(agent: str) -> list[AgentName]:
+def _hook_targets(
+    agent: str,
+    *,
+    sources: Sequence[str] | None = None,
+) -> list[AgentName]:
     normalized = (agent or "all").strip().lower()
+    if normalized == "auto":
+        inferred = [
+            target
+            for target in SUPPORTED_HOOK_TARGETS
+            if target in set(sources or ())
+        ]
+        if inferred:
+            return inferred
+        # Defensive only: callers reach this after the scope blockers, which
+        # already reject an empty scope and any source outside COMPLETION_MODES
+        # (whose keys are exactly SUPPORTED_HOOK_TARGETS). It exists so a future
+        # source that gains a completion mode without a SessionStart hook fails
+        # loudly here instead of silently scheduling nothing.
+        raise AutoUploadError(
+            "invalid_hook_target",
+            "No supported SessionStart agent was found in the authorized scope.",
+        )
     if normalized == "all":
         return ["claude", "codex"]
     if normalized in SUPPORTED_HOOK_TARGETS:
@@ -1123,7 +1215,6 @@ def enable(
     to wait for a scan in another process.
     """
 
-    targets = _hook_targets(agent)
     lock_context: Any | None = None
     conn = open_index()
     try:
@@ -1146,6 +1237,7 @@ def enable(
                 "scope_blockers": scope["blockers"],
                 "unsupported_sources": scope["unsupported_sources"],
             }
+        targets = _hook_targets(agent, sources=scope["sources"])
         if not _has_successful_manual_receipt(conn):
             return AutoUploadError(
                 "manual_share_required",
@@ -1217,6 +1309,7 @@ def enable(
                 "message": "The refreshed source/project scope is not eligible.",
                 "scope_blockers": scope["blockers"],
             }
+        targets = _hook_targets(agent, sources=scope["sources"])
         challenge = _authorization_challenge(
             capabilities, terms, scope, ai_backend
         )
@@ -1404,9 +1497,18 @@ def enable(
         server_reauthorization_succeeded = False
         email_enrollment_may_have_committed = False
         recovery_only_written = False
+        # Which one-shot identity credential this attempt actually put on the
+        # wire, or None when it sent neither. Set on both the create and the
+        # credential-rotation path — a non-rotating PATCH reuses the pinned
+        # active credential and consumes nothing. The cleanup below keys off
+        # this: removing a credential that was never sent destroys a still-valid
+        # one, and leaving a consumed one behind strands a spent single-use
+        # secret in config.
+        sent_identity_kind: str | None = None
         try:
             snapshots = _snapshot_hook_files(SUPPORTED_HOOK_TARGETS)
-            hook_results = install_hooks(agent=agent)
+            hook_agent = "all" if len(targets) > 1 else targets[0]
+            hook_results = install_hooks(agent=hook_agent)
             if not all(result.get("configured") for result in hook_results):
                 raise AutoUploadError(
                     "hook_install_failed",
@@ -1445,16 +1547,46 @@ def enable(
                         server_reauthorization_succeeded = True
                     raise
             else:
-                upload_token = str(config.get("verified_email_token") or "").strip()
-                if not upload_token:
+                identity_config = load_config()
+                upload_token = str(
+                    identity_config.get("verified_email_token") or ""
+                ).strip()
+                enrollment_grant = _available_recurring_enrollment_grant(
+                    identity_config,
+                    origin=str(capabilities["origin"]),
+                    capability_version=capabilities.get(
+                        "manual_share_enrollment_grant_version"
+                    ),
+                )
+                # Prefer the purpose-scoped enrollment grant: it exists only to
+                # authorize this enrollment, while verified_email_token is the
+                # manual-share credential — consuming the token here when a
+                # usable grant is idle would silently cost the user their next
+                # manual share and let the grant expire unused. If the server
+                # rejects the grant, the fallback below removes it and a retry
+                # finds the still-present token.
+                if enrollment_grant:
+                    sent_identity_kind = "enrollment_grant"
+                elif upload_token:
+                    sent_identity_kind = "upload_token"
+                else:
                     raise AutoUploadError(
                         "email_verification_required",
-                        "Verify your email again before creating a recurring enrollment.",
+                        "Verify your email before creating a recurring enrollment.",
                     )
                 try:
                     response = create_enrollment(
                         capabilities,
-                        upload_token=upload_token,
+                        upload_token=(
+                            upload_token
+                            if sent_identity_kind == "upload_token"
+                            else None
+                        ),
+                        enrollment_grant=(
+                            enrollment_grant
+                            if sent_identity_kind == "enrollment_grant"
+                            else None
+                        ),
                         client_enrollment_id=client_enrollment_id,
                         scope_entries=scope["entries"],
                         authorization_version=str(expected_auth),
@@ -1637,24 +1769,28 @@ def enable(
 
             config = load_config()
             config["auto_upload_capability_available"] = True
-            # Only the create / credential-rotation path sends the one-shot
-            # verified_email_token to the server; the non-rotating update path
-            # reuses the pinned active credential and never sends it. Deleting it
-            # there would silently destroy a still-valid manual-share credential
-            # the user just re-verified, so gate the removal to the paths that
-            # actually consumed it.
-            consumed_one_shot_token = not (updating and not rotating_credentials)
-            if consumed_one_shot_token:
+            # Remove only the purpose-scoped identity credential actually sent
+            # on create/rotation. A non-rotating PATCH uses the pinned active
+            # credential and must preserve any fresh manual-share token or
+            # receipt-issued enrollment grant.
+            if sent_identity_kind == "upload_token":
                 config.pop("verified_email_token", None)
                 config.pop("verified_email_token_expires_at", None)
+            elif sent_identity_kind == "enrollment_grant":
+                _remove_recurring_enrollment_grant(config)
             if save_config(config) is False:
                 raise AutoUploadError(
                     "config_persistence_failed",
                     "Recurring enrollment could not persist its local config safely.",
                 )
-            if consumed_one_shot_token:
+            if sent_identity_kind is not None:
                 persisted_config = _load_config_readonly()
-                if persisted_config.get("verified_email_token"):
+                credential_still_present = (
+                    bool(persisted_config.get("verified_email_token"))
+                    if sent_identity_kind == "upload_token"
+                    else bool(persisted_config.get("recurring_enrollment_grant"))
+                )
+                if credential_still_present:
                     raise AutoUploadError(
                         "config_persistence_failed",
                         "The consumed one-shot verification credential could not be removed durably.",
@@ -1810,8 +1946,11 @@ def enable(
                 # id to recover/reissue the hosted credentials.
                 try:
                     failure_config = load_config()
-                    failure_config.pop("verified_email_token", None)
-                    failure_config.pop("verified_email_token_expires_at", None)
+                    if sent_identity_kind == "enrollment_grant":
+                        _remove_recurring_enrollment_grant(failure_config)
+                    else:
+                        failure_config.pop("verified_email_token", None)
+                        failure_config.pop("verified_email_token_expires_at", None)
                     save_config(failure_config)
                 except Exception:
                     pass
@@ -1824,7 +1963,31 @@ def enable(
                     ambiguous=True,
                 )
             elif isinstance(exc, RecurringServiceError):
-                if updating and exc.code in {
+                enrollment_grant_rejected = (
+                    sent_identity_kind == "enrollment_grant"
+                    and not exc.ambiguous
+                    and exc.code
+                    in {
+                        "email_verification_required",
+                        "credential_invalid",
+                        "credential_expired",
+                        "credential_revoked",
+                    }
+                )
+                if enrollment_grant_rejected:
+                    try:
+                        failure_config = load_config()
+                        _remove_recurring_enrollment_grant(failure_config)
+                        save_config(failure_config)
+                    except Exception:
+                        pass
+                if enrollment_grant_rejected:
+                    error = AutoUploadError(
+                        "email_verification_required",
+                        "The receipt-issued enrollment grant is unavailable. "
+                        "Verify your email to continue.",
+                    )
+                elif updating and exc.code in {
                     "credential_invalid",
                     "credential_expired",
                     "credential_revoked",

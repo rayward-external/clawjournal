@@ -24,6 +24,25 @@ from . import __version__
 RECURRING_UPLOAD_API_VERSION = 2
 RECURRING_CLIENT_PROTOCOL_VERSION = "2"
 RECURRING_CADENCE_DAYS = 1
+MANUAL_SHARE_ENROLLMENT_GRANT_VERSION = 1
+
+
+def grant_capability_version_supported(value: Any) -> bool:
+    """Exact-integer check for the advertised enrollment-grant version.
+
+    The grant is an optional convenience on top of email verification, so an
+    unknown or malformed advertised version must only disable the grant path —
+    never fail the whole capability document, which would block enrollment for
+    every client until an upgrade. Strict typing matters here because Python
+    bools compare equal to ints: a server sending ``true`` must not pass as
+    version 1.
+    """
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value == MANUAL_SHARE_ENROLLMENT_GRANT_VERSION
+    )
 # Mirrors the hosted RECURRING_SCOPE_MAX_ENTRIES contract limit so oversized
 # scopes fail fast locally instead of as a server-worded enrollment rejection.
 MAX_SCOPE_ENTRIES = 200
@@ -111,6 +130,26 @@ def _normalized_origin(
     port = f":{parsed_port}" if parsed_port is not None else ""
     rendered_host = f"[{hostname}]" if ":" in hostname else hostname
     return f"{scheme}://{rendered_host}{port}"
+
+
+def comparable_origin(value: str) -> str:
+    """Render an origin so two spellings of the same host compare equal.
+
+    The enrollment-grant issuer is derived from the configured share URL, which
+    preserves whatever casing and explicit port the operator wrote, while
+    capability validation lowercases the host and re-renders the port. Comparing
+    those two spellings directly makes a perfectly valid grant silently
+    unusable, so both sides normalize through here first. A value this module
+    cannot parse as an origin is returned trimmed rather than raising: the
+    caller is comparing two strings for equality, not authorizing egress.
+    """
+
+    try:
+        return _normalized_origin(
+            value, allow_local_http=_allow_insecure_loopback_http()
+        )
+    except CapabilityError:
+        return value.strip().rstrip("/")
 
 
 def _endpoint(
@@ -397,23 +436,36 @@ def _scope_payload(scope_entries: Any) -> list[dict[str, str]]:
 def create_enrollment(
     capabilities: Mapping[str, Any],
     *,
-    upload_token: str,
     client_enrollment_id: str,
     scope_entries: Any,
     authorization_version: str,
     retention_version: str,
     ownership_certification: bool,
+    upload_token: str | None = None,
+    enrollment_grant: str | None = None,
 ) -> dict[str, Any]:
     if ownership_certification is not True:
         raise CapabilityError(
             "ownership_certification_required",
             "Recurring enrollment requires the explicit ownership certification.",
         )
+    normalized_upload_token = (upload_token or "").strip()
+    normalized_enrollment_grant = (enrollment_grant or "").strip()
+    if bool(normalized_upload_token) == bool(normalized_enrollment_grant):
+        raise CapabilityError(
+            "email_verification_required",
+            "Recurring enrollment requires exactly one verified identity credential.",
+        )
+    identity_payload = (
+        {"enrollment_grant": normalized_enrollment_grant}
+        if normalized_enrollment_grant
+        else {"upload_token": normalized_upload_token}
+    )
     return _request_json(
         str(capabilities["recurring_enrollment_url"]),
         method="POST",
         payload={
-            "upload_token": upload_token,
+            **identity_payload,
             "client_enrollment_id": client_enrollment_id,
             "scope": _scope_payload(scope_entries),
             "authorization_version": authorization_version,

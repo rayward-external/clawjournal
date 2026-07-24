@@ -82,7 +82,11 @@ def isolated_auto_upload(tmp_path, monkeypatch):
     }
 
 
-def _save_scope_config(*, upload_token: str | None = None) -> dict[str, Any]:
+def _save_scope_config(
+    *,
+    upload_token: str | None = None,
+    enrollment_grant: str | None = None,
+) -> dict[str, Any]:
     config: dict[str, Any] = {
         **config_module.DEFAULT_CONFIG,
         "source": "claude",
@@ -92,6 +96,13 @@ def _save_scope_config(*, upload_token: str | None = None) -> dict[str, Any]:
     if upload_token is not None:
         config["verified_email_token"] = upload_token
         config["verified_email_token_expires_at"] = "2099-01-01T00:00:00+00:00"
+    if enrollment_grant is not None:
+        config["recurring_enrollment_grant"] = enrollment_grant
+        config["recurring_enrollment_grant_expires_at"] = (
+            "2099-01-01T00:00:00+00:00"
+        )
+        config["recurring_enrollment_grant_receipt_id"] = "manual-receipt-1"
+        config["recurring_enrollment_grant_issuer"] = ORIGIN
     config_module.save_config(config)
     return config
 
@@ -167,6 +178,7 @@ def _credentials(enrollment_id: str = "server-enrollment-1") -> dict[str, str]:
 def _capabilities(origin: str = ORIGIN) -> dict[str, Any]:
     return {
         "origin": origin,
+        "manual_share_enrollment_grant_version": 1,
         "maximum_bundle_size": 5_000_000,
         "recurring_cadence_days": 1,
         "recurring_enrollment_url": f"{origin}/api/recurring-enrollments",
@@ -362,29 +374,21 @@ def test_status_is_read_only_without_an_install(
     assert not isolated_auto_upload["install"].exists()
 
 
-def test_auto_upload_ui_is_hidden_unless_internal_rollout_is_enabled(
-    isolated_auto_upload,
-    monkeypatch,
-):
-    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
-    assert auto.status()["ui_visible"] is False
-
-    monkeypatch.setenv(auto.AUTO_UPLOAD_UI_ENV, "1")
+def test_auto_upload_ui_is_visible_by_default(isolated_auto_upload):
     assert auto.status()["ui_visible"] is True
 
 
-def test_successful_manual_receipt_and_hosted_offer_reveal_auto_upload_ui(
+def test_hosted_offer_requires_the_receipt_database_not_just_config_cache(
     isolated_auto_upload,
-    monkeypatch,
 ):
-    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
     config = _save_scope_config()
     config["auto_upload_capability_available"] = True
     assert config_module.save_config(config)
 
-    # A stale config cache without the receipt database must not reveal the
-    # controls after a partial reinstall.
-    assert auto.status()["ui_visible"] is False
+    # A stale config cache without the receipt database must not surface the
+    # offer after a partial reinstall. (The Settings panel itself is always
+    # visible now; only the receipt-page offer stays gated.)
+    assert auto.status()["offer_available"] is False
 
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -410,9 +414,7 @@ def test_successful_manual_receipt_and_hosted_offer_reveal_auto_upload_ui(
 
 def test_existing_auto_upload_authority_keeps_controls_visible(
     isolated_auto_upload,
-    monkeypatch,
 ):
-    monkeypatch.delenv(auto.AUTO_UPLOAD_UI_ENV, raising=False)
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -2708,6 +2710,288 @@ def test_ambiguous_credential_rotation_never_uses_invalidated_old_recovery(
     disabled = auto.disable()
     assert disabled["mode"] == "off"
     assert revoke_calls == [("server-enrollment-1", "recovery-secret")]
+
+
+def test_enable_prefers_manual_share_grant_without_email_verification(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(enrollment_grant="cj_enroll_one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+
+    def create(_capabilities, **kwargs):
+        create_calls.append(dict(kwargs))
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["mode"] == "enabled"
+    assert len(create_calls) == 1
+    assert create_calls[0]["enrollment_grant"] == "cj_enroll_one-shot"
+    assert create_calls[0]["upload_token"] is None
+    persisted = config_module.load_config()
+    assert "recurring_enrollment_grant" not in persisted
+    assert "recurring_enrollment_grant_expires_at" not in persisted
+    assert "recurring_enrollment_grant_receipt_id" not in persisted
+    assert "recurring_enrollment_grant_issuer" not in persisted
+
+
+def test_enable_prefers_the_grant_over_a_live_manual_share_token(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A usable grant is consumed before the manual-share email token.
+
+    ``verified_email_token`` is the manual-share credential; burning it on
+    enrollment while the purpose-scoped grant idles to expiry would silently
+    cost the user their next manual share.
+    """
+
+    _save_scope_config(
+        upload_token="manual-share-token",
+        enrollment_grant="cj_enroll_one-shot",
+    )
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+
+    def create(_capabilities, **kwargs):
+        create_calls.append(dict(kwargs))
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["mode"] == "enabled"
+    assert create_calls[0]["enrollment_grant"] == "cj_enroll_one-shot"
+    assert create_calls[0]["upload_token"] is None
+    persisted = config_module.load_config()
+    # Only the grant was consumed; the manual-share token survives untouched.
+    assert "recurring_enrollment_grant" not in persisted
+    assert persisted["verified_email_token"] == "manual-share-token"
+
+
+def test_unsupported_server_grant_version_disables_only_the_grant_path(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A newer advertised grant version degrades to email verification.
+
+    It must not be sent to a server that no longer speaks this grant version,
+    and it must not be destroyed either — nothing consumed it.
+    """
+
+    _save_scope_config(enrollment_grant="cj_enroll_one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    capabilities = _capabilities()
+    capabilities["manual_share_enrollment_grant_version"] = 2
+    monkeypatch.setattr(
+        auto, "fetch_capabilities", lambda **_kwargs: capabilities
+    )
+    monkeypatch.setattr(
+        auto,
+        "create_enrollment",
+        lambda *_a, **_k: pytest.fail("the grant must not be sent"),
+    )
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "email_verification_required"
+    persisted = config_module.load_config()
+    assert persisted["recurring_enrollment_grant"] == "cj_enroll_one-shot"
+
+
+@pytest.mark.parametrize(
+    "rejection_code",
+    [
+        "email_verification_required",
+        "credential_invalid",
+        "credential_expired",
+        "credential_revoked",
+    ],
+)
+def test_rejected_manual_share_grant_falls_back_to_email_verification(
+    isolated_auto_upload,
+    monkeypatch,
+    rejection_code,
+):
+    _save_scope_config(enrollment_grant="cj_enroll_expired")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+
+    def reject(_capabilities, **_kwargs):
+        raise RecurringServiceError(
+            rejection_code,
+            "Fresh verified identity is required.",
+        )
+
+    monkeypatch.setattr(auto, "create_enrollment", reject)
+    profile = _current_authorization_profile_hash()
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=profile,
+    )
+
+    assert result["code"] == "email_verification_required"
+    persisted = config_module.load_config()
+    assert "recurring_enrollment_grant" not in persisted
+    assert auto.status()["enrollment_grant_available"] is False
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [4102444800, 4102444800.0, "4102444800"],
+)
+def test_manual_share_grant_accepts_supported_epoch_expirations(
+    isolated_auto_upload,
+    monkeypatch,
+    expires_at,
+):
+    _save_scope_config(enrollment_grant="cj_enroll_epoch")
+    config = config_module.load_config()
+    config["recurring_enrollment_grant_expires_at"] = expires_at
+    config_module.save_config(config)
+    monkeypatch.setattr(auto, "_configured_hosted_origin", lambda: ORIGIN)
+
+    assert auto.status()["enrollment_grant_available"] is True
+    assert (
+        auto._available_recurring_enrollment_grant(
+            config_module.load_config(),
+            origin=ORIGIN,
+            capability_version=1,
+        )
+        == "cj_enroll_epoch"
+    )
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [ORIGIN, "https://DATA.RAYWARD.AI", "https://data.rayward.ai/"],
+)
+def test_grant_issuer_survives_equivalent_origin_spellings(
+    isolated_auto_upload,
+    monkeypatch,
+    issuer,
+):
+    """A valid grant must not be lost to host casing or a trailing slash.
+
+    Both sides start from the same CLAWJOURNAL_SHARE_URL, but the issuer keeps
+    whatever the operator wrote while capability validation lowercases the host.
+    Comparing the raw spellings would silently force email verification forever
+    on an install that only differs cosmetically. Note this normalizes case, not
+    authority: a differing port is still a differing origin, as the port case in
+    ``test_grant_from_a_different_origin_is_never_offered_or_sent`` locks in.
+    """
+
+    _save_scope_config(enrollment_grant="cj_enroll_one-shot")
+    config = config_module.load_config()
+    config["recurring_enrollment_grant_issuer"] = issuer
+    config_module.save_config(config)
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+
+    def create(_capabilities, **kwargs):
+        create_calls.append(dict(kwargs))
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+
+    assert auto.status()["enrollment_grant_available"] is True
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["mode"] == "enabled"
+    assert create_calls[0]["enrollment_grant"] == "cj_enroll_one-shot"
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    ["https://evil.example.test", "https://data.rayward.ai:8443"],
+)
+def test_grant_from_a_different_origin_is_never_offered_or_sent(
+    isolated_auto_upload,
+    monkeypatch,
+    issuer,
+):
+    """A grant issued by another origin must not be advertised or put on the wire.
+
+    The workbench reads ``enrollment_grant_available`` to decide whether it can
+    skip email verification, so a status that ignores the issuer would send the
+    participant down a path enable is bound to refuse. A differing port is a
+    differing origin here, exactly as the capability endpoint pinning treats it.
+    """
+
+    _save_scope_config(enrollment_grant="cj_enroll_other-host")
+    config = config_module.load_config()
+    config["recurring_enrollment_grant_issuer"] = issuer
+    config_module.save_config(config)
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        auto,
+        "create_enrollment",
+        lambda *_a, **_k: pytest.fail("enrollment must not be attempted"),
+    )
+
+    assert auto.status()["enrollment_grant_available"] is False
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "email_verification_required"
 
 
 def test_enable_requires_exact_versions_then_commits_all_authority_transactionally(

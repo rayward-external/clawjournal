@@ -39,7 +39,12 @@ def add_auto_upload_parser(subparsers) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="auto_upload_command", required=True)
 
     enable = commands.add_parser("enable", help="Review terms and enable automatic sharing")
-    enable.add_argument("--agent", choices=["claude", "codex", "all"], default="all")
+    enable.add_argument(
+        "--agent",
+        choices=["auto", "claude", "codex", "all"],
+        default="auto",
+        help="SessionStart agent hook (default: infer from the accepted source scope)",
+    )
     enable.add_argument("--accept-authorization-version", default=None)
     enable.add_argument("--accept-retention-version", default=None)
     enable.add_argument("--accept-ownership-certification-version", default=None)
@@ -189,6 +194,12 @@ def _interactive_accept(
         "AI-PII: "
         + (f"enabled via {ai.get('backend')}" if ai.get("enabled") else "disabled")
     ))
+    # Transcribing each version is the affirmative act itself, not decoration.
+    # A bare [y/N] can be answered without reading the text it is attached to,
+    # and it makes the accepted version a value the client echoes back from the
+    # challenge rather than one the participant attested to. Recurring sharing
+    # uploads future traces without per-bundle review, so its acceptance keeps
+    # the deliberate friction even though the web checkboxes are lighter.
     try:
         entered_auth = input(
             _sanitize_terminal_line(

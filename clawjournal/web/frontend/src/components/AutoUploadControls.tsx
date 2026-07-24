@@ -164,6 +164,13 @@ function selectedAgent(status: AutoUploadStatus): AutoUploadAgent {
   return 'all';
 }
 
+function inferredAgent(sources: string[], fallback: AutoUploadAgent): AutoUploadAgent {
+  const selected = new Set(sources);
+  if (selected.has('claude') && !selected.has('codex')) return 'claude';
+  if (selected.has('codex') && !selected.has('claude')) return 'codex';
+  return fallback;
+}
+
 function StatusChip({ children, tone = 'neutral' }: {
   children: React.ReactNode;
   tone?: 'neutral' | 'good' | 'warning' | 'danger' | 'info';
@@ -213,9 +220,16 @@ interface AuthorizationDialogProps {
   initialStatus: AutoUploadStatus;
   onClose: () => void;
   onEnabled: (status: AutoUploadStatus) => void;
+  inline?: boolean;
 }
 
-function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: AuthorizationDialogProps) {
+function AuthorizationDialog({
+  open,
+  initialStatus,
+  onClose,
+  onEnabled,
+  inline = false,
+}: AuthorizationDialogProps) {
   const { toast } = useToast();
   const titleId = useId();
   const requestedRef = useRef(false);
@@ -283,6 +297,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       const next = challengeFromError(requestError);
       if (next) {
         setChallenge(next);
+        setAgent(current => inferredAgent(next.scope.sources, current));
       } else if (requiresEmailVerification(requestError)) {
         await showEmailVerification(
           'Verify your email before loading the recurring authorization.',
@@ -343,18 +358,18 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
   // focused element on close, so keyboard and screen-reader focus follow the
   // modal instead of staying on the background controls behind the overlay.
   useEffect(() => {
-    if (!open) return;
+    if (!open || inline) return;
     const previousFocus = document.activeElement as HTMLElement | null;
     dialogRef.current?.focus();
     return () => { previousFocus?.focus?.(); };
-  }, [open]);
+  }, [inline, open]);
 
   // Behave like a real modal: trap Tab within the dialog's focusables and
   // swallow every other page keystroke (capture phase) so background controls
   // can never be operated through the overlay. Escape dismisses unless a
   // mutating submit is in flight.
   useEffect(() => {
-    if (!open) return;
+    if (!open || inline) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation();
@@ -382,7 +397,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [dismissDialog, submitting, open]);
+  }, [dismissDialog, inline, submitting, open]);
 
   if (!open) return null;
 
@@ -431,7 +446,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
       // Updating an active enrollment uses its pinned active credential. Only
       // a new enrollment (or an explicit credential error returned below)
       // requires another one-shot email verification.
-      if (initialStatus.mode !== 'off') {
+      if (initialStatus.mode !== 'off' || initialStatus.enrollment_grant_available) {
         await enableWithAcceptedTerms();
         return;
       }
@@ -507,46 +522,66 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
 
   return (
     <div
-      role="presentation"
-      onMouseDown={event => { if (event.target === event.currentTarget && !submitting) dismissDialog(); }}
-      style={{
+      role={inline ? undefined : 'presentation'}
+      onMouseDown={event => {
+        if (!inline && event.target === event.currentTarget && !submitting) dismissDialog();
+      }}
+      style={inline ? {
+        margin: '20px auto', maxWidth: 680, padding: '18px 20px', textAlign: 'left',
+        border: `1px solid ${colors.primary200}`, borderRadius: 10,
+        background: colors.primary50,
+      } : {
         position: 'fixed', inset: 0, zIndex: 9998, padding: 20,
         display: 'grid', placeItems: 'center', background: 'rgba(27, 26, 23, 0.45)',
       }}
     >
       <section
         ref={dialogRef}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
+        tabIndex={inline ? undefined : -1}
+        role={inline ? 'region' : 'dialog'}
+        aria-modal={inline ? undefined : 'true'}
         aria-labelledby={titleId}
-        style={{
+        style={inline ? {
+          width: '100%',
+        } : {
           width: 'min(680px, calc(100vw - 40px))', maxHeight: 'calc(100vh - 40px)',
           overflow: 'auto', background: colors.white, borderRadius: 12,
           boxShadow: '0 18px 50px rgba(0,0,0,0.22)', padding: '22px 24px',
         }}
       >
         <h3 id={titleId} style={{ margin: '0 0 6px', fontSize: 18, color: colors.gray900 }}>
-          Authorize future automatic uploads
+          {inline ? 'Share future traces automatically?' : 'Authorize future automatic uploads'}
         </h3>
         <p style={{ margin: '0 0 18px', fontSize: 13, lineHeight: 1.55, color: colors.gray600 }}>
-          Future selected traces in this exact scope may be uploaded without you reviewing each
-          bundle. This is separate from the consent you gave for the bundle you just reviewed.
+          {inline
+            ? `Enable up to ${cap} eligible future traces every ${cadence} day${cadence === 1 ? '' : 's'} from the exact scope below. ${
+              initialStatus.enrollment_grant_available
+                ? 'The receipt from this share lets you enable it without verifying your email again.'
+                : 'If its receipt-issued enrollment grant is unavailable or expires, you will verify your email before enabling.'
+            }`
+            : 'Future selected traces in this exact scope may be uploaded without you reviewing each bundle. This is separate from the consent you gave for the bundle you just reviewed.'}
         </p>
 
-        <label style={{ display: 'block', marginBottom: 14, fontSize: 12.5, color: colors.gray700 }}>
-          Run on agent sessions
-          <select
-            value={agent}
-            disabled={loading}
-            onChange={event => setAgent(event.target.value as AutoUploadAgent)}
-            style={{ ...selectStyle, display: 'block', marginTop: 5, minWidth: 220 }}
-          >
-            <option value="all">Claude Code and Codex</option>
-            <option value="claude">Claude Code</option>
-            <option value="codex">Codex</option>
-          </select>
-        </label>
+        {new Set(scope.sources.filter(source => source === 'claude' || source === 'codex')).size === 1 ? (
+          <SummaryItem
+            label="Run on agent sessions"
+            value={scope.sources.includes('codex') ? 'Codex' : 'Claude Code'}
+          />
+        ) : (
+          <label style={{ display: 'block', marginBottom: 14, fontSize: 12.5, color: colors.gray700 }}>
+            Run on agent sessions
+            <select
+              value={agent}
+              disabled={loading}
+              onChange={event => setAgent(event.target.value as AutoUploadAgent)}
+              style={{ ...selectStyle, display: 'block', marginTop: 5, minWidth: 220 }}
+            >
+              <option value="all">Claude Code and Codex</option>
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
+          </label>
+        )}
 
         <div style={summaryGridStyle}>
           <SummaryItem label="Sources" value={compactList(scope.sources, 'No confirmed sources')} />
@@ -663,9 +698,14 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
             <div style={{ fontSize: 13, fontWeight: 650, color: colors.gray900 }}>
               Verify your email
             </div>
+            {/* This block is also reached from the settings panel while
+                rotating an active enrollment's credentials, where no grant was
+                ever issued. Naming one unconditionally would tell those users
+                a receipt grant expired when they never had one. */}
             <div style={{ fontSize: 12, lineHeight: 1.45, color: colors.gray600 }}>
-              The token used for the manual upload is single-use. Verify again to authorize this
-              recurring enrollment; your recurring terms selection above remains unchanged.
+              {initialStatus.enrollment_grant_available
+                ? 'The receipt-issued enrollment grant is unavailable or expired. Verify your email to continue; your recurring terms selection above remains unchanged.'
+                : 'Recurring enrollment needs its own single-use email verification. Verify to continue; your recurring terms selection above remains unchanged.'}
             </div>
             {tokenValid ? (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
@@ -745,7 +785,7 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}>
           <button disabled={submitting} onClick={dismissDialog} style={{ ...btnSecondary, ...disabledStyle(submitting) }}>
-            Cancel
+            {inline ? 'Not now' : 'Cancel'}
           </button>
           {!verificationRequired && (
             <button
@@ -753,7 +793,11 @@ function AuthorizationDialog({ open, initialStatus, onClose, onEnabled }: Author
               onClick={() => void accept()}
               style={{ ...btnPrimary, ...disabledStyle(!challenge || !accepted || !ownershipCertified || loading) }}
             >
-              {loading && challenge ? 'Checking verification…' : 'Enable automatic upload'}
+              {submitting
+                ? 'Enabling…'
+                : loading && challenge
+                  ? 'Refreshing and enabling…'
+                  : 'Enable automatic upload'}
             </button>
           )}
         </div>
@@ -794,7 +838,6 @@ function SummaryItem({ label, value }: { label: string; value: string }) {
 
 export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string | null }) {
   const [status, setStatus] = useState<AutoUploadStatus | null>(null);
-  const [dialogOpen, setDialogOpen] = useState(false);
   // Dismissal is scoped to the receipt it was shown for: "Not now" on one
   // share must not suppress the offer after every future manual share.
   const [dismissedReceipt, setDismissedReceipt] = useState<string | null>(() => {
@@ -824,33 +867,13 @@ export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string |
   if (!status || !status.ui_visible || dismissed || status.mode !== 'off' || !status.offer_available) return null;
 
   return (
-    <>
-      <div style={{
-        margin: '20px auto', maxWidth: 520, padding: '16px 18px', textAlign: 'left',
-        border: `1px solid ${colors.primary200}`, borderRadius: 10, background: colors.primary50,
-      }}>
-        <div style={{ fontSize: 14, fontWeight: 650, color: colors.gray900 }}>
-          Share future traces automatically?
-        </div>
-        <p style={{ margin: '6px 0 14px', fontSize: 12.5, lineHeight: 1.55, color: colors.gray700 }}>
-          Once a week, ClawJournal can select and upload up to {status.cap} eligible future traces
-          from your approved scope. Those future bundles upload without individual review. You will
-          see the exact scope and recurring terms before anything is enabled.
-        </p>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button onClick={() => setDialogOpen(true)} style={btnPrimary}>
-            Review and enable
-          </button>
-          <button onClick={dismiss} style={btnGhost}>Not now</button>
-        </div>
-      </div>
-      <AuthorizationDialog
-        open={dialogOpen}
-        initialStatus={status}
-        onClose={() => setDialogOpen(false)}
-        onEnabled={next => { setStatus(next); dismiss(); }}
-      />
-    </>
+    <AuthorizationDialog
+      inline
+      open
+      initialStatus={status}
+      onClose={dismiss}
+      onEnabled={next => { setStatus(next); dismiss(); }}
+    />
   );
 }
 

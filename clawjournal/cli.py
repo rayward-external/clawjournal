@@ -159,6 +159,7 @@ def _mask_config_for_display(config: Mapping[str, Any]) -> dict[str, Any]:
         "token",
         "secret",
         "credential",
+        "grant",
         "password",
         "api_key",
         "access_key",
