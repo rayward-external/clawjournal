@@ -947,19 +947,21 @@ def reinstall(
         # directly.  This parent already owns it, so mark the child to avoid a
         # recursive acquisition deadlock.
         child_env[INSTALL_LOCK_HELD_ENV] = "1"
-        child_env.pop(ACTIVE_PYTHON_ENV, None)
+        # Bootstrap through the interpreter that is running ClawJournal before
+        # either installer probes PATH. This is required for absolute desktop
+        # shortcuts and conda/custom environments whose Python is not exported.
+        child_env[ACTIVE_PYTHON_ENV] = sys.executable
         base_prefix = getattr(sys, "base_prefix", sys.prefix)
         if sys.prefix != base_prefix or hasattr(sys, "real_prefix"):
             # Console entry points run under the environment in their shebang.
-            # Keep the installer on that exact environment even when the user
-            # no longer has CLAWJOURNAL_VENV exported.
+            # Preserve its root for compatibility with the managed-venv path;
+            # ACTIVE_PYTHON supplies the exact executable used to bootstrap it.
             child_env["CLAWJOURNAL_VENV"] = sys.prefix
         else:
             # Editable installs are also supported directly in a user, conda
             # base, or system interpreter. Reinstall through that exact Python
             # instead of silently creating/updating ~/.clawjournal-venv.
             child_env.pop("CLAWJOURNAL_VENV", None)
-            child_env[ACTIVE_PYTHON_ENV] = sys.executable
         try:
             process_kwargs: dict[str, object] = {}
             if os.name == "posix":

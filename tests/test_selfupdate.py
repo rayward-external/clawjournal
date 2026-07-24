@@ -1321,16 +1321,19 @@ def test_reinstall_targets_the_active_virtual_environment(
     marker = fake_repo / "venv-seen"
     (scripts / "install.sh").write_text(
         "#!/bin/sh\n"
-        f'printf "%s" "${{CLAWJOURNAL_VENV:-unset}}" > "{marker}"\n'
+        f'printf "%s|%s" "${{CLAWJOURNAL_VENV:-unset}}" '
+        f'"${{CLAWJOURNAL_ACTIVE_PYTHON:-unset}}" > "{marker}"\n'
     )
     active_venv = tmp_path / "custom-venv"
+    active_python = active_venv / "bin" / "python"
     monkeypatch.setattr(selfupdate.sys, "prefix", str(active_venv))
     monkeypatch.setattr(selfupdate.sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(selfupdate.sys, "executable", str(active_python))
 
     result = selfupdate.reinstall(repo=fake_repo, capture=True)
 
     assert result["status"] == "reinstalled"
-    assert marker.read_text() == str(active_venv)
+    assert marker.read_text() == f"{active_venv}|{active_python}"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
