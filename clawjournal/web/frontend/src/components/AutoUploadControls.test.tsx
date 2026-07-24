@@ -16,7 +16,7 @@ function status(overrides: Partial<AutoUploadStatus> = {}): AutoUploadStatus {
     ui_visible: true,
     offer_available: false,
     enrollment_grant_available: false,
-    scope: { sources: [], projects: [] },
+    scope: { sources: [], projects: [], entries: [] },
     cap: 5,
     cadence_days: 1,
     ai: { enabled: false, backend: null },
@@ -457,7 +457,7 @@ describe('AutoUploadOffer', () => {
     }));
     vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(new ApiError(400, 'Scope too large', {
       code: 'scope_too_large',
-      message: 'The source x project scope exceeds the hosted limit of 200 entries; '
+      message: 'The exact source/project scope exceeds the hosted limit of 200 entries; '
         + 'exclude projects (config --exclude) or narrow the source scope first.',
       scope_blockers: ['scope_too_large'],
     }));
@@ -465,7 +465,7 @@ describe('AutoUploadOffer', () => {
     renderControl(<AutoUploadOffer manualReceiptId="receipt-oversized-scope" />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'This scope has too many source and project combinations',
+      'This scope has too many exact source/project pairs',
     );
     expect(screen.queryByText('Choose what automatic uploads may include')).not.toBeInTheDocument();
   });
@@ -474,11 +474,19 @@ describe('AutoUploadOffer', () => {
     const initial = status({
       offer_available: true,
       enrollment_grant_available: true,
-      scope: { sources: ['codex'], projects: ['project-a'] },
+      scope: {
+        sources: ['codex'],
+        projects: ['project-a'],
+        entries: [['codex', 'project-a']],
+      },
     });
     const enabled = status({
       mode: 'enabled',
-      scope: { sources: ['codex'], projects: ['project-a'] },
+      scope: {
+        sources: ['codex'],
+        projects: ['project-a'],
+        entries: [['codex', 'project-a']],
+      },
     });
     const grantChallenge = authorizationRequired();
     (grantChallenge.body.scope as Record<string, unknown>).sources = ['codex'];
@@ -585,7 +593,11 @@ describe('AutoUploadPanel authorization', () => {
     const initial = status({
       mode: 'enabled',
       run_now_allowed: true,
-      scope: { sources: ['claude'], projects: ['project-a'] },
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
       authorization: { version: 'recurring-v1', text: 'old terms' },
       hooks: [
         { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
@@ -659,7 +671,11 @@ describe('AutoUploadPanel authorization', () => {
     // ever issued on this path, so it must not claim one expired.
     const initial = status({
       mode: 'enabled',
-      scope: { sources: ['claude'], projects: ['project-a'] },
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
       hooks: [
         { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
         { agent: 'codex', selected: false, configured: true, installed: true, last_observed_at: null },
@@ -693,6 +709,33 @@ describe('AutoUploadPanel authorization', () => {
 });
 
 describe('AutoUploadPanel status and controls', () => {
+  it('shows every durable exact pair instead of implying a Cartesian scope', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      mode: 'enabled',
+      scope: {
+        sources: ['claude', 'codex'],
+        projects: ['alpha', 'beta'],
+        entries: [
+          ['claude', 'alpha'],
+          ['codex', 'beta'],
+        ],
+      },
+    }));
+
+    renderControl(<AutoUploadPanel />);
+
+    const title = await screen.findByText(
+      'Exact enrolled scope · 2 source/project pairs',
+    );
+    const scopeBlock = title.parentElement;
+    expect(scopeBlock).toHaveTextContent('Claude Code → alpha');
+    expect(scopeBlock).toHaveTextContent('Codex → beta');
+    expect(scopeBlock).not.toHaveTextContent('Claude Code → beta');
+    expect(scopeBlock).not.toHaveTextContent('Codex → alpha');
+    expect(screen.getByText('Sources represented')).toBeInTheDocument();
+    expect(screen.getByText('Projects represented')).toBeInTheDocument();
+  });
+
   it('renders every mode, health, and transient overlay chip', async () => {
     const statusSpy = vi.spyOn(api.autoUpload, 'status');
 
@@ -813,7 +856,11 @@ describe('AutoUploadPanel status and controls', () => {
       eligibility: {
         selected_count: 1,
         eligible_count: 3,
-        exclusion_counts: { held_or_embargoed: 2, source_excluded: 4 },
+        exclusion_counts: {
+          held_or_embargoed: 2,
+          source_excluded: 4,
+          scope_pair_excluded: 1,
+        },
       },
     }));
 
@@ -822,6 +869,7 @@ describe('AutoUploadPanel status and controls', () => {
     const reviewLink = await screen.findByRole('link', { name: 'Review 2 in Share' });
     expect(reviewLink).toHaveAttribute('href', '/share');
     expect(screen.getByText('Outside enrolled sources: 4')).toBeInTheDocument();
+    expect(screen.getByText('Outside exact enrolled scope: 1')).toBeInTheDocument();
   });
 
   it('requires an explicit retry for pending revocation and calls disable again', async () => {
@@ -847,7 +895,11 @@ describe('AuthorizationDialog daemon version skew', () => {
     const enrolled = status({
       mode: 'enabled',
       run_now_allowed: true,
-      scope: { sources: ['claude'], projects: ['project-a'] },
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
       authorization: { version: 'recurring-v1', text: 'terms' },
       hooks: [
         { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
@@ -871,7 +923,11 @@ describe('AuthorizationDialog daemon version skew', () => {
     const enrolled = status({
       mode: 'enabled',
       run_now_allowed: true,
-      scope: { sources: ['claude'], projects: ['project-a'] },
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
       authorization: { version: 'recurring-v2', text: 'terms' },
       hooks: [
         { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
@@ -898,7 +954,11 @@ describe('AuthorizationDialog focus and dismissal', () => {
     const enrolled = status({
       mode: 'enabled',
       run_now_allowed: true,
-      scope: { sources: ['claude'], projects: ['project-a'] },
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
       authorization: { version: 'recurring-v1', text: 'terms' },
       hooks: [
         { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
@@ -927,7 +987,11 @@ describe('AuthorizationDialog focus and dismissal', () => {
     const enrolled = status({
       mode: 'enabled',
       run_now_allowed: true,
-      scope: { sources: ['claude'], projects: ['project-a'] },
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
       authorization: { version: 'recurring-v1', text: 'terms' },
       hooks: [
         { agent: 'claude', selected: true, configured: true, installed: true, last_observed_at: null },
