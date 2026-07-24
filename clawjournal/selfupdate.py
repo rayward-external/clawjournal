@@ -35,6 +35,7 @@ from .config import CONFIG_DIR
 
 STAMP_FILENAME = "last_update_check"
 PENDING_REINSTALL_FILENAME = "pending_reinstall.json"
+FRONTEND_BUILD_REVISION_FILENAME = ".clawjournal-build-revision"
 THROTTLE_SECONDS = 60 * 60  # once per hour
 FETCH_TIMEOUT_SECONDS = 8
 APPLY_TIMEOUT_SECONDS = 5
@@ -457,6 +458,61 @@ def _frontend_is_built(repo: Path) -> bool:
     return (repo / "clawjournal" / "web" / "frontend" / "dist" / "index.html").exists()
 
 
+def _frontend_build_revision_path(repo: Path) -> Path:
+    return (
+        repo
+        / "clawjournal"
+        / "web"
+        / "frontend"
+        / "dist"
+        / FRONTEND_BUILD_REVISION_FILENAME
+    )
+
+
+def record_frontend_build(repo: Path, revision: str | None = None) -> bool:
+    """Stamp a successfully completed workbench build with its source revision.
+
+    Source mtimes can show that a build is stale when a file changes, but they
+    cannot show that a pulled commit deleted an input. Installers call this
+    only after npm completes successfully, so pending frontend work is cleared
+    only when the built output is known to cover the requested checkout.
+    """
+    built_revision = revision or _rev_parse(repo, "HEAD")
+    if not built_revision:
+        return False
+    path = _frontend_build_revision_path(repo)
+    tmp = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(f"{built_revision}\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        _debug(f"could not record frontend build revision: {exc}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _frontend_build_covers(repo: Path, revision: str) -> bool:
+    """Return whether the last successful build includes ``revision``."""
+    try:
+        built_revision = _frontend_build_revision_path(repo).read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        return False
+    if not built_revision:
+        return False
+    if built_revision == revision:
+        return True
+    # A later successful build also reconciles an older pending frontend
+    # revision. Unknown or pruned revisions fail closed and retain the notice.
+    return _is_ancestor(repo, revision, built_revision) is True
+
+
 def _frontend_stale(repo: Path) -> bool:
     """True when the built workbench is older than its sources.
 
@@ -566,10 +622,14 @@ def finalize_install(
     remaining = set(raw_reasons) if isinstance(raw_reasons, list) else set()
     remaining.discard("deps")
 
-    frontend_current = (
-        _frontend_is_built(target) and not _frontend_stale(target)
-    )
+    frontend_current = _frontend_is_built(target) and not _frontend_stale(target)
     if frontend_requested:
+        required_revision = str(record.get("to") or _rev_parse(target, "HEAD") or "")
+        frontend_current = (
+            frontend_current
+            and bool(required_revision)
+            and _frontend_build_covers(target, required_revision)
+        )
         if frontend_current:
             remaining.discard("frontend")
         else:
@@ -1075,8 +1135,13 @@ def maybe_self_update(*, now: float | None = None) -> str:
     return "spawned" if spawned else "spawn-failed"
 
 
-def selfupdate_sync(repo: Path | None = None, *, check_only: bool = False,
-                    force: bool = False) -> dict[str, object]:
+def selfupdate_sync(
+    repo: Path | None = None,
+    *,
+    check_only: bool = False,
+    force: bool = False,
+    _lock_held: bool = False,
+) -> dict[str, object]:
     """Synchronous variant for the `clawjournal selfupdate` subcommand.
 
     Returns a small dict describing what happened. Surfaces errors as
@@ -1144,14 +1209,103 @@ def selfupdate_sync(repo: Path | None = None, *, check_only: bool = False,
         info["status"] = "behind"
         return info
 
-    update = _apply_fast_forward(target, upstream_ref, force=force)
-    if update is None or update.returncode != 0:
-        info["status"] = "update-failed"
-        if update is not None:
-            info["stderr"] = update.stderr.decode("utf-8", "replace").strip()
-        return info
+    owns_lock = False
+    if not _lock_held:
+        if not _claim_reinstall_lock():
+            info["status"] = "reinstall-in-progress"
+            return info
+        owns_lock = True
+    try:
+        # Fetch and preflight happen outside the lock for ordinary syncs. A
+        # direct installer or background updater could finish between that
+        # preflight and our claim, so repeat every mutable check while owning
+        # the checkout/install critical section.
+        branch = _current_branch(target)
+        info["branch"] = branch
+        if branch != DEFAULT_BRANCH:
+            info["status"] = f"branch-{branch or 'unknown'}"
+            return info
+        if not force:
+            is_dirty, err = _git_status_ok(target)
+            if is_dirty is None:
+                info["status"] = f"skip-{err}"
+                return info
+            if is_dirty:
+                info["status"] = "dirty"
+                return info
 
-    info["status"] = "updated"
-    info["reinstall"] = _record_reinstall_needs(target, head_sha, upstream_sha)
-    _write_stamp(time.time())
-    return info
+        head_sha = _rev_parse(target, "HEAD") or ""
+        upstream_sha = _rev_parse(target, upstream_ref) or ""
+        info["head"] = head_sha
+        info["upstream"] = upstream_sha
+        if not head_sha or not upstream_sha:
+            info["status"] = "rev-parse-failed"
+            return info
+
+        relation = _history_relation(target, head_sha, upstream_sha)
+        info["relation"] = relation
+        if relation == "up-to-date":
+            info["status"] = "up-to-date"
+            _write_stamp(time.time())
+            return info
+        if relation in {"ahead", "diverged", "ancestry-failed"}:
+            info["status"] = relation
+            return info
+
+        update = _apply_fast_forward(target, upstream_ref, force=force)
+        if update is None or update.returncode != 0:
+            info["status"] = "update-failed"
+            if update is not None:
+                info["stderr"] = update.stderr.decode("utf-8", "replace").strip()
+            return info
+
+        info["status"] = "updated"
+        info["reinstall"] = _record_reinstall_needs(target, head_sha, upstream_sha)
+        _write_stamp(time.time())
+        return info
+    finally:
+        if owns_lock:
+            _release_reinstall_lock()
+
+
+def selfupdate_and_reinstall(
+    repo: Path | None = None,
+    *,
+    force: bool = False,
+    capture: bool = False,
+    with_frontend: bool = False,
+    with_sharing: bool = False,
+) -> dict[str, object]:
+    """Synchronize and reinstall under one checkout/install critical section."""
+    target = repo or _package_repo_root()
+    if target is None:
+        result = selfupdate_sync(repo=target, force=force)
+        result["reinstall_result"] = {
+            "status": "skipped-update-blocked",
+            "update_status": result.get("status"),
+        }
+        return result
+    if not _claim_reinstall_lock():
+        return {
+            "repo": str(target),
+            "status": "reinstall-in-progress",
+            "reinstall_result": {"status": "reinstall-in-progress"},
+        }
+    try:
+        result = selfupdate_sync(repo=target, force=force, _lock_held=True)
+        if result.get("status") in {"updated", "up-to-date"}:
+            result["reinstall_result"] = reinstall(
+                repo=target,
+                capture=capture,
+                with_frontend=with_frontend,
+                with_sharing=with_sharing,
+                _lock_held=True,
+            )
+        else:
+            result["reinstall_result"] = {
+                "status": "skipped-update-blocked",
+                "update_status": result.get("status"),
+            }
+        return result
+    finally:
+        _release_reinstall_lock()

@@ -238,6 +238,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # 4) Optional frontend build. Failures here are non-fatal — the CLI install
 #    already succeeded; only the opt-in frontend is missing.
 if ($WithFrontend) {
+    $frontendBuildSucceeded = $false
     $npm = Get-Command npm -ErrorAction SilentlyContinue
     if (-not $npm) {
         Write-Warning "-WithFrontend requested but npm not found. Install Node.js (https://nodejs.org) and re-run."
@@ -252,10 +253,24 @@ if ($WithFrontend) {
                 & npm run build --silent
                 if ($LASTEXITCODE -ne 0) {
                     Write-Warning "npm run build failed (exit $LASTEXITCODE); workbench not built. The CLI is installed."
+                } else {
+                    $frontendBuildSucceeded = $true
                 }
             }
         } finally {
             Pop-Location
+        }
+        if ($frontendBuildSucceeded) {
+            # A revision stamp detects source deletions that mtime checks
+            # cannot see. Failure to stamp is safe: finalization stays pending.
+            $recordBuildCode = 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from clawjournal.selfupdate import record_frontend_build; record_frontend_build(Path(sys.argv[1]))'
+            $previousBuildEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                & $VenvPy -c $recordBuildCode $RepoDir *> $null
+            } finally {
+                $ErrorActionPreference = $previousBuildEap
+            }
         }
     }
 }

@@ -3873,6 +3873,11 @@ def _render_selfupdate_status(result: dict) -> str:
         return f"Fetch failed: {result.get('stderr', '')}".rstrip()
     if status == "update-failed":
         return f"Update failed: {result.get('stderr', '')}".rstrip()
+    if status == "reinstall-in-progress":
+        return (
+            "Skipped: another checkout update or install is already running. "
+            "Try again in a few minutes."
+        )
     return f"selfupdate status: {status}"
 
 
@@ -5379,7 +5384,7 @@ def main() -> None:
             clear_pending_reinstall,
             finalize_install,
             pending_reinstall_notice,
-            reinstall as run_reinstall,
+            selfupdate_and_reinstall,
             selfupdate_sync,
         )
 
@@ -5411,31 +5416,17 @@ def main() -> None:
             )
             sys.exit(2)
 
-        result = selfupdate_sync(check_only=args.check, force=args.force)
-
-        if args.reinstall and result.get("status") in {"updated", "up-to-date"}:
-            # An explicit reinstall is authoritative even when HEAD is
-            # already current. Older auto-updaters had no pending record, so
-            # skipping here could leave historical dependency or scanner
-            # drift untouched while claiming the install was aligned.
-            result = {
-                **result,
-                "reinstall_result": run_reinstall(
-                    capture=args.json,
-                    with_frontend=args.with_frontend,
-                    with_sharing=args.with_sharing,
-                ),
-            }
-        elif args.reinstall:
-            # A blocked synchronization must not install from the dirty,
-            # divergent, or otherwise unverified checkout.
-            result = {
-                **result,
-                "reinstall_result": {
-                    "status": "skipped-update-blocked",
-                    "update_status": result.get("status"),
-                },
-            }
+        if args.reinstall:
+            # Keep checkout movement, pending-reason recording, and the
+            # requested install inside one shared critical section.
+            result = selfupdate_and_reinstall(
+                force=args.force,
+                capture=args.json,
+                with_frontend=args.with_frontend,
+                with_sharing=args.with_sharing,
+            )
+        else:
+            result = selfupdate_sync(check_only=args.check, force=args.force)
 
         exit_code = _selfupdate_exit_code(result)
         if args.json:

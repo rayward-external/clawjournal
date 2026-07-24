@@ -208,7 +208,12 @@ if [ "$WITH_FRONTEND" -eq 1 ]; then
 EOF
   else
     echo "-> Building browser workbench"
-    if ! ( cd "$REPO_DIR/clawjournal/web/frontend" && npm install --silent && npm run build --silent ); then
+    if ( cd "$REPO_DIR/clawjournal/web/frontend" && npm install --silent && npm run build --silent ); then
+      # A revision stamp is required in addition to mtimes: deleted frontend
+      # inputs leave no newer file behind for a staleness check to discover.
+      "$VENV_PY" -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from clawjournal.selfupdate import record_frontend_build; record_frontend_build(Path(sys.argv[1]))' \
+        "$REPO_DIR" >/dev/null 2>&1 || true
+    else
       echo "[!] Frontend build failed. The CLI is installed; re-run with --with-frontend after fixing the build." >&2
     fi
   fi

@@ -20,6 +20,7 @@ def test_posix_installer_supports_managed_sharing_dependencies():
     assert '"$VENV_BIN/clawjournal" trufflehog install' in script
     assert "--finalize-install" in script
     assert "record_install_sync" in script
+    assert "record_frontend_build" in script
     assert "install_lock.py" in script
     assert "CLAWJOURNAL_INSTALL_LOCK_HELD" in script
     assert "merge-base --is-ancestor" in script
@@ -45,6 +46,7 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     assert "& $ClawJournalExe trufflehog install" in script
     assert "--finalize-install" in script
     assert "record_install_sync" in script
+    assert "record_frontend_build" in script
     assert "install_lock.py" in script
     assert "CLAWJOURNAL_INSTALL_LOCK_HELD" in script
     assert "merge-base --is-ancestor" in script

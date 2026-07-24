@@ -427,6 +427,51 @@ def test_selfupdate_sync_applies_fast_forward(
     assert (fake_repo / "NEW").exists()
 
 
+def test_selfupdate_sync_does_not_fast_forward_during_install(
+    isolated_config_dir, fake_repo, tmp_path
+):
+    """Synchronous updates share the installer's checkout transition lock."""
+    remote = _wire_remote(fake_repo, tmp_path)
+    old_head = _head(fake_repo)
+    _push_upstream_change(remote, tmp_path, "NEW")
+
+    assert selfupdate._claim_reinstall_lock() is True
+    try:
+        result = selfupdate.selfupdate_sync(repo=fake_repo)
+    finally:
+        selfupdate._release_reinstall_lock()
+
+    assert result["status"] == "reinstall-in-progress"
+    assert _head(fake_repo) == old_head
+    assert not (fake_repo / "NEW").exists()
+
+
+def test_selfupdate_and_reinstall_keeps_one_lock_across_both_steps(
+    monkeypatch, isolated_config_dir, fake_repo
+):
+    observed = []
+
+    def fake_sync(**kwargs):
+        observed.append(("sync", selfupdate.reinstall_in_progress(), kwargs))
+        return {"status": "up-to-date"}
+
+    def fake_reinstall(**kwargs):
+        observed.append(("reinstall", selfupdate.reinstall_in_progress(), kwargs))
+        return {"status": "reinstalled"}
+
+    monkeypatch.setattr(selfupdate, "selfupdate_sync", fake_sync)
+    monkeypatch.setattr(selfupdate, "reinstall", fake_reinstall)
+
+    result = selfupdate.selfupdate_and_reinstall(repo=fake_repo, capture=True)
+
+    assert result["reinstall_result"]["status"] == "reinstalled"
+    assert [step for step, _, _ in observed] == ["sync", "reinstall"]
+    assert all(lock_owned for _, lock_owned, _ in observed)
+    assert observed[0][2]["_lock_held"] is True
+    assert observed[1][2]["_lock_held"] is True
+    assert selfupdate.reinstall_in_progress() is False
+
+
 def test_selfupdate_sync_skips_local_ahead_without_resetting(
     monkeypatch, isolated_config_dir, fake_repo, tmp_path
 ):
@@ -567,7 +612,7 @@ def test_cli_should_auto_update_skips_help_and_version():
 
 @pytest.mark.parametrize("json_mode", [False, True])
 def test_cli_reinstall_failure_exits_nonzero(
-    monkeypatch, capsys, json_mode
+    monkeypatch, capsys, isolated_config_dir, json_mode
 ):
     """Automation must not continue after the installer fails."""
     from clawjournal import cli
@@ -608,11 +653,12 @@ def test_cli_reinstall_failure_exits_nonzero(
         "diverged",
         "fetch-failed",
         "update-failed",
+        "reinstall-in-progress",
         "not-a-checkout",
     ],
 )
 def test_cli_blocked_sync_never_runs_reinstall(
-    monkeypatch, capsys, status
+    monkeypatch, capsys, isolated_config_dir, status
 ):
     """A blocked update must leave the existing checkout uninstalled."""
     from clawjournal import cli
@@ -643,7 +689,7 @@ def test_cli_blocked_sync_never_runs_reinstall(
 
 
 def test_cli_explicit_reinstall_runs_even_when_checkout_is_current(
-    monkeypatch, capsys
+    monkeypatch, capsys, isolated_config_dir
 ):
     """Legacy installs can request optional components that are still absent."""
     from clawjournal import cli
@@ -677,11 +723,12 @@ def test_cli_explicit_reinstall_runs_even_when_checkout_is_current(
 
     cli.main()
 
-    assert calls == [{
-        "capture": True,
-        "with_frontend": True,
-        "with_sharing": True,
-    }]
+    assert len(calls) == 1
+    assert calls[0]["repo"] == Path(__file__).resolve().parents[1]
+    assert calls[0]["capture"] is True
+    assert calls[0]["with_frontend"] is True
+    assert calls[0]["with_sharing"] is True
+    assert calls[0]["_lock_held"] is True
     assert '"status": "reinstalled"' in capsys.readouterr().out
 
 
@@ -1024,6 +1071,46 @@ def test_finalize_install_preserves_unrequested_optional_reasons(
     ]
 
 
+def test_frontend_deletion_stays_pending_until_new_revision_is_built(
+    isolated_config_dir, fake_repo
+):
+    """A deletion has no newer source mtime, so the build stamp must catch it."""
+    html = _build_fake_dist(fake_repo)
+    source = fake_repo / "clawjournal" / "web" / "frontend" / "src" / "old.ts"
+    source.parent.mkdir(parents=True)
+    source.write_text("old\n")
+    old_sha = _commit_file(
+        fake_repo,
+        "clawjournal/web/frontend/src/old.ts",
+        "old\n",
+        "add frontend input",
+    )
+    assert selfupdate.record_frontend_build(fake_repo, old_sha) is True
+    now = time.time()
+    os.utime(html, (now, now))
+    source.unlink()
+    subprocess.run(
+        ["git", "-C", str(fake_repo), "add", "-u"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(fake_repo), "commit", "--quiet", "-m", "delete frontend input"],
+        check=True,
+    )
+    new_sha = _head(fake_repo)
+    selfupdate.record_pending_reinstall(old_sha, new_sha, ["frontend"])
+
+    result = selfupdate.finalize_install(
+        repo=fake_repo,
+        frontend_requested=True,
+    )
+
+    assert selfupdate._frontend_stale(fake_repo) is False
+    assert result["frontend_current"] is False
+    assert result["remaining"] == ["frontend"]
+    assert selfupdate.read_pending_reinstall()["reasons"] == ["frontend"]
+
+
 def test_direct_sync_records_optional_changes_before_finalization(
     isolated_config_dir, fake_repo
 ):
@@ -1218,6 +1305,7 @@ def test_reinstall_clears_when_workbench_build_is_current(
     os.utime(older, (now - 100, now - 100))
     os.utime(html, (now, now))
     selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["frontend"])
+    assert selfupdate.record_frontend_build(fake_repo, "b" * 40) is True
 
     result = selfupdate.reinstall(repo=fake_repo, capture=True)
 
