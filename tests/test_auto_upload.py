@@ -2749,6 +2749,89 @@ def test_enable_prefers_manual_share_grant_without_email_verification(
     assert "recurring_enrollment_grant_issuer" not in persisted
 
 
+def test_enable_prefers_the_grant_over_a_live_manual_share_token(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A usable grant is consumed before the manual-share email token.
+
+    ``verified_email_token`` is the manual-share credential; burning it on
+    enrollment while the purpose-scoped grant idles to expiry would silently
+    cost the user their next manual share.
+    """
+
+    _save_scope_config(
+        upload_token="manual-share-token",
+        enrollment_grant="cj_enroll_one-shot",
+    )
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    create_calls: list[dict[str, Any]] = []
+
+    def create(_capabilities, **kwargs):
+        create_calls.append(dict(kwargs))
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", create)
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["mode"] == "enabled"
+    assert create_calls[0]["enrollment_grant"] == "cj_enroll_one-shot"
+    assert create_calls[0]["upload_token"] is None
+    persisted = config_module.load_config()
+    # Only the grant was consumed; the manual-share token survives untouched.
+    assert "recurring_enrollment_grant" not in persisted
+    assert persisted["verified_email_token"] == "manual-share-token"
+
+
+def test_unsupported_server_grant_version_disables_only_the_grant_path(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    """A newer advertised grant version degrades to email verification.
+
+    It must not be sent to a server that no longer speaks this grant version,
+    and it must not be destroyed either — nothing consumed it.
+    """
+
+    _save_scope_config(enrollment_grant="cj_enroll_one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    capabilities = _capabilities()
+    capabilities["manual_share_enrollment_grant_version"] = 2
+    monkeypatch.setattr(
+        auto, "fetch_capabilities", lambda **_kwargs: capabilities
+    )
+    monkeypatch.setattr(
+        auto,
+        "create_enrollment",
+        lambda *_a, **_k: pytest.fail("the grant must not be sent"),
+    )
+
+    result = auto.enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash=_current_authorization_profile_hash(),
+    )
+
+    assert result["code"] == "email_verification_required"
+    persisted = config_module.load_config()
+    assert persisted["recurring_enrollment_grant"] == "cj_enroll_one-shot"
+
+
 @pytest.mark.parametrize(
     "rejection_code",
     [

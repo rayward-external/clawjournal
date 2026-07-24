@@ -59,14 +59,29 @@ def test_capabilities_require_every_safety_contract():
 
 @pytest.mark.parametrize(
     "grant_version",
-    [True, 1.0, "1", 2],
+    [True, 1.0, "1", 2, None],
 )
-def test_capabilities_require_an_exact_integer_grant_version(grant_version):
-    with pytest.raises(client.CapabilityError, match="enrollment-grant"):
-        client.validate_capabilities(
-            _caps(manual_share_enrollment_grant_version=grant_version),
-            origin="https://data.rayward.ai",
-        )
+def test_unknown_grant_version_never_fails_the_capability_document(grant_version):
+    """The grant is a convenience on top of email verification.
+
+    A server advertising a different (or malformed) grant version must only
+    disable the grant shortcut — failing validation here would block every
+    enrollment path, email verification included, until a client upgrade.
+    """
+
+    validated = client.validate_capabilities(
+        _caps(manual_share_enrollment_grant_version=grant_version),
+        origin="https://data.rayward.ai",
+    )
+
+    assert validated["recurring_enrollment_url"]
+    assert not client.grant_capability_version_supported(grant_version)
+
+
+def test_grant_version_support_requires_the_exact_integer():
+    assert client.grant_capability_version_supported(1) is True
+    # Python bools compare equal to ints; True must not pass as version 1.
+    assert client.grant_capability_version_supported(True) is False
 
 
 def test_capabilities_reject_cross_origin_endpoint():

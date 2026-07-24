@@ -154,6 +154,16 @@ DEFAULT_CONFIG: ClawJournalConfig = {
 _KNOWN_PREFIXES = ("claude:", "claude-science:", "codex:", "gemini:", "opencode:", "openclaw:", "kimi:", "cline:", "workbuddy:", "custom:")
 _BOTH_SOURCES = ("claude", "codex")
 
+# The receipt-issued recurring-enrollment grant travels as one unit: the
+# secret, its expiry, the receipt it is bound to, and the issuing origin.
+# Every writer that stores or clears it must touch all four keys.
+RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS = (
+    "recurring_enrollment_grant",
+    "recurring_enrollment_grant_expires_at",
+    "recurring_enrollment_grant_receipt_id",
+    "recurring_enrollment_grant_issuer",
+)
+
 
 def load_config() -> ClawJournalConfig:
     if CONFIG_FILE.exists():

@@ -44,6 +44,7 @@ from .auto_upload_client import (
     fetch_authorization,
     fetch_capabilities,
     get_enrollment,
+    grant_capability_version_supported,
     lookup_receipt,
     recovery_capabilities,
     revoke_enrollment,
@@ -58,7 +59,12 @@ from .auto_upload_credentials import (
     remove_active_token,
     write_credentials,
 )
-from .config import load_config, save_config, source_scope_sources
+from .config import (
+    RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
+    load_config,
+    save_config,
+    source_scope_sources,
+)
 from .paths import atomic_write_text, ensure_hash_salt
 from .raw_sources import (
     RawFingerprint,
@@ -248,14 +254,6 @@ def _parse_expiry_time(value: Any) -> datetime | None:
         return None
 
 
-_RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS = (
-    "recurring_enrollment_grant",
-    "recurring_enrollment_grant_expires_at",
-    "recurring_enrollment_grant_receipt_id",
-    "recurring_enrollment_grant_issuer",
-)
-
-
 def _available_recurring_enrollment_grant(
     config: Mapping[str, Any],
     *,
@@ -281,7 +279,7 @@ def _available_recurring_enrollment_grant(
         not grant
         or expires_at is None
         or expires_at <= _now() + timedelta(seconds=60)
-        or capability_version != MANUAL_SHARE_ENROLLMENT_GRANT_VERSION
+        or not grant_capability_version_supported(capability_version)
         or comparable_origin(issuer) != comparable_origin(origin)
     ):
         return None
@@ -289,13 +287,19 @@ def _available_recurring_enrollment_grant(
 
 
 def _configured_hosted_origin() -> str | None:
-    """The origin this install would enroll against, without a network call."""
+    """The origin this install would enroll against, without a network call.
+
+    The lazy import avoids a module-level cycle (daemon already imports this
+    module); RuntimeError is how ``_hosted_api_base`` reports a missing or
+    invalid share URL. Anything else should surface — a swallowed bug here
+    would silently report "no grant" forever.
+    """
 
     try:
         from .workbench.daemon import _hosted_api_base
 
         return _hosted_api_base()
-    except Exception:
+    except (ImportError, RuntimeError):
         return None
 
 
@@ -318,7 +322,7 @@ def _status_grant_available(config: Mapping[str, Any]) -> bool:
 
 
 def _remove_recurring_enrollment_grant(config: dict[str, Any]) -> None:
-    for key in _RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS:
+    for key in RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS:
         config.pop(key, None)
 
 
@@ -1554,10 +1558,17 @@ def enable(
                         "manual_share_enrollment_grant_version"
                     ),
                 )
-                if upload_token:
-                    sent_identity_kind = "upload_token"
-                elif enrollment_grant:
+                # Prefer the purpose-scoped enrollment grant: it exists only to
+                # authorize this enrollment, while verified_email_token is the
+                # manual-share credential — consuming the token here when a
+                # usable grant is idle would silently cost the user their next
+                # manual share and let the grant expire unused. If the server
+                # rejects the grant, the fallback below removes it and a retry
+                # finds the still-present token.
+                if enrollment_grant:
                     sent_identity_kind = "enrollment_grant"
+                elif upload_token:
+                    sent_identity_kind = "upload_token"
                 else:
                     raise AutoUploadError(
                         "email_verification_required",

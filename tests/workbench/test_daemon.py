@@ -3595,6 +3595,42 @@ class TestVerifyEmailAPI:
         assert saved["pending_verification_id"] == "verify-123"
         assert saved["pending_verification_email"] == "test@university.edu"
 
+    def test_switching_identities_clears_the_enrollment_grant(self, monkeypatch):
+        """A grant issued to one verified email must not survive a new identity.
+
+        Re-verifying the same email keeps it: nothing about the grant's
+        authority changed, and destroying it would force the second email
+        verification the grant exists to avoid.
+        """
+        from clawjournal.workbench.daemon import request_email_verification
+
+        grant_state = {
+            "recurring_enrollment_grant": "cj_enroll_one-shot",
+            "recurring_enrollment_grant_expires_at": "2099-01-01T00:00:00+00:00",
+            "recurring_enrollment_grant_receipt_id": "rcpt-1",
+            "recurring_enrollment_grant_issuer": "https://hosted.example.test",
+        }
+        snapshots: list[dict] = []
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"verified_email": "old@university.edu", **grant_state},
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.save_config",
+            lambda config: snapshots.append(dict(config)) or True,
+        )
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=_mock_urlopen_factory()):
+            request_email_verification("old@university.edu")
+            request_email_verification("new@university.edu")
+
+        same_identity, new_identity = snapshots
+        for key in grant_state:
+            assert same_identity[key] == grant_state[key]
+            assert key not in new_identity
+        assert "verified_email_token" not in new_identity
+
     def test_confirm_email_verification_persists_upload_token_and_expiry(self, monkeypatch):
         from clawjournal.workbench.daemon import confirm_email_verification
 

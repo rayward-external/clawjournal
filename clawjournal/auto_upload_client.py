@@ -25,6 +25,24 @@ RECURRING_UPLOAD_API_VERSION = 2
 RECURRING_CLIENT_PROTOCOL_VERSION = "2"
 RECURRING_CADENCE_DAYS = 1
 MANUAL_SHARE_ENROLLMENT_GRANT_VERSION = 1
+
+
+def grant_capability_version_supported(value: Any) -> bool:
+    """Exact-integer check for the advertised enrollment-grant version.
+
+    The grant is an optional convenience on top of email verification, so an
+    unknown or malformed advertised version must only disable the grant path —
+    never fail the whole capability document, which would block enrollment for
+    every client until an upgrade. Strict typing matters here because Python
+    bools compare equal to ints: a server sending ``true`` must not pass as
+    version 1.
+    """
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value == MANUAL_SHARE_ENROLLMENT_GRANT_VERSION
+    )
 # Mirrors the hosted RECURRING_SCOPE_MAX_ENTRIES contract limit so oversized
 # scopes fail fast locally instead of as a server-worded enrollment rejection.
 MAX_SCOPE_ENTRIES = 200
@@ -189,16 +207,6 @@ def validate_capabilities(
                 "capability_incompatible",
                 f"Hosted recurring-upload capability {field} is unavailable or incompatible.",
             )
-    grant_version = capabilities.get("manual_share_enrollment_grant_version")
-    if grant_version is not None and (
-        not isinstance(grant_version, int)
-        or isinstance(grant_version, bool)
-        or grant_version != MANUAL_SHARE_ENROLLMENT_GRANT_VERSION
-    ):
-        raise CapabilityError(
-            "capability_incompatible",
-            "Hosted recurring-upload enrollment-grant capability is incompatible.",
-        )
     if require_enrollment_open and capabilities.get("recurring_enrollment_open") is not True:
         raise CapabilityError(
             "enrollment_closed",

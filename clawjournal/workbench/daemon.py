@@ -50,7 +50,12 @@ from ..scoring.overrides import (
     normalize_failure_evidence,
     requires_failure_evidence,
 )
-from ..config import CONFIG_DIR, load_config, save_config
+from ..config import (
+    CONFIG_DIR,
+    RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
+    load_config,
+    save_config,
+)
 from .findings_pipeline import (
     drain_findings_backfill,
     run_findings_pipeline,
@@ -1606,14 +1611,6 @@ def _clear_stored_upload_token() -> None:
             raise OSError("Stored upload authority could not be cleared safely.")
 
 
-_RECURRING_ENROLLMENT_GRANT_KEYS = (
-    "recurring_enrollment_grant",
-    "recurring_enrollment_grant_expires_at",
-    "recurring_enrollment_grant_receipt_id",
-    "recurring_enrollment_grant_issuer",
-)
-
-
 def _store_recurring_enrollment_grant(
     hosted_result: dict[str, Any],
     *,
@@ -1715,7 +1712,7 @@ def request_email_verification(email: str) -> dict:
             "verified_email",
             "verified_email_token",
             "verified_email_token_expires_at",
-            *_RECURRING_ENROLLMENT_GRANT_KEYS,
+            *RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
         ):
             config.pop(key, None)
     config["pending_verification_id"] = verification_id
