@@ -550,16 +550,20 @@ def test_cli_should_auto_update_skips_help_and_version():
 
 
 @pytest.mark.parametrize("json_mode", [False, True])
-def test_cli_selfupdate_failure_exits_nonzero(
+def test_cli_reinstall_failure_exits_nonzero(
     monkeypatch, capsys, json_mode
 ):
-    """Automation must not continue after either update stage failed."""
+    """Automation must not continue after the installer fails."""
     from clawjournal import cli
 
     monkeypatch.setattr(
         selfupdate,
         "selfupdate_sync",
-        lambda **kwargs: {"status": "fetch-failed", "stderr": "offline"},
+        lambda **kwargs: {
+            "status": "up-to-date",
+            "head": "a" * 40,
+            "upstream": "a" * 40,
+        },
     )
     monkeypatch.setattr(
         selfupdate,
@@ -576,8 +580,50 @@ def test_cli_selfupdate_failure_exits_nonzero(
 
     assert exc.value.code == 1
     output = capsys.readouterr()
-    assert "fetch-failed" in output.out or "Fetch failed" in output.out
     assert "installer-failed" in output.out or "Reinstall failed" in output.out
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "dirty",
+        "branch-feature",
+        "ahead",
+        "diverged",
+        "fetch-failed",
+        "update-failed",
+        "not-a-checkout",
+    ],
+)
+def test_cli_blocked_sync_never_runs_reinstall(
+    monkeypatch, capsys, status
+):
+    """A blocked update must leave the existing checkout uninstalled."""
+    from clawjournal import cli
+
+    monkeypatch.setattr(
+        selfupdate,
+        "selfupdate_sync",
+        lambda **kwargs: {"status": status, "stderr": "blocked"},
+    )
+    calls = []
+    monkeypatch.setattr(
+        selfupdate,
+        "reinstall",
+        lambda **kwargs: calls.append(kwargs) or {"status": "reinstalled"},
+    )
+    monkeypatch.setattr(
+        "sys.argv", ["clawjournal", "selfupdate", "--reinstall", "--json"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert calls == []
+    output = capsys.readouterr().out
+    assert '"status": "skipped-update-blocked"' in output
+    assert f'"update_status": "{status}"' in output
 
 
 def test_cli_explicit_reinstall_runs_even_when_checkout_is_current(
@@ -944,6 +990,29 @@ def test_finalize_install_preserves_unrequested_optional_reasons(
     ]
 
 
+def test_direct_sync_records_optional_changes_before_finalization(
+    isolated_config_dir, fake_repo
+):
+    """A direct installer pull must retain unrequested scanner work."""
+    bin_dir = isolated_config_dir / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "trufflehog").write_text("")
+    old_sha = _head(fake_repo)
+    new_sha = _commit_file(
+        fake_repo,
+        "clawjournal/redaction/trufflehog_install.py",
+        'PINNED_VERSION = "next"\n',
+        "bump scanner",
+    )
+
+    selfupdate.record_install_sync(fake_repo, old_sha, new_sha)
+    result = selfupdate.finalize_install(repo=fake_repo)
+
+    assert result["status"] == "finalized-partial"
+    assert result["remaining"] == ["scanners"]
+    assert selfupdate.read_pending_reinstall()["reasons"] == ["scanners"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_runs_installer_and_clears_notice(isolated_config_dir, fake_repo):
     marker = _make_installer(fake_repo)
@@ -981,6 +1050,27 @@ def test_reinstall_disables_auto_update_in_the_child(isolated_config_dir, fake_r
 
     assert selfupdate.reinstall(repo=fake_repo, capture=True)["status"] == "reinstalled"
     assert marker.read_text().strip() == "1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_targets_the_active_virtual_environment(
+    monkeypatch, isolated_config_dir, fake_repo, tmp_path
+):
+    scripts = fake_repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    marker = fake_repo / "venv-seen"
+    (scripts / "install.sh").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s" "${{CLAWJOURNAL_VENV:-unset}}" > "{marker}"\n'
+    )
+    active_venv = tmp_path / "custom-venv"
+    monkeypatch.setattr(selfupdate.sys, "prefix", str(active_venv))
+    monkeypatch.setattr(selfupdate.sys, "base_prefix", str(tmp_path / "base-python"))
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled"
+    assert marker.read_text() == str(active_venv)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")

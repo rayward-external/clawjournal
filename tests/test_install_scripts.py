@@ -14,6 +14,9 @@ def test_posix_installer_supports_managed_sharing_dependencies():
     assert '"$VENV_BIN/clawjournal" betterleaks install' in script
     assert '"$VENV_BIN/clawjournal" trufflehog install' in script
     assert "--finalize-install" in script
+    assert "record_install_sync" in script
+    assert '"$REPO_DIR" "$SYNC_FROM" "$SYNC_TO"' in script
+    assert script.index("record_install_sync") < script.index("pip install")
     assert "--clear-pending" not in script
 
     help_result = subprocess.run(
@@ -33,4 +36,7 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     assert "& $ClawJournalExe betterleaks install" in script
     assert "& $ClawJournalExe trufflehog install" in script
     assert "--finalize-install" in script
+    assert "record_install_sync" in script
+    assert "$RepoDir $script:SyncFrom $script:SyncTo" in script
+    assert script.index("record_install_sync") < script.index("pip install")
     assert "--clear-pending" not in script

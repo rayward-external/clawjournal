@@ -47,6 +47,8 @@ done
 # installing from it. Safe by construction: fast-forward only, and only on a
 # clean `main` — anything else is left untouched with an explanation, and the
 # install proceeds from the code that is already there.
+SYNC_FROM=""
+SYNC_TO=""
 sync_checkout() {
   sc_repo="$1"
   [ -d "$sc_repo/.git" ] || return 0
@@ -63,7 +65,13 @@ sync_checkout() {
     echo "[i] Not updating the checkout: it has local changes (they are preserved). Installing the current code."
     return 0
   fi
+  sc_before="$(git -C "$sc_repo" rev-parse HEAD 2>/dev/null || echo '')"
   if git -C "$sc_repo" pull --ff-only --quiet origin main 2>/dev/null; then
+    sc_after="$(git -C "$sc_repo" rev-parse HEAD 2>/dev/null || echo '')"
+    if [ -n "$sc_before" ] && [ -n "$sc_after" ]; then
+      SYNC_FROM="$sc_before"
+      SYNC_TO="$sc_after"
+    fi
     echo "[ok] Checkout is on the latest published version."
   else
     echo "[i] Could not fetch the latest version (offline, or history has diverged). Installing the current code."
@@ -135,6 +143,13 @@ if [ -x "$VENV_DIR/bin/python" ]; then
 else
   VENV_PY="$VENV_DIR/Scripts/python.exe"
   VENV_BIN="$VENV_DIR/Scripts"
+fi
+
+# Record anything the direct checkout sync changed before installation begins.
+# If pip or an optional install later fails, the pending notice must survive.
+if [ -n "$SYNC_FROM" ] && [ -n "$SYNC_TO" ]; then
+  "$VENV_PY" -c 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from clawjournal.selfupdate import record_install_sync; record_install_sync(Path(sys.argv[1]), sys.argv[2], sys.argv[3])' \
+    "$REPO_DIR" "$SYNC_FROM" "$SYNC_TO" >/dev/null 2>&1 || true
 fi
 
 # 3) Install ClawJournal in editable mode.

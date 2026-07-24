@@ -52,6 +52,8 @@ if ($DesktopShortcut) {
 # installing from it. Safe by construction: fast-forward only, and only on a
 # clean `main` — anything else is left untouched with an explanation, and the
 # install proceeds from the code that is already there.
+$script:SyncFrom = $null
+$script:SyncTo = $null
 function Sync-Checkout {
     param([string]$Repo)
     if (-not (Test-Path (Join-Path $Repo '.git'))) { return }
@@ -75,8 +77,17 @@ function Sync-Checkout {
             Write-Host "[i] Not updating the checkout: it has local changes (they are preserved). Installing the current code."
             return
         }
+        $before = (& git -C $Repo rev-parse HEAD 2>$null) -join ''
+        if ($LASTEXITCODE -ne 0) { $before = $null }
         & git -C $Repo pull --ff-only --quiet origin main 2>$null
-        if ($LASTEXITCODE -eq 0) {
+        $pullExit = $LASTEXITCODE
+        if ($pullExit -eq 0) {
+            $after = (& git -C $Repo rev-parse HEAD 2>$null) -join ''
+            $afterExit = $LASTEXITCODE
+            if ($before -and $afterExit -eq 0 -and $after) {
+                $script:SyncFrom = $before
+                $script:SyncTo = $after
+            }
             Write-Host "[ok] Checkout is on the latest published version."
         } else {
             Write-Host "[i] Could not fetch the latest version (offline, or history has diverged). Installing the current code."
@@ -150,6 +161,19 @@ if (-not (Test-Path $VenvPy)) {
 
 $VenvBin = Join-Path $VenvPath 'Scripts'
 $ClawJournalExe = Join-Path $VenvBin 'clawjournal.exe'
+
+# Record anything the direct checkout sync changed before installation begins.
+# If pip or an optional install later fails, the pending notice must survive.
+if ($script:SyncFrom -and $script:SyncTo) {
+    $recordCode = 'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from clawjournal.selfupdate import record_install_sync; record_install_sync(Path(sys.argv[1]), sys.argv[2], sys.argv[3])'
+    $previousRecordEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $VenvPy -c $recordCode $RepoDir $script:SyncFrom $script:SyncTo *> $null
+    } finally {
+        $ErrorActionPreference = $previousRecordEap
+    }
+}
 
 # 3) Install ClawJournal in editable mode.
 Write-Host "-> Installing ClawJournal (editable) from $RepoDir"

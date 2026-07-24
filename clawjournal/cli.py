@@ -3895,6 +3895,11 @@ def _render_reinstall_status(result: dict) -> str:
         detail = str(result.get("stderr") or "").strip()
         suffix = f": {detail}" if detail else "."
         return f"Reinstall failed (`{result.get('command')}`){suffix}"
+    if status == "skipped-update-blocked":
+        return (
+            "Reinstall skipped because the checkout could not be synchronized "
+            f"({result.get('update_status')})."
+        )
     return f"reinstall status: {status}"
 
 
@@ -5367,7 +5372,7 @@ def main() -> None:
 
         result = selfupdate_sync(check_only=args.check, force=args.force)
 
-        if args.reinstall:
+        if args.reinstall and result.get("status") in {"updated", "up-to-date"}:
             # An explicit reinstall is authoritative even when HEAD is
             # already current. Older auto-updaters had no pending record, so
             # skipping here could leave historical dependency or scanner
@@ -5379,6 +5384,16 @@ def main() -> None:
                     with_frontend=args.with_frontend,
                     with_sharing=args.with_sharing,
                 ),
+            }
+        elif args.reinstall:
+            # A blocked synchronization must not install from the dirty,
+            # divergent, or otherwise unverified checkout.
+            result = {
+                **result,
+                "reinstall_result": {
+                    "status": "skipped-update-blocked",
+                    "update_status": result.get("status"),
+                },
             }
 
         exit_code = _selfupdate_exit_code(result)

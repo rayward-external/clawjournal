@@ -421,6 +421,15 @@ def _record_reinstall_needs(repo: Path, old_sha: str, new_sha: str) -> list[str]
     return reasons
 
 
+def record_install_sync(repo: Path, old_sha: str, new_sha: str) -> list[str]:
+    """Persist work introduced by a direct installer's checkout sync.
+
+    Installers call this before pip or optional component work begins, so a
+    later failure cannot hide dependency, frontend, or scanner drift.
+    """
+    return _record_reinstall_needs(repo, old_sha, new_sha)
+
+
 def pending_reinstall_notice() -> str | None:
     """The short banner shown until the install is reconciled, or None."""
     record = read_pending_reinstall()
@@ -539,8 +548,9 @@ def finalize_install(
 ) -> dict[str, object]:
     """Retire only pending reasons that an installer verifiably reconciled.
 
-    Both platform installers call this after pip succeeds. Frontend failures
-    are intentionally non-fatal in those scripts, so a requested workbench is
+    Both platform installers call this after first recording any checkout range
+    they synchronized and then completing pip. Frontend failures are
+    intentionally non-fatal in those scripts, so a requested workbench is
     cleared only when the built index exists and is current. Scanner reasons
     are cleared only after both managed binaries exist.
     """
@@ -678,6 +688,13 @@ def reinstall(
         info["status"] = "reinstall-in-progress"
         return info
     try:
+        child_env = {**os.environ, OPT_OUT_ENV: "1"}
+        base_prefix = getattr(sys, "base_prefix", sys.prefix)
+        if sys.prefix != base_prefix or hasattr(sys, "real_prefix"):
+            # Console entry points run under the environment in their shebang.
+            # Keep the installer on that exact environment even when the user
+            # no longer has CLAWJOURNAL_VENV exported.
+            child_env["CLAWJOURNAL_VENV"] = sys.prefix
         try:
             result = subprocess.run(
                 cmd,
@@ -690,7 +707,7 @@ def reinstall(
                 # The installer shells out to the CLI it is installing;
                 # without this the child would fire its own auto-update
                 # mid-install.
-                env={**os.environ, OPT_OUT_ENV: "1"},
+                env=child_env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             info["status"] = "installer-failed"
