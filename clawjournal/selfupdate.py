@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,7 @@ APPLY_TIMEOUT_SECONDS = 5
 DIFF_TIMEOUT_SECONDS = 5
 # An npm install + Vite build on a cold cache is the long pole here.
 REINSTALL_TIMEOUT_SECONDS = 15 * 60
+REINSTALL_TERMINATE_GRACE_SECONDS = 5.0
 REINSTALL_LOCK_FILENAME = "reinstall.lock"
 DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE = "origin"
@@ -649,6 +651,70 @@ def _release_reinstall_lock() -> None:
         _release_advisory_lock(fd)
 
 
+def _terminate_installer_tree(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = REINSTALL_TERMINATE_GRACE_SECONDS,
+) -> None:
+    """Terminate every installer descendant and reap the group leader.
+
+    The installer launches pip, npm, and scanner installers.  Killing only
+    its shell on timeout would release our advisory lock while those children
+    could still be writing the same environment.  POSIX installers therefore
+    run in a fresh session and Windows installers in a new process group; this
+    helper tears down that entire tree before ``reinstall()`` can release the
+    lock.
+    """
+    if os.name == "posix":
+        try:
+            process_group = os.getpgid(process.pid)
+        except ProcessLookupError:
+            process.wait()
+            return
+
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            process.wait()
+            return
+
+        deadline = time.monotonic() + max(0.0, grace_seconds)
+        while time.monotonic() < deadline:
+            # Reap the group leader promptly; otherwise its zombie alone can
+            # make the group appear alive for the full grace period.
+            process.poll()
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    else:
+        # CREATE_NEW_PROCESS_GROUP gives taskkill a bounded tree rooted at the
+        # PowerShell installer. /T includes pip/npm/scanner descendants.
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(1.0, grace_seconds),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+
+    try:
+        process.wait(timeout=max(1.0, grace_seconds))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def reinstall(
     repo: Path | None = None,
     *,
@@ -696,28 +762,41 @@ def reinstall(
             # no longer has CLAWJOURNAL_VENV exported.
             child_env["CLAWJOURNAL_VENV"] = sys.prefix
         try:
-            result = subprocess.run(
+            process_kwargs: dict[str, object] = {}
+            if os.name == "posix":
+                process_kwargs["start_new_session"] = True
+            else:
+                process_kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+            process = subprocess.Popen(
                 cmd,
                 cwd=str(target),
                 stdout=subprocess.PIPE if capture else None,
                 stderr=subprocess.PIPE if capture else None,
                 stdin=subprocess.DEVNULL,
-                timeout=timeout,
-                check=False,
                 # The installer shells out to the CLI it is installing;
                 # without this the child would fire its own auto-update
                 # mid-install.
                 env=child_env,
+                **process_kwargs,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                _terminate_installer_tree(process)
+                # Drain captured pipes after the whole process tree is gone.
+                process.communicate()
+                info["status"] = "installer-failed"
+                info["stderr"] = str(exc)
+                return info
+        except OSError as exc:
             info["status"] = "installer-failed"
             info["stderr"] = str(exc)
             return info
 
-        info["returncode"] = result.returncode
-        if capture and result.stderr:
-            info["stderr"] = result.stderr.decode("utf-8", "replace").strip()
-        if result.returncode != 0:
+        info["returncode"] = process.returncode
+        if capture and stderr:
+            info["stderr"] = stderr.decode("utf-8", "replace").strip()
+        if process.returncode != 0:
             info["status"] = "installer-failed"
             return info
 

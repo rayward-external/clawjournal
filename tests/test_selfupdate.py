@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1049,6 +1051,44 @@ def test_failed_reinstall_keeps_the_notice(isolated_config_dir, fake_repo):
     assert result["status"] == "installer-failed"
     # The install is still stale, so the user must still be told.
     assert selfupdate.read_pending_reinstall() is not None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_timed_out_reinstall_kills_descendants_before_unlock(
+    isolated_config_dir, fake_repo
+):
+    """A timed-out shell must not orphan a child that still mutates the install."""
+    import fcntl
+
+    scripts = fake_repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    descendant_lock = fake_repo / "descendant.lock"
+    ready = fake_repo / "descendant-ready"
+    child_code = (
+        "import fcntl, pathlib, time;"
+        f"lock=open({str(descendant_lock)!r}, 'w');"
+        "fcntl.flock(lock, fcntl.LOCK_EX);"
+        f"pathlib.Path({str(ready)!r}).write_text('ready');"
+        "time.sleep(30)"
+    )
+    (scripts / "install.sh").write_text(
+        "#!/bin/sh\n"
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)} &\n"
+        "wait\n"
+    )
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True, timeout=0.5)
+
+    assert result["status"] == "installer-failed"
+    assert ready.exists()
+    fd = os.open(str(descendant_lock), os.O_RDWR)
+    try:
+        # Returning from reinstall has made its advisory lock reusable, so
+        # every descendant must already have released its own lock too.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")

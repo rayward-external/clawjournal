@@ -573,6 +573,33 @@ def test_launch_reuses_live_workbench(
     ]
 
 
+def test_update_restart_launch_suppresses_launch_only_actions(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+    captured: dict[str, object] = {}
+    monkeypatch.setenv(desktop._UPDATE_RESTART_CHILD_ENV, "1")
+    monkeypatch.setattr(desktop, "note_opened", lambda: calls.append("opened"))
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
+    monkeypatch.setattr(
+        desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE
+    )
+    monkeypatch.setattr(
+        desktop.webbrowser, "open", lambda url: calls.append(("browser", url))
+    )
+    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda: None)
+    monkeypatch.setattr(
+        "clawjournal.workbench.daemon.run_server",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    desktop.launch(startup_head="a" * 40)
+
+    assert calls == []
+    assert captured["open_browser"] is False
+    assert captured["startup_head"] == "a" * 40
+
+
 def test_occupied_unknown_port_is_not_opened_or_replaced(
     isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
