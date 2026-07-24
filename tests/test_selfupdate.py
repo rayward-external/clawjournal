@@ -232,20 +232,17 @@ def test_concurrent_invocation_is_excluded_by_lock(
 ):
     """If a parallel CLI invocation already holds the lock, this one
     must bail out as throttled and NOT spawn a second update."""
-    import fcntl
-
     monkeypatch.delenv("CLAWJOURNAL_NO_AUTO_UPDATE", raising=False)
     lock = isolated_config_dir / "last_update_check.lock"
-    peer_fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(peer_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    peer_fd = selfupdate._acquire_advisory_lock(lock)
+    assert peer_fd is not None
 
     spawned: list[Path] = []
     _stub_spawn_ok(monkeypatch, spawned)
     try:
         assert selfupdate.maybe_self_update() == "throttled"
     finally:
-        fcntl.flock(peer_fd, fcntl.LOCK_UN)
-        os.close(peer_fd)
+        selfupdate._release_advisory_lock(peer_fd)
     assert spawned == []
 
 
@@ -1358,6 +1355,35 @@ def test_reinstall_targets_the_active_non_virtualenv_interpreter(
 
     assert result["status"] == "reinstalled"
     assert marker.read_text() == f"{active_python}|unset"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell invocation")
+def test_windows_reinstall_targets_the_active_interpreter(
+    monkeypatch, isolated_config_dir, fake_repo, tmp_path
+):
+    scripts = fake_repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    marker = fake_repo / "windows-env-seen"
+    (scripts / "install.ps1").write_text(
+        "Set-Content -LiteralPath $env:CJ_TEST_MARKER "
+        '-Value "$env:CLAWJOURNAL_ACTIVE_PYTHON|'
+        '$env:CLAWJOURNAL_INSTALL_LOCK_HELD|'
+        '$env:CLAWJOURNAL_NO_AUTO_UPDATE" -NoNewline\n',
+        encoding="utf-8",
+    )
+    active_venv = tmp_path / "custom-venv"
+    active_python = active_venv / "Scripts" / "python.exe"
+    monkeypatch.setattr(selfupdate.sys, "prefix", str(active_venv))
+    monkeypatch.setattr(
+        selfupdate.sys, "base_prefix", str(tmp_path / "base-python")
+    )
+    monkeypatch.setattr(selfupdate.sys, "executable", str(active_python))
+    monkeypatch.setenv("CJ_TEST_MARKER", str(marker))
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled"
+    assert marker.read_text(encoding="utf-8") == f"{active_python}|1|1"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")

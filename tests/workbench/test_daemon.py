@@ -2701,6 +2701,58 @@ class TestStaticServing:
         assert "Session Timeline" in body
         assert "Built UI" not in body
 
+    def test_serves_startup_snapshot_while_live_dist_is_rebuilt(
+        self, index_setup, monkeypatch
+    ):
+        from http.server import ThreadingHTTPServer
+
+        from clawjournal.workbench import daemon
+        from clawjournal.workbench.frontend_snapshot import (
+            capture_frontend_snapshot,
+        )
+
+        dist = index_setup / "frontend_dist"
+        assets = dist / "assets"
+        assets.mkdir(parents=True)
+        (dist / "index.html").write_text(
+            '<!doctype html><script src="/assets/app-old.js"></script>',
+            encoding="utf-8",
+        )
+        (assets / "app-old.js").write_bytes(b"old frontend")
+        snapshot = capture_frontend_snapshot(dist, revision="a" * 40)
+
+        monkeypatch.setattr(daemon, "FRONTEND_DIST", dist)
+        daemon._open_request_admission()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
+        srv._frontend_snapshot = snapshot
+        thread = Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            (dist / "index.html").write_text(
+                '<!doctype html><script src="/assets/app-new.js"></script>',
+                encoding="utf-8",
+            )
+            (assets / "app-old.js").unlink()
+            (assets / "app-new.js").write_bytes(b"new frontend")
+
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            body = response.read()
+            assert response.status == 200
+            assert b"app-old.js" in body
+            assert b"app-new.js" not in body
+
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/assets/app-old.js")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert response.read() == b"old frontend"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
+
 
 class TestTimelineRoute:
     def test_session_timeline_renders_cost_incidents_and_subagents(self, server, index_setup):
