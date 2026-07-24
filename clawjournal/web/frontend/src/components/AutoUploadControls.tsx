@@ -1301,6 +1301,9 @@ export function AutoUploadPanel({ onConfigUpdated }: {
   const mutating = busy !== null;
   const canEnable = status.mode === 'off' && status.offer_available && !status.overlay && !mutating;
   const runDisabled = mutating || running || !status.run_now_allowed;
+  const exactScopeText = status.scope.entries
+    .map(([source, project]) => `${sourceLabel(source)} → ${project}`)
+    .join('\n');
 
   return (
     <div style={panelStyle}>
@@ -1330,8 +1333,8 @@ export function AutoUploadPanel({ onConfigUpdated }: {
       {loadError && <div role="alert" style={{ ...noticeStyle, color: colors.red700 }}>{loadError}</div>}
 
       <div style={{ ...summaryGridStyle, marginTop: 14 }}>
-        <SummaryItem label="Sources" value={compactList(status.scope.sources, status.mode === 'off' ? 'Set when enabled' : 'None')} />
-        <SummaryItem label="Projects" value={compactList(status.scope.projects, status.mode === 'off' ? 'Set when enabled' : 'None')} />
+        <SummaryItem label="Sources represented" value={compactList(status.scope.sources, status.mode === 'off' ? 'Set when enabled' : 'None')} />
+        <SummaryItem label="Projects represented" value={compactList(status.scope.projects, status.mode === 'off' ? 'Set when enabled' : 'None')} />
         <SummaryItem label="Future-only cutoff" value={status.enrolled_at ? formatTimestamp(status.enrolled_at) : 'Begins when enabled'} />
         <SummaryItem label="Cycle" value={`Up to ${status.cap} traces every ${status.cadence_days} day${status.cadence_days === 1 ? '' : 's'}`} />
         <SummaryItem label="AI-assisted PII" value={status.ai.enabled ? `On · ${status.ai.backend ?? 'configured provider'}` : 'Off'} />
@@ -1339,6 +1342,13 @@ export function AutoUploadPanel({ onConfigUpdated }: {
         <SummaryItem label="Next due" value={formatTimestamp(status.next_due_at)} />
         <SummaryItem label="Next retry" value={formatTimestamp(status.next_retry_at)} />
       </div>
+
+      {status.mode !== 'off' && (
+        <TermsBlock
+          title={`Exact enrolled scope · ${status.scope.entries.length} source/project pair${status.scope.entries.length === 1 ? '' : 's'}`}
+          text={exactScopeText || 'No exact source/project pairs are stored.'}
+        />
+      )}
 
       {status.mode !== 'off' && (
         <p style={{ margin: '12px 0', fontSize: 12.5, color: colors.gray600 }}>

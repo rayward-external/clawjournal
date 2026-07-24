@@ -2088,6 +2088,104 @@ def test_scope_entries_are_only_observed_source_project_pairs(
     conn.close()
 
 
+def test_control_state_keeps_durable_pair_scope_when_one_pair_is_unobserved(
+    isolated_auto_upload,
+):
+    """Pruning one authorized pair must not stall other authorized pairs."""
+    config = _save_scope_config()
+    config["source"] = "all"
+    assert config_module.save_config(config)
+    conn = open_index()
+
+    removed, _ = _session(
+        isolated_auto_upload["root"],
+        "authorized-removed",
+        project="alpha",
+    )
+    surviving, _ = _session(
+        isolated_auto_upload["root"],
+        "authorized-surviving",
+        project="beta",
+    )
+    surviving["source"] = "codex"
+    assert upsert_sessions(conn, [removed, surviving]) == 2
+    assert set_hold_state(
+        conn,
+        "authorized-surviving",
+        "released",
+        changed_by="test",
+        reason="fixture",
+    )
+
+    enrolled_sources = ["claude", "codex"]
+    enrolled_projects = ["alpha", "beta"]
+    profile = auto.egress_profile_hash(
+        conn,
+        enrollment_scope={
+            "sources": enrolled_sources,
+            "projects": enrolled_projects,
+        },
+        api_origin=ORIGIN,
+        ai_backend=None,
+        config=config,
+    )
+    save_auto_upload_enrollment(
+        conn,
+        mode="enabled",
+        health="ready",
+        generation=1,
+        enrolled_at=ENROLLED_AT,
+        client_enrollment_id="client-exact-pairs",
+        enrolled_sources=enrolled_sources,
+        enrolled_projects=enrolled_projects,
+        enrolled_scope_entries=[
+            ("claude", "alpha"),
+            ("codex", "beta"),
+        ],
+        egress_profile_hash=profile,
+    )
+
+    # The scanner may prune the final row for one authorized pair. Keep both
+    # aggregate source and project values represented through newly observed,
+    # unenrolled cross-pairs so this isolates the exact-pair presence check.
+    conn.execute(
+        "DELETE FROM sessions WHERE session_id = ?",
+        ("authorized-removed",),
+    )
+    new_claude, _ = _session(
+        isolated_auto_upload["root"],
+        "new-claude-beta",
+        project="beta",
+    )
+    new_codex, _ = _session(
+        isolated_auto_upload["root"],
+        "new-codex-alpha",
+        project="alpha",
+    )
+    new_codex["source"] = "codex"
+    assert upsert_sessions(conn, [new_claude, new_codex]) == 2
+
+    current_scope = auto._current_scope(conn, config)
+    assert current_scope["sources"] == enrolled_sources
+    assert current_scope["projects"] == enrolled_projects
+    assert ("claude", "alpha") not in current_scope["entries"]
+    revision = conn.execute(
+        "SELECT content_revision FROM sessions WHERE session_id = ?",
+        ("authorized-surviving",),
+    ).fetchone()[0]
+    conn.close()
+
+    # The durable pair remains authorized, while candidate selection separately
+    # rejects every newly observed pair that is absent from the snapshot.
+    auto._assert_control_state(
+        expected_generation=1,
+        expected_profile_hash=profile,
+        expected_revisions={"authorized-surviving": revision},
+        api_origin=ORIGIN,
+        ai_backend=None,
+    )
+
+
 def test_observed_pair_scope_avoids_false_cartesian_limit(
     isolated_auto_upload,
 ):

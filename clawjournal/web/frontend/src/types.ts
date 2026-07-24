@@ -262,6 +262,7 @@ export interface AutoUploadStatus {
   scope: {
     sources: string[];
     projects: string[];
+    entries: Array<[string, string]>;
   };
   cap: number;
   cadence_days: number;

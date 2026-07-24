@@ -95,8 +95,25 @@ function qs(params: Record<string, string | number | string[] | number[] | null 
   return s ? `?${s}` : '';
 }
 
+function normalizeAutoUploadScopeEntries(value: unknown): Array<[string, string]> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap(item => {
+    if (
+      !Array.isArray(item)
+      || item.length !== 2
+      || typeof item[0] !== 'string'
+      || !item[0].trim()
+      || typeof item[1] !== 'string'
+      || !item[1].trim()
+    ) {
+      return [];
+    }
+    return [[item[0].trim(), item[1].trim()] as [string, string]];
+  });
+}
+
 function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadStatus {
-  const scope = raw.scope ?? { sources: [], projects: [] };
+  const scope = raw.scope ?? { sources: [], projects: [], entries: [] };
   const ai = raw.ai ?? { enabled: false, backend: null };
   const authorization = raw.authorization ?? { version: null, text: null };
   const retention = raw.retention ?? { version: null, text: null };
@@ -124,6 +141,7 @@ function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadSt
     scope: {
       sources: Array.isArray(scope.sources) ? scope.sources : [],
       projects: Array.isArray(scope.projects) ? scope.projects : [],
+      entries: normalizeAutoUploadScopeEntries(scope.entries),
     },
     cap: typeof raw.cap === 'number' ? raw.cap : 5,
     cadence_days: typeof raw.cadence_days === 'number' ? raw.cadence_days : 1,

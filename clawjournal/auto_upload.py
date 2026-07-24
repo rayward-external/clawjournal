@@ -2743,14 +2743,15 @@ def _assert_control_state(
             raise ControlChanged()
         config = _load_config_readonly()
         current_scope = _current_scope(conn, config)
+        # Exact pairs are the durable authorization snapshot, not a live
+        # observation requirement. Candidate selection still matches every
+        # session against enrolled_scope_entries, so an unobserved pair cannot
+        # expand egress; removing its last local row must not stall candidates
+        # from the other authorized pairs.
         if current_scope["blockers"] or not set(enrollment["enrolled_sources"]).issubset(
             set(current_scope["sources"])
         ) or not set(enrollment["enrolled_projects"]).issubset(
             set(current_scope["projects"])
-        ) or not {
-            tuple(entry) for entry in enrollment["enrolled_scope_entries"]
-        }.issubset(
-            set(current_scope["entries"])
         ):
             raise ControlChanged("The confirmed source/project scope changed during the run.")
         current_profile = egress_profile_hash(

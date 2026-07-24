@@ -29,12 +29,22 @@ describe('automatic-upload API normalization', () => {
     vi.unstubAllGlobals();
   });
 
-  it('preserves selected hook targets and safely normalizes malformed hook rows', async () => {
+  it('preserves exact scope and selected hooks while safely normalizing malformed rows', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
       json: async () => ({
         mode: 'enabled',
+        scope: {
+          sources: ['claude', 'codex'],
+          projects: ['alpha', 'beta'],
+          entries: [
+            ['claude', 'alpha'],
+            ['codex', 'beta'],
+            ['codex', 42],
+            ['claude', 'alpha', 'extra'],
+          ],
+        },
         hooks: [
           {
             agent: 'claude',
@@ -62,6 +72,14 @@ describe('automatic-upload API normalization', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/auto-upload/status', {
       headers: {},
+    });
+    expect(status.scope).toEqual({
+      sources: ['claude', 'codex'],
+      projects: ['alpha', 'beta'],
+      entries: [
+        ['claude', 'alpha'],
+        ['codex', 'beta'],
+      ],
     });
     expect(status.hooks).toEqual([
       {
