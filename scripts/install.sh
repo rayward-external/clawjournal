@@ -43,6 +43,33 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Bring an existing checkout up to the latest published version before
+# installing from it. Safe by construction: fast-forward only, and only on a
+# clean `main` — anything else is left untouched with an explanation, and the
+# install proceeds from the code that is already there.
+sync_checkout() {
+  sc_repo="$1"
+  [ -d "$sc_repo/.git" ] || return 0
+  if [ -n "${CLAWJOURNAL_NO_AUTO_UPDATE:-}" ]; then
+    # Set by `clawjournal selfupdate --reinstall`, which already synced.
+    return 0
+  fi
+  sc_branch="$(git -C "$sc_repo" symbolic-ref --short -q HEAD 2>/dev/null || echo '?')"
+  if [ "$sc_branch" != "main" ]; then
+    echo "[i] Not updating the checkout: it is on branch '$sc_branch', not 'main'. Installing the current code."
+    return 0
+  fi
+  if [ -n "$(git -C "$sc_repo" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    echo "[i] Not updating the checkout: it has local changes (they are preserved). Installing the current code."
+    return 0
+  fi
+  if git -C "$sc_repo" pull --ff-only --quiet origin main 2>/dev/null; then
+    echo "[ok] Checkout is on the latest published version."
+  else
+    echo "[i] Could not fetch the latest version (offline, or history has diverged). Installing the current code."
+  fi
+}
+
 # Resolve the repo root. If the script is run from a checkout, REPO_DIR is the
 # parent of scripts/. If piped via `curl | sh`, $0 is "sh" and we clone fresh.
 SCRIPT_PATH="${0:-}"
@@ -52,15 +79,13 @@ if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
 fi
 if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/pyproject.toml" ]; then
   TARGET="${CLAWJOURNAL_REPO:-$HOME/clawjournal}"
-  if [ -d "$TARGET/.git" ]; then
-    echo "-> Updating existing checkout at $TARGET"
-    git -C "$TARGET" pull --ff-only --quiet || true
-  else
+  if [ ! -d "$TARGET/.git" ]; then
     echo "-> Cloning ClawJournal to $TARGET"
     git clone --quiet https://github.com/rayward-external/clawjournal.git "$TARGET"
   fi
   REPO_DIR="$TARGET"
 fi
+sync_checkout "$REPO_DIR"
 
 VENV_DIR="${CLAWJOURNAL_VENV:-$HOME/.clawjournal-venv}"
 
@@ -148,7 +173,10 @@ if [ "$DESKTOP_SHORTCUT" -eq 1 ]; then
   "$VENV_BIN/clawjournal" desktop install
 fi
 
-# 7) Report.
+# 7) Report. The install just reconciled everything a background auto-update
+#    could have left stale, so retire any pending-reinstall notice.
+CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" selfupdate --clear-pending >/dev/null 2>&1 || true
+
 echo
 INSTALLED_VERSION="$("$VENV_PY" -c 'import clawjournal; print(clawjournal.__version__)' 2>/dev/null || echo "?")"
 echo "[ok] ClawJournal $INSTALLED_VERSION installed."

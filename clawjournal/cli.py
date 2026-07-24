@@ -3844,6 +3844,62 @@ def _run_note(args: argparse.Namespace) -> None:
     sys.exit(2)
 
 
+def _render_selfupdate_status(result: dict) -> str:
+    """Human-readable one-liner for a `selfupdate_sync` result."""
+    status = result.get("status")
+    head = str(result.get("head", ""))[:7]
+    upstream = str(result.get("upstream", ""))[:7]
+    if status == "not-a-checkout":
+        return "clawjournal is not installed from an editable git checkout — nothing to update."
+    if status == "up-to-date":
+        return f"Already up to date ({head})."
+    if status == "behind":
+        return (f"Update available: {head} -> {upstream}. "
+                "Run `clawjournal selfupdate` to apply.")
+    if status == "updated":
+        return f"Updated {head} -> {upstream}."
+    if status == "dirty":
+        return "Skipped: the checkout has local changes. Commit/stash or pass --force."
+    if isinstance(status, str) and status.startswith("branch-"):
+        return (f"Skipped: not on the main branch ({status[len('branch-'):]}). "
+                "Check out main first.")
+    if status == "ahead":
+        return "Skipped: local main has commits not present on origin/main. Update manually."
+    if status == "diverged":
+        return "Skipped: local main has diverged from origin/main. Update manually."
+    if status == "ancestry-failed":
+        return "Skipped: could not compare local main with origin/main."
+    if status == "fetch-failed":
+        return f"Fetch failed: {result.get('stderr', '')}".rstrip()
+    if status == "update-failed":
+        return f"Update failed: {result.get('stderr', '')}".rstrip()
+    return f"selfupdate status: {status}"
+
+
+def _render_reinstall_status(result: dict) -> str:
+    """Human-readable one-liner for a `selfupdate.reinstall` result."""
+    status = result.get("status")
+    if status == "reinstalled":
+        return "Reinstall complete — dependencies, workbench build, and scanners match the checkout."
+    if status == "already-aligned":
+        return "Everything already matches the latest published version — nothing to reinstall."
+    if status == "reinstalled-partial":
+        hint = str(result.get("hint") or "the workbench build is still stale.")
+        return f"Reinstall completed, but not everything: {hint}"
+    if status == "reinstall-in-progress":
+        return ("Another reinstall is already running (likely the background "
+                "auto-update). Try again in a few minutes.")
+    if status == "not-a-checkout":
+        return "Reinstall skipped: clawjournal is not installed from a git checkout."
+    if status == "installer-missing":
+        return f"Reinstall skipped: no installer script found in {result.get('repo')}."
+    if status == "installer-failed":
+        detail = str(result.get("stderr") or "").strip()
+        suffix = f": {detail}" if detail else "."
+        return f"Reinstall failed (`{result.get('command')}`){suffix}"
+    return f"reinstall status: {status}"
+
+
 _AUTO_UPDATE_SKIP_FLAGS = frozenset({"-h", "--help", "--version"})
 
 
@@ -3880,6 +3936,16 @@ def main() -> None:
             maybe_self_update()
         except Exception:
             # Auto-update must never block the CLI. Swallow anything.
+            pass
+        # A previous update may have pulled source that the installed tool
+        # can't act on yet (new deps, stale workbench build, bumped scanner
+        # pins). Say so on stderr so `--json` stdout stays machine-readable.
+        try:
+            from .selfupdate import pending_reinstall_notice
+            reinstall_notice = pending_reinstall_notice()
+            if reinstall_notice:
+                print(reinstall_notice, file=sys.stderr)
+        except Exception:
             pass
 
     parser = argparse.ArgumentParser(description="ClawJournal — coding agent conversation exporter")
@@ -4009,6 +4075,11 @@ def main() -> None:
                     help="Report whether updates are available without applying them")
     su.add_argument("--force", action="store_true",
                     help="Discard local changes on main before applying a fast-forward update")
+    su.add_argument("--reinstall", action="store_true",
+                    help="Update, then rerun the installer so dependencies, the workbench "
+                         "build, and the pinned scanners match the checkout")
+    su.add_argument("--clear-pending", action="store_true",
+                    help="Dismiss the pending-reinstall notice (the installer does this itself)")
     su.add_argument("--json", action="store_true", help="Output result as JSON")
 
     th = sub.add_parser("trufflehog",
@@ -5231,42 +5302,54 @@ def main() -> None:
         sys.exit(2)
 
     if command == "selfupdate":
-        from .selfupdate import selfupdate_sync
+        from .selfupdate import (
+            clear_pending_reinstall,
+            pending_reinstall_notice,
+            reinstall as run_reinstall,
+            selfupdate_sync,
+        )
+
+        if args.clear_pending:
+            clear_pending_reinstall()
+            if args.json:
+                print(json.dumps({"status": "cleared"}, indent=2))
+            else:
+                print("Pending-reinstall notice cleared.")
+            return
+
+        if args.reinstall and args.check:
+            print("error: --check and --reinstall are mutually exclusive",
+                  file=sys.stderr)
+            sys.exit(2)
+
         result = selfupdate_sync(check_only=args.check, force=args.force)
+
+        if args.reinstall:
+            from .selfupdate import reinstall_needed
+
+            # Skip the minutes-long installer run when the pull found
+            # nothing new and nothing is pending or stale — this makes
+            # `selfupdate --reinstall` cheap to run unconditionally. For
+            # every other outcome (updated, or a blocked pull: dirty tree,
+            # no network) the reinstall is best-effort: it still reconciles
+            # the install with whatever the checkout holds right now.
+            if result.get("status") in {"up-to-date", "updated"} and not reinstall_needed():
+                result = {**result, "reinstall_result": {"status": "already-aligned"}}
+            else:
+                result = {**result, "reinstall_result": run_reinstall(capture=args.json)}
+
         if args.json:
             print(json.dumps(result, indent=2))
+            return
+
+        print(_render_selfupdate_status(result))
+        install_result = result.get("reinstall_result")
+        if isinstance(install_result, dict):
+            print(_render_reinstall_status(install_result))
         else:
-            selfupdate_status = result.get("status")
-            if selfupdate_status == "not-a-checkout":
-                print("clawjournal is not installed from an editable git checkout — nothing to update.")
-            elif selfupdate_status == "up-to-date":
-                print(f"Already up to date ({str(result.get('head', ''))[:7]}).")
-            elif selfupdate_status == "behind":
-                print(
-                    f"Update available: {str(result.get('head', ''))[:7]} -> "
-                    f"{str(result.get('upstream', ''))[:7]}. Run `clawjournal selfupdate` to apply."
-                )
-            elif selfupdate_status == "updated":
-                print(
-                    f"Updated {str(result.get('head', ''))[:7]} -> "
-                    f"{str(result.get('upstream', ''))[:7]}."
-                )
-            elif selfupdate_status == "dirty":
-                print("Skipped: the checkout has local changes. Commit/stash or pass --force.")
-            elif isinstance(selfupdate_status, str) and selfupdate_status.startswith("branch-"):
-                print(f"Skipped: not on the main branch ({selfupdate_status[len('branch-'):]}). Check out main first.")
-            elif selfupdate_status == "ahead":
-                print("Skipped: local main has commits not present on origin/main. Update manually.")
-            elif selfupdate_status == "diverged":
-                print("Skipped: local main has diverged from origin/main. Update manually.")
-            elif selfupdate_status == "ancestry-failed":
-                print("Skipped: could not compare local main with origin/main.")
-            elif selfupdate_status == "fetch-failed":
-                print(f"Fetch failed: {result.get('stderr', '')}".rstrip())
-            elif selfupdate_status == "update-failed":
-                print(f"Update failed: {result.get('stderr', '')}".rstrip())
-            else:
-                print(f"selfupdate status: {selfupdate_status}")
+            notice = pending_reinstall_notice()
+            if notice:
+                print(notice)
         return
 
     if command == "trufflehog":

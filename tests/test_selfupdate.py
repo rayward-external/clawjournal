@@ -39,6 +39,7 @@ def _init_repo(repo: Path) -> None:
 
 def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
     path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
     subprocess.run(["git", "-C", str(repo), "add", name], check=True)
     subprocess.run(
@@ -568,3 +569,432 @@ def test_cli_should_auto_update_skips_help_and_version():
     # But -h paired with a real subcommand still updates — the user is
     # asking for subcommand help and may proceed to run it.
     assert _should_auto_update(["clawjournal", "scan", "--help"]) is True
+
+
+# ---------- pending reinstall -------------------------------------------------
+
+
+def _make_installer(repo: Path, *, exit_code: int = 0) -> Path:
+    """Write a stand-in scripts/install.sh that records that it ran."""
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    script = scripts / "install.sh"
+    marker = repo / "installer-ran"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" > "{marker}"\n'
+        f"exit {exit_code}\n"
+    )
+    return marker
+
+
+def test_classify_reinstall_reasons_maps_paths_to_triggers():
+    assert selfupdate.classify_reinstall_reasons(["pyproject.toml"]) == ["deps"]
+    assert selfupdate.classify_reinstall_reasons(
+        ["clawjournal/web/frontend/src/App.tsx"]
+    ) == ["frontend"]
+    assert selfupdate.classify_reinstall_reasons(
+        ["clawjournal/redaction/trufflehog_install.py"]
+    ) == ["scanners"]
+    # Ordinary Python changes ride along with the editable install for free.
+    assert selfupdate.classify_reinstall_reasons(["clawjournal/cli.py"]) == []
+    assert selfupdate.classify_reinstall_reasons([]) == []
+
+
+def test_classify_reinstall_reasons_reports_every_trigger_hit():
+    reasons = selfupdate.classify_reinstall_reasons(
+        [
+            "pyproject.toml",
+            "clawjournal/web/frontend/package.json",
+            "clawjournal/redaction/betterleaks_install.py",
+            "README.md",
+        ]
+    )
+    assert reasons == ["deps", "frontend", "scanners"]
+
+
+def test_no_pending_record_when_update_touches_only_python(
+    isolated_config_dir, fake_repo, tmp_path
+):
+    """An editable install already picks up plain .py changes."""
+    remote = _wire_remote(fake_repo, tmp_path)
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "--quiet", str(remote), str(other)], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.name", "t"], check=True)
+    _commit_file(other, "clawjournal/cli.py", "x = 1\n", "tweak cli")
+    subprocess.run(
+        ["git", "-C", str(other), "push", "--quiet", "origin", "main"], check=True
+    )
+
+    result = selfupdate.selfupdate_sync(repo=fake_repo)
+
+    assert result["status"] == "updated"
+    assert result["reinstall"] == []
+    assert selfupdate.read_pending_reinstall() is None
+    assert selfupdate.pending_reinstall_notice() is None
+
+
+def test_dependency_change_records_pending_reinstall(
+    isolated_config_dir, fake_repo, tmp_path
+):
+    remote = _wire_remote(fake_repo, tmp_path)
+    before = _head(fake_repo)
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "--quiet", str(remote), str(other)], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.name", "t"], check=True)
+    after = _commit_file(other, "pyproject.toml", "[project]\n", "add a dependency")
+    subprocess.run(
+        ["git", "-C", str(other), "push", "--quiet", "origin", "main"], check=True
+    )
+
+    result = selfupdate.selfupdate_sync(repo=fake_repo)
+
+    assert result["status"] == "updated"
+    assert result["reinstall"] == ["deps"]
+    record = selfupdate.read_pending_reinstall()
+    assert record["from"] == before
+    assert record["to"] == after
+    notice = selfupdate.pending_reinstall_notice()
+    assert "Python dependencies changed" in notice
+    assert "selfupdate --reinstall" in notice
+
+
+def _push_upstream_change(remote: Path, tmp_path: Path, name: str) -> None:
+    """Land a single-file commit on the shared bare remote."""
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "--quiet", str(remote), str(other)], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.name", "t"], check=True)
+    _commit_file(other, name, "x\n", f"change {name}")
+    subprocess.run(
+        ["git", "-C", str(other), "push", "--quiet", "origin", "main"], check=True
+    )
+
+
+def _build_fake_dist(repo: Path) -> Path:
+    dist = repo / "clawjournal" / "web" / "frontend" / "dist"
+    dist.mkdir(parents=True, exist_ok=True)
+    html = dist / "index.html"
+    html.write_text("<html></html>")
+    return html
+
+
+def test_background_update_auto_reinstalls_when_needed(
+    monkeypatch, isolated_config_dir, fake_repo, tmp_path
+):
+    """After a background fast-forward, the child finishes the job itself."""
+    remote = _wire_remote(fake_repo, tmp_path)
+    _build_fake_dist(fake_repo)
+    _push_upstream_change(remote, tmp_path, "clawjournal/web/frontend/src/App.tsx")
+
+    calls = []
+    monkeypatch.setattr(
+        selfupdate, "reinstall",
+        lambda repo, **kw: calls.append(repo) or {"status": "installer-failed"},
+    )
+
+    assert selfupdate._run_background_update(fake_repo) == 0
+
+    assert calls == [fake_repo]
+    # The stubbed reinstall failed, so the record survives as the fallback
+    # and the foreground CLI will show the fix-it notice.
+    record = selfupdate.read_pending_reinstall()
+    assert record["reasons"] == ["frontend"]
+    assert "workbench build is stale" in selfupdate.pending_reinstall_notice()
+
+
+def test_python_only_background_update_skips_the_reinstall(
+    monkeypatch, isolated_config_dir, fake_repo, tmp_path
+):
+    """Plain .py changes ride along with the editable install for free."""
+    remote = _wire_remote(fake_repo, tmp_path)
+    _build_fake_dist(fake_repo)
+    _push_upstream_change(remote, tmp_path, "clawjournal/cli.py")
+
+    calls = []
+    monkeypatch.setattr(
+        selfupdate, "reinstall",
+        lambda repo, **kw: calls.append(repo) or {"status": "reinstalled"},
+    )
+
+    assert selfupdate._run_background_update(fake_repo) == 0
+    assert calls == []
+    assert selfupdate.read_pending_reinstall() is None
+
+
+def test_frontend_change_is_moot_on_cli_only_machines(
+    monkeypatch, isolated_config_dir, fake_repo, tmp_path
+):
+    """No built workbench -> a frontend-only update needs no reinstall."""
+    remote = _wire_remote(fake_repo, tmp_path)
+    _push_upstream_change(remote, tmp_path, "clawjournal/web/frontend/src/App.tsx")
+
+    calls = []
+    monkeypatch.setattr(
+        selfupdate, "reinstall",
+        lambda repo, **kw: calls.append(repo) or {"status": "reinstalled"},
+    )
+
+    assert selfupdate._run_background_update(fake_repo) == 0
+    assert calls == []
+    assert selfupdate.read_pending_reinstall() is None
+
+
+def test_scanner_pin_change_is_moot_without_managed_scanners(
+    isolated_config_dir, fake_repo, tmp_path
+):
+    remote = _wire_remote(fake_repo, tmp_path)
+    _push_upstream_change(
+        remote, tmp_path, "clawjournal/redaction/trufflehog_install.py"
+    )
+
+    result = selfupdate.selfupdate_sync(repo=fake_repo)
+
+    assert result["status"] == "updated"
+    assert result["reinstall"] == []
+    assert selfupdate.read_pending_reinstall() is None
+
+
+def test_scanner_pin_change_records_with_managed_scanners(
+    isolated_config_dir, fake_repo, tmp_path
+):
+    bin_dir = isolated_config_dir / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "trufflehog").write_text("")
+    remote = _wire_remote(fake_repo, tmp_path)
+    _push_upstream_change(
+        remote, tmp_path, "clawjournal/redaction/betterleaks_install.py"
+    )
+
+    result = selfupdate.selfupdate_sync(repo=fake_repo)
+
+    assert result["status"] == "updated"
+    assert result["reinstall"] == ["scanners"]
+
+
+def test_undiffable_update_assumes_reinstall_is_needed(
+    monkeypatch, isolated_config_dir, fake_repo
+):
+    """A spurious notice is cheaper than silently serving a stale build."""
+    monkeypatch.setattr(
+        "clawjournal.selfupdate._changed_paths", lambda *a, **k: None
+    )
+    reasons = selfupdate._record_reinstall_needs(fake_repo, "a" * 40, "b" * 40)
+    assert reasons == ["unknown"]
+    assert "could not be inspected" in selfupdate.pending_reinstall_notice()
+
+
+def test_consecutive_updates_accumulate_reasons(isolated_config_dir):
+    """Two pulls before one reinstall must not lose the first pull's needs."""
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
+    selfupdate.record_pending_reinstall("b" * 40, "c" * 40, ["frontend"])
+
+    record = selfupdate.read_pending_reinstall()
+    assert record["reasons"] == ["deps", "frontend"]
+    # `from` stays pinned to the last revision that was actually installed.
+    assert record["from"] == "a" * 40
+    assert record["to"] == "c" * 40
+
+
+def test_record_pending_reinstall_ignores_empty_reasons(isolated_config_dir):
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, [])
+    assert selfupdate.read_pending_reinstall() is None
+
+
+def test_clear_pending_reinstall_is_idempotent(isolated_config_dir):
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
+    selfupdate.clear_pending_reinstall()
+    assert selfupdate.read_pending_reinstall() is None
+    selfupdate.clear_pending_reinstall()  # no record left — must not raise
+
+
+def test_corrupt_pending_record_is_ignored(isolated_config_dir):
+    (isolated_config_dir / selfupdate.PENDING_REINSTALL_FILENAME).write_text("{not json")
+    assert selfupdate.read_pending_reinstall() is None
+    assert selfupdate.pending_reinstall_notice() is None
+
+
+# ---------- reinstall ---------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_installer_command_matches_what_is_installed(
+    isolated_config_dir, fake_repo
+):
+    _make_installer(fake_repo)
+
+    # Nothing optional installed -> plain CLI reinstall.
+    assert selfupdate._installer_command(fake_repo) == [
+        "sh", str(fake_repo / "scripts" / "install.sh")
+    ]
+
+    # A built workbench must be rebuilt, or the reinstall reintroduces the
+    # exact staleness this mechanism exists to prevent.
+    dist = fake_repo / "clawjournal" / "web" / "frontend" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<html></html>")
+    assert "--with-frontend" in selfupdate._installer_command(fake_repo)
+
+    bin_dir = isolated_config_dir / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "trufflehog").write_text("")
+    assert "--with-sharing" in selfupdate._installer_command(fake_repo)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_runs_installer_and_clears_notice(isolated_config_dir, fake_repo):
+    marker = _make_installer(fake_repo)
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled"
+    assert marker.exists()
+    assert selfupdate.read_pending_reinstall() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_failed_reinstall_keeps_the_notice(isolated_config_dir, fake_repo):
+    _make_installer(fake_repo, exit_code=1)
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "installer-failed"
+    # The install is still stale, so the user must still be told.
+    assert selfupdate.read_pending_reinstall() is not None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_disables_auto_update_in_the_child(isolated_config_dir, fake_repo):
+    """The installer shells out to the CLI it is installing."""
+    scripts = fake_repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    marker = fake_repo / "env-seen"
+    (scripts / "install.sh").write_text(
+        "#!/bin/sh\n"
+        f'echo "${{CLAWJOURNAL_NO_AUTO_UPDATE:-unset}}" > "{marker}"\n'
+    )
+
+    assert selfupdate.reinstall(repo=fake_repo, capture=True)["status"] == "reinstalled"
+    assert marker.read_text().strip() == "1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_partial_when_workbench_build_is_still_stale(
+    isolated_config_dir, fake_repo
+):
+    """install.sh exits 0 even when the frontend build is skipped (no npm).
+
+    Clearing the record on exit code alone would retire the fix-it notice
+    exactly when it is still needed.
+    """
+    _make_installer(fake_repo)  # exits 0 without building anything
+    html = _build_fake_dist(fake_repo)
+    src = fake_repo / "clawjournal" / "web" / "frontend" / "src"
+    src.mkdir(parents=True)
+    newer = src / "App.tsx"
+    newer.write_text("x")
+    now = time.time()
+    os.utime(html, (now - 100, now - 100))
+    os.utime(newer, (now, now))
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps", "frontend"])
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled-partial"
+    # deps were reconciled by the installer; only the stale build nags on.
+    assert selfupdate.read_pending_reinstall()["reasons"] == ["frontend"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_clears_when_workbench_build_is_current(
+    isolated_config_dir, fake_repo
+):
+    _make_installer(fake_repo)
+    html = _build_fake_dist(fake_repo)
+    src = fake_repo / "clawjournal" / "web" / "frontend" / "src"
+    src.mkdir(parents=True)
+    older = src / "App.tsx"
+    older.write_text("x")
+    now = time.time()
+    os.utime(older, (now - 100, now - 100))
+    os.utime(html, (now, now))
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["frontend"])
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled"
+    assert selfupdate.read_pending_reinstall() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_refuses_to_race_another_installer(isolated_config_dir, fake_repo):
+    """Concurrent pip/npm runs corrupt each other — one installer at a time."""
+    marker = _make_installer(fake_repo)
+    (isolated_config_dir / selfupdate.REINSTALL_LOCK_FILENAME).write_text("")
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstall-in-progress"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_stale_reinstall_lock_is_reclaimed(isolated_config_dir, fake_repo):
+    marker = _make_installer(fake_repo)
+    lock = isolated_config_dir / selfupdate.REINSTALL_LOCK_FILENAME
+    lock.write_text("")
+    old = time.time() - selfupdate.REINSTALL_LOCK_STALE_SECONDS - 10
+    os.utime(lock, (old, old))
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled"
+    assert marker.exists()
+    assert not lock.exists()
+
+
+def test_reinstall_without_installer_script_reports_cleanly(
+    isolated_config_dir, fake_repo
+):
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+    assert result["status"] == "installer-missing"
+
+
+def test_reinstall_outside_a_checkout_reports_cleanly(monkeypatch, isolated_config_dir):
+    monkeypatch.setattr("clawjournal.selfupdate._package_repo_root", lambda: None)
+    assert selfupdate.reinstall()["status"] == "not-a-checkout"
+
+
+# ---------- reinstall_needed --------------------------------------------------
+
+
+def test_reinstall_needed_false_when_nothing_pending(isolated_config_dir, fake_repo):
+    assert selfupdate.reinstall_needed(repo=fake_repo) is False
+
+
+def test_reinstall_needed_true_with_pending_record(isolated_config_dir, fake_repo):
+    selfupdate.record_pending_reinstall("a" * 40, "b" * 40, ["deps"])
+    assert selfupdate.reinstall_needed(repo=fake_repo) is True
+
+
+def test_reinstall_needed_true_when_workbench_build_is_stale(
+    isolated_config_dir, fake_repo
+):
+    html = _build_fake_dist(fake_repo)
+    src = fake_repo / "clawjournal" / "web" / "frontend" / "src"
+    src.mkdir(parents=True)
+    newer = src / "App.tsx"
+    newer.write_text("x")
+    now = time.time()
+    os.utime(html, (now - 100, now - 100))
+    os.utime(newer, (now, now))
+    assert selfupdate.reinstall_needed(repo=fake_repo) is True
+
+
+def test_reinstall_needed_false_outside_a_checkout(monkeypatch, isolated_config_dir):
+    monkeypatch.setattr("clawjournal.selfupdate._package_repo_root", lambda: None)
+    assert selfupdate.reinstall_needed() is False

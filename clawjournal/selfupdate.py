@@ -4,6 +4,9 @@ Inspired by gstack: every CLI invocation triggers a fast update check
 (throttled to once an hour, network-failure-safe, completely silent).
 The fast-forward runs in a detached subprocess so it can't slow down the
 user; the editable install means the next invocation picks up new code.
+When an update needs more than a pull (new dependencies, a stale
+workbench build, bumped scanner pins), the detached child also reruns
+the project's installer so the next invocation is fully aligned.
 
 The check is a no-op when any of these is true:
   - opt-out env var ``CLAWJOURNAL_NO_AUTO_UPDATE`` is set to a truthy value
@@ -18,7 +21,9 @@ The check is a no-op when any of these is true:
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -28,9 +33,17 @@ from pathlib import Path
 from .config import CONFIG_DIR
 
 STAMP_FILENAME = "last_update_check"
+PENDING_REINSTALL_FILENAME = "pending_reinstall.json"
 THROTTLE_SECONDS = 60 * 60  # once per hour
 FETCH_TIMEOUT_SECONDS = 8
 APPLY_TIMEOUT_SECONDS = 5
+DIFF_TIMEOUT_SECONDS = 5
+# An npm install + Vite build on a cold cache is the long pole here.
+REINSTALL_TIMEOUT_SECONDS = 15 * 60
+REINSTALL_LOCK_FILENAME = "reinstall.lock"
+# Reclaim a lock left behind by a crashed installer one minute past the
+# longest run we would ever wait for.
+REINSTALL_LOCK_STALE_SECONDS = REINSTALL_TIMEOUT_SECONDS + 60
 # The lock is held only across the brief spawn window (parent releases
 # immediately after Popen returns). 60s is generous for that; using the
 # full THROTTLE_SECONDS would mean a crashed CLI blocks updates for an
@@ -274,6 +287,369 @@ def _history_relation(repo: Path, head: str, upstream: str) -> str:
     return "diverged"
 
 
+# ---------- pending reinstall -------------------------------------------------
+#
+# A fast-forward only moves source files. The editable install picks up plain
+# ``.py`` changes for free, but three kinds of change leave the *installed*
+# tool inconsistent with the checkout until the installer is rerun:
+#
+#   deps      new/changed requirements are never pip-installed by a git pull
+#   frontend  ``web/frontend/dist/`` is gitignored, so a pulled UI change does
+#             not reach the built assets that ``clawjournal serve`` ships
+#   scanners  a bumped PINNED_VERSION does not re-download the binary
+#
+# The background updater finishes the job itself: after a fast-forward that
+# hits any trigger, it reruns the project's installer (quietly, at most once
+# per update, never touching uncommitted work — the ff-only pull already
+# guaranteed a clean main checkout). The pending record doubles as the
+# fallback: when that reinstall can't complete — no npm, no network, a
+# concurrent installer — the record survives and every foreground invocation
+# prints a one-line fix-it notice until the install is reconciled.
+
+_REINSTALL_TRIGGERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("deps", ("pyproject.toml",)),
+    ("frontend", ("clawjournal/web/frontend/",)),
+    (
+        "scanners",
+        (
+            "clawjournal/redaction/betterleaks_install.py",
+            "clawjournal/redaction/trufflehog_install.py",
+        ),
+    ),
+)
+
+_REINSTALL_REASON_TEXT = {
+    "deps": "Python dependencies changed",
+    "frontend": "the workbench build is stale",
+    "scanners": "the pinned secret scanners changed",
+    "unknown": "the update could not be inspected",
+}
+
+
+def _pending_reinstall_path() -> Path:
+    return CONFIG_DIR / PENDING_REINSTALL_FILENAME
+
+
+def _changed_paths(repo: Path, old_sha: str, new_sha: str) -> list[str] | None:
+    """Repo-relative paths touched between two commits, or None if git failed."""
+    result = _git(repo, "diff", "--name-only", f"{old_sha}..{new_sha}",
+                  timeout=DIFF_TIMEOUT_SECONDS, capture=True)
+    if result is None or result.returncode != 0:
+        return None
+    text = result.stdout.decode("utf-8", "replace")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def classify_reinstall_reasons(paths: list[str]) -> list[str]:
+    """Which reinstall triggers the given changed paths hit, in table order."""
+    reasons = []
+    for reason, prefixes in _REINSTALL_TRIGGERS:
+        if any(path.startswith(prefix) for path in paths for prefix in prefixes):
+            reasons.append(reason)
+    return reasons
+
+
+def read_pending_reinstall() -> dict[str, object] | None:
+    """Return the recorded pending-reinstall state, or None if there is none."""
+    try:
+        raw = _pending_reinstall_path().read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not data.get("reasons"):
+        return None
+    return data
+
+
+def record_pending_reinstall(from_sha: str, to_sha: str, reasons: list[str]) -> None:
+    """Record that the checkout has moved ahead of what is installed.
+
+    Merges with any existing record: two background updates in a row must
+    not lose the first one's reasons, and ``from`` stays pinned to the last
+    revision that was actually installed. Written atomically because the
+    detached background child writes this while a foreground CLI reads it.
+    """
+    if not reasons:
+        return
+    existing = read_pending_reinstall() or {}
+    prior = existing.get("reasons")
+    payload = {
+        "from": existing.get("from") or from_sha,
+        "to": to_sha,
+        "reasons": sorted(set(reasons) | set(prior if isinstance(prior, list) else [])),
+    }
+    path = _pending_reinstall_path()
+    tmp = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        _debug(f"could not record pending reinstall: {exc}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def clear_pending_reinstall() -> None:
+    try:
+        _pending_reinstall_path().unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _debug(f"could not clear pending reinstall: {exc}")
+
+
+def _record_reinstall_needs(repo: Path, old_sha: str, new_sha: str) -> list[str]:
+    """Classify an applied update and persist what it means. Returns reasons.
+
+    Reasons that cannot matter on this machine are dropped: a stale
+    workbench build is meaningless without a built workbench, and a bumped
+    scanner pin without managed scanners simply means the new pin installs
+    whenever the scanners are first installed. Recording them anyway would
+    nag the user toward a reinstall that changes nothing they use.
+    """
+    paths = _changed_paths(repo, old_sha, new_sha)
+    if paths is None:
+        # Couldn't diff. Assume the worst: a spurious notice costs the user
+        # one command, a missed one means silently serving a stale workbench.
+        reasons = ["unknown"]
+    else:
+        reasons = classify_reinstall_reasons(paths)
+        if not _frontend_is_built(repo):
+            reasons = [r for r in reasons if r != "frontend"]
+        if not _sharing_is_installed():
+            reasons = [r for r in reasons if r != "scanners"]
+    record_pending_reinstall(old_sha, new_sha, reasons)
+    return reasons
+
+
+def pending_reinstall_notice() -> str | None:
+    """The short banner shown until the install is reconciled, or None."""
+    record = read_pending_reinstall()
+    if record is None:
+        return None
+    raw_reasons = record.get("reasons")
+    reasons = raw_reasons if isinstance(raw_reasons, list) else []
+    detail = "; ".join(_REINSTALL_REASON_TEXT.get(r, str(r)) for r in reasons)
+    old = str(record.get("from") or "")[:7]
+    new = str(record.get("to") or "")[:7]
+    moved = f" {old} -> {new}" if old and new else ""
+    return (
+        f"[!] ClawJournal updated{moved} ({detail}).\n"
+        f"    Finish with: clawjournal selfupdate --reinstall"
+    )
+
+
+# ---------- reinstall ---------------------------------------------------------
+
+
+def _frontend_is_built(repo: Path) -> bool:
+    return (repo / "clawjournal" / "web" / "frontend" / "dist" / "index.html").exists()
+
+
+def _frontend_stale(repo: Path) -> bool:
+    """True when the built workbench is older than its sources.
+
+    Mirrors the `find -newer` staleness check in scripts/install.sh. Only
+    meaningful when a build exists at all — callers gate on
+    ``_frontend_is_built`` first.
+    """
+    frontend = repo / "clawjournal" / "web" / "frontend"
+    try:
+        built = (frontend / "dist" / "index.html").stat().st_mtime
+    except OSError:
+        return True
+    skip = {"dist", "node_modules"}
+    for root, dirs, files in os.walk(frontend):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files:
+            try:
+                if os.path.getmtime(os.path.join(root, name)) > built:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _sharing_is_installed() -> bool:
+    bin_dir = CONFIG_DIR / "bin"
+    return any(
+        (bin_dir / name).exists()
+        for name in ("betterleaks", "betterleaks.exe", "trufflehog", "trufflehog.exe")
+    )
+
+
+def _installer_command(repo: Path) -> list[str] | None:
+    """Build the installer invocation that matches this machine's setup.
+
+    The flags are inferred from what is already installed rather than
+    remembered from the original run: rerunning without ``--with-frontend``
+    on a machine that has a built workbench would leave exactly the stale
+    UI this whole mechanism exists to prevent.
+    """
+    if os.name == "nt":
+        script = repo / "scripts" / "install.ps1"
+        if not script.exists():
+            return None
+        cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)]
+        frontend_flag, sharing_flag = "-WithFrontend", "-WithSharing"
+    else:
+        script = repo / "scripts" / "install.sh"
+        if not script.exists():
+            return None
+        # Invoke via `sh` so a checkout without the exec bit still works.
+        cmd = ["sh", str(script)]
+        frontend_flag, sharing_flag = "--with-frontend", "--with-sharing"
+    if _frontend_is_built(repo):
+        cmd.append(frontend_flag)
+    if _sharing_is_installed():
+        cmd.append(sharing_flag)
+    return cmd
+
+
+def reinstall_needed(repo: Path | None = None) -> bool:
+    """True when the installed tool may not match the checkout.
+
+    Lets `selfupdate --reinstall` be safely run unconditionally (the setup
+    prompt tells participants' agents to do exactly that): when the pull
+    found nothing and nothing is pending or stale, the minutes-long
+    installer run is skipped entirely.
+    """
+    target = repo or _package_repo_root()
+    if target is None:
+        return False
+    if read_pending_reinstall() is not None:
+        return True
+    return _frontend_is_built(target) and _frontend_stale(target)
+
+
+def _reinstall_lock_path() -> Path:
+    return CONFIG_DIR / REINSTALL_LOCK_FILENAME
+
+
+def _claim_reinstall_lock() -> bool:
+    """One installer at a time — concurrent pip/npm runs corrupt each other.
+
+    The contenders are the detached background child and a user-invoked
+    `selfupdate --reinstall`. The loser reports and leaves the pending
+    record in place for the winner to clear.
+    """
+    lock = _reinstall_lock_path()
+    for _ in range(2):
+        try:
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except FileNotFoundError:
+                continue  # holder released between open and stat — retry
+            except OSError:
+                return False
+            if age <= REINSTALL_LOCK_STALE_SECONDS:
+                return False
+            try:
+                lock.unlink()  # crashed holder; reclaim on the next pass
+            except OSError:
+                return False
+        except OSError:
+            return False
+    return False
+
+
+def _release_reinstall_lock() -> None:
+    try:
+        _reinstall_lock_path().unlink()
+    except OSError:
+        pass
+
+
+def reinstall(repo: Path | None = None, *, capture: bool = False,
+              timeout: float = REINSTALL_TIMEOUT_SECONDS) -> dict[str, object]:
+    """Rerun the project's installer against the current checkout.
+
+    Runs in the foreground for `selfupdate --reinstall` and in the detached
+    background child right after an auto-applied update. Clears the
+    pending-reinstall record only for what verifiably matches the checkout
+    afterwards.
+    """
+    target = repo or _package_repo_root()
+    if target is None:
+        return {"status": "not-a-checkout", "repo": None}
+
+    cmd = _installer_command(target)
+    if cmd is None:
+        return {"status": "installer-missing", "repo": str(target)}
+
+    info: dict[str, object] = {"repo": str(target), "command": " ".join(cmd)}
+
+    if not _claim_reinstall_lock():
+        info["status"] = "reinstall-in-progress"
+        return info
+    try:
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(target),
+                stdout=subprocess.PIPE if capture else None,
+                stderr=subprocess.PIPE if capture else None,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+                # The installer shells out to the CLI it is installing;
+                # without this the child would fire its own auto-update
+                # mid-install.
+                env={**os.environ, OPT_OUT_ENV: "1"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            info["status"] = "installer-failed"
+            info["stderr"] = str(exc)
+            return info
+
+        info["returncode"] = result.returncode
+        if capture and result.stderr:
+            info["stderr"] = result.stderr.decode("utf-8", "replace").strip()
+        if result.returncode != 0:
+            info["status"] = "installer-failed"
+            return info
+
+        # The installer reports success even when the optional workbench
+        # build was skipped (no npm) or failed — that step is deliberately
+        # non-fatal there. Clearing the record on exit code alone would
+        # retire the fix-it notice exactly when it is still needed, so
+        # verify the build and keep a narrowed record when it is behind.
+        prior = read_pending_reinstall() or {}
+        clear_pending_reinstall()
+        if _frontend_is_built(target) and _frontend_stale(target):
+            record_pending_reinstall(
+                str(prior.get("from") or ""), str(prior.get("to") or ""),
+                ["frontend"])
+            info["status"] = "reinstalled-partial"
+            if shutil.which("npm") is None:
+                info["hint"] = (
+                    "Node.js (npm) was not found, so the workbench was not "
+                    "rebuilt. Install Node.js, then run "
+                    "`clawjournal selfupdate --reinstall` again.")
+            else:
+                info["hint"] = (
+                    "The workbench build did not complete; run "
+                    "`scripts/install.sh --with-frontend` to see the build "
+                    "error.")
+            return info
+
+        info["status"] = "reinstalled"
+        return info
+    finally:
+        _release_reinstall_lock()
+
+
 def _apply_fast_forward(
     repo: Path, upstream: str, *, force: bool
 ) -> subprocess.CompletedProcess[bytes] | None:
@@ -326,6 +702,17 @@ def _run_background_update(repo: Path) -> int:
         update = _apply_fast_forward(repo, upstream_ref, force=False)
         if update is None:
             return 1
+        if update.returncode == 0:
+            # Note what the pulled commits imply for the *installed* tool,
+            # then finish the job while we're already in the background:
+            # rerun the installer so the participant's next invocation has
+            # the new dependencies, workbench build, and scanner pins
+            # without doing anything. If the reinstall can't complete, the
+            # pending record survives and the foreground CLI shows the
+            # one-line fix-it notice instead.
+            reasons = _record_reinstall_needs(repo, head_sha, upstream_sha)
+            if reasons:
+                reinstall(repo, capture=True)
         return update.returncode
     except BaseException as exc:  # noqa: BLE001 - silent child, see docstring
         _debug(f"background update crashed: {exc}")
@@ -523,5 +910,6 @@ def selfupdate_sync(repo: Path | None = None, *, check_only: bool = False,
         return info
 
     info["status"] = "updated"
+    info["reinstall"] = _record_reinstall_needs(target, head_sha, upstream_sha)
     _write_stamp(time.time())
     return info

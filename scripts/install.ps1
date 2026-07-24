@@ -48,6 +48,44 @@ if ($DesktopShortcut) {
     $WithFrontend = $true
 }
 
+# Bring an existing checkout up to the latest published version before
+# installing from it. Safe by construction: fast-forward only, and only on a
+# clean `main` — anything else is left untouched with an explanation, and the
+# install proceeds from the code that is already there.
+function Sync-Checkout {
+    param([string]$Repo)
+    if (-not (Test-Path (Join-Path $Repo '.git'))) { return }
+    if ($env:CLAWJOURNAL_NO_AUTO_UPDATE) {
+        # Set by `clawjournal selfupdate --reinstall`, which already synced.
+        return
+    }
+    # A failed sync must never abort the install — relax the error preference
+    # locally (on PS 5.1, native stderr under redirection can otherwise become
+    # a terminating error).
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $branch = & git -C $Repo symbolic-ref --short -q HEAD 2>$null
+        if ($branch -ne 'main') {
+            Write-Host "[i] Not updating the checkout: it is on branch '$branch', not 'main'. Installing the current code."
+            return
+        }
+        $dirty = & git -C $Repo status --porcelain --untracked-files=no 2>$null
+        if ($dirty) {
+            Write-Host "[i] Not updating the checkout: it has local changes (they are preserved). Installing the current code."
+            return
+        }
+        & git -C $Repo pull --ff-only --quiet origin main 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[ok] Checkout is on the latest published version."
+        } else {
+            Write-Host "[i] Could not fetch the latest version (offline, or history has diverged). Installing the current code."
+        }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
 # Resolve repo root (parent of scripts\). If we were piped via iwr|iex with no
 # script on disk, $PSScriptRoot is empty — clone the repo first.
 $RepoDir = $null
@@ -55,16 +93,14 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot '..\pyproject.toml'))
     $RepoDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 } else {
     $target = if ($env:CLAWJOURNAL_REPO) { $env:CLAWJOURNAL_REPO } else { Join-Path $HOME 'clawjournal' }
-    if (Test-Path (Join-Path $target '.git')) {
-        Write-Host "-> Updating existing checkout at $target"
-        & git -C $target pull --ff-only --quiet
-    } else {
+    if (-not (Test-Path (Join-Path $target '.git'))) {
         Write-Host "-> Cloning ClawJournal to $target"
         & git clone --quiet https://github.com/rayward-external/clawjournal.git $target
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
     $RepoDir = $target
 }
+Sync-Checkout -Repo $RepoDir
 
 if (-not $VenvPath) {
     $VenvPath = if ($env:CLAWJOURNAL_VENV) { $env:CLAWJOURNAL_VENV } else { Join-Path $HOME '.clawjournal-venv' }
@@ -175,7 +211,22 @@ if ($DesktopShortcut) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-# 7) Report.
+# 7) Report. The install just reconciled everything a background auto-update
+#    could have left stale, so retire any pending-reinstall notice.
+$previousNoAutoUpdate = $env:CLAWJOURNAL_NO_AUTO_UPDATE
+$env:CLAWJOURNAL_NO_AUTO_UPDATE = '1'
+try {
+    & $ClawJournalExe selfupdate --clear-pending *> $null
+} catch {
+    # A missing notice is not an install failure.
+} finally {
+    if ($null -eq $previousNoAutoUpdate) {
+        Remove-Item Env:CLAWJOURNAL_NO_AUTO_UPDATE -ErrorAction SilentlyContinue
+    } else {
+        $env:CLAWJOURNAL_NO_AUTO_UPDATE = $previousNoAutoUpdate
+    }
+}
+
 $InstalledVersion = & $VenvPy -c "import clawjournal; print(clawjournal.__version__)" 2>$null
 if (-not $InstalledVersion) { $InstalledVersion = '?' }
 Write-Host ""
