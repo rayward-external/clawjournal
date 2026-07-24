@@ -163,7 +163,26 @@ function Find-Python {
     return $null
 }
 
-$python = Find-Python
+# Reinstalls supply the interpreter that launched ClawJournal. Honor it before
+# probing PATH so conda/custom installs remain reinstallable when their Python
+# is not exposed there.
+$activePython = $env:CLAWJOURNAL_ACTIVE_PYTHON
+$python = $null
+if ($activePython) {
+    if (-not (Test-Path $activePython -PathType Leaf)) {
+        Write-Host "[x] Active Python does not exist: $activePython" -ForegroundColor Red
+        exit 1
+    }
+    $versionCode = 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
+    & $activePython -c $versionCode *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[x] Active Python must be Python 3.10+: $activePython" -ForegroundColor Red
+        exit 1
+    }
+    $python = [pscustomobject]@{ Source = $activePython; Prefix = @() }
+} else {
+    $python = Find-Python
+}
 if (-not $python) {
     Write-Host @"
 [x] Python 3.10+ not found on PATH.
@@ -206,13 +225,9 @@ if ($script:SyncBlocked) { exit 1 }
 
 # 2) Reuse the interpreter that invoked selfupdate, or create/reuse the
 #    managed venv for direct installer runs.
-$UseActivePython = [bool]$env:CLAWJOURNAL_ACTIVE_PYTHON
+$UseActivePython = [bool]$activePython
 if ($UseActivePython) {
-    $VenvPy = $env:CLAWJOURNAL_ACTIVE_PYTHON
-    if (-not (Test-Path $VenvPy -PathType Leaf)) {
-        Write-Host "[x] Active Python does not exist: $VenvPy" -ForegroundColor Red
-        exit 1
-    }
+    $VenvPy = $activePython
     $VenvBin = Split-Path -Parent $VenvPy
 } else {
     $VenvPy = Join-Path $VenvPath 'Scripts\python.exe'

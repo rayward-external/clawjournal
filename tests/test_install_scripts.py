@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,9 @@ def test_posix_installer_supports_managed_sharing_dependencies():
     assert "run_clawjournal trufflehog install" in script
     assert "CLAWJOURNAL_ACTIVE_PYTHON" in script
     assert '"$VENV_PY" -m clawjournal.cli' in script
+    assert script.index('PYTHON="$ACTIVE_PYTHON"') < script.index(
+        "for candidate in python3.13"
+    )
     assert "--finalize-install" in script
     assert "record_install_sync" in script
     assert "record_frontend_build" in script
@@ -49,6 +53,9 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     assert "Invoke-ClawJournal trufflehog install" in script
     assert "CLAWJOURNAL_ACTIVE_PYTHON" in script
     assert "-m clawjournal.cli @args" in script
+    assert script.index(
+        "$python = [pscustomobject]@{ Source = $activePython; Prefix = @() }"
+    ) < script.index("$python = Find-Python")
     assert "--finalize-install" in script
     assert "record_install_sync" in script
     assert "record_frontend_build" in script
@@ -58,6 +65,52 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     assert "$RepoDir $script:SyncFrom $script:SyncTo" in script
     assert script.index("record_install_sync") < script.index("pip install")
     assert "--clear-pending" not in script
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_posix_installer_uses_active_python_before_path_probe(tmp_path):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "install.sh").write_text((ROOT / "scripts" / "install.sh").read_text())
+    (repo / "pyproject.toml").write_text("[project]\nname='active-python-test'\n")
+
+    active_python = tmp_path / "custom-python"
+    active_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then echo 'Python 3.11.0'; fi\n"
+        "case \"${2:-}\" in\n"
+        "  *'print(clawjournal.__version__)'*) echo 'test' ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    active_python.chmod(0o755)
+
+    path_bin = tmp_path / "path-bin"
+    path_bin.mkdir()
+    for command in ("cat", "dirname", "mktemp", "rm"):
+        source = shutil.which(command)
+        assert source is not None
+        (path_bin / command).symlink_to(source)
+
+    result = subprocess.run(
+        ["/bin/sh", str(scripts / "install.sh")],
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": str(path_bin),
+            "CLAWJOURNAL_ACTIVE_PYTHON": str(active_python),
+            "CLAWJOURNAL_INSTALL_LOCK_HELD": "1",
+            "CLAWJOURNAL_NO_AUTO_UPDATE": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Python 3.10+ not found on PATH" not in result.stderr
+    assert f"[ok] Python: Python 3.11.0 ({active_python})" in result.stdout
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX advisory-lock check")
@@ -248,10 +301,18 @@ def test_posix_installer_syncs_linked_worktree(tmp_path):
         check=True,
     ).stdout.strip()
 
+    active_python = tmp_path / "active-python"
+    active_python.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-c\" ]; then exit 0; fi\n"
+        "exit 1\n"
+    )
+    active_python.chmod(0o755)
     env = {
         **os.environ,
         "HOME": str(tmp_path / "home"),
-        "CLAWJOURNAL_ACTIVE_PYTHON": str(tmp_path / "missing-python"),
+        "CLAWJOURNAL_ACTIVE_PYTHON": str(active_python),
+        "CLAWJOURNAL_INSTALL_LOCK_HELD": "1",
     }
     result = subprocess.run(
         ["sh", str(worktree / "scripts" / "install.sh")],
@@ -272,7 +333,6 @@ def test_posix_installer_syncs_linked_worktree(tmp_path):
     assert before != expected
     assert after == expected
     assert result.returncode == 1
-    assert "Active Python is not executable" in result.stderr
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")

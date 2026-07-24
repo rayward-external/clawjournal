@@ -115,16 +115,30 @@ fi
 VENV_DIR="${CLAWJOURNAL_VENV:-$HOME/.clawjournal-venv}"
 ACTIVE_PYTHON="${CLAWJOURNAL_ACTIVE_PYTHON:-}"
 
-# 1) Locate a Python 3.10+ interpreter.
+# 1) Locate a Python 3.10+ interpreter. Reinstalls supply the interpreter that
+# launched ClawJournal; honor it before probing PATH so conda/custom installs
+# remain reinstallable even when that interpreter is not exposed there.
 PYTHON=""
-for candidate in python3.13 python3.12 python3.11 python3.10 python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
-      PYTHON="$candidate"
-      break
-    fi
+if [ -n "$ACTIVE_PYTHON" ]; then
+  if [ ! -x "$ACTIVE_PYTHON" ]; then
+    echo "[x] Active Python is not executable: $ACTIVE_PYTHON" >&2
+    exit 1
   fi
-done
+  if ! "$ACTIVE_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    echo "[x] Active Python must be Python 3.10+: $ACTIVE_PYTHON" >&2
+    exit 1
+  fi
+  PYTHON="$ACTIVE_PYTHON"
+else
+  for candidate in python3.13 python3.12 python3.11 python3.10 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+        PYTHON="$candidate"
+        break
+      fi
+    fi
+  done
+fi
 
 if [ -z "$PYTHON" ]; then
   cat >&2 <<EOF
@@ -170,10 +184,6 @@ fi
 #    managed venv for direct installer runs.
 ACTIVE_INSTALL=0
 if [ -n "$ACTIVE_PYTHON" ]; then
-  if [ ! -x "$ACTIVE_PYTHON" ]; then
-    echo "[x] Active Python is not executable: $ACTIVE_PYTHON" >&2
-    exit 1
-  fi
   VENV_PY="$ACTIVE_PYTHON"
   VENV_BIN="$(dirname "$ACTIVE_PYTHON")"
   ACTIVE_INSTALL=1
