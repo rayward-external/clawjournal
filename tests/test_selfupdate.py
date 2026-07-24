@@ -806,17 +806,35 @@ def test_background_update_auto_reinstalls_when_needed(
     calls = []
     monkeypatch.setattr(
         selfupdate, "reinstall",
-        lambda repo, **kw: calls.append(repo) or {"status": "installer-failed"},
+        lambda repo, **kw: calls.append((repo, kw)) or {"status": "installer-failed"},
     )
 
     assert selfupdate._run_background_update(fake_repo) == 0
 
-    assert calls == [fake_repo]
+    assert calls == [(fake_repo, {"capture": True, "_lock_held": True})]
     # The stubbed reinstall failed, so the record survives as the fallback
     # and the foreground CLI will show the fix-it notice.
     record = selfupdate.read_pending_reinstall()
     assert record["reasons"] == ["frontend"]
     assert "workbench build is stale" in selfupdate.pending_reinstall_notice()
+
+
+def test_background_update_holds_install_lock_before_fast_forward(
+    isolated_config_dir, fake_repo, tmp_path
+):
+    """A direct install in progress must leave both checkout and record untouched."""
+    remote = _wire_remote(fake_repo, tmp_path)
+    old_head = _head(fake_repo)
+    _push_upstream_change(remote, tmp_path, "pyproject.toml")
+
+    assert selfupdate._claim_reinstall_lock() is True
+    try:
+        assert selfupdate._run_background_update(fake_repo) == 0
+    finally:
+        selfupdate._release_reinstall_lock()
+
+    assert _head(fake_repo) == old_head
+    assert selfupdate.read_pending_reinstall() is None
 
 
 def test_python_only_background_update_skips_the_reinstall(

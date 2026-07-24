@@ -667,6 +667,24 @@ def _terminate_installer_tree(
     lock.
     """
     if os.name == "posix":
+        def group_alive(process_group: int) -> bool:
+            # poll() reaps the leader so a zombie parent does not keep the
+            # process group looking live after every descendant has exited.
+            process.poll()
+            try:
+                os.killpg(process_group, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        def wait_for_group(process_group: int, seconds: float) -> bool:
+            deadline = time.monotonic() + max(0.0, seconds)
+            while group_alive(process_group):
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.01)
+            return True
+
         try:
             process_group = os.getpgid(process.pid)
         except ProcessLookupError:
@@ -679,21 +697,15 @@ def _terminate_installer_tree(
             process.wait()
             return
 
-        deadline = time.monotonic() + max(0.0, grace_seconds)
-        while time.monotonic() < deadline:
-            # Reap the group leader promptly; otherwise its zombie alone can
-            # make the group appear alive for the full grace period.
-            process.poll()
-            try:
-                os.killpg(process_group, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.05)
-        else:
+        if not wait_for_group(process_group, grace_seconds):
             try:
                 os.killpg(process_group, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            # killpg() delivers the signal but does not wait for every member
+            # to exit.  Do not let the install lock go until descendants have
+            # actually dropped their files and advisory locks.
+            wait_for_group(process_group, max(1.0, grace_seconds))
     else:
         # CREATE_NEW_PROCESS_GROUP gives taskkill a bounded tree rooted at the
         # PowerShell installer. /T includes pip/npm/scanner descendants.
@@ -723,6 +735,7 @@ def reinstall(
     timeout: float = REINSTALL_TIMEOUT_SECONDS,
     with_frontend: bool = False,
     with_sharing: bool = False,
+    _lock_held: bool = False,
 ) -> dict[str, object]:
     """Rerun the project's installer against the current checkout.
 
@@ -751,7 +764,7 @@ def reinstall(
         arg in {"--with-sharing", "-WithSharing"} for arg in cmd
     )
 
-    if not _claim_reinstall_lock():
+    if not _lock_held and not _claim_reinstall_lock():
         info["status"] = "reinstall-in-progress"
         return info
     try:
@@ -841,7 +854,8 @@ def reinstall(
         info["status"] = "reinstalled"
         return info
     finally:
-        _release_reinstall_lock()
+        if not _lock_held:
+            _release_reinstall_lock()
 
 
 def _apply_fast_forward(
@@ -893,21 +907,40 @@ def _run_background_update(repo: Path) -> int:
         if _history_relation(repo, head_sha, upstream_sha) != "behind":
             return 0
 
-        update = _apply_fast_forward(repo, upstream_ref, force=False)
-        if update is None:
-            return 1
-        if update.returncode == 0:
-            # Note what the pulled commits imply for the *installed* tool,
-            # then finish the job while we're already in the background:
-            # rerun the installer so the participant's next invocation has
-            # the new dependencies, workbench build, and scanner pins
-            # without doing anything. If the reinstall can't complete, the
-            # pending record survives and the foreground CLI shows the
-            # one-line fix-it notice instead.
-            reasons = _record_reinstall_needs(repo, head_sha, upstream_sha)
-            if reasons:
-                reinstall(repo, capture=True)
-        return update.returncode
+        # Coordinate the checkout transition and the install as one critical
+        # section.  Otherwise a direct installer could finish against the old
+        # revision while this child moves HEAD, then clear reasons it never
+        # actually reconciled.
+        if not _claim_reinstall_lock():
+            return 0
+        try:
+            # A direct installer may have completed a sync while this child
+            # waited for the lock, so prove the relation again before moving
+            # anything.
+            head_sha = _rev_parse(repo, "HEAD")
+            upstream_sha = _rev_parse(repo, upstream_ref)
+            if not head_sha or not upstream_sha:
+                return 1
+            if _history_relation(repo, head_sha, upstream_sha) != "behind":
+                return 0
+
+            update = _apply_fast_forward(repo, upstream_ref, force=False)
+            if update is None:
+                return 1
+            if update.returncode == 0:
+                # Note what the pulled commits imply for the *installed* tool,
+                # then finish the job while we're already in the background:
+                # rerun the installer so the participant's next invocation has
+                # the new dependencies, workbench build, and scanner pins
+                # without doing anything. If the reinstall can't complete, the
+                # pending record survives and the foreground CLI shows the
+                # one-line fix-it notice instead.
+                reasons = _record_reinstall_needs(repo, head_sha, upstream_sha)
+                if reasons:
+                    reinstall(repo, capture=True, _lock_held=True)
+            return update.returncode
+        finally:
+            _release_reinstall_lock()
     except BaseException as exc:  # noqa: BLE001 - silent child, see docstring
         _debug(f"background update crashed: {exc}")
         return 1
