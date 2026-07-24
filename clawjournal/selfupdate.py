@@ -780,45 +780,105 @@ def _terminate_installer_tree(
     lock.
     """
     if os.name == "posix":
-        def group_alive(process_group: int) -> bool:
-            # poll() reaps the leader so a zombie parent does not keep the
-            # process group looking live after every descendant has exited.
+        def session_members(session_id: int) -> list[tuple[int, str]] | None:
+            """Return process metadata for the installer's POSIX session."""
+            try:
+                result = subprocess.run(
+                    ["ps", "-Ao", "pid=,sid=,stat="],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                    check=False,
+                    text=True,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if result.returncode != 0:
+                return None
+            members = []
+            for line in result.stdout.splitlines():
+                fields = line.split(None, 2)
+                if len(fields) != 3:
+                    continue
+                try:
+                    pid, sid = int(fields[0]), int(fields[1])
+                except ValueError:
+                    continue
+                if sid == session_id:
+                    members.append((pid, fields[2]))
+            return members
+
+        def session_alive(session_id: int, process_group: int) -> bool:
+            # poll() reaps the leader so it cannot keep the session looking
+            # active after every descendant has exited.
             process.poll()
+            members = session_members(session_id)
+            if members is not None:
+                # Zombies have already released file descriptors and locks.
+                return any(not state.startswith("Z") for _, state in members)
             try:
                 os.killpg(process_group, 0)
             except ProcessLookupError:
                 return False
             return True
 
-        def wait_for_group(process_group: int, seconds: float) -> bool:
+        def signal_session(
+            session_id: int,
+            process_group: int,
+            signum: signal.Signals,
+        ) -> None:
+            # Shells may place background jobs in their own process groups.
+            # Signal the original group first, then every remaining member of
+            # the fresh installer session so none escape cleanup.
+            try:
+                os.killpg(process_group, signum)
+            except ProcessLookupError:
+                pass
+            for pid, state in session_members(session_id) or []:
+                if state.startswith("Z"):
+                    continue
+                try:
+                    os.kill(pid, signum)
+                except ProcessLookupError:
+                    pass
+
+        def wait_for_session(
+            session_id: int,
+            process_group: int,
+            seconds: float,
+            *,
+            repeat_signal: signal.Signals | None = None,
+        ) -> bool:
             deadline = time.monotonic() + max(0.0, seconds)
-            while group_alive(process_group):
+            while session_alive(session_id, process_group):
                 if time.monotonic() >= deadline:
                     return False
-                time.sleep(0.01)
+                if repeat_signal is not None:
+                    # Catch a child forked between the previous session
+                    # snapshot and delivery of the terminating signal.
+                    signal_session(session_id, process_group, repeat_signal)
+                time.sleep(0.05)
             return True
 
         try:
             process_group = os.getpgid(process.pid)
+            session_id = os.getsid(process.pid)
         except ProcessLookupError:
             process.wait()
             return
 
-        try:
-            os.killpg(process_group, signal.SIGTERM)
-        except ProcessLookupError:
-            process.wait()
-            return
-
-        if not wait_for_group(process_group, grace_seconds):
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            # killpg() delivers the signal but does not wait for every member
-            # to exit.  Do not let the install lock go until descendants have
-            # actually dropped their files and advisory locks.
-            wait_for_group(process_group, max(1.0, grace_seconds))
+        signal_session(session_id, process_group, signal.SIGTERM)
+        if not wait_for_session(session_id, process_group, grace_seconds):
+            signal_session(session_id, process_group, signal.SIGKILL)
+            # Signals are asynchronous. Do not let the install lock go until
+            # every non-zombie session member has dropped files and locks.
+            wait_for_session(
+                session_id,
+                process_group,
+                max(1.0, grace_seconds),
+                repeat_signal=signal.SIGKILL,
+            )
     else:
         # CREATE_NEW_PROCESS_GROUP gives taskkill a bounded tree rooted at the
         # PowerShell installer. /T includes pip/npm/scanner descendants.

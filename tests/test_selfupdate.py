@@ -595,6 +595,12 @@ def test_cli_requested_subcommand_skips_global_option_values():
     assert _requested_subcommand(
         ["clawjournal", "--format=md", "selfupdate"]
     ) == "selfupdate"
+    assert _requested_subcommand(
+        ["clawjournal", "--sou", "codex", "serve"]
+    ) == "serve"
+    assert _requested_subcommand(
+        ["clawjournal", "--pii-p", "rules", "serve"]
+    ) == "serve"
 
 
 def test_cli_should_auto_update_skips_help_and_version():

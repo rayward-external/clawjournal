@@ -3933,6 +3933,32 @@ _GLOBAL_OPTIONS_WITH_VALUES = frozenset({
     "--pii-sanitized-output",
     "--pii-backend",
 })
+_GLOBAL_OPTIONS_WITHOUT_VALUES = frozenset({
+    "--all-projects",
+    "--no-thinking",
+    "--pii-review",
+    "--pii-apply",
+    "--help",
+    "--version",
+})
+_GLOBAL_LONG_OPTIONS = frozenset(
+    option
+    for option in _GLOBAL_OPTIONS_WITH_VALUES | _GLOBAL_OPTIONS_WITHOUT_VALUES
+    if option.startswith("--")
+)
+
+
+def _global_option_consumes_next(token: str) -> bool:
+    """Mirror argparse abbreviation for root options that take a value."""
+    if token in _GLOBAL_OPTIONS_WITH_VALUES:
+        return True
+    if not token.startswith("--") or "=" in token:
+        return False
+    matches = [option for option in _GLOBAL_LONG_OPTIONS if option.startswith(token)]
+    return (
+        len(matches) == 1
+        and matches[0] in _GLOBAL_OPTIONS_WITH_VALUES
+    )
 
 
 def _requested_subcommand(argv: list[str] | None = None) -> str | None:
@@ -3941,7 +3967,7 @@ def _requested_subcommand(argv: list[str] | None = None) -> str | None:
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in _GLOBAL_OPTIONS_WITH_VALUES:
+        if _global_option_consumes_next(token):
             index += 2
             continue
         if token.startswith("-"):
