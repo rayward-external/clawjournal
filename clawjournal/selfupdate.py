@@ -45,6 +45,7 @@ REINSTALL_TIMEOUT_SECONDS = 15 * 60
 REINSTALL_TERMINATE_GRACE_SECONDS = 5.0
 REINSTALL_LOCK_FILENAME = "reinstall.lock"
 INSTALL_LOCK_HELD_ENV = "CLAWJOURNAL_INSTALL_LOCK_HELD"
+ACTIVE_PYTHON_ENV = "CLAWJOURNAL_ACTIVE_PYTHON"
 DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE = "origin"
 
@@ -946,12 +947,19 @@ def reinstall(
         # directly.  This parent already owns it, so mark the child to avoid a
         # recursive acquisition deadlock.
         child_env[INSTALL_LOCK_HELD_ENV] = "1"
+        child_env.pop(ACTIVE_PYTHON_ENV, None)
         base_prefix = getattr(sys, "base_prefix", sys.prefix)
         if sys.prefix != base_prefix or hasattr(sys, "real_prefix"):
             # Console entry points run under the environment in their shebang.
             # Keep the installer on that exact environment even when the user
             # no longer has CLAWJOURNAL_VENV exported.
             child_env["CLAWJOURNAL_VENV"] = sys.prefix
+        else:
+            # Editable installs are also supported directly in a user, conda
+            # base, or system interpreter. Reinstall through that exact Python
+            # instead of silently creating/updating ~/.clawjournal-venv.
+            child_env.pop("CLAWJOURNAL_VENV", None)
+            child_env[ACTIVE_PYTHON_ENV] = sys.executable
         try:
             process_kwargs: dict[str, object] = {}
             if os.name == "posix":

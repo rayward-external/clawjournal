@@ -1334,6 +1334,30 @@ def test_reinstall_targets_the_active_virtual_environment(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
+def test_reinstall_targets_the_active_non_virtualenv_interpreter(
+    monkeypatch, isolated_config_dir, fake_repo, tmp_path
+):
+    scripts = fake_repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    marker = fake_repo / "python-seen"
+    (scripts / "install.sh").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s|%s" "${{CLAWJOURNAL_ACTIVE_PYTHON:-unset}}" '
+        f'"${{CLAWJOURNAL_VENV:-unset}}" > "{marker}"\n'
+    )
+    active_python = tmp_path / "python"
+    active_prefix = tmp_path / "base"
+    monkeypatch.setattr(selfupdate.sys, "executable", str(active_python))
+    monkeypatch.setattr(selfupdate.sys, "prefix", str(active_prefix))
+    monkeypatch.setattr(selfupdate.sys, "base_prefix", str(active_prefix))
+
+    result = selfupdate.reinstall(repo=fake_repo, capture=True)
+
+    assert result["status"] == "reinstalled"
+    assert marker.read_text() == f"{active_python}|unset"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_partial_when_workbench_build_is_still_stale(
     isolated_config_dir, fake_repo
 ):

@@ -16,8 +16,10 @@ def test_posix_installer_supports_managed_sharing_dependencies():
     script = (ROOT / "scripts" / "install.sh").read_text()
 
     assert "--with-sharing" in script
-    assert '"$VENV_BIN/clawjournal" betterleaks install' in script
-    assert '"$VENV_BIN/clawjournal" trufflehog install' in script
+    assert "run_clawjournal betterleaks install" in script
+    assert "run_clawjournal trufflehog install" in script
+    assert "CLAWJOURNAL_ACTIVE_PYTHON" in script
+    assert '"$VENV_PY" -m clawjournal.cli' in script
     assert "--finalize-install" in script
     assert "record_install_sync" in script
     assert "record_frontend_build" in script
@@ -42,8 +44,10 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     script = (ROOT / "scripts" / "install.ps1").read_text()
 
     assert "[switch]$WithSharing" in script
-    assert "& $ClawJournalExe betterleaks install" in script
-    assert "& $ClawJournalExe trufflehog install" in script
+    assert "Invoke-ClawJournal betterleaks install" in script
+    assert "Invoke-ClawJournal trufflehog install" in script
+    assert "CLAWJOURNAL_ACTIVE_PYTHON" in script
+    assert "-m clawjournal.cli @args" in script
     assert "--finalize-install" in script
     assert "record_install_sync" in script
     assert "record_frontend_build" in script

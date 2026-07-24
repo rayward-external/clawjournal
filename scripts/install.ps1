@@ -204,16 +204,40 @@ Write-Host "[ok] Python: $versionLine ($($python.Source))"
 Sync-Checkout -Repo $RepoDir
 if ($script:SyncBlocked) { exit 1 }
 
-# 2) Create venv if missing.
-$VenvPy = Join-Path $VenvPath 'Scripts\python.exe'
-if (-not (Test-Path $VenvPy)) {
-    Write-Host "-> Creating venv at $VenvPath"
-    & $python.Source @($python.Prefix + @('-m', 'venv', $VenvPath))
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# 2) Reuse the interpreter that invoked selfupdate, or create/reuse the
+#    managed venv for direct installer runs.
+$UseActivePython = [bool]$env:CLAWJOURNAL_ACTIVE_PYTHON
+if ($UseActivePython) {
+    $VenvPy = $env:CLAWJOURNAL_ACTIVE_PYTHON
+    if (-not (Test-Path $VenvPy -PathType Leaf)) {
+        Write-Host "[x] Active Python does not exist: $VenvPy" -ForegroundColor Red
+        exit 1
+    }
+    $VenvBin = Split-Path -Parent $VenvPy
+} else {
+    $VenvPy = Join-Path $VenvPath 'Scripts\python.exe'
+    if (-not (Test-Path $VenvPy)) {
+        Write-Host "-> Creating venv at $VenvPath"
+        & $python.Source @($python.Prefix + @('-m', 'venv', $VenvPath))
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+    $VenvBin = Join-Path $VenvPath 'Scripts'
+}
+$ClawJournalExe = Join-Path $VenvBin 'clawjournal.exe'
+
+function Invoke-ClawJournal {
+    if ($script:UseActivePython) {
+        & $script:VenvPy -m clawjournal.cli @args
+    } else {
+        & $script:ClawJournalExe @args
+    }
 }
 
-$VenvBin = Join-Path $VenvPath 'Scripts'
-$ClawJournalExe = Join-Path $VenvBin 'clawjournal.exe'
+$ClawJournalDisplay = if ($UseActivePython) {
+    "$VenvPy -m clawjournal.cli"
+} else {
+    $ClawJournalExe
+}
 
 # Record anything the direct checkout sync changed before installation begins.
 # If pip or an optional install later fails, the pending notice must survive.
@@ -230,8 +254,10 @@ if ($script:SyncFrom -and $script:SyncTo) {
 
 # 3) Install ClawJournal in editable mode.
 Write-Host "-> Installing ClawJournal (editable) from $RepoDir"
-& $VenvPy -m pip install --quiet --upgrade pip
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (-not $UseActivePython) {
+    & $VenvPy -m pip install --quiet --upgrade pip
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 & $VenvPy -m pip install --quiet -e $RepoDir
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -282,9 +308,9 @@ if ($WithSharing) {
     $previousNoAutoUpdate = $env:CLAWJOURNAL_NO_AUTO_UPDATE
     $env:CLAWJOURNAL_NO_AUTO_UPDATE = '1'
     try {
-        & $ClawJournalExe betterleaks install
+        Invoke-ClawJournal betterleaks install
         if ($LASTEXITCODE -ne 0) { throw "Betterleaks installation failed (exit $LASTEXITCODE)." }
-        & $ClawJournalExe trufflehog install
+        Invoke-ClawJournal trufflehog install
         if ($LASTEXITCODE -ne 0) { throw "TruffleHog installation failed (exit $LASTEXITCODE)." }
     } finally {
         if ($null -eq $previousNoAutoUpdate) {
@@ -295,11 +321,11 @@ if ($WithSharing) {
     }
 }
 
-# 6) Optional desktop launcher. It uses the just-installed venv executable so
-#    the shortcut remains independent of the user's PATH.
+# 6) Optional desktop launcher. It uses the just-installed interpreter or venv
+#    command so the shortcut remains independent of the user's PATH.
 if ($DesktopShortcut) {
     Write-Host "-> Installing desktop shortcut"
-    & $ClawJournalExe desktop install
+    Invoke-ClawJournal desktop install
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
@@ -312,7 +338,7 @@ try {
     $finalizeArgs = @('selfupdate', '--finalize-install')
     if ($WithFrontend) { $finalizeArgs += '--frontend-requested' }
     if ($WithSharing) { $finalizeArgs += '--scanners-installed' }
-    & $ClawJournalExe @finalizeArgs *> $null
+    Invoke-ClawJournal @finalizeArgs *> $null
 } catch {
     # Finalization is best-effort; any unresolved notice remains in place.
 } finally {
@@ -329,10 +355,10 @@ Write-Host ""
 Write-Host "[ok] ClawJournal $InstalledVersion installed."
 
 Write-Host ""
-Write-Host "Run:    $ClawJournalExe scan"
-Write-Host "        $ClawJournalExe serve"
+Write-Host "Run:    $ClawJournalDisplay scan"
+Write-Host "        $ClawJournalDisplay serve"
 Write-Host ""
-Write-Host "Or add the venv to PATH for this session:"
+Write-Host "Or add the Python environment to PATH for this session:"
 Write-Host "        `$env:Path = `"$VenvBin;`" + `$env:Path"
 
 # 8) Soft hints for optional runtime deps.
@@ -363,7 +389,7 @@ $managedBetterleaks = Join-Path $HOME ".clawjournal\bin\betterleaks.exe"
 if (-not $WithSharing -and -not (Get-Command betterleaks -ErrorAction SilentlyContinue) -and -not (Test-Path $managedBetterleaks)) {
     Write-Host ""
     Write-Host "[i] Betterleaks is required when sharing exports."
-    Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalExe betterleaks install"
+    Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalDisplay betterleaks install"
     Write-Host "    Or re-run: .\scripts\install.ps1 -WithSharing"
 }
 
@@ -371,6 +397,6 @@ $managedTrufflehog = Join-Path $HOME ".clawjournal\bin\trufflehog.exe"
 if (-not $WithSharing -and -not (Get-Command trufflehog -ErrorAction SilentlyContinue) -and -not (Test-Path $managedTrufflehog)) {
     Write-Host ""
     Write-Host "[i] TruffleHog is required when sharing exports."
-    Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalExe trufflehog install"
+    Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalDisplay trufflehog install"
     Write-Host "    Or re-run: .\scripts\install.ps1 -WithSharing"
 }

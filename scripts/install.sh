@@ -111,6 +111,7 @@ if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/pyproject.toml" ]; then
 fi
 
 VENV_DIR="${CLAWJOURNAL_VENV:-$HOME/.clawjournal-venv}"
+ACTIVE_PYTHON="${CLAWJOURNAL_ACTIVE_PYTHON:-}"
 
 # 1) Locate a Python 3.10+ interpreter.
 PYTHON=""
@@ -163,9 +164,18 @@ if ! sync_checkout "$REPO_DIR"; then
   exit 1
 fi
 
-# 2) Create or reuse the venv. On Debian-likes, "python3 -m venv" fails when
-#    python3-venv isn't installed — surface that clearly.
-if [ ! -x "$VENV_DIR/bin/python" ] && [ ! -x "$VENV_DIR/Scripts/python.exe" ]; then
+# 2) Reuse the interpreter that invoked selfupdate, or create/reuse the
+#    managed venv for direct installer runs.
+ACTIVE_INSTALL=0
+if [ -n "$ACTIVE_PYTHON" ]; then
+  if [ ! -x "$ACTIVE_PYTHON" ]; then
+    echo "[x] Active Python is not executable: $ACTIVE_PYTHON" >&2
+    exit 1
+  fi
+  VENV_PY="$ACTIVE_PYTHON"
+  VENV_BIN="$(dirname "$ACTIVE_PYTHON")"
+  ACTIVE_INSTALL=1
+elif [ ! -x "$VENV_DIR/bin/python" ] && [ ! -x "$VENV_DIR/Scripts/python.exe" ]; then
   echo "-> Creating venv at $VENV_DIR"
   if ! "$PYTHON" -m venv "$VENV_DIR" 2>"$ERR_LOG"; then
     cat "$ERR_LOG" >&2
@@ -178,12 +188,28 @@ EOF
   fi
 fi
 
-if [ -x "$VENV_DIR/bin/python" ]; then
-  VENV_PY="$VENV_DIR/bin/python"
-  VENV_BIN="$VENV_DIR/bin"
+if [ "$ACTIVE_INSTALL" -eq 0 ]; then
+  if [ -x "$VENV_DIR/bin/python" ]; then
+    VENV_PY="$VENV_DIR/bin/python"
+    VENV_BIN="$VENV_DIR/bin"
+  else
+    VENV_PY="$VENV_DIR/Scripts/python.exe"
+    VENV_BIN="$VENV_DIR/Scripts"
+  fi
+fi
+
+run_clawjournal() {
+  if [ "$ACTIVE_INSTALL" -eq 1 ]; then
+    CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_PY" -m clawjournal.cli "$@"
+  else
+    CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" "$@"
+  fi
+}
+
+if [ "$ACTIVE_INSTALL" -eq 1 ]; then
+  CLAWJOURNAL_DISPLAY="$VENV_PY -m clawjournal.cli"
 else
-  VENV_PY="$VENV_DIR/Scripts/python.exe"
-  VENV_BIN="$VENV_DIR/Scripts"
+  CLAWJOURNAL_DISPLAY="$VENV_BIN/clawjournal"
 fi
 
 # Record anything the direct checkout sync changed before installation begins.
@@ -195,7 +221,9 @@ fi
 
 # 3) Install ClawJournal in editable mode.
 echo "-> Installing ClawJournal (editable) from $REPO_DIR"
-"$VENV_PY" -m pip install --quiet --upgrade pip
+if [ "$ACTIVE_INSTALL" -eq 0 ]; then
+  "$VENV_PY" -m pip install --quiet --upgrade pip
+fi
 "$VENV_PY" -m pip install --quiet -e "$REPO_DIR"
 
 # 4) Optional: build the browser workbench. Failures here are non-fatal — the
@@ -223,15 +251,15 @@ fi
 # installed under ~/.clawjournal/bin without root access.
 if [ "$WITH_SHARING" -eq 1 ]; then
   echo "-> Installing managed secret scanners"
-  CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" betterleaks install
-  CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" trufflehog install
+  run_clawjournal betterleaks install
+  run_clawjournal trufflehog install
 fi
 
-# 6) Optional desktop launcher. It uses the just-installed venv executable so
-#    the shortcut remains independent of the user's PATH.
+# 6) Optional desktop launcher. It uses the just-installed interpreter or venv
+#    command so the shortcut remains independent of the user's PATH.
 if [ "$DESKTOP_SHORTCUT" -eq 1 ]; then
   echo "-> Installing desktop shortcut"
-  "$VENV_BIN/clawjournal" desktop install
+  run_clawjournal desktop install
 fi
 
 # 7) Retire only the pending reasons this run actually reconciled. Frontend
@@ -244,7 +272,7 @@ fi
 if [ "$WITH_SHARING" -eq 1 ]; then
   set -- "$@" --scanners-installed
 fi
-CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" selfupdate "$@" >/dev/null 2>&1 || true
+run_clawjournal selfupdate "$@" >/dev/null 2>&1 || true
 
 echo
 INSTALLED_VERSION="$("$VENV_PY" -c 'import clawjournal; print(clawjournal.__version__)' 2>/dev/null || echo "?")"
@@ -252,10 +280,10 @@ echo "[ok] ClawJournal $INSTALLED_VERSION installed."
 
 cat <<EOF
 
-Run:    $VENV_BIN/clawjournal scan
-        $VENV_BIN/clawjournal serve
+Run:    $CLAWJOURNAL_DISPLAY scan
+        $CLAWJOURNAL_DISPLAY serve
 
-Or add the venv to your PATH:
+Or add the Python environment to your PATH:
         export PATH="$VENV_BIN:\$PATH"
 EOF
 
@@ -279,20 +307,20 @@ elif [ -d "$FE_SRC_DIR" ] && [ -n "$(find "$FE_SRC_DIR" -type f -newer "$FE_DIST
 EOF
 fi
 
-if [ "$WITH_SHARING" -eq 0 ] && ! CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" betterleaks status --json >/dev/null 2>&1; then
+if [ "$WITH_SHARING" -eq 0 ] && ! run_clawjournal betterleaks status --json >/dev/null 2>&1; then
   cat <<EOF
 
 [i] Betterleaks is required when sharing exports. Install it with:
-    $VENV_BIN/clawjournal betterleaks install      (pinned version, sha256-verified, no root needed)
+    $CLAWJOURNAL_DISPLAY betterleaks install      (pinned version, sha256-verified, no root needed)
     Or re-run: ./scripts/install.sh --with-sharing
 EOF
 fi
 
-if [ "$WITH_SHARING" -eq 0 ] && ! CLAWJOURNAL_NO_AUTO_UPDATE=1 "$VENV_BIN/clawjournal" trufflehog status --json >/dev/null 2>&1; then
+if [ "$WITH_SHARING" -eq 0 ] && ! run_clawjournal trufflehog status --json >/dev/null 2>&1; then
   cat <<EOF
 
 [i] TruffleHog is required when sharing exports. Install it before 'bundle-export':
-    $VENV_BIN/clawjournal trufflehog install      (pinned version, sha256-verified, no root needed)
+    $CLAWJOURNAL_DISPLAY trufflehog install      (pinned version, sha256-verified, no root needed)
     Or re-run: ./scripts/install.sh --with-sharing
 EOF
 fi
