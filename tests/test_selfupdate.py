@@ -1093,17 +1093,18 @@ def test_timed_out_reinstall_kills_descendants_before_unlock(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")
 def test_reinstall_disables_auto_update_in_the_child(isolated_config_dir, fake_repo):
-    """The installer shells out to the CLI it is installing."""
+    """The child neither auto-updates nor reacquires its parent's install lock."""
     scripts = fake_repo / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     marker = fake_repo / "env-seen"
     (scripts / "install.sh").write_text(
         "#!/bin/sh\n"
-        f'echo "${{CLAWJOURNAL_NO_AUTO_UPDATE:-unset}}" > "{marker}"\n'
+        f'printf "%s,%s" "${{CLAWJOURNAL_NO_AUTO_UPDATE:-unset}}" '
+        f'"${{CLAWJOURNAL_INSTALL_LOCK_HELD:-unset}}" > "{marker}"\n'
     )
 
     assert selfupdate.reinstall(repo=fake_repo, capture=True)["status"] == "reinstalled"
-    assert marker.read_text().strip() == "1"
+    assert marker.read_text() == "1,1"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")

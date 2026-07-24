@@ -20,11 +20,6 @@
 
 set -eu
 
-# Capture stderr from venv creation in a per-run temp file. mktemp avoids the
-# /tmp/<predictable-name> race (multi-user systems, symlink attacks).
-ERR_LOG="$(mktemp 2>/dev/null || echo "/tmp/clawjournal-venv.$$.err")"
-trap 'rm -f "$ERR_LOG"' EXIT INT TERM
-
 WITH_FRONTEND=0
 DESKTOP_SHORTCUT=0
 WITH_SHARING=0
@@ -66,16 +61,37 @@ sync_checkout() {
     return 0
   fi
   sc_before="$(git -C "$sc_repo" rev-parse HEAD 2>/dev/null || echo '')"
-  if git -C "$sc_repo" pull --ff-only --quiet origin main 2>/dev/null; then
-    sc_after="$(git -C "$sc_repo" rev-parse HEAD 2>/dev/null || echo '')"
-    if [ -n "$sc_before" ] && [ -n "$sc_after" ]; then
-      SYNC_FROM="$sc_before"
-      SYNC_TO="$sc_after"
-    fi
-    echo "[ok] Checkout is on the latest published version."
-  else
-    echo "[i] Could not fetch the latest version (offline, or history has diverged). Installing the current code."
+  if ! git -C "$sc_repo" fetch --quiet origin main 2>/dev/null; then
+    echo "[i] Could not fetch the latest version (offline). Installing the current code."
+    return 0
   fi
+  sc_upstream="$(git -C "$sc_repo" rev-parse FETCH_HEAD 2>/dev/null || echo '')"
+  if [ -z "$sc_before" ] || [ -z "$sc_upstream" ]; then
+    echo "[i] Could not compare the checkout with the latest published version. Installing the current code."
+    return 0
+  fi
+  if [ "$sc_before" = "$sc_upstream" ]; then
+    SYNC_FROM="$sc_before"
+    SYNC_TO="$sc_upstream"
+    echo "[ok] Checkout is on the latest published version."
+    return 0
+  fi
+  if git -C "$sc_repo" merge-base --is-ancestor "$sc_before" "$sc_upstream" 2>/dev/null; then
+    if git -C "$sc_repo" merge --ff-only --quiet "$sc_upstream" 2>/dev/null; then
+      SYNC_FROM="$sc_before"
+      SYNC_TO="$sc_upstream"
+      echo "[ok] Checkout is on the latest published version."
+      return 0
+    fi
+    echo "[i] Could not apply the latest published version. Installing the current code."
+    return 0
+  fi
+  if git -C "$sc_repo" merge-base --is-ancestor "$sc_upstream" "$sc_before" 2>/dev/null; then
+    echo "[x] Not installing: this main checkout has unpublished local commits. Move them to a branch, then retry." >&2
+  else
+    echo "[x] Not installing: this main checkout has diverged from the published version. Reconcile it, then retry." >&2
+  fi
+  return 1
 }
 
 # Resolve the repo root. If the script is run from a checkout, REPO_DIR is the
@@ -93,7 +109,6 @@ if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/pyproject.toml" ]; then
   fi
   REPO_DIR="$TARGET"
 fi
-sync_checkout "$REPO_DIR"
 
 VENV_DIR="${CLAWJOURNAL_VENV:-$HOME/.clawjournal-venv}"
 
@@ -120,7 +135,33 @@ EOF
   exit 1
 fi
 
+# Direct installer invocations join the same advisory lock as automatic
+# reinstalls. The Python parent marks recursive installer children so they do
+# not try to acquire their already-held lock again.
+if [ "${CLAWJOURNAL_INSTALL_LOCK_HELD:-}" != "1" ]; then
+  set --
+  if [ "$DESKTOP_SHORTCUT" -eq 1 ]; then
+    set -- "$@" --desktop-shortcut
+  elif [ "$WITH_FRONTEND" -eq 1 ]; then
+    set -- "$@" --with-frontend
+  fi
+  if [ "$WITH_SHARING" -eq 1 ]; then
+    set -- "$@" --with-sharing
+  fi
+  exec "$PYTHON" "$REPO_DIR/scripts/install_lock.py" -- \
+    sh "$REPO_DIR/scripts/install.sh" "$@"
+fi
+
 echo "[ok] Python: $("$PYTHON" --version 2>&1) ($(command -v "$PYTHON"))"
+
+# Capture stderr from venv creation in a per-run temp file. mktemp avoids the
+# /tmp/<predictable-name> race (multi-user systems, symlink attacks).
+ERR_LOG="$(mktemp 2>/dev/null || echo "/tmp/clawjournal-venv.$$.err")"
+trap 'rm -f "$ERR_LOG"' EXIT INT TERM
+
+if ! sync_checkout "$REPO_DIR"; then
+  exit 1
+fi
 
 # 2) Create or reuse the venv. On Debian-likes, "python3 -m venv" fails when
 #    python3-venv isn't installed — surface that clearly.

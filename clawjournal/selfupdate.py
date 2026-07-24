@@ -43,6 +43,7 @@ DIFF_TIMEOUT_SECONDS = 5
 REINSTALL_TIMEOUT_SECONDS = 15 * 60
 REINSTALL_TERMINATE_GRACE_SECONDS = 5.0
 REINSTALL_LOCK_FILENAME = "reinstall.lock"
+INSTALL_LOCK_HELD_ENV = "CLAWJOURNAL_INSTALL_LOCK_HELD"
 DEFAULT_BRANCH = "main"
 DEFAULT_REMOTE = "origin"
 
@@ -755,6 +756,10 @@ def reinstall(
         return info
     try:
         child_env = {**os.environ, OPT_OUT_ENV: "1"}
+        # The platform installer uses the same advisory lock when launched
+        # directly.  This parent already owns it, so mark the child to avoid a
+        # recursive acquisition deadlock.
+        child_env[INSTALL_LOCK_HELD_ENV] = "1"
         base_prefix = getattr(sys, "base_prefix", sys.prefix)
         if sys.prefix != base_prefix or hasattr(sys, "real_prefix"):
             # Console entry points run under the environment in their shebang.

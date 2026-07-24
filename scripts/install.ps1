@@ -54,6 +54,7 @@ if ($DesktopShortcut) {
 # install proceeds from the code that is already there.
 $script:SyncFrom = $null
 $script:SyncTo = $null
+$script:SyncBlocked = $false
 function Sync-Checkout {
     param([string]$Repo)
     if (-not (Test-Path (Join-Path $Repo '.git'))) { return }
@@ -79,19 +80,44 @@ function Sync-Checkout {
         }
         $before = (& git -C $Repo rev-parse HEAD 2>$null) -join ''
         if ($LASTEXITCODE -ne 0) { $before = $null }
-        & git -C $Repo pull --ff-only --quiet origin main 2>$null
-        $pullExit = $LASTEXITCODE
-        if ($pullExit -eq 0) {
-            $after = (& git -C $Repo rev-parse HEAD 2>$null) -join ''
-            $afterExit = $LASTEXITCODE
-            if ($before -and $afterExit -eq 0 -and $after) {
-                $script:SyncFrom = $before
-                $script:SyncTo = $after
-            }
-            Write-Host "[ok] Checkout is on the latest published version."
-        } else {
-            Write-Host "[i] Could not fetch the latest version (offline, or history has diverged). Installing the current code."
+        & git -C $Repo fetch --quiet origin main 2>$null
+        $fetchExit = $LASTEXITCODE
+        if ($fetchExit -ne 0) {
+            Write-Host "[i] Could not fetch the latest version (offline). Installing the current code."
+            return
         }
+        $upstream = (& git -C $Repo rev-parse FETCH_HEAD 2>$null) -join ''
+        $upstreamExit = $LASTEXITCODE
+        if (-not $before -or $upstreamExit -ne 0 -or -not $upstream) {
+            Write-Host "[i] Could not compare the checkout with the latest published version. Installing the current code."
+            return
+        }
+        if ($before -eq $upstream) {
+            $script:SyncFrom = $before
+            $script:SyncTo = $upstream
+            Write-Host "[ok] Checkout is on the latest published version."
+            return
+        }
+        & git -C $Repo merge-base --is-ancestor $before $upstream 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            & git -C $Repo merge --ff-only --quiet $upstream 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $script:SyncFrom = $before
+                $script:SyncTo = $upstream
+                Write-Host "[ok] Checkout is on the latest published version."
+                return
+            }
+            Write-Host "[x] Not installing: the latest published version could not be applied. Retry after checking the checkout." -ForegroundColor Red
+            $script:SyncBlocked = $true
+            return
+        }
+        & git -C $Repo merge-base --is-ancestor $upstream $before 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[x] Not installing: this main checkout has unpublished local commits. Move them to a branch, then retry." -ForegroundColor Red
+        } else {
+            Write-Host "[x] Not installing: this main checkout has diverged from the published version. Reconcile it, then retry." -ForegroundColor Red
+        }
+        $script:SyncBlocked = $true
     } finally {
         $ErrorActionPreference = $prevEap
     }
@@ -111,7 +137,6 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot '..\pyproject.toml'))
     }
     $RepoDir = $target
 }
-Sync-Checkout -Repo $RepoDir
 
 if (-not $VenvPath) {
     $VenvPath = if ($env:CLAWJOURNAL_VENV) { $env:CLAWJOURNAL_VENV } else { Join-Path $HOME '.clawjournal-venv' }
@@ -148,8 +173,36 @@ if (-not $python) {
     exit 1
 }
 
+# Direct installer invocations join the same advisory lock as automatic
+# reinstalls. Internal reinstall children mark the environment to avoid
+# recursively acquiring the lock their parent already owns.
+if ($env:CLAWJOURNAL_INSTALL_LOCK_HELD -ne '1') {
+    $installerArgs = @()
+    if ($DesktopShortcut) {
+        $installerArgs += '-DesktopShortcut'
+    } elseif ($WithFrontend) {
+        $installerArgs += '-WithFrontend'
+    }
+    if ($WithSharing) { $installerArgs += '-WithSharing' }
+    if ($VenvPath) { $installerArgs += @('-VenvPath', $VenvPath) }
+    $hostExe = (Get-Process -Id $PID).Path
+    $lockCommand = @(
+        (Join-Path $RepoDir 'scripts\install_lock.py'),
+        '--',
+        $hostExe,
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', (Join-Path $RepoDir 'scripts\install.ps1')
+    ) + $installerArgs
+    & $python.Source @($python.Prefix + $lockCommand)
+    exit $LASTEXITCODE
+}
+
 $versionLine = (& $python.Source @($python.Prefix + @('--version')) 2>&1) -join ' '
 Write-Host "[ok] Python: $versionLine ($($python.Source))"
+
+Sync-Checkout -Repo $RepoDir
+if ($script:SyncBlocked) { exit 1 }
 
 # 2) Create venv if missing.
 $VenvPy = Join-Path $VenvPath 'Scripts\python.exe'
