@@ -60,6 +60,57 @@ def test_frontend_snapshot_stays_on_the_startup_build(tmp_path):
     assert snapshot.read("/assets/app-new.js") is None
 
 
+def test_no_snapshot_when_dist_has_never_been_built(tmp_path):
+    assert capture_frontend_snapshot(tmp_path / "dist", revision=OLD) is None
+
+
+def test_no_snapshot_while_a_build_has_emptied_dist(tmp_path):
+    """Vite clears ``dist/`` before it bundles, so a daemon starting mid-build
+    sees a stable *empty* tree. Pinning it would serve the placeholder for the
+    life of the process; falling back to disk self-heals on the next request.
+    """
+    dist = tmp_path / "dist"
+    dist.mkdir()
+
+    assert capture_frontend_snapshot(dist, revision=OLD) is None
+
+
+def test_no_snapshot_when_index_html_has_not_landed_yet(tmp_path):
+    """A half-written tree is internally consistent but has no SPA entry."""
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "assets" / "app-new.js").write_bytes(b"new frontend")
+
+    assert capture_frontend_snapshot(dist, revision=OLD) is None
+
+
+def test_no_snapshot_when_the_tree_keeps_changing_mid_capture(tmp_path, monkeypatch):
+    from clawjournal.workbench import frontend_snapshot
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_bytes(b"<html>")
+
+    signatures = iter(
+        [
+            (("index.html", 6, 1),),
+            (("index.html", 6, 2),),
+            (("index.html", 6, 3),),
+            (("index.html", 6, 4),),
+        ]
+    )
+    monkeypatch.setattr(
+        frontend_snapshot, "_tree_signature", lambda root: next(signatures)
+    )
+
+    assert (
+        frontend_snapshot.capture_frontend_snapshot(
+            dist, revision=OLD, retry_delay=0
+        )
+        is None
+    )
+
+
 def test_no_restart_when_head_unchanged(quiet_env, monkeypatch):
     monkeypatch.setattr("clawjournal.selfupdate._rev_parse", lambda repo, rev: OLD)
     assert daemon._update_restart_due(quiet_env, OLD, now=1000.0, activity=IDLE) is None

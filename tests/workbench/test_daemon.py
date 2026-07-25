@@ -2753,6 +2753,61 @@ class TestStaticServing:
             srv.server_close()
             thread.join(timeout=5)
 
+    def test_unpinnable_frontend_falls_back_to_the_live_build(
+        self, index_setup, monkeypatch
+    ):
+        """Starting inside the installer's rebuild window must not blank the UI.
+
+        Vite empties ``dist/`` before bundling, so a daemon that starts then
+        has nothing to pin. It must keep the historical disk-backed serving
+        rather than latch an empty snapshot and answer every request with the
+        "no frontend built" placeholder for the rest of its life.
+        """
+        from http.server import ThreadingHTTPServer
+
+        from clawjournal.workbench import daemon
+        from clawjournal.workbench.frontend_snapshot import (
+            capture_frontend_snapshot,
+        )
+
+        dist = index_setup / "frontend_dist"
+        (dist / "assets").mkdir(parents=True)
+        snapshot = capture_frontend_snapshot(dist, revision="a" * 40)
+        assert snapshot is None
+
+        # The build finishes moments later; dist on disk is healthy.
+        (dist / "index.html").write_text(
+            '<!doctype html><title>Session Timeline</title>'
+            '<script src="/assets/app.js"></script>',
+            encoding="utf-8",
+        )
+        (dist / "assets" / "app.js").write_bytes(b"real frontend")
+
+        monkeypatch.setattr(daemon, "FRONTEND_DIST", dist)
+        daemon._open_request_admission()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
+        srv._frontend_snapshot = snapshot
+        thread = Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            body = response.read()
+            assert response.status == 200
+            assert b"Session Timeline" in body
+            assert b"ClawJournal Workbench" not in body  # not the placeholder
+
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/assets/app.js")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert response.read() == b"real frontend"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
+
 
 class TestTimelineRoute:
     def test_session_timeline_renders_cost_incidents_and_subagents(self, server, index_setup):
