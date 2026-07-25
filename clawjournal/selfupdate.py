@@ -703,10 +703,9 @@ def finalize_install(
 def reinstall_needed(repo: Path | None = None) -> bool:
     """True when the installed tool may not match the checkout.
 
-    Lets `selfupdate --reinstall` be safely run unconditionally (the setup
-    prompt tells participants' agents to do exactly that): when the pull
-    found nothing and nothing is pending or stale, the minutes-long
-    installer run is skipped entirely.
+    The running daemon uses this as a restart gate. The explicit
+    ``selfupdate --reinstall`` command intentionally still reruns the installer
+    when the checkout is current so it can repair unrecorded environment drift.
     """
     target = repo or _package_repo_root()
     if target is None:

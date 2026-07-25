@@ -578,6 +578,7 @@ def test_update_restart_launch_suppresses_launch_only_actions(
 ) -> None:
     calls: list[object] = []
     captured: dict[str, object] = {}
+    frontend_snapshot = object()
     monkeypatch.setenv(desktop._UPDATE_RESTART_CHILD_ENV, "1")
     monkeypatch.setattr(desktop, "note_opened", lambda: calls.append("opened"))
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
@@ -593,11 +594,15 @@ def test_update_restart_launch_suppresses_launch_only_actions(
         lambda **kwargs: captured.update(kwargs),
     )
 
-    desktop.launch(startup_head="a" * 40)
+    desktop.launch(
+        startup_head="a" * 40,
+        frontend_snapshot=frontend_snapshot,
+    )
 
     assert calls == []
     assert captured["open_browser"] is False
     assert captured["startup_head"] == "a" * 40
+    assert captured["frontend_snapshot"] is frontend_snapshot
 
 
 def test_occupied_unknown_port_is_not_opened_or_replaced(

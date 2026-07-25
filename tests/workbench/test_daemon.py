@@ -2619,6 +2619,40 @@ class TestFrontendStaleWarning:
 
         assert capsys.readouterr().err == ""
 
+    def test_pinned_stale_warning_asks_for_a_restart_too(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Rebuilding does not reach a process serving a startup snapshot."""
+        frontend = tmp_path / "frontend"
+        dist = frontend / "dist"
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        _write_with_mtime(dist / "index.html", "<!doctype html>", 100)
+        _write_with_mtime(frontend / "src" / "App.tsx", "export {}", 200)
+
+        _warn_if_frontend_stale(pinned=True)
+
+        err = capsys.readouterr().err
+        assert "frontend bundle is STALE" in err
+        assert "restart the daemon" in err
+
+    def test_pinned_process_does_not_call_a_mid_rebuild_dist_missing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The installer empties dist/ while we serve the copy pinned from it."""
+        frontend = tmp_path / "frontend"
+        dist = frontend / "dist"
+        dist.mkdir(parents=True)
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        _write_with_mtime(frontend / "src" / "App.tsx", "export {}", 100)
+
+        _warn_if_frontend_stale(pinned=True)
+        assert capsys.readouterr().err == ""
+
+        _warn_if_frontend_stale()
+        assert "frontend bundle is MISSING" in capsys.readouterr().err
+
 
 class TestReloadSupervisor:
     def test_reload_child_command_uses_module_invocation(self, monkeypatch):
@@ -2700,6 +2734,113 @@ class TestStaticServing:
         assert resp.status == 200
         assert "Session Timeline" in body
         assert "Built UI" not in body
+
+    def test_serves_startup_snapshot_while_live_dist_is_rebuilt(
+        self, index_setup, monkeypatch
+    ):
+        from http.server import ThreadingHTTPServer
+
+        from clawjournal.workbench import daemon
+        from clawjournal.workbench.frontend_snapshot import (
+            capture_frontend_snapshot,
+        )
+
+        dist = index_setup / "frontend_dist"
+        assets = dist / "assets"
+        assets.mkdir(parents=True)
+        (dist / "index.html").write_text(
+            '<!doctype html><script src="/assets/app-old.js"></script>',
+            encoding="utf-8",
+        )
+        (assets / "app-old.js").write_bytes(b"old frontend")
+        snapshot = capture_frontend_snapshot(dist, revision="a" * 40)
+
+        monkeypatch.setattr(daemon, "FRONTEND_DIST", dist)
+        daemon._open_request_admission()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
+        srv._frontend_snapshot = snapshot
+        thread = Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            (dist / "index.html").write_text(
+                '<!doctype html><script src="/assets/app-new.js"></script>',
+                encoding="utf-8",
+            )
+            (assets / "app-old.js").unlink()
+            (assets / "app-new.js").write_bytes(b"new frontend")
+
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            body = response.read()
+            assert response.status == 200
+            assert b"app-old.js" in body
+            assert b"app-new.js" not in body
+
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/assets/app-old.js")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert response.read() == b"old frontend"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
+
+    def test_unpinnable_frontend_falls_back_to_the_live_build(
+        self, index_setup, monkeypatch
+    ):
+        """Starting inside the installer's rebuild window must not blank the UI.
+
+        Vite empties ``dist/`` before bundling, so a daemon that starts then
+        has nothing to pin. It must keep the historical disk-backed serving
+        rather than latch an empty snapshot and answer every request with the
+        "no frontend built" placeholder for the rest of its life.
+        """
+        from http.server import ThreadingHTTPServer
+
+        from clawjournal.workbench import daemon
+        from clawjournal.workbench.frontend_snapshot import (
+            capture_frontend_snapshot,
+        )
+
+        dist = index_setup / "frontend_dist"
+        (dist / "assets").mkdir(parents=True)
+        snapshot = capture_frontend_snapshot(dist, revision="a" * 40)
+        assert snapshot is None
+
+        # The build finishes moments later; dist on disk is healthy.
+        (dist / "index.html").write_text(
+            '<!doctype html><title>Session Timeline</title>'
+            '<script src="/assets/app.js"></script>',
+            encoding="utf-8",
+        )
+        (dist / "assets" / "app.js").write_bytes(b"real frontend")
+
+        monkeypatch.setattr(daemon, "FRONTEND_DIST", dist)
+        daemon._open_request_admission()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), WorkbenchHandler)
+        srv._frontend_snapshot = snapshot
+        thread = Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/")
+            response = conn.getresponse()
+            body = response.read()
+            assert response.status == 200
+            assert b"Session Timeline" in body
+            assert b"ClawJournal Workbench" not in body  # not the placeholder
+
+            conn = HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/assets/app.js")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert response.read() == b"real frontend"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
 
 
 class TestTimelineRoute:

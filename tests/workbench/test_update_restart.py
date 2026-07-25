@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from clawjournal.workbench import daemon
+from clawjournal.workbench.frontend_snapshot import capture_frontend_snapshot
 
 
 OLD = "a" * 40
@@ -30,6 +31,105 @@ def test_restarts_when_updated_reconciled_and_idle(quiet_env):
     assert daemon._update_restart_due(
         quiet_env, OLD, now=1000.0, activity=IDLE
     ) == NEW
+
+
+def test_frontend_snapshot_stays_on_the_startup_build(tmp_path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<script src="/assets/app-old.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "app-old.js").write_bytes(b"old frontend")
+
+    snapshot = capture_frontend_snapshot(dist, revision=OLD)
+
+    (dist / "index.html").write_text(
+        '<script src="/assets/app-new.js"></script>',
+        encoding="utf-8",
+    )
+    (assets / "app-old.js").unlink()
+    (assets / "app-new.js").write_bytes(b"new frontend")
+
+    assert snapshot.revision == OLD
+    assert snapshot.read("index.html") == (
+        b'<script src="/assets/app-old.js"></script>'
+    )
+    assert snapshot.read("/assets/app-old.js") == b"old frontend"
+    assert snapshot.read("/assets/app-new.js") is None
+
+
+def test_no_snapshot_when_dist_has_never_been_built(tmp_path):
+    assert capture_frontend_snapshot(tmp_path / "dist", revision=OLD) is None
+
+
+def test_no_snapshot_while_a_build_has_emptied_dist(tmp_path):
+    """Vite clears ``dist/`` before it bundles, so a daemon starting mid-build
+    sees a stable *empty* tree. Pinning it would serve the placeholder for the
+    life of the process; falling back to disk self-heals on the next request.
+    """
+    dist = tmp_path / "dist"
+    dist.mkdir()
+
+    assert capture_frontend_snapshot(dist, revision=OLD) is None
+
+
+def test_no_snapshot_when_index_html_has_not_landed_yet(tmp_path):
+    """A half-written tree is internally consistent but has no SPA entry."""
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "assets" / "app-new.js").write_bytes(b"new frontend")
+
+    assert capture_frontend_snapshot(dist, revision=OLD) is None
+
+
+def test_no_snapshot_when_the_tree_keeps_changing_mid_capture(tmp_path, monkeypatch):
+    from clawjournal.workbench import frontend_snapshot
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_bytes(b"<html>")
+
+    signatures = iter(
+        [
+            (("index.html", 6, 1),),
+            (("index.html", 6, 2),),
+            (("index.html", 6, 3),),
+            (("index.html", 6, 4),),
+        ]
+    )
+    monkeypatch.setattr(
+        frontend_snapshot, "_tree_signature", lambda root: next(signatures)
+    )
+
+    assert (
+        frontend_snapshot.capture_frontend_snapshot(
+            dist, revision=OLD, retry_delay=0
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "repo, argv, expected",
+    [
+        (Path("/repo"), ["clawjournal", "serve"], True),
+        (Path("/repo"), ["clawjournal", "serve", "--port", "8384"], True),
+        (Path("/repo"), ["clawjournal", "desktop", "launch"], True),
+        # No checkout to fast-forward: a wheel install's dist/ never moves.
+        (None, ["clawjournal", "serve"], False),
+        # Never binds a socket, so it has nothing to keep serving.
+        (Path("/repo"), ["clawjournal", "desktop", "status"], False),
+        (Path("/repo"), ["clawjournal", "desktop", "stop"], False),
+        # The dev supervisor exists precisely to pick rebuilds up.
+        (Path("/repo"), ["clawjournal", "serve", "--reload"], False),
+    ],
+)
+def test_frontend_is_pinned_only_where_it_can_help(repo, argv, expected):
+    from clawjournal import cli
+
+    assert cli._should_pin_frontend(repo, argv) is expected
 
 
 def test_no_restart_when_head_unchanged(quiet_env, monkeypatch):
@@ -208,10 +308,12 @@ def test_request_accounting_never_goes_negative(monkeypatch):
 def test_serve_captures_head_before_starting_auto_update(monkeypatch):
     """A fast updater must not hide the old backend revision from the watcher."""
     from clawjournal import cli, selfupdate
+    from clawjournal.workbench import frontend_snapshot
 
     events: list[str] = []
     captured: dict[str, object] = {}
     repo = Path("/nonexistent-repo")
+    snapshot = object()
 
     monkeypatch.setattr(
         "sys.argv",
@@ -225,6 +327,11 @@ def test_serve_captures_head_before_starting_auto_update(monkeypatch):
 
     monkeypatch.setattr(selfupdate, "_rev_parse", read_head)
     monkeypatch.setattr(
+        frontend_snapshot,
+        "capture_frontend_snapshot",
+        lambda **kwargs: events.append("frontend") or snapshot,
+    )
+    monkeypatch.setattr(
         selfupdate, "maybe_self_update", lambda: events.append("update")
     )
     monkeypatch.setattr(selfupdate, "pending_reinstall_notice", lambda: None)
@@ -236,5 +343,6 @@ def test_serve_captures_head_before_starting_auto_update(monkeypatch):
 
     cli.main()
 
-    assert events[:2] == ["head", "update"]
+    assert events[:3] == ["head", "frontend", "update"]
     assert captured["startup_head"] == OLD
+    assert captured["frontend_snapshot"] is snapshot
