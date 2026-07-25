@@ -314,20 +314,83 @@ def test_preserves_good_bad_mix():
 
 
 def test_cross_kind_title_extension_collapses():
-    # the distiller decorated a carried title ("Fix Root Cause" -> "Fix Root Cause
-    # Durably") and flipped the kind; guidance overlap is far below the cross-kind
-    # threshold, so the title-subset check must catch it.
-    avoid = SkillRule(kind="avoid", trigger="t", title="Fix Root Cause",
-                      guidance="don't stop at the temporary manual workaround that turns "
-                               "the test green — fix the root cause in the image build",
-                      why="w", taxonomy="revision_failure", support=7)
-    do = SkillRule(kind="do", trigger="t", title="Fix Root Cause Durably",
-                   guidance="land the permanent fix in the durable artifact and re-verify "
-                            "with the same harness that found it",
-                   why="w", support=4)
+    # Real stored pair: the distiller decorated a carried title ("Fix Root Cause" ->
+    # "Fix Root Cause Durably") and flipped the kind. Full guidance overlap is ~0.33,
+    # below the cross-kind threshold, but trigger/body corroboration verifies the
+    # extension before the title-subset path collapses it.
+    avoid = SkillRule(
+        kind="avoid",
+        trigger=(
+            "e2e testing surfaces a real production bug and a manual tweak makes it pass"
+        ),
+        title="Fix Root Cause",
+        guidance=(
+            "Don't stop at the temporary manual workaround that turns the test green — "
+            "identify and fix the root cause in the image build or source before calling "
+            "it done."
+        ),
+        why="w",
+        taxonomy="revision_failure",
+        support=7,
+    )
+    do = SkillRule(
+        kind="do",
+        trigger=(
+            "e2e or manual testing surfaces a real production bug and a quick in-place "
+            "workaround makes it pass"
+        ),
+        title="Fix Root Cause Durably",
+        guidance=(
+            "Land the permanent fix in the durable artifact — image build, source, or "
+            "deploy sequence — instead of stopping at the manual workaround, then "
+            "re-verify the root-cause fix with the same harness that found it."
+        ),
+        why="w",
+        support=4,
+    )
     merged = merge_rules([avoid], [do], set())
     assert sum("root cause" in (r.title or "").lower() for r in merged) == 1
     assert merged[0].kind == "avoid"                    # carried rule preferred (no churn)
+
+
+def test_title_extension_requires_independent_corroboration():
+    quality = SkillRule(
+        kind="do",
+        title="Test AI",
+        trigger="when evaluating an AI answer for response quality",
+        guidance="score model responses for factual correctness and instruction following",
+        why="unchecked answers reached users",
+    )
+    security = SkillRule(
+        kind="do",
+        title="Test AI Security",
+        trigger="before probing an AI workflow for prompt injection",
+        guidance="probe prompts for injection bypasses and secret exfiltration",
+        why="unsafe prompts exposed protected data",
+    )
+
+    assert len(merge_rules([quality], [security], set())) == 2
+
+
+def test_uncorroborated_title_extension_can_merge_on_strong_full_guidance():
+    base = SkillRule(
+        kind="do",
+        title="Test AI",
+        trigger="t",
+        guidance="inspect output",
+        why="w",
+    )
+    extended = SkillRule(
+        kind="do",
+        title="Test AI Security",
+        trigger="t",
+        guidance="inspect response",
+        why="w",
+    )
+
+    # Only one shared keyword cannot corroborate the title, but 1/3 full-guidance
+    # Jaccard still clears the normal same-kind threshold below the title branch.
+    assert len(merge_rules([base], [extended], set())) == 1
 
 
 def test_short_shared_title_words_do_not_collapse():

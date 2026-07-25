@@ -188,14 +188,21 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     shared = tka & tkb
     if len(shared) >= 2:
         parallel_scope_swap = _is_parallel_title_scope_swap(a, b)
-        if (tka <= tkb or tkb <= tka) and not parallel_scope_swap:
-            return True
-        title_overlap = len(shared) / len(tka | tkb)
         corroborated = (
             bool(a.taxonomy and a.taxonomy == b.taxonomy)
             or _keyword_corroboration(a.guidance, b.guidance)
             or _keyword_corroboration(a.trigger, b.trigger)
         )
+        # An extending title can add a real scope ("Test AI Security"), so set
+        # containment is not sufficient by itself. Require the same independent
+        # corroboration as other fuzzy-title matches.
+        if (
+            (tka <= tkb or tkb <= tka)
+            and corroborated
+            and not parallel_scope_swap
+        ):
+            return True
+        title_overlap = len(shared) / len(tka | tkb)
         if (
             title_overlap >= _TITLE_DUP_JACCARD
             and corroborated
@@ -625,7 +632,10 @@ def _print_preview(res: SkillResult) -> None:
             print(f"        why:  {r.why}")
     _print_focus(res)
     if res.dropped:
-        print(f"\n  Dropping {len(res.dropped)} previously-installed rule(s) outranked this run:")
+        print(
+            f"\n  Dropping {len(res.dropped)} previously-installed rule(s) "
+            "no longer in the install set:"
+        )
         for r in res.dropped:
             print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
     if res.trend:

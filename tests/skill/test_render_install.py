@@ -27,6 +27,25 @@ def test_hard_deny_scans_rendered_metadata_fields():
     assert "url" in blocked[0][1]
 
 
+def test_hard_deny_blocks_unsupported_personal_claims():
+    bad = _rule()
+    bad.why = "The developer’s repeated carelessness caused rework"
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+def test_hard_deny_allows_technical_trait_wording():
+    safe = _rule(
+        kind="do",
+        guidance="avoid unreliable integration tests by quarantining flaky cases",
+    )
+
+    assert render.gate_rules([safe]) == ([safe], [])
+
+
 def test_render_frontmatter_and_sections():
     md = render.render_skill_md([_rule(), _rule(kind="do", guidance="read source first")], META)
     assert md.startswith("---\nname: clawjournal-lessons")

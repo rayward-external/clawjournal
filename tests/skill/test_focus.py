@@ -428,6 +428,7 @@ def test_technical_adjectives_and_agent_facing_triggers_remain_eligible():
         ("trigger", "when the developer addresses CI unreliability before merging"),
         ("guidance", "the developer fixed the integration test’s unreliability"),
         ("guidance", "the coding agent corrected flaky-test unreliability"),
+        ("guidance", "avoid unreliable integration tests by quarantining flaky cases"),
         ("trigger", "when their integration test shows persistent unreliability"),
     ],
 )
