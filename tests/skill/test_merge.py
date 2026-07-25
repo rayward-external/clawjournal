@@ -79,18 +79,18 @@ def test_cross_kind_same_title_collapses():
 def test_one_word_title_swap_collapses():
     # The distiller re-emits a carried lesson under a near-identical title (one word
     # swapped, neither a subset). Both are 'do' rules, so there is no taxonomy to catch
-    # it and even the full stored pair's guidance overlap is only ~0.22 — below the
+    # it and even the full stored pair's guidance overlap is only ~0.09 — below the
     # 0.30 same-kind bar — so without the title check both install and burn two slots.
     carried = SkillRule(
         kind="do", trigger="t", title="Reproduce Review Findings",
-        guidance="before listing a suspected defect, run the targeted test slice for the "
-                 "touched module or build a small scratch repro that exercises the exact path",
+        guidance="before listing a suspected defect, reproduce the exact path with the "
+                 "targeted test slice or a small scratch case for the touched module",
         why="w", support=5)
     fresh = SkillRule(
         kind="do", trigger="t", title="Prove Review Findings",
-        guidance="before reporting each suspected defect, ground it in the current repo: read "
-                 "the implementation and tests the diff touches, then state which claims were "
-                 "executed versus only statically inspected",
+        guidance="before reporting each suspected defect, prove it in the current repo: read "
+                 "the implementation and tests the diff touches, then state which claims "
+                 "were executed versus only statically inspected",
         why="w", support=9)
     merged = merge_rules([carried], [fresh], set())
     assert sum("Review Findings" in r.title for r in merged) == 1
@@ -114,6 +114,85 @@ def test_near_title_similarity_requires_independent_corroboration():
     )
 
     assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scopes_survive_generic_guidance_corroboration():
+    api = SkillRule(
+        kind="do",
+        title="Validate API Responses",
+        trigger="before changing an API response",
+        guidance=(
+            "validate each API response against the schema before updating the "
+            "client contract and publishing release notes"
+        ),
+        why="client requests broke",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Validate Database Responses",
+        trigger="before changing a database response",
+        guidance=(
+            "validate each database response against the schema before changing "
+            "persistence migrations and inspecting stored records"
+        ),
+        why="stored records broke",
+    )
+
+    # Shared validate/response/schema vocabulary corroborates the common template,
+    # not the conflicting API/database scope that makes these distinct lessons.
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scope_guard_retains_two_letter_acronyms():
+    api = SkillRule(
+        kind="do",
+        title="Validate API Responses",
+        trigger="before changing an API response",
+        guidance=(
+            "validate each API response against the schema before updating the "
+            "client contract and publishing release notes"
+        ),
+        why="client requests broke",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Validate DB Responses",
+        trigger="before changing a DB response",
+        guidance=(
+            "validate each DB response against the schema before changing "
+            "persistence migrations and inspecting stored records"
+        ),
+        why="stored records broke",
+    )
+
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scope_swap_can_merge_on_strong_full_guidance():
+    raw = SkillRule(
+        kind="do",
+        title="Verify Raw Counts",
+        trigger="before reporting a count",
+        guidance=(
+            "recompute every count directly from raw records and compare the "
+            "reported total before publishing"
+        ),
+        why="unchecked counts caused rework",
+    )
+    source = SkillRule(
+        kind="do",
+        title="Verify Source Counts",
+        trigger="before reporting a count",
+        guidance=(
+            "recompute every count directly from source records and compare the "
+            "reported total before publishing"
+        ),
+        why="unchecked counts caused rework",
+    )
+
+    # The parallel-title guard only blocks weak fuzzy evidence. These still collapse
+    # through the existing >=0.30 full-guidance path.
+    assert len(merge_rules([raw], [source], set())) == 1
 
 
 def test_near_title_real_paraphrase_with_corroboration_collapses():

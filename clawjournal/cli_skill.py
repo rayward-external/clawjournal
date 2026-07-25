@@ -107,10 +107,21 @@ def _stem(w: str) -> str:
     return w
 
 
+def _keyword_stems(text: str) -> list[str]:
+    """Ordered significant word stems for body comparisons."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [_stem(w) for w in words if len(w) > 2 and w not in _DUP_STOPWORDS]
+
+
+def _title_stems(text: str) -> list[str]:
+    """Ordered title stems, retaining short scope terms such as DB or AI."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [_stem(w) for w in words if w not in _DUP_STOPWORDS]
+
+
 def _guidance_keywords(text: str) -> set[str]:
     """Significant word stems in a rule's guidance."""
-    words = re.findall(r"[a-z0-9]+", (text or "").lower())
-    return {_stem(w) for w in words if len(w) > 2 and w not in _DUP_STOPWORDS}
+    return set(_keyword_stems(text))
 
 
 def _guidance_overlap(a: str, b: str) -> float:
@@ -130,6 +141,19 @@ def _keyword_corroboration(a: str, b: str) -> bool:
         len(shared) >= 2
         and len(shared) / min(len(ka), len(kb)) >= _TITLE_DUP_CORROBORATION
     )
+
+
+def _is_parallel_title_scope_swap(a: SkillRule, b: SkillRule) -> bool:
+    """Return whether equal title templates replace one non-leading scope word."""
+    words_a = _title_stems(a.title)
+    words_b = _title_stems(b.title)
+    if len(words_a) != len(words_b):
+        return False
+    differences = [i for i, pair in enumerate(zip(words_a, words_b)) if pair[0] != pair[1]]
+    # The first significant word is the command verb. A swap there is commonly a
+    # paraphrase ("Prove" vs "Reproduce"); a sole later swap commonly distinguishes
+    # parallel subjects ("API" vs "Database") and needs the full guidance-overlap bar.
+    return len(differences) == 1 and differences[0] > 0
 
 
 def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
@@ -156,12 +180,15 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     # A near-identical title may count too, but title similarity is not evidence of
     # meaning by itself ("Verify API Contracts" and "Verify Database Contracts" are
     # distinct). Require corroboration in taxonomy, guidance, or trigger before applying
-    # the fuzzy-title path. This still catches measured rewrites such as "Prove Review
-    # Findings" / "Reproduce Review Findings".
-    tka, tkb = _guidance_keywords(ta), _guidance_keywords(tb)
+    # the fuzzy-title path. A one-word substitution inside otherwise parallel title
+    # templates (e.g. API vs database responses) must instead pass the stronger normal
+    # guidance-overlap bar below. This still catches measured action rewrites such as
+    # "Prove Review Findings" / "Reproduce Review Findings".
+    tka, tkb = set(_title_stems(ta)), set(_title_stems(tb))
     shared = tka & tkb
     if len(shared) >= 2:
-        if tka <= tkb or tkb <= tka:
+        parallel_scope_swap = _is_parallel_title_scope_swap(a, b)
+        if (tka <= tkb or tkb <= tka) and not parallel_scope_swap:
             return True
         title_overlap = len(shared) / len(tka | tkb)
         corroborated = (
@@ -169,7 +196,11 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
             or _keyword_corroboration(a.guidance, b.guidance)
             or _keyword_corroboration(a.trigger, b.trigger)
         )
-        if title_overlap >= _TITLE_DUP_JACCARD and corroborated:
+        if (
+            title_overlap >= _TITLE_DUP_JACCARD
+            and corroborated
+            and not parallel_scope_swap
+        ):
             return True
     if a.kind == b.kind:
         if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson
