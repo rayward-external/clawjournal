@@ -2619,6 +2619,40 @@ class TestFrontendStaleWarning:
 
         assert capsys.readouterr().err == ""
 
+    def test_pinned_stale_warning_asks_for_a_restart_too(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Rebuilding does not reach a process serving a startup snapshot."""
+        frontend = tmp_path / "frontend"
+        dist = frontend / "dist"
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        _write_with_mtime(dist / "index.html", "<!doctype html>", 100)
+        _write_with_mtime(frontend / "src" / "App.tsx", "export {}", 200)
+
+        _warn_if_frontend_stale(pinned=True)
+
+        err = capsys.readouterr().err
+        assert "frontend bundle is STALE" in err
+        assert "restart the daemon" in err
+
+    def test_pinned_process_does_not_call_a_mid_rebuild_dist_missing(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The installer empties dist/ while we serve the copy pinned from it."""
+        frontend = tmp_path / "frontend"
+        dist = frontend / "dist"
+        dist.mkdir(parents=True)
+        monkeypatch.setattr("clawjournal.workbench.daemon.FRONTEND_DIST", dist)
+
+        _write_with_mtime(frontend / "src" / "App.tsx", "export {}", 100)
+
+        _warn_if_frontend_stale(pinned=True)
+        assert capsys.readouterr().err == ""
+
+        _warn_if_frontend_stale()
+        assert "frontend bundle is MISSING" in capsys.readouterr().err
+
 
 class TestReloadSupervisor:
     def test_reload_child_command_uses_module_invocation(self, monkeypatch):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,20 +27,27 @@ class FrontendSnapshot:
 
 
 def _tree_signature(root: Path) -> tuple[tuple[str, int, int], ...] | None:
+    """Size + mtime of every file under ``root``, or ``None`` if it can't be read.
+
+    ``os.walk`` rather than ``rglob`` so each file costs a single ``stat`` --
+    the walk already tells us what is a directory.
+    """
+    entries: list[tuple[str, int, int]] = []
     try:
-        return tuple(
-            sorted(
-                (
-                    path.relative_to(root).as_posix(),
-                    path.stat().st_size,
-                    path.stat().st_mtime_ns,
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                path = Path(dirpath) / name
+                info = path.stat()
+                entries.append(
+                    (
+                        path.relative_to(root).as_posix(),
+                        info.st_size,
+                        info.st_mtime_ns,
+                    )
                 )
-                for path in root.rglob("*")
-                if path.is_file()
-            )
-        )
     except OSError:
         return None
+    return tuple(sorted(entries))
 
 
 def capture_frontend_snapshot(

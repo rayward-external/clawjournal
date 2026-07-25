@@ -111,6 +111,27 @@ def test_no_snapshot_when_the_tree_keeps_changing_mid_capture(tmp_path, monkeypa
     )
 
 
+@pytest.mark.parametrize(
+    "repo, argv, expected",
+    [
+        (Path("/repo"), ["clawjournal", "serve"], True),
+        (Path("/repo"), ["clawjournal", "serve", "--port", "8384"], True),
+        (Path("/repo"), ["clawjournal", "desktop", "launch"], True),
+        # No checkout to fast-forward: a wheel install's dist/ never moves.
+        (None, ["clawjournal", "serve"], False),
+        # Never binds a socket, so it has nothing to keep serving.
+        (Path("/repo"), ["clawjournal", "desktop", "status"], False),
+        (Path("/repo"), ["clawjournal", "desktop", "stop"], False),
+        # The dev supervisor exists precisely to pick rebuilds up.
+        (Path("/repo"), ["clawjournal", "serve", "--reload"], False),
+    ],
+)
+def test_frontend_is_pinned_only_where_it_can_help(repo, argv, expected):
+    from clawjournal import cli
+
+    assert cli._should_pin_frontend(repo, argv) is expected
+
+
 def test_no_restart_when_head_unchanged(quiet_env, monkeypatch):
     monkeypatch.setattr("clawjournal.selfupdate._rev_parse", lambda repo, rev: OLD)
     assert daemon._update_restart_due(quiet_env, OLD, now=1000.0, activity=IDLE) is None

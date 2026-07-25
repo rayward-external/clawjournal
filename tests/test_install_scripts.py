@@ -37,7 +37,7 @@ def test_posix_installer_supports_managed_sharing_dependencies():
 
     shell = shutil.which("sh")
     if shell is None:
-        return
+        pytest.skip("no POSIX sh to run the installer's --help with")
     help_result = subprocess.run(
         [shell, str(ROOT / "scripts" / "install.sh"), "--help"],
         check=False,

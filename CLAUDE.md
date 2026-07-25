@@ -21,6 +21,8 @@ cd clawjournal/web/frontend && npm install && npm run build
 
 The CI `smoke` job verifies that the built wheel contains `clawjournal/web/frontend/dist/index.html`. Touching the frontend without rebuilding will silently regress the wheel.
 
+A running `clawjournal serve` pins the bundle it captured at startup, so a rebuild is invisible to it until you restart the daemon — `serve --reload` stays disk-backed and picks rebuilds up on reload.
+
 CLI entry point: `clawjournal = clawjournal.cli:main` (see `pyproject.toml`). README.md has the full user-facing command reference.
 
 ## Architecture

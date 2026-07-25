@@ -5426,15 +5426,20 @@ npm run build</pre>
         self.wfile.write(data)
 
 
-def _warn_if_frontend_stale() -> None:
+def _warn_if_frontend_stale(*, pinned: bool = False) -> None:
     """In a dev checkout, warn when the served bundle is older than build inputs.
 
-    The editable install serves the gitignored ``dist/`` straight off disk, so
-    frontend edits (or a freshly-merged feature) are invisible until someone runs
+    Frontend edits (or a freshly-merged feature) are invisible until someone runs
     a build. We only have a ``src/`` tree in a dev checkout -- the shipped wheel
     packages only ``dist/`` -- so its presence is what distinguishes "developer
     who should rebuild" from "user running the released package". Silent on the
     latter.
+
+    ``pinned`` says this process captured ``dist/`` into memory at startup
+    instead of reading it per request. That changes both hints: a rebuild no
+    longer reaches the running daemon, so the fix is build *and restart*; and a
+    ``dist/`` that a rebuild has since emptied is not worth a MISSING banner,
+    because the pinned copy is what is being served.
     """
     frontend_root = FRONTEND_DIST.parent
     src_dir = frontend_root / "src"
@@ -5455,6 +5460,8 @@ def _warn_if_frontend_stale() -> None:
         print(f"{bar}\n", file=sys.stderr)
 
     if not index_html.exists():
+        if pinned:
+            return  # serving the startup snapshot; a mid-rebuild dist/ is fine
         _banner([
             "⚠  frontend bundle is MISSING — the workbench will serve a placeholder.",
             f"   build it:  {build_cmd}",
@@ -5468,11 +5475,19 @@ def _warn_if_frontend_stale() -> None:
         return  # can't stat -- don't block startup over a warning
 
     if newest_input > dist_mtime:
-        _banner([
+        lines = [
             "⚠  frontend bundle is STALE — build inputs are newer than dist/.",
             "   You are seeing an OLD UI. Rebuild to pick up frontend changes:",
             f"     {build_cmd}",
-        ])
+        ]
+        if pinned:
+            lines.append(
+                "   then restart the daemon — this process serves the bundle"
+            )
+            lines.append(
+                "   it pinned at startup (`serve --reload` stays disk-backed)."
+            )
+        _banner(lines)
 
 
 def _newest_frontend_build_input_mtime(frontend_root: Path) -> float:
@@ -5868,7 +5883,7 @@ def run_server(
     url = f"http://localhost:{port}/"
     logger.info("Workbench running at %s", url)
 
-    _warn_if_frontend_stale()
+    _warn_if_frontend_stale(pinned=frontend_snapshot is not None)
 
     if remote:
         import socket

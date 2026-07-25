@@ -4000,6 +4000,31 @@ def _should_auto_update(argv: list[str] | None = None) -> bool:
     return command != "selfupdate"
 
 
+def _should_pin_frontend(
+    startup_repo: Path | None, argv: list[str] | None = None
+) -> bool:
+    """Whether this process should capture an immutable frontend snapshot.
+
+    Pinning only earns its keep for a process that will serve requests while
+    something else can rewrite ``dist/`` underneath it:
+
+      - a wheel install has no checkout for the updater to fast-forward, so
+        there is nothing to defend against (and `_package_repo_root` is the
+        same gate `daemon_startup_head` already uses);
+      - `desktop status` / `desktop stop` exit without binding a socket;
+      - `--reload` opts out on purpose — picking up rebuilds is the dev
+        supervisor's whole job.
+    """
+    if startup_repo is None:
+        return False
+    tokens = (sys.argv if argv is None else argv)[1:]
+    if "--reload" in tokens:
+        return False
+    if _requested_subcommand(argv) == "desktop":
+        return "launch" in tokens
+    return True
+
+
 def main() -> None:
     # A workbench process must remember the revision its already-imported
     # Python belongs to and pin its matching frontend before the detached
@@ -4009,12 +4034,13 @@ def main() -> None:
     if _requested_subcommand() in {"serve", "desktop"}:
         try:
             from .selfupdate import _package_repo_root, _rev_parse
-            from .workbench.frontend_snapshot import capture_frontend_snapshot
 
             startup_repo = _package_repo_root()
             if startup_repo is not None:
                 daemon_startup_head = _rev_parse(startup_repo, "HEAD")
-            if "--reload" not in sys.argv:
+            if _should_pin_frontend(startup_repo):
+                from .workbench.frontend_snapshot import capture_frontend_snapshot
+
                 daemon_frontend_snapshot = capture_frontend_snapshot(
                     revision=daemon_startup_head
                 )
