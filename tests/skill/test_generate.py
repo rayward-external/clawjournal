@@ -32,6 +32,38 @@ def test_generate_end_to_end(index_conn, ins):
     assert res.corpus.total_failures == 1 and res.corpus.total_successes == 1
 
 
+def test_generate_adds_one_preview_only_focus_without_another_model_call(index_conn, ins):
+    ins(
+        index_conn, "fail-1", project="alpha", start_time="2026-05-27T12:00:00+00:00",
+        fvs=5, modes='["verification_skipped"]', learning="reported a stale test result",
+    )
+    ins(
+        index_conn, "fail-2", project="alpha", start_time="2026-05-28T12:00:00+00:00",
+        fvs=5, modes='["verification_skipped"]', learning="reported a stale test result",
+    )
+    ins(
+        index_conn, "fail-3", project="beta", start_time="2026-05-28T18:00:00+00:00",
+        fvs=5, modes='["verification_skipped"]', learning="reported a stale test result",
+    )
+    fake = FakeCaller({"rules": [{
+        "kind": "avoid",
+        "title": "Recompute Final Badge",
+        "trigger": "before reporting a final task status",
+        "guidance": "re-run final verification and read its result",
+        "why": "stale intermediate results caused incorrect final status reports",
+        "taxonomy": "verification_skipped",
+        "evidence_session_ids": ["case-01", "case-02", "case-03"],
+    }]})
+
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+
+    assert fake.calls == 1
+    assert res.focus is not None
+    assert res.focus.session_count == 3
+    assert "Focus this week" not in res.skill_md
+    assert "Focus this week" not in res.region
+
+
 def _one_avoid_fake_and_seed(index_conn, ins):
     ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]', learning="said done early")
     return FakeCaller({"rules": [
@@ -48,6 +80,7 @@ def test_unattributable_whole_doc_finding_fails_closed(index_conn, ins, monkeypa
     monkeypatch.setattr(render, "gate_secret_pii_per_rule", lambda rules, **kw: (rules, []))
     res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
     assert res.gate_issues   # blocked, not silently cleared
+    assert res.focus is None
 
 
 def test_scanner_error_fails_closed_without_per_rule_misattribution(index_conn, ins, monkeypatch):

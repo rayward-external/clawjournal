@@ -35,6 +35,10 @@ def test_single_call_and_parse():
     assert len(fake.calls) == 1                       # Mode A == one distill call
     assert [r.kind for r in rules] == ["avoid", "do"]
     assert rules[0].support == 4                      # backfilled from recurrence
+    system_prompt = fake.calls[0][0]
+    assert "CODING-AGENT behavior" in system_prompt
+    assert "Never diagnose or make workplace-performance claims" in system_prompt
+    assert "EVERY selected case that directly supports" in system_prompt
 
 
 def test_evidence_ids_are_limited_to_selected_sessions():

@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .skill import distill as _distill
+from .skill import focus as _focus
 from .skill import install as _install
 from .skill import render as _render
 from .skill import select as _select
@@ -44,6 +45,8 @@ class SkillResult:
     trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
     # run-over-run for OBJECTIVE signals: {signal: (prev_rate_or_None, current_rate)}
     objective_trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
+    # Preview framing only; the underlying rule already belongs to ``rules``.
+    focus: _focus.FocusSpotlight | None = None
 
 
 _SUPPORT_HALFLIFE_DAYS = 30.0  # a rule's effective support halves every 30 idle days
@@ -370,6 +373,11 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
     dropped = [r for r in existing if _store.fingerprint(r) in (prev_installed - merged_fps)]
+    focus = (
+        _focus.select_focus(active_rules=rules, current_rules=fresh, corpus=corpus)
+        if rules and not gate_issues
+        else None
+    )
 
     # run-over-run recurrence signal (§9/D9): current vs the LAST saved snapshot (which
     # is per-run, not calendar-weekly), for the failure modes the current "avoid" rules
@@ -390,7 +398,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     objective_trend = {k: (prev_obj.get(k), cur_obj.get(k, 0.0)) for k in sorted(obj_keys)}
 
     return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta,
-                       added_fps, dropped, trend, objective_trend)
+                       added_fps, dropped, trend, objective_trend, focus)
 
 
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
@@ -535,9 +543,11 @@ def _print_preview(res: SkillResult) -> None:
     if not res.rules:
         if c.is_empty():
             print("No scored failure/success sessions in the window.")
-            print("Try `clawjournal skill --all` for the first run.")
+            print("Try `clawjournal skill --all --no-score --preview` to use already-scored history.")
+            print("Run `--all` without `--no-score` only after confirming whole-history AI scoring.")
         else:
             print("No usable rules this run.")
+        _print_focus(getattr(res, "focus", None))
         return
     print(f"Proposed skill set ({len(res.rules)} rule(s)):\n")
     for i, r in enumerate(res.rules, 1):
@@ -551,6 +561,7 @@ def _print_preview(res: SkillResult) -> None:
             print(f"        when: {r.trigger}")
         if r.why:
             print(f"        why:  {r.why}")
+    _print_focus(getattr(res, "focus", None))
     if res.dropped:
         print(f"\n  Dropping {len(res.dropped)} previously-installed rule(s) outranked this run:")
         for r in res.dropped:
@@ -590,6 +601,27 @@ def _print_preview(res: SkillResult) -> None:
         print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {', '.join(res.gate_issues)}"))
         print("    (fail-closed — nothing was written. If the scanner itself errored, re-run; "
               "otherwise the flagged lesson spans rules — inspect the source sessions.)")
+
+
+def _print_focus(focus: _focus.FocusSpotlight | None) -> None:
+    if focus is None:
+        print("\nFocus this week: abstained")
+        print("  No current-run avoid rule both passed the focus safeguards and had")
+        print("  direct support from at least 3 sessions across 2 days and 2 projects.")
+        return
+    rule = focus.rule
+    print(_ascii_safe(
+        "\nFocus this week (coding-agent behavior; preview spotlight only)"
+    ))
+    print(f"  Pattern: {rule.display_title()}")
+    print(f"  Observed cost: {rule.why}")
+    print(f"  Replacement trigger: {rule.trigger}")
+    print(f"  Replacement habit: {rule.guidance}")
+    print(
+        f"  Evidence: {focus.session_count} directly cited sessions across "
+        f"{focus.day_count} days and {focus.project_count} projects."
+    )
+    print("  The underlying lesson remains in the proposed skill set.")
 
 
 def run_skill(args) -> None:
