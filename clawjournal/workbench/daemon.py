@@ -4452,6 +4452,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     else None
                 ),
                 challenge_only=bool(body.get("challenge_only")),
+                prepare_for_manual_share=bool(
+                    body.get("prepare_for_manual_share")
+                ),
             )
         )
 

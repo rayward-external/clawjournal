@@ -363,6 +363,7 @@ export const api = {
       accepted_ownership_certification_version?: string;
       accepted_authorization_profile_hash?: string;
       challenge_only?: boolean;
+      prepare_for_manual_share?: boolean;
     }): Promise<AutoUploadStatus> {
       const status = await request<Partial<AutoUploadStatus>>('/auto-upload/enable', {
         method: 'POST',
