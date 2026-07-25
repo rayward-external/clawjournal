@@ -39,6 +39,7 @@ def test_single_call_and_parse():
     assert "CODING-AGENT behavior" in system_prompt
     assert "Never diagnose or make workplace-performance claims" in system_prompt
     assert "EVERY selected case that directly supports" in system_prompt
+    assert "rather than a personal trait or overall-work assessment" in system_prompt
 
 
 def test_evidence_ids_are_limited_to_selected_sessions():

@@ -86,7 +86,8 @@ _DUP_STOPWORDS = frozenset(
 )
 
 
-_TITLE_DUP_JACCARD = 0.5  # near-identical titles => one lesson (see _same_lesson)
+_TITLE_DUP_JACCARD = 0.5
+_TITLE_DUP_CORROBORATION = 0.15
 
 
 def _stem(w: str) -> str:
@@ -119,6 +120,18 @@ def _guidance_overlap(a: str, b: str) -> float:
     return len(ka & kb) / len(ka | kb)
 
 
+def _keyword_corroboration(a: str, b: str) -> bool:
+    """Require independent shared meaning before a fuzzy title can deduplicate."""
+    ka, kb = _guidance_keywords(a), _guidance_keywords(b)
+    if not ka or not kb:
+        return False
+    shared = ka & kb
+    return (
+        len(shared) >= 2
+        and len(shared) / min(len(ka), len(kb)) >= _TITLE_DUP_CORROBORATION
+    )
+
+
 def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     """True if two rules teach the SAME lesson (a paraphrase fingerprint dedup misses).
 
@@ -140,19 +153,24 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     # carried title instead of reusing it verbatim ("Fix Root Cause" came back as
     # "Fix Root Cause Durably" [do] beside the carried [avoid], guidance overlap only
     # 0.25). Require >=2 shared keywords so one-word titles can't match everything.
-    # A near-identical title counts as well, not just a strict extension: the distiller
-    # also SWAPS one word of a short title ("Prove Review Findings" vs the carried
-    # "Reproduce Review Findings" — neither is a subset, and both are 'do' rules, which
-    # carry no taxonomy, so the fallback compared guidance at 0.22 < 0.30 and installed
-    # both). Measured over real rule sets, 0.5 collapses exactly the genuine paraphrase
-    # pairs and stops short of the 0.4 band, where distinct lessons start appearing
-    # ("Verify Against Spec" vs "Verify Stats Against Source").
+    # A near-identical title may count too, but title similarity is not evidence of
+    # meaning by itself ("Verify API Contracts" and "Verify Database Contracts" are
+    # distinct). Require corroboration in taxonomy, guidance, or trigger before applying
+    # the fuzzy-title path. This still catches measured rewrites such as "Prove Review
+    # Findings" / "Reproduce Review Findings".
     tka, tkb = _guidance_keywords(ta), _guidance_keywords(tb)
     shared = tka & tkb
-    if len(shared) >= 2 and (
-        tka <= tkb or tkb <= tka or len(shared) / len(tka | tkb) >= _TITLE_DUP_JACCARD
-    ):
-        return True
+    if len(shared) >= 2:
+        if tka <= tkb or tkb <= tka:
+            return True
+        title_overlap = len(shared) / len(tka | tkb)
+        corroborated = (
+            bool(a.taxonomy and a.taxonomy == b.taxonomy)
+            or _keyword_corroboration(a.guidance, b.guidance)
+            or _keyword_corroboration(a.trigger, b.trigger)
+        )
+        if title_overlap >= _TITLE_DUP_JACCARD and corroborated:
+            return True
     if a.kind == b.kind:
         if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson
             return True

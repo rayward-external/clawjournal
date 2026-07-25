@@ -14,13 +14,18 @@ def _candidate(
     *,
     source: str = "codex",
     kind: str = "avoid",
+    failure_modes: list[str] | None = None,
+    recovery_labels: list[str] | None = None,
 ) -> SkillCandidate:
     return SkillCandidate(
         session_id=sid,
         project=project,
         source=source,
         kind=kind,
-        failure_modes=["verification_skipped"],
+        failure_modes=(
+            ["verification_skipped"] if failure_modes is None else failure_modes
+        ),
+        recovery_labels=[] if recovery_labels is None else recovery_labels,
         start_time=f"2026-05-{day:02d}T12:00:00+00:00",
     )
 
@@ -109,9 +114,10 @@ def test_recovered_failure_sessions_count_as_direct_evidence():
     """A cleanly-recovered failure lands in the "do" pool but still witnessed the
     failure mode, so an avoid rule may cite it."""
     corpus = _corpus([], successes=[
-        _candidate("s1", "alpha", 27, kind="do"),
-        _candidate("s2", "alpha", 28, kind="do"),
-        _candidate("s3", "beta", 28, kind="do"),
+        _candidate("s1", "alpha", 27, kind="do", recovery_labels=["self_recovered"]),
+        _candidate("s2", "alpha", 28, kind="do",
+                   recovery_labels=["user_corrected_recovery"]),
+        _candidate("s3", "beta", 28, kind="do", recovery_labels=["self_recovered"]),
     ])
     rule = _rule()
 
@@ -132,9 +138,12 @@ def test_production_corpus_shape_synthetic_avoid_plus_real_do_still_qualifies():
                        kind="avoid", support_count=31),
     ]
     real = [
-        _candidate("s1", "clawjournal", 23, kind="do"),
-        _candidate("s2", "clawjournal-share", 28, kind="do"),
-        _candidate("s3", "outputs", 31, kind="do"),
+        _candidate("s1", "clawjournal", 23, kind="do",
+                   recovery_labels=["self_recovered"]),
+        _candidate("s2", "clawjournal-share", 28, kind="do",
+                   recovery_labels=["user_corrected_recovery"]),
+        _candidate("s3", "outputs", 31, kind="do",
+                   recovery_labels=["self_recovered"]),
     ]
     corpus = _corpus(synthetic, successes=real, eligible=["s1", "s2", "s3"])
     rule = _rule()
@@ -145,6 +154,70 @@ def test_production_corpus_shape_synthetic_avoid_plus_real_do_still_qualifies():
     assert focus is not None
     # case-01 is the synthetic aggregate and must not be counted.
     assert (focus.session_count, focus.day_count, focus.project_count) == (3, 3, 3)
+
+
+@pytest.mark.parametrize(
+    ("failure_modes", "recovery_labels"),
+    [
+        ([], []),
+        ([], ["self_recovered"]),
+        (["verification_skipped"], []),
+        (["execution_error"], ["self_recovered"]),
+    ],
+    ids=[
+        "pure-success",
+        "recovery-without-mode",
+        "matching-mode-without-recovery",
+        "recovered-other-mode",
+    ],
+)
+def test_unrelated_do_sessions_do_not_count_as_direct_avoid_evidence(
+    failure_modes,
+    recovery_labels,
+):
+    corpus = _corpus([], successes=[
+        _candidate("s1", "alpha", 27, kind="do",
+                   failure_modes=failure_modes, recovery_labels=recovery_labels),
+        _candidate("s2", "alpha", 28, kind="do",
+                   failure_modes=failure_modes, recovery_labels=recovery_labels),
+        _candidate("s3", "beta", 28, kind="do",
+                   failure_modes=failure_modes, recovery_labels=recovery_labels),
+    ])
+    rule = _rule()
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
+@pytest.mark.parametrize("taxonomy", ["", "not_a_failure_mode"])
+def test_rule_requires_a_valid_taxonomy_for_direct_evidence(taxonomy):
+    corpus = _corpus([
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ])
+    rule = _rule()
+    rule.taxonomy = taxonomy
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
+def test_unrelated_citations_are_excluded_from_reported_evidence_count():
+    relevant = [
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ]
+    unrelated = _candidate(
+        "s4", "gamma", 29, kind="do", failure_modes=[], recovery_labels=[]
+    )
+    corpus = _corpus(relevant, successes=[unrelated])
+    rule = _rule()
+    rule.evidence_session_ids.append("case-04")
+
+    focus = select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus)
+
+    assert focus is not None
+    assert (focus.session_count, focus.project_count) == (3, 2)
 
 
 def test_synthetic_aggregate_does_not_count_as_direct_session_evidence():
@@ -279,6 +352,95 @@ def test_personal_character_diagnosis_is_not_focus_eligible():
     ])
     rule = _rule(why="the pattern shows that you are careless and unreliable")
     assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
+@pytest.mark.parametrize("field", ["title", "trigger", "guidance", "why"])
+def test_personal_attribution_is_rejected_in_every_displayed_field(field):
+    corpus = _corpus([
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ])
+    rule = _rule()
+    setattr(rule, field, "The developer’s repeated carelessness caused rework")
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "text"),
+    [
+        ("why", "The engineer was unreliable and delayed the handoff"),
+        ("title", "Procrastination"),
+        ("trigger", "when you are careless about final validation"),
+        ("guidance", "because you are lazy, re-run final verification"),
+        ("guidance", "stop behaving recklessly"),
+        ("title", "Developer Carelessness"),
+        ("guidance", "The developer shows repeated carelessness; rerun verification"),
+        ("trigger", "when carelessness by the developer affects validation"),
+        ("guidance", "Their carelessness requires another verification run"),
+        ("guidance", "The developer showed repeated carelessness; rerun verification"),
+        ("why", "The engineer acted carelessly and delayed the handoff"),
+        ("trigger", "when the user displayed persistent overconfidence"),
+        ("guidance", "The developer has been careless about validation"),
+        ("why", "The engineer became careless and delayed the handoff"),
+        ("why", "The developer’s pattern of carelessness caused rework"),
+        ("guidance", "The developer demonstrated a pattern of carelessness"),
+        ("why", "The engineer was extremely careless"),
+        ("trigger", "The developer repeatedly procrastinated before final verification"),
+    ],
+)
+def test_personal_trait_morphology_does_not_bypass_safeguard(field, text):
+    corpus = _corpus([
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ])
+    rule = _rule()
+    setattr(rule, field, text)
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
+def test_technical_adjectives_and_agent_facing_triggers_remain_eligible():
+    corpus = _corpus([
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ])
+    rule = _rule(
+        why="an unreliable integration test masked the regression and caused rework"
+    )
+    rule.trigger = "when the developer asks for a merge verdict"
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "text"),
+    [
+        ("trigger", "when the developer is fixing an unreliable test"),
+        ("trigger", "when you are debugging an unreliable integration test"),
+        ("guidance", "the coding agent is debugging an unreliable test"),
+        ("guidance", "repair the developer’s unreliable test before trusting it"),
+        ("why", "A user-facing report showed the wrong final status"),
+        ("why", "The stale status forced developers to repeat the handoff"),
+        ("trigger", "when the developer addresses CI unreliability before merging"),
+        ("guidance", "the developer fixed the integration test’s unreliability"),
+        ("guidance", "the coding agent corrected flaky-test unreliability"),
+        ("trigger", "when their integration test shows persistent unreliability"),
+    ],
+)
+def test_personal_safeguard_allows_technical_and_consequence_wording(field, text):
+    corpus = _corpus([
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ])
+    rule = _rule()
+    setattr(rule, field, text)
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is not None
 
 
 @pytest.mark.parametrize("title", ["User Is Careless", "Careless", "Careless User"])

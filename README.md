@@ -177,11 +177,12 @@ If `clawjournal` is not found, use the full command printed by the installer.
 
 `clawjournal skill` uses one optional AI distill call to propose up to five
 coding-agent lessons. Its preview names one human-facing weekly focus only when a
-fresh avoid rule directly cites at least 3 sessions across 2 days and 2 projects;
-otherwise it explicitly abstains when no rule also passes its focus safeguards. The
-spotlight framing and aggregate evidence are not installed into agent instructions;
-the underlying lesson remains in the proposed skill set. It does not claim to assess
-your personality or performance at work.
+fresh avoid rule directly cites matching failure or clean-recovery evidence from at
+least 3 sessions across 2 days and 2 projects; otherwise it explicitly abstains when
+no rule also passes its focus safeguards. The spotlight framing and aggregate
+evidence are not installed into agent instructions; the underlying lesson remains in
+the proposed skill set. It does not claim to assess your personality or performance
+at work.
 
 The terminal guide keeps the essential selection, redaction, consent, and destination safeguards in a simpler interface.
 

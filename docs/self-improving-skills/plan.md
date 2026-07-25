@@ -211,10 +211,11 @@ The optional **Focus this week** spotlight uses no second model call. It is elig
 only for a freshly distilled avoid rule whose exact fingerprint survives the final
 gates and whose current-run aliases resolve to at least 3 real cited sessions across
 2 days and 2 projects. Synthetic aggregate aliases and stored aliases do not count.
-A cited session counts regardless of which pool it was selected into: a cleanly
-recovered failure is taught as a "do" but still witnessed the failure mode, and
-requiring failure-classified evidence made the spotlight unreachable in practice.
-Source prefixes do not make one repository count as multiple projects. The spotlight
+A cited session counts only when its structured failure modes contain the avoid
+rule's valid taxonomy. A failure-pool candidate then counts directly; a do-pool
+candidate additionally needs a clean-recovery label, retaining real
+mistake-to-fix evidence without admitting unrelated strong successes. Source
+prefixes do not make one repository count as multiple projects. The spotlight
 describes coding-agent behavior, explicitly abstains when no rule passes both its
 evidence and actor/safety safeguards, and does not store or install its spotlight
 framing or aggregate evidence. The underlying rule remains in the proposed

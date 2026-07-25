@@ -79,8 +79,8 @@ def test_cross_kind_same_title_collapses():
 def test_one_word_title_swap_collapses():
     # The distiller re-emits a carried lesson under a near-identical title (one word
     # swapped, neither a subset). Both are 'do' rules, so there is no taxonomy to catch
-    # it and their guidance overlap is only ~0.22 — below the 0.30 same-kind bar — so
-    # without the title check both install and burn two of the five slots.
+    # it and even the full stored pair's guidance overlap is only ~0.22 — below the
+    # 0.30 same-kind bar — so without the title check both install and burn two slots.
     carried = SkillRule(
         kind="do", trigger="t", title="Reproduce Review Findings",
         guidance="before listing a suspected defect, run the targeted test slice for the "
@@ -95,6 +95,58 @@ def test_one_word_title_swap_collapses():
     merged = merge_rules([carried], [fresh], set())
     assert sum("Review Findings" in r.title for r in merged) == 1
     assert merged[0].title == "Reproduce Review Findings"   # carried wording wins
+
+
+def test_near_title_similarity_requires_independent_corroboration():
+    api = SkillRule(
+        kind="do",
+        title="Verify API Contracts",
+        trigger="before changing an API",
+        guidance="compare client payload fields against the server schema",
+        why="mismatched payloads broke requests",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Verify Database Contracts",
+        trigger="before changing persistence",
+        guidance="run migrations and validate stored rows against database constraints",
+        why="schema drift broke persistence",
+    )
+
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_near_title_real_paraphrase_with_corroboration_collapses():
+    carried = SkillRule(
+        kind="do",
+        title="Verify Against Primary Source",
+        trigger=(
+            "When a count, statistic, or finding you're about to report was derived "
+            "from a narrative summary or intermediate report"
+        ),
+        guidance=(
+            "Re-derive it directly from the raw ground-truth data (CSV/JSON/source) "
+            "before committing, and treat any user pushback on numbers as a signal "
+            "to audit the primary source."
+        ),
+        why="Trusting a report summary missed incomplete tasks.",
+    )
+    fresh = SkillRule(
+        kind="do",
+        title="Verify Stats Against Source",
+        trigger=(
+            "Before writing quantitative claims (counts, statistics, confidence "
+            "assertions) into a report or doc"
+        ),
+        guidance=(
+            "Recompute each figure directly from the source data and calibrate the "
+            "confidence tone to what is actually verified, rather than asserting "
+            "plausible-but-unchecked numbers and overstating findings"
+        ),
+        why="Unchecked counts required multi-round fact-checking.",
+    )
+
+    assert len(merge_rules([carried], [fresh], set())) == 1
 
 
 def test_partially_shared_titles_on_distinct_lessons_survive():
