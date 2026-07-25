@@ -86,6 +86,9 @@ _DUP_STOPWORDS = frozenset(
 )
 
 
+_TITLE_DUP_JACCARD = 0.5  # near-identical titles => one lesson (see _same_lesson)
+
+
 def _stem(w: str) -> str:
     """Crude suffix fold so rewrites match ('flagging'/'flag', 'waited'/'wait').
 
@@ -137,8 +140,18 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     # carried title instead of reusing it verbatim ("Fix Root Cause" came back as
     # "Fix Root Cause Durably" [do] beside the carried [avoid], guidance overlap only
     # 0.25). Require >=2 shared keywords so one-word titles can't match everything.
+    # A near-identical title counts as well, not just a strict extension: the distiller
+    # also SWAPS one word of a short title ("Prove Review Findings" vs the carried
+    # "Reproduce Review Findings" — neither is a subset, and both are 'do' rules, which
+    # carry no taxonomy, so the fallback compared guidance at 0.22 < 0.30 and installed
+    # both). Measured over real rule sets, 0.5 collapses exactly the genuine paraphrase
+    # pairs and stops short of the 0.4 band, where distinct lessons start appearing
+    # ("Verify Against Spec" vs "Verify Stats Against Source").
     tka, tkb = _guidance_keywords(ta), _guidance_keywords(tb)
-    if len(tka & tkb) >= 2 and (tka <= tkb or tkb <= tka):
+    shared = tka & tkb
+    if len(shared) >= 2 and (
+        tka <= tkb or tkb <= tka or len(shared) / len(tka | tkb) >= _TITLE_DUP_JACCARD
+    ):
         return True
     if a.kind == b.kind:
         if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson

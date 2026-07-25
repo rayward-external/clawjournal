@@ -76,6 +76,42 @@ def test_cross_kind_same_title_collapses():
     assert sum(r.title == "Verify Beyond Green Tests" for r in merged) == 1
 
 
+def test_one_word_title_swap_collapses():
+    # The distiller re-emits a carried lesson under a near-identical title (one word
+    # swapped, neither a subset). Both are 'do' rules, so there is no taxonomy to catch
+    # it and their guidance overlap is only ~0.22 — below the 0.30 same-kind bar — so
+    # without the title check both install and burn two of the five slots.
+    carried = SkillRule(
+        kind="do", trigger="t", title="Reproduce Review Findings",
+        guidance="before listing a suspected defect, run the targeted test slice for the "
+                 "touched module or build a small scratch repro that exercises the exact path",
+        why="w", support=5)
+    fresh = SkillRule(
+        kind="do", trigger="t", title="Prove Review Findings",
+        guidance="before reporting each suspected defect, ground it in the current repo: read "
+                 "the implementation and tests the diff touches, then state which claims were "
+                 "executed versus only statically inspected",
+        why="w", support=9)
+    merged = merge_rules([carried], [fresh], set())
+    assert sum("Review Findings" in r.title for r in merged) == 1
+    assert merged[0].title == "Reproduce Review Findings"   # carried wording wins
+
+
+def test_partially_shared_titles_on_distinct_lessons_survive():
+    # Guard the 0.5 bar from sliding: these share 2 title keywords but sit at 0.4 and
+    # teach different lessons (a design spec vs. the raw numbers behind a stat).
+    spec = SkillRule(kind="do", trigger="t", title="Verify Against Spec",
+                     guidance="read the design doc clause by clause and cross-check each "
+                              "documented filter and cap against the implementation",
+                     why="w", support=5)
+    stats = SkillRule(kind="do", trigger="t", title="Verify Stats Against Source",
+                      guidance="re-derive every reported number directly from the raw "
+                               "ground-truth CSV before committing it",
+                      why="w", support=4)
+    merged = merge_rules([], [spec, stats], set())
+    assert len(merged) == 2
+
+
 def test_distinct_do_rules_survive():
     # 'do' rules carry no taxonomy; only genuine paraphrases (high overlap) collapse.
     a = _tr("write a failing regression test that reproduces the bug before fixing", kind="do")
