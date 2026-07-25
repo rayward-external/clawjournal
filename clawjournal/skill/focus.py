@@ -60,7 +60,18 @@ class FocusSpotlight:
 
 
 def _direct_candidates(rule: SkillRule, corpus: SkillCorpus) -> list[SkillCandidate]:
-    """Resolve this run's cited aliases to distinct, real avoid-session candidates."""
+    """Resolve this run's cited aliases to distinct, real session candidates.
+
+    Deliberately does NOT require ``candidate.kind == "avoid"``.  A cleanly
+    recovered failure is routed into the "do" pool by ``select_skill_candidates``
+    (it teaches the recovery), but it is still a real observation of the failure
+    mode an avoid rule describes.  Requiring failure-classified evidence discarded
+    exactly that evidence: on a real 19-candidate corpus every non-synthetic
+    candidate was ``kind="do"`` and every ``kind="avoid"`` one was a synthetic
+    aggregate, so no rule could ever qualify.  What defends the "N directly cited
+    real sessions" claim is the synthetic + unambiguous-alias filtering below,
+    not the candidate's pool label.
+    """
     aliases = _candidate_aliases(corpus)
     eligible_ids = set(corpus.eligible_session_ids)
     alias_counts: dict[str, int] = {}
@@ -74,7 +85,6 @@ def _direct_candidates(rule: SkillRule, corpus: SkillCorpus) -> list[SkillCandid
         if (
             alias
             and alias_counts.get(alias) == 1
-            and candidate.kind == "avoid"
             and candidate.session_id in eligible_ids
         ):
             # Synthetic objective aggregates have placeholder ids which are not in

@@ -13,25 +13,36 @@ def _candidate(
     day: int,
     *,
     source: str = "codex",
+    kind: str = "avoid",
 ) -> SkillCandidate:
     return SkillCandidate(
         session_id=sid,
         project=project,
         source=source,
-        kind="avoid",
+        kind=kind,
         failure_modes=["verification_skipped"],
         start_time=f"2026-05-{day:02d}T12:00:00+00:00",
     )
 
 
-def _corpus(candidates: list[SkillCandidate], *, eligible: list[str] | None = None) -> SkillCorpus:
+def _corpus(
+    candidates: list[SkillCandidate],
+    *,
+    eligible: list[str] | None = None,
+    successes: list[SkillCandidate] | None = None,
+) -> SkillCorpus:
+    successes = successes or []
     return SkillCorpus(
         window_start="2026-05-20",
         window_end="2026-05-31",
         failures=candidates,
+        successes=successes,
         total_failures=len(candidates),
+        total_successes=len(successes),
         eligible_session_ids=(
-            eligible if eligible is not None else [candidate.session_id for candidate in candidates]
+            eligible
+            if eligible is not None
+            else [candidate.session_id for candidate in candidates + successes]
         ),
     )
 
@@ -92,6 +103,48 @@ def test_abstains_when_any_evidence_breadth_threshold_is_missing(candidates):
         current_rules=[rule],
         corpus=_corpus(candidates),
     ) is None
+
+
+def test_recovered_failure_sessions_count_as_direct_evidence():
+    """A cleanly-recovered failure lands in the "do" pool but still witnessed the
+    failure mode, so an avoid rule may cite it."""
+    corpus = _corpus([], successes=[
+        _candidate("s1", "alpha", 27, kind="do"),
+        _candidate("s2", "alpha", 28, kind="do"),
+        _candidate("s3", "beta", 28, kind="do"),
+    ])
+    rule = _rule()
+
+    focus = select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus)
+
+    assert focus is not None
+    assert (focus.session_count, focus.day_count, focus.project_count) == (3, 2, 2)
+
+
+def test_production_corpus_shape_synthetic_avoid_plus_real_do_still_qualifies():
+    """Regression for the real 19-candidate corpus that abstained: every
+    non-synthetic candidate was kind="do" and every kind="avoid" one was a
+    synthetic aggregate. The real sessions must still carry the spotlight."""
+    synthetic = [
+        SkillCandidate(session_id="env-signature-0", project="gamma", source="codex",
+                       kind="avoid", support_count=27),
+        SkillCandidate(session_id="human-rejection", project="delta", source="claude",
+                       kind="avoid", support_count=31),
+    ]
+    real = [
+        _candidate("s1", "clawjournal", 23, kind="do"),
+        _candidate("s2", "clawjournal-share", 28, kind="do"),
+        _candidate("s3", "outputs", 31, kind="do"),
+    ]
+    corpus = _corpus(synthetic, successes=real, eligible=["s1", "s2", "s3"])
+    rule = _rule()
+    rule.evidence_session_ids = ["case-01", "case-03", "case-04", "case-05"]
+
+    focus = select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus)
+
+    assert focus is not None
+    # case-01 is the synthetic aggregate and must not be counted.
+    assert (focus.session_count, focus.day_count, focus.project_count) == (3, 3, 3)
 
 
 def test_synthetic_aggregate_does_not_count_as_direct_session_evidence():
