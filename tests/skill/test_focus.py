@@ -240,6 +240,17 @@ def test_personal_character_title_is_not_focus_eligible(title):
     assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
 
 
+def test_personal_label_in_trigger_is_not_focus_eligible():
+    corpus = _corpus([
+        _candidate("s1", "alpha", 27),
+        _candidate("s2", "alpha", 28),
+        _candidate("s3", "beta", 28),
+    ])
+    rule = _rule()
+    rule.trigger = "when the user is careless about verifying results"
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
 def test_personal_character_directive_is_not_focus_eligible():
     corpus = _corpus([
         _candidate("s1", "alpha", 27),

@@ -547,7 +547,7 @@ def _print_preview(res: SkillResult) -> None:
             print("Run `--all` without `--no-score` only after confirming whole-history AI scoring.")
         else:
             print("No usable rules this run.")
-        _print_focus(getattr(res, "focus", None))
+        _print_focus(res)
         return
     print(f"Proposed skill set ({len(res.rules)} rule(s)):\n")
     for i, r in enumerate(res.rules, 1):
@@ -561,7 +561,7 @@ def _print_preview(res: SkillResult) -> None:
             print(f"        when: {r.trigger}")
         if r.why:
             print(f"        why:  {r.why}")
-    _print_focus(getattr(res, "focus", None))
+    _print_focus(res)
     if res.dropped:
         print(f"\n  Dropping {len(res.dropped)} previously-installed rule(s) outranked this run:")
         for r in res.dropped:
@@ -603,11 +603,19 @@ def _print_preview(res: SkillResult) -> None:
               "otherwise the flagged lesson spans rules — inspect the source sessions.)")
 
 
-def _print_focus(focus: _focus.FocusSpotlight | None) -> None:
+def _print_focus(res: SkillResult) -> None:
+    focus = getattr(res, "focus", None)
     if focus is None:
         print("\nFocus this week: abstained")
-        print("  No current-run avoid rule both passed the focus safeguards and had")
-        print("  direct support from at least 3 sessions across 2 days and 2 projects.")
+        # State the ACTUAL reason: with no rules or a gate failure the evidence
+        # thresholds were never evaluated, so don't claim they fell short.
+        if not getattr(res, "rules", None):
+            print("  No proposed rules this run, so there was nothing to spotlight.")
+        elif getattr(res, "gate_issues", None):
+            print("  The render-time gate blocked this run before a focus could be considered.")
+        else:
+            print("  No current-run avoid rule both passed the focus safeguards and had")
+            print("  direct support from at least 3 sessions across 2 days and 2 projects.")
         return
     rule = focus.rule
     print(_ascii_safe(

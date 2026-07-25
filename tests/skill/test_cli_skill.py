@@ -142,6 +142,33 @@ def test_empty_preview_does_not_recommend_unconfirmed_whole_history_scoring(caps
     assert "only after confirming whole-history AI scoring" in output
 
 
+def test_empty_preview_abstention_does_not_claim_an_evidence_shortfall(capsys):
+    class Result:
+        rules = []
+        corpus = SkillCorpus(window_start="a", window_end="b")
+        focus = None
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "nothing to spotlight" in output
+    assert "at least 3 sessions across 2 days and 2 projects" not in output
+
+
+def test_gate_blocked_preview_abstains_for_the_gate_reason(capsys):
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w")
+    res = _preview_result(rule, None)
+    res.gate_issues = ["secret-scan: generic-api-key"]
+
+    _print_preview(res)
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "render-time gate blocked this run" in output
+    assert "at least 3 sessions across 2 days and 2 projects" not in output
+
+
 def test_gate_issues_exit_nonzero(monkeypatch):
     class Conn:
         def close(self):

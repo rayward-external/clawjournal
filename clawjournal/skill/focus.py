@@ -111,7 +111,7 @@ def _spotlight(rule: SkillRule, corpus: SkillCorpus) -> FocusSpotlight | None:
     if (
         _UNSUPPORTED_PERSONAL_CLAIM_RE.search(all_text)
         or _SECOND_PERSON_WHY_RE.search(rule.why)
-        or _PERSONAL_LABEL_RE.search("\n".join((rule.title, rule.why)))
+        or _PERSONAL_LABEL_RE.search("\n".join((rule.title, rule.trigger, rule.why)))
         or _PERSONAL_DIRECTIVE_RE.search("\n".join((rule.title, rule.guidance)))
         or _BARE_PERSONAL_TITLE_RE.search(rule.title)
     ):
