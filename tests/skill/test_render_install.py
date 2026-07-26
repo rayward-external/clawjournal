@@ -143,6 +143,75 @@ def test_hard_deny_allows_technical_trait_wording(guidance):
     assert render.gate_rules([safe]) == ([safe], [])
 
 
+@pytest.mark.parametrize(
+    "rule",
+    [
+        SkillRule(
+            kind="avoid",
+            title="Pair Flags With Fixes",
+            trigger=(
+                "You detect inaccuracies or problems in a user-supplied plan, spec, "
+                "or cleanup proposal."
+            ),
+            guidance=(
+                "Don't just flag the issues and wait; in the same turn attach a concrete "
+                "correction or proposed next step for each problem so the loop isn't left "
+                "in an unresolved state depending on a user reply that may never come."
+            ),
+            why=(
+                "The agent correctly diagnosed inaccuracies in a proposed cleanup plan "
+                "but offered no fix, leaving an unresolved state the user never returned to."
+            ),
+        ),
+        SkillRule(
+            kind="do",
+            title="Fix Root Cause",
+            trigger=(
+                "When a manual or temporary workaround makes a bug's symptom disappear "
+                "(e.g., chmod on a mounted volume, patching runtime state)"
+            ),
+            guidance=(
+                "Distinguish diagnostic workarounds from permanent fixes: locate and fix "
+                "the defect at its source layer, then re-verify with the same harness."
+            ),
+            why=(
+                "Agent verified a volume-permission workaround but had to be told to fix "
+                "it properly at image-build."
+            ),
+        ),
+        SkillRule(
+            kind="avoid",
+            title="Close With Verdict",
+            trigger=(
+                "When asked to review a PR and you have finished the investigation steps"
+            ),
+            guidance=(
+                "Don't end on test logs; synthesize a final answer to the exact question."
+            ),
+            why=(
+                "Validation traces ended without a recommendation, leaving reviews "
+                "unusable for the decision."
+            ),
+        ),
+    ],
+    ids=["user-reply", "operational-adverbs", "completed-technical-action"],
+)
+def test_hard_deny_preserves_existing_operational_lessons(rule):
+    assert render.gate_rules([rule]) == ([rule], [])
+
+
+@pytest.mark.parametrize("adverb", ["hurriedly", "hastily", "thoughtlessly", "blindly"])
+def test_operational_manner_exemption_does_not_cover_other_adverbs(adverb):
+    unsafe = _rule(
+        guidance=f"The agent fixed it properly but {adverb} changed the config."
+    )
+
+    assert render.gate_rules([unsafe]) == (
+        [],
+        [(unsafe, ["unsupported_personal_claim"])],
+    )
+
+
 def test_fallback_title_uses_full_guidance_context_for_policy():
     from clawjournal.skill.schema import parse_rules
 

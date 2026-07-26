@@ -315,7 +315,8 @@ _TECHNICAL_OBJECT_RE = re.compile(
     r"context|coverage|credentials?|data|databases?|dependenc(?:y|ies)|deployments?|"
     r"diffs?|docs?|documentation|environments?|errors?|evidence|feedback|files?|"
     r"findings?|fix(?:es)?|fixtures?|goals?|graphs?|implementations?|information|inputs?|"
-    r"interfaces?|instructions?|issues?|jobs?|logs?|merges?|messages?|metrics?|"
+    r"inaccurac(?:y|ies)|interfaces?|instructions?|investigations?|issues?|jobs?|"
+    r"logs?|merges?|messages?|metrics?|"
     r"migrations?|models?|outputs?|packages?|patches?|paths?|permissions?|"
     r"pipelines?|preferences?|projects?|prompts?|quer(?:y|ies)|questions?|queues?|"
     r"reports?|requests?|responses?|results?|reviews?|runs?|schemas?|scripts?|"
@@ -362,6 +363,13 @@ _TECHNICAL_ADVERBIAL_PARTICIPLE_RE = re.compile(
     rf"written)\s+[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern}",
     re.IGNORECASE,
 )
+_SAFE_TASK_MANNER_RE = re.compile(
+    rf"(?:\b(?P<correctly>correctly)\s+diagnosed\s+"
+    rf"[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern}|"
+    rf"\bfix(?:ed|ing)?\s+it\s+(?P<properly>properly)\b"
+    rf"[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern})",
+    re.IGNORECASE,
+)
 _SAFE_ATTRIBUTION_ACTION_RE = re.compile(
     rf"^(?:been\s+)?{_SAFE_ACTION_GERUND}\b|"
     r"^to\s+(?:ask|check|choose|clarify|continue|decide|"
@@ -395,9 +403,17 @@ def _has_governed_decision(tail: str) -> bool:
 
 
 def _has_personal_manner_adverb(tail: str) -> bool:
+    safe_task_adverb_spans = {
+        safe.span(group)
+        for safe in _SAFE_TASK_MANNER_RE.finditer(tail)
+        for group in ("correctly", "properly")
+        if safe.start(group) >= 0
+    }
     for match in _ACTOR_ADVERB_RE.finditer(tail):
         adverb = match.group("adverb").casefold()
-        if adverb in _SAFE_ACTOR_ADVERBS:
+        if adverb in _SAFE_ACTOR_ADVERBS or adverb == "reply":
+            continue
+        if match.span() in safe_task_adverb_spans:
             continue
         if _TECHNICAL_ADVERBIAL_PARTICIPLE_RE.match(tail[match.start():]):
             continue
