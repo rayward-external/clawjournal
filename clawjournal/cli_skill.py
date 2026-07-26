@@ -13,6 +13,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
 from .skill import distill as _distill
@@ -144,16 +145,25 @@ def _keyword_corroboration(a: str, b: str) -> bool:
 
 
 def _is_parallel_title_scope_swap(a: SkillRule, b: SkillRule) -> bool:
-    """Return whether equal title templates replace one non-leading scope word."""
+    """Return whether title templates replace a non-leading scope word.
+
+    Inserted/deleted modifiers do not hide an internal substitution: for example,
+    ``Validate API Responses`` and ``Validate Database Responses Early`` remain
+    parallel scoped lessons. Leading action rewrites and pure extensions are not
+    scope swaps.
+    """
     words_a = _title_stems(a.title)
     words_b = _title_stems(b.title)
-    if len(words_a) != len(words_b):
+    if not words_a or not words_b or words_a[0] != words_b[0]:
         return False
-    differences = [i for i, pair in enumerate(zip(words_a, words_b)) if pair[0] != pair[1]]
-    # The first significant word is the command verb. A swap there is commonly a
-    # paraphrase ("Prove" vs "Reproduce"); a sole later swap commonly distinguishes
-    # parallel subjects ("API" vs "Database") and needs the full guidance-overlap bar.
-    return len(differences) == 1 and differences[0] > 0
+    opcodes = SequenceMatcher(None, words_a, words_b, autojunk=False).get_opcodes()
+    # A non-leading replacement commonly distinguishes parallel subjects (API vs
+    # database). Insertions/deletions are incidental modifiers; by themselves they
+    # remain eligible for the extension/paraphrase paths.
+    return any(
+        tag == "replace" and index_a > 0 and index_b > 0
+        for tag, index_a, _, index_b, _ in opcodes
+    )
 
 
 def _same_lesson(a: SkillRule, b: SkillRule) -> bool:

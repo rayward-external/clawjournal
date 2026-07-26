@@ -143,6 +143,27 @@ def test_parallel_title_scopes_survive_generic_guidance_corroboration():
     assert len(merge_rules([api], [database], set())) == 2
 
 
+def test_parallel_title_scope_guard_ignores_trailing_modifiers():
+    api = SkillRule(
+        kind="do",
+        title="Validate API Response Schemas",
+        trigger="before changing response validation",
+        guidance="validate API response schemas before publishing the client contract",
+        why="client requests broke",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Validate Database Response Schemas Early",
+        trigger="before changing response validation",
+        guidance=(
+            "validate database response schemas early before running persistence migrations"
+        ),
+        why="stored records broke",
+    )
+
+    assert len(merge_rules([api], [database], set())) == 2
+
+
 def test_parallel_title_scope_guard_retains_two_letter_acronyms():
     api = SkillRule(
         kind="do",

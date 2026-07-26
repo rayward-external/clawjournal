@@ -129,8 +129,8 @@ _PERSONAL_OWNERSHIP_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSONAL_PERFORMANCE_RE = re.compile(
-    rf"\b{_PERSON_ACTOR}\b\s+(?:performs?|performed|works?|worked)\s+"
-    r"(?:poorly|badly)\b",
+    rf"\b{_PERSON_ACTOR}\b\s+(?:(?:performs?|performed|works?|worked)|"
+    r"(?:is|are|was|were)\s+(?:performing|working))\s+(?:poorly|badly)\b",
     re.IGNORECASE,
 )
 _PERSONAL_JOB_RE = re.compile(
@@ -296,9 +296,15 @@ _TECHNICAL_OBJECT_RE = re.compile(
 )
 _TECHNICAL_MODIFIER = (
     r"(?:backend|failing|flaky|frontend|integration|local|remote|regression|"
-    r"security|stale|unit)"
+    r"security|slow|stale|unit)"
 )
 _TECHNICAL_NOUN_PHRASE = (
+    rf"(?:(?:a|an|another|the|its|our|your)\s+)?"
+    rf"(?:{_TECHNICAL_MODIFIER}\s+){{0,2}}"
+    rf"{_TECHNICAL_OBJECT_RE.pattern}"
+    rf"(?:\s+{_TECHNICAL_OBJECT_RE.pattern})*"
+)
+_DIRECT_TECHNICAL_OBJECT_PHRASE = (
     rf"(?:(?:a|an|another|the|its|our|your)\s+)?"
     rf"(?:{_TECHNICAL_MODIFIER}\s+){{0,2}}"
     rf"{_TECHNICAL_OBJECT_RE.pattern}"
@@ -312,6 +318,13 @@ _BARE_TECHNICAL_COMPONENT_RE = re.compile(
 _SAFE_TECHNICAL_ROLE_RE = re.compile(
     rf"^(?:(?:a|an|the)\s+)?{_TECHNICAL_OBJECT_RE.pattern}\s+"
     r"(?:maintainer|operator|owner|service)$",
+    re.IGNORECASE,
+)
+_SAFE_MORPHOLOGICAL_ACTION_RE = re.compile(
+    r"^(?:(?:not|never)\s+)?"
+    r"(?!(?:acting|appearing|becoming|behaving|being|failing|feeling|looking|"
+    r"procrastinating|remaining|seeming|slacking|struggling|underperforming)\b)"
+    rf"[a-z][a-z-]*ing\s+{_DIRECT_TECHNICAL_OBJECT_PHRASE}$",
     re.IGNORECASE,
 )
 _SAFE_ATTRIBUTION_ACTION_RE = re.compile(
@@ -383,6 +396,8 @@ def _is_safe_link_component(
         _SAFE_ACTION_RE,
         _SAFE_OWNERSHIP_RE,
     )):
+        return True
+    if _SAFE_MORPHOLOGICAL_ACTION_RE.fullmatch(normalized):
         return True
     if _SAFE_TECHNICAL_ROLE_RE.fullmatch(normalized):
         return True
