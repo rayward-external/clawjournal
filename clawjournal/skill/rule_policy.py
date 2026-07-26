@@ -120,7 +120,8 @@ _PERSONAL_ACTION_ADVERB_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSONAL_DECISION_RE = re.compile(
-    r"\b(?:poor|bad|weak|questionable|flawed|reckless|shortsighted)\s+"
+    r"\b(?:poor|bad|weak|questionable|careless|flawed|foolish|reckless|"
+    r"shortsighted|unsound)\s+"
     r"(?:decisions?|choices?|decision-making)\b",
     re.IGNORECASE,
 )
@@ -196,7 +197,7 @@ _PERSONAL_EVALUATION_BY_ROLE_RE = re.compile(
 # to enumerate every possible English adjective. Concrete coding actions,
 # operational states, and technical-resource clauses are the explicit safe set.
 _PERSON_LINK_RE = re.compile(
-    rf"(?=\b{_PERSON_ACTOR}\b\s+"
+    rf"(?=\b(?P<actor>{_PERSON_ACTOR})\b\s+"
     r"(?:is|are|was|were|seems?|appears?|became|remained|"
     r"has\s+been|have\s+been|had\s+been|"
     r"(?:can|could|may|might|will|would|should|must)\s+be)\s+"
@@ -226,6 +227,34 @@ _COORDINATE_RE = re.compile(
     r"\s*(?:,|\b(?:and|but|yet|or|while)\b)\s*",
     re.IGNORECASE,
 )
+_ACTOR_ADVERB_RE = re.compile(r"\b(?P<adverb>[a-z][a-z-]*ly)\b", re.IGNORECASE)
+_SAFE_ACTOR_ADVERBS = frozenset({
+    "actively",
+    "actually",
+    "already",
+    "automatically",
+    "concurrently",
+    "currently",
+    "deterministically",
+    "directly",
+    "explicitly",
+    "finally",
+    "immediately",
+    "independently",
+    "locally",
+    "manually",
+    "only",
+    "programmatically",
+    "remotely",
+    "repeatedly",
+    "safely",
+    "securely",
+    "separately",
+    "sequentially",
+    "silently",
+    "specifically",
+    "temporarily",
+})
 _SAFE_PREFIX_RE = re.compile(
     r"^(?:(?:currently|actively|still|already|now|temporarily|repeatedly|"
     r"then)\s+)+",
@@ -285,7 +314,7 @@ _TECHNICAL_OBJECT_RE = re.compile(
     r"consent|containers?|"
     r"context|coverage|credentials?|data|databases?|dependenc(?:y|ies)|deployments?|"
     r"diffs?|docs?|documentation|environments?|errors?|evidence|feedback|files?|"
-    r"findings?|fix(?:es)?|fixtures?|goals?|implementations?|information|inputs?|"
+    r"findings?|fix(?:es)?|fixtures?|goals?|graphs?|implementations?|information|inputs?|"
     r"interfaces?|instructions?|issues?|jobs?|logs?|merges?|messages?|metrics?|"
     r"migrations?|models?|outputs?|packages?|patches?|paths?|permissions?|"
     r"pipelines?|preferences?|projects?|prompts?|quer(?:y|ies)|questions?|queues?|"
@@ -295,8 +324,8 @@ _TECHNICAL_OBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _TECHNICAL_MODIFIER = (
-    r"(?:backend|failing|flaky|frontend|integration|local|remote|regression|"
-    r"security|slow|stale|unit)"
+    r"(?:backend|failing|flaky|fresh|frontend|integration|local|production|"
+    r"remote|regression|security|slow|stale|unit)"
 )
 _TECHNICAL_NOUN_PHRASE = (
     rf"(?:(?:a|an|another|the|its|our|your)\s+)?"
@@ -325,6 +354,12 @@ _SAFE_MORPHOLOGICAL_ACTION_RE = re.compile(
     r"(?!(?:acting|appearing|becoming|behaving|being|failing|feeling|looking|"
     r"procrastinating|remaining|seeming|slacking|struggling|underperforming)\b)"
     rf"[a-z][a-z-]*ing\s+{_DIRECT_TECHNICAL_OBJECT_PHRASE}$",
+    re.IGNORECASE,
+)
+_TECHNICAL_ADVERBIAL_PARTICIPLE_RE = re.compile(
+    rf"^[a-z][a-z-]*ly\s+(?:configured|encoded|escaped|formatted|generated|"
+    rf"ordered|performing|quoted|rendered|serialized|sorted|structured|typed|"
+    rf"written)\s+[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern}",
     re.IGNORECASE,
 )
 _SAFE_ATTRIBUTION_ACTION_RE = re.compile(
@@ -359,6 +394,26 @@ def _has_governed_decision(tail: str) -> bool:
     return False
 
 
+def _has_personal_manner_adverb(tail: str) -> bool:
+    for match in _ACTOR_ADVERB_RE.finditer(tail):
+        adverb = match.group("adverb").casefold()
+        if adverb in _SAFE_ACTOR_ADVERBS:
+            continue
+        if _TECHNICAL_ADVERBIAL_PARTICIPLE_RE.match(tail[match.start():]):
+            continue
+        return True
+    return False
+
+
+def _has_technical_pronoun_antecedent(text: str, offset: int) -> bool:
+    """Return whether ``they`` follows a technical, not human, clause subject."""
+    clause = re.split(r"[.;\n]", text[:offset])[-1]
+    return bool(
+        _TECHNICAL_OBJECT_RE.search(clause)
+        and not re.search(rf"\b{_PERSON_ACTOR_NOUN}\b", clause, re.IGNORECASE)
+    )
+
+
 def _has_personal_clause(text: str) -> bool:
     for match in _HUMAN_CLAUSE_RE.finditer(text):
         tail = match.group("tail")
@@ -366,7 +421,8 @@ def _has_personal_clause(text: str) -> bool:
         if boundary:
             tail = tail[:boundary.start()]
         if (
-            _PERSONAL_ACTION_ADVERB_RE.search(tail)
+            _has_personal_manner_adverb(tail)
+            or _PERSONAL_ACTION_ADVERB_RE.search(tail)
             or _has_governed_match(tail, _PERSONAL_QUALITY_RE)
             or _has_governed_match(tail, _PERSONAL_OWNERSHIP_RE)
             or _has_governed_match(tail, _PERSONAL_DESCRIPTOR_RE)
@@ -439,6 +495,11 @@ def _has_structural_human_evaluation(text: str) -> bool:
     if _has_personal_clause(text):
         return True
     for match in _PERSON_LINK_RE.finditer(text):
+        if (
+            match.group("actor").casefold() == "they"
+            and _has_technical_pronoun_antecedent(text, match.start())
+        ):
+            continue
         if not _is_safe_link_predicate(match.group("predicate")):
             return True
     for match in _PERSON_ATTRIBUTION_RE.finditer(text):

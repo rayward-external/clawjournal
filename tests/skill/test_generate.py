@@ -185,6 +185,47 @@ def test_personal_claim_is_removed_from_mixed_legacy_install_set(index_conn):
     )
 
 
+def test_unsafe_carried_rule_cannot_suppress_safe_fresh_replacement(index_conn, ins):
+    from clawjournal.skill import store
+    from clawjournal.skill.schema import SkillRule
+
+    unsafe = SkillRule(
+        kind="avoid",
+        title="Developer Carelessness",
+        trigger="before reporting status",
+        guidance="pause before handoff and inspect the latest command outcome",
+        why="The developer is unprofessional",
+        taxonomy="verification_skipped",
+        support=20,
+    )
+    store.mark_installed(index_conn, [unsafe])
+    ins(
+        index_conn,
+        "fail",
+        fvs=5,
+        modes='["verification_skipped"]',
+        learning="reported a stale test result",
+    )
+    fake = FakeCaller({"rules": [{
+        "kind": "avoid",
+        "title": "Verify Final State",
+        "trigger": "before reporting status",
+        "guidance": "read the final verification result before reporting status",
+        "why": "stale results produced incorrect status reports",
+        "taxonomy": "verification_skipped",
+    }]})
+
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+
+    assert [rule.title for rule in res.rules] == ["Verify Final State"]
+    assert unsafe.guidance in {rule.guidance for rule in res.dropped}
+    assert any(
+        rule.guidance == unsafe.guidance
+        and reasons == ["unsupported_personal_claim"]
+        for rule, reasons in res.blocked
+    )
+
+
 def _one_avoid_fake_and_seed(index_conn, ins):
     ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]', learning="said done early")
     return FakeCaller({"rules": [

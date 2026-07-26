@@ -414,7 +414,12 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     # merge with durable state (skip rejected, replace weakest)
     rejected = _store.rejected_fingerprints(conn)
-    existing = _store.load_kept(conn)
+    stored_rules = _store.load_kept(conn)
+    # Gate legacy/carried wording before semantic clustering. Otherwise an unsafe
+    # high-support carried rule can suppress a safe fresh replacement, then disappear
+    # at the post-merge gate and leave the user with neither lesson.
+    existing, existing_blocked = _render.gate_rules(stored_rules)
+    blocked = blocked + existing_blocked
     prev_installed = _store.installed_fingerprints(conn)
     merged = merge_rules(existing, fresh, rejected, now=now or datetime.now(timezone.utc))
     # re-apply the external/exec hard-deny to the FULL install set (incl. store rules)
@@ -451,7 +456,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
-    dropped = [r for r in existing if _store.fingerprint(r) in (prev_installed - merged_fps)]
+    dropped = [
+        r for r in stored_rules
+        if _store.fingerprint(r) in (prev_installed - merged_fps)
+    ]
     focus = (
         _focus.select_focus(active_rules=rules, current_rules=fresh, corpus=corpus)
         if rules and not gate_issues
