@@ -64,7 +64,11 @@ describe('success sound', () => {
     expect(sound.loop).toBe(false);
     expect(sound.volume).toBe(0.25);
 
+    vi.advanceTimersByTime(900);
+    expect(sound.pause).not.toHaveBeenCalled();
+
     resolvePrimingPlayback();
+    await Promise.resolve();
     await Promise.resolve();
 
     expect(sound.play).toHaveBeenCalledOnce();
@@ -96,5 +100,42 @@ describe('success sound', () => {
     expect(sound.currentTime).toBe(0);
     expect(sound.loop).toBe(false);
     expect(sound.volume).toBe(0.25);
+  });
+
+  it('does not restart playback after cancellation wins a priming race', async () => {
+    vi.useFakeTimers();
+    let rejectPrimingPlayback!: () => void;
+    const sound = {
+      currentTime: 0,
+      loop: false,
+      paused: true,
+      preload: '',
+      volume: 1,
+      load: vi.fn(),
+      pause: vi.fn(),
+      play: vi.fn()
+        .mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+          rejectPrimingPlayback = () => reject(new Error('cancelled'));
+        }))
+        .mockResolvedValue(undefined),
+    };
+    vi.stubGlobal('Audio', vi.fn(function AudioMock() { return sound; }));
+
+    const {
+      cancelSuccessChime,
+      playSuccessChime,
+      primeSuccessChime,
+    } = await import('./successChime.ts');
+    primeSuccessChime();
+    playSuccessChime();
+    cancelSuccessChime();
+    rejectPrimingPlayback();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(sound.play).toHaveBeenCalledOnce();
+    expect(sound.pause).toHaveBeenCalledOnce();
+    vi.advanceTimersByTime(900);
+    expect(sound.pause).toHaveBeenCalledOnce();
   });
 });

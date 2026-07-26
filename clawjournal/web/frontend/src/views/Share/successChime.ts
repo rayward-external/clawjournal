@@ -5,6 +5,7 @@ const SUCCESS_CHIME_DURATION_MS = 900;
 let successSound: HTMLAudioElement | null = null;
 let primingPlayback: Promise<boolean> | null = null;
 let stopPlaybackTimer: ReturnType<typeof setTimeout> | null = null;
+let playbackSequence = 0;
 
 function getSuccessSound(): HTMLAudioElement | null {
   if (typeof Audio === 'undefined') return null;
@@ -53,6 +54,7 @@ function schedulePlaybackStop(sound: HTMLAudioElement) {
  * succeeds, then restart it audibly in playSuccessChime().
  */
 export function primeSuccessChime() {
+  playbackSequence += 1;
   try {
     const sound = getSuccessSound();
     if (!sound) return;
@@ -71,25 +73,39 @@ export function primeSuccessChime() {
 
 /** Play a short, restrained excerpt of the bundled success MP3. */
 export function playSuccessChime() {
+  const sequence = ++playbackSequence;
   try {
     const sound = getSuccessSound();
     if (!sound) return;
+    clearPlaybackStop();
     const primed = primingPlayback;
     primingPlayback = null;
     sound.loop = false;
     sound.currentTime = 0;
     sound.volume = SUCCESS_CHIME_VOLUME;
-    schedulePlaybackStop(sound);
+
+    const stopAfterPlaybackStarts = (started: boolean) => {
+      if (started && sequence === playbackSequence) {
+        schedulePlaybackStop(sound);
+      }
+    };
 
     // A normal submission is already playing the element silently, so changing
     // its time and volume does not need a fresh autoplay permission. Preserve a
     // direct-call fallback for callers that did not prime it first.
     if (!primed) {
-      void requestPlayback(sound);
+      void requestPlayback(sound).then(stopAfterPlaybackStarts);
     } else if (sound.paused) {
       void primed.then((started) => {
-        if (!started || sound.paused) void requestPlayback(sound);
+        if (sequence !== playbackSequence) return;
+        if (started && !sound.paused) {
+          schedulePlaybackStop(sound);
+        } else {
+          void requestPlayback(sound).then(stopAfterPlaybackStarts);
+        }
       });
+    } else {
+      schedulePlaybackStop(sound);
     }
   } catch {
     // Sound is optional; submission has already succeeded.
@@ -98,6 +114,7 @@ export function playSuccessChime() {
 
 /** Stop the silent priming loop when submission does not succeed. */
 export function cancelSuccessChime() {
+  playbackSequence += 1;
   primingPlayback = null;
   clearPlaybackStop();
   try {
