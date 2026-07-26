@@ -246,7 +246,8 @@ _SAFE_ACTION_GERUND = (
     r"creating|debugging|deciding|deleting|deploying|editing|fixing|generating|"
     r"handling|implementing|inspecting|installing|investigating|loading|making|"
     r"merging|modifying|opening|parsing|preparing|pushing|reading|recovering|"
-    r"rendering|reporting|reproducing|requesting|responding|retrying|reviewing|"
+    r"refactoring|rendering|reporting|reproducing|requesting|resolving|"
+    r"responding|retrying|reviewing|"
     r"rerunning|running|scanning|sending|testing|trying|updating|using|"
     r"validating|verifying|waiting|working|writing)"
 )
@@ -291,6 +292,26 @@ _TECHNICAL_OBJECT_RE = re.compile(
     r"reports?|requests?|responses?|results?|reviews?|runs?|schemas?|scripts?|"
     r"services?|sessions?|states?|status(?:es)?|suites?|tasks?|tests?|time|tools?|"
     r"traces?|uis?|validation|verification|worktrees?|workflows?)\b",
+    re.IGNORECASE,
+)
+_TECHNICAL_MODIFIER = (
+    r"(?:backend|failing|flaky|frontend|integration|local|remote|regression|"
+    r"security|stale|unit)"
+)
+_TECHNICAL_NOUN_PHRASE = (
+    rf"(?:(?:a|an|another|the|its|our|your)\s+)?"
+    rf"(?:{_TECHNICAL_MODIFIER}\s+){{0,2}}"
+    rf"{_TECHNICAL_OBJECT_RE.pattern}"
+    rf"(?:\s+{_TECHNICAL_OBJECT_RE.pattern})*"
+)
+_BARE_TECHNICAL_COMPONENT_RE = re.compile(
+    rf"^{_TECHNICAL_NOUN_PHRASE}"
+    rf"(?:\s+(?:for|from|in|on|with)\s+{_TECHNICAL_NOUN_PHRASE})?$",
+    re.IGNORECASE,
+)
+_SAFE_TECHNICAL_ROLE_RE = re.compile(
+    rf"^(?:(?:a|an|the)\s+)?{_TECHNICAL_OBJECT_RE.pattern}\s+"
+    r"(?:maintainer|operator|owner|service)$",
     re.IGNORECASE,
 )
 _SAFE_ATTRIBUTION_ACTION_RE = re.compile(
@@ -348,7 +369,11 @@ def _has_personal_clause(text: str) -> bool:
     )
 
 
-def _is_safe_link_component(component: str) -> bool:
+def _is_safe_link_component(
+    component: str,
+    *,
+    allow_inherited_object: bool = False,
+) -> bool:
     normalized = re.sub(r"\s+", " ", component.replace("’", "'")).strip()
     normalized = _SAFE_PREFIX_RE.sub("", normalized)
     if _UNSAFE_LINK_COMPLEMENT_RE.search(normalized):
@@ -359,15 +384,26 @@ def _is_safe_link_component(component: str) -> bool:
         _SAFE_OWNERSHIP_RE,
     )):
         return True
+    if _SAFE_TECHNICAL_ROLE_RE.fullmatch(normalized):
+        return True
     if _SAFE_RESOURCE_STATE_RE.search(normalized) or _SAFE_PREPOSITION_RE.search(normalized):
         return _TECHNICAL_OBJECT_RE.search(normalized) is not None
-    # A coordinated technical object may inherit the prior action/status.
-    return _TECHNICAL_OBJECT_RE.search(normalized) is not None
+    return bool(
+        allow_inherited_object
+        and _BARE_TECHNICAL_COMPONENT_RE.fullmatch(normalized)
+    )
 
 
 def _is_safe_link_predicate(predicate: str) -> bool:
     parts = _components(predicate)
-    return bool(parts) and all(_is_safe_link_component(part) for part in parts)
+    if not parts or not _is_safe_link_component(parts[0]):
+        return False
+    # In "fixing code and tests", the later bare technical object inherits the
+    # first component's recognized action. It is never sufficient on its own.
+    return all(
+        _is_safe_link_component(part, allow_inherited_object=True)
+        for part in parts[1:]
+    )
 
 
 def _is_safe_attribution_object(obj: str) -> bool:
