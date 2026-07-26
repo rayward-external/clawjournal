@@ -1206,6 +1206,7 @@ def enable(
     accepted_ownership_certification_version: str | None = None,
     accepted_authorization_profile_hash: str | None = None,
     challenge_only: bool = False,
+    prepare_for_manual_share: bool = False,
     scan_progress: Callable[[str, int, int], None] | None = None,
     scan_wait_notice: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
@@ -1214,6 +1215,10 @@ def enable(
     ``challenge_only`` always returns the authorization challenge and can
     never enroll, so clients that only want to display the current terms
     are not depending on version mismatch to keep the call non-mutating.
+    ``prepare_for_manual_share`` is valid only with ``challenge_only`` and
+    lets the final manual-submit screen display the exact recurring terms
+    before the successful receipt exists.  Enrollment still cannot mutate
+    until the manual upload succeeds and issues its one-shot grant.
     Protocol v2 requires the ownership certification to be accepted with the
     same exact-version discipline as the authorization and retention terms.
     ``scan_progress`` is forwarded to the strict refresh (sources and
@@ -1225,6 +1230,11 @@ def enable(
     lock_context: Any | None = None
     conn = open_index()
     try:
+        if prepare_for_manual_share and not challenge_only:
+            return AutoUploadError(
+                "invalid_request",
+                "Manual-share preparation is read-only and requires challenge_only.",
+            ).as_result()
         config = load_config()
         scope = _current_scope(conn, config)
         if scope["blockers"]:
@@ -1245,7 +1255,10 @@ def enable(
                 "unsupported_sources": scope["unsupported_sources"],
             }
         targets = _hook_targets(agent, sources=scope["sources"])
-        if not _has_successful_manual_receipt(conn):
+        if (
+            not _has_successful_manual_receipt(conn)
+            and not prepare_for_manual_share
+        ):
             return AutoUploadError(
                 "manual_share_required",
                 "Complete one successful hosted manual share before enabling automatic uploads.",
@@ -1261,6 +1274,14 @@ def enable(
         # create/PATCH, the runner's enrollment gate) re-enforce capability
         # freshness.
         capabilities = fetch_capabilities(force=True)
+        if prepare_for_manual_share and not grant_capability_version_supported(
+            capabilities.get("manual_share_enrollment_grant_version")
+        ):
+            return AutoUploadError(
+                "enrollment_grant_unavailable",
+                "The hosted service cannot enable automatic uploads from this "
+                "manual receipt.",
+            ).as_result()
         terms = fetch_authorization(capabilities)
         ai_backend = _resolved_ai_backend(config)
 

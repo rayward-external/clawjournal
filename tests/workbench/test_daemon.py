@@ -427,6 +427,47 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "accepted_ownership_certification_version": "own-v1",
             "accepted_authorization_profile_hash": "profile-sha256",
             "challenge_only": False,
+            "prepare_for_manual_share": False,
+        }
+    ]
+
+
+def test_auto_upload_enable_forwards_manual_share_preparation(server, monkeypatch):
+    from clawjournal import auto_upload
+
+    calls = []
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": False,
+            "status": 409,
+            "code": "authorization_required",
+        },
+    )
+
+    status_code, body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "agent": "all",
+            "challenge_only": True,
+            "prepare_for_manual_share": True,
+        },
+    )
+
+    assert status_code == 409
+    assert body["code"] == "authorization_required"
+    assert calls == [
+        {
+            "agent": "all",
+            "accepted_authorization_version": None,
+            "accepted_retention_version": None,
+            "accepted_ownership_certification_version": None,
+            "accepted_authorization_profile_hash": None,
+            "challenge_only": True,
+            "prepare_for_manual_share": True,
         }
     ]
 

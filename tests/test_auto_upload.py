@@ -470,6 +470,98 @@ def test_enable_requires_a_successful_hosted_manual_receipt_before_network(
     assert not credential_path().exists()
 
 
+def test_manual_submit_can_prepare_read_only_challenge_before_receipt(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    scan_calls = _patch_strict_scanner(monkeypatch)
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "fetch_authorization", lambda _caps: _terms())
+
+    result = auto.enable(
+        agent="claude",
+        challenge_only=True,
+        prepare_for_manual_share=True,
+    )
+
+    assert result["code"] == "authorization_required"
+    assert result["scope"]["entries"] == [["claude", "project-one"]]
+    assert scan_calls == []
+    assert not credential_path().exists()
+    conn = open_index()
+    try:
+        assert get_auto_upload_enrollment(conn) is None
+    finally:
+        conn.close()
+
+
+def test_manual_submit_preparation_cannot_mutate(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    network_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "fetch_capabilities",
+        lambda **_kwargs: network_calls.append("capabilities"),
+    )
+
+    result = auto.enable(
+        agent="claude",
+        prepare_for_manual_share=True,
+    )
+
+    assert result["code"] == "invalid_request"
+    assert network_calls == []
+    assert not credential_path().exists()
+
+
+def test_manual_submit_preparation_requires_supported_receipt_grant(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    capabilities = _capabilities()
+    capabilities["manual_share_enrollment_grant_version"] = 2
+    authorization_calls: list[str] = []
+    monkeypatch.setattr(
+        auto,
+        "fetch_capabilities",
+        lambda **_kwargs: capabilities,
+    )
+    monkeypatch.setattr(
+        auto,
+        "fetch_authorization",
+        lambda _caps: authorization_calls.append("authorization") or _terms(),
+    )
+
+    result = auto.enable(
+        agent="claude",
+        challenge_only=True,
+        prepare_for_manual_share=True,
+    )
+
+    assert result["code"] == "enrollment_grant_unavailable"
+    assert authorization_calls == []
+    assert not credential_path().exists()
+    conn = open_index()
+    try:
+        assert get_auto_upload_enrollment(conn) is None
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("submission_channel", [None, "manual"])
 def test_enable_accepts_legacy_and_explicit_manual_receipts(
     isolated_auto_upload,

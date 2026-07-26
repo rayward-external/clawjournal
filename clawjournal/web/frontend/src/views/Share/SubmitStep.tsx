@@ -2,6 +2,12 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api.ts';
 import { colors } from '../../theme.ts';
 import { Spinner } from '../../components/Spinner.tsx';
+import { challengeFromError } from '../../components/autoUploadChallenge.ts';
+import type {
+  AutoUploadAgent,
+  AutoUploadAuthorizationChallenge,
+  AutoUploadStatus,
+} from '../../types.ts';
 import type { HostedConsent, ShareDestination } from './types.ts';
 import { SHARE_SHELL_WIDTH, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, Icon } from './shared.tsx';
@@ -26,6 +32,20 @@ type UploadStatus = {
   pending_email: string | null;
 };
 
+function automaticUploadAgent(
+  challenge: AutoUploadAuthorizationChallenge,
+): AutoUploadAgent {
+  const sources = new Set(
+    challenge.scope.sources.filter(source => (
+      source === 'claude' || source === 'codex'
+    )),
+  );
+  if (sources.size === 1) {
+    return sources.has('codex') ? 'codex' : 'claude';
+  }
+  return 'all';
+}
+
 export function SubmitStep(p: SubmitStepProps) {
   const [consent, setConsent] = useState<HostedConsent | null>(null);
   const [loadingConsent, setLoadingConsent] = useState(true);
@@ -37,6 +57,17 @@ export function SubmitStep(p: SubmitStepProps) {
   const [devCode, setDevCode] = useState<string | null>(null);
   const [acceptTerms, setAcceptTerms] = useState(false);
   const [ownership, setOwnership] = useState(false);
+  const [autoUploadStatus, setAutoUploadStatus] =
+    useState<AutoUploadStatus | null>(null);
+  const [autoUploadChallenge, setAutoUploadChallenge] =
+    useState<AutoUploadAuthorizationChallenge | null>(null);
+  // The final submit screen defaults to the streamlined combined action once
+  // the exact recurring challenge is available.  The local enrollment itself
+  // remains off until Submit succeeds, and the participant can uncheck this.
+  const [enableAutomaticUploads, setEnableAutomaticUploads] = useState(false);
+  const [showAutomaticUploadDetails, setShowAutomaticUploadDetails] = useState(false);
+  const [showAcceptedDomains, setShowAcceptedDomains] = useState(false);
+  const [enablingAutomaticUploads, setEnablingAutomaticUploads] = useState(false);
   const [busy, setBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitStageIndex, setSubmitStageIndex] = useState(0);
@@ -110,6 +141,47 @@ export function SubmitStep(p: SubmitStepProps) {
   useEffect(() => {
     void loadSubmitState();
   }, [loadSubmitState]);
+
+  const loadAutomaticUploadOption = useCallback(async () => {
+    try {
+      const status = await api.autoUpload.status();
+      setAutoUploadStatus(status);
+      if (status.mode !== 'off') {
+        setAutoUploadChallenge(null);
+        setEnableAutomaticUploads(true);
+        return;
+      }
+      try {
+        await api.autoUpload.enable({
+          agent: 'all',
+          challenge_only: true,
+          prepare_for_manual_share: true,
+        });
+        setAutoUploadChallenge(null);
+        setEnableAutomaticUploads(false);
+      } catch (challengeError) {
+        const preparedChallenge = challengeFromError(challengeError);
+        setAutoUploadChallenge(preparedChallenge);
+        setEnableAutomaticUploads(preparedChallenge !== null);
+        if (preparedChallenge) {
+          // The ownership checkbox may have been checked while the hosted
+          // challenge was loading.  Reset it so the participant accepts the
+          // now-visible wording that explicitly covers future bundles.
+          setOwnership(false);
+        }
+      }
+    } catch {
+      // Automatic upload is optional.  Capability, scope, or network
+      // failures must never block the manual share the participant reviewed.
+      setAutoUploadStatus(null);
+      setAutoUploadChallenge(null);
+      setEnableAutomaticUploads(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAutomaticUploadOption();
+  }, [loadAutomaticUploadOption]);
 
   useEffect(() => {
     if (!tokenValid || busy) return;
@@ -204,8 +276,39 @@ export function SubmitStep(p: SubmitStepProps) {
         ai_pii: p.aiPiiEnabled,
       });
       submitted = true;
-      p.toast('Submitted', 'success');
       playSuccessChime();
+      let automaticUploadEnabled = false;
+      if (enableAutomaticUploads && autoUploadChallenge) {
+        setEnablingAutomaticUploads(true);
+        try {
+          await api.autoUpload.enable({
+            agent: automaticUploadAgent(autoUploadChallenge),
+            accepted_authorization_version:
+              autoUploadChallenge.authorization.version,
+            accepted_retention_version: autoUploadChallenge.retention.version,
+            accepted_ownership_certification_version:
+              autoUploadChallenge.ownership_certification.version,
+            accepted_authorization_profile_hash:
+              autoUploadChallenge.authorization_profile_hash,
+          });
+          automaticUploadEnabled = true;
+        } catch {
+          // The manual receipt is already final.  Keep it successful and let
+          // the existing receipt-page offer expose any refreshed scope/terms
+          // or retryable enrollment failure instead of misreporting the share.
+          p.toast(
+            'Submitted. Automatic upload still needs review on the receipt page.',
+            'info',
+          );
+        } finally {
+          setEnablingAutomaticUploads(false);
+        }
+      }
+      if (automaticUploadEnabled) {
+        p.toast('Submitted and automatic uploads enabled', 'success');
+      } else if (!enableAutomaticUploads || !autoUploadChallenge) {
+        p.toast('Submitted', 'success');
+      }
       p.onSubmitted(result.receipt_id, result.hosted_status || null, consentData.support_contact || p.shareDestination?.support_contact || null);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Submission failed';
@@ -233,10 +336,29 @@ export function SubmitStep(p: SubmitStepProps) {
   const acceptedDomains = (
     p.shareDestination?.supported_institution_email_policy?.domain_suffixes ?? []
   ).filter((d): d is string => typeof d === 'string' && d.length > 0);
+  const supportsExplicitCollaborators =
+    p.shareDestination?.supported_institution_email_policy
+      ?.explicit_collaborators_supported === true;
 
+  const automaticUploadsAlreadyConfigured =
+    autoUploadStatus?.mode === 'enabled' || autoUploadStatus?.mode === 'paused';
+  const willEnableAutomaticUploads =
+    enableAutomaticUploads && autoUploadChallenge !== null;
+  const automaticUploadCap =
+    autoUploadChallenge?.cap ?? autoUploadStatus?.cap ?? 5;
+  const automaticUploadCadence =
+    autoUploadChallenge?.cadence_days ?? autoUploadStatus?.cadence_days ?? 1;
+  const automaticUploadScopeEntries =
+    autoUploadChallenge?.scope.entries ?? autoUploadStatus?.scope.entries ?? [];
   const disabled = busy || loadingConsent || !p.shareId || !tokenValid || !acceptTerms || !ownership || !consent;
   const supportContact = consent?.support_contact || p.shareDestination?.support_contact || null;
-  const currentSubmitStage = submitStages[submitStageIndex] ?? submitStages[0];
+  const currentSubmitStage = enablingAutomaticUploads
+    ? {
+        buttonLabel: 'Enabling automatic uploads...',
+        detail: 'Confirming the exact recurring scope and installing the session hook.',
+        progress: 96,
+      }
+    : submitStages[submitStageIndex] ?? submitStages[0];
   const submitPipelineLabel = p.aiPiiEnabled
     ? 'AI PII review -> redaction -> secret scan -> upload'
     : 'redaction -> secret scan -> upload';
@@ -314,7 +436,31 @@ export function SubmitStep(p: SubmitStepProps) {
                   />
                   {acceptedDomains.length > 0 && (
                     <div style={{ fontSize: 11.5, color: colors.gray500, lineHeight: 1.4 }}>
-                      Accepted domains: {acceptedDomains.join(', ')}
+                      {supportsExplicitCollaborators
+                        ? 'Academic and approved collaborator emails are supported.'
+                        : 'Academic email addresses are supported.'}{' '}
+                      <button
+                        type="button"
+                        aria-expanded={showAcceptedDomains}
+                        aria-controls="accepted-email-domains"
+                        onClick={() => setShowAcceptedDomains(value => !value)}
+                        style={{
+                          padding: 0,
+                          border: 0,
+                          background: 'transparent',
+                          color: colors.primary500,
+                          font: 'inherit',
+                          textDecoration: 'underline',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {showAcceptedDomains ? 'Hide accepted domains' : 'View accepted domains'}
+                      </button>
+                      {showAcceptedDomains && (
+                        <div id="accepted-email-domains" style={{ marginTop: 4 }}>
+                          Accepted domains: {acceptedDomains.join(', ')}
+                        </div>
+                      )}
                     </div>
                   )}
                   <button onClick={sendCode} disabled={busy || !email.trim()} style={{ ...btnPrimary, justifyContent: 'center', opacity: busy || !email.trim() ? 0.5 : 1 }}>
@@ -347,8 +493,153 @@ export function SubmitStep(p: SubmitStepProps) {
                 I accept the displayed consent and data-use terms.
               </CheckboxRow>
               <CheckboxRow checked={ownership} onChange={setOwnership}>
-                I certify this bundle is mine to submit and contains no third-party confidential material.
+                {willEnableAutomaticUploads
+                  ? 'I certify this bundle and future automatically uploaded bundles are mine to submit and contain no third-party confidential material.'
+                  : 'I certify this bundle is mine to submit and contains no third-party confidential material.'}
               </CheckboxRow>
+              {(autoUploadChallenge || automaticUploadsAlreadyConfigured) && (
+                <div style={{
+                  paddingTop: 10,
+                  borderTop: `1px solid ${colors.gray200}`,
+                  display: 'grid',
+                  gap: 8,
+                }}>
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 9,
+                    fontSize: 12.5,
+                    color: colors.gray700,
+                    lineHeight: 1.4,
+                  }}>
+                    <input
+                      id="enable-automatic-uploads-after-share"
+                      type="checkbox"
+                      aria-label="Enable automatic uploads after this share"
+                      checked={enableAutomaticUploads}
+                      disabled={automaticUploadsAlreadyConfigured || busy}
+                      onChange={event => {
+                        if (automaticUploadsAlreadyConfigured || busy) return;
+                        const checked = event.target.checked;
+                        setEnableAutomaticUploads(checked);
+                        if (checked) {
+                          // The recurring ownership text covers future
+                          // bundles, so a check made against the manual-only
+                          // wording cannot be reused as that distinct act.
+                          setOwnership(false);
+                        }
+                      }}
+                      style={{
+                        marginTop: 2,
+                        width: 15,
+                        height: 15,
+                        accentColor: colors.gray900,
+                        flexShrink: 0,
+                        cursor: automaticUploadsAlreadyConfigured || busy
+                          ? 'not-allowed'
+                          : 'pointer',
+                      }}
+                    />
+                    <span>
+                      <label
+                        htmlFor="enable-automatic-uploads-after-share"
+                        style={{
+                          cursor: automaticUploadsAlreadyConfigured || busy
+                            ? 'not-allowed'
+                            : 'pointer',
+                        }}
+                      >
+                        {automaticUploadsAlreadyConfigured
+                          ? `Automatic uploads are already ${
+                              autoUploadStatus?.mode === 'paused'
+                                ? 'configured (currently paused)'
+                                : 'enabled'
+                            }: up to ${automaticUploadCap} trace uploads every ${
+                              automaticUploadCadence
+                            } day${automaticUploadCadence === 1 ? '' : 's'}.`
+                          : `After this share succeeds, enable up to ${
+                              automaticUploadCap
+                            } automatic trace uploads every ${
+                              automaticUploadCadence
+                            } day${automaticUploadCadence === 1 ? '' : 's'} for this exact scope.`}
+                      </label>{' '}
+                      <button
+                        type="button"
+                        aria-expanded={showAutomaticUploadDetails}
+                        onClick={() => setShowAutomaticUploadDetails(value => !value)}
+                        style={{
+                          padding: 0,
+                          border: 0,
+                          background: 'transparent',
+                          color: colors.primary500,
+                          font: 'inherit',
+                          textDecoration: 'underline',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {showAutomaticUploadDetails ? 'Hide details' : 'View details'}
+                      </button>
+                    </span>
+                  </div>
+                  {showAutomaticUploadDetails && (
+                    <div style={{
+                      maxHeight: 190,
+                      overflow: 'auto',
+                      padding: '10px 12px',
+                      border: `1px solid ${colors.gray200}`,
+                      borderRadius: 8,
+                      background: colors.gray50,
+                      color: colors.gray600,
+                      fontSize: 11.5,
+                      lineHeight: 1.5,
+                      whiteSpace: 'pre-wrap',
+                    }}>
+                      {autoUploadChallenge ? (
+                        <>
+                          <strong style={{ color: colors.gray800 }}>
+                            Recurring authorization · {autoUploadChallenge.authorization.version}
+                          </strong>
+                          {'\n'}{autoUploadChallenge.authorization.text}
+                          {'\n\n'}
+                          <strong style={{ color: colors.gray800 }}>
+                            Retention · {autoUploadChallenge.retention.version}
+                          </strong>
+                          {'\n'}{autoUploadChallenge.retention.text}
+                          {'\n\n'}
+                          <strong style={{ color: colors.gray800 }}>
+                            Ownership · {autoUploadChallenge.ownership_certification.version}
+                          </strong>
+                          {'\n'}{autoUploadChallenge.ownership_certification.text}
+                          {'\n\n'}
+                        </>
+                      ) : (
+                        <>
+                          <strong style={{ color: colors.gray800 }}>
+                            Existing recurring enrollment
+                          </strong>
+                          {'\n'}
+                          This manual share does not change the automatic-upload authorization
+                          already stored on this device.
+                          {'\n\n'}
+                          <strong style={{ color: colors.gray800 }}>
+                            Authorization · {autoUploadStatus?.authorization.version ?? 'accepted'}
+                          </strong>
+                          {'\n'}
+                          <strong style={{ color: colors.gray800 }}>
+                            Retention · {autoUploadStatus?.retention.version ?? 'accepted'}
+                          </strong>
+                          {'\n\n'}
+                        </>
+                      )}
+                      <strong style={{ color: colors.gray800 }}>Exact scope</strong>
+                      {'\n'}
+                      {automaticUploadScopeEntries
+                        .map(([source, project]) => `${source} → ${project}`)
+                        .join('\n') || 'Stored enrollment scope'}
+                    </div>
+                  )}
+                </div>
+              )}
               <button
                 onClick={submit}
                 disabled={disabled}
@@ -375,7 +666,10 @@ export function SubmitStep(p: SubmitStepProps) {
                   </>
                 ) : (
                   <>
-                    <Icon name="check" size={14} /> Submit to ClawJournal Research
+                    <Icon name="check" size={14} />
+                    {willEnableAutomaticUploads
+                      ? 'Submit and enable automatic uploads'
+                      : 'Submit to ClawJournal Research'}
                   </>
                 )}
               </button>
