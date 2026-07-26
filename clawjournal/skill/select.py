@@ -271,7 +271,6 @@ def select_skill_candidates(
 
     mode_counter: Counter[str] = Counter()
     recovery_counter: Counter[str] = Counter()
-    outcome_counter: Counter[str] = Counter()
     _counted: set[str] = set()  # count each session once (a session can match both queries)
     for row in list(fail_rows) + list(succ_rows):
         sid = row["session_id"]
@@ -280,8 +279,6 @@ def select_skill_candidates(
         _counted.add(sid)
         mode_counter.update(_parse_json_list(row["ai_failure_modes"]))
         recovery_counter.update(_parse_json_list(row["ai_recovery_labels"]))
-        if row["ai_outcome_badge"]:
-            outcome_counter.update([row["ai_outcome_badge"]])
 
     def _excerpts(session_id: str) -> list[Any]:
         if excerpt_loader is None:
@@ -340,7 +337,11 @@ def select_skill_candidates(
         elif recovery:
             support = max([recovery_counter[r] for r in recovery] or [1])
         else:
-            support = outcome_counter[row["ai_outcome_badge"]] or 1
+            # A generic outcome badge (for example, ``resolved``) says the session
+            # succeeded, not that this candidate's particular lesson recurred. Count
+            # only the directly evidenced session so ``support_count`` stays comparable
+            # with the structured mode/recovery recurrence used everywhere else.
+            support = 1
         q = row["ai_quality_score"]
         impact = float(q if q is not None else 3)  # 0 is a real score, not "unscored"
         recency = _recency_weight(row["start_time"], now=clock)
@@ -362,12 +363,33 @@ def select_skill_candidates(
     gated_eligible = [sid for sid in eligible_ids if sid not in blocked_ids]
     eligible_scored = len(gated_eligible)
 
-    ranked = sorted(
-        failures + successes,
-        key=lambda c: (c.rank_score, c.support_count, c.impact, c.start_time or ""),
-        reverse=True,
-    )
-    selected = ranked[:pool_cap] if pool_cap and pool_cap > 0 else ranked
+    def _ranked(candidates: list[SkillCandidate]) -> list[SkillCandidate]:
+        return sorted(
+            candidates,
+            key=lambda c: (c.rank_score, c.support_count, c.impact, c.start_time or ""),
+            reverse=True,
+        )
+
+    ranked_failures = _ranked(failures)
+    ranked_successes = _ranked(successes)
+    if pool_cap and pool_cap > 0:
+        # Reserve representation for both lesson kinds. A single shared ranking lets
+        # one abundant/high-support pool shut the other out completely; alternating
+        # the independently-ranked pools preserves their best evidence, then naturally
+        # fills any unused slots from the kind that still has candidates.
+        selected: list[SkillCandidate] = []
+        fi = si = 0
+        while len(selected) < pool_cap and (
+            fi < len(ranked_failures) or si < len(ranked_successes)
+        ):
+            if fi < len(ranked_failures):
+                selected.append(ranked_failures[fi])
+                fi += 1
+            if len(selected) < pool_cap and si < len(ranked_successes):
+                selected.append(ranked_successes[si])
+                si += 1
+    else:
+        selected = ranked_failures + ranked_successes
     selected_failures = [c for c in selected if c.kind == "avoid"]
     selected_successes = [c for c in selected if c.kind == "do"]
 

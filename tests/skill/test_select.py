@@ -63,6 +63,42 @@ def test_selection_caps_to_ranked_top_pool(index_conn, ins):
     assert len({"f0", "f1", "f2"} - selected) == 1
 
 
+def test_success_heavy_pool_keeps_real_failures_and_comparable_support(index_conn, ins):
+    # Regression for #156: generic resolved-badge frequency is not recurrence of any
+    # particular lesson, and many such successes must not starve real avoid evidence.
+    for i in range(30):
+        ins(index_conn, f"win{i}", outcome="resolved", quality=5,
+            learning=f"successful lesson {i}")
+    for i in range(3):
+        ins(index_conn, f"fail{i}", fvs=4, modes='["verification_skipped"]',
+            learning=f"failure lesson {i}")
+
+    corpus = select_skill_candidates(index_conn, now=NOW, pool_cap=5)
+
+    assert {c.session_id for c in corpus.failures} == {"fail0", "fail1", "fail2"}
+    assert len(corpus.candidates) == 5
+    assert {c.support_count for c in corpus.successes} == {1}
+
+
+def test_pool_cap_interleaves_kinds_when_success_rank_is_higher(index_conn, ins):
+    # Structured clean-recovery recurrence is legitimate support, but it still must
+    # not consume every prompt slot and make avoid lessons impossible to distill.
+    for i in range(12):
+        ins(index_conn, f"recovered{i}", outcome="resolved", quality=5,
+            recovery='["self_recovered"]', learning=f"recovery lesson {i}")
+    for i in range(2):
+        ins(index_conn, f"fail{i}", fvs=3, modes='["verification_skipped"]',
+            learning=f"failure lesson {i}")
+
+    corpus = select_skill_candidates(index_conn, now=NOW, pool_cap=4)
+
+    assert len(corpus.failures) == 2
+    assert len(corpus.successes) == 2
+    assert min(c.support_count for c in corpus.successes) > max(
+        c.support_count for c in corpus.failures
+    )
+
+
 def test_hold_state_gate_excludes_pending(index_conn, ins):
     ins(index_conn, "ok", fvs=5, learning="a", hold_state="auto_redacted")
     ins(index_conn, "pending", fvs=5, learning="b", hold_state="pending_review")
