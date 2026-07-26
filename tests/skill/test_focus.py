@@ -1,5 +1,7 @@
 """Preview-only weekly focus selection and evidence calibration."""
 
+import time
+
 import pytest
 
 from clawjournal.skill.focus import select_focus
@@ -648,3 +650,58 @@ def test_duplicate_fingerprint_cannot_borrow_safe_evidence_for_unsafe_last_rule(
         current_rules=[first, last],
         corpus=corpus,
     ) is None
+
+
+def _candidate_at(sid: str, project: str, start_time: str) -> SkillCandidate:
+    return SkillCandidate(
+        session_id=sid,
+        project=project,
+        source="claude",
+        kind="avoid",
+        failure_modes=["verification_skipped"],
+        start_time=start_time,
+    )
+
+
+@pytest.fixture
+def pacific_tz(monkeypatch):
+    """Run the body in a fixed zone west of UTC (skipped where tzset is absent)."""
+    tzset = getattr(time, "tzset", None)
+    if tzset is None:                                   # Windows
+        pytest.skip("time.tzset is unavailable on this platform")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    tzset()
+    yield
+    tzset()                                             # restore from the unpatched TZ
+
+
+def test_one_local_afternoon_is_not_two_days(pacific_tz):
+    """Day breadth is the user's calendar, not UTC.
+
+    15:40, 16:20 and 17:10 US-Pacific on one Wednesday are stored as 22:40Z,
+    23:20Z and 00:10Z, so bucketing by UTC date reported a single 90-minute
+    sitting as "across 2 days" — exactly the one-sitting case the threshold
+    exists to reject.
+    """
+    corpus = _corpus([
+        _candidate_at("s1", "alpha", "2026-05-27T22:40:00+00:00"),
+        _candidate_at("s2", "alpha", "2026-05-27T23:20:00+00:00"),
+        _candidate_at("s3", "beta", "2026-05-28T00:10:00+00:00"),
+    ])
+    rule = _rule()
+
+    assert select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus) is None
+
+
+def test_distinct_local_days_still_qualify(pacific_tz):
+    corpus = _corpus([
+        _candidate_at("s1", "alpha", "2026-05-27T20:00:00+00:00"),
+        _candidate_at("s2", "alpha", "2026-05-28T20:00:00+00:00"),
+        _candidate_at("s3", "beta", "2026-05-29T20:00:00+00:00"),
+    ])
+    rule = _rule()
+
+    focus = select_focus(active_rules=[rule], current_rules=[rule], corpus=corpus)
+
+    assert focus is not None
+    assert focus.day_count == 3

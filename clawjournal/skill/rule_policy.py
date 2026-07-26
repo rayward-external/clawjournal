@@ -16,20 +16,35 @@ _UNSUPPORTED_PERSONAL_CLAIM_RE = re.compile(
 )
 _SECOND_PERSON_WHY_RE = re.compile(r"\b(?:you|your|yours|yourself)\b", re.IGNORECASE)
 _HUMAN_ROLE = (
-    r"(?:users?|developers?|engineers?|employees?|persons?|people|"
+    r"(?:users?|developers?|engineers?|employees?|persons?|people|humans?|"
     r"programmers?|workers?|coders?|authors?|reviewers?|maintainers?|"
-    r"contributors?)"
+    r"contributors?|teammates?|colleagues?|co-?workers?|collaborators?)"
 )
-_PERSON_ACTOR = rf"(?:you|we|they|he|she|{_HUMAN_ROLE}|(?:coding\s+)?agents?)"
+# Nouns that only ever denote a person in SUBJECT position but double as technical
+# modifiers elsewhere ("dev server", "dev branch").  They join the clause-level actor
+# alternation, which requires a following copula/verb, but must stay out of
+# ``_PERSON_ACTOR_NOUN`` — that one also feeds the attributive check, where adding
+# them would reject ordinary phrases like "unreliable dev server".
+_HUMAN_ROLE_SUBJECT_ONLY = r"(?:devs?|folks)"
+# "whoever wrote this", "whoever reviewed the diff" — an indefinite human subject the
+# role list cannot enumerate. Bounded so it cannot swallow a whole sentence.
+_INDEFINITE_HUMAN_SUBJECT = r"(?:whoever(?:\s+\w+){1,3})"
+_PERSON_ACTOR = (
+    rf"(?:you|we|they|he|she|{_INDEFINITE_HUMAN_SUBJECT}|{_HUMAN_ROLE}|"
+    rf"{_HUMAN_ROLE_SUBJECT_ONLY}|(?:coding\s+)?agents?)"
+)
 _PERSON_ACTOR_NOUN = rf"(?:{_HUMAN_ROLE}|(?:coding\s+)?agents?)"
 _PLURAL_HUMAN_ANTECEDENT_RE = re.compile(
     r"\b(?:we|people|persons|users|developers|engineers|employees|programmers|"
     r"workers|coders|authors|reviewers|maintainers|contributors|agents|"
+    r"humans|teammates|colleagues|co-?workers|collaborators|devs|folks|"
     r"(?:he|she)\s+(?:and|or)\s+(?:he|she)|"
     r"(?:user|developer|engineer|employee|programmer|worker|coder|author|"
-    r"reviewer|maintainer|contributor|agent)\s+and\s+"
+    r"reviewer|maintainer|contributor|agent|human|teammate|colleague|"
+    r"co-?worker|collaborator|dev)\s+and\s+"
     r"(?:a\s+|an\s+|the\s+)?(?:user|developer|engineer|employee|programmer|"
-    r"worker|coder|author|reviewer|maintainer|contributor|agent))\b",
+    r"worker|coder|author|reviewer|maintainer|contributor|agent|human|"
+    r"teammate|colleague|co-?worker|collaborator|dev))\b",
     re.IGNORECASE,
 )
 _PERSON_TRAIT_ADJECTIVE = (

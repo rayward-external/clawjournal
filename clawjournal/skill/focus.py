@@ -10,7 +10,6 @@ persisted skill; its underlying rule remains part of the proposed skill set.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timezone
 
 from .distill import _candidate_aliases
 from .rule_policy import has_unsupported_personal_claim
@@ -113,7 +112,14 @@ def _spotlight(rule: SkillRule, corpus: SkillCorpus) -> FocusSpotlight | None:
     for candidate in direct:
         parsed = _parse_start_time(candidate.start_time)
         if parsed is not None:
-            days.add(parsed.astimezone(timezone.utc).date())
+            # The preview prints "across N days" to show the pattern recurred on
+            # separate days rather than in one sitting, so N must be counted in the
+            # user's own calendar.  Sessions are stored as UTC instants, so bucketing
+            # by the UTC date reports days from a calendar the user does not live in:
+            # west of UTC one unbroken afternoon that crosses UTC midnight (17:00
+            # US-Pacific, 19:00 US-Eastern) reads as two days.  ``desktop.py`` counts
+            # its user-facing days locally for the same reason.
+            days.add(parsed.astimezone().date())
         project = _project_identity(candidate)
         if project:
             projects.add(project)

@@ -451,3 +451,50 @@ def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypat
     # idempotent: re-install doesn't duplicate the region
     install.install_codex(region)
     assert agents.read_text().count(install.BEGIN_MARKER) == 1
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        # "human" is the likeliest word for a model summarizing agent transcripts,
+        # and the closed role list did not contain it.
+        "The human is careless about verifying results",
+        "Humans are careless when reading the diff",
+        "The dev is sloppy when reviewing diffs",
+        "The teammate is unreliable about running the suite",
+        "The colleague is disorganized",
+        "The coworker was reckless with the migration",
+        "The collaborator is overconfident about the schema",
+        # Indefinite human subject the role list cannot enumerate.
+        "Whoever wrote this was negligent",
+        "Whoever reviewed the diff is careless",
+        # Plural pronoun resolved through the widened antecedent list.
+        "Humans reviewed the diff. They were careless.",
+        "The teammate reviewed tests with the colleague. They were inept.",
+    ],
+)
+def test_hard_deny_blocks_personal_claims_outside_the_core_role_list(claim):
+    bad = _rule(guidance=claim)
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        # "dev" and "human" are person nouns only in subject position; as modifiers
+        # they are ordinary technical vocabulary and must not be gated.
+        "the dev server is unreachable during the run",
+        "deploy to the dev branch before promoting",
+        "unreliable dev server masked the failure",
+        "emit human-readable output for the report",
+        "human-readable logs were truncated at the cap",
+    ],
+)
+def test_hard_deny_allows_subject_only_role_nouns_used_as_modifiers(guidance):
+    safe = _rule(kind="do", guidance=guidance)
+
+    assert render.gate_rules([safe]) == ([safe], [])
