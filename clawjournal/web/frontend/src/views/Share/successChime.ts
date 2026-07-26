@@ -1,7 +1,10 @@
 const SUCCESS_SOUND_URL = '/sounds/submission-success.mp3';
+const SUCCESS_CHIME_VOLUME = 0.25;
+const SUCCESS_CHIME_DURATION_MS = 900;
 
 let successSound: HTMLAudioElement | null = null;
 let primingPlayback: Promise<boolean> | null = null;
+let stopPlaybackTimer: ReturnType<typeof setTimeout> | null = null;
 
 function getSuccessSound(): HTMLAudioElement | null {
   if (typeof Audio === 'undefined') return null;
@@ -23,6 +26,25 @@ function requestPlayback(sound: HTMLAudioElement): Promise<boolean> {
   }
 }
 
+function clearPlaybackStop() {
+  if (stopPlaybackTimer === null) return;
+  clearTimeout(stopPlaybackTimer);
+  stopPlaybackTimer = null;
+}
+
+function schedulePlaybackStop(sound: HTMLAudioElement) {
+  clearPlaybackStop();
+  stopPlaybackTimer = setTimeout(() => {
+    stopPlaybackTimer = null;
+    try {
+      sound.pause();
+      sound.currentTime = 0;
+    } catch {
+      // Sound is optional; cleanup must not affect the completed submission.
+    }
+  }, SUCCESS_CHIME_DURATION_MS);
+}
+
 /**
  * Begin loading the exact success MP3 while the upload is in progress.
  *
@@ -34,6 +56,7 @@ export function primeSuccessChime() {
   try {
     const sound = getSuccessSound();
     if (!sound) return;
+    clearPlaybackStop();
     if (!sound.paused) sound.pause();
     sound.currentTime = 0;
     sound.loop = true;
@@ -46,7 +69,7 @@ export function primeSuccessChime() {
   }
 }
 
-/** Play the bundled success MP3 from the beginning without transforming it. */
+/** Play a short, restrained excerpt of the bundled success MP3. */
 export function playSuccessChime() {
   try {
     const sound = getSuccessSound();
@@ -55,7 +78,8 @@ export function playSuccessChime() {
     primingPlayback = null;
     sound.loop = false;
     sound.currentTime = 0;
-    sound.volume = 1;
+    sound.volume = SUCCESS_CHIME_VOLUME;
+    schedulePlaybackStop(sound);
 
     // A normal submission is already playing the element silently, so changing
     // its time and volume does not need a fresh autoplay permission. Preserve a
@@ -75,12 +99,13 @@ export function playSuccessChime() {
 /** Stop the silent priming loop when submission does not succeed. */
 export function cancelSuccessChime() {
   primingPlayback = null;
+  clearPlaybackStop();
   try {
     if (!successSound) return;
     successSound.pause();
     successSound.loop = false;
     successSound.currentTime = 0;
-    successSound.volume = 1;
+    successSound.volume = SUCCESS_CHIME_VOLUME;
   } catch {
     // Sound is optional; failure cleanup must not mask the submission error.
   }

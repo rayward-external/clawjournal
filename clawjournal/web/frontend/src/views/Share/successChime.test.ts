@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 describe('success sound', () => {
   beforeEach(() => {
@@ -6,7 +6,11 @@ describe('success sound', () => {
     vi.unstubAllGlobals();
   });
 
-  it('preloads the bundled MP3 without transforming it', async () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('preloads the bundled MP3 silently', async () => {
     const sound = {
       currentTime: 0,
       loop: false,
@@ -32,6 +36,7 @@ describe('success sound', () => {
   });
 
   it('restarts an armed element after delayed submission success', async () => {
+    vi.useFakeTimers();
     let resolvePrimingPlayback!: () => void;
     const sound = {
       currentTime: 0,
@@ -57,12 +62,17 @@ describe('success sound', () => {
     expect(sound.play).toHaveBeenCalledOnce();
     expect(sound.currentTime).toBe(0);
     expect(sound.loop).toBe(false);
-    expect(sound.volume).toBe(1);
+    expect(sound.volume).toBe(0.25);
 
     resolvePrimingPlayback();
     await Promise.resolve();
 
     expect(sound.play).toHaveBeenCalledOnce();
+    vi.advanceTimersByTime(899);
+    expect(sound.pause).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(sound.pause).toHaveBeenCalledOnce();
+    expect(sound.currentTime).toBe(0);
   });
 
   it('stops silent playback when submission does not succeed', async () => {
@@ -85,6 +95,6 @@ describe('success sound', () => {
     expect(sound.pause).toHaveBeenCalledOnce();
     expect(sound.currentTime).toBe(0);
     expect(sound.loop).toBe(false);
-    expect(sound.volume).toBe(1);
+    expect(sound.volume).toBe(0.25);
   });
 });
