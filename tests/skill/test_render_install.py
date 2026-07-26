@@ -498,3 +498,153 @@ def test_hard_deny_allows_subject_only_role_nouns_used_as_modifiers(guidance):
     safe = _rule(kind="do", guidance=guidance)
 
     assert render.gate_rules([safe]) == ([safe], [])
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        # A subordinate clause closes at its comma; the main instruction after it
+        # is not part of the "you are ..." complement.
+        "when you are unsure, ask before proceeding",
+        "when you are about to rename a symbol, search for callers",
+        "if you are blocked, leave the branch untouched and say so",
+        "when you are stuck, re-read the failing assertion first",
+        # Possessed subjects that are ordinary infrastructure nouns.
+        "clear the cache when your cache is stale",
+        "re-read the file when your symbol lookup misses",
+    ],
+)
+def test_hard_deny_allows_operational_state_and_infrastructure_lessons(guidance):
+    safe = _rule(kind="do", guidance=guidance)
+
+    assert render.gate_rules([safe]) == ([safe], [])
+
+
+@pytest.mark.parametrize(
+    "why",
+    [
+        # "user"/"agent" modifying a technical head noun is not a person judgment.
+        "unreliable user tests masked the failure",
+        "unreliable agent responses were retried without a cap",
+    ],
+)
+def test_hard_deny_allows_role_nouns_modifying_a_technical_head(why):
+    safe = SkillRule(kind="avoid", trigger="before done", guidance="cap the retries", why=why)
+
+    assert render.gate_rules([safe]) == ([safe], [])
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        # The clause bound must not become an escape hatch: a judgment that really
+        # does follow the comma still gets its own linking match.
+        "when the tests pass, the developer is careless",
+        "if the build is green, the reviewer is sloppy",
+        "the engineer is lazy, so reviews slip",
+        # A trailing possessive still evaluates the person, not the artifact.
+        "the careless user's patch broke the build",
+    ],
+)
+def test_hard_deny_still_blocks_judgments_after_a_clause_boundary(claim):
+    bad = _rule(guidance=claim)
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+@pytest.mark.parametrize(
+    "why",
+    [
+        # The attributive exemption must not become a bypass: a person-trait stays
+        # a judgment however technical the following noun is. Only "unreliable"
+        # can describe an artifact; a config cannot be negligent.
+        "careless developer commits broke the build",
+        "sloppy engineer code shipped without review",
+        "lazy reviewer comments missed the bug",
+        "negligent user configs leaked the token",
+        "careless user commits broke the build",
+        # And the bare head-noun reading is still an evaluation.
+        "the unreliable user broke the build",
+    ],
+)
+def test_hard_deny_blocks_person_traits_before_a_technical_noun(why):
+    bad = SkillRule(kind="avoid", trigger="before done", guidance="cap the retries", why=why)
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+@pytest.mark.parametrize(
+    "why",
+    [
+        # "has a history/habit/pattern of ..." claims a standing disposition, so
+        # it stays personal however technical the rest is. The component test only
+        # asks whether SOME technical noun appears, which a wider noun list makes
+        # easy to satisfy — hence the explicit check.
+        "the reviewer has a history of ignoring the endpoint",
+        "the developer has a habit of skipping the tests",
+        "the user has a tendency to force the merge",
+        "the engineer has a track record of breaking the build",
+    ],
+)
+def test_hard_deny_blocks_standing_disposition_claims_about_people(why):
+    bad = SkillRule(kind="avoid", trigger="before done", guidance="cap the retries", why=why)
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+def test_hard_deny_allows_a_standing_pattern_about_the_coding_agent():
+    """Describing what the agent repeatedly does is the whole point of an avoid rule."""
+    safe = SkillRule(
+        kind="avoid",
+        trigger="before reporting a final status",
+        guidance="re-run verification last",
+        why="the agent has a history of skipping the final verification",
+    )
+
+    assert render.gate_rules([safe]) == ([safe], [])
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        # Found by adversarially attacking the loosenings above. Each one passed an
+        # intermediate version of this gate; they are kept as the standing proof
+        # that widening the safe vocabulary did not reopen the deny path.
+        #
+        # A personal head noun with a technical prepositional phrase hanging off it.
+        "The user's memory of the folder layout is unreliable. Confirm paths with a listing first.",
+        "The reviewer's grasp of the module is shallow. Do not treat approval as verification.",
+        "This developer lacks the attention to detail a rebase demands. Prefer a merge commit.",
+        "The user's excuses about the cache led to another outage. Reproduce with it disabled.",
+        "The developer's refusal to read the comments caused the regression. Read them first.",
+        # A judgment coordinated onto a subordinate clause, after the comma.
+        "When CI stays red for a day, the reviewer is waiting, and has a long history of "
+        "approving diffs without reading them.",
+        "Keep in mind that the reviewer is busy, and has a history of merging without reading.",
+        "When you are unsure about a schema change, that is usually overconfidence rather "
+        "than a real ambiguity.",
+        # A bare state used to evaluate a third party rather than the work in hand.
+        "the maintainer is unclear on the basics of this codebase",
+        "the reviewer is unsure about nearly every change they approve",
+        "the user is unclear about what they want in every single session",
+        # Trait + role where the following word is a verb, not a technical head noun.
+        "an unreliable user commits secrets and never notices",
+        "unreliable users review nothing and approve everything",
+    ],
+)
+def test_hard_deny_survives_adversarial_probes_of_the_safe_vocabulary(guidance):
+    bad = _rule(guidance=guidance)
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]

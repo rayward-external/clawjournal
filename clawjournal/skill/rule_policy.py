@@ -110,8 +110,26 @@ _PERSONAL_PROCRASTINATION_RE = re.compile(
     rf"\b{_PERSON_ACTOR}\b(?:\W+\w+){{0,4}}\W+procrastinat(?:e|es|ed|ing)\b",
     re.IGNORECASE,
 )
-_PERSONAL_PRENOMINAL_RE = re.compile(
-    rf"\b{_PERSON_TRAIT_ADJECTIVE}\s+{_PERSON_ACTOR_NOUN}\b",
+# _PERSONAL_PRENOMINAL_RE is defined after _TECHNICAL_OBJECT_RE, which it needs to
+# tell a head noun from an attributive modifier ("careless user" vs "user tests").
+_AGENT_ACTOR_RE = re.compile(r"(?:the\s+)?(?:coding\s+)?agents?", re.IGNORECASE)
+_PERSONAL_PATTERN_OBJECT_RE = re.compile(
+    r"^(?:an?|the)?\s*(?:long|clear|consistent|repeated|chronic)?\s*"
+    r"(?:history|habit|pattern|tendency|track\s+record|propensity)\s+(?:of|to|for)\b",
+    re.IGNORECASE,
+)
+_SELF_OR_AGENT_ACTOR_RE = re.compile(
+    r"(?:you|we|(?:the\s+)?(?:coding\s+)?agents?)", re.IGNORECASE
+)
+_ANY_PERSONAL_TRAIT_RE = re.compile(
+    rf"\b(?:{_PERSON_TRAIT}|arrogan(?:t|ce)|dishonest|foolish|immature|incapable|"
+    r"shortsighted|unethical|unmotivated|unprofessional|incompeten(?:t|ce)|"
+    r"laziness|hubris)\b",
+    re.IGNORECASE,
+)
+_PREDICATE_CONTINUATION_RE = re.compile(
+    r"^(?:and|or|but|nor|yet|with|without|which|who|whose|plus|"
+    r"as\s+well\s+as|along\s+with)\b",
     re.IGNORECASE,
 )
 _PERSONAL_DIRECTIVE_RE = re.compile(
@@ -242,7 +260,7 @@ _PERSON_LINK_AFTER_MODIFIER_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSON_ATTRIBUTION_RE = re.compile(
-    rf"(?=\b{_PERSON_ACTOR}\b\s+"
+    rf"(?=\b(?P<actor>{_PERSON_ACTOR})\b\s+"
     r"(?P<verb>has|have|had|lacks?|lacked|shows?|showed|shown|"
     r"displays?|displayed|demonstrates?|demonstrated|exhibits?|exhibited|"
     r"exercises?|exercised|possesses?|possessed)\s+"
@@ -301,8 +319,18 @@ _SAFE_OWNERSHIP_RE = re.compile(
 )
 _SAFE_RESOURCE_STATE_RE = re.compile(
     r"^(?:(?:not|never)\s+)?(?:able|unable)\s+to\b|"
-    r"^(?:(?:not|never)\s+)?(?:awaiting|missing|requesting|seeking|"
-    r"uncertain)\b",
+    r"^(?:(?:not|never)\s+)?(?:awaiting|missing|requesting|seeking)\b",
+    re.IGNORECASE,
+)
+# Transient states of the WORK that take no object. "when you are unsure, ask
+# first" is the canonical shape of a good rule, but the object-taking branch
+# above demands a technical noun beside the state, and "unsure" never has one —
+# so the identical lesson passed or failed on word choice ("uncertain about the
+# schema" was safe, "unsure" was an evaluation). A trait complement cannot reach
+# here: _UNSAFE_LINK_COMPLEMENT_RE is checked first.
+_SAFE_STANDALONE_STATE_RE = re.compile(
+    r"^(?:(?:not|never)\s+)?(?:blocked|done|finished|ready|stuck|unclear|"
+    r"uncertain|unsure|waiting)\b",
     re.IGNORECASE,
 )
 _SAFE_PREPOSITION_RE = re.compile(
@@ -316,21 +344,54 @@ _UNSAFE_LINK_COMPLEMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _TECHNICAL_OBJECT_RE = re.compile(
-    r"\b(?:access|accounts?|apis?|approvals?|artifacts?|answers?|"
-    r"auth(?:entication|orizations?)?|"
-    r"authenticate|branch(?:es)?|builds?|changes?|checkouts?|ci|code|commands?|"
-    r"commits?|configs?|configuration|confirmations?|connections?|connectivity|"
-    r"consent|containers?|"
+    r"\b(?:access|accounts?|apis?|approvals?|artifacts?|answers?|arguments?|args?|"
+    r"assertions?|assumptions?|auth(?:entication|orizations?)?|"
+    r"authenticate|branch(?:es)?|buffers?|builds?|caches?|callbacks?|callers?|"
+    r"certificates?|certs?|changes?|checkouts?|ci|classes|code|columns?|commands?|"
+    r"comments?|commits?|configs?|configuration|confirmations?|connections?|connectivity|"
+    r"consent|constants?|containers?|"
     r"context|coverage|credentials?|data|databases?|dependenc(?:y|ies)|deployments?|"
-    r"diffs?|docs?|documentation|environments?|errors?|evidence|feedback|files?|"
-    r"findings?|fix(?:es)?|fixtures?|goals?|graphs?|implementations?|information|inputs?|"
-    r"interfaces?|instructions?|investigations?|issues?|jobs?|"
-    r"logs?|merges?|messages?|metrics?|"
-    r"migrations?|models?|outputs?|packages?|patches?|paths?|permissions?|"
-    r"pipelines?|preferences?|projects?|prompts?|quer(?:y|ies)|questions?|queues?|"
-    r"reports?|requests?|responses?|results?|reviews?|runs?|schemas?|scripts?|"
-    r"services?|sessions?|states?|status(?:es)?|suites?|tasks?|tests?|time|tools?|"
-    r"traces?|uis?|validation|verification|worktrees?|workflows?)\b",
+    r"diffs?|directories|directory|docs?|documentation|endpoints?|entr(?:y|ies)|"
+    r"environments?|errors?|evidence|exceptions?|feedback|fields?|files?|flags?|"
+    r"findings?|fix(?:es)?|fixtures?|folders?|functions?|goals?|graphs?|handlers?|"
+    r"headers?|hooks?|implementations?|imports?|indexes|indices|information|inputs?|"
+    r"interfaces?|instructions?|investigations?|issues?|jobs?|keys?|"
+    r"locks?|logs?|merges?|messages?|methods?|metrics?|modules?|"
+    r"migrations?|models?|outputs?|packages?|parameters?|params?|patches?|paths?|"
+    r"permissions?|"
+    r"pipelines?|ports?|preferences?|projects?|prompts?|quer(?:y|ies)|questions?|queues?|"
+    r"rebases?|records?|releases?|repos?|repositor(?:y|ies)|"
+    r"reports?|requests?|responses?|results?|reviews?|routes?|rows?|runs?|schemas?|"
+    r"scripts?|secrets?|"
+    r"services?|sessions?|snapshots?|sockets?|states?|status(?:es)?|streams?|suites?|"
+    r"symbols?|tables?|tags?|tasks?|tests?|threads?|time|tokens?|tools?|"
+    r"traces?|types?|uis?|urls?|validation|values?|variables?|verification|versions?|"
+    r"worktrees?|workflows?)\b",
+    re.IGNORECASE,
+)
+_PERSONAL_PRENOMINAL_RE = re.compile(
+    # "careless developer" evaluates a person; "unreliable user tests" does not —
+    # there ``user`` modifies a technical head noun and the trait describes the
+    # tests. Without a head check the gate read the second as "unreliable user"
+    # and silently dropped an ordinary lesson.
+    #
+    # The exemption is deliberately limited to ``user``/``agent``: those are the
+    # role nouns that routinely modify a technical head in this domain ("user
+    # input", "user config", "agent responses"). Allowing it for every role would
+    # reopen the judgment as long as some technical noun followed — "careless
+    # developer commits" would pass. A trailing possessive ("the careless user's
+    # patch") also still evaluates the person, so it stays denied.
+    # The trait must also be one that can sensibly describe an artifact. Of this
+    # list only "unreliable" does; a config cannot be negligent or lazy, so
+    # "negligent user configs" is still an evaluation of whoever wrote them.
+    # The head noun is a closed list of words that are unambiguously nouns here.
+    # A general "any technical word" test also matches verbs — "an unreliable
+    # user commits secrets" and "unreliable users review nothing" would read as
+    # noun phrases and the judgment would pass.
+    rf"\b(?!unreliable\s+(?:user|(?:coding\s+)?agent)\s+"
+    rf"(?:tests?|input|inputs|output|outputs|responses?|data|config|configs|"
+    rf"configuration|sessions?|messages?|prompts?|feedback|settings?)\b)"
+    rf"{_PERSON_TRAIT_ADJECTIVE}\s+{_PERSON_ACTOR_NOUN}\b",
     re.IGNORECASE,
 )
 _TECHNICAL_MODIFIER = (
@@ -506,6 +567,7 @@ def _is_safe_link_component(
     component: str,
     *,
     allow_inherited_object: bool = False,
+    actor: str = "",
 ) -> bool:
     normalized = re.sub(r"\s+", " ", component.replace("’", "'")).strip()
     normalized = _SAFE_PREFIX_RE.sub("", normalized)
@@ -528,6 +590,14 @@ def _is_safe_link_component(
         return True
     if _SAFE_TECHNICAL_ROLE_RE.fullmatch(normalized):
         return True
+    # A bare state is safe only for the addressee or the agent: "when you are
+    # unsure" reports the state of the work in hand. "the reviewer is unsure
+    # about nearly every change" is an evaluation of a third party, so a
+    # third-person human subject keeps needing a technical object.
+    if _SAFE_STANDALONE_STATE_RE.match(normalized) and _SELF_OR_AGENT_ACTOR_RE.fullmatch(
+        actor.strip()
+    ):
+        return True
     if _SAFE_RESOURCE_STATE_RE.search(normalized) or _SAFE_PREPOSITION_RE.search(normalized):
         return _TECHNICAL_OBJECT_RE.search(normalized) is not None
     return bool(
@@ -536,30 +606,90 @@ def _is_safe_link_component(
     )
 
 
-def _is_safe_link_predicate(predicate: str) -> bool:
+def _predicate_within_clause(text: str, actor_start: int, predicate: str) -> str:
+    """Trim a captured predicate to the clause the linking verb actually governs.
+
+    The linking patterns capture to the end of the sentence, so in "when you are
+    unsure, ask before proceeding" the predicate came out as "unsure, ask before
+    proceeding" — the main instruction after the comma was judged as part of the
+    complement, and ordinary rules were rejected for it. When the actor sits in a
+    subordinate clause, that clause closes at the first comma.
+
+    This cannot hide a judgment that really does follow the comma: the linking
+    patterns scan with a lookahead, so a later "<actor> is <trait>" clause is
+    matched independently.
+    """
+    head = re.split(r"[.;\n]", text[:actor_start])[-1]
+    if not _SUBORDINATE_BOUNDARY_RE.search(head):
+        return predicate
+    bounded, sep, rest = predicate.partition(",")
+    if not sep:
+        return predicate
+    # Only a genuinely new clause ends the complement. "…, and has a long history
+    # of approving blindly" or "…, with a poor record" continues the SAME
+    # predicate, so truncating there would hide the judgment that follows.
+    if _PREDICATE_CONTINUATION_RE.match(rest.strip()):
+        return predicate
+    # Truncating is only ever a convenience for a benign main clause. If anything
+    # after the comma carries trait vocabulary ("…, that is usually overconfidence"),
+    # keep the whole predicate so it is still judged.
+    if _ANY_PERSONAL_TRAIT_RE.search(rest):
+        return predicate
+    return bounded
+
+
+def _is_safe_link_predicate(predicate: str, actor: str = "") -> bool:
     parts = _components(predicate)
-    if not parts or not _is_safe_link_component(parts[0]):
+    if not parts or not _is_safe_link_component(parts[0], actor=actor):
         return False
     # In "fixing code and tests", the later bare technical object inherits the
     # first component's recognized action. It is never sufficient on its own.
     return all(
-        _is_safe_link_component(part, allow_inherited_object=True)
+        _is_safe_link_component(part, allow_inherited_object=True, actor=actor)
         for part in parts[1:]
     )
 
 
-def _is_safe_attribution_object(obj: str) -> bool:
+def _is_safe_attribution_object(obj: str, actor: str = "") -> bool:
+    # "has a history/habit/pattern of <anything>" claims a standing disposition,
+    # so it stays a personal claim however technical the rest of the phrase is —
+    # the component test below only asks whether a technical noun appears
+    # somewhere, which a widened noun list makes easy to satisfy.
+    # A coding agent is exempt: describing what the agent repeatedly does is the
+    # whole point of an "avoid" rule.
+    if _PERSONAL_PATTERN_OBJECT_RE.match(obj.strip()):
+        return bool(
+            _AGENT_ACTOR_RE.fullmatch(actor.strip())
+            and not _ANY_PERSONAL_TRAIT_RE.search(obj)
+        )
     parts = _components(obj)
     return bool(parts) and all(
-        _TECHNICAL_OBJECT_RE.search(part)
+        _TECHNICAL_OBJECT_RE.search(_head_chunk(part))
         or _SAFE_ATTRIBUTION_ACTION_RE.search(part)
         for part in parts
     )
 
 
+def _head_chunk(part: str) -> str:
+    """The head of a noun phrase: everything before its first preposition.
+
+    "cache" and "test suite" are technical subjects; "memory of the folder
+    layout", "grasp of the module" and "refusal to read the comments" are not —
+    their heads are personal nouns and only the trailing prepositional phrase is
+    technical. Searching the whole phrase for any technical word lets that
+    trailing phrase launder the claim, so match on the head alone.
+    """
+    return re.split(
+        r"\b(?:of|about|to|for|with|regarding|concerning|around|over)\b",
+        part, maxsplit=1,
+    )[0]
+
+
 def _possessed_subject_is_technical(subject: str) -> bool:
     parts = _components(subject)
-    return bool(parts) and all(_TECHNICAL_OBJECT_RE.search(part) for part in parts)
+    return bool(parts) and all(
+        _TECHNICAL_OBJECT_RE.search(_head_chunk(part)) for part in parts
+    )
 
 
 def _modifier_has_human_evaluation(actor: str, modifier: str) -> bool:
@@ -655,7 +785,10 @@ def _has_structural_human_evaluation(text: str) -> bool:
             and _has_technical_pronoun_antecedent(text, match.start())
         ):
             continue
-        if not _is_safe_link_predicate(match.group("predicate")):
+        if not _is_safe_link_predicate(
+            _predicate_within_clause(text, match.start(), match.group("predicate")),
+            match.group("actor"),
+        ):
             return True
     for match in _PERSON_LINK_AFTER_MODIFIER_RE.finditer(text):
         if _modifier_has_human_evaluation(
@@ -674,7 +807,10 @@ def _has_structural_human_evaluation(text: str) -> bool:
             match.group("link"),
         ):
             continue
-        if not _is_safe_link_predicate(match.group("predicate")):
+        if not _is_safe_link_predicate(
+            _predicate_within_clause(text, match.start(), match.group("predicate")),
+            match.group("actor"),
+        ):
             return True
     for match in _PERSON_ATTRIBUTION_RE.finditer(text):
         obj = match.group("object").strip()
@@ -683,7 +819,7 @@ def _has_structural_human_evaluation(text: str) -> bool:
             r"^been\b", obj, re.IGNORECASE
         ):
             continue
-        if not _is_safe_attribution_object(obj):
+        if not _is_safe_attribution_object(obj, match.group("actor")):
             return True
     for pattern in (_PERSON_POSSESSIVE_LINK_RE, _PERSON_POSSESSIVE_CONSEQUENCE_RE):
         for match in pattern.finditer(text):
