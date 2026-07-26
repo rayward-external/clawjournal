@@ -4,10 +4,11 @@ from argparse import Namespace
 
 import pytest
 
-from clawjournal.cli_skill import _format_install_targets, run_skill
+from clawjournal.cli_skill import _format_install_targets, _print_preview, run_skill
+from clawjournal.skill.focus import FocusSpotlight
 from clawjournal.skill import store
 from clawjournal.skill.schema import SkillRule
-from clawjournal.skill.select import SkillCorpus
+from clawjournal.skill.select import SkillCandidate, SkillCorpus
 
 
 def _args(**overrides):
@@ -63,6 +64,145 @@ def test_rejects_invalid_distill_effort(monkeypatch, capsys):
 )
 def test_format_install_targets(targets, label):
     assert _format_install_targets(targets) == label
+
+
+def _preview_result(rule, focus):
+    class Result:
+        rules = [rule]
+        skill_md = ""
+        region = ""
+        blocked = []
+        gate_issues = []
+        corpus = SkillCorpus(
+            window_start="a",
+            window_end="b",
+            total_failures=3,
+            eligible_scored=3,
+        )
+        meta = {}
+        added_fps = {store.fingerprint(rule)}
+        dropped = []
+        trend = {}
+        objective_trend = {}
+
+    Result.focus = focus
+    return Result()
+
+
+def test_preview_prints_calibrated_human_only_focus(capsys):
+    rule = SkillRule(
+        kind="avoid",
+        title="Recompute Final Badge",
+        trigger="before reporting final status",
+        guidance="re-run final verification and read its result",
+        why="stale intermediate results caused incorrect status reports",
+        taxonomy="verification_skipped",
+    )
+    focus = FocusSpotlight(
+        rule=rule,
+        session_count=3,
+        day_count=2,
+        project_count=2,
+    )
+
+    _print_preview(_preview_result(rule, focus))
+    output = capsys.readouterr().out
+
+    assert "Focus this week (coding-agent behavior; preview spotlight only)" in output
+    assert "Pattern: Recompute Final Badge" in output
+    assert "Observed cost: stale intermediate results" in output
+    assert "Replacement trigger: before reporting final status" in output
+    assert "Replacement habit: re-run final verification" in output
+    assert "Evidence: 3 directly cited sessions across 2 days and 2 projects." in output
+    assert "underlying lesson remains in the proposed skill set" in output
+    assert "work performance" not in output.lower()
+
+
+def test_preview_explicitly_abstains_when_no_focus_is_eligible(capsys):
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w")
+
+    _print_preview(_preview_result(rule, None))
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "passed the focus safeguards" in output
+    assert "at least 3 sessions across 2 days and 2 projects" in output
+
+
+def test_empty_preview_does_not_recommend_unconfirmed_whole_history_scoring(capsys):
+    class Result:
+        rules = []
+        corpus = SkillCorpus(window_start="a", window_end="b")
+        focus = None
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "skill --all --no-score --preview" in output
+    assert "only after confirming whole-history AI scoring" in output
+
+
+def test_empty_preview_abstention_does_not_claim_an_evidence_shortfall(capsys):
+    class Result:
+        rules = []
+        corpus = SkillCorpus(window_start="a", window_end="b")
+        focus = None
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "nothing to spotlight" in output
+    assert "at least 3 sessions across 2 days and 2 projects" not in output
+
+
+def test_empty_preview_reports_safety_gate_reasons(capsys):
+    blocked_rule = SkillRule(
+        kind="avoid",
+        title="Personal Judgment",
+        trigger="during review",
+        guidance="the developer is inept",
+        why="the review took longer",
+    )
+
+    class Result:
+        rules = []
+        corpus = SkillCorpus(
+            window_start="a",
+            window_end="b",
+            failures=[
+                SkillCandidate(
+                    session_id="s1",
+                    project="repo",
+                    source="codex",
+                    kind="avoid",
+                )
+            ],
+            total_failures=1,
+        )
+        focus = None
+        blocked = [(blocked_rule, ["unsupported_personal_claim"])]
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "No usable rules this run." in output
+    assert "1 rule(s) dropped by the safety gate" in output
+    assert "Personal Judgment" in output
+    assert "unsupported_personal_claim" in output
+
+
+def test_gate_blocked_preview_abstains_for_the_gate_reason(capsys):
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w")
+    res = _preview_result(rule, None)
+    res.gate_issues = ["secret-scan: generic-api-key"]
+
+    _print_preview(res)
+    output = capsys.readouterr().out
+
+    assert "Focus this week: abstained" in output
+    assert "render-time gate blocked this run" in output
+    assert "at least 3 sessions across 2 days and 2 projects" not in output
 
 
 def test_gate_issues_exit_nonzero(monkeypatch):

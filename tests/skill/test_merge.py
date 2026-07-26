@@ -76,6 +76,194 @@ def test_cross_kind_same_title_collapses():
     assert sum(r.title == "Verify Beyond Green Tests" for r in merged) == 1
 
 
+def test_one_word_title_swap_collapses():
+    # The distiller re-emits a carried lesson under a near-identical title (one word
+    # swapped, neither a subset). Both are 'do' rules, so there is no taxonomy to catch
+    # it and even the full stored pair's guidance overlap is only ~0.09 — below the
+    # 0.30 same-kind bar — so without the title check both install and burn two slots.
+    carried = SkillRule(
+        kind="do", trigger="t", title="Reproduce Review Findings",
+        guidance="before listing a suspected defect, reproduce the exact path with the "
+                 "targeted test slice or a small scratch case for the touched module",
+        why="w", support=5)
+    fresh = SkillRule(
+        kind="do", trigger="t", title="Prove Review Findings",
+        guidance="before reporting each suspected defect, prove it in the current repo: read "
+                 "the implementation and tests the diff touches, then state which claims "
+                 "were executed versus only statically inspected",
+        why="w", support=9)
+    merged = merge_rules([carried], [fresh], set())
+    assert sum("Review Findings" in r.title for r in merged) == 1
+    assert merged[0].title == "Reproduce Review Findings"   # carried wording wins
+
+
+def test_near_title_similarity_requires_independent_corroboration():
+    api = SkillRule(
+        kind="do",
+        title="Verify API Contracts",
+        trigger="before changing an API",
+        guidance="compare client payload fields against the server schema",
+        why="mismatched payloads broke requests",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Verify Database Contracts",
+        trigger="before changing persistence",
+        guidance="run migrations and validate stored rows against database constraints",
+        why="schema drift broke persistence",
+    )
+
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scopes_survive_generic_guidance_corroboration():
+    api = SkillRule(
+        kind="do",
+        title="Validate API Responses",
+        trigger="before changing an API response",
+        guidance=(
+            "validate each API response against the schema before updating the "
+            "client contract and publishing release notes"
+        ),
+        why="client requests broke",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Validate Database Responses",
+        trigger="before changing a database response",
+        guidance=(
+            "validate each database response against the schema before changing "
+            "persistence migrations and inspecting stored records"
+        ),
+        why="stored records broke",
+    )
+
+    # Shared validate/response/schema vocabulary corroborates the common template,
+    # not the conflicting API/database scope that makes these distinct lessons.
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scope_guard_ignores_trailing_modifiers():
+    api = SkillRule(
+        kind="do",
+        title="Validate API Response Schemas",
+        trigger="before changing response validation",
+        guidance="validate API response schemas before publishing the client contract",
+        why="client requests broke",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Validate Database Response Schemas Early",
+        trigger="before changing response validation",
+        guidance=(
+            "validate database response schemas early before running persistence migrations"
+        ),
+        why="stored records broke",
+    )
+
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scope_guard_retains_two_letter_acronyms():
+    api = SkillRule(
+        kind="do",
+        title="Validate API Responses",
+        trigger="before changing an API response",
+        guidance=(
+            "validate each API response against the schema before updating the "
+            "client contract and publishing release notes"
+        ),
+        why="client requests broke",
+    )
+    database = SkillRule(
+        kind="do",
+        title="Validate DB Responses",
+        trigger="before changing a DB response",
+        guidance=(
+            "validate each DB response against the schema before changing "
+            "persistence migrations and inspecting stored records"
+        ),
+        why="stored records broke",
+    )
+
+    assert len(merge_rules([api], [database], set())) == 2
+
+
+def test_parallel_title_scope_swap_can_merge_on_strong_full_guidance():
+    raw = SkillRule(
+        kind="do",
+        title="Verify Raw Counts",
+        trigger="before reporting a count",
+        guidance=(
+            "recompute every count directly from raw records and compare the "
+            "reported total before publishing"
+        ),
+        why="unchecked counts caused rework",
+    )
+    source = SkillRule(
+        kind="do",
+        title="Verify Source Counts",
+        trigger="before reporting a count",
+        guidance=(
+            "recompute every count directly from source records and compare the "
+            "reported total before publishing"
+        ),
+        why="unchecked counts caused rework",
+    )
+
+    # The parallel-title guard only blocks weak fuzzy evidence. These still collapse
+    # through the existing >=0.30 full-guidance path.
+    assert len(merge_rules([raw], [source], set())) == 1
+
+
+def test_near_title_real_paraphrase_with_corroboration_collapses():
+    carried = SkillRule(
+        kind="do",
+        title="Verify Against Primary Source",
+        trigger=(
+            "When a count, statistic, or finding you're about to report was derived "
+            "from a narrative summary or intermediate report"
+        ),
+        guidance=(
+            "Re-derive it directly from the raw ground-truth data (CSV/JSON/source) "
+            "before committing, and treat any user pushback on numbers as a signal "
+            "to audit the primary source."
+        ),
+        why="Trusting a report summary missed incomplete tasks.",
+    )
+    fresh = SkillRule(
+        kind="do",
+        title="Verify Stats Against Source",
+        trigger=(
+            "Before writing quantitative claims (counts, statistics, confidence "
+            "assertions) into a report or doc"
+        ),
+        guidance=(
+            "Recompute each figure directly from the source data and calibrate the "
+            "confidence tone to what is actually verified, rather than asserting "
+            "plausible-but-unchecked numbers and overstating findings"
+        ),
+        why="Unchecked counts required multi-round fact-checking.",
+    )
+
+    assert len(merge_rules([carried], [fresh], set())) == 1
+
+
+def test_partially_shared_titles_on_distinct_lessons_survive():
+    # Guard the 0.5 bar from sliding: these share 2 title keywords but sit at 0.4 and
+    # teach different lessons (a design spec vs. the raw numbers behind a stat).
+    spec = SkillRule(kind="do", trigger="t", title="Verify Against Spec",
+                     guidance="read the design doc clause by clause and cross-check each "
+                              "documented filter and cap against the implementation",
+                     why="w", support=5)
+    stats = SkillRule(kind="do", trigger="t", title="Verify Stats Against Source",
+                      guidance="re-derive every reported number directly from the raw "
+                               "ground-truth CSV before committing it",
+                      why="w", support=4)
+    merged = merge_rules([], [spec, stats], set())
+    assert len(merged) == 2
+
+
 def test_distinct_do_rules_survive():
     # 'do' rules carry no taxonomy; only genuine paraphrases (high overlap) collapse.
     a = _tr("write a failing regression test that reproduces the bug before fixing", kind="do")
@@ -147,20 +335,83 @@ def test_preserves_good_bad_mix():
 
 
 def test_cross_kind_title_extension_collapses():
-    # the distiller decorated a carried title ("Fix Root Cause" -> "Fix Root Cause
-    # Durably") and flipped the kind; guidance overlap is far below the cross-kind
-    # threshold, so the title-subset check must catch it.
-    avoid = SkillRule(kind="avoid", trigger="t", title="Fix Root Cause",
-                      guidance="don't stop at the temporary manual workaround that turns "
-                               "the test green — fix the root cause in the image build",
-                      why="w", taxonomy="revision_failure", support=7)
-    do = SkillRule(kind="do", trigger="t", title="Fix Root Cause Durably",
-                   guidance="land the permanent fix in the durable artifact and re-verify "
-                            "with the same harness that found it",
-                   why="w", support=4)
+    # Real stored pair: the distiller decorated a carried title ("Fix Root Cause" ->
+    # "Fix Root Cause Durably") and flipped the kind. Full guidance overlap is ~0.33,
+    # below the cross-kind threshold, but trigger/body corroboration verifies the
+    # extension before the title-subset path collapses it.
+    avoid = SkillRule(
+        kind="avoid",
+        trigger=(
+            "e2e testing surfaces a real production bug and a manual tweak makes it pass"
+        ),
+        title="Fix Root Cause",
+        guidance=(
+            "Don't stop at the temporary manual workaround that turns the test green — "
+            "identify and fix the root cause in the image build or source before calling "
+            "it done."
+        ),
+        why="w",
+        taxonomy="revision_failure",
+        support=7,
+    )
+    do = SkillRule(
+        kind="do",
+        trigger=(
+            "e2e or manual testing surfaces a real production bug and a quick in-place "
+            "workaround makes it pass"
+        ),
+        title="Fix Root Cause Durably",
+        guidance=(
+            "Land the permanent fix in the durable artifact — image build, source, or "
+            "deploy sequence — instead of stopping at the manual workaround, then "
+            "re-verify the root-cause fix with the same harness that found it."
+        ),
+        why="w",
+        support=4,
+    )
     merged = merge_rules([avoid], [do], set())
     assert sum("root cause" in (r.title or "").lower() for r in merged) == 1
     assert merged[0].kind == "avoid"                    # carried rule preferred (no churn)
+
+
+def test_title_extension_requires_independent_corroboration():
+    quality = SkillRule(
+        kind="do",
+        title="Test AI",
+        trigger="when evaluating an AI answer for response quality",
+        guidance="score model responses for factual correctness and instruction following",
+        why="unchecked answers reached users",
+    )
+    security = SkillRule(
+        kind="do",
+        title="Test AI Security",
+        trigger="before probing an AI workflow for prompt injection",
+        guidance="probe prompts for injection bypasses and secret exfiltration",
+        why="unsafe prompts exposed protected data",
+    )
+
+    assert len(merge_rules([quality], [security], set())) == 2
+
+
+def test_uncorroborated_title_extension_can_merge_on_strong_full_guidance():
+    base = SkillRule(
+        kind="do",
+        title="Test AI",
+        trigger="t",
+        guidance="inspect output",
+        why="w",
+    )
+    extended = SkillRule(
+        kind="do",
+        title="Test AI Security",
+        trigger="t",
+        guidance="inspect response",
+        why="w",
+    )
+
+    # Only one shared keyword cannot corroborate the title, but 1/3 full-guidance
+    # Jaccard still clears the normal same-kind threshold below the title branch.
+    assert len(merge_rules([base], [extended], set())) == 1
 
 
 def test_short_shared_title_words_do_not_collapse():

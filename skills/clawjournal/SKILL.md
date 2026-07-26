@@ -1,6 +1,6 @@
 ---
 name: clawjournal
-description: Review, curate, and share coding agent conversation traces. Use when the user asks to review traces, curate sessions, manage their workbench, export conversations, share a trace, or review PII/secrets in exports. Triggers on "review traces", "share traces", "clawjournal", "my sessions", "what did I work on", or trace curation requests.
+description: Review, curate, share, and learn from coding agent conversation traces. Use when the user asks to review traces, curate sessions, manage their workbench, export conversations, share a trace, review PII/secrets in exports, or distill recurring coding-agent lessons and a weekly focus. Triggers on "review traces", "share traces", "clawjournal", "my sessions", "what did I work on", "improve my Codex usage", "what coding habit should I change", or self-improving-skill requests.
 ---
 
 # ClawJournal
@@ -226,6 +226,28 @@ Opens a browser at `localhost:8384` with:
 
 ---
 
+## Self-Improving Lessons
+
+When the user asks what recurring coding-agent behavior to improve, preview the
+local distilled lessons:
+
+```bash
+clawjournal skill --preview
+```
+
+If the preview reports no scored sessions, retry once with
+`clawjournal skill --all --no-score --preview` to use already-scored history without
+starting a whole-history scoring run. If that is also empty, explain the gap and ask
+before running `--all` without `--no-score`. Present the single **Focus this week**
+as a coding-agent behavior with its observed cost, replacement trigger, replacement
+habit, and evidence breadth. If the command abstains, report that no eligible
+evidence-backed focus was available; do not invent a generic critique or diagnose
+the user's personality or performance at work. Do not infer exact evidence from
+stored support counts or old `case-NN` aliases. Install or refresh the generated
+lessons only when the user asks, using `clawjournal skill` and its confirmation flow.
+
+---
+
 ## Export Mode
 
 When the user asks to bulk export their conversations locally:
@@ -281,6 +303,9 @@ clawjournal rescore --window 7d [--source failure-corpus] [--limit 200]
 clawjournal score-view <id>
 clawjournal set-score <id> --failure-value <1-5> [--failure-evidence "..."] [--reason "..."]
 clawjournal set-score <id> --quality <1-5> [--reason "..."]  # legacy productivity only
+
+# Self-improving lessons
+clawjournal skill [--preview] [--all]
 
 # Advanced self-hosted ingest upload
 clawjournal share --status approved [--note "..."] [--preview] [--json]  # package locally; hosted submit is workbench-only

@@ -1,6 +1,6 @@
 # Self-Improving Skills — Implementation Plan (v8, lean)
 
-> Status: **plan for iteration** (no code yet). Date: 2026-06-30.
+> Status: **Mode A implemented; plan for iteration**. Updated: 2026-07-24.
 > **Two modes:** **A — light/local (the focus)** and **B — heavy/upload (next)**.
 > Companion rationale: `brief.md`. Figures: `figures/fig1–7.png`. This version
 > **merges the Claude + Codex reviews**, adds the Mode-A build-readiness fixes,
@@ -54,7 +54,7 @@ default scoring/selection window is the last 7 days.**
 | D5 | Source | The user's own **scored** sessions: recurring **failures** → "avoid this" skills; recurring **successes / recovered failures** → "do this" skills. **Recurrence × impact, not raw frequency** (nontrivial only). |
 | D6 | Inference | The user's **own agent CLI** (Claude/Codex) via `run_default_agent_task` — `ANTHROPIC_API_KEY` stripped → subscription, **no API key, ~free**. One distill call per run, using stronger distill-only defaults (Claude Opus + `xhigh`, Codex `gpt-5.5` + `xhigh`) while batch scoring keeps its fast defaults. |
 | D7 | Privacy (Mode A) | Local-to-ClawJournal: **anonymize + net-new secrets-scrub before the distill call**; deterministic PII/secrets/TruffleHog gate before writing a skill. Default Mode A has one AI egress: the distill call through the user's own agent CLI. Any AI-PII pass is deferred or must be an explicit second-egress opt-in. Egress honesty: skills reach the model provider when the agent loads them. |
-| D8 | Review | The 5 are **previewed before install** (a poisoned/over-general rule must not auto-activate); deterministic **hard-deny** of external/exec tokens in rule text. |
+| D8 | Review | The 5 are **previewed before install** (a poisoned/over-general rule must not auto-activate); deterministic **hard-deny** of external/exec tokens in rule text. Preview may also show one human-facing weekly focus, but it is never installed. |
 | D9 | Validation (Mode A) | **Light/observational only** — track whether targeted failure modes recur less week-over-week. Directional, not a powered metric. Rigorous A/B is Mode B. |
 | D10 | Leverage | Reference `mindsdb/anton` / `claude-reflect` (MIT); reuse clawjournal's scoring + redaction + installer. `claude-memory-compiler` (unlicensed) = ideas only. |
 | D11 | Mode B (deferred) | Upload = **gated + redacted only** (source/project confirmed; never raw/embargoed). Private service owns deep analysis (embeddings, cross-user, community lessons, expensive validation, ranking). **Open-core IP boundary + withholding-free exchange.** Returned candidates re-enter local gates + preview. |
@@ -170,7 +170,7 @@ required. If used, match deterministically — same `project`/`source` + same
    trigger, guidance, why, evidence_session_ids}]`, ≤5. Reuse `generate.py`'s robust
    JSON extraction.
 6. **Gate + preview** — hard-deny + deterministic PII/secrets/TruffleHog; show the
-   5; user confirms.
+   5; optionally spotlight one fresh, directly evidenced avoid rule; user confirms.
 7. **Install** — write the `clawjournal-lessons` skill for Claude Code + Codex
    (§8); idempotent.
 
@@ -206,6 +206,20 @@ it (cap stays 5) → **re-preview the diff** before install. Track targeted
 failure-mode **recurrence** week-over-week as a directional "is it helping?" signal
 (not a powered metric — single-user windows are usually "insufficient data"; honest
 about that). Rigorous validation is Mode B.
+
+The optional **Focus this week** spotlight uses no second model call. It is eligible
+only for a freshly distilled avoid rule whose exact fingerprint survives the final
+gates and whose current-run aliases resolve to at least 3 real cited sessions across
+2 days and 2 projects. Synthetic aggregate aliases and stored aliases do not count.
+A cited session counts only when its structured failure modes contain the avoid
+rule's valid taxonomy. A failure-pool candidate then counts directly; a do-pool
+candidate additionally needs a clean-recovery label, retaining real
+mistake-to-fix evidence without admitting unrelated strong successes. Source
+prefixes do not make one repository count as multiple projects. The spotlight
+describes coding-agent behavior, explicitly abstains when no rule passes both its
+evidence and actor/safety safeguards, and does not store or install its spotlight
+framing or aggregate evidence. The underlying rule remains in the proposed
+Claude/Codex skill set.
 
 Full lifecycle states can wait, but Mode A needs minimal durable state now:
 `fingerprint`, `approved_at`, `rejected_at`, `installed_at`, `last_seen_at`, and

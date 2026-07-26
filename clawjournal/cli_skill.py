@@ -13,9 +13,11 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
 from .skill import distill as _distill
+from .skill import focus as _focus
 from .skill import install as _install
 from .skill import render as _render
 from .skill import select as _select
@@ -44,6 +46,8 @@ class SkillResult:
     trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
     # run-over-run for OBJECTIVE signals: {signal: (prev_rate_or_None, current_rate)}
     objective_trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
+    # Preview framing only; the underlying rule already belongs to ``rules``.
+    focus: _focus.FocusSpotlight | None = None
 
 
 _SUPPORT_HALFLIFE_DAYS = 30.0  # a rule's effective support halves every 30 idle days
@@ -83,6 +87,10 @@ _DUP_STOPWORDS = frozenset(
 )
 
 
+_TITLE_DUP_JACCARD = 0.5
+_TITLE_DUP_CORROBORATION = 0.15
+
+
 def _stem(w: str) -> str:
     """Crude suffix fold so rewrites match ('flagging'/'flag', 'waited'/'wait').
 
@@ -100,10 +108,21 @@ def _stem(w: str) -> str:
     return w
 
 
+def _keyword_stems(text: str) -> list[str]:
+    """Ordered significant word stems for body comparisons."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [_stem(w) for w in words if len(w) > 2 and w not in _DUP_STOPWORDS]
+
+
+def _title_stems(text: str) -> list[str]:
+    """Ordered title stems, retaining short scope terms such as DB or AI."""
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [_stem(w) for w in words if w not in _DUP_STOPWORDS]
+
+
 def _guidance_keywords(text: str) -> set[str]:
     """Significant word stems in a rule's guidance."""
-    words = re.findall(r"[a-z0-9]+", (text or "").lower())
-    return {_stem(w) for w in words if len(w) > 2 and w not in _DUP_STOPWORDS}
+    return set(_keyword_stems(text))
 
 
 def _guidance_overlap(a: str, b: str) -> float:
@@ -111,6 +130,40 @@ def _guidance_overlap(a: str, b: str) -> float:
     if not ka or not kb:
         return 0.0
     return len(ka & kb) / len(ka | kb)
+
+
+def _keyword_corroboration(a: str, b: str) -> bool:
+    """Require independent shared meaning before a fuzzy title can deduplicate."""
+    ka, kb = _guidance_keywords(a), _guidance_keywords(b)
+    if not ka or not kb:
+        return False
+    shared = ka & kb
+    return (
+        len(shared) >= 2
+        and len(shared) / min(len(ka), len(kb)) >= _TITLE_DUP_CORROBORATION
+    )
+
+
+def _is_parallel_title_scope_swap(a: SkillRule, b: SkillRule) -> bool:
+    """Return whether title templates replace a non-leading scope word.
+
+    Inserted/deleted modifiers do not hide an internal substitution: for example,
+    ``Validate API Responses`` and ``Validate Database Responses Early`` remain
+    parallel scoped lessons. Leading action rewrites and pure extensions are not
+    scope swaps.
+    """
+    words_a = _title_stems(a.title)
+    words_b = _title_stems(b.title)
+    if not words_a or not words_b or words_a[0] != words_b[0]:
+        return False
+    opcodes = SequenceMatcher(None, words_a, words_b, autojunk=False).get_opcodes()
+    # A non-leading replacement commonly distinguishes parallel subjects (API vs
+    # database). Insertions/deletions are incidental modifiers; by themselves they
+    # remain eligible for the extension/paraphrase paths.
+    return any(
+        tag == "replace" and index_a > 0 and index_b > 0
+        for tag, index_a, _, index_b, _ in opcodes
+    )
 
 
 def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
@@ -134,9 +187,38 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     # carried title instead of reusing it verbatim ("Fix Root Cause" came back as
     # "Fix Root Cause Durably" [do] beside the carried [avoid], guidance overlap only
     # 0.25). Require >=2 shared keywords so one-word titles can't match everything.
-    tka, tkb = _guidance_keywords(ta), _guidance_keywords(tb)
-    if len(tka & tkb) >= 2 and (tka <= tkb or tkb <= tka):
-        return True
+    # A near-identical title may count too, but title similarity is not evidence of
+    # meaning by itself ("Verify API Contracts" and "Verify Database Contracts" are
+    # distinct). Require corroboration in taxonomy, guidance, or trigger before applying
+    # the fuzzy-title path. A one-word substitution inside otherwise parallel title
+    # templates (e.g. API vs database responses) must instead pass the stronger normal
+    # guidance-overlap bar below. This still catches measured action rewrites such as
+    # "Prove Review Findings" / "Reproduce Review Findings".
+    tka, tkb = set(_title_stems(ta)), set(_title_stems(tb))
+    shared = tka & tkb
+    if len(shared) >= 2:
+        parallel_scope_swap = _is_parallel_title_scope_swap(a, b)
+        corroborated = (
+            bool(a.taxonomy and a.taxonomy == b.taxonomy)
+            or _keyword_corroboration(a.guidance, b.guidance)
+            or _keyword_corroboration(a.trigger, b.trigger)
+        )
+        # An extending title can add a real scope ("Test AI Security"), so set
+        # containment is not sufficient by itself. Require the same independent
+        # corroboration as other fuzzy-title matches.
+        if (
+            (tka <= tkb or tkb <= tka)
+            and corroborated
+            and not parallel_scope_swap
+        ):
+            return True
+        title_overlap = len(shared) / len(tka | tkb)
+        if (
+            title_overlap >= _TITLE_DUP_JACCARD
+            and corroborated
+            and not parallel_scope_swap
+        ):
+            return True
     if a.kind == b.kind:
         if a.taxonomy and a.taxonomy == b.taxonomy:  # same failure mode -> same lesson
             return True
@@ -332,7 +414,12 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     # merge with durable state (skip rejected, replace weakest)
     rejected = _store.rejected_fingerprints(conn)
-    existing = _store.load_kept(conn)
+    stored_rules = _store.load_kept(conn)
+    # Gate legacy/carried wording before semantic clustering. Otherwise an unsafe
+    # high-support carried rule can suppress a safe fresh replacement, then disappear
+    # at the post-merge gate and leave the user with neither lesson.
+    existing, existing_blocked = _render.gate_rules(stored_rules)
+    blocked = blocked + existing_blocked
     prev_installed = _store.installed_fingerprints(conn)
     merged = merge_rules(existing, fresh, rejected, now=now or datetime.now(timezone.utc))
     # re-apply the external/exec hard-deny to the FULL install set (incl. store rules)
@@ -369,7 +456,15 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
-    dropped = [r for r in existing if _store.fingerprint(r) in (prev_installed - merged_fps)]
+    dropped = [
+        r for r in stored_rules
+        if _store.fingerprint(r) in (prev_installed - merged_fps)
+    ]
+    focus = (
+        _focus.select_focus(active_rules=rules, current_rules=fresh, corpus=corpus)
+        if rules and not gate_issues
+        else None
+    )
 
     # run-over-run recurrence signal (§9/D9): current vs the LAST saved snapshot (which
     # is per-run, not calendar-weekly), for the failure modes the current "avoid" rules
@@ -390,7 +485,7 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     objective_trend = {k: (prev_obj.get(k), cur_obj.get(k, 0.0)) for k in sorted(obj_keys)}
 
     return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta,
-                       added_fps, dropped, trend, objective_trend)
+                       added_fps, dropped, trend, objective_trend, focus)
 
 
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
@@ -528,6 +623,14 @@ def _format_install_targets(targets: list[str]) -> str:
     return ", ".join(labels[:-1]) + f" + {labels[-1]}"
 
 
+def _print_blocked_rules(res: SkillResult) -> None:
+    blocked = getattr(res, "blocked", None)
+    if blocked:
+        print(f"\n  {len(blocked)} rule(s) dropped by the safety gate:")
+        for rule, reasons in blocked:
+            print(f"    - {rule.display_title()}  ({', '.join(reasons)})")
+
+
 def _print_preview(res: SkillResult) -> None:
     c = res.corpus
     print(f"\nWindow: {c.total_failures} failure + {c.total_successes} success/recovery "
@@ -535,9 +638,12 @@ def _print_preview(res: SkillResult) -> None:
     if not res.rules:
         if c.is_empty():
             print("No scored failure/success sessions in the window.")
-            print("Try `clawjournal skill --all` for the first run.")
+            print("Try `clawjournal skill --all --no-score --preview` to use already-scored history.")
+            print("Run `--all` without `--no-score` only after confirming whole-history AI scoring.")
         else:
             print("No usable rules this run.")
+        _print_focus(res)
+        _print_blocked_rules(res)
         return
     print(f"Proposed skill set ({len(res.rules)} rule(s)):\n")
     for i, r in enumerate(res.rules, 1):
@@ -551,8 +657,12 @@ def _print_preview(res: SkillResult) -> None:
             print(f"        when: {r.trigger}")
         if r.why:
             print(f"        why:  {r.why}")
+    _print_focus(res)
     if res.dropped:
-        print(f"\n  Dropping {len(res.dropped)} previously-installed rule(s) outranked this run:")
+        print(
+            f"\n  Dropping {len(res.dropped)} previously-installed rule(s) "
+            "no longer in the install set:"
+        )
         for r in res.dropped:
             print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
     if res.trend:
@@ -582,14 +692,40 @@ def _print_preview(res: SkillResult) -> None:
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {sig}: {prev:.0%} → {cur:.0%}  ({arrow})"))
-    if res.blocked:
-        print(f"\n  {len(res.blocked)} rule(s) dropped by the safety gate:")
-        for r, reasons in res.blocked:
-            print(f"    - {r.display_title()}  ({', '.join(reasons)})")
+    _print_blocked_rules(res)
     if res.gate_issues:
         print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {', '.join(res.gate_issues)}"))
         print("    (fail-closed — nothing was written. If the scanner itself errored, re-run; "
               "otherwise the flagged lesson spans rules — inspect the source sessions.)")
+
+
+def _print_focus(res: SkillResult) -> None:
+    focus = getattr(res, "focus", None)
+    if focus is None:
+        print("\nFocus this week: abstained")
+        # State the ACTUAL reason: with no rules or a gate failure the evidence
+        # thresholds were never evaluated, so don't claim they fell short.
+        if not getattr(res, "rules", None):
+            print("  No proposed rules this run, so there was nothing to spotlight.")
+        elif getattr(res, "gate_issues", None):
+            print("  The render-time gate blocked this run before a focus could be considered.")
+        else:
+            print("  No current-run avoid rule both passed the focus safeguards and had")
+            print("  direct support from at least 3 sessions across 2 days and 2 projects.")
+        return
+    rule = focus.rule
+    print(_ascii_safe(
+        "\nFocus this week (coding-agent behavior; preview spotlight only)"
+    ))
+    print(f"  Pattern: {rule.display_title()}")
+    print(f"  Observed cost: {rule.why}")
+    print(f"  Replacement trigger: {rule.trigger}")
+    print(f"  Replacement habit: {rule.guidance}")
+    print(
+        f"  Evidence: {focus.session_count} directly cited sessions across "
+        f"{focus.day_count} days and {focus.project_count} projects."
+    )
+    print("  The underlying lesson remains in the proposed skill set.")
 
 
 def run_skill(args) -> None:

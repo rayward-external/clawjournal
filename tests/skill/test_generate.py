@@ -32,6 +32,200 @@ def test_generate_end_to_end(index_conn, ins):
     assert res.corpus.total_failures == 1 and res.corpus.total_successes == 1
 
 
+def test_generate_adds_one_preview_only_focus_without_another_model_call(index_conn, ins):
+    ins(
+        index_conn, "fail-1", project="alpha", start_time="2026-05-27T12:00:00+00:00",
+        fvs=5, modes='["verification_skipped"]', learning="reported a stale test result",
+    )
+    ins(
+        index_conn, "fail-2", project="alpha", start_time="2026-05-28T12:00:00+00:00",
+        fvs=5, modes='["verification_skipped"]', learning="reported a stale test result",
+    )
+    ins(
+        index_conn, "fail-3", project="beta", start_time="2026-05-28T18:00:00+00:00",
+        fvs=5, modes='["verification_skipped"]', learning="reported a stale test result",
+    )
+    fake = FakeCaller({"rules": [{
+        "kind": "avoid",
+        "title": "Recompute Final Badge",
+        "trigger": "before reporting a final task status",
+        "guidance": "re-run final verification and read its result",
+        "why": "stale intermediate results caused incorrect final status reports",
+        "taxonomy": "verification_skipped",
+        "evidence_session_ids": ["case-01", "case-02", "case-03"],
+    }]})
+
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+
+    assert fake.calls == 1
+    assert res.focus is not None
+    assert res.focus.session_count == 3
+    assert "Focus this week" not in res.skill_md
+    assert "Focus this week" not in res.region
+
+
+def test_generate_never_renders_or_installs_unsupported_personal_claim(index_conn, ins):
+    ins(
+        index_conn,
+        "fail",
+        fvs=5,
+        modes='["verification_skipped"]',
+        learning="reported a stale test result",
+    )
+    fake = FakeCaller({"rules": [
+        {
+            "kind": "avoid",
+            "title": "Developer Carelessness",
+            "trigger": "before reporting a final task status",
+            "guidance": "re-run final verification and read its result",
+            "why": "The developer’s repeated carelessness caused rework",
+            "taxonomy": "verification_skipped",
+            "evidence_session_ids": ["case-01"],
+        },
+        {
+            "kind": "do",
+            "title": "Read Final Result",
+            "trigger": "before reporting a final task status",
+            "guidance": "read the final verification result before reporting status",
+            "why": "stale intermediate results produced incorrect status reports",
+        },
+    ]})
+
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+
+    assert [rule.title for rule in res.rules] == ["Read Final Result"]
+    assert "careless" not in res.skill_md.lower()
+    assert any(
+        rule.title == "Developer Carelessness"
+        and reasons == ["unsupported_personal_claim"]
+        for rule, reasons in res.blocked
+    )
+
+
+def test_personal_claim_is_blocked_before_it_can_replace_safe_carried_wording(
+    index_conn,
+    ins,
+):
+    from clawjournal.skill import store
+    from clawjournal.skill.schema import SkillRule
+
+    safe = SkillRule(
+        kind="avoid",
+        title="Read Final Result",
+        trigger="before reporting a final task status",
+        guidance="re-run final verification and read its result",
+        why="stale intermediate results produced incorrect status reports",
+        taxonomy="verification_skipped",
+    )
+    store.mark_installed(index_conn, [safe])
+    ins(
+        index_conn,
+        "fail",
+        fvs=5,
+        modes='["verification_skipped"]',
+        learning="reported a stale test result",
+    )
+    fake = FakeCaller({"rules": [{
+        "kind": "avoid",
+        "title": "Developer Carelessness",
+        "trigger": "before reporting a final task status",
+        # Same fingerprint as the carried rule; only the unsafe fresh metadata differs.
+        "guidance": safe.guidance,
+        "why": "The developer’s repeated carelessness caused rework",
+        "taxonomy": "verification_skipped",
+        "evidence_session_ids": ["case-01"],
+    }]})
+
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+
+    assert [(rule.title, rule.why) for rule in res.rules] == [(safe.title, safe.why)]
+    assert res.added_fps == set()
+    assert any(
+        rule.title == "Developer Carelessness"
+        and reasons == ["unsupported_personal_claim"]
+        for rule, reasons in res.blocked
+    )
+
+
+def test_personal_claim_is_removed_from_mixed_legacy_install_set(index_conn):
+    from clawjournal.skill import store
+    from clawjournal.skill.schema import SkillRule
+
+    safe = SkillRule(
+        kind="do",
+        title="Read Final Result",
+        trigger="before reporting status",
+        guidance="read the final verification result before reporting status",
+        why="stale results produced incorrect status reports",
+    )
+    unsafe = SkillRule(
+        kind="avoid",
+        title="Developer Carelessness",
+        trigger="before reporting status",
+        guidance="pause before handoff and inspect the latest command outcome",
+        why="The developer’s repeated carelessness caused rework",
+        taxonomy="verification_skipped",
+    )
+    store.mark_installed(index_conn, [safe, unsafe])
+
+    res = generate_skill(
+        index_conn,
+        window_days=7,
+        caller=FakeCaller({"rules": []}),
+        now=NOW,
+    )
+
+    assert [rule.title for rule in res.rules] == [safe.title]
+    assert "careless" not in res.skill_md.lower()
+    assert unsafe.guidance in {rule.guidance for rule in res.dropped}
+    assert any(
+        rule.guidance == unsafe.guidance
+        and reasons == ["unsupported_personal_claim"]
+        for rule, reasons in res.blocked
+    )
+
+
+def test_unsafe_carried_rule_cannot_suppress_safe_fresh_replacement(index_conn, ins):
+    from clawjournal.skill import store
+    from clawjournal.skill.schema import SkillRule
+
+    unsafe = SkillRule(
+        kind="avoid",
+        title="Developer Carelessness",
+        trigger="before reporting status",
+        guidance="pause before handoff and inspect the latest command outcome",
+        why="The developer is unprofessional",
+        taxonomy="verification_skipped",
+        support=20,
+    )
+    store.mark_installed(index_conn, [unsafe])
+    ins(
+        index_conn,
+        "fail",
+        fvs=5,
+        modes='["verification_skipped"]',
+        learning="reported a stale test result",
+    )
+    fake = FakeCaller({"rules": [{
+        "kind": "avoid",
+        "title": "Verify Final State",
+        "trigger": "before reporting status",
+        "guidance": "read the final verification result before reporting status",
+        "why": "stale results produced incorrect status reports",
+        "taxonomy": "verification_skipped",
+    }]})
+
+    res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
+
+    assert [rule.title for rule in res.rules] == ["Verify Final State"]
+    assert unsafe.guidance in {rule.guidance for rule in res.dropped}
+    assert any(
+        rule.guidance == unsafe.guidance
+        and reasons == ["unsupported_personal_claim"]
+        for rule, reasons in res.blocked
+    )
+
+
 def _one_avoid_fake_and_seed(index_conn, ins):
     ins(index_conn, "fail", fvs=5, modes='["verification_skipped"]', learning="said done early")
     return FakeCaller({"rules": [
@@ -48,6 +242,7 @@ def test_unattributable_whole_doc_finding_fails_closed(index_conn, ins, monkeypa
     monkeypatch.setattr(render, "gate_secret_pii_per_rule", lambda rules, **kw: (rules, []))
     res = generate_skill(index_conn, window_days=7, caller=fake, now=NOW)
     assert res.gate_issues   # blocked, not silently cleared
+    assert res.focus is None
 
 
 def test_scanner_error_fails_closed_without_per_rule_misattribution(index_conn, ins, monkeypatch):

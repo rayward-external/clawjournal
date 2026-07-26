@@ -5,7 +5,8 @@ Two render targets share one body:
   - Codex: a markdown managed-region (no frontmatter) for ``AGENTS.md``.
 
 The gate has two deterministic layers (human review is the binding control on top):
-  - ``gate_rules`` drops any rule whose text trips the external/exec hard-deny;
+  - ``gate_rules`` drops any rule whose text trips the external/exec hard-deny or
+    makes an unsupported personal/work-performance claim;
   - ``gate_rendered`` scans the final text for secrets/PII (and TruffleHog when
     available) and reports findings so the caller blocks the write.
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..redaction import betterleaks, pii, scan_policy, secrets, trufflehog
+from .rule_policy import find_rule_policy_violations
 from .schema import SkillRule, find_external_tokens
 
 SKILL_NAME = "clawjournal-lessons"
@@ -27,11 +29,11 @@ SKILL_DESCRIPTION = (
 
 
 def gate_rules(rules: list[SkillRule]) -> tuple[list[SkillRule], list[tuple[SkillRule, list[str]]]]:
-    """Split rules into (kept, blocked-with-reasons) via the hard-deny."""
+    """Split rules into (kept, blocked-with-reasons) via deterministic hard-denies."""
     kept: list[SkillRule] = []
     blocked: list[tuple[SkillRule, list[str]]] = []
     for r in rules:
-        reasons = find_external_tokens(r)
+        reasons = find_external_tokens(r) + find_rule_policy_violations(r)
         (blocked.append((r, reasons)) if reasons else kept.append(r))
     return kept, blocked
 
