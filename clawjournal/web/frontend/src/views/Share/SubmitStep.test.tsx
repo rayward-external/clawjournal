@@ -292,6 +292,113 @@ describe('SubmitStep automatic-upload opt-in', () => {
     expect(toast).toHaveBeenCalledWith('Submitted', 'success');
   });
 
+  it('does not offer the combined action without a supported receipt grant', async () => {
+    vi.spyOn(api.share, 'consent').mockResolvedValue({
+      consent_text: 'Manual share consent.',
+      retention_text: 'Manual retention terms.',
+      consent_version: 'consent-v1',
+      retention_policy_version: 'retention-v1',
+    });
+    vi.spyOn(api.share, 'uploadStatus').mockResolvedValue({
+      verified_email: 'participant@example.edu',
+      token_valid: true,
+      expires_at: '2099-01-01T00:00:00Z',
+      pending_email: null,
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(
+      automaticUploadStatus(),
+    );
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(
+      new ApiError(400, 'Receipt grant unavailable', {
+        code: 'enrollment_grant_unavailable',
+      }),
+    );
+
+    renderSubmit();
+
+    await waitFor(() => {
+      expect(enableSpy).toHaveBeenCalledWith({
+        agent: 'all',
+        challenge_only: true,
+        prepare_for_manual_share: true,
+      });
+    });
+    expect(screen.queryByLabelText(
+      'Enable automatic uploads after this share',
+    )).not.toBeInTheDocument();
+    expect(screen.getByRole('button', {
+      name: 'Submit to ClawJournal Research',
+    })).toBeInTheDocument();
+  });
+
+  it('locks the automatic-upload choice once submission begins', async () => {
+    vi.spyOn(api.share, 'consent').mockResolvedValue({
+      consent_text: 'Manual share consent.',
+      retention_text: 'Manual retention terms.',
+      consent_version: 'consent-v1',
+      retention_policy_version: 'retention-v1',
+    });
+    vi.spyOn(api.share, 'uploadStatus').mockResolvedValue({
+      verified_email: 'participant@example.edu',
+      token_valid: true,
+      expires_at: '2099-01-01T00:00:00Z',
+      pending_email: null,
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(
+      automaticUploadStatus(),
+    );
+    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(authorizationRequired())
+      .mockResolvedValueOnce(automaticUploadStatus({ mode: 'enabled' }));
+    let completeUpload: (
+      result: Awaited<ReturnType<typeof api.shares.upload>>,
+    ) => void = () => {};
+    vi.spyOn(api.shares, 'upload').mockImplementation(() => new Promise(
+      resolve => {
+        completeUpload = resolve;
+      },
+    ));
+    const { onSubmitted } = renderSubmit();
+
+    const automaticUpload = await screen.findByLabelText(
+      'Enable automatic uploads after this share',
+    );
+    fireEvent.click(screen.getByText(
+      'I accept the displayed consent and data-use terms.',
+    ));
+    fireEvent.click(screen.getByText(
+      /I certify this bundle and future automatically uploaded bundles/,
+    ));
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Submit and enable automatic uploads',
+    }));
+
+    await waitFor(() => {
+      expect(automaticUpload).toBeDisabled();
+    });
+    fireEvent.click(automaticUpload);
+    expect(automaticUpload).toBeChecked();
+
+    completeUpload({
+      ok: true,
+      shared_at: '2026-07-25T00:00:00Z',
+      receipt_id: 'receipt-locked-choice',
+      hosted_status: 'accepted',
+      session_count: 1,
+      bundle_hash: 'bundle-hash',
+      redaction_summary: { total_redactions: 0, by_type: {} },
+    });
+
+    await waitFor(() => {
+      expect(onSubmitted).toHaveBeenCalledWith(
+        'receipt-locked-choice',
+        'accepted',
+        null,
+      );
+    });
+    expect(enableSpy).toHaveBeenCalledTimes(2);
+  });
+
   it('shows an existing enrollment as checked and locked without re-enrolling', async () => {
     vi.spyOn(api.share, 'consent').mockResolvedValue({
       consent_text: 'Manual share consent.',

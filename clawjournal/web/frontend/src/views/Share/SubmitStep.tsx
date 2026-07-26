@@ -517,9 +517,9 @@ export function SubmitStep(p: SubmitStepProps) {
                       type="checkbox"
                       aria-label="Enable automatic uploads after this share"
                       checked={enableAutomaticUploads}
-                      disabled={automaticUploadsAlreadyConfigured}
+                      disabled={automaticUploadsAlreadyConfigured || busy}
                       onChange={event => {
-                        if (automaticUploadsAlreadyConfigured) return;
+                        if (automaticUploadsAlreadyConfigured || busy) return;
                         const checked = event.target.checked;
                         setEnableAutomaticUploads(checked);
                         if (checked) {
@@ -535,14 +535,16 @@ export function SubmitStep(p: SubmitStepProps) {
                         height: 15,
                         accentColor: colors.gray900,
                         flexShrink: 0,
-                        cursor: automaticUploadsAlreadyConfigured ? 'not-allowed' : 'pointer',
+                        cursor: automaticUploadsAlreadyConfigured || busy
+                          ? 'not-allowed'
+                          : 'pointer',
                       }}
                     />
                     <span>
                       <label
                         htmlFor="enable-automatic-uploads-after-share"
                         style={{
-                          cursor: automaticUploadsAlreadyConfigured
+                          cursor: automaticUploadsAlreadyConfigured || busy
                             ? 'not-allowed'
                             : 'pointer',
                         }}

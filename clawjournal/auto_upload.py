@@ -1274,6 +1274,14 @@ def enable(
         # create/PATCH, the runner's enrollment gate) re-enforce capability
         # freshness.
         capabilities = fetch_capabilities(force=True)
+        if prepare_for_manual_share and not grant_capability_version_supported(
+            capabilities.get("manual_share_enrollment_grant_version")
+        ):
+            return AutoUploadError(
+                "enrollment_grant_unavailable",
+                "The hosted service cannot enable automatic uploads from this "
+                "manual receipt.",
+            ).as_result()
         terms = fetch_authorization(capabilities)
         ai_backend = _resolved_ai_backend(config)
 
