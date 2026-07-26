@@ -22,6 +22,16 @@ _HUMAN_ROLE = (
 )
 _PERSON_ACTOR = rf"(?:you|we|they|he|she|{_HUMAN_ROLE}|(?:coding\s+)?agents?)"
 _PERSON_ACTOR_NOUN = rf"(?:{_HUMAN_ROLE}|(?:coding\s+)?agents?)"
+_PLURAL_HUMAN_ANTECEDENT_RE = re.compile(
+    r"\b(?:we|people|persons|users|developers|engineers|employees|programmers|"
+    r"workers|coders|authors|reviewers|maintainers|contributors|agents|"
+    r"(?:he|she)\s+(?:and|or)\s+(?:he|she)|"
+    r"(?:user|developer|engineer|employee|programmer|worker|coder|author|"
+    r"reviewer|maintainer|contributor|agent)\s+and\s+"
+    r"(?:a\s+|an\s+|the\s+)?(?:user|developer|engineer|employee|programmer|"
+    r"worker|coder|author|reviewer|maintainer|contributor|agent))\b",
+    re.IGNORECASE,
+)
 _PERSON_TRAIT_ADJECTIVE = (
     r"(?:careless|lazy|unreliable|incompetent|undisciplined|disorganized|"
     r"reckless|impulsive|impatient|inattentive|overconfident|negligent|"
@@ -48,7 +58,7 @@ _PERSON_MODIFIER = (
 )
 _PERSONAL_COPULA_RE = re.compile(
     rf"\b{_PERSON_ACTOR}\b\s+(?:(?:is|are|was|were|seems?|appears?|became|"
-    rf"remained|has\s+been|have\s+been|had\s+been)\s+"
+    rf"remain(?:s|ed)?|has\s+been|have\s+been|had\s+been)\s+"
     rf"{_PERSON_MODIFIER}(?:{_PERSON_TRAIT_ADJECTIVE}|{_PERSON_TRAIT_NOUN})|"
     rf"(?:acts?|acted|behaves?|behaved)\s+"
     rf"{_PERSON_MODIFIER}{_PERSON_TRAIT_ADVERB})\b",
@@ -114,9 +124,9 @@ _PERSONAL_DESCRIPTOR_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSONAL_ACTION_ADVERB_RE = re.compile(
-    r"\b(?:arrogantly|carelessly|dishonestly|foolishly|immaturely|"
-    r"incompetently|negligently|recklessly|sloppily|unethically|"
-    r"unprofessionally)\b",
+    rf"\b(?:{_PERSON_TRAIT_ADVERB}|arrogantly|badly|blindly|dishonestly|"
+    r"foolishly|hastily|hurriedly|immaturely|poorly|stupidly|thoughtlessly|"
+    r"unethically|unprofessionally)\b",
     re.IGNORECASE,
 )
 _PERSONAL_DECISION_RE = re.compile(
@@ -172,7 +182,7 @@ _HUMAN_CLAUSE_RE = re.compile(
     re.IGNORECASE,
 )
 _SUBORDINATE_BOUNDARY_RE = re.compile(
-    r"\b(?:after|although|as|because|before|if|so\s+that|that|when|"
+    r"\b(?:after|although|as|because|before|despite|if|so\s+that|that|when|"
     r"which|while|who|where)\b",
     re.IGNORECASE,
 )
@@ -198,7 +208,19 @@ _PERSONAL_EVALUATION_BY_ROLE_RE = re.compile(
 # operational states, and technical-resource clauses are the explicit safe set.
 _PERSON_LINK_RE = re.compile(
     rf"(?=\b(?P<actor>{_PERSON_ACTOR})\b\s+"
-    r"(?:is|are|was|were|seems?|appears?|became|remained|"
+    r"(?:is|are|was|were|seems?|appears?|became|remain(?:s|ed)?|"
+    r"has\s+been|have\s+been|had\s+been|"
+    r"(?:can|could|may|might|will|would|should|must)\s+be)\s+"
+    r"(?P<predicate>[^.;\n]+))",
+    re.IGNORECASE,
+)
+_PERSON_LINK_AFTER_MODIFIER_RE = re.compile(
+    rf"(?=\b(?P<actor>{_PERSON_ACTOR})\b\s*"
+    r"(?:(?:[\[({,]|--?|[—–])\s*){0,2}"
+    r"(?:after|although|as|because|before|despite|if|that|when|which|while|"
+    r"who|whom|whose|where)\b"
+    r"(?P<modifier>[^.;]{0,512})"
+    r"\b(?P<link>is|are|was|were|seems?|appears?|became|remain(?:s|ed)?|"
     r"has\s+been|have\s+been|had\s+been|"
     r"(?:can|could|may|might|will|would|should|must)\s+be)\s+"
     r"(?P<predicate>[^.;\n]+))",
@@ -227,34 +249,6 @@ _COORDINATE_RE = re.compile(
     r"\s*(?:,|\b(?:and|but|yet|or|while)\b)\s*",
     re.IGNORECASE,
 )
-_ACTOR_ADVERB_RE = re.compile(r"\b(?P<adverb>[a-z][a-z-]*ly)\b", re.IGNORECASE)
-_SAFE_ACTOR_ADVERBS = frozenset({
-    "actively",
-    "actually",
-    "already",
-    "automatically",
-    "concurrently",
-    "currently",
-    "deterministically",
-    "directly",
-    "explicitly",
-    "finally",
-    "immediately",
-    "independently",
-    "locally",
-    "manually",
-    "only",
-    "programmatically",
-    "remotely",
-    "repeatedly",
-    "safely",
-    "securely",
-    "separately",
-    "sequentially",
-    "silently",
-    "specifically",
-    "temporarily",
-})
 _SAFE_PREFIX_RE = re.compile(
     r"^(?:(?:currently|actively|still|already|now|temporarily|repeatedly|"
     r"then)\s+)+",
@@ -315,7 +309,7 @@ _TECHNICAL_OBJECT_RE = re.compile(
     r"context|coverage|credentials?|data|databases?|dependenc(?:y|ies)|deployments?|"
     r"diffs?|docs?|documentation|environments?|errors?|evidence|feedback|files?|"
     r"findings?|fix(?:es)?|fixtures?|goals?|graphs?|implementations?|information|inputs?|"
-    r"inaccurac(?:y|ies)|interfaces?|instructions?|investigations?|issues?|jobs?|"
+    r"interfaces?|instructions?|investigations?|issues?|jobs?|"
     r"logs?|merges?|messages?|metrics?|"
     r"migrations?|models?|outputs?|packages?|patches?|paths?|permissions?|"
     r"pipelines?|preferences?|projects?|prompts?|quer(?:y|ies)|questions?|queues?|"
@@ -357,17 +351,39 @@ _SAFE_MORPHOLOGICAL_ACTION_RE = re.compile(
     rf"[a-z][a-z-]*ing\s+{_DIRECT_TECHNICAL_OBJECT_PHRASE}$",
     re.IGNORECASE,
 )
+_SAFE_ACTION_MANNER_PREFIX_RE = re.compile(
+    rf"^(?:[a-z][a-z-]*ly\s+){{1,2}}(?={_SAFE_ACTION_GERUND}\b)",
+    re.IGNORECASE,
+)
 _TECHNICAL_ADVERBIAL_PARTICIPLE_RE = re.compile(
-    rf"^[a-z][a-z-]*ly\s+(?:configured|encoded|escaped|formatted|generated|"
+    rf"[a-z][a-z-]*ly\s+(?:configured|encoded|escaped|formatted|generated|"
     rf"ordered|performing|quoted|rendered|serialized|sorted|structured|typed|"
     rf"written)\s+[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern}",
     re.IGNORECASE,
 )
-_SAFE_TASK_MANNER_RE = re.compile(
-    rf"(?:\b(?P<correctly>correctly)\s+diagnosed\s+"
-    rf"[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern}|"
-    rf"\bfix(?:ed|ing)?\s+it\s+(?P<properly>properly)\b"
-    rf"[^.;,\n]{{0,40}}{_TECHNICAL_OBJECT_RE.pattern})",
+_TECHNICAL_OBJECT_MODIFIER_GOVERNOR_RE = re.compile(
+    r"\b(?:analyz(?:e|es|ed|ing)|check(?:s|ed|ing)?|compar(?:e|es|ed|ing)|"
+    r"fix(?:es|ed|ing)?|inspect(?:s|ed|ing)?|pars(?:e|es|ed|ing)|"
+    r"read(?:s|ing)?|review(?:s|ed|ing)?|scan(?:s|ned|ning)?|"
+    r"validat(?:e|es|ed|ing))\b",
+    re.IGNORECASE,
+)
+_EMBEDDED_TECHNICAL_SUBJECT_RE = re.compile(
+    rf"\b(?P<verb>[a-z][a-z-]*)\s+(?:that\s+)?"
+    rf"(?P<subject>(?:(?:their|this|these|those|his|her)\s+)?"
+    rf"{_TECHNICAL_NOUN_PHRASE}(?:\s+itself)?)\s*[,)\]}}—–-]*\s*$",
+    re.IGNORECASE,
+)
+_EARLIER_MODIFIER_ACTION_RE = re.compile(
+    rf"\b(?:{_SAFE_ACTION_GERUND}|[a-z][a-z-]*ed|did|found|made|ran|read|"
+    r"said|saw|told|wrote)\b",
+    re.IGNORECASE,
+)
+_MODIFIER_PERSONAL_STATE_RE = re.compile(
+    rf"\b(?:called|considered|deemed|despite\s+being|labeled|"
+    rf"regarded(?:\s+as)?|while)\s+"
+    rf"{_PERSON_MODIFIER}(?:{_PERSON_TRAIT}|{_PERSONAL_DESCRIPTOR_RE.pattern}|"
+    rf"inept|mediocre)\b",
     re.IGNORECASE,
 )
 _SAFE_ATTRIBUTION_ACTION_RE = re.compile(
@@ -402,20 +418,21 @@ def _has_governed_decision(tail: str) -> bool:
     return False
 
 
-def _has_personal_manner_adverb(tail: str) -> bool:
-    safe_task_adverb_spans = {
-        safe.span(group)
-        for safe in _SAFE_TASK_MANNER_RE.finditer(tail)
-        for group in ("correctly", "properly")
-        if safe.start(group) >= 0
-    }
-    for match in _ACTOR_ADVERB_RE.finditer(tail):
-        adverb = match.group("adverb").casefold()
-        if adverb in _SAFE_ACTOR_ADVERBS or adverb == "reply":
-            continue
-        if match.span() in safe_task_adverb_spans:
-            continue
-        if _TECHNICAL_ADVERBIAL_PARTICIPLE_RE.match(tail[match.start():]):
+def _is_technical_object_modifier(tail: str, start: int) -> bool:
+    phrase = _TECHNICAL_ADVERBIAL_PARTICIPLE_RE.match(tail, start)
+    if not phrase:
+        return False
+    prefix = tail[:start]
+    governors = list(_TECHNICAL_OBJECT_MODIFIER_GOVERNOR_RE.finditer(prefix))
+    if not governors:
+        return False
+    suffix = prefix[governors[-1].end():]
+    return re.search(r"\b(?:and|but|or|then|yet)\b", suffix, re.IGNORECASE) is None
+
+
+def _has_personal_action_adverb(tail: str) -> bool:
+    for match in _PERSONAL_ACTION_ADVERB_RE.finditer(tail):
+        if _is_technical_object_modifier(tail, match.start()):
             continue
         return True
     return False
@@ -423,11 +440,28 @@ def _has_personal_manner_adverb(tail: str) -> bool:
 
 def _has_technical_pronoun_antecedent(text: str, offset: int) -> bool:
     """Return whether ``they`` follows a technical, not human, clause subject."""
-    clause = re.split(r"[.;\n]", text[:offset])[-1]
-    return bool(
-        _TECHNICAL_OBJECT_RE.search(clause)
-        and not re.search(rf"\b{_PERSON_ACTOR_NOUN}\b", clause, re.IGNORECASE)
+    clauses = re.split(r"[.;\n]", text[:offset])
+    clause = next((part for part in reversed(clauses) if part.strip()), "")
+    technical_refs = list(_TECHNICAL_OBJECT_RE.finditer(clause))
+    if not technical_refs:
+        return False
+    human_refs = re.findall(
+        rf"\b(?:he|she|him|her|{_PERSON_ACTOR_NOUN})\b",
+        clause,
+        re.IGNORECASE,
     )
+    if _PLURAL_HUMAN_ANTECEDENT_RE.search(clause) or len(human_refs) >= 2:
+        return False
+    singular_s_words = {"access", "analysis", "business", "class", "process", "status"}
+    has_plural_technical = any(
+        (word := re.findall(r"[a-z]+", match.group().casefold()))
+        and word[-1].endswith("s")
+        and word[-1] not in singular_s_words
+        for match in technical_refs
+    )
+    if has_plural_technical:
+        return True
+    return not re.search(rf"\b{_PERSON_ACTOR}\b", clause, re.IGNORECASE)
 
 
 def _has_personal_clause(text: str) -> bool:
@@ -437,8 +471,7 @@ def _has_personal_clause(text: str) -> bool:
         if boundary:
             tail = tail[:boundary.start()]
         if (
-            _has_personal_manner_adverb(tail)
-            or _PERSONAL_ACTION_ADVERB_RE.search(tail)
+            _has_personal_action_adverb(tail)
             or _has_governed_match(tail, _PERSONAL_QUALITY_RE)
             or _has_governed_match(tail, _PERSONAL_OWNERSHIP_RE)
             or _has_governed_match(tail, _PERSONAL_DESCRIPTOR_RE)
@@ -461,6 +494,13 @@ def _is_safe_link_component(
 ) -> bool:
     normalized = re.sub(r"\s+", " ", component.replace("’", "'")).strip()
     normalized = _SAFE_PREFIX_RE.sub("", normalized)
+    manner_prefix = _SAFE_ACTION_MANNER_PREFIX_RE.match(normalized)
+    if manner_prefix and _PERSONAL_ACTION_ADVERB_RE.search(manner_prefix.group()):
+        return False
+    if manner_prefix:
+        normalized = normalized[manner_prefix.end():]
+    elif _PERSONAL_ACTION_ADVERB_RE.match(normalized):
+        return False
     if _UNSAFE_LINK_COMPLEMENT_RE.search(normalized):
         return False
     if any(pattern.search(normalized) for pattern in (
@@ -507,6 +547,90 @@ def _possessed_subject_is_technical(subject: str) -> bool:
     return bool(parts) and all(_TECHNICAL_OBJECT_RE.search(part) for part in parts)
 
 
+def _modifier_has_human_evaluation(actor: str, modifier: str) -> bool:
+    cleaned = modifier.strip(" \t,()[]{}—–-")
+    if not cleaned:
+        return False
+    if _MODIFIER_PERSONAL_STATE_RE.search(cleaned):
+        return True
+    synthetic = f"{actor} {cleaned}"
+    if _has_personal_clause(synthetic):
+        return True
+    for match in _PERSON_LINK_RE.finditer(synthetic):
+        if not _is_safe_link_predicate(match.group("predicate")):
+            return True
+    for match in _PERSON_ATTRIBUTION_RE.finditer(synthetic):
+        if not _is_safe_attribution_object(match.group("object").strip()):
+            return True
+    return False
+
+
+def _subject_agrees_with_link(subject: str, link: str) -> bool:
+    words = re.findall(r"[a-z]+", subject.casefold())
+    if not words:
+        return False
+    while words and words[-1] == "itself":
+        words.pop()
+    if not words:
+        return False
+    singular_s_words = {"access", "analysis", "business", "class", "process", "status"}
+    subject_is_plural = (
+        words[-1] == "data"
+        or (words[-1].endswith("s") and words[-1] not in singular_s_words)
+    )
+    normalized_link = re.sub(r"\s+", " ", link.casefold()).strip()
+    singular_link = normalized_link in {
+        "is", "was", "seems", "appears", "became", "remains", "remained", "has been",
+    }
+    plural_link = normalized_link in {
+        "are", "were", "seem", "appear", "remain", "have been",
+    }
+    if singular_link:
+        return not subject_is_plural
+    if plural_link:
+        return subject_is_plural
+    return True
+
+
+def _actor_agrees_with_link(actor: str, link: str) -> bool:
+    normalized_actor = re.sub(r"\s+", " ", actor.casefold()).strip()
+    if normalized_actor in {"you"}:
+        return True
+    actor_is_plural = (
+        normalized_actor in {"we", "they", "people", "persons"}
+        or normalized_actor.endswith("s")
+    )
+    normalized_link = re.sub(r"\s+", " ", link.casefold()).strip()
+    if normalized_link in {
+        "is", "was", "seems", "appears", "became", "remains", "remained", "has been",
+    }:
+        return not actor_is_plural
+    if normalized_link in {"are", "were", "seem", "appear", "remain", "have been"}:
+        return actor_is_plural
+    return True
+
+
+def _modifier_ends_with_embedded_technical_subject(
+    actor: str,
+    modifier: str,
+    link: str,
+) -> bool:
+    if modifier.rstrip().endswith((",", ")", "]", "}", "—", "–", "-")):
+        return False
+    cleaned = modifier.strip(" \t,()[]{}—–-")
+    match = _EMBEDDED_TECHNICAL_SUBJECT_RE.search(cleaned)
+    if not match or not _subject_agrees_with_link(match.group("subject"), link):
+        return False
+    earlier = cleaned[:match.start()]
+    if re.search(r"\b(?:and|but|or|then|yet)\b", earlier, re.IGNORECASE):
+        return False
+    return bool(
+        _EARLIER_MODIFIER_ACTION_RE.search(earlier)
+        or _TECHNICAL_OBJECT_MODIFIER_GOVERNOR_RE.search(earlier)
+        or not _actor_agrees_with_link(actor, link)
+    )
+
+
 def _has_structural_human_evaluation(text: str) -> bool:
     if _has_personal_clause(text):
         return True
@@ -514,6 +638,25 @@ def _has_structural_human_evaluation(text: str) -> bool:
         if (
             match.group("actor").casefold() == "they"
             and _has_technical_pronoun_antecedent(text, match.start())
+        ):
+            continue
+        if not _is_safe_link_predicate(match.group("predicate")):
+            return True
+    for match in _PERSON_LINK_AFTER_MODIFIER_RE.finditer(text):
+        if _modifier_has_human_evaluation(
+            match.group("actor"),
+            match.group("modifier"),
+        ):
+            return True
+        if (
+            match.group("actor").casefold() == "they"
+            and _has_technical_pronoun_antecedent(text, match.start())
+        ):
+            continue
+        if _modifier_ends_with_embedded_technical_subject(
+            match.group("actor"),
+            match.group("modifier"),
+            match.group("link"),
         ):
             continue
         if not _is_safe_link_predicate(match.group("predicate")):

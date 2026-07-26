@@ -623,6 +623,14 @@ def _format_install_targets(targets: list[str]) -> str:
     return ", ".join(labels[:-1]) + f" + {labels[-1]}"
 
 
+def _print_blocked_rules(res: SkillResult) -> None:
+    blocked = getattr(res, "blocked", None)
+    if blocked:
+        print(f"\n  {len(blocked)} rule(s) dropped by the safety gate:")
+        for rule, reasons in blocked:
+            print(f"    - {rule.display_title()}  ({', '.join(reasons)})")
+
+
 def _print_preview(res: SkillResult) -> None:
     c = res.corpus
     print(f"\nWindow: {c.total_failures} failure + {c.total_successes} success/recovery "
@@ -635,6 +643,7 @@ def _print_preview(res: SkillResult) -> None:
         else:
             print("No usable rules this run.")
         _print_focus(res)
+        _print_blocked_rules(res)
         return
     print(f"Proposed skill set ({len(res.rules)} rule(s)):\n")
     for i, r in enumerate(res.rules, 1):
@@ -683,10 +692,7 @@ def _print_preview(res: SkillResult) -> None:
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {sig}: {prev:.0%} → {cur:.0%}  ({arrow})"))
-    if res.blocked:
-        print(f"\n  {len(res.blocked)} rule(s) dropped by the safety gate:")
-        for r, reasons in res.blocked:
-            print(f"    - {r.display_title()}  ({', '.join(reasons)})")
+    _print_blocked_rules(res)
     if res.gate_issues:
         print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {', '.join(res.gate_issues)}"))
         print("    (fail-closed — nothing was written. If the scanner itself errored, re-run; "

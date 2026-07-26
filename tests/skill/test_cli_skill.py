@@ -8,7 +8,7 @@ from clawjournal.cli_skill import _format_install_targets, _print_preview, run_s
 from clawjournal.skill.focus import FocusSpotlight
 from clawjournal.skill import store
 from clawjournal.skill.schema import SkillRule
-from clawjournal.skill.select import SkillCorpus
+from clawjournal.skill.select import SkillCandidate, SkillCorpus
 
 
 def _args(**overrides):
@@ -154,6 +154,42 @@ def test_empty_preview_abstention_does_not_claim_an_evidence_shortfall(capsys):
     assert "Focus this week: abstained" in output
     assert "nothing to spotlight" in output
     assert "at least 3 sessions across 2 days and 2 projects" not in output
+
+
+def test_empty_preview_reports_safety_gate_reasons(capsys):
+    blocked_rule = SkillRule(
+        kind="avoid",
+        title="Personal Judgment",
+        trigger="during review",
+        guidance="the developer is inept",
+        why="the review took longer",
+    )
+
+    class Result:
+        rules = []
+        corpus = SkillCorpus(
+            window_start="a",
+            window_end="b",
+            failures=[
+                SkillCandidate(
+                    session_id="s1",
+                    project="repo",
+                    source="codex",
+                    kind="avoid",
+                )
+            ],
+            total_failures=1,
+        )
+        focus = None
+        blocked = [(blocked_rule, ["unsupported_personal_claim"])]
+
+    _print_preview(Result())
+    output = capsys.readouterr().out
+
+    assert "No usable rules this run." in output
+    assert "1 rule(s) dropped by the safety gate" in output
+    assert "Personal Judgment" in output
+    assert "unsupported_personal_claim" in output
 
 
 def test_gate_blocked_preview_abstains_for_the_gate_reason(capsys):
