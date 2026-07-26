@@ -648,3 +648,50 @@ def test_hard_deny_survives_adversarial_probes_of_the_safe_vocabulary(guidance):
 
     assert kept == []
     assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        # The distiller can write in the user's own voice; first person was absent
+        # from the actor alternation entirely, and "am" from every copula list.
+        "I was careless and caused rework",
+        "I am sloppy about running tests",
+        "I am unreliable at reviewing diffs",
+        "when I am incompetent at review, ask for help",
+        "I have a history of skipping tests",
+        "My poor judgment delayed the fix",
+        "My carelessness broke the build",
+        "Our carelessness broke the build",
+    ],
+)
+def test_hard_deny_blocks_first_person_personal_claims(guidance):
+    bad = _rule(guidance=guidance)
+
+    kept, blocked = render.gate_rules([bad])
+
+    assert kept == []
+    assert blocked == [(bad, ["unsupported_personal_claim"])]
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        # "I" is matched case-sensitively on purpose: a case-insensitive \bi\b
+        # matches the loop variable that appears throughout ordinary lessons.
+        "reset i before the loop and re-run the suite",
+        "for i in range(n), validate the schema",
+        "increment i is wrong when the list is empty",
+        # First-person possessives of technical objects are not evaluations.
+        "rebase my branch onto main before pushing",
+        "my config is stale; regenerate it",
+        "check my test suite output before reporting",
+        # And a bare state about oneself is as benign as one about "you".
+        "when I am unsure, ask before proceeding",
+        "when I am blocked, say so and stop",
+    ],
+)
+def test_hard_deny_allows_loop_variables_and_first_person_technical_context(guidance):
+    safe = _rule(kind="do", guidance=guidance)
+
+    assert render.gate_rules([safe]) == ([safe], [])

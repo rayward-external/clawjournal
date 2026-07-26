@@ -29,9 +29,12 @@ _HUMAN_ROLE_SUBJECT_ONLY = r"(?:devs?|folks)"
 # "whoever wrote this", "whoever reviewed the diff" — an indefinite human subject the
 # role list cannot enumerate. Bounded so it cannot swallow a whole sentence.
 _INDEFINITE_HUMAN_SUBJECT = r"(?:whoever(?:\s+\w+){1,3})"
+# "I"/"me" are matched case-SENSITIVELY: a case-insensitive \bi\b matches the loop
+# variable that appears all over ordinary coding lessons ("reset i before the loop").
+_FIRST_PERSON_SUBJECT = r"(?:(?-i:I)|(?-i:me))"
 _PERSON_ACTOR = (
-    rf"(?:you|we|they|he|she|{_INDEFINITE_HUMAN_SUBJECT}|{_HUMAN_ROLE}|"
-    rf"{_HUMAN_ROLE_SUBJECT_ONLY}|(?:coding\s+)?agents?)"
+    rf"(?:you|we|they|he|she|{_FIRST_PERSON_SUBJECT}|{_INDEFINITE_HUMAN_SUBJECT}|"
+    rf"{_HUMAN_ROLE}|{_HUMAN_ROLE_SUBJECT_ONLY}|(?:coding\s+)?agents?)"
 )
 _PERSON_ACTOR_NOUN = rf"(?:{_HUMAN_ROLE}|(?:coding\s+)?agents?)"
 _PLURAL_HUMAN_ANTECEDENT_RE = re.compile(
@@ -72,7 +75,7 @@ _PERSON_MODIFIER = (
     r"persistent|persistently|habitual|habitually|\w+ly)\s+){0,2}"
 )
 _PERSONAL_COPULA_RE = re.compile(
-    rf"\b{_PERSON_ACTOR}\b\s+(?:(?:is|are|was|were|seems?|appears?|became|"
+    rf"\b{_PERSON_ACTOR}\b\s+(?:(?:is|am|are|was|were|seems?|appears?|became|"
     rf"remain(?:s|ed)?|has\s+been|have\s+been|had\s+been)\s+"
     rf"{_PERSON_MODIFIER}(?:{_PERSON_TRAIT_ADJECTIVE}|{_PERSON_TRAIT_NOUN})|"
     rf"(?:acts?|acted|behaves?|behaved)\s+"
@@ -80,7 +83,7 @@ _PERSONAL_COPULA_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSON_POSSESSIVE = (
-    rf"(?:your|their|his|her|{_PERSON_ACTOR_NOUN}(?:['’]s|['’]))"
+    rf"(?:your|their|his|her|my|our|{_PERSON_ACTOR_NOUN}(?:['’]s|['’]))"
 )
 _PERSON_TRAIT_NOUN_PHRASE = (
     rf"(?:a\s+)?{_PERSON_MODIFIER}"
@@ -103,7 +106,7 @@ _PERSONAL_TRAIT_BY_ROLE_RE = re.compile(
     re.IGNORECASE,
 )
 _PERSONAL_PRONOUN_POSSESSIVE_RE = re.compile(
-    rf"\b(?:their|his|her)\s+{_PERSON_TRAIT_NOUN_PHRASE}\b",
+    rf"\b(?:their|his|her|my|our)\s+{_PERSON_TRAIT_NOUN_PHRASE}\b",
     re.IGNORECASE,
 )
 _PERSONAL_PROCRASTINATION_RE = re.compile(
@@ -119,7 +122,7 @@ _PERSONAL_PATTERN_OBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _SELF_OR_AGENT_ACTOR_RE = re.compile(
-    r"(?:you|we|(?:the\s+)?(?:coding\s+)?agents?)", re.IGNORECASE
+    r"(?:you|we|(?-i:I)|(?:the\s+)?(?:coding\s+)?agents?)", re.IGNORECASE
 )
 _ANY_PERSONAL_TRAIT_RE = re.compile(
     rf"\b(?:{_PERSON_TRAIT}|arrogan(?:t|ce)|dishonest|foolish|immature|incapable|"
@@ -241,7 +244,7 @@ _PERSONAL_EVALUATION_BY_ROLE_RE = re.compile(
 # operational states, and technical-resource clauses are the explicit safe set.
 _PERSON_LINK_RE = re.compile(
     rf"(?=\b(?P<actor>{_PERSON_ACTOR})\b\s+"
-    r"(?:is|are|was|were|seems?|appears?|became|remain(?:s|ed)?|"
+    r"(?:is|am|are|was|were|seems?|appears?|became|remain(?:s|ed)?|"
     r"has\s+been|have\s+been|had\s+been|"
     r"(?:can|could|may|might|will|would|should|must)\s+be)\s+"
     r"(?P<predicate>[^.;\n]+))",
@@ -253,7 +256,7 @@ _PERSON_LINK_AFTER_MODIFIER_RE = re.compile(
     r"(?:after|although|as|because|before|despite|if|that|when|which|while|"
     r"who|whom|whose|where)\b"
     r"(?P<modifier>[^.;]{0,512})"
-    r"\b(?P<link>is|are|was|were|seems?|appears?|became|remain(?:s|ed)?|"
+    r"\b(?P<link>is|am|are|was|were|seems?|appears?|became|remain(?:s|ed)?|"
     r"has\s+been|have\s+been|had\s+been|"
     r"(?:can|could|may|might|will|would|should|must)\s+be)\s+"
     r"(?P<predicate>[^.;\n]+))",
@@ -269,7 +272,7 @@ _PERSON_ATTRIBUTION_RE = re.compile(
 )
 _PERSON_POSSESSIVE_LINK_RE = re.compile(
     rf"(?=\b{_PERSON_POSSESSIVE}\s+(?P<subject>[^.;,\n]+?)\s+"
-    r"(?:is|are|was|were|seems?|appears?|became|remained)\s+[^.;,\n]+)",
+    r"(?:is|am|are|was|were|seems?|appears?|became|remained)\s+[^.;,\n]+)",
     re.IGNORECASE,
 )
 _PERSON_POSSESSIVE_CONSEQUENCE_RE = re.compile(
