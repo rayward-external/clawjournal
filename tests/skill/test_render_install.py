@@ -27,9 +27,37 @@ def test_hard_deny_scans_rendered_metadata_fields():
     assert "url" in blocked[0][1]
 
 
-def test_hard_deny_blocks_unsupported_personal_claims():
-    bad = _rule()
-    bad.why = "The developer’s repeated carelessness caused rework"
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "The developer's poor judgment caused rework",
+        "The developer lacks diligence",
+        "The engineer is unprofessional",
+        "The developer exercised questionable judgment",
+        "The developer lacks diligence on tests",
+        "The developer is blocked by CI and unprofessional",
+        "The coder makes reckless decisions",
+        "The developer is fixing tests carelessly",
+        "The developer needs better judgment",
+        "The developer should not be unprofessional",
+        "Avoid the developer's shortsighted decisions",
+        "They lack diligence",
+        "He has poor judgment",
+        "The developer made bad decisions",
+        "The developer performs poorly",
+        "The developer did a terrible job",
+        "The developer is poor at code review",
+        "The developer is bad with tests",
+        "The developer is terrible at code review",
+        "The developer delivered poor work",
+        "The developer evaluates reviewer competence",
+        "The developer questions reviewer competence",
+        "The developer questions the reviewer's competence",
+        "The developer has poor ownership of the issue",
+    ],
+)
+def test_hard_deny_blocks_unsupported_personal_claims(claim):
+    bad = _rule(guidance=claim)
 
     kept, blocked = render.gate_rules([bad])
 
@@ -37,13 +65,68 @@ def test_hard_deny_blocks_unsupported_personal_claims():
     assert blocked == [(bad, ["unsupported_personal_claim"])]
 
 
-def test_hard_deny_allows_technical_trait_wording():
-    safe = _rule(
-        kind="do",
-        guidance="avoid unreliable integration tests by quarantining flaky cases",
-    )
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        "avoid unreliable integration tests by quarantining flaky cases",
+        "the coding agent is blocked by CI",
+        "the developer lacks database access",
+        "the engineer showed weak test coverage",
+        "the developer is unable to access the database",
+        "the user is missing permissions",
+        "the agent is uncertain which command to run",
+        "the reviewer is requesting changes",
+        "the user is trying to authenticate",
+        "the developer is on the main branch",
+        "the developer fixes tests that perform poorly",
+        "the developer is fixing tests, then rerunning validation",
+        "the developer verifies data integrity before migration",
+        "the agent checks API capabilities before use",
+        "the developer documents component responsibility",
+        "the developer fixes badly formatted code",
+        "the developer waits while the service behaves badly",
+        "the developer reviews bad decisions made by the model",
+        "the developer records the reviewer judgment in the report",
+        "the report records the judgment by the reviewer",
+        "a poor test by the developer caused the CI failure",
+        "a weak implementation by the developer failed validation",
+        "a questionable patch by the developer required rework",
+        "the developer documents component ownership",
+        "the developer has enough time to run the suite",
+        "when you have explicit user approval",
+        "when you have confirmation from the user",
+        "when the developer has consent to publish",
+    ],
+)
+def test_hard_deny_allows_technical_trait_wording(guidance):
+    safe = _rule(kind="do", guidance=guidance)
 
     assert render.gate_rules([safe]) == ([safe], [])
+
+
+def test_fallback_title_uses_full_guidance_context_for_policy():
+    from clawjournal.skill.schema import parse_rules
+
+    safe, unsafe = parse_rules({"rules": [
+        {
+            "kind": "do",
+            "trigger": "when reviewing coverage",
+            "guidance": "the engineer showed weak test coverage",
+            "why": "the report omitted an edge case",
+        },
+        {
+            "kind": "avoid",
+            "trigger": "before review",
+            "guidance": "the developer lacks diligence on tests",
+            "why": "the review required rework",
+        },
+    ]})
+
+    assert safe.title == "the engineer showed weak"
+    assert render.gate_rules([safe, unsafe]) == (
+        [safe],
+        [(unsafe, ["unsupported_personal_claim"])],
+    )
 
 
 def test_render_frontmatter_and_sections():
