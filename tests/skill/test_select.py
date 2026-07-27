@@ -116,6 +116,35 @@ def test_hold_state_gate_excludes_pending_from_rates(index_conn, ins):
     assert corpus.eligible_scored == 1
 
 
+def test_objective_universe_includes_unscored_sessions(index_conn, ins):
+    ins(index_conn, "scored", fvs=5, learning="judge evidence")
+    ins(index_conn, "unscored")
+
+    corpus = select_skill_candidates(index_conn, now=NOW)
+
+    assert corpus.eligible_session_ids == ["scored"]
+    assert set(corpus.objective_session_ids) == {"scored", "unscored"}
+    assert corpus.objective_session_count == 2
+
+
+def test_objective_universe_preserves_scope_and_release_gates(index_conn, ins):
+    ins(index_conn, "keep")
+    ins(index_conn, "held", hold_state="pending_review")
+    ins(index_conn, "excluded", project="private-client")
+    ins(index_conn, "other-source", source="claude")
+    ins(index_conn, "segmented", review_status="segmented")
+    ins(index_conn, "old", start_time="2026-05-01T00:00:00+00:00")
+
+    corpus = select_skill_candidates(
+        index_conn,
+        now=NOW,
+        sources=["codex"],
+        excluded_projects=["codex:private-client"],
+    )
+
+    assert corpus.objective_session_ids == ["keep"]
+
+
 def test_window_and_source_scope(index_conn, ins):
     ins(index_conn, "recent", fvs=4, learning="x", start_time="2026-05-28T00:00:00+00:00")
     ins(index_conn, "old", fvs=4, learning="x", start_time="2026-05-01T00:00:00+00:00")

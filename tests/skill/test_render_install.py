@@ -8,6 +8,14 @@ from clawjournal.skill.schema import SkillRule
 META = {"generated_at": "2026-06-30", "window_days": 7, "sources": 9}
 
 
+@pytest.fixture
+def agent_home(tmp_path, monkeypatch):
+    """Keep global Claude/Codex install tests inside the temporary directory."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    return tmp_path
+
+
 def _rule(kind="avoid", guidance="run the test suite first"):
     return SkillRule(kind=kind, trigger="before done", guidance=guidance, why="premature 4x")
 
@@ -361,11 +369,10 @@ def test_gate_rendered_blocks_trufflehog_scan_errors(monkeypatch):
     assert render.gate_rendered("ordinary text") == ["trufflehog: trufflehog-error"]
 
 
-def test_install_writes_and_overwrites(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_install_writes_and_overwrites(agent_home):
     md = render.render_skill_md([_rule()], META)
     p = install.install_claude(md)
-    assert p == tmp_path / ".claude" / "skills" / "clawjournal-lessons" / "SKILL.md"
+    assert p == agent_home / ".claude" / "skills" / "clawjournal-lessons" / "SKILL.md"
     assert p.read_text().startswith("---\nname: clawjournal-lessons")
     assert install.INTEGRITY_PREFIX in p.read_text()          # self-verifying, no sidecar
     assert not install.claude_skill_hash_path(p).exists()     # legacy sidecar retired
@@ -374,10 +381,9 @@ def test_install_writes_and_overwrites(tmp_path, monkeypatch):
     assert "updated rule" in p.read_text()
 
 
-def test_install_claude_backs_up_external_edit_and_regenerates(tmp_path, monkeypatch):
+def test_install_claude_backs_up_external_edit_and_regenerates(agent_home):
     # #8: a weekly-regenerated artifact must not brick on an external touch — the edit
     # is preserved in a .bak and the file is regenerated (not a hard refusal).
-    monkeypatch.setenv("HOME", str(tmp_path))
     p = install.install_claude(render.render_skill_md([_rule()], META))
     p.write_text(p.read_text() + "\nmanual edit\n", encoding="utf-8")     # external touch (append)
     install.install_claude(render.render_skill_md([_rule(guidance="updated rule")], META))
@@ -386,8 +392,7 @@ def test_install_claude_backs_up_external_edit_and_regenerates(tmp_path, monkeyp
     assert bak.exists() and "manual edit" in bak.read_text()              # user's copy preserved
 
 
-def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_install_claude_refuses_non_managed_existing_file(agent_home):
     p = install.claude_skill_path()
     p.parent.mkdir(parents=True)
     p.write_text("custom skill\n", encoding="utf-8")
@@ -396,10 +401,9 @@ def test_install_claude_refuses_non_managed_existing_file(tmp_path, monkeypatch)
         install.install_claude(render.render_skill_md([_rule()], META))
 
 
-def test_install_claude_backs_up_mid_body_edit(tmp_path, monkeypatch):
+def test_install_claude_backs_up_mid_body_edit(agent_home):
     # #2 + #8: a mid-body edit (integrity line intact at the end) is still detected by
     # the embedded hash — and preserved in .bak, not silently overwritten or refused.
-    monkeypatch.setenv("HOME", str(tmp_path))
     p = install.install_claude(render.render_skill_md([_rule()], META))
     p.write_text(p.read_text().replace("premature 4x", "REWORDED BY USER"), encoding="utf-8")
     install.install_claude(render.render_skill_md([_rule(guidance="v2")], META))
@@ -408,10 +412,9 @@ def test_install_claude_backs_up_mid_body_edit(tmp_path, monkeypatch):
     assert bak.exists() and "REWORDED BY USER" in bak.read_text()
 
 
-def test_install_claude_migrates_pre_integrity_file(tmp_path, monkeypatch):
+def test_install_claude_migrates_pre_integrity_file(agent_home):
     # #1: a managed file from before the embedded-hash change (provenance marker, no
     # integrity line, possibly a stale/absent sidecar) must regenerate, not brick.
-    monkeypatch.setenv("HOME", str(tmp_path))
     p = install.claude_skill_path()
     p.parent.mkdir(parents=True)
     p.write_text(render.render_skill_md([_rule()], META), encoding="utf-8")  # no integrity line
@@ -439,9 +442,8 @@ def test_upsert_region_escapes_inner_managed_markers():
     assert "<!-- clawjournal BEGIN marker escaped -->" in rendered
 
 
-def test_install_codex_managed_region_preserves_user_content(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    agents = tmp_path / ".codex" / "AGENTS.md"
+def test_install_codex_managed_region_preserves_user_content(agent_home):
+    agents = agent_home / ".codex" / "AGENTS.md"
     agents.parent.mkdir(parents=True)
     agents.write_text("# My project rules\n\nkeep this\n")
     region = render.render_agents_region([_rule()], META)

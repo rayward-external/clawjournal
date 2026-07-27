@@ -1,4 +1,4 @@
-"""Select skill candidates from the user's own *scored* sessions (Mode A).
+"""Select skill candidates and objective feedback sessions for Mode A.
 
 Two pools, all pure SQL/Python (no LLM):
   - **avoid** = recurring failure modes with real impact (the ``ai_failure_modes``
@@ -73,8 +73,11 @@ class SkillCorpus:
     total_successes: int = 0
     eligible_scored: int = 0   # scored sessions in the window (rate denominator)
     # every gated (hold-state + exclusion checked) scored session in the window —
-    # the scan universe for cross-session env-signature candidates (skill.turns)
+    # the judge-backed universe used by candidate attribution/focus selection
     eligible_session_ids: list[str] = field(default_factory=list)
+    # every gated session in the window, scored or not — the judge-independent scan
+    # universe for tool-error signatures and human rejections (skill.turns)
+    objective_session_ids: list[str] = field(default_factory=list)
     # OBJECTIVE feedback recurrence: {readable signal key -> distinct-session count}
     # for tool-error signatures + human rejections (skill.turns populates it). Judge-
     # free ground truth; snapshotted run-over-run for a verifiable improvement trend.
@@ -87,10 +90,15 @@ class SkillCorpus:
         return {m: n / self.eligible_scored for m, n in self.mode_recurrence.items()}
 
     def objective_rates(self) -> dict[str, float]:
-        """Per-objective-signal incidence rate over eligible scored sessions."""
-        if self.eligible_scored <= 0:
+        """Per-objective-signal incidence rate over all gated window sessions."""
+        denominator = self.objective_session_count
+        if denominator <= 0:
             return {}
-        return {k: n / self.eligible_scored for k, n in self.objective_recurrence.items()}
+        return {k: n / denominator for k, n in self.objective_recurrence.items()}
+
+    @property
+    def objective_session_count(self) -> int:
+        return len(self.objective_session_ids)
 
     @property
     def candidates(self) -> list[SkillCandidate]:
@@ -253,7 +261,7 @@ def select_skill_candidates(
     )
     succ_rows = [r for r in conn.execute(succ_sql, [window_floor, *src]).fetchall() if _keep(r)]
 
-    # eligible = the rate denominator; a SUPERSET of every session that can feed
+    # eligible = the judge-backed rate denominator; a SUPERSET of every session that can feed
     # mode_counter (the numerator), else a rate can exceed 100%. A candidate qualifies
     # by score, by outcome badge, or by failure_modes+recovery — so count any judge verdict.
     # Excluded projects are dropped here too (they're not candidates).
@@ -265,9 +273,17 @@ def select_skill_candidates(
     eligible_ids = [r["session_id"] for r in conn.execute(eligible_sql, [window_floor, *src]).fetchall()
                     if _keep(r)]
 
-    candidate_ids = [row["session_id"] for row in list(fail_rows) + list(succ_rows)]
-    # One hold-state gate pass over the union (candidates are a subset of eligible).
-    blocked_ids = _release_blocked_ids(conn, candidate_ids + eligible_ids, now=clock)
+    # Objective feedback is intentionally judge-independent. Its universe includes every
+    # session in the same time/source/project scope, whether or not the scoring budget has
+    # reached it. Run the hold-state gate once over this superset; judge candidates and
+    # eligible_ids are subsets, so the same blocked set protects both paths.
+    objective_sql = f"SELECT session_id, start_time, project, source {base}"
+    objective_ids = [
+        r["session_id"]
+        for r in conn.execute(objective_sql, [window_floor, *src]).fetchall()
+        if _keep(r)
+    ]
+    blocked_ids = _release_blocked_ids(conn, objective_ids, now=clock)
 
     mode_counter: Counter[str] = Counter()
     recovery_counter: Counter[str] = Counter()
@@ -361,6 +377,7 @@ def select_skill_candidates(
 
     # eligible_ids computed above; reuse the single blocked_ids pass (no second gate query).
     gated_eligible = [sid for sid in eligible_ids if sid not in blocked_ids]
+    gated_objective = [sid for sid in objective_ids if sid not in blocked_ids]
     eligible_scored = len(gated_eligible)
 
     def _ranked(candidates: list[SkillCandidate]) -> list[SkillCandidate]:
@@ -400,4 +417,5 @@ def select_skill_candidates(
         total_failures=len(failures), total_successes=len(successes),
         eligible_scored=eligible_scored,
         eligible_session_ids=gated_eligible,
+        objective_session_ids=gated_objective,
     )

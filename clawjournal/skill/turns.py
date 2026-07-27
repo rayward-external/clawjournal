@@ -331,8 +331,9 @@ def add_env_candidates(
     This is the judge-free evidence path: ``support_count`` is the number of
     DISTINCT sessions that hit the same normalized tool error — a real count the
     user can verify, not an AI-inferred failure mode. Scans only
-    ``corpus.eligible_session_ids`` (already hold-state + exclusion gated), so the
-    egress surface is identical to the rest of the corpus. Best-effort per session.
+    ``corpus.objective_session_ids`` (already hold-state + exclusion gated), including
+    unscored sessions so scoring budget cannot hide objective evidence. Best-effort per
+    session.
     """
     from .select import SkillCandidate, _candidate_rank, _recency_weight
 
@@ -340,7 +341,7 @@ def add_env_candidates(
         from ..workbench.index import get_session_detail
         loader = get_session_detail
     hits: dict[str, dict[str, Any]] = {}
-    for sid in getattr(corpus, "eligible_session_ids", []) or []:
+    for sid in getattr(corpus, "objective_session_ids", []) or []:
         try:
             detail = loader(conn, sid) or {}
             messages = detail.get("messages") or []
@@ -439,7 +440,8 @@ def add_rejection_candidate(
     human feedback the correction heuristic never sees. ``support_count`` is the
     number of distinct sessions containing at least one rejection (a real count).
     Excerpts render as pivotal_turns: agent_before = the attempted action,
-    user_correction = the rejection reason. Scans only the gated session ids.
+    user_correction = the rejection reason. Scans all gated window sessions regardless
+    of whether the judge has scored them.
     """
     from .select import SkillCandidate, _candidate_rank, _recency_weight
 
@@ -450,7 +452,7 @@ def add_rejection_candidate(
     reasons: Counter[str] = Counter()
     excerpts: list[TurnExcerpt] = []
     last_detail: dict[str, Any] = {}
-    for sid in getattr(corpus, "eligible_session_ids", []) or []:
+    for sid in getattr(corpus, "objective_session_ids", []) or []:
         try:
             detail = loader(conn, sid) or {}
             messages = detail.get("messages") or []
