@@ -189,7 +189,7 @@ def test_excerpts_for_session_puts_corrections_first_and_caps():
 def test_add_env_candidates_clusters_across_sessions():
     from clawjournal.skill.turns import add_env_candidates
     corpus = SkillCorpus(window_start="a", window_end="b",
-                         eligible_session_ids=["s1", "s2", "s3"])
+                         objective_session_ids=["s1", "s2", "s3"])
 
     def loader(conn, sid):
         return {"project": "p", "source": "claude", "start_time": "2026-07-01T00:00:00+00:00",
@@ -211,7 +211,7 @@ def test_add_env_candidates_clusters_across_sessions():
 def test_add_env_candidates_requires_min_recurrence():
     from clawjournal.skill.turns import add_env_candidates
     corpus = SkillCorpus(window_start="a", window_end="b",
-                         eligible_session_ids=["s1", "s2"])
+                         objective_session_ids=["s1", "s2"])
 
     def loader(conn, sid):
         return {"messages": [_at(_tu("Edit", "x", status="error",
@@ -270,7 +270,7 @@ def test_teammate_relays_are_not_corrections():
 def test_add_rejection_candidate_clusters_across_sessions():
     from clawjournal.skill.turns import add_rejection_candidate
     corpus = SkillCorpus(window_start="a", window_end="b",
-                         eligible_session_ids=["s1", "s2", "s3"])
+                         objective_session_ids=["s1", "s2", "s3"])
     denials = {
         "s1": "The user doesn't want to take this action right now. STOP what you are doing.",
         "s2": ("Permission for this action was denied by the Claude Code auto mode "
@@ -297,7 +297,7 @@ def test_add_rejection_candidate_clusters_across_sessions():
 def test_add_rejection_candidate_requires_min_recurrence():
     from clawjournal.skill.turns import add_rejection_candidate
     corpus = SkillCorpus(window_start="a", window_end="b",
-                         eligible_session_ids=["s1", "s2"])
+                         objective_session_ids=["s1", "s2"])
 
     def loader(conn, sid):
         return {"messages": [_at(_tu("Bash", "rm -rf x", status="error",
@@ -313,7 +313,7 @@ def test_synthetic_candidates_get_noncolliding_ids():
     # support across the shared alias.
     from clawjournal.skill.turns import add_env_candidates, add_rejection_candidate
     corpus = SkillCorpus(window_start="a", window_end="b",
-                         eligible_session_ids=["s1", "s2", "s3"])
+                         objective_session_ids=["s1", "s2", "s3"])
 
     def loader(conn, sid):
         return {"project": "p", "source": "claude", "start_time": "2026-07-01T00:00:00+00:00",
@@ -335,17 +335,22 @@ def test_synthetic_candidates_get_noncolliding_ids():
 
 def test_objective_recurrence_populated_for_trend():
     from clawjournal.skill.turns import add_env_candidates, add_rejection_candidate
-    corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
-                         eligible_session_ids=["s1", "s2", "s3"])
+    corpus = SkillCorpus(
+        window_start="a", window_end="b", eligible_scored=1,
+        objective_session_ids=[f"s{i}" for i in range(1, 11)],
+    )
 
     def loader(conn, sid):
+        messages = []
+        if sid in {"s1", "s2", "s3"}:
+            messages = [
+                _at(_tu("Edit", "x", status="error",
+                        output="String to replace not found in file.")),
+                _at(_tu("Bash", "git push", status="error",
+                        output="The user doesn't want to take this action right now.")),
+            ]
         return {"project": "p", "source": "claude", "start_time": "2026-07-01T00:00:00+00:00",
-                "messages": [
-                    _at(_tu("Edit", "x", status="error",
-                            output="String to replace not found in file.")),
-                    _at(_tu("Bash", "git push", status="error",
-                            output="The user doesn't want to take this action right now.")),
-                ]}
+                "messages": messages}
 
     add_env_candidates(None, corpus, loader=loader)
     add_rejection_candidate(None, corpus, loader=loader)
@@ -359,7 +364,7 @@ def test_objective_recurrence_records_below_teach_bar():
     # but must NOT become a taught candidate (bar is 3).
     from clawjournal.skill.turns import add_env_candidates
     corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
-                         eligible_session_ids=["s1", "s2"])
+                         objective_session_ids=["s1", "s2"])
 
     def loader(conn, sid):
         return {"messages": [_at(_tu("Edit", "x", status="error",
@@ -379,7 +384,7 @@ def test_newer_rejection_phrasing_is_human_not_env():
     assert _teachable_error({"output": {"text": msg}}) == ""   # not an env signal
 
     corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
-                         eligible_session_ids=["s1", "s2", "s3"])
+                         objective_session_ids=["s1", "s2", "s3"])
 
     def loader(conn, sid):
         return {"project": "p", "source": "codex", "start_time": "2026-07-01T00:00:00+00:00",

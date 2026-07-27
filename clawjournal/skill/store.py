@@ -169,10 +169,11 @@ def _ensure_snapshots(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS skill_mode_snapshots ("
         "recorded_at TEXT, n INTEGER, rates_json TEXT)"
     )
-    # Separate table (not an ALTER) so an older DB with no objective column can't break;
-    # same shape as the mode snapshot, holding objective-signal rates instead.
+    # The objective metric originally used scored sessions as its denominator. Keep the
+    # replacement in a new table so the first judge-independent run starts a clean
+    # baseline instead of comparing incompatible rate definitions.
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS skill_objective_snapshots ("
+        "CREATE TABLE IF NOT EXISTS skill_objective_session_snapshots ("
         "recorded_at TEXT, n INTEGER, rates_json TEXT)"
     )
     conn.commit()
@@ -215,7 +216,8 @@ def save_objective_snapshot(conn: sqlite3.Connection, rates: dict[str, float], n
     """Record the window's objective-signal incidence rates (run-over-run trend)."""
     _ensure_snapshots(conn)
     conn.execute(
-        "INSERT INTO skill_objective_snapshots (recorded_at, n, rates_json) VALUES (?,?,?)",
+        "INSERT INTO skill_objective_session_snapshots "
+        "(recorded_at, n, rates_json) VALUES (?,?,?)",
         (now or now_iso(), int(n), json.dumps(rates)),
     )
     conn.commit()
@@ -223,7 +225,7 @@ def save_objective_snapshot(conn: sqlite3.Connection, rates: dict[str, float], n
 
 def last_objective_snapshot(conn: sqlite3.Connection) -> tuple[str, int, dict[str, float]] | None:
     """Return the most recent (recorded_at, n, rates) objective snapshot, or None."""
-    return _read_last_snapshot(conn, "skill_objective_snapshots")
+    return _read_last_snapshot(conn, "skill_objective_session_snapshots")
 
 
 def reject(conn: sqlite3.Connection, fp: str, *, now: str | None = None) -> bool:

@@ -678,9 +678,9 @@ def _print_preview(res: SkillResult) -> None:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {mode}: {prev:.0%} → {cur:.0%}  ({arrow})"))
     if res.objective_trend:
-        n = res.corpus.eligible_scored
-        print(_ascii_safe("\n  Objective feedback recurrence vs your last run "
-                          "(tool errors + rejections per scored session — verifiable, not judge-inferred):"))
+        n = res.corpus.objective_session_count
+        print(_ascii_safe(f"\n  Objective feedback recurrence vs your last run "
+                          f"(rate over {n} gated session(s) — verifiable, not judge-inferred):"))
         # most-recurrent first; cap so a long tail of rare signatures doesn't flood output
         ordered = sorted(res.objective_trend.items(),
                          key=lambda kv: -max(kv[1][0] or 0.0, kv[1][1]))[:6]
@@ -851,13 +851,14 @@ def run_skill(args) -> None:
             # Worst case the next run re-labels these rules [NEW]; the install is safe.
             try:
                 _store.mark_installed(conn, res.rules)  # upserts + marks 'kept'
-                # Only snapshot when the window actually had scored sessions — an idle
-                # run (empty corpus but kept rules re-proposed) must NOT overwrite the
-                # last real snapshot with an empty one (would reset the run-over-run trend).
+                # Judge-backed and objective telemetry have independent universes. An
+                # idle universe must not overwrite its last real snapshot with an empty
+                # one, while unscored objective evidence must still be persisted.
                 if res.corpus.eligible_scored > 0:
                     _store.save_mode_snapshot(conn, res.corpus.mode_rates(), res.corpus.eligible_scored)
+                if res.corpus.objective_session_count > 0:
                     _store.save_objective_snapshot(conn, res.corpus.objective_rates(),
-                                                   res.corpus.eligible_scored)
+                                                   res.corpus.objective_session_count)
             except Exception as exc:
                 print(f"note: installed to disk, but failed to record state "
                       f"({exc.__class__.__name__}); the next run may re-propose these rules.")

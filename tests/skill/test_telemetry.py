@@ -27,6 +27,18 @@ def test_eligible_denominator_and_rate(index_conn, ins):
     assert abs(corpus.mode_rates()["verification_skipped"] - 0.5) < 1e-9
 
 
+def test_objective_rate_uses_all_gated_sessions_not_scored_subset(index_conn, ins):
+    ins(index_conn, "scored", fvs=5, learning="x")
+    for i in range(3):
+        ins(index_conn, f"unscored-{i}")
+    corpus = select_skill_candidates(index_conn, now=NOW)
+    corpus.objective_recurrence["tool error"] = 2
+
+    assert corpus.eligible_scored == 1
+    assert corpus.objective_session_count == 4
+    assert abs(corpus.objective_rates()["tool error"] - 0.5) < 1e-9
+
+
 def test_snapshot_round_trip(index_conn):
     store.save_mode_snapshot(index_conn, {"verification_skipped": 0.9}, 20)
     last = store.last_mode_snapshot(index_conn)
@@ -59,13 +71,27 @@ def test_objective_snapshot_round_trip(index_conn):
     assert n == 15 and abs(rates["user-rejected actions"] - 0.2) < 1e-9
 
 
+def test_legacy_scored_denominator_objective_snapshot_is_not_reused(index_conn):
+    index_conn.execute(
+        "CREATE TABLE skill_objective_snapshots "
+        "(recorded_at TEXT, n INTEGER, rates_json TEXT)"
+    )
+    index_conn.execute(
+        "INSERT INTO skill_objective_snapshots VALUES (?,?,?)",
+        ("2026-05-30T00:00:00+00:00", 10, '{"tool error": 0.9}'),
+    )
+    index_conn.commit()
+
+    assert store.last_objective_snapshot(index_conn) is None
+
+
 def test_generate_reports_objective_trend(index_conn, ins, monkeypatch):
     store.save_objective_snapshot(index_conn, {"user-rejected actions": 0.40}, 20)   # prior run
     for i in range(12):
         ins(index_conn, f"ok{i}", quality=5, outcome="resolved", learning="y")
     # `ins` seeds no message blobs, so inject a known objective signal directly
     def fake_env(conn, corpus, **kw):
-        corpus.objective_recurrence["user-rejected actions"] = 3   # 3 of 12 scored = 25%
+        corpus.objective_recurrence["user-rejected actions"] = 3   # 3 of 12 gated = 25%
     monkeypatch.setattr("clawjournal.cli_skill._turns.add_env_candidates", fake_env)
     monkeypatch.setattr("clawjournal.cli_skill._turns.add_rejection_candidate", lambda *a, **k: None)
     fake = FakeCaller({"rules": [
