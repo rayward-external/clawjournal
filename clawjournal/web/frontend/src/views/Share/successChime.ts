@@ -1,5 +1,5 @@
 const SUCCESS_SOUND_URL = '/sounds/submission-success.mp3';
-const SUCCESS_CHIME_VOLUME = 0.25;
+const SUCCESS_CHIME_VOLUME = 0.15;
 const SUCCESS_CHIME_DURATION_MS = 900;
 
 let successSound: HTMLAudioElement | null = null;

@@ -62,7 +62,7 @@ describe('success sound', () => {
     expect(sound.play).toHaveBeenCalledOnce();
     expect(sound.currentTime).toBe(0);
     expect(sound.loop).toBe(false);
-    expect(sound.volume).toBe(0.25);
+    expect(sound.volume).toBe(0.15);
 
     vi.advanceTimersByTime(900);
     expect(sound.pause).not.toHaveBeenCalled();
@@ -99,7 +99,7 @@ describe('success sound', () => {
     expect(sound.pause).toHaveBeenCalledOnce();
     expect(sound.currentTime).toBe(0);
     expect(sound.loop).toBe(false);
-    expect(sound.volume).toBe(0.25);
+    expect(sound.volume).toBe(0.15);
   });
 
   it('does not restart playback after cancellation wins a priming race', async () => {
