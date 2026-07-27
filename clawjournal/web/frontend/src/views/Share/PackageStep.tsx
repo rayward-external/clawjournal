@@ -108,7 +108,7 @@ export function PackageStep(p: PackageStepProps) {
             ? p.missingScanners
               ? 'A required local secret scanner is missing.'
               : p.failed
-            : <>Compressing {p.approvedCount} approved trace{p.approvedCount === 1 ? '' : 's'} into a single redacted zip.</>}
+            : <>Preparing {p.approvedCount} approved trace{p.approvedCount === 1 ? '' : 's'} through local redaction, PII review, secret scans, and one ZIP finalization.</>}
         </p>
         <div style={{
           width: 260, margin: '0 auto 16px', height: 4,

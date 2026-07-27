@@ -27,6 +27,17 @@ function renderMissingScanners(overrides: Partial<React.ComponentProps<typeof Pa
 }
 
 describe('PackageStep scanner recovery', () => {
+  it('describes the real local packaging stages', () => {
+    renderMissingScanners({
+      failed: null,
+      missingScanners: false,
+      log: 'Running the final secret scan...',
+    });
+
+    expect(screen.getByText(/local redaction, PII review, secret scans, and one ZIP finalization/)).toBeInTheDocument();
+    expect(screen.getByText('Running the final secret scan...')).toBeInTheDocument();
+  });
+
   it('offers a local managed install and retry when preflight reports a missing scanner', () => {
     const { onInstallScannersAndRetry } = renderMissingScanners();
 

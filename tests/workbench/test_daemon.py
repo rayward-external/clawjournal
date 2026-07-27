@@ -25,6 +25,7 @@ from clawjournal.workbench.daemon import (
     _SHARE_COOLDOWN_SECONDS,
     _apply_upload_pii_redactions,
     _build_share_zip,
+    _finalized_share_zip,
     _reload_child_command,
     _missing_ingest_url_error,
     _next_scan_delay,
@@ -1639,6 +1640,35 @@ class TestScanner:
             json.loads(manifest_path.read_text(encoding="utf-8"))["export_path"]
             == sentinel
         )
+
+    def test_finalized_share_zip_reuses_and_invalidates_cached_bytes(self, tmp_path):
+        (tmp_path / "sessions.jsonl").write_text('{"value":1}\n', encoding="utf-8")
+        (tmp_path / "manifest.json").write_text(
+            json.dumps({"share_id": "share-1", "session_count": 1}),
+            encoding="utf-8",
+        )
+        (tmp_path / "trufflehog.post-pii.json").write_text("{}\n", encoding="utf-8")
+        (tmp_path / "secret-scan.post-pii.json").write_text("{}\n", encoding="utf-8")
+
+        first_path, first_reused = _finalized_share_zip(tmp_path)
+        first_bytes = first_path.read_bytes()
+        first_mtime = first_path.stat().st_mtime_ns
+
+        second_path, second_reused = _finalized_share_zip(tmp_path)
+        assert second_path == first_path
+        assert second_reused is True
+        assert first_reused is False
+        assert second_path.stat().st_mtime_ns == first_mtime
+
+        (tmp_path / "sessions.jsonl").write_text(
+            '{"value":2,"changed":true}\n',
+            encoding="utf-8",
+        )
+        third_path, third_reused = _finalized_share_zip(tmp_path)
+        assert third_reused is False
+        assert third_path.read_bytes() != first_bytes
+        with zipfile.ZipFile(third_path) as archive:
+            assert b'"changed":true' in archive.read("sessions.jsonl")
 
     def test_strict_scan_fails_when_enrolled_source_is_not_discovered(
         self, tmp_path, monkeypatch
@@ -4921,6 +4951,14 @@ class TestShareAPI:
         share_id = self._create_and_export_share(server)
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
 
+        status, sealed = _post(
+            server,
+            f"/api/shares/{share_id}/seal",
+            {"ai_pii": False},
+        )
+        assert status == 200
+        assert sealed["packaging"]["zip_reused"] is False
+
         def assert_zip(req):
             body = req.data
             assert b'name="sessions"' not in body
@@ -4947,6 +4985,7 @@ class TestShareAPI:
 
         assert status == 200
         assert data["receipt_id"] == "rcpt-test-123"
+        assert data["zip_reused"] is True
 
     def _seed_released_session(self, session_id, content):
         """Upsert a single session containing `content` and release it so the
@@ -5383,12 +5422,31 @@ class TestShareAPI:
         assert data["ok"] is True
         assert data["redaction_summary"]["pii_review"]["ai_enabled"] is True
         assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert data["packaging"]["stage"] == "done"
+        assert data["packaging"]["progress"] == 100
+        assert data["packaging"]["zip_reused"] is False
+        assert {
+            "scanner_setup",
+            "export_and_initial_scan",
+            "pii_review",
+            "post_pii_secret_scan",
+            "zip_finalize",
+            "total",
+        }.issubset(data["packaging"]["timings_ms"])
         assert calls == 1
+
+        status, package_status = _get(
+            server,
+            f"/api/shares/{share_id}/package-status",
+        )
+        assert status == 200
+        assert package_status == data["packaging"]
 
         status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
         assert status == 200
         assert data["ok"] is True
         assert data["redaction_summary"]["pii_review"]["finding_count"] == 1
+        assert data["packaging"]["zip_reused"] is True
         assert calls == 1
 
         status, content_type, body = _get_raw(server, f"/api/shares/{share_id}/download")
@@ -5511,11 +5569,13 @@ class TestShareAPI:
         # First seal: no custom redaction strings configured.
         status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
         assert status == 200
+        assert data["packaging"]["zip_reused"] is False
         assert calls == 1
 
         # Re-seal with identical settings reuses the cache (no rebuild).
         status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
         assert status == 200
+        assert data["packaging"]["zip_reused"] is True
         assert calls == 1
 
         # Prove the cached export is genuinely stale once the setting changes:
@@ -5535,6 +5595,7 @@ class TestShareAPI:
 
         status, data = _post(server, f"/api/shares/{share_id}/seal", {"ai_pii": True})
         assert status == 200
+        assert data["packaging"]["zip_reused"] is False
         # Cache invalidated by the settings change → the export was rebuilt.
         assert calls == 2
 
