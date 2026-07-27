@@ -4374,6 +4374,72 @@ def create_share(
     return share_id
 
 
+def synchronize_share_predecessors(
+    conn: sqlite3.Connection,
+    share_id: str,
+    *,
+    expected_revisions: Mapping[str, str],
+    required_predecessors: Mapping[str, str | None],
+) -> int:
+    """Bind an unsubmitted share to receiver-authoritative predecessors.
+
+    The hosted preflight is advisory; this local write is guarded by the exact
+    create-time content revisions, and the server still repeats its
+    compare-and-set during upload.
+    """
+    started_transaction = not conn.in_transaction
+    if started_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        share = conn.execute(
+            "SELECT shared_at, hosted_receipt_id FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        if share is None:
+            raise ValueError("Share not found")
+        if share["shared_at"] is not None or share["hosted_receipt_id"] is not None:
+            raise ValueError("Submitted shares cannot change predecessor claims")
+
+        rows = conn.execute(
+            "SELECT session_id, content_revision, replaces_revision "
+            "FROM share_sessions WHERE share_id = ? ORDER BY session_id",
+            (share_id,),
+        ).fetchall()
+        found_ids = {str(row["session_id"]) for row in rows}
+        if found_ids != set(expected_revisions) or found_ids != set(required_predecessors):
+            raise RevisionConflictError([{
+                "session_id": session_id,
+                "expected_revision_hash": expected_revisions.get(session_id),
+                "current_revision_hash": None,
+            } for session_id in sorted(
+                found_ids | set(expected_revisions) | set(required_predecessors)
+            )])
+
+        changed = 0
+        for row in rows:
+            session_id = str(row["session_id"])
+            if row["content_revision"] != expected_revisions[session_id]:
+                raise RevisionConflictError([{
+                    "session_id": session_id,
+                    "expected_revision_hash": expected_revisions[session_id],
+                    "current_revision_hash": row["content_revision"],
+                }])
+            required = required_predecessors[session_id]
+            if row["replaces_revision"] == required:
+                continue
+            conn.execute(
+                "UPDATE share_sessions SET replaces_revision = ? "
+                "WHERE share_id = ? AND session_id = ? AND content_revision = ?",
+                (required, share_id, session_id, expected_revisions[session_id]),
+            )
+            changed += 1
+        conn.commit()
+        return changed
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def share_revision_blockers(
     conn: sqlite3.Connection,
     share_id: str,
@@ -5176,6 +5242,8 @@ def already_shared_revision_blockers(
 def share_predecessor_blockers(
     conn: sqlite3.Connection,
     share_id: str,
+    *,
+    accepted_predecessors: Mapping[str, str | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Return packaged replacements based on a stale uploaded predecessor.
 
@@ -5202,6 +5270,12 @@ def share_predecessor_blockers(
         if latest == row["content_revision"]:
             reason = "already_shared_revision"
         elif latest == row["replaces_revision"]:
+            continue
+        elif (
+            accepted_predecessors is not None
+            and row["session_id"] in accepted_predecessors
+            and accepted_predecessors[row["session_id"]] == row["replaces_revision"]
+        ):
             continue
         else:
             reason = "stale_predecessor"

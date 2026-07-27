@@ -3226,10 +3226,16 @@ class TestRunServerPortFallback:
         mock_open.assert_called_once_with("http://localhost:9999/")
 
 
-def _mock_urlopen_factory(upload_response=None, upload_error=None, upload_assert=None, capabilities=None):
+def _mock_urlopen_factory(
+    upload_response=None,
+    upload_error=None,
+    upload_assert=None,
+    capabilities=None,
+    lineage_preflight=None,
+):
     """Create a mock urlopen that handles the hosted research API."""
     upload_resp = upload_response or {"receipt_id": "rcpt-test-123", "status": "received"}
-    cap_resp = capabilities or {
+    cap_resp = dict(capabilities or {
         "submissions_open": True,
         "preferred_upload_flow": "browser_zip",
         "cli_ingest_supported": False,
@@ -3240,7 +3246,12 @@ def _mock_urlopen_factory(upload_response=None, upload_error=None, upload_assert
         "supported_institution_email_policy": {"domain_suffixes": [".edu", "rayward.ai"]},
         "contact_email": "contact@example.test",
         "cache_seconds": 0,
-    }
+    })
+    if lineage_preflight is not None:
+        cap_resp.setdefault(
+            "manual_lineage_preflight_url",
+            "/api/manual-lineage-preflight",
+        )
 
     def _resp(payload):
         resp = MagicMock()
@@ -3271,6 +3282,16 @@ def _mock_urlopen_factory(upload_response=None, upload_error=None, upload_assert
                 "verification_id": "verify-123",
                 "expires_at": "2026-01-01T00:00:00+00:00",
             })
+        if "/api/manual-lineage-preflight" in url:
+            if lineage_preflight is None:
+                raise ValueError("Unexpected lineage preflight request")
+            request_payload = json.loads(req.data.decode("utf-8"))
+            response_payload = (
+                lineage_preflight(request_payload)
+                if callable(lineage_preflight)
+                else lineage_preflight
+            )
+            return _resp(response_payload)
         if "/api/submissions" in url:
             if upload_assert is not None:
                 upload_assert(req)
@@ -3291,6 +3312,21 @@ def _share_config(**overrides):
     }
     config.update(overrides)
     return config
+
+
+def test_manual_lineage_preflight_must_stay_on_hosted_origin(monkeypatch):
+    from clawjournal.workbench import daemon
+
+    monkeypatch.setattr(
+        daemon,
+        "_HOSTED_SHARE_URL",
+        "https://hosted.example.test/share",
+    )
+
+    with pytest.raises(ValueError, match="configured origin"):
+        daemon._manual_lineage_preflight_url({
+            "manual_lineage_preflight_url": "https://attacker.example/api/preflight",
+        })
 
 
 def _mock_trufflehog_clean(monkeypatch):
@@ -4706,6 +4742,201 @@ class TestShareAPI:
 
         assert status == 409
         assert data["blockers"][0]["reason"] == "stale_predecessor"
+
+    def test_hosted_upload_rebases_to_receiver_head_and_repackages(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench.index import (
+            create_share,
+            get_share,
+            open_index,
+            update_session,
+        )
+
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "continued-hosted-session"
+        self._seed_released_session(session_id, "first locally shared revision")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            first_share = create_share(conn, [session_id])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", first_share),
+            )
+            conn.commit()
+            local_predecessor = conn.execute(
+                "SELECT content_revision FROM share_sessions WHERE share_id = ?",
+                (first_share,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self._seed_released_session(session_id, "continued work after first upload")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            share_id = create_share(conn, [session_id])
+            share = get_share(conn, share_id)
+            assert share is not None
+            current_revision = share["sessions"][0]["share_content_revision"]
+            assert share["sessions"][0]["share_replaces_revision"] == local_predecessor
+        finally:
+            conn.close()
+
+        status, exported = _post(server, f"/api/shares/{share_id}/export")
+        assert status == 200, exported
+
+        receiver_head = "sha256:" + ("b" * 64)
+        preflight_claims = []
+
+        def lineage_preflight(payload):
+            assert payload["upload_token"] == "test-upload-token"
+            assert len(payload["sessions"]) == 1
+            claim = payload["sessions"][0]
+            preflight_claims.append(dict(claim))
+            assert claim["session_id"] == session_id
+            assert claim["revision_hash"] == current_revision
+            ready = claim["replaces_revision_hash"] == receiver_head
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": session_id,
+                    "status": "ready" if ready else "rebase_required",
+                    "current_head_revision_hash": receiver_head,
+                    "current_head_accepted_at": "2026-07-02T00:00:00+00:00",
+                    "required_replaces_revision_hash": receiver_head,
+                }],
+            }
+
+        captured = {}
+
+        def assert_zip(req):
+            captured["manifest"] = self._manifest_from_upload(req)
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=assert_zip,
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 200, data
+        assert [
+            claim["replaces_revision_hash"] for claim in preflight_claims
+        ] == [local_predecessor, receiver_head]
+        uploaded_session = next(
+            item
+            for item in captured["manifest"]["sessions"]
+            if item["session_id"] == session_id
+        )
+        assert uploaded_session["replaces_revision_hash"] == receiver_head
+        conn = open_index()
+        try:
+            stored = conn.execute(
+                "SELECT replaces_revision FROM share_sessions WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert stored == receiver_head
+
+    def test_hosted_upload_does_not_rebase_draft_older_than_receiver_head(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench.index import create_share, open_index, update_session
+
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "stale-hosted-draft"
+        self._seed_released_session(session_id, "draft created before remote update")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            share_id = create_share(conn, [session_id])
+        finally:
+            conn.close()
+
+        receiver_head = "sha256:" + ("c" * 64)
+
+        def lineage_preflight(payload):
+            claim = payload["sessions"][0]
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": session_id,
+                    "status": "rebase_required",
+                    "current_head_revision_hash": receiver_head,
+                    "current_head_accepted_at": "2099-01-01T00:00:00+00:00",
+                    "required_replaces_revision_hash": receiver_head,
+                }],
+            }
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=lambda _req: pytest.fail("stale draft uploaded"),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 409
+        assert "created before another revision" in data["error"]
+
+    def test_hosted_lineage_sync_revision_conflict_returns_409(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench import daemon
+        from clawjournal.workbench.index import RevisionConflictError
+
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        blocker = {
+            "session_id": "sess-0",
+            "expected_revision_hash": "sha256:old",
+            "current_revision_hash": "sha256:new",
+        }
+
+        def fail_sync(*_args, **_kwargs):
+            raise RevisionConflictError([blocker])
+
+        monkeypatch.setattr(
+            daemon,
+            "_synchronize_manual_share_lineage",
+            fail_sync,
+        )
+        monkeypatch.setattr(daemon, "load_config", lambda: _share_config())
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(lineage_preflight={}),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 409
+        assert data["blocked_sessions"] == [blocker]
 
     def test_duplicate_receipt_returned_even_without_valid_token(self, server, monkeypatch):
         """Receipt hydration/retry should not require a still-valid upload token."""

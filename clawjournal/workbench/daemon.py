@@ -25,7 +25,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from .. import __version__
 from ..auto_upload_client import (
@@ -91,6 +91,7 @@ from .index import (
     share_predecessor_blockers,
     share_revision_blockers,
     source_scope_blockers,
+    synchronize_share_predecessors,
     update_session,
     upsert_sessions,
 )
@@ -1524,6 +1525,155 @@ def _fetch_hosted_share_capabilities(*, force: bool = False) -> dict[str, Any]:
     return capabilities
 
 
+def _manual_lineage_preflight_url(
+    capabilities: dict[str, Any],
+) -> str | None:
+    advertised = capabilities.get("manual_lineage_preflight_url")
+    if not isinstance(advertised, str) or not advertised.strip():
+        return None
+    api_base = _hosted_api_base()
+    resolved = urljoin(f"{api_base}/", advertised.strip())
+    if comparable_origin(resolved) != comparable_origin(api_base):
+        raise ValueError("Hosted lineage preflight must use the configured origin.")
+    return resolved
+
+
+def _manual_share_lineage_claims(share: dict[str, Any]) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    for session in share.get("sessions") or []:
+        session_id = session.get("session_id")
+        revision_hash = session.get("share_content_revision")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("Share contains an invalid session identity.")
+        if not isinstance(revision_hash, str) or not revision_hash:
+            raise ValueError("Share contains a session without a revision identity.")
+        predecessor = session.get("share_replaces_revision")
+        if predecessor is not None and not isinstance(predecessor, str):
+            raise ValueError("Share contains an invalid predecessor identity.")
+        claims.append({
+            "session_id": session_id,
+            "revision_hash": revision_hash,
+            "replaces_revision_hash": predecessor,
+        })
+    if not claims:
+        raise ValueError("Share contains no session lineage claims.")
+    return claims
+
+
+def _synchronize_manual_share_lineage(
+    conn: sqlite3.Connection,
+    *,
+    share_id: str,
+    share: dict[str, Any],
+    upload_token: str,
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    preflight_url = _manual_lineage_preflight_url(capabilities)
+    if preflight_url is None:
+        return {
+            "supported": False,
+            "changed": False,
+            "accepted_predecessors": None,
+        }
+
+    claims = _manual_share_lineage_claims(share)
+    response = _json_request(
+        preflight_url,
+        method="POST",
+        payload={"upload_token": upload_token, "sessions": claims},
+        timeout=30,
+    )
+    rows = response.get("sessions")
+    if not isinstance(rows, list):
+        raise ValueError("Hosted lineage preflight returned no session results.")
+
+    expected_revisions = {
+        str(claim["session_id"]): str(claim["revision_hash"])
+        for claim in claims
+    }
+    local_predecessors = {
+        str(claim["session_id"]): claim.get("replaces_revision_hash")
+        for claim in claims
+    }
+    required_predecessors: dict[str, str | None] = {}
+    head_accepted_at: dict[str, str | None] = {}
+    statuses: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Hosted lineage preflight returned an invalid result.")
+        session_id = row.get("session_id")
+        status = row.get("status")
+        required = row.get("required_replaces_revision_hash")
+        accepted_at = row.get("current_head_accepted_at")
+        if (
+            not isinstance(session_id, str)
+            or session_id not in expected_revisions
+            or session_id in statuses
+            or status not in {"ready", "rebase_required", "stale_revision"}
+            or (required is not None and not isinstance(required, str))
+            or (accepted_at is not None and not isinstance(accepted_at, str))
+        ):
+            raise ValueError("Hosted lineage preflight returned an invalid result.")
+        statuses[session_id] = status
+        required_predecessors[session_id] = required
+        head_accepted_at[session_id] = accepted_at
+    if set(statuses) != set(expected_revisions):
+        raise ValueError("Hosted lineage preflight returned incomplete results.")
+
+    stale_ids = sorted(
+        session_id
+        for session_id, status in statuses.items()
+        if status == "stale_revision"
+    )
+    if stale_ids:
+        return {
+            "supported": True,
+            "error": (
+                "The hosted service already has a newer revision of this trace. "
+                "Review the latest local trace and create a new share."
+            ),
+            "status": 409,
+            "blocked_sessions": stale_ids,
+        }
+
+    share_created_at = _expiry_timestamp(share.get("created_at"))
+    for session_id, status in statuses.items():
+        if status != "rebase_required":
+            continue
+        receiver_accepted_at = _expiry_timestamp(head_accepted_at[session_id])
+        if (
+            share_created_at is None
+            or receiver_accepted_at is None
+            or share_created_at <= receiver_accepted_at
+        ):
+            return {
+                "supported": True,
+                "error": (
+                    "This package was created before another revision reached the "
+                    "hosted service. Review the latest trace and create a new share."
+                ),
+                "status": 409,
+                "blocked_sessions": [session_id],
+            }
+
+    changed = any(
+        local_predecessors[session_id] != required
+        for session_id, required in required_predecessors.items()
+    )
+    if changed:
+        synchronize_share_predecessors(
+            conn,
+            share_id,
+            expected_revisions=expected_revisions,
+            required_predecessors=required_predecessors,
+        )
+    return {
+        "supported": True,
+        "changed": changed,
+        "accepted_predecessors": required_predecessors,
+    }
+
+
 def _recurring_offer_available(capabilities: dict[str, Any]) -> bool:
     """Return whether the live capability document offers this protocol."""
 
@@ -2351,6 +2501,7 @@ def _load_finalized_share_export(
     ai_pii: bool | None = None,
     ai_backend: str | None = None,
     expected_fingerprint: str | None = None,
+    expected_lineage: dict[str, tuple[str, str | None]] | None = None,
 ) -> tuple[Path, dict[str, Any]] | None:
     # Finalized exports are point-in-time artifacts: a later config change
     # creates a new share/seal operation rather than mutating this cached zip.
@@ -2386,6 +2537,27 @@ def _load_finalized_share_export(
         return None
     if manifest.get("share_id") != share_id and manifest.get("bundle_id") != share_id:
         return None
+    if expected_lineage is not None:
+        manifest_sessions = manifest.get("sessions")
+        if not isinstance(manifest_sessions, list):
+            return None
+        manifest_lineage: dict[str, tuple[str, str | None]] = {}
+        for item in manifest_sessions:
+            if not isinstance(item, dict):
+                return None
+            session_id = item.get("session_id")
+            revision_hash = item.get("revision_hash")
+            predecessor = item.get("replaces_revision_hash")
+            if (
+                not isinstance(session_id, str)
+                or not isinstance(revision_hash, str)
+                or (predecessor is not None and not isinstance(predecessor, str))
+                or session_id in manifest_lineage
+            ):
+                return None
+            manifest_lineage[session_id] = (revision_hash, predecessor)
+        if manifest_lineage != expected_lineage:
+            return None
     if not _manifest_is_finalized_for_upload(
         manifest,
         ai_pii=ai_pii,
@@ -2429,6 +2601,14 @@ def _prepare_share_export_for_upload(
             "status": 409,
         }
     settings_fingerprint = _redaction_settings_fingerprint(settings)
+    expected_lineage = {
+        str(session["session_id"]): (
+            str(session["share_content_revision"]),
+            session.get("share_replaces_revision"),
+        )
+        for session in share.get("sessions") or []
+        if session.get("session_id") and session.get("share_content_revision")
+    }
     if reuse_finalized:
         # Pass the RAW override (not effective_ai_pii) on purpose: a finalized
         # export is a point-in-time artifact. With an explicit ai_pii override
@@ -2443,6 +2623,7 @@ def _prepare_share_export_for_upload(
             ai_pii=ai_pii_review_enabled,
             ai_backend=(ai_pii_backend if ai_pii_review_enabled else None),
             expected_fingerprint=settings_fingerprint,
+            expected_lineage=expected_lineage,
         )
         if cached is not None:
             export_dir, manifest = cached
@@ -2509,6 +2690,8 @@ def _final_manual_share_egress_gate(
     share_id: str,
     session_ids: list[str],
     source_filter: str | list[str] | tuple[str, ...] | None,
+    *,
+    accepted_predecessors: dict[str, str | None] | None = None,
 ) -> dict[str, Any] | None:
     """Re-check mutable share gates immediately before manual upload egress."""
     release_blockers = release_gate_blockers(conn, session_ids)
@@ -2541,7 +2724,11 @@ def _final_manual_share_egress_gate(
     # share in the same revision chain lands first), so re-check it here too —
     # otherwise a stale-predecessor duplicate that #109 added this gate to
     # refuse could still cross egress.
-    predecessor_blockers = share_predecessor_blockers(conn, share_id)
+    predecessor_blockers = share_predecessor_blockers(
+        conn,
+        share_id,
+        accepted_predecessors=accepted_predecessors,
+    )
     if predecessor_blockers:
         return {
             "error": "Share revisions are duplicate or based on a stale predecessor",
@@ -2862,7 +3049,6 @@ def submit_share_to_hosted(
             "blockers": predecessor_blockers,
             "status": 409,
         }
-
     try:
         _verified_email, upload_token = _ensure_hosted_upload_token()
     except RuntimeError as exc:
@@ -2879,16 +3065,106 @@ def submit_share_to_hosted(
             "status": 403,
         }
 
-    export_dir, manifest, error = _prepare_share_export_for_upload(
-        conn,
-        share_id,
-        share,
-        settings,
-        reuse_finalized=True,
-        ai_pii_review_enabled=ai_pii_review_enabled,
-    )
-    if error:
-        return error
+    export_dir: Path | None = None
+    manifest: dict[str, Any] = {}
+    accepted_predecessors: dict[str, str | None] | None = None
+    for synchronization_attempt in range(2):
+        try:
+            lineage = _synchronize_manual_share_lineage(
+                conn,
+                share_id=share_id,
+                share=share,
+                upload_token=upload_token,
+                capabilities=capabilities,
+            )
+        except urllib.error.HTTPError as exc:
+            return _hosted_http_error_result(exc)
+        except RevisionConflictError as exc:
+            return {
+                "error": "Trace revisions changed while synchronizing the hosted predecessor.",
+                "blocked_sessions": exc.blockers,
+                "status": 409,
+            }
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+            return {
+                "error": f"Could not verify the hosted trace revision: {exc}",
+                "status": 502,
+            }
+        if lineage.get("error"):
+            return lineage
+        if lineage.get("changed"):
+            refreshed_share = get_share(conn, share_id)
+            if refreshed_share is None:
+                return {"error": "Share not found", "status": 404}
+            share = refreshed_share
+            session_ids = [s["session_id"] for s in share.get("sessions") or []]
+
+        accepted_predecessors = lineage.get("accepted_predecessors")
+        predecessor_blockers = share_predecessor_blockers(
+            conn,
+            share_id,
+            accepted_predecessors=accepted_predecessors,
+        )
+        if predecessor_blockers:
+            return {
+                "error": "Share revisions are duplicate or based on a stale predecessor",
+                "blockers": predecessor_blockers,
+                "status": 409,
+            }
+
+        export_dir, manifest, error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+            ai_pii_review_enabled=ai_pii_review_enabled,
+        )
+        if error:
+            return error
+        if export_dir is None:
+            return {"error": "Failed to prepare upload zip", "status": 500}
+        if not lineage.get("supported"):
+            break
+
+        try:
+            final_lineage = _synchronize_manual_share_lineage(
+                conn,
+                share_id=share_id,
+                share=share,
+                upload_token=upload_token,
+                capabilities=capabilities,
+            )
+        except urllib.error.HTTPError as exc:
+            return _hosted_http_error_result(exc)
+        except RevisionConflictError as exc:
+            return {
+                "error": "Trace revisions changed while rechecking the hosted predecessor.",
+                "blocked_sessions": exc.blockers,
+                "status": 409,
+            }
+        except (OSError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+            return {
+                "error": f"Could not recheck the hosted trace revision: {exc}",
+                "status": 502,
+            }
+        if final_lineage.get("error"):
+            return final_lineage
+        accepted_predecessors = final_lineage.get("accepted_predecessors")
+        if not final_lineage.get("changed"):
+            break
+        refreshed_share = get_share(conn, share_id)
+        if refreshed_share is None:
+            return {"error": "Share not found", "status": 404}
+        share = refreshed_share
+        if synchronization_attempt == 1:
+            return {
+                "error": (
+                    "The hosted trace changed repeatedly while packaging. "
+                    "Review the latest trace and try again."
+                ),
+                "status": 409,
+            }
     if export_dir is None:
         return {"error": "Failed to prepare upload zip", "status": 500}
 
@@ -2955,7 +3231,11 @@ def submit_share_to_hosted(
         "status": 504,
     }
     final_gate_error = _final_manual_share_egress_gate(
-        conn, share_id, session_ids, settings.get("source_filter")
+        conn,
+        share_id,
+        session_ids,
+        settings.get("source_filter"),
+        accepted_predecessors=accepted_predecessors,
     )
     if final_gate_error:
         return final_gate_error
