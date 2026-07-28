@@ -3041,7 +3041,8 @@ def _handle_codex_session_meta(
     payload = entry.get("payload", {})
     session_cwd = payload.get("cwd")
     if isinstance(session_cwd, str) and session_cwd.strip():
-        state.raw_cwd = session_cwd
+        if state.raw_cwd == UNKNOWN_CODEX_CWD:
+            state.raw_cwd = session_cwd
         if state.metadata["cwd"] is None:
             state.metadata["cwd"] = anonymizer.path(session_cwd)
     if state.metadata["session_id"] == filepath.stem:
@@ -3067,7 +3068,8 @@ def _handle_codex_turn_context(
     payload = entry.get("payload", {})
     session_cwd = payload.get("cwd")
     if isinstance(session_cwd, str) and session_cwd.strip():
-        state.raw_cwd = session_cwd
+        if state.raw_cwd == UNKNOWN_CODEX_CWD:
+            state.raw_cwd = session_cwd
         if state.metadata["cwd"] is None:
             state.metadata["cwd"] = anonymizer.path(session_cwd)
     if state.metadata["model"] is None:
