@@ -1572,6 +1572,24 @@ def _manual_share_lineage_claims(
     return claims
 
 
+_LINEAGE_PREFLIGHT_ABSENT_STATUSES = frozenset({404, 405, 410, 501})
+
+
+def _lineage_preflight_is_unavailable(exc: urllib.error.HTTPError) -> bool:
+    """Whether a preflight failure means the capability is simply not there.
+
+    A capability document can advertise the endpoint before the deployment that
+    serves it, and a live endpoint can have an outage. Neither should be a new
+    way for manual submission to fail, so those two shapes — the endpoint is
+    absent, or the endpoint is broken — degrade instead of blocking. Anything
+    else (auth, a semantic rejection) is a real answer and still surfaces.
+    """
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        return False
+    return code in _LINEAGE_PREFLIGHT_ABSENT_STATUSES or code >= 500
+
+
 def _synchronize_manual_share_lineage(
     conn: sqlite3.Connection,
     *,
@@ -1595,12 +1613,31 @@ def _synchronize_manual_share_lineage(
         excluded_projects=excluded_projects,
         included_session_ids=included_session_ids,
     )
-    response = _json_request(
-        preflight_url,
-        method="POST",
-        payload={"upload_token": upload_token, "sessions": claims},
-        timeout=30,
-    )
+    try:
+        response = _json_request(
+            preflight_url,
+            method="POST",
+            payload={"upload_token": upload_token, "sessions": claims},
+            timeout=30,
+        )
+    except urllib.error.HTTPError as exc:
+        if not _lineage_preflight_is_unavailable(exc):
+            raise
+        # Degrading here restores the pre-preflight behavior exactly: no
+        # predecessor is rebound, `accepted_predecessors` stays None so the
+        # local gate keeps its strict reading, and the hosted compare-and-set
+        # still refuses a claim that does not match the receiver's head. The
+        # participant loses the reconciliation, not the protection.
+        logger.warning(
+            "Hosted lineage preflight unavailable (HTTP %s); "
+            "submitting with the locally declared predecessor.",
+            exc.code,
+        )
+        return {
+            "supported": False,
+            "changed": False,
+            "accepted_predecessors": None,
+        }
     rows = response.get("sessions")
     if not isinstance(rows, list):
         raise ValueError("Hosted lineage preflight returned no session results.")
@@ -3245,6 +3282,13 @@ def submit_share_to_hosted(
             }
         if final_lineage.get("error"):
             return final_lineage
+        if not final_lineage.get("supported"):
+            # The endpoint went away between the two calls. Keep the
+            # predecessors the first response accepted rather than dropping to
+            # None — the packaged bundle was built from them, and discarding
+            # them here would make the egress gate refuse a share this same
+            # request just rebound.
+            break
         accepted_predecessors = final_lineage.get("accepted_predecessors")
         if not final_lineage.get("changed"):
             break

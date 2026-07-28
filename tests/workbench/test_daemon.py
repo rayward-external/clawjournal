@@ -4967,6 +4967,175 @@ class TestShareAPI:
             item["session_id"] for item in captured["manifest"]["sessions"]
         } == {"sess-0"}
 
+    @pytest.mark.parametrize("preflight_status", [404, 405, 410, 500, 502, 503])
+    def test_unavailable_lineage_preflight_degrades_instead_of_blocking(
+        self, server, monkeypatch, preflight_status
+    ):
+        """An advertised endpoint that is absent or broken must not block.
+
+        A capability document can name the endpoint before the deployment that
+        serves it, and a live endpoint can have an outage. Either would
+        otherwise take down manual submission entirely.
+        """
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        def unavailable(_payload):
+            raise urllib.error.HTTPError(
+                "https://example.test/api/manual-lineage-preflight",
+                preflight_status,
+                "Unavailable",
+                {},
+                BytesIO(b'{"error":"unavailable"}'),
+            )
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        captured = {}
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=unavailable,
+                upload_assert=lambda req: captured.update(
+                    manifest=self._manifest_from_upload(req)
+                ),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 200, data
+        # Degrading must not rewrite lineage: the bundle ships the locally
+        # declared predecessor, exactly as it did before the preflight existed.
+        assert captured["manifest"]["sessions"]
+        for item in captured["manifest"]["sessions"]:
+            assert item["replaces_revision_hash"] is None
+
+    def test_auth_failure_on_lineage_preflight_still_blocks(self, server, monkeypatch):
+        """Only absent/broken degrades — a real answer still surfaces."""
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+
+        def forbidden(_payload):
+            raise urllib.error.HTTPError(
+                "https://example.test/api/manual-lineage-preflight",
+                403,
+                "Forbidden",
+                {},
+                BytesIO(b'{"error":"upload token rejected"}'),
+            )
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=forbidden,
+                upload_assert=lambda _req: pytest.fail("uploaded despite 403"),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status != 200
+        assert "upload token rejected" in data["error"]
+
+    def test_recheck_going_unavailable_keeps_the_accepted_predecessor(
+        self, server, monkeypatch
+    ):
+        """A rebase, then the endpoint disappears before the recheck.
+
+        The bundle was packaged from the predecessor the first response
+        accepted, so dropping it would make the egress gate refuse a share this
+        same request just rebound.
+        """
+        from clawjournal.workbench.index import (
+            create_share,
+            open_index,
+            update_session,
+        )
+
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "recheck-vanishes-session"
+        self._seed_released_session(session_id, "first locally shared revision")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            first_share = create_share(conn, [session_id])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", first_share),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self._seed_released_session(session_id, "continued work after first upload")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            share_id = create_share(conn, [session_id])
+        finally:
+            conn.close()
+
+        status, exported = _post(server, f"/api/shares/{share_id}/export")
+        assert status == 200, exported
+
+        receiver_head = "sha256:" + ("b" * 64)
+        calls = []
+
+        def lineage_preflight(payload):
+            calls.append(payload)
+            if len(calls) > 1:
+                raise urllib.error.HTTPError(
+                    "https://example.test/api/manual-lineage-preflight",
+                    503, "Unavailable", {}, BytesIO(b"{}"),
+                )
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": session_id,
+                    "status": "rebase_required",
+                    "current_head_revision_hash": receiver_head,
+                    "current_head_accepted_at": "2026-07-02T00:00:00+00:00",
+                    "required_replaces_revision_hash": receiver_head,
+                }],
+            }
+
+        captured = {}
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=lambda req: captured.update(
+                    manifest=self._manifest_from_upload(req)
+                ),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 200, data
+        uploaded = captured["manifest"]["sessions"][0]
+        assert uploaded["replaces_revision_hash"] == receiver_head
+
     def test_hosted_upload_does_not_rebase_draft_older_than_receiver_head(
         self, server, monkeypatch
     ):
