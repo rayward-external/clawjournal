@@ -2556,7 +2556,17 @@ def _load_finalized_share_export(
             ):
                 return None
             manifest_lineage[session_id] = (revision_hash, predecessor)
-        if manifest_lineage != expected_lineage:
+        # The export skips sessions an `excluded_projects` change filtered out
+        # (or whose detail row is gone), so the manifest legitimately carries a
+        # subset of the share's rows. Compare only what the bundle actually
+        # ships: a rebased predecessor still invalidates the cache, while a
+        # skipped session no longer forces a rebuild on every seal / download /
+        # submit. Composition changes arrive through `excluded_projects`, which
+        # `redaction_settings_fingerprint` already covers.
+        if any(
+            expected_lineage.get(session_id) != lineage
+            for session_id, lineage in manifest_lineage.items()
+        ):
             return None
     if not _manifest_is_finalized_for_upload(
         manifest,
@@ -3040,6 +3050,20 @@ def submit_share_to_hosted(
         return {
             "error": "Share contains sessions that are not released",
             "blockers": blockers,
+            "status": 409,
+        }
+    # Confirmed source scope is the control that decides whether these sessions
+    # may leave the machine at all, so it has to clear before the first request
+    # that carries their identities. `_prepare_share_export_for_upload` re-checks
+    # it, but that runs after the lineage preflight has already sent session ids
+    # and revision hashes to the hosted service.
+    source_blockers = source_scope_blockers(
+        conn, session_ids, settings.get("source_filter")
+    )
+    if source_blockers:
+        return {
+            "error": "Share contains sessions outside the confirmed source scope",
+            "blockers": source_blockers,
             "status": 409,
         }
     predecessor_blockers = share_predecessor_blockers(conn, share_id)

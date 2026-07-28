@@ -4851,6 +4851,57 @@ class TestShareAPI:
             conn.close()
         assert stored == receiver_head
 
+    def test_lineage_preflight_waits_for_the_source_scope_gate(
+        self, server, monkeypatch
+    ):
+        """Confirmed source scope decides whether these sessions may leave.
+
+        The preflight carries session ids and content-revision hashes, so it is
+        egress: it must not run before the gate that authorizes it. The export
+        re-checks the same gate, but that happens after the request is already
+        on the wire.
+        """
+        WorkbenchHandler._last_share_time = 0.0
+        share_id = self._create_and_export_share(server)
+        preflight_calls = []
+
+        def lineage_preflight(payload):
+            preflight_calls.append(payload)
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": claim["session_id"],
+                    "status": "ready",
+                    "current_head_revision_hash": None,
+                    "current_head_accepted_at": None,
+                    "required_replaces_revision_hash": claim[
+                        "replaces_revision_hash"
+                    ],
+                } for claim in payload["sessions"]],
+            }
+
+        # The seeded sessions are `claude`; the confirmed scope is `codex`.
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(source="codex"),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=lambda _req: pytest.fail("out-of-scope share uploaded"),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 409, data
+        assert "confirmed source scope" in data["error"]
+        assert preflight_calls == []
+
     def test_hosted_upload_does_not_rebase_draft_older_than_receiver_head(
         self, server, monkeypatch
     ):
