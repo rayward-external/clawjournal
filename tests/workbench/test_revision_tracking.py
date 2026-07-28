@@ -512,6 +512,55 @@ def test_receiver_preflight_rebinds_only_the_unsubmitted_share(index_conn):
     assert revision_r1 != receiver_head
 
 
+def test_receiver_preflight_can_rebind_only_the_packaged_subset(index_conn):
+    upsert_sessions(index_conn, [
+        _session("trace-1", "first trace"),
+        _session("trace-2", "second trace"),
+    ])
+    _approve(index_conn, "trace-1")
+    _approve(index_conn, "trace-2")
+    share_id = create_share(index_conn, ["trace-1", "trace-2"])
+    revisions = {
+        row["session_id"]: row["content_revision"]
+        for row in index_conn.execute(
+            "SELECT session_id, content_revision FROM share_sessions "
+            "WHERE share_id = ?",
+            (share_id,),
+        )
+    }
+    receiver_head = "sha256:" + ("c" * 64)
+
+    with pytest.raises(RevisionConflictError):
+        synchronize_share_predecessors(
+            index_conn,
+            share_id,
+            expected_revisions={"trace-1": revisions["trace-1"]},
+            required_predecessors={"trace-1": receiver_head},
+        )
+
+    changed = synchronize_share_predecessors(
+        index_conn,
+        share_id,
+        expected_revisions={"trace-1": revisions["trace-1"]},
+        required_predecessors={"trace-1": receiver_head},
+        allow_subset=True,
+    )
+
+    assert changed == 1
+    predecessors = {
+        row["session_id"]: row["replaces_revision"]
+        for row in index_conn.execute(
+            "SELECT session_id, replaces_revision FROM share_sessions "
+            "WHERE share_id = ?",
+            (share_id,),
+        )
+    }
+    assert predecessors == {
+        "trace-1": receiver_head,
+        "trace-2": None,
+    }
+
+
 def test_share_predecessor_blocks_same_revision_uploaded_by_another_share(index_conn):
     upsert_sessions(index_conn, [_session(content="r1")])
     _approve(index_conn)

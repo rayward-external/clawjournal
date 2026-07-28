@@ -4902,6 +4902,71 @@ class TestShareAPI:
         assert "confirmed source scope" in data["error"]
         assert preflight_calls == []
 
+    def test_lineage_preflight_omits_excluded_project_sessions(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench.index import open_index
+
+        WorkbenchHandler._last_share_time = 0.0
+        conn = open_index()
+        try:
+            conn.execute(
+                "UPDATE sessions SET project = ? WHERE session_id = ?",
+                ("excluded-project", "sess-1"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        share_id = self._create_and_export_share(server)
+        preflight_calls = []
+        captured = {}
+
+        def lineage_preflight(payload):
+            preflight_calls.append(payload)
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": claim["session_id"],
+                    "status": "ready",
+                    "current_head_revision_hash": None,
+                    "current_head_accepted_at": None,
+                    "required_replaces_revision_hash": claim[
+                        "replaces_revision_hash"
+                    ],
+                } for claim in payload["sessions"]],
+            }
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(
+                excluded_projects=["claude:excluded-project"],
+            ),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=lambda req: captured.update(
+                    manifest=self._manifest_from_upload(req)
+                ),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 200, data
+        assert preflight_calls
+        assert all(
+            {claim["session_id"] for claim in call["sessions"]} == {"sess-0"}
+            for call in preflight_calls
+        )
+        assert {
+            item["session_id"] for item in captured["manifest"]["sessions"]
+        } == {"sess-0"}
+
     def test_hosted_upload_does_not_rebase_draft_older_than_receiver_head(
         self, server, monkeypatch
     ):

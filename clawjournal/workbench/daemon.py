@@ -1538,13 +1538,25 @@ def _manual_lineage_preflight_url(
     return resolved
 
 
-def _manual_share_lineage_claims(share: dict[str, Any]) -> list[dict[str, Any]]:
+def _manual_share_lineage_claims(
+    share: dict[str, Any],
+    *,
+    excluded_projects: list[str] | None = None,
+    included_session_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     claims: list[dict[str, Any]] = []
     for session in share.get("sessions") or []:
         session_id = session.get("session_id")
         revision_hash = session.get("share_content_revision")
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("Share contains an invalid session identity.")
+        if (
+            included_session_ids is not None
+            and session_id not in included_session_ids
+        ):
+            continue
+        if session_matches_excluded_projects(session, excluded_projects):
+            continue
         if not isinstance(revision_hash, str) or not revision_hash:
             raise ValueError("Share contains a session without a revision identity.")
         predecessor = session.get("share_replaces_revision")
@@ -1567,6 +1579,8 @@ def _synchronize_manual_share_lineage(
     share: dict[str, Any],
     upload_token: str,
     capabilities: dict[str, Any],
+    excluded_projects: list[str] | None = None,
+    included_session_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     preflight_url = _manual_lineage_preflight_url(capabilities)
     if preflight_url is None:
@@ -1576,7 +1590,11 @@ def _synchronize_manual_share_lineage(
             "accepted_predecessors": None,
         }
 
-    claims = _manual_share_lineage_claims(share)
+    claims = _manual_share_lineage_claims(
+        share,
+        excluded_projects=excluded_projects,
+        included_session_ids=included_session_ids,
+    )
     response = _json_request(
         preflight_url,
         method="POST",
@@ -1666,6 +1684,7 @@ def _synchronize_manual_share_lineage(
             share_id,
             expected_revisions=expected_revisions,
             required_predecessors=required_predecessors,
+            allow_subset=True,
         )
     return {
         "supported": True,
@@ -2720,7 +2739,11 @@ def _final_manual_share_egress_gate(
             "status": 409,
         }
 
-    revision_blockers = share_revision_blockers(conn, share_id)
+    revision_blockers = share_revision_blockers(
+        conn,
+        share_id,
+        session_ids=session_ids,
+    )
     if revision_blockers:
         return {
             "error": "Trace revisions changed after review.",
@@ -2738,6 +2761,7 @@ def _final_manual_share_egress_gate(
         conn,
         share_id,
         accepted_predecessors=accepted_predecessors,
+        session_ids=session_ids,
     )
     if predecessor_blockers:
         return {
@@ -3044,7 +3068,14 @@ def submit_share_to_hosted(
         }
 
     from .index import release_gate_blockers
-    session_ids = [s["session_id"] for s in share.get("sessions") or []]
+    try:
+        scoped_claims = _manual_share_lineage_claims(
+            share,
+            excluded_projects=settings.get("excluded_projects"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc), "status": 409}
+    session_ids = [str(claim["session_id"]) for claim in scoped_claims]
     blockers = release_gate_blockers(conn, session_ids)
     if blockers:
         return {
@@ -3066,7 +3097,11 @@ def submit_share_to_hosted(
             "blockers": source_blockers,
             "status": 409,
         }
-    predecessor_blockers = share_predecessor_blockers(conn, share_id)
+    predecessor_blockers = share_predecessor_blockers(
+        conn,
+        share_id,
+        session_ids=session_ids,
+    )
     if predecessor_blockers:
         return {
             "error": "Share revisions are duplicate or based on a stale predecessor",
@@ -3100,6 +3135,8 @@ def submit_share_to_hosted(
                 share=share,
                 upload_token=upload_token,
                 capabilities=capabilities,
+                excluded_projects=settings.get("excluded_projects"),
+                included_session_ids=set(session_ids),
             )
         except urllib.error.HTTPError as exc:
             return _hosted_http_error_result(exc)
@@ -3128,6 +3165,7 @@ def submit_share_to_hosted(
             conn,
             share_id,
             accepted_predecessors=accepted_predecessors,
+            session_ids=session_ids,
         )
         if predecessor_blockers:
             return {
@@ -3148,6 +3186,37 @@ def submit_share_to_hosted(
             return error
         if export_dir is None:
             return {"error": "Failed to prepare upload zip", "status": 500}
+        manifest_sessions = manifest.get("sessions")
+        if not isinstance(manifest_sessions, list):
+            return {
+                "error": "Finalized share contains no session manifest.",
+                "status": 500,
+            }
+        packaged_session_ids: list[str] = []
+        for item in manifest_sessions:
+            session_id = item.get("session_id") if isinstance(item, dict) else None
+            if not isinstance(session_id, str) or not session_id:
+                return {
+                    "error": "Finalized share contains an invalid session identity.",
+                    "status": 500,
+                }
+            packaged_session_ids.append(session_id)
+        if not packaged_session_ids:
+            return {
+                "error": "Share contains no sessions eligible for upload.",
+                "status": 409,
+            }
+        if len(set(packaged_session_ids)) != len(packaged_session_ids):
+            return {
+                "error": "Finalized share contains duplicate session identities.",
+                "status": 500,
+            }
+        if not set(packaged_session_ids).issubset(session_ids):
+            return {
+                "error": "Finalized share no longer matches the confirmed project scope.",
+                "status": 409,
+            }
+        session_ids = packaged_session_ids
         if not lineage.get("supported"):
             break
 
@@ -3158,6 +3227,8 @@ def submit_share_to_hosted(
                 share=share,
                 upload_token=upload_token,
                 capabilities=capabilities,
+                excluded_projects=settings.get("excluded_projects"),
+                included_session_ids=set(session_ids),
             )
         except urllib.error.HTTPError as exc:
             return _hosted_http_error_result(exc)
