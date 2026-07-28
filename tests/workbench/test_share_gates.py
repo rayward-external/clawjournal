@@ -737,6 +737,132 @@ class TestSecretScanGate:
         assert cached_dir == export_dir
         assert cached_manifest == manifest
 
+    def test_finalized_export_reuse_survives_a_skipped_session(
+        self,
+        conn,
+        monkeypatch,
+        tmp_path,
+    ):
+        """A session the export skipped must not defeat the lineage check.
+
+        `excluded_projects` filters sessions out of the bundle at export time,
+        so the manifest carries a subset of the share's rows. Comparing the two
+        sets for equality made every seal / download / submit rebuild the
+        artifact — re-running the gate and the AI-PII pass, so the bytes the
+        participant reviewed were not the bytes submitted.
+        """
+        from clawjournal.workbench import daemon as daemon_module
+        from clawjournal.workbench.daemon import _prepare_share_export_for_upload
+
+        monkeypatch.setattr(daemon_module, "CONFIG_DIR", tmp_path)
+        _mock_gate_engines(monkeypatch)
+
+        kept = _settled_session("sess-keep", content="ordinary trace content")
+        dropped = _settled_session("sess-drop", content="ordinary trace content")
+        dropped["project"] = "excluded-demo"
+        upsert_sessions(conn, [kept, dropped])
+        conn.commit()
+        share_id = create_share(conn, ["sess-keep", "sess-drop"], note="t")
+        share = get_share(conn, share_id)
+        settings = {
+            "custom_strings": [],
+            "extra_usernames": [],
+            "excluded_projects": ["claude:excluded-demo"],
+            "blocked_domains": [],
+            "allowlist_entries": [],
+            "source_filter": None,
+            "ai_pii_review_enabled": False,
+        }
+
+        export_dir, manifest, error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+        assert error is None
+        assert export_dir is not None
+        assert [item["session_id"] for item in manifest["sessions"]] == ["sess-keep"]
+
+        def unexpected_rebuild(*_args, **_kwargs):
+            raise AssertionError("skipped session must not force a rebuild")
+
+        monkeypatch.setattr(daemon_module, "export_share_to_disk", unexpected_rebuild)
+
+        cached_dir, cached_manifest, cached_error = _prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+
+        assert cached_error is None
+        assert cached_dir == export_dir
+        assert cached_manifest == manifest
+
+    def test_finalized_export_reuse_rejects_a_rebased_predecessor(
+        self,
+        conn,
+        monkeypatch,
+        tmp_path,
+    ):
+        """Rebinding the predecessor must still invalidate the sealed bundle."""
+        from clawjournal.workbench import daemon as daemon_module
+        from clawjournal.workbench.daemon import _load_finalized_share_export
+
+        monkeypatch.setattr(daemon_module, "CONFIG_DIR", tmp_path)
+        _mock_gate_engines(monkeypatch)
+        share_id, share = self._share(conn, content="ordinary trace content")
+        settings = {
+            "custom_strings": [],
+            "extra_usernames": [],
+            "excluded_projects": [],
+            "blocked_domains": [],
+            "allowlist_entries": [],
+            "source_filter": None,
+            "ai_pii_review_enabled": False,
+        }
+
+        export_dir, manifest, error = daemon_module._prepare_share_export_for_upload(
+            conn,
+            share_id,
+            share,
+            settings,
+            reuse_finalized=True,
+        )
+        assert error is None
+        assert export_dir is not None
+        sealed = manifest["sessions"][0]
+
+        fingerprint = manifest["redaction_settings_fingerprint"]
+        unchanged = _load_finalized_share_export(
+            share_id,
+            ai_pii=None,
+            expected_fingerprint=fingerprint,
+            expected_lineage={
+                sealed["session_id"]: (
+                    sealed["revision_hash"],
+                    sealed["replaces_revision_hash"],
+                ),
+            },
+        )
+        assert unchanged is not None
+
+        rebased = _load_finalized_share_export(
+            share_id,
+            ai_pii=None,
+            expected_fingerprint=fingerprint,
+            expected_lineage={
+                sealed["session_id"]: (
+                    sealed["revision_hash"],
+                    "sha256:" + ("b" * 64),
+                ),
+            },
+        )
+        assert rebased is None
+
     def test_unverified_token_is_redacted_and_share_advances(self, conn, monkeypatch):
         # The headline behavior change: a recognizable-but-unverified
         # token no longer rejects the session — the exact span is

@@ -1046,6 +1046,58 @@ class TestDiscoverProjects:
         paragraphs = [p.strip() for p in thinking.split("\n\n") if p.strip()]
         assert paragraphs == ["Planning fix", "Reading code"]
 
+    def test_codex_parser_keeps_initial_cwd_when_windows_case_changes(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = tmp_path / "rollout-windows-cwd.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-07-28T07:13:20.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "session-windows-cwd",
+                    "cwd": "d:\\work\\clawjournal",
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-28T07:13:21.000Z",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "D:\\work\\clawjournal",
+                    "model": "gpt-5.6-sol",
+                },
+            },
+            {
+                "timestamp": "2026-07-28T07:13:22.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "hello"},
+            },
+            {
+                "timestamp": "2026-07-28T07:13:23.000Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "hi"},
+            },
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="d:\\work\\clawjournal",
+        )
+
+        assert result is not None
+        assert result["session_id"] == "session-windows-cwd"
+        assert [message["role"] for message in result["messages"]] == [
+            "user",
+            "assistant",
+        ]
+
     def test_discover_opencode_projects(self, tmp_path, monkeypatch):
         self._disable_codex(tmp_path, monkeypatch)
         db_path = tmp_path / "opencode.db"
