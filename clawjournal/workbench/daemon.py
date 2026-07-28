@@ -1,7 +1,6 @@
 """Local daemon for the scientist workbench — scanner + HTTP API."""
 
 import hashlib
-import io
 import json
 import logging
 import os
@@ -325,7 +324,27 @@ _HOSTED_SHARE_URL = os.environ.get("CLAWJOURNAL_SHARE_URL", _HOSTED_SHARE_URL_DE
 _SHARE_GCS_BUCKET = os.environ.get("CLAWJOURNAL_GCS_BUCKET", "clawjournal-traces")
 _SHARE_GCS_PREFIX = os.environ.get("CLAWJOURNAL_GCS_PREFIX", "clawjournal")
 _SHARE_UPLOAD_TIMEOUT = 120
+_SHARE_ZIP_CACHE_FILENAME = "finalized-share.zip"
+_SHARE_ZIP_CACHE_METADATA_FILENAME = "finalized-share.zip.meta.json"
+_SHARE_ZIP_CACHE_VERSION = 1
+_SHARE_ZIP_REQUIRED_FILES = (
+    "sessions.jsonl",
+    "manifest.json",
+    "trufflehog.post-pii.json",
+    "secret-scan.post-pii.json",
+)
+_SHARE_ZIP_MEMBERS = (
+    "sessions.jsonl",
+    "manifest.json",
+    "trufflehog.json",
+    "trufflehog.post-pii.json",
+    "secret-scan.json",
+    "secret-scan.post-pii.json",
+)
 _share_rate_lock = threading.Lock()
+_share_zip_cache_lock = threading.RLock()
+_share_package_progress_lock = threading.Lock()
+_share_package_progress: dict[str, dict[str, Any]] = {}
 _auto_upload_run_lock = threading.Lock()
 _auto_upload_run_thread: threading.Thread | None = None
 _HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
@@ -1853,42 +1872,162 @@ def _transport_manifest_bytes(manifest_file: Path) -> bytes:
     ).encode("utf-8")
 
 
-def _build_share_zip(export_dir: Path) -> bytes:
-    """Build the finalized share zip expected by hosted submission.
+def _record_elapsed_ms(
+    timings: dict[str, int] | None,
+    stage: str,
+    started_at: float,
+) -> None:
+    if timings is not None:
+        timings[stage] = max(0, round((time.perf_counter() - started_at) * 1000))
 
-    `secret-scan.post-pii.json` (the tiered gate's proof marker) is
-    required alongside the legacy `trufflehog.post-pii.json` so a zip
-    can never be built from an export that skipped the combined gate.
-    """
-    required = [
-        "sessions.jsonl",
-        "manifest.json",
-        "trufflehog.post-pii.json",
-        "secret-scan.post-pii.json",
+
+def _emit_packaging_stage(
+    progress: Callable[[str], None] | None,
+    stage: str,
+) -> None:
+    if progress is None:
+        return
+    try:
+        progress(stage)
+    except Exception:
+        logger.warning("Share packaging progress callback failed at stage=%s", stage)
+
+
+def _set_share_package_progress(
+    share_id: str,
+    *,
+    stage: str,
+    message: str,
+    progress: int,
+    timings_ms: dict[str, int] | None = None,
+    zip_reused: bool | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "share_id": share_id,
+        "stage": stage,
+        "message": message,
+        "progress": max(0, min(100, int(progress))),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if timings_ms is not None:
+        payload["timings_ms"] = dict(timings_ms)
+    if zip_reused is not None:
+        payload["zip_reused"] = zip_reused
+    with _share_package_progress_lock:
+        if share_id not in _share_package_progress and len(_share_package_progress) >= 100:
+            oldest = min(
+                _share_package_progress,
+                key=lambda key: _share_package_progress[key].get("updated_at", ""),
+            )
+            _share_package_progress.pop(oldest, None)
+        _share_package_progress[share_id] = payload
+    return dict(payload)
+
+
+def _get_share_package_progress(share_id: str) -> dict[str, Any] | None:
+    with _share_package_progress_lock:
+        payload = _share_package_progress.get(share_id)
+        return dict(payload) if payload is not None else None
+
+
+def _share_zip_input_snapshot(export_dir: Path) -> dict[str, Any]:
+    missing = [
+        name for name in _SHARE_ZIP_REQUIRED_FILES
+        if not (export_dir / name).exists()
     ]
-    missing = [name for name in required if not (export_dir / name).exists()]
     if missing:
         raise FileNotFoundError(f"Finalized share is missing {', '.join(missing)}")
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in (
-            "sessions.jsonl",
-            "manifest.json",
-            "trufflehog.json",
-            "trufflehog.post-pii.json",
-            "secret-scan.json",
-            "secret-scan.post-pii.json",
-        ):
-            path = export_dir / name
-            if path.exists():
-                payload = (
-                    _transport_manifest_bytes(path)
-                    if name == "manifest.json"
-                    else path.read_bytes()
+    inputs: dict[str, dict[str, int]] = {}
+    for name in _SHARE_ZIP_MEMBERS:
+        path = export_dir / name
+        if not path.exists():
+            continue
+        stat = path.stat()
+        inputs[name] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    return {"version": _SHARE_ZIP_CACHE_VERSION, "inputs": inputs}
+
+
+def _cached_share_zip(
+    export_dir: Path,
+    snapshot: dict[str, Any],
+) -> Path | None:
+    zip_path = export_dir / _SHARE_ZIP_CACHE_FILENAME
+    metadata_path = export_dir / _SHARE_ZIP_CACHE_METADATA_FILENAME
+    if not zip_path.is_file() or not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("snapshot") != snapshot:
+            return None
+        if metadata.get("zip_size_bytes") != zip_path.stat().st_size:
+            return None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return zip_path
+
+
+def _finalized_share_zip(export_dir: Path) -> tuple[Path, bool]:
+    """Return one atomically cached ZIP for a finalized export directory."""
+    export_dir = export_dir.resolve()
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    with _share_zip_cache_lock:
+        for _attempt in range(2):
+            snapshot = _share_zip_input_snapshot(export_dir)
+            cached = _cached_share_zip(export_dir, snapshot)
+            if cached is not None:
+                return cached, True
+
+            suffix = uuid.uuid4().hex
+            temp_zip = export_dir / f".{_SHARE_ZIP_CACHE_FILENAME}.{suffix}.tmp"
+            temp_metadata = export_dir / (
+                f".{_SHARE_ZIP_CACHE_METADATA_FILENAME}.{suffix}.tmp"
+            )
+            try:
+                with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for name in _SHARE_ZIP_MEMBERS:
+                        path = export_dir / name
+                        if not path.exists():
+                            continue
+                        payload = (
+                            _transport_manifest_bytes(path)
+                            if name == "manifest.json"
+                            else path.read_bytes()
+                        )
+                        archive.writestr(name, payload)
+
+                if _share_zip_input_snapshot(export_dir) != snapshot:
+                    temp_zip.unlink(missing_ok=True)
+                    continue
+
+                zip_path = export_dir / _SHARE_ZIP_CACHE_FILENAME
+                metadata_path = export_dir / _SHARE_ZIP_CACHE_METADATA_FILENAME
+                os.replace(temp_zip, zip_path)
+                temp_metadata.write_text(
+                    json.dumps({
+                        "snapshot": snapshot,
+                        "zip_size_bytes": zip_path.stat().st_size,
+                    }, sort_keys=True),
+                    encoding="utf-8",
                 )
-                zf.writestr(name, payload)
-    return buf.getvalue()
+                os.replace(temp_metadata, metadata_path)
+                return zip_path, False
+            finally:
+                temp_zip.unlink(missing_ok=True)
+                temp_metadata.unlink(missing_ok=True)
+
+    raise RuntimeError("Finalized share changed while its ZIP was being built")
+
+
+def _build_share_zip(export_dir: Path) -> bytes:
+    """Return the cached finalized ZIP bytes expected by hosted submission."""
+    with _share_zip_cache_lock:
+        zip_path, _reused = _finalized_share_zip(export_dir)
+        return zip_path.read_bytes()
 
 
 def _jsonl_row_count(path: Path) -> int:
@@ -2066,6 +2205,8 @@ def finalize_share_export_for_upload(
     ai_pii: bool = False,
     ai_backend: str = "auto",
     before_ai_call: Callable[[], None] | None = None,
+    progress: Callable[[str], None] | None = None,
+    timings_ms: dict[str, int] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Apply final local-only gates before an export becomes an upload zip.
 
@@ -2091,6 +2232,8 @@ def finalize_share_export_for_upload(
             "status": 422,
         }, manifest
 
+    _emit_packaging_stage(progress, "pii_review")
+    pii_started = time.perf_counter()
     try:
         pii_summary = _apply_upload_pii_redactions(
             sessions_file,
@@ -2124,11 +2267,13 @@ def finalize_share_export_for_upload(
             raise exc.cause
         if isinstance(exc, ControlChanged):
             raise
+        _record_elapsed_ms(timings_ms, "pii_review", pii_started)
         logger.warning("PII redaction pass failed: %s", exc)
         return {
             "error": "PII redaction failed — upload aborted. Try again or report this issue.",
             "status": 500,
         }, manifest
+    _record_elapsed_ms(timings_ms, "pii_review", pii_started)
 
     redaction_summary = manifest.setdefault("redaction_summary", {})
     if isinstance(redaction_summary, dict):
@@ -2158,6 +2303,8 @@ def finalize_share_export_for_upload(
             "status": 503,
         }, manifest
 
+    _emit_packaging_stage(progress, "post_pii_secret_scan")
+    post_scan_started = time.perf_counter()
     try:
         from ..redaction import scan_policy
         from ..redaction import trufflehog as trufflehog_scanner
@@ -2165,12 +2312,18 @@ def finalize_share_export_for_upload(
 
         post_pii_gate = run_share_gate(sessions_file, manifest, conn=conn)
     except Exception as exc:
+        _record_elapsed_ms(
+            timings_ms,
+            "post_pii_secret_scan",
+            post_scan_started,
+        )
         logger.warning("Post-PII secret-scan gate failed: %s", exc)
         return {
             "error": "Post-redaction scan failed — upload aborted.",
             "detail": str(exc),
             "status": 500,
         }, manifest
+    _record_elapsed_ms(timings_ms, "post_pii_secret_scan", post_scan_started)
 
     # `secret-scan.json` is the authoritative combined report shipped in
     # the zip; `secret-scan.post-pii.json` proves the final artifact
@@ -2414,7 +2567,10 @@ def _prepare_share_export_for_upload(
     ai_pii_review_enabled: bool | None = None,
     ai_pii_backend: str = "auto",
     before_ai_call: Callable[[], None] | None = None,
+    progress: Callable[[str], None] | None = None,
+    timings_ms: dict[str, int] | None = None,
 ) -> tuple[Path | None, dict[str, Any], dict[str, Any] | None]:
+    prepare_started = time.perf_counter()
     effective_ai_pii = (
         bool(settings.get("ai_pii_review_enabled", False))
         if ai_pii_review_enabled is None
@@ -2438,14 +2594,21 @@ def _prepare_share_export_for_upload(
         # The fingerprint additionally forces a rebuild when the redaction
         # settings changed since seal, so we never reuse stale-redacted bytes.
         # A cache miss still finalizes with effective_ai_pii below.
+        cache_lookup_started = time.perf_counter()
         cached = _load_finalized_share_export(
             share_id,
             ai_pii=ai_pii_review_enabled,
             ai_backend=(ai_pii_backend if ai_pii_review_enabled else None),
             expected_fingerprint=settings_fingerprint,
         )
+        _record_elapsed_ms(
+            timings_ms,
+            "finalized_export_cache_lookup",
+            cache_lookup_started,
+        )
         if cached is not None:
             export_dir, manifest = cached
+            _record_elapsed_ms(timings_ms, "prepare_total", prepare_started)
             return export_dir, manifest, None
 
     # Existing participants can receive a new required scanner through a
@@ -2456,8 +2619,12 @@ def _prepare_share_export_for_upload(
     # reason the workbench can recover from explicitly.
     from ..redaction.scanner_install import ensure_share_scanners
 
+    _emit_packaging_stage(progress, "scanner_setup")
+    scanner_setup_started = time.perf_counter()
     scanner_setup = ensure_share_scanners()
+    _record_elapsed_ms(timings_ms, "scanner_setup", scanner_setup_started)
     if not scanner_setup["ok"]:
+        _record_elapsed_ms(timings_ms, "prepare_total", prepare_started)
         return None, {}, {
             "error": scanner_setup.get("error") or "Required secret scanners are not installed.",
             "block_reason": "scanner-not-installed",
@@ -2465,6 +2632,8 @@ def _prepare_share_export_for_upload(
             "status": 503,
         }
 
+    _emit_packaging_stage(progress, "export_and_initial_scan")
+    export_started = time.perf_counter()
     export_dir, manifest = export_share_to_disk(
         conn,
         share_id,
@@ -2475,9 +2644,16 @@ def _prepare_share_export_for_upload(
         blocked_domains=settings["blocked_domains"],
         allowlist_entries=settings["allowlist_entries"],
     )
+    _record_elapsed_ms(
+        timings_ms,
+        "export_and_initial_scan",
+        export_started,
+    )
     if export_dir is None:
+        _record_elapsed_ms(timings_ms, "prepare_total", prepare_started)
         return None, manifest, {"error": "Failed to prepare upload zip", "status": 500}
     if manifest.get("block_reason") == "revision_conflict":
+        _record_elapsed_ms(timings_ms, "prepare_total", prepare_started)
         return export_dir, manifest, {
             "error": manifest.get("block_message") or "Trace revisions changed after review.",
             "block_reason": "revision_conflict",
@@ -2498,9 +2674,13 @@ def _prepare_share_export_for_upload(
         ai_pii=effective_ai_pii,
         ai_backend=ai_pii_backend,
         before_ai_call=before_ai_call,
+        progress=progress,
+        timings_ms=timings_ms,
     )
     if error:
+        _record_elapsed_ms(timings_ms, "prepare_total", prepare_started)
         return export_dir, manifest, error
+    _record_elapsed_ms(timings_ms, "prepare_total", prepare_started)
     return export_dir, manifest, None
 
 
@@ -2893,8 +3073,10 @@ def submit_share_to_hosted(
         return {"error": "Failed to prepare upload zip", "status": 500}
 
     try:
-        zip_bytes = _build_share_zip(export_dir)
-    except OSError as exc:
+        with _share_zip_cache_lock:
+            zip_path, zip_reused = _finalized_share_zip(export_dir)
+            zip_bytes = zip_path.read_bytes()
+    except (OSError, RuntimeError) as exc:
         return {"error": f"Failed to build upload zip: {exc}", "status": 500}
 
     max_bundle_size = capabilities.get("maximum_bundle_size", 52_428_800)
@@ -3013,6 +3195,7 @@ def submit_share_to_hosted(
         "session_count": _jsonl_row_count(sessions_file),
         "bundle_hash": bundle_hash,
         "zip_size_bytes": len(zip_bytes),
+        "zip_reused": zip_reused,
         "redaction_summary": redaction_summary,
     }
 
@@ -3208,6 +3391,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/bundles/") and path.endswith("/download"):
             share_id = path[len("/api/bundles/"):-len("/download")]
             self._handle_download_share(share_id, params)
+        elif path.startswith("/api/bundles/") and path.endswith("/package-status"):
+            share_id = path[len("/api/bundles/"):-len("/package-status")]
+            self._handle_share_package_status(share_id)
         elif path.startswith("/api/bundles/"):
             share_id = path[len("/api/bundles/"):]
             self._handle_get_share(share_id)
@@ -3219,6 +3405,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/shares/") and path.endswith("/download"):
             share_id = path[len("/api/shares/"):-len("/download")]
             self._handle_download_share(share_id, params)
+        elif path.startswith("/api/shares/") and path.endswith("/package-status"):
+            share_id = path[len("/api/shares/"):-len("/package-status")]
+            self._handle_share_package_status(share_id)
         elif path.startswith("/api/shares/"):
             share_id = path[len("/api/shares/"):]
             self._handle_get_share(share_id)
@@ -4700,6 +4889,29 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _handle_share_package_status(self, share_id: str) -> None:
+        payload = _get_share_package_progress(share_id)
+        if payload is not None:
+            _json_response(self, payload)
+            return
+
+        conn = open_index()
+        try:
+            if get_share(conn, share_id) is None:
+                _json_response(self, {"error": "Share not found"}, 404)
+                return
+        finally:
+            conn.close()
+
+        payload = {
+            "share_id": share_id,
+            "stage": "not_started",
+            "message": "Waiting to start packaging...",
+            "progress": 0,
+            "updated_at": None,
+        }
+        _json_response(self, payload)
+
     def _handle_get_share(self, share_id: str) -> None:
         conn = open_index()
         try:
@@ -4712,8 +4924,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 export_dir, finalized_manifest = cached
                 share["manifest"] = finalized_manifest
                 try:
-                    share["zip_size_bytes"] = len(_build_share_zip(export_dir))
-                except OSError:
+                    zip_path, _reused = _finalized_share_zip(export_dir)
+                    share["zip_size_bytes"] = zip_path.stat().st_size
+                except (OSError, RuntimeError):
                     pass
             share.pop("gcs_uri", None)
             _with_legacy_bundle_alias(share)
@@ -4945,10 +5158,50 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         """Finalize a share for browser upload without returning zip bytes."""
         body = _read_body(self)
         ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
+        package_started = time.perf_counter()
+        timings_ms: dict[str, int] = {}
+        _set_share_package_progress(
+            share_id,
+            stage="starting",
+            message="Starting local packaging...",
+            progress=2,
+        )
+
+        stage_details = {
+            "scanner_setup": ("Checking local secret scanners...", 8),
+            "export_and_initial_scan": (
+                "Applying deterministic redaction and the first secret scan...",
+                18,
+            ),
+            "pii_review": (
+                "Running final AI-assisted PII review..."
+                if ai_pii_override
+                else "Running final rules-only PII review...",
+                48,
+            ),
+            "post_pii_secret_scan": ("Running the final secret scan...", 72),
+        }
+
+        def report_stage(stage: str) -> None:
+            message, progress_value = stage_details[stage]
+            _set_share_package_progress(
+                share_id,
+                stage=stage,
+                message=message,
+                progress=progress_value,
+                timings_ms=timings_ms,
+            )
+
         conn = open_index()
         try:
             share = get_share(conn, share_id)
             if share is None:
+                _set_share_package_progress(
+                    share_id,
+                    stage="failed",
+                    message="Packaging stopped because the share no longer exists.",
+                    progress=0,
+                )
                 _json_response(self, {"error": "Share not found"}, 404)
                 return
 
@@ -4960,17 +5213,69 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 settings,
                 reuse_finalized=True,
                 ai_pii_review_enabled=ai_pii_override,
+                progress=report_stage,
+                timings_ms=timings_ms,
             )
             if error:
+                current_status = _get_share_package_progress(share_id) or {}
+                _set_share_package_progress(
+                    share_id,
+                    stage="failed",
+                    message="Packaging stopped at a local safety gate.",
+                    progress=int(current_status.get("progress", 8)),
+                    timings_ms=timings_ms,
+                )
                 _json_response(self, error, int(error.get("status", 500)))
                 return
             if export_dir is None:
+                _set_share_package_progress(
+                    share_id,
+                    stage="failed",
+                    message="Packaging could not prepare the finalized export.",
+                    progress=72,
+                    timings_ms=timings_ms,
+                )
                 _json_response(self, {"error": "Failed to prepare upload zip"}, 500)
                 return
+
+            _set_share_package_progress(
+                share_id,
+                stage="zip_finalize",
+                message="Finalizing the ZIP once for download or submission...",
+                progress=90,
+                timings_ms=timings_ms,
+            )
+            zip_started = time.perf_counter()
             try:
-                zip_size_bytes = len(_build_share_zip(export_dir))
-            except OSError:
-                zip_size_bytes = None
+                zip_path, zip_reused = _finalized_share_zip(export_dir)
+                zip_size_bytes = zip_path.stat().st_size
+            except (OSError, RuntimeError) as exc:
+                _record_elapsed_ms(timings_ms, "zip_finalize", zip_started)
+                _set_share_package_progress(
+                    share_id,
+                    stage="failed",
+                    message="ZIP finalization failed.",
+                    progress=90,
+                    timings_ms=timings_ms,
+                )
+                _json_response(self, {"error": f"Failed to build upload zip: {exc}"}, 500)
+                return
+            _record_elapsed_ms(timings_ms, "zip_finalize", zip_started)
+            _record_elapsed_ms(timings_ms, "total", package_started)
+            package_status = _set_share_package_progress(
+                share_id,
+                stage="done",
+                message="Bundle ready.",
+                progress=100,
+                timings_ms=timings_ms,
+                zip_reused=zip_reused,
+            )
+            logger.info(
+                "Share packaging completed sessions=%d zip_reused=%s timings_ms=%s",
+                len(manifest.get("sessions", [])),
+                zip_reused,
+                json.dumps(timings_ms, sort_keys=True),
+            )
 
             _json_response(self, {
                 "ok": True,
@@ -4978,6 +5283,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "session_count": len(manifest.get("sessions", [])),
                 "zip_size_bytes": zip_size_bytes,
                 "redaction_summary": manifest.get("redaction_summary", {}),
+                "packaging": package_status,
             })
         finally:
             conn.close()
@@ -5014,20 +5320,26 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "Failed to prepare download"}, 500)
                 return
 
-            zip_bytes = _build_share_zip(export_dir)
+            try:
+                zip_path, _reused = _finalized_share_zip(export_dir)
+                zip_size_bytes = zip_path.stat().st_size
+            except (OSError, RuntimeError) as exc:
+                _json_response(self, {"error": f"Failed to build download zip: {exc}"}, 500)
+                return
 
-            # Serve the zip
             date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
             filename = f"clawjournal-share-{share_id[:8]}-{date_str}.zip"
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-            self.send_header("Content-Length", str(len(zip_bytes)))
+            self.send_header("Content-Length", str(zip_size_bytes))
             origin = _cors_origin(self)
             if origin:
                 self.send_header("Access-Control-Allow-Origin", origin)
             self.end_headers()
-            self.wfile.write(zip_bytes)
+            with zip_path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    self.wfile.write(chunk)
         finally:
             conn.close()
 

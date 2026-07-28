@@ -95,8 +95,6 @@ function restoredQueueFromParams(
   return sanitizeQueueSelection(stats, restored ?? defaultQueue);
 }
 
-const PACKAGE_LOG_TRACE_LIMIT = 20;
-const PACKAGE_ANIMATION_MAX_MS = 10_000;
 
 export interface ShareProps {
   onSubmittedShareChange?: (shareId: string | null) => void;
@@ -1026,40 +1024,23 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setPackageBlockReason(null);
     setBlockedPackageSessions([]);
     setPackageProgress(0);
-    setPackageLog('Allocating bundle...');
+    setPackageLog('Creating the local share record...');
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact', 'review']));
 
     const approvedList = approvedSessions;
-    const traceLogLines = approvedList
-      .slice(0, PACKAGE_LOG_TRACE_LIMIT)
-      .map((s) => `Adding ${s.session_id.slice(0, 10)}.jsonl...`);
-    if (approvedList.length > PACKAGE_LOG_TRACE_LIMIT) {
-      traceLogLines.push(`Adding ${approvedList.length - PACKAGE_LOG_TRACE_LIMIT} more traces...`);
-    }
-    const logLines = [
-      'Allocating bundle...',
-      'Writing manifest.json...',
-      ...traceLogLines,
-      aiPiiEnabled ? 'Running final AI PII review...' : 'Running final rules-only PII review...',
-      'Running final secret scan...',
-      'Sealing bundle...',
-    ];
+    let progressTimer: number | null = null;
+    let progressStopped = false;
 
-    const animStart = Date.now();
-    const duration = Math.min(PACKAGE_ANIMATION_MAX_MS, 2200 + approvedList.length * 220);
+    const stopProgressPolling = () => {
+      progressStopped = true;
+      if (progressTimer !== null) window.clearInterval(progressTimer);
+    };
 
-    const timers: number[] = [];
-    logLines.forEach((line, i) => {
-      timers.push(window.setTimeout(() => setPackageLog(line), (duration / logLines.length) * i));
-    });
-    const tick = window.setInterval(() => {
-      const elapsed = Date.now() - animStart;
-      setPackageProgress(Math.min(95, Math.round((elapsed / duration) * 95)));
-    }, 60);
-
-    const clearAllTimers = () => {
-      window.clearInterval(tick);
-      timers.forEach((t) => window.clearTimeout(t));
+    const refreshPackageProgress = async (shareId: string) => {
+      const status = await api.shares.packageStatus(shareId).catch(() => null);
+      if (!status || progressStopped) return;
+      setPackageProgress((current) => Math.max(current, status.progress));
+      setPackageLog(status.message);
     };
 
     try {
@@ -1075,23 +1056,22 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         undefined,
         expectedRevisions,
       );
-
-      // Finish the animation cleanly before exposing the share id — the
-      // `packageProgress >= 100 && packagedShareId` combination triggers the
-      // fallback useEffect that flips the stepper to Done.
-      const animRemaining = Math.max(0, duration - (Date.now() - animStart));
-      await new Promise((r) => window.setTimeout(r, animRemaining));
-      clearAllTimers();
-      setPackageProgress(98);
-      setPackageLog('Finalizing zip...');
+      setPackageProgress(2);
+      setPackageLog('Starting local packaging...');
 
       // Seal performs the final local-only PII pass and post-PII TruffleHog
       // gate without triggering a browser save. The Done button is the only
       // action that downloads bytes.
-      const sealed = await api.shares.seal(share_id, { aiPii: aiPiiEnabled });
+      const sealPromise = api.shares.seal(share_id, { aiPii: aiPiiEnabled });
+      void refreshPackageProgress(share_id);
+      progressTimer = window.setInterval(() => {
+        void refreshPackageProgress(share_id);
+      }, 300);
+      const sealed = await sealPromise;
+      stopProgressPolling();
 
-      setPackageProgress(100);
-      setPackageLog('Done.');
+      setPackageProgress(sealed.packaging?.progress ?? 100);
+      setPackageLog(sealed.packaging?.message ?? 'Bundle ready.');
 
       // Bundle info — use `undefined` locale (empty-array form is a known
       // source of RangeError in some Intl configs).
@@ -1120,7 +1100,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       try { reload(); } catch { /* ignore */ }
       try { toast('Bundle ready', 'success'); } catch { /* ignore */ }
     } catch (err: unknown) {
-      clearAllTimers();
+      stopProgressPolling();
       const msg = err instanceof Error ? err.message : 'Package failed';
       const blockReason = err instanceof ApiError && typeof err.body.block_reason === 'string'
         ? err.body.block_reason
@@ -1131,6 +1111,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       setPackageLog(`Failed: ${msg}`);
       toast(msg, 'error');
     } finally {
+      stopProgressPolling();
       packagingStartedRef.current = false;
     }
   }, [approvedSessions, note, toast, aiPiiEnabled]);

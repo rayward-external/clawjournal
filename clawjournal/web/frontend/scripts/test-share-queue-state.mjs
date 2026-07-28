@@ -136,8 +136,10 @@ assert.match(reviewStep, /sorted\.slice\(0, visibleCount\)/);
 assert.doesNotMatch(reviewStep, /sorted\.map\(/);
 
 const shareIndex = await readFile(new URL('../src/views/Share/index.tsx', import.meta.url), 'utf8');
-assert.match(shareIndex, /\.slice\(0, PACKAGE_LOG_TRACE_LIMIT\)/);
-assert.match(shareIndex, /Math\.min\(PACKAGE_ANIMATION_MAX_MS, 2200 \+ approvedList\.length \* 220\)/);
+assert.doesNotMatch(shareIndex, /PACKAGE_LOG_TRACE_LIMIT|PACKAGE_ANIMATION_MAX_MS|animRemaining/);
+assert.match(shareIndex, /const sealPromise = api\.shares\.seal\(/);
+assert.match(shareIndex, /api\.shares\.packageStatus\(shareId\)/);
+assert.match(shareIndex, /window\.setInterval\(\(\) => \{/);
 assert.match(shareIndex, /cancelRedactionRun\(redactionRunRef\)/);
 assert.match(shareIndex, /return !data \|\| data\.loading/);
 assert.match(shareIndex, /signal: run\.controller\.signal/);

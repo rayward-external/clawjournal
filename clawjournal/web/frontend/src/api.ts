@@ -574,12 +574,33 @@ export const api = {
       session_count: number;
       zip_size_bytes?: number | null;
       redaction_summary: { total_redactions: number; by_type: Record<string, number> };
+      packaging?: {
+        share_id: string;
+        stage: string;
+        message: string;
+        progress: number;
+        updated_at: string | null;
+        timings_ms?: Record<string, number>;
+        zip_reused?: boolean;
+      };
     }> {
       return request(`/shares/${encodeURIComponent(id)}/seal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ai_pii: opts?.aiPii }),
       });
+    },
+
+    packageStatus(id: string): Promise<{
+      share_id: string;
+      stage: string;
+      message: string;
+      progress: number;
+      updated_at: string | null;
+      timings_ms?: Record<string, number>;
+      zip_reused?: boolean;
+    }> {
+      return request(`/shares/${encodeURIComponent(id)}/package-status`);
     },
 
     preview(id: string): Promise<SharePreview> {
