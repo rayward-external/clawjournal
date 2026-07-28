@@ -1,6 +1,8 @@
 const SUCCESS_SOUND_URL = '/sounds/submission-success.mp3';
 const SUCCESS_CHIME_VOLUME = 0.15;
-const SUCCESS_CHIME_DURATION_MS = 900;
+const SUCCESS_CHIME_HOLD_MS = 1500;
+const SUCCESS_CHIME_FADE_MS = 500;
+const SUCCESS_CHIME_FADE_STEP_MS = 25;
 
 let successSound: HTMLAudioElement | null = null;
 let primingPlayback: Promise<boolean> | null = null;
@@ -33,17 +35,40 @@ function clearPlaybackStop() {
   stopPlaybackTimer = null;
 }
 
+function finishPlayback(sound: HTMLAudioElement) {
+  sound.pause();
+  sound.currentTime = 0;
+  sound.volume = SUCCESS_CHIME_VOLUME;
+}
+
 function schedulePlaybackStop(sound: HTMLAudioElement) {
   clearPlaybackStop();
   stopPlaybackTimer = setTimeout(() => {
     stopPlaybackTimer = null;
-    try {
-      sound.pause();
-      sound.currentTime = 0;
-    } catch {
-      // Sound is optional; cleanup must not affect the completed submission.
-    }
-  }, SUCCESS_CHIME_DURATION_MS);
+    const initialVolume = sound.volume;
+    const fadeStartedAt = Date.now();
+    const fadeStep = () => {
+      try {
+        const elapsed = Date.now() - fadeStartedAt;
+        const progress = Math.min(1, elapsed / SUCCESS_CHIME_FADE_MS);
+        sound.volume = initialVolume * (1 - progress);
+        if (progress >= 1) {
+          stopPlaybackTimer = null;
+          finishPlayback(sound);
+          return;
+        }
+        stopPlaybackTimer = setTimeout(fadeStep, SUCCESS_CHIME_FADE_STEP_MS);
+      } catch {
+        stopPlaybackTimer = null;
+        try {
+          finishPlayback(sound);
+        } catch {
+          // Sound is optional; cleanup must not affect the completed submission.
+        }
+      }
+    };
+    fadeStep();
+  }, SUCCESS_CHIME_HOLD_MS);
 }
 
 /**

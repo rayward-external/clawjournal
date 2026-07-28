@@ -64,7 +64,7 @@ describe('success sound', () => {
     expect(sound.loop).toBe(false);
     expect(sound.volume).toBe(0.15);
 
-    vi.advanceTimersByTime(900);
+    vi.advanceTimersByTime(1500);
     expect(sound.pause).not.toHaveBeenCalled();
 
     resolvePrimingPlayback();
@@ -72,11 +72,19 @@ describe('success sound', () => {
     await Promise.resolve();
 
     expect(sound.play).toHaveBeenCalledOnce();
-    vi.advanceTimersByTime(899);
+    vi.advanceTimersByTime(1499);
     expect(sound.pause).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
+    expect(sound.pause).not.toHaveBeenCalled();
+    expect(sound.volume).toBe(0.15);
+    vi.advanceTimersByTime(250);
+    expect(sound.pause).not.toHaveBeenCalled();
+    expect(sound.volume).toBeGreaterThan(0);
+    expect(sound.volume).toBeLessThan(0.15);
+    vi.advanceTimersByTime(250);
     expect(sound.pause).toHaveBeenCalledOnce();
     expect(sound.currentTime).toBe(0);
+    expect(sound.volume).toBe(0.15);
   });
 
   it('stops silent playback when submission does not succeed', async () => {
@@ -135,7 +143,7 @@ describe('success sound', () => {
 
     expect(sound.play).toHaveBeenCalledOnce();
     expect(sound.pause).toHaveBeenCalledOnce();
-    vi.advanceTimersByTime(900);
+    vi.advanceTimersByTime(1500);
     expect(sound.pause).toHaveBeenCalledOnce();
   });
 });
