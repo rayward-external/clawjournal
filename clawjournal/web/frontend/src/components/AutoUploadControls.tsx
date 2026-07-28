@@ -3,7 +3,6 @@ import type { CSSProperties } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api.ts';
 import type {
-  AutoUploadAgent,
   AutoUploadAuthorizationChallenge,
   AutoUploadCandidateReport,
   AutoUploadStatus,
@@ -125,22 +124,12 @@ function disabledStyle(disabled: boolean): CSSProperties {
   return disabled ? { opacity: 0.5, cursor: 'not-allowed' } : {};
 }
 
-function selectedAgent(status: AutoUploadStatus): AutoUploadAgent {
-  const selected = new Set(
-    status.hooks
-      .filter(hook => hook.selected)
-      .map(hook => hook.agent),
-  );
-  if (selected.has('claude') && !selected.has('codex')) return 'claude';
-  if (selected.has('codex') && !selected.has('claude')) return 'codex';
-  return 'all';
-}
-
-function inferredAgent(sources: string[], fallback: AutoUploadAgent): AutoUploadAgent {
+function automaticCheckInAgents(sources: string[]): string {
   const selected = new Set(sources);
-  if (selected.has('claude') && !selected.has('codex')) return 'claude';
-  if (selected.has('codex') && !selected.has('claude')) return 'codex';
-  return fallback;
+  if (selected.has('claude') && selected.has('codex')) return 'Claude Code and Codex';
+  if (selected.has('claude')) return 'Claude Code';
+  if (selected.has('codex')) return 'Codex';
+  return 'No supported agents';
 }
 
 function StatusChip({ children, tone = 'neutral' }: {
@@ -209,7 +198,6 @@ function AuthorizationDialog({
   const requestedRef = useRef(false);
   const challengeRequestRef = useRef(0);
   const dialogRef = useRef<HTMLElement>(null);
-  const [agent, setAgent] = useState<AutoUploadAgent>(() => selectedAgent(initialStatus));
   const [challenge, setChallenge] = useState<AutoUploadAuthorizationChallenge | null>(null);
   const [accepted, setAccepted] = useState(false);
   // Protocol v2: the ownership certification is a distinct affirmative act,
@@ -254,7 +242,7 @@ function AuthorizationDialog({
     if (isCurrent()) setError(message);
   }, []);
 
-  const requestChallenge = useCallback(async (requestedAgent: AutoUploadAgent = agent) => {
+  const requestChallenge = useCallback(async () => {
     const requestId = challengeRequestRef.current + 1;
     challengeRequestRef.current = requestId;
     const isCurrent = () => challengeRequestRef.current === requestId;
@@ -268,7 +256,7 @@ function AuthorizationDialog({
     try {
       // challenge_only can never enroll by contract, so a success here means
       // the daemon violated that contract; refuse to treat it as enabled.
-      await api.autoUpload.enable({ agent: requestedAgent, challenge_only: true });
+      await api.autoUpload.enable({ agent: 'auto', challenge_only: true });
       if (isCurrent()) {
         setError('The service did not return the required authorization challenge. Review status before continuing.');
       }
@@ -277,7 +265,6 @@ function AuthorizationDialog({
       const next = challengeFromError(requestError);
       if (next) {
         setChallenge(next);
-        setAgent(current => inferredAgent(next.scope.sources, current));
       } else if (needsScopeSetup(requestError)) {
         try {
           const [config, projects] = await Promise.all([
@@ -338,7 +325,7 @@ function AuthorizationDialog({
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [agent, showEmailVerification]);
+  }, [showEmailVerification]);
 
   const dismissDialog = useCallback(() => {
     challengeRequestRef.current += 1;
@@ -367,10 +354,8 @@ function AuthorizationDialog({
       return;
     }
     if (!requestedRef.current) {
-      const currentAgent = selectedAgent(initialStatus);
-      setAgent(currentAgent);
       requestedRef.current = true;
-      void requestChallenge(currentAgent);
+      void requestChallenge();
     }
   }, [initialStatus, open, requestChallenge]);
 
@@ -464,13 +449,7 @@ function AuthorizationDialog({
       onScopeSaved?.(nextConfig);
       if (!isCurrent()) return;
       setSubmitting(false);
-      // Match the hook trigger to the scope just saved instead of the stale
-      // agent state: a claude-only scope must not install a codex hook.
-      const scopeAgent: AutoUploadAgent = scopeSource === 'both'
-        ? 'all'
-        : scopeSource as AutoUploadAgent;
-      setAgent(scopeAgent);
-      await requestChallenge(scopeAgent);
+      await requestChallenge();
     } catch (scopeError) {
       if (isCurrent()) {
         setError(errorMessage(scopeError, 'Could not save the automatic-upload scope.'));
@@ -488,7 +467,7 @@ function AuthorizationDialog({
     setSubmitting(true);
     try {
       const next = await api.autoUpload.enable({
-        agent,
+        agent: 'auto',
         accepted_authorization_version: challenge.authorization.version,
         accepted_retention_version: challenge.retention.version,
         accepted_ownership_certification_version: challenge.ownership_certification.version,
@@ -641,30 +620,14 @@ function AuthorizationDialog({
               : 'Future selected traces in this exact scope may be uploaded without you reviewing each bundle. This is separate from the consent you gave for the bundle you just reviewed.'}
         </p>
 
-        {/* Hidden during scope setup: its options carry the same labels as the
-            source-scope select below and answer a later question (which agent
-            sessions trigger runs, not what may be exported). */}
+        {/* SessionStart hooks follow the exact upload scope. Keeping this
+            read-only prevents a trigger selector from looking like a second,
+            conflicting data-scope control. */}
         {!scopeConfig && (
-          new Set(scope.sources.filter(source => source === 'claude' || source === 'codex')).size === 1 ? (
-            <SummaryItem
-              label="Run on agent sessions"
-              value={scope.sources.includes('codex') ? 'Codex' : 'Claude Code'}
-            />
-          ) : (
-            <label style={{ display: 'block', marginBottom: 14, fontSize: 12.5, color: colors.gray700 }}>
-              Run on agent sessions
-              <select
-                value={agent}
-                disabled={loading}
-                onChange={event => setAgent(event.target.value as AutoUploadAgent)}
-                style={{ ...selectStyle, display: 'block', marginTop: 5, minWidth: 220 }}
-              >
-                <option value="all">Claude Code and Codex</option>
-                <option value="claude">Claude Code</option>
-                <option value="codex">Codex</option>
-              </select>
-            </label>
-          )
+          <SummaryItem
+            label="Automatic check-ins"
+            value={automaticCheckInAgents(scope.sources) + ' - matches exact upload scope'}
+          />
         )}
 
         {scopeConfig ? (

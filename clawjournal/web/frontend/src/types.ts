@@ -227,7 +227,7 @@ export interface WorkbenchConfig {
 export type AutoUploadMode = 'off' | 'enabled' | 'paused';
 export type AutoUploadHealth = 'ready' | 'action_required' | 'retrying';
 export type AutoUploadOverlay = 'running' | 'revocation_pending' | null;
-export type AutoUploadAgent = 'claude' | 'codex' | 'all';
+export type AutoUploadAgent = 'claude' | 'codex' | 'all' | 'auto';
 
 export interface AutoUploadHookDiagnostic {
   agent: string;
