@@ -184,9 +184,19 @@ describe('AutoUploadOffer', () => {
     vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
       offer_available: true,
     }));
+    const bothSourcesChallenge = authorizationRequired();
+    (bothSourcesChallenge.body.scope as Record<string, unknown>).sources = ['claude', 'codex'];
+    (bothSourcesChallenge.body.scope as Record<string, unknown>).projects = [
+      'project-a',
+      'project-b',
+    ];
+    (bothSourcesChallenge.body.scope as Record<string, unknown>).entries = [
+      ['claude', 'project-a'],
+      ['codex', 'project-b'],
+    ];
     const enableSpy = vi.spyOn(api.autoUpload, 'enable')
       .mockRejectedValueOnce(scopeRequired())
-      .mockRejectedValueOnce(authorizationRequired());
+      .mockRejectedValueOnce(bothSourcesChallenge);
     vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
     const updateSpy = vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
       source: 'both',
@@ -238,11 +248,14 @@ describe('AutoUploadOffer', () => {
     }));
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
     expect(enableSpy).toHaveBeenNthCalledWith(2, {
-      agent: 'all',
+      agent: 'auto',
       challenge_only: true,
     });
     expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
-    expect(screen.getByText('claude → project-a')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
+    expect(screen.getByText('Claude Code and Codex - matches exact upload scope')).toBeInTheDocument();
+    expect(screen.getByText(/claude \u2192 project-a/)).toBeInTheDocument();
+    expect(screen.getByText(/codex \u2192 project-b/)).toBeInTheDocument();
   });
 
   it('retries with the hook matching a single-source scope after saving', async () => {
@@ -273,10 +286,10 @@ describe('AutoUploadOffer', () => {
     fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
     fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
 
-    // A claude-only scope must not schedule a codex SessionStart hook.
+    // The daemon derives SessionStart hooks from the exact saved scope.
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
     expect(enableSpy).toHaveBeenNthCalledWith(2, {
-      agent: 'claude',
+      agent: 'auto',
       challenge_only: true,
     });
   });
@@ -470,7 +483,7 @@ describe('AutoUploadOffer', () => {
     expect(screen.queryByText('Choose what automatic uploads may include')).not.toBeInTheDocument();
   });
 
-  it('enables inline with the receipt grant and infers the only agent', async () => {
+  it('enables inline with the receipt grant and lets the daemon infer hooks', async () => {
     const initial = status({
       offer_available: true,
       enrollment_grant_available: true,
@@ -516,7 +529,7 @@ describe('AutoUploadOffer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
-    expect(enableSpy.mock.calls[1][0].agent).toBe('codex');
+    expect(enableSpy.mock.calls[1][0].agent).toBe('auto');
     expect(uploadStatusSpy).not.toHaveBeenCalled();
   });
 });
@@ -589,7 +602,7 @@ describe('AutoUploadPanel authorization', () => {
     expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
   });
 
-  it('shows the distinct recurring wording, retains the selected hook, and rejects a stale GET after enable', async () => {
+  it('shows the distinct recurring wording, derives hooks from scope, and rejects a stale GET after enable', async () => {
     const initial = status({
       mode: 'enabled',
       run_now_allowed: true,
@@ -624,7 +637,8 @@ describe('AutoUploadPanel authorization', () => {
 
     await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
     expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
-    expect(enableSpy).toHaveBeenNthCalledWith(1, { agent: 'claude', challenge_only: true });
+    expect(enableSpy).toHaveBeenNthCalledWith(1, { agent: 'auto', challenge_only: true });
+    expect(screen.getByText('Claude Code - matches exact upload scope')).toBeInTheDocument();
     expect(screen.getByText(/separate from the consent you gave/i)).toBeInTheDocument();
     expect(screen.getByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();
@@ -648,7 +662,7 @@ describe('AutoUploadPanel authorization', () => {
 
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
     expect(enableSpy).toHaveBeenNthCalledWith(2, {
-      agent: 'claude',
+      agent: 'auto',
       accepted_authorization_version: 'recurring-v2',
       accepted_retention_version: 'retention-v3',
       accepted_ownership_certification_version: 'ownership-v1',
