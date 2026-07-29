@@ -246,6 +246,14 @@ describe('SubmitStep automatic-upload opt-in', () => {
     expect(screen.getByRole('button', {
       name: 'Refreshing history...',
     })).toBeDisabled();
+    // The reported scan has to reach the bar itself, not just the text under
+    // it: 42 of 118 projects sits inside the enrollment band, above anything
+    // the timed crawl can reach on its own.
+    await waitFor(() => {
+      expect(
+        Number(screen.getByRole('progressbar').getAttribute('aria-valuenow')),
+      ).toBe(97);
+    });
     await act(async () => {
       enableRequest.resolve(automaticUploadStatus({ mode: 'enabled' }));
       await Promise.resolve();
