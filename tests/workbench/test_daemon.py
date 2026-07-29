@@ -3344,6 +3344,61 @@ def _share_config(**overrides):
     return config
 
 
+def test_unambiguous_epoch_seconds_refuses_what_it_cannot_place():
+    from clawjournal.workbench.daemon import (
+        _AmbiguousTimestamp,
+        _expiry_timestamp,
+        _unambiguous_epoch_seconds,
+    )
+
+    aware = "2026-07-02T00:00:00+00:00"
+    assert _unambiguous_epoch_seconds(aware) == datetime(
+        2026, 7, 2, tzinfo=timezone.utc
+    ).timestamp()
+    assert _unambiguous_epoch_seconds("2026-07-02T00:00:00Z") == (
+        _unambiguous_epoch_seconds(aware)
+    )
+    # Epoch seconds are UTC by definition, so there is nothing to resolve.
+    assert _unambiguous_epoch_seconds(1_800_000_000) == 1_800_000_000.0
+    assert _unambiguous_epoch_seconds("1800000000") == 1_800_000_000.0
+    # Not supplied stays a legitimate answer; the caller decides what to do.
+    assert _unambiguous_epoch_seconds(None) is None
+
+    for unplaceable in (
+        "2026-07-02T00:00:00",       # no offset — the whole point
+        "2026-07-02",                # date only
+        "not a timestamp",
+        "",
+        True,
+        {"when": "now"},
+    ):
+        with pytest.raises(_AmbiguousTimestamp):
+            _unambiguous_epoch_seconds(unplaceable)
+
+    # Why a naive string has to be refused rather than guessed at: the same
+    # characters denote a different instant in every zone that reads them, and
+    # the client reading them is not the service that wrote them.
+    naive = "2026-07-02T00:00:00"
+    base = datetime.fromisoformat(naive)
+    readings = {
+        offset: base.replace(tzinfo=timezone(timedelta(hours=offset))).timestamp()
+        for offset in (0, 8, -7)
+    }
+    assert len(set(readings.values())) == 3
+    # The hazard is directional. A reader at a positive offset places the
+    # instant *earlier* than a UTC writer meant, so the receiver's head looks
+    # older than it is — the direction that licenses a rebase. A reader west of
+    # UTC places it later, which only blocks.
+    assert readings[8] < readings[0] < readings[-7]
+
+    # `_expiry_timestamp` still picks one of those readings (the local one).
+    # That is fine for an expiry this machine wrote, and is exactly why the
+    # lineage guard cannot use it against a remote clock.
+    assert _expiry_timestamp(naive) == base.timestamp()
+    with pytest.raises(_AmbiguousTimestamp):
+        _unambiguous_epoch_seconds(naive)
+
+
 def test_manual_lineage_preflight_must_stay_on_hosted_origin(monkeypatch):
     from clawjournal.workbench import daemon
 
@@ -5271,6 +5326,195 @@ class TestShareAPI:
             "clawjournal.workbench.daemon.urllib.request.urlopen",
             side_effect=_mock_urlopen_factory(
                 lineage_preflight=lineage_preflight,
+                upload_assert=lambda req: captured.update(
+                    manifest=self._manifest_from_upload(req)
+                ),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 200, data
+        assert captured["manifest"]["sessions"][0][
+            "replaces_revision_hash"
+        ] == receiver_head
+
+    def _rebase_preflight_server(self, session_id, receiver_head, accepted_at):
+        """A hosted server asking this session to rebase onto `receiver_head`."""
+        def lineage_preflight(payload):
+            claim = payload["sessions"][0]
+            ready = claim["replaces_revision_hash"] == receiver_head
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": session_id,
+                    "status": "ready" if ready else "rebase_required",
+                    "current_head_revision_hash": receiver_head,
+                    "current_head_accepted_at": accepted_at,
+                    "required_replaces_revision_hash": receiver_head,
+                }],
+            }
+        return lineage_preflight
+
+    def _continued_share(self, server, session_id):
+        """A share whose trace grew after an earlier revision was uploaded."""
+        from clawjournal.workbench.index import (
+            create_share,
+            open_index,
+            update_session,
+        )
+
+        self._seed_released_session(session_id, "first locally shared revision")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            first_share = create_share(conn, [session_id])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", first_share),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self._seed_released_session(session_id, "continued work after first upload")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            share_id = create_share(conn, [session_id])
+        finally:
+            conn.close()
+        status, exported = _post(server, f"/api/shares/{share_id}/export")
+        assert status == 200, exported
+        return share_id
+
+    def test_rebase_refuses_a_head_timestamp_without_a_utc_offset(
+        self, server, monkeypatch
+    ):
+        """A naive instant names no single moment, so it cannot clear the guard.
+
+        Read as local time at a positive UTC offset it lands in the past by the
+        size of the offset, which is the permissive direction — it would
+        license a rebase the participant never earned. That is the hosted
+        service breaking its contract, not something re-reviewing the trace can
+        fix, so it must not surface as share advice.
+        """
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "naive-timestamp-session"
+        share_id = self._continued_share(server, session_id)
+        receiver_head = "sha256:" + ("b" * 64)
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=self._rebase_preflight_server(
+                    session_id, receiver_head, "2026-07-02T00:00:00"
+                ),
+                upload_assert=lambda _req: pytest.fail("rebased on a naive instant"),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 502, data
+        assert "no UTC offset" in data["error"]
+
+        conn = open_index()
+        try:
+            stored = conn.execute(
+                "SELECT replaces_revision, predecessor_source "
+                "FROM share_sessions WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert stored["replaces_revision"] != receiver_head
+        assert stored["predecessor_source"] is None
+
+    def test_rebase_refuses_a_head_accepted_within_the_clock_skew_margin(
+        self, server, monkeypatch
+    ):
+        """Two clocks, one margin: a near-tie proves nothing and must block."""
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "skewed-clock-session"
+        share_id = self._continued_share(server, session_id)
+        receiver_head = "sha256:" + ("b" * 64)
+
+        conn = open_index()
+        try:
+            created_at = conn.execute(
+                "SELECT created_at FROM shares WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        # The receiver accepted its head one minute before this share was
+        # created — later in wall-clock terms, but well inside plausible drift.
+        accepted_at = datetime.fromisoformat(created_at) - timedelta(seconds=60)
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=self._rebase_preflight_server(
+                    session_id, receiver_head, accepted_at.isoformat()
+                ),
+                upload_assert=lambda _req: pytest.fail("rebased on a near-tie"),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 409, data
+        assert "too close together" in data["error"]
+        assert data["blocked_sessions"] == [session_id]
+
+    def test_rebase_allows_a_head_accepted_beyond_the_clock_skew_margin(
+        self, server, monkeypatch
+    ):
+        """Just past the margin the ordering is unambiguous, so it proceeds."""
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "clear-margin-session"
+        share_id = self._continued_share(server, session_id)
+        receiver_head = "sha256:" + ("b" * 64)
+
+        conn = open_index()
+        try:
+            created_at = conn.execute(
+                "SELECT created_at FROM shares WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        accepted_at = datetime.fromisoformat(created_at) - timedelta(seconds=301)
+
+        captured = {}
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=self._rebase_preflight_server(
+                    session_id, receiver_head, accepted_at.isoformat()
+                ),
                 upload_assert=lambda req: captured.update(
                     manifest=self._manifest_from_upload(req)
                 ),

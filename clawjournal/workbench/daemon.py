@@ -1416,6 +1416,50 @@ def _email_domain_allowed(
     )
 
 
+class _AmbiguousTimestamp(ValueError):
+    """An instant was supplied without enough information to place it."""
+
+
+def _unambiguous_epoch_seconds(value: Any) -> float | None:
+    """Return epoch seconds for a value that names one instant, or None.
+
+    Unlike ``_expiry_timestamp`` this refuses a timezone-less ISO string
+    instead of reading it as local time. That reading is harmless for a token
+    expiry the same machine wrote, but not for comparing a local clock against
+    a remote one: at a positive UTC offset it shifts the remote instant into
+    the past by the size of the offset (UTC+8 reads a UTC instant as 8 hours
+    earlier), which is the permissive direction for the lineage rebase guard.
+
+    Missing (None) is a legitimate "not supplied" and returns None. A value
+    that is present but cannot name an instant raises, so a malformed hosted
+    response surfaces as a protocol error rather than as advice to the
+    participant that they should create a new share.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise _AmbiguousTimestamp("Timestamp must not be a boolean.")
+    if isinstance(value, (int, float)):
+        # Epoch seconds are UTC by definition, so there is nothing to resolve.
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        raise _AmbiguousTimestamp("Timestamp must be a non-empty ISO 8601 string.")
+    raw = value.strip()
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _AmbiguousTimestamp(f"Timestamp {raw!r} is not ISO 8601.") from exc
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        raise _AmbiguousTimestamp(
+            f"Timestamp {raw!r} has no UTC offset, so it names no single instant."
+        )
+    return parsed.timestamp()
+
+
 def _expiry_timestamp(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -1593,6 +1637,12 @@ def _manual_share_lineage_claims(
 
 _LINEAGE_PREFLIGHT_ABSENT_STATUSES = frozenset({404, 405, 410, 501})
 
+# How far apart the participant's clock and the receiver's clock may plausibly
+# be. The rebase guard compares one against the other, so a gap smaller than
+# this proves nothing about which instant really came first and must not be
+# read as "my package is newer".
+_LINEAGE_CLOCK_SKEW_SECONDS = 300
+
 
 def _lineage_preflight_is_unavailable(exc: urllib.error.HTTPError) -> bool:
     """Whether a preflight failure means the capability is simply not there.
@@ -1710,11 +1760,23 @@ def _synchronize_manual_share_lineage(
             "blocked_sessions": stale_ids,
         }
 
-    share_created_at = _expiry_timestamp(share.get("created_at"))
+    try:
+        share_created_at = _unambiguous_epoch_seconds(share.get("created_at"))
+    except _AmbiguousTimestamp:
+        share_created_at = None
     for session_id, status in statuses.items():
         if status != "rebase_required":
             continue
-        receiver_accepted_at = _expiry_timestamp(head_accepted_at[session_id])
+        # A malformed instant here is the hosted service breaking the contract,
+        # not something the participant can fix by re-reviewing the trace.
+        try:
+            receiver_accepted_at = _unambiguous_epoch_seconds(
+                head_accepted_at[session_id]
+            )
+        except _AmbiguousTimestamp as exc:
+            raise ValueError(
+                f"Hosted lineage preflight returned an unusable head timestamp: {exc}"
+            ) from exc
         if (
             share_created_at is None
             or receiver_accepted_at is None
@@ -1725,6 +1787,22 @@ def _synchronize_manual_share_lineage(
                 "error": (
                     "This package was created before another revision reached the "
                     "hosted service. Review the latest trace and create a new share."
+                ),
+                "status": 409,
+                "blocked_sessions": [session_id],
+            }
+        # The two instants come from different clocks — the participant's and
+        # the receiver's — so a margin narrower than plausible drift proves
+        # nothing about which really happened first. Rebasing on a tie would
+        # declare that this package supersedes a head it may not contain, so
+        # anything inside the margin blocks and resolves itself as time passes.
+        if share_created_at - receiver_accepted_at <= _LINEAGE_CLOCK_SKEW_SECONDS:
+            return {
+                "supported": True,
+                "error": (
+                    "This package and another revision reached the hosted service "
+                    "too close together to tell apart. Wait a few minutes, then "
+                    "review the latest trace and create a new share."
                 ),
                 "status": 409,
                 "blocked_sessions": [session_id],
