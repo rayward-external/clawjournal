@@ -10,6 +10,8 @@ import pytest
 
 from clawjournal.workbench.index import (
     EXACT_SCOPE_PAIRS_SCHEMA_VERSION,
+    PREDECESSOR_SOURCE_RECEIVER,
+    RECEIVER_PREDECESSOR_SCHEMA_VERSION,
     RECURRING_PROTOCOL_V2_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
     already_shared_revision_blockers,
@@ -108,8 +110,9 @@ def _mark_shared(conn, session_id: str) -> str:
 
 def test_fresh_schema_has_auto_upload_foundation(index_conn):
     assert index_conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
-    assert WORKBENCH_SCHEMA_VERSION == EXACT_SCOPE_PAIRS_SCHEMA_VERSION
+    assert WORKBENCH_SCHEMA_VERSION == RECEIVER_PREDECESSOR_SCHEMA_VERSION
     assert EXACT_SCOPE_PAIRS_SCHEMA_VERSION == 10
+    assert RECEIVER_PREDECESSOR_SCHEMA_VERSION == 11
     assert RECURRING_PROTOCOL_V2_SCHEMA_VERSION == 9
 
     session_columns = {
@@ -647,3 +650,45 @@ def test_candidate_report_fails_closed_when_enrolled_scope_loses_confirmation(in
         "enrolled_project_removed",
     ]
     assert report["exclusion_counts"]["scope_confirmation_changed"] == 1
+
+
+def test_v11_migration_adds_the_receiver_predecessor_marker(tmp_path, monkeypatch):
+    """An index predating the marker must upgrade to the strict reading.
+
+    NULL is the create-time local baseline, so every historical share keeps the
+    behavior it had before the lineage preflight existed.
+    """
+    db_path = tmp_path / "index.db"
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", db_path)
+    monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+
+    conn = open_index()
+    upsert_sessions(conn, [_session("trace-legacy")])
+    set_hold_state(conn, "trace-legacy", "released", changed_by="user", reason="t")
+    share_id = create_share(conn, ["trace-legacy"])
+    conn.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("ALTER TABLE share_sessions DROP COLUMN predecessor_source")
+    raw.execute(f"PRAGMA user_version = {EXACT_SCOPE_PAIRS_SCHEMA_VERSION}")
+    raw.commit()
+    raw.close()
+
+    conn = open_index()
+    try:
+        assert conn.execute(
+            "PRAGMA user_version"
+        ).fetchone()[0] == WORKBENCH_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT predecessor_source FROM share_sessions WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()[0] is None
+        # The column exists and is writable at the new version.
+        conn.execute(
+            "UPDATE share_sessions SET predecessor_source = ? WHERE share_id = ?",
+            (PREDECESSOR_SOURCE_RECEIVER, share_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()

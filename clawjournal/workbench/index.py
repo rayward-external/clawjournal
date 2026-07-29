@@ -44,8 +44,10 @@ BLOBS_DIR = CONFIG_DIR / "blobs"
 # version 7 adds the local automatic-upload enrollment/candidate foundation,
 # and version 8 adds durable per-agent hook observations plus the raw-source
 # fingerprint snapshot needed to recover a sealed artifact safely, version 9
-# pins hosted recurring-protocol-v2 authorization metadata, and version 10
-# stores the exact source/project pair snapshot used by recurring selection.
+# pins hosted recurring-protocol-v2 authorization metadata, version 10
+# stores the exact source/project pair snapshot used by recurring selection,
+# and version 11 records which share predecessors the hosted receiver dictated
+# so a retried submission can tell them apart from a locally stale claim.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
@@ -55,7 +57,13 @@ AUTO_UPLOAD_FOUNDATION_SCHEMA_VERSION = 7
 AUTO_UPLOAD_SCHEMA_VERSION = 8
 RECURRING_PROTOCOL_V2_SCHEMA_VERSION = 9
 EXACT_SCOPE_PAIRS_SCHEMA_VERSION = 10
-WORKBENCH_SCHEMA_VERSION = EXACT_SCOPE_PAIRS_SCHEMA_VERSION
+RECEIVER_PREDECESSOR_SCHEMA_VERSION = 11
+WORKBENCH_SCHEMA_VERSION = RECEIVER_PREDECESSOR_SCHEMA_VERSION
+
+# `share_sessions.predecessor_source` values. NULL means the predecessor is the
+# create-time local baseline; RECEIVER means the hosted lineage preflight
+# dictated it and local revision history cannot validate it.
+PREDECESSOR_SOURCE_RECEIVER = "receiver"
 BACKFILL_WINDOW = 100
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
 SHARE_RECOMMENDATION_LIMIT = 10
@@ -178,11 +186,12 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 
 CREATE TABLE IF NOT EXISTS share_sessions (
-    share_id          TEXT NOT NULL REFERENCES shares(share_id),
-    session_id        TEXT NOT NULL REFERENCES sessions(session_id),
-    added_at          TEXT NOT NULL,
-    content_revision  TEXT,
-    replaces_revision TEXT,
+    share_id           TEXT NOT NULL REFERENCES shares(share_id),
+    session_id         TEXT NOT NULL REFERENCES sessions(session_id),
+    added_at           TEXT NOT NULL,
+    content_revision   TEXT,
+    replaces_revision  TEXT,
+    predecessor_source TEXT,
     PRIMARY KEY (share_id, session_id)
 );
 
@@ -613,6 +622,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_auto_upload_recovery_metadata(conn)
     _migrate_recurring_protocol_v2(conn)
     _migrate_exact_scope_pairs(conn)
+    _migrate_receiver_predecessor(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -1078,6 +1088,39 @@ def _migrate_exact_scope_pairs(conn: sqlite3.Connection) -> None:
             )
 
         conn.execute(f"PRAGMA user_version = {EXACT_SCOPE_PAIRS_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_receiver_predecessor(conn: sqlite3.Connection) -> None:
+    """Advance v10 -> v11 with the receiver-dictated predecessor marker.
+
+    Rebinding a share to the hosted receiver's head writes a predecessor that
+    local revision history cannot reproduce, so the stale-predecessor gate
+    cannot tell it apart from a claim a newer local upload has overtaken.
+    Existing rows keep NULL, which reads as the create-time local baseline —
+    the strict interpretation, and the correct one for every share that
+    predates the lineage preflight.
+    """
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= RECEIVER_PREDECESSOR_SCHEMA_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        try:
+            conn.execute(
+                "ALTER TABLE share_sessions ADD COLUMN predecessor_source TEXT"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc):
+                raise
+        conn.execute(
+            f"PRAGMA user_version = {RECEIVER_PREDECESSOR_SCHEMA_VERSION}"
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -4439,10 +4482,20 @@ def synchronize_share_predecessors(
             required = required_predecessors[session_id]
             if row["replaces_revision"] == required:
                 continue
+            # Mark only the rows the receiver actually redirected. Marking a row
+            # whose predecessor already matched would disable the local stale
+            # check for ordinary shares, where it still does real work.
             conn.execute(
-                "UPDATE share_sessions SET replaces_revision = ? "
+                "UPDATE share_sessions "
+                "SET replaces_revision = ?, predecessor_source = ? "
                 "WHERE share_id = ? AND session_id = ? AND content_revision = ?",
-                (required, share_id, session_id, expected_revisions[session_id]),
+                (
+                    required,
+                    PREDECESSOR_SOURCE_RECEIVER,
+                    share_id,
+                    session_id,
+                    expected_revisions[session_id],
+                ),
             )
             changed += 1
         conn.commit()
@@ -5277,9 +5330,19 @@ def share_predecessor_blockers(
     this share's own revision, it is a known duplicate. Any third revision
     means a newer replacement won the race and this share must not overwrite
     it.
+
+    A row the hosted receiver redirected (``predecessor_source`` is
+    ``receiver``) is exempt from that last rule, because its predecessor is the
+    receiver's head rather than anything local revision history can reproduce —
+    reading it as a third revision is what stranded a rebound share after a
+    failed attempt. The duplicate check above still applies, and the receiver's
+    own compare-and-set remains the authority on whether the claim is current.
+    ``accepted_predecessors`` carries the same exemption for the response being
+    processed right now; the column is what makes it survive a retry.
     """
     rows = conn.execute(
-        "SELECT session_id, content_revision, replaces_revision "
+        "SELECT session_id, content_revision, replaces_revision, "
+        "predecessor_source "
         "FROM share_sessions WHERE share_id = ? ORDER BY session_id",
         (share_id,),
     ).fetchall()
@@ -5298,6 +5361,8 @@ def share_predecessor_blockers(
         if latest == row["content_revision"]:
             reason = "already_shared_revision"
         elif latest == row["replaces_revision"]:
+            continue
+        elif row["predecessor_source"] == PREDECESSOR_SOURCE_RECEIVER:
             continue
         elif (
             accepted_predecessors is not None
