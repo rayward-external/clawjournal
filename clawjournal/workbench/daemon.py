@@ -346,6 +346,8 @@ _share_rate_lock = threading.Lock()
 _share_zip_cache_lock = threading.RLock()
 _share_package_progress_lock = threading.Lock()
 _share_package_progress: dict[str, dict[str, Any]] = {}
+_auto_upload_enable_progress_lock = threading.Lock()
+_auto_upload_enable_progress: dict[str, dict[str, Any]] = {}
 _auto_upload_run_lock = threading.Lock()
 _auto_upload_run_thread: threading.Thread | None = None
 _HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
@@ -2136,6 +2138,48 @@ def _get_share_package_progress(share_id: str) -> dict[str, Any] | None:
         return dict(payload) if payload is not None else None
 
 
+def _set_auto_upload_enable_progress(
+    progress_id: str,
+    *,
+    stage: str,
+    message: str,
+    source: str | None = None,
+    current_project: int | None = None,
+    total_projects: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "progress_id": progress_id,
+        "stage": stage,
+        "message": message,
+        "source": source,
+        "current_project": current_project,
+        "total_projects": total_projects,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with _auto_upload_enable_progress_lock:
+        if (
+            progress_id not in _auto_upload_enable_progress
+            and len(_auto_upload_enable_progress) >= 100
+        ):
+            oldest = min(
+                _auto_upload_enable_progress,
+                key=lambda key: _auto_upload_enable_progress[key].get(
+                    "updated_at", ""
+                ),
+            )
+            _auto_upload_enable_progress.pop(oldest, None)
+        _auto_upload_enable_progress[progress_id] = payload
+    return dict(payload)
+
+
+def _get_auto_upload_enable_progress(
+    progress_id: str,
+) -> dict[str, Any] | None:
+    with _auto_upload_enable_progress_lock:
+        payload = _auto_upload_enable_progress.get(progress_id)
+        return dict(payload) if payload is not None else None
+
+
 def _share_zip_input_snapshot(export_dir: Path) -> dict[str, Any]:
     missing = [
         name for name in _SHARE_ZIP_REQUIRED_FILES
@@ -3798,6 +3842,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_share_upload_status()
         elif path == "/api/auto-upload/status":
             self._handle_auto_upload_status()
+        elif path.startswith("/api/auto-upload/enable-progress/"):
+            progress_id = unquote(
+                path[len("/api/auto-upload/enable-progress/"):]
+            )
+            self._handle_auto_upload_enable_progress(progress_id)
         elif path == "/api/auto-upload/preview":
             self._handle_auto_upload_preview(refresh=False)
         elif path == "/api/scoring/backend":
@@ -5027,6 +5076,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         self._send_auto_upload_result(status())
 
+    def _handle_auto_upload_enable_progress(
+        self, progress_id: str
+    ) -> None:
+        payload = _get_auto_upload_enable_progress(progress_id)
+        if payload is None:
+            _json_response(self, {"error": "Enable progress not found"}, 404)
+            return
+        _json_response(self, payload)
+
     def _handle_auto_upload_preview(self, *, refresh: bool) -> None:
         from ..auto_upload import preview
 
@@ -5036,35 +5094,115 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         from ..auto_upload import enable
 
         body = _read_body(self) or {}
-        self._send_auto_upload_result(
-            enable(
-                agent=str(body.get("agent") or "all"),
-                accepted_authorization_version=(
-                    str(body["accepted_authorization_version"])
-                    if body.get("accepted_authorization_version") is not None
-                    else None
+        profile_hash = (
+            str(body["accepted_authorization_profile_hash"])
+            if body.get("accepted_authorization_profile_hash") is not None
+            else None
+        )
+        progress_id = (
+            str(body["progress_id"])
+            if body.get("progress_id") is not None
+            else None
+        )
+        track_progress = (
+            bool(progress_id)
+            and bool(profile_hash)
+            and not bool(body.get("challenge_only"))
+        )
+
+        if track_progress and (
+            len(progress_id or "") > 128
+            or re.fullmatch(r"[A-Za-z0-9._:-]+", progress_id or "") is None
+        ):
+            _json_response(self, {"error": "Invalid progress identifier"}, 400)
+            return
+
+        def scan_wait_notice() -> None:
+            if progress_id is not None:
+                _set_auto_upload_enable_progress(
+                    progress_id,
+                    stage="waiting_for_scan_lock",
+                    message="Waiting for another scan to finish before refreshing...",
+                )
+
+        def scan_progress(source: str, current: int, total: int) -> None:
+            if progress_id is None:
+                return
+            source_label = {
+                "claude": "Claude Code",
+                "codex": "Codex",
+            }.get(source, source)
+            _set_auto_upload_enable_progress(
+                progress_id,
+                stage="scanning",
+                message=(
+                    f"Refreshing {source_label} source logs: "
+                    f"{current}/{total} projects"
                 ),
-                accepted_retention_version=(
-                    str(body["accepted_retention_version"])
-                    if body.get("accepted_retention_version") is not None
-                    else None
-                ),
-                accepted_ownership_certification_version=(
-                    str(body["accepted_ownership_certification_version"])
-                    if body.get("accepted_ownership_certification_version") is not None
-                    else None
-                ),
-                accepted_authorization_profile_hash=(
-                    str(body["accepted_authorization_profile_hash"])
-                    if body.get("accepted_authorization_profile_hash") is not None
-                    else None
-                ),
-                challenge_only=bool(body.get("challenge_only")),
-                prepare_for_manual_share=bool(
-                    body.get("prepare_for_manual_share")
+                source=source,
+                current_project=current,
+                total_projects=total,
+            )
+
+        if track_progress and progress_id is not None:
+            _set_auto_upload_enable_progress(
+                progress_id,
+                stage="checking_hosted_service",
+                message="Checking the hosted service and current terms...",
+            )
+
+        enable_kwargs: dict[str, Any] = {
+            "agent": str(body.get("agent") or "all"),
+            "accepted_authorization_version": (
+                str(body["accepted_authorization_version"])
+                if body.get("accepted_authorization_version") is not None
+                else None
+            ),
+            "accepted_retention_version": (
+                str(body["accepted_retention_version"])
+                if body.get("accepted_retention_version") is not None
+                else None
+            ),
+            "accepted_ownership_certification_version": (
+                str(body["accepted_ownership_certification_version"])
+                if body.get("accepted_ownership_certification_version") is not None
+                else None
+            ),
+            "accepted_authorization_profile_hash": profile_hash,
+            "challenge_only": bool(body.get("challenge_only")),
+            "prepare_for_manual_share": bool(
+                body.get("prepare_for_manual_share")
+            ),
+        }
+        if track_progress:
+            enable_kwargs["scan_progress"] = scan_progress
+            enable_kwargs["scan_wait_notice"] = scan_wait_notice
+
+        try:
+            result = enable(**enable_kwargs)
+        except Exception:
+            if track_progress and progress_id is not None:
+                _set_auto_upload_enable_progress(
+                    progress_id,
+                    stage="failed",
+                    message="Automatic upload could not be enabled.",
+                )
+            raise
+
+        if track_progress and progress_id is not None:
+            _set_auto_upload_enable_progress(
+                progress_id,
+                stage="complete" if result.get("ok") else "failed",
+                message=(
+                    "Automatic upload enabled."
+                    if result.get("ok")
+                    else str(
+                        result.get("message")
+                        or "Automatic upload could not be enabled."
+                    )
                 ),
             )
-        )
+        self._send_auto_upload_result(result)
 
     def _handle_auto_upload_run(self) -> None:
         global _auto_upload_run_thread

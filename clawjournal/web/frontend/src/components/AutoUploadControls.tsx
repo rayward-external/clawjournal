@@ -2,9 +2,14 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api.ts';
+import {
+  createAutoUploadEnableProgressId,
+  startAutoUploadEnableProgressPolling,
+} from '../autoUploadEnableProgress.ts';
 import type {
   AutoUploadAuthorizationChallenge,
   AutoUploadCandidateReport,
+  AutoUploadEnableProgress,
   AutoUploadStatus,
   ProjectSummary,
   WorkbenchConfig,
@@ -222,6 +227,8 @@ function AuthorizationDialog({
   const [scopeProjects, setScopeProjects] = useState<ProjectSummary[]>([]);
   const [scopeSource, setScopeSource] = useState('');
   const [scopeProjectsConfirmed, setScopeProjectsConfirmed] = useState(false);
+  const [enableProgress, setEnableProgress] =
+    useState<AutoUploadEnableProgress | null>(null);
 
   const showEmailVerification = useCallback(async (
     message: string,
@@ -351,6 +358,7 @@ function AuthorizationDialog({
       setScopeProjects([]);
       setScopeSource('');
       setScopeProjectsConfirmed(false);
+      setEnableProgress(null);
       return;
     }
     if (!requestedRef.current) {
@@ -465,6 +473,11 @@ function AuthorizationDialog({
   const enableWithAcceptedTerms = async () => {
     if (!challenge || !accepted || !ownershipCertified) return;
     setSubmitting(true);
+    const progressId = createAutoUploadEnableProgressId();
+    const stopProgressPolling = startAutoUploadEnableProgressPolling(
+      progressId,
+      setEnableProgress,
+    );
     try {
       const next = await api.autoUpload.enable({
         agent: 'auto',
@@ -472,6 +485,7 @@ function AuthorizationDialog({
         accepted_retention_version: challenge.retention.version,
         accepted_ownership_certification_version: challenge.ownership_certification.version,
         accepted_authorization_profile_hash: challenge.authorization_profile_hash,
+        progress_id: progressId,
       });
       onEnabled(next);
       toast('Automatic upload enabled', 'success');
@@ -490,6 +504,8 @@ function AuthorizationDialog({
         setError(errorMessage(enableError, 'Could not enable automatic upload.'));
       }
     } finally {
+      stopProgressPolling();
+      setEnableProgress(null);
       setSubmitting(false);
     }
   };
@@ -956,6 +972,36 @@ function AuthorizationDialog({
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {submitting && enableProgress && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              marginTop: 14,
+              padding: '10px 12px',
+              border: `1px solid ${colors.primary200}`,
+              borderRadius: 8,
+              background: colors.primary50,
+              color: colors.gray800,
+              fontSize: 12.5,
+              lineHeight: 1.45,
+            }}
+          >
+            <div>{enableProgress.message}</div>
+            {enableProgress.stage === 'scanning'
+              && enableProgress.current_project !== null
+              && enableProgress.total_projects !== null
+              && enableProgress.total_projects > 0 && (
+                <progress
+                  aria-label="Automatic upload enrollment refresh"
+                  value={enableProgress.current_project}
+                  max={enableProgress.total_projects}
+                  style={{ width: '100%', marginTop: 8 }}
+                />
+              )}
           </div>
         )}
 

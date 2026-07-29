@@ -25,6 +25,7 @@ import type {
   WorkbenchConfig,
   AutoUploadAgent,
   AutoUploadCandidateReport,
+  AutoUploadEnableProgress,
   AutoUploadHookDiagnostic,
   AutoUploadStatus,
 } from './types.ts';
@@ -364,6 +365,7 @@ export const api = {
       accepted_authorization_profile_hash?: string;
       challenge_only?: boolean;
       prepare_for_manual_share?: boolean;
+      progress_id?: string;
     }): Promise<AutoUploadStatus> {
       const status = await request<Partial<AutoUploadStatus>>('/auto-upload/enable', {
         method: 'POST',
@@ -371,6 +373,12 @@ export const api = {
         body: JSON.stringify(body),
       });
       return normalizeAutoUploadStatus(status);
+    },
+
+    enableProgress(progressId: string): Promise<AutoUploadEnableProgress> {
+      return request(
+        `/auto-upload/enable-progress/${encodeURIComponent(progressId)}`,
+      );
     },
 
     async run(): Promise<AutoUploadStatus> {

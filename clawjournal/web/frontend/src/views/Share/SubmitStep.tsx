@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api.ts';
+import {
+  createAutoUploadEnableProgressId,
+  startAutoUploadEnableProgressPolling,
+} from '../../autoUploadEnableProgress.ts';
 import { colors } from '../../theme.ts';
 import { Spinner } from '../../components/Spinner.tsx';
 import { challengeFromError } from '../../components/autoUploadChallenge.ts';
 import type {
   AutoUploadAgent,
   AutoUploadAuthorizationChallenge,
+  AutoUploadEnableProgress,
   AutoUploadStatus,
 } from '../../types.ts';
 import type { HostedConsent, ShareDestination } from './types.ts';
@@ -68,6 +73,8 @@ export function SubmitStep(p: SubmitStepProps) {
   const [showAutomaticUploadDetails, setShowAutomaticUploadDetails] = useState(false);
   const [showAcceptedDomains, setShowAcceptedDomains] = useState(false);
   const [enablingAutomaticUploads, setEnablingAutomaticUploads] = useState(false);
+  const [automaticUploadEnableProgress, setAutomaticUploadEnableProgress] =
+    useState<AutoUploadEnableProgress | null>(null);
   const [busy, setBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitStageIndex, setSubmitStageIndex] = useState(0);
@@ -280,6 +287,11 @@ export function SubmitStep(p: SubmitStepProps) {
       let automaticUploadEnabled = false;
       if (enableAutomaticUploads && autoUploadChallenge) {
         setEnablingAutomaticUploads(true);
+        const progressId = createAutoUploadEnableProgressId();
+        const stopProgressPolling = startAutoUploadEnableProgressPolling(
+          progressId,
+          setAutomaticUploadEnableProgress,
+        );
         try {
           await api.autoUpload.enable({
             agent: automaticUploadAgent(autoUploadChallenge),
@@ -290,6 +302,7 @@ export function SubmitStep(p: SubmitStepProps) {
               autoUploadChallenge.ownership_certification.version,
             accepted_authorization_profile_hash:
               autoUploadChallenge.authorization_profile_hash,
+            progress_id: progressId,
           });
           automaticUploadEnabled = true;
         } catch {
@@ -301,6 +314,8 @@ export function SubmitStep(p: SubmitStepProps) {
             'info',
           );
         } finally {
+          stopProgressPolling();
+          setAutomaticUploadEnableProgress(null);
           setEnablingAutomaticUploads(false);
         }
       }
@@ -354,9 +369,25 @@ export function SubmitStep(p: SubmitStepProps) {
   const supportContact = consent?.support_contact || p.shareDestination?.support_contact || null;
   const currentSubmitStage = enablingAutomaticUploads
     ? {
-        buttonLabel: 'Enabling automatic uploads...',
-        detail: 'Confirming the exact recurring scope and installing the session hook.',
-        progress: 96,
+        buttonLabel: automaticUploadEnableProgress?.stage === 'waiting_for_scan_lock'
+          ? 'Waiting for scanner...'
+          : automaticUploadEnableProgress?.stage === 'scanning'
+            ? 'Refreshing history...'
+            : 'Enabling automatic uploads...',
+        detail: automaticUploadEnableProgress?.message
+          ?? 'Confirming the exact recurring scope and installing the session hook.',
+        progress: automaticUploadEnableProgress?.stage === 'scanning'
+          && automaticUploadEnableProgress.current_project !== null
+          && automaticUploadEnableProgress.total_projects
+          ? Math.min(
+              99,
+              94 + Math.round(
+                5
+                * automaticUploadEnableProgress.current_project
+                / automaticUploadEnableProgress.total_projects,
+              ),
+            )
+          : 96,
       }
     : submitStages[submitStageIndex] ?? submitStages[0];
   const submitPipelineLabel = p.aiPiiEnabled

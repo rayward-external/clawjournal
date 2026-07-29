@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError } from '../../api.ts';
 import type { AutoUploadStatus } from '../../types.ts';
@@ -10,6 +10,16 @@ vi.mock('./successChime.ts', () => ({
   playSuccessChime: vi.fn(),
   primeSuccessChime: vi.fn(),
 }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function automaticUploadStatus(
   overrides: Partial<AutoUploadStatus> = {},
@@ -163,6 +173,7 @@ describe('SubmitStep automatic-upload opt-in', () => {
 
   it('uses the manual receipt grant to enable automatic uploads in one submit', async () => {
     const calls: string[] = [];
+    const enableRequest = deferred<AutoUploadStatus>();
     vi.spyOn(api.share, 'consent').mockResolvedValue({
       consent_text: 'Manual share consent.',
       retention_text: 'Manual retention terms.',
@@ -182,8 +193,17 @@ describe('SubmitStep automatic-upload opt-in', () => {
       .mockRejectedValueOnce(authorizationRequired())
       .mockImplementationOnce(async () => {
         calls.push('enable');
-        return automaticUploadStatus({ mode: 'enabled' });
+        return enableRequest.promise;
       });
+    vi.spyOn(api.autoUpload, 'enableProgress').mockResolvedValue({
+      progress_id: 'progress-issue165',
+      stage: 'scanning',
+      message: 'Refreshing Codex source logs: 42/118 projects',
+      source: 'codex',
+      current_project: 42,
+      total_projects: 118,
+      updated_at: '2026-07-29T00:00:00Z',
+    });
     vi.spyOn(api.shares, 'upload').mockImplementation(async () => {
       calls.push('upload');
       return {
@@ -218,6 +238,19 @@ describe('SubmitStep automatic-upload opt-in', () => {
       name: 'Submit and enable automatic uploads',
     }));
 
+    expect(await screen.findByText(
+      'Refreshing Codex source logs: 42/118 projects',
+      {},
+      { timeout: 2_000 },
+    )).toBeInTheDocument();
+    expect(screen.getByRole('button', {
+      name: 'Refreshing history...',
+    })).toBeDisabled();
+    await act(async () => {
+      enableRequest.resolve(automaticUploadStatus({ mode: 'enabled' }));
+      await Promise.resolve();
+    });
+
     await waitFor(() => {
       expect(onSubmitted).toHaveBeenCalledWith(
         'receipt-1',
@@ -232,6 +265,7 @@ describe('SubmitStep automatic-upload opt-in', () => {
       accepted_retention_version: 'retention-v1',
       accepted_ownership_certification_version: 'ownership-v1',
       accepted_authorization_profile_hash: 'profile-hash-v3',
+      progress_id: expect.any(String),
     });
     expect(toast).toHaveBeenCalledWith(
       'Submitted and automatic uploads enabled',

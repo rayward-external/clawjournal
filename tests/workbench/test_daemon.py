@@ -336,6 +336,7 @@ def _delete(port, path, *, skip_auth=False):
     ("method", "path"),
     [
         ("get", "/api/auto-upload/status"),
+        ("get", "/api/auto-upload/enable-progress/missing-profile"),
         ("get", "/api/auto-upload/preview"),
         ("post", "/api/auto-upload/preview"),
         ("post", "/api/auto-upload/enable"),
@@ -431,6 +432,84 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "prepare_for_manual_share": False,
         }
     ]
+
+
+def test_auto_upload_enable_reports_lock_wait_and_scan_progress(server, monkeypatch):
+    from clawjournal import auto_upload
+
+    waiting = Event()
+    continue_to_scan = Event()
+    scanning = Event()
+    finish = Event()
+    response = {}
+    profile_hash = "profile-progress-v2"
+    progress_id = "progress-issue165"
+
+    def fake_enable(**kwargs):
+        kwargs["scan_wait_notice"]()
+        waiting.set()
+        if not continue_to_scan.wait(timeout=5):
+            raise AssertionError("test did not release scan-lock wait")
+        kwargs["scan_progress"]("codex", 42, 118)
+        scanning.set()
+        if not finish.wait(timeout=5):
+            raise AssertionError("test did not release scan progress")
+        return {"ok": True, "mode": "enabled", "health": "ready"}
+
+    monkeypatch.setattr(auto_upload, "enable", fake_enable)
+
+    def post_enable():
+        response["value"] = _post(
+            server,
+            "/api/auto-upload/enable",
+            {
+                "agent": "codex",
+                "accepted_authorization_profile_hash": profile_hash,
+                "progress_id": progress_id,
+            },
+        )
+
+    thread = Thread(target=post_enable, daemon=True)
+    thread.start()
+    try:
+        assert waiting.wait(timeout=5)
+        status_code, body = _get(
+            server, f"/api/auto-upload/enable-progress/{progress_id}"
+        )
+        assert status_code == 200
+        assert body == {
+            "progress_id": progress_id,
+            "stage": "waiting_for_scan_lock",
+            "message": "Waiting for another scan to finish before refreshing...",
+            "source": None,
+            "current_project": None,
+            "total_projects": None,
+            "updated_at": body["updated_at"],
+        }
+
+        continue_to_scan.set()
+        assert scanning.wait(timeout=5)
+        status_code, body = _get(
+            server, f"/api/auto-upload/enable-progress/{progress_id}"
+        )
+        assert status_code == 200
+        assert body["stage"] == "scanning"
+        assert body["source"] == "codex"
+        assert body["current_project"] == 42
+        assert body["total_projects"] == 118
+        assert body["message"] == "Refreshing Codex source logs: 42/118 projects"
+    finally:
+        continue_to_scan.set()
+        finish.set()
+        thread.join(timeout=5)
+
+    assert response["value"][0] == 200
+    status_code, body = _get(
+        server, f"/api/auto-upload/enable-progress/{progress_id}"
+    )
+    assert status_code == 200
+    assert body["stage"] == "complete"
+    assert body["message"] == "Automatic upload enabled."
 
 
 def test_auto_upload_enable_forwards_manual_share_preparation(server, monkeypatch):
