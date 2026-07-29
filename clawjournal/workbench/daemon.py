@@ -348,8 +348,41 @@ _share_package_progress_lock = threading.Lock()
 _share_package_progress: dict[str, dict[str, Any]] = {}
 _auto_upload_run_lock = threading.Lock()
 _auto_upload_run_thread: threading.Thread | None = None
+_auto_upload_enrollment_lock = threading.Lock()
+_auto_upload_enrollment_thread: threading.Thread | None = None
 _HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
 _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
+
+
+def _start_auto_upload_enrollment_worker() -> bool:
+    """Start or resume the durable enrollment job without blocking HTTP."""
+
+    global _auto_upload_enrollment_thread
+
+    from ..auto_upload import has_pending_enrollment_job, run_pending_enrollment_job
+
+    with _auto_upload_enrollment_lock:
+        if (
+            _auto_upload_enrollment_thread is not None
+            and _auto_upload_enrollment_thread.is_alive()
+        ):
+            return False
+        if not has_pending_enrollment_job():
+            return False
+
+        def run_background() -> None:
+            try:
+                run_pending_enrollment_job()
+            except Exception:
+                logger.exception("Background automatic-upload enrollment crashed")
+
+        _auto_upload_enrollment_thread = threading.Thread(
+            target=run_background,
+            name="clawjournal-auto-upload-enrollment",
+            daemon=True,
+        )
+        _auto_upload_enrollment_thread.start()
+        return True
 
 # Sources supported in the workbench (scientist-facing subset)
 WORKBENCH_SOURCES = {
@@ -5111,9 +5144,37 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self._send_auto_upload_result(preview(refresh=refresh))
 
     def _handle_auto_upload_enable(self) -> None:
-        from ..auto_upload import enable
+        from ..auto_upload import enable, queue_enable
 
         body = _read_body(self) or {}
+        if bool(body.get("background")):
+            result = queue_enable(
+                agent=str(body.get("agent") or "all"),
+                accepted_authorization_version=(
+                    str(body["accepted_authorization_version"])
+                    if body.get("accepted_authorization_version") is not None
+                    else None
+                ),
+                accepted_retention_version=(
+                    str(body["accepted_retention_version"])
+                    if body.get("accepted_retention_version") is not None
+                    else None
+                ),
+                accepted_ownership_certification_version=(
+                    str(body["accepted_ownership_certification_version"])
+                    if body.get("accepted_ownership_certification_version") is not None
+                    else None
+                ),
+                accepted_authorization_profile_hash=(
+                    str(body["accepted_authorization_profile_hash"])
+                    if body.get("accepted_authorization_profile_hash") is not None
+                    else None
+                ),
+            )
+            if result.get("ok") is True:
+                _start_auto_upload_enrollment_worker()
+            self._send_auto_upload_result(result)
+            return
         self._send_auto_upload_result(
             enable(
                 agent=str(body.get("agent") or "all"),
@@ -5846,6 +5907,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         # (missing consent fields) doesn't consume the 10s cooldown — only a real
         # submission attempt should start it.
         body = _read_body(self)
+        automatic_upload_request = body.get("automatic_upload")
+        if automatic_upload_request is not None and not isinstance(
+            automatic_upload_request, dict
+        ):
+            _json_response(
+                self,
+                {"error": "automatic_upload must be an object when provided."},
+                400,
+            )
+            return
         force = _body_bool(body.get("force", False))
         ai_pii_override = _optional_bool(body.get("ai_pii")) if "ai_pii" in body else None
         required = [
@@ -5906,6 +5977,57 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     save_config(config)
                 except Exception:
                     pass
+                if isinstance(automatic_upload_request, dict):
+                    from ..auto_upload import queue_enable
+
+                    queued = queue_enable(
+                        agent=str(automatic_upload_request.get("agent") or "all"),
+                        accepted_authorization_version=(
+                            str(automatic_upload_request["accepted_authorization_version"])
+                            if automatic_upload_request.get(
+                                "accepted_authorization_version"
+                            ) is not None
+                            else None
+                        ),
+                        accepted_retention_version=(
+                            str(automatic_upload_request["accepted_retention_version"])
+                            if automatic_upload_request.get(
+                                "accepted_retention_version"
+                            ) is not None
+                            else None
+                        ),
+                        accepted_ownership_certification_version=(
+                            str(
+                                automatic_upload_request[
+                                    "accepted_ownership_certification_version"
+                                ]
+                            )
+                            if automatic_upload_request.get(
+                                "accepted_ownership_certification_version"
+                            ) is not None
+                            else None
+                        ),
+                        accepted_authorization_profile_hash=(
+                            str(
+                                automatic_upload_request[
+                                    "accepted_authorization_profile_hash"
+                                ]
+                            )
+                            if automatic_upload_request.get(
+                                "accepted_authorization_profile_hash"
+                            ) is not None
+                            else None
+                        ),
+                    )
+                    queued_ok = queued.get("ok") is True
+                    if queued_ok:
+                        _start_auto_upload_enrollment_worker()
+                    result["automatic_upload"] = {
+                        "queued": queued.get("overlay") == "enrollment_pending",
+                        "mode": queued.get("mode", "off"),
+                        "code": queued.get("code"),
+                        "message": queued.get("message"),
+                    }
                 with _share_rate_lock:
                     WorkbenchHandler._last_share_time = time.time()
                 _json_response(self, result)
@@ -6409,6 +6531,9 @@ def _background_workers_active(scanner: Scanner | None = None) -> bool:
     upload_thread = _auto_upload_run_thread
     if upload_thread is not None and upload_thread.is_alive():
         return True
+    enrollment_thread = _auto_upload_enrollment_thread
+    if enrollment_thread is not None and enrollment_thread.is_alive():
+        return True
     if scanner is not None:
         score_thread = scanner._score_thread
         if score_thread is not None and score_thread.is_alive():
@@ -6696,6 +6821,11 @@ def run_server(
     logger.info("Workbench running at %s", url)
 
     _warn_if_frontend_stale(pinned=frontend_snapshot is not None)
+
+    # A manual Share may have queued recurring enrollment immediately before
+    # the daemon or machine stopped.  The accepted request lives in SQLite, so
+    # resume it before the ordinary background scan; no browser tab is needed.
+    _start_auto_upload_enrollment_worker()
 
     if remote:
         import socket

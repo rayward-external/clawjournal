@@ -5,6 +5,8 @@ import json
 import pytest
 
 from clawjournal.config import (
+    _auto_upload_profile_projection,
+    _migrate_default_source_scope,
     _migrate_excluded_projects,
     _migrate_findings_engines,
     _migrate_remove_auto_upload_ui_flag,
@@ -14,10 +16,27 @@ from clawjournal.config import (
 )
 
 
+class TestAutoUploadProfileProjection:
+    def test_manual_export_scope_does_not_change_recurring_profile(self):
+        baseline = _auto_upload_profile_projection({
+            "source": "claude",
+            "projects_confirmed": True,
+            "excluded_projects": [],
+        })
+        changed_manual_scope = _auto_upload_profile_projection({
+            "source": "workbuddy",
+            "projects_confirmed": False,
+            "excluded_projects": [],
+        })
+
+        assert changed_manual_scope == baseline
+
+
 class TestLoadConfig:
     def test_no_file_returns_defaults(self, tmp_config):
         config = load_config()
         assert config["repo"] is None
+        assert config["source"] == "all"
         assert config["excluded_projects"] == []
         assert config["redact_strings"] == []
 
@@ -29,6 +48,16 @@ class TestLoadConfig:
         assert config["custom_key"] == "val"
         # Defaults still present
         assert "excluded_projects" in config
+        assert config["source"] == "all"
+
+    def test_unconfigured_source_migrates_to_all(self, tmp_config):
+        tmp_config.parent.mkdir(parents=True, exist_ok=True)
+        tmp_config.write_text(json.dumps({"source": None}))
+
+        config = load_config()
+
+        assert config["source"] == "all"
+        assert json.loads(tmp_config.read_text())["source"] == "all"
 
     def test_corrupt_json_returns_defaults(self, tmp_config, capsys):
         tmp_config.parent.mkdir(parents=True, exist_ok=True)
@@ -87,6 +116,22 @@ class TestMigrateExcludedProjects:
         config = {"excluded_projects": ["claude:already", "bare-name", "gemini:hash"]}
         assert _migrate_excluded_projects(config) is True
         assert config["excluded_projects"] == ["claude:already", "claude:bare-name", "gemini:hash"]
+
+
+class TestMigrateDefaultSourceScope:
+    @pytest.mark.parametrize("source", [None, "", "auto", " AUTO "])
+    def test_unconfigured_values_default_to_all(self, source):
+        config = {"source": source}
+
+        assert _migrate_default_source_scope(config) is True
+        assert config["source"] == "all"
+
+    @pytest.mark.parametrize("source", ["all", "claude", "codex", "workbuddy"])
+    def test_explicit_scope_is_preserved(self, source):
+        config = {"source": source}
+
+        assert _migrate_default_source_scope(config) is False
+        assert config["source"] == source
 
 
 class TestNormalizeExcludedProjectNames:

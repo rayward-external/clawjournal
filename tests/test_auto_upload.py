@@ -35,12 +35,15 @@ from clawjournal.workbench import index as index_module
 from clawjournal.workbench.index import (
     add_policy,
     create_share,
+    get_auto_upload_enrollment_job,
     get_auto_upload_enrollment,
     open_index,
     remove_policy,
     save_auto_upload_enrollment,
+    save_auto_upload_enrollment_job,
     set_hold_state,
     update_auto_upload_enrollment,
+    update_auto_upload_enrollment_job,
     upsert_sessions,
 )
 
@@ -161,6 +164,17 @@ def _seed_released_session(
         reason="fixture",
     )
     return raw_path
+
+
+def _seed_successful_manual_receipt(conn, root: Path) -> None:
+    _seed_released_session(conn, root)
+    share_id = create_share(conn, ["session-one"])
+    conn.execute(
+        "UPDATE shares SET status = 'shared', shared_at = ?, "
+        "hosted_receipt_id = ?, submission_channel = 'manual' WHERE share_id = ?",
+        ("2026-07-13T00:00:00+00:00", "manual-receipt-1", share_id),
+    )
+    conn.commit()
 
 
 def _credentials(enrollment_id: str = "server-enrollment-1") -> dict[str, str]:
@@ -328,6 +342,161 @@ def _seed_changed_approved_revision(conn, root: Path) -> str:
     )
     conn.commit()
     return revision
+
+
+def test_queue_enable_persists_without_scanning_or_network(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(enrollment_grant="receipt-grant")
+    conn = open_index()
+    try:
+        _seed_successful_manual_receipt(
+            conn, isolated_auto_upload["root"]
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        auto,
+        "fetch_capabilities",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("queueing must not perform hosted I/O")
+        ),
+    )
+    monkeypatch.setattr(
+        auto,
+        "_strict_scan_for_enable",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("queueing must not scan")
+        ),
+    )
+
+    result = auto.queue_enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash="accepted-profile",
+    )
+
+    assert result["ok"] is True
+    assert result["code"] == "enrollment_queued"
+    assert result["overlay"] == "enrollment_pending"
+    assert result["health"] == "ready"
+    conn = open_index()
+    try:
+        job = get_auto_upload_enrollment_job(conn)
+        assert job is not None
+        assert job["state"] == "queued"
+        assert job["request"] == {
+            "agent": "claude",
+            "accepted_authorization_profile_hash": "accepted-profile",
+            "accepted_authorization_version": AUTH_VERSION,
+            "accepted_ownership_certification_version": OWNERSHIP_VERSION,
+            "accepted_retention_version": RETENTION_VERSION,
+        }
+        assert get_auto_upload_enrollment(conn) is None
+    finally:
+        conn.close()
+
+
+def test_background_enrollment_resumes_a_running_job_after_restart(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(enrollment_grant="receipt-grant")
+    conn = open_index()
+    try:
+        _seed_successful_manual_receipt(
+            conn, isolated_auto_upload["root"]
+        )
+    finally:
+        conn.close()
+    assert auto.queue_enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash="accepted-profile",
+    )["ok"] is True
+    conn = open_index()
+    try:
+        job = get_auto_upload_enrollment_job(conn)
+        assert job is not None
+        job_id = job["job_id"]
+        assert update_auto_upload_enrollment_job(
+            conn,
+            expected_job_id=job_id,
+            state="running",
+            current_stage="scanning",
+        )
+    finally:
+        conn.close()
+
+    calls = []
+
+    def fake_enable(**kwargs):
+        calls.append(kwargs)
+        kwargs["scan_progress"]("claude", 2, 4)
+        return {"ok": True, "mode": "enabled", "health": "ready"}
+
+    monkeypatch.setattr(auto, "enable", fake_enable)
+
+    result = auto.run_pending_enrollment_job()
+
+    assert result["mode"] == "enabled"
+    assert calls[0]["background_job_id"] == job_id
+    conn = open_index()
+    try:
+        assert get_auto_upload_enrollment_job(conn) is None
+    finally:
+        conn.close()
+
+
+def test_background_enrollment_keeps_retryable_failure_durable(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    _save_scope_config(enrollment_grant="receipt-grant")
+    conn = open_index()
+    try:
+        _seed_successful_manual_receipt(
+            conn, isolated_auto_upload["root"]
+        )
+    finally:
+        conn.close()
+    assert auto.queue_enable(
+        agent="claude",
+        accepted_authorization_version=AUTH_VERSION,
+        accepted_retention_version=RETENTION_VERSION,
+        accepted_ownership_certification_version=OWNERSHIP_VERSION,
+        accepted_authorization_profile_hash="accepted-profile",
+    )["ok"] is True
+    monkeypatch.setattr(
+        auto,
+        "enable",
+        lambda **kwargs: {
+            "ok": False,
+            "code": "scanner_busy",
+            "message": "Another scan is active.",
+            "retryable": True,
+        },
+    )
+
+    result = auto.run_pending_enrollment_job()
+
+    assert result["code"] == "scanner_busy"
+    assert auto.has_pending_enrollment_job() is True
+    conn = open_index()
+    try:
+        job = get_auto_upload_enrollment_job(conn)
+        assert job is not None
+        assert job["state"] == "retrying"
+        assert job["error_code"] == "scanner_busy"
+        assert job["retryable"] is True
+    finally:
+        conn.close()
 
 
 def _patch_runner_host(monkeypatch, *, origin: str = ORIGIN) -> None:
@@ -593,24 +762,36 @@ def test_enable_accepts_legacy_and_explicit_manual_receipts(
     assert result["code"] == "authorization_required"
 
 
-def test_v1_scope_rejects_sources_without_audited_raw_snapshot(
+def test_recurring_scope_uses_all_audited_sources_and_ignores_manual_source(
     isolated_auto_upload,
 ):
     conn = open_index()
-    session, _raw_path = _session(isolated_auto_upload["root"], "other-source")
-    session["source"] = "workbuddy"
-    session["project"] = "workbuddy:project"
-    upsert_sessions(conn, [session])
+    unsupported, _raw_path = _session(isolated_auto_upload["root"], "other-source")
+    unsupported["source"] = "workbuddy"
+    unsupported["project"] = "workbuddy:project"
+    supported, _raw_path = _session(isolated_auto_upload["root"], "supported-source")
+    codex, _raw_path = _session(
+        isolated_auto_upload["root"], "codex-source", project="codex:project"
+    )
+    codex["source"] = "codex"
+    upsert_sessions(conn, [unsupported, supported, codex])
     config = {
         **config_module.DEFAULT_CONFIG,
         "source": "workbuddy",
-        "projects_confirmed": True,
+        "projects_confirmed": False,
     }
 
     scope = auto._current_scope(conn, config)
 
-    assert "unsupported_source" in scope["blockers"]
-    assert scope["unsupported_sources"] == ["workbuddy"]
+    assert scope["sources"] == ["claude", "codex"]
+    assert scope["entries"] == [
+        ("claude", "project-one"),
+        ("codex", "codex:project"),
+    ]
+    assert scope["blockers"] == []
+    assert scope["source_confirmed"] is True
+    assert scope["projects_confirmed"] is True
+    assert scope["unsupported_sources"] == []
     conn.close()
 
 
@@ -1223,6 +1404,46 @@ def test_raw_stat_signatures_detect_append_and_replace(isolated_auto_upload):
     raw_path.unlink()
     raw_path.write_text(same_content, encoding="utf-8")
     assert auto._raw_stat_signatures(conn, share) != after_append
+    conn.close()
+
+
+def test_raw_stat_signatures_allow_append_after_sealed_segment(
+    isolated_auto_upload,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    raw_path = _seed_released_session(conn, isolated_auto_upload["root"])
+    sealed_end = raw_path.stat().st_size
+    conn.execute(
+        "UPDATE sessions SET raw_source_start_offset = 0, "
+        "raw_source_end_offset = ?, segment_sealed = 1 "
+        "WHERE session_id = 'session-one'",
+        (sealed_end,),
+    )
+    conn.commit()
+    _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="sealed",
+    )
+    share = dict(
+        conn.execute("SELECT * FROM shares WHERE share_id = ?", (share_id,)).fetchone()
+    )
+
+    baseline = auto._raw_stat_signatures(conn, share)
+    with raw_path.open("a", encoding="utf-8") as handle:
+        handle.write("later active-tail content\n")
+    assert auto._raw_stat_signatures(conn, share) == baseline
+
+    with raw_path.open("r+b") as handle:
+        handle.seek(0)
+        original = handle.read(1)
+        handle.seek(0)
+        handle.write(b"X" if original != b"X" else b"Y")
+    assert auto._raw_stat_signatures(conn, share) != baseline
     conn.close()
 
 
@@ -3258,6 +3479,20 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
     assert missing_ownership["code"] == "authorization_required"
     assert create_calls == []
 
+    conn = open_index()
+    try:
+        save_auto_upload_enrollment_job(
+            conn,
+            job_id="stale-background-job",
+            state="action_required",
+            request={"agent": "claude"},
+            current_stage="review_required",
+            error_code="authorization_required",
+            error_message="Review the refreshed scope.",
+        )
+    finally:
+        conn.close()
+
     result = auto.enable(
         agent="claude",
         accepted_authorization_version=AUTH_VERSION,
@@ -3286,6 +3521,7 @@ def test_enable_requires_exact_versions_then_commits_all_authority_transactional
         assert enrollment["enrolled_scope_entries"] == [
             ("claude", "project-one")
         ]
+        assert get_auto_upload_enrollment_job(conn) is None
     finally:
         conn.close()
 

@@ -21,6 +21,7 @@ from clawjournal.parsing.segmenter import (
     _split_session,
     _strip_openclaw_metadata,
     pre_scan_openclaw_hints,
+    segment_append_only_session,
     segment_openclaw_session,
 )
 
@@ -70,6 +71,61 @@ def _session(messages, session_id="test-session-001", source="openclaw"):
             "output_tokens": 0,
         },
     }
+
+
+class TestAppendOnlySegmentation:
+    def test_eof_turn_remains_active_until_next_user_confirms_boundary(self):
+        messages = [
+            _user("question one"),
+            _assistant("answer one"),
+            _user("question two"),
+            _assistant("answer two"),
+        ]
+        session = _session(messages, session_id="growing", source="codex")
+
+        result = segment_append_only_session(
+            session,
+            [10, 20, 30, 40],
+            message_start_offsets=[0, 10, 20, 30],
+            raw_source_size=40,
+            max_messages=4,
+            max_user_messages=99,
+            max_text_bytes=999_999,
+            max_raw_bytes=999_999,
+        )
+
+        assert result == [session]
+
+    def test_next_user_seals_prior_turn_and_leaves_tail_unranged(self):
+        messages = [
+            _user("question one"),
+            _assistant("answer one"),
+            _user("question two"),
+            _assistant("answer two"),
+            _user("question three"),
+        ]
+        session = _session(messages, session_id="growing", source="codex")
+
+        result = segment_append_only_session(
+            session,
+            [10, 20, 30, 40, 55],
+            message_start_offsets=[0, 10, 20, 30, 50],
+            raw_source_size=55,
+            max_messages=4,
+            max_user_messages=99,
+            max_text_bytes=999_999,
+            max_raw_bytes=999_999,
+        )
+
+        assert [item["session_id"] for item in result] == [
+            "growing",
+            "growing_seg-0001",
+        ]
+        assert result[0]["segment_sealed"] is True
+        assert result[0]["raw_source_end_offset"] == 50
+        assert result[1]["segment_sealed"] is False
+        assert result[1]["raw_source_start_offset"] is None
+        assert result[1]["raw_source_end_offset"] is None
 
 
 # ---------------------------------------------------------------------------

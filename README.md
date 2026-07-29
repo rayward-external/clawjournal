@@ -45,8 +45,8 @@ reports a problem, show me its message, explain it in plain words, and stop.
 After this setup, ClawJournal keeps itself up to date automatically, so I
 should not need to repeat any of this.
 
-Look across all supported coding agents unless I tell you otherwise. Set that
-scope explicitly with `clawjournal config --source all`, then show me the
+Look across all supported coding agents unless I tell you otherwise. ClawJournal
+defaults to that all-source scope; show me the
 discovered projects before confirming them so I can exclude personal,
 confidential, third-party, or unrelated work.
 
@@ -152,8 +152,10 @@ If you are unsure at any point, stop before **Submit**. Your review and package 
 - **Local by default.** Scanning and reviewing create a local index and local copies of your agent sessions. Those copies can contain the original text.
 - **AI features are optional.** If you enable them, ClawJournal removes home-folder paths and usernames locally first. The remaining session text is sent to the AI service you choose and may still contain identifying details.
 - **Sharing has safety checks.** Redaction and secret scans run before a package can be submitted. One scanner may contact a credential provider to check whether a suspected secret is live. A missing or failed required scan blocks sharing.
-- **Automatic uploads remain off until a successful manual share.** When the hosted recurring terms are available, the final Submit screen selects the combined “submit and enable” action by default, shows the exact cadence/cap, and links to the full terms and scope. You can uncheck it before submitting. If automatic uploads are already configured, the same row stays checked and locked; review, pause, or turn them off from Settings.
+- **Automatic uploads remain off until a successful manual share.** When the hosted recurring terms are available, the final Submit screen selects the combined “submit and enable” action by default, automatically includes every observed recurring-capable source, shows the exact cadence/cap, and links to the full terms and source/project pairs. You can uncheck it before submitting. After the manual receipt is saved, recurring setup is queued locally and continues in the daemon without holding the receipt screen open; closing the browser does not cancel it, and restarting `clawjournal serve` resumes it. If automatic uploads are already configured, the same row stays checked and locked; review, pause, or turn them off from Settings.
 - **ClawJournal keeps itself current.** Installs from a git checkout quietly fast-forward to the latest published version (at most once an hour) and, when an update changes dependencies, the workbench, or the pinned scanners, rerun the installer in the background. A running workbench switches to the new version at the next quiet moment (never during a request or right after you changed something) — just reload the page. Updates never touch your local changes, and updating never uploads anything. Set `CLAWJOURNAL_NO_AUTO_UPDATE=1` to opt out.
+
+- **One long agent conversation still makes progress.** Claude Code and Codex logs are read incrementally and split only at complete assistant-turn checkpoints after bounded limits are reached. Closed checkpoints can become eligible while you keep using the same conversation; the current unfinished tail stays local.
 
 For the complete details, see [PRIVACY.md](PRIVACY.md).
 
@@ -162,7 +164,6 @@ For the complete details, see [PRIVACY.md](PRIVACY.md).
 These are the main commands:
 
 ```bash
-clawjournal config --source all           # explicitly include all supported agent sources
 clawjournal serve                        # open the local workbench
 clawjournal skill --preview              # preview lessons + one evidence-backed weekly focus
 clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring

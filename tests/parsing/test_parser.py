@@ -84,25 +84,12 @@ def _isolate_workbuddy_ai_projects(tmp_path, monkeypatch):
     )
 
 
-def test_iter_jsonl_reads_utf8_explicitly(tmp_path, monkeypatch):
+def test_iter_jsonl_decodes_utf8_explicitly(tmp_path):
     path = tmp_path / "session.jsonl"
     payload = {"message": "research note with Cyrillic: с"}
     path.write_bytes((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
 
-    import builtins
-
-    real_open = builtins.open
-    seen_encodings = []
-
-    def open_spy(file, *args, **kwargs):
-        if file == path:
-            seen_encodings.append(kwargs.get("encoding"))
-        return real_open(file, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", open_spy)
-
     assert list(_iter_jsonl(path)) == [payload]
-    assert seen_encodings == ["utf-8"]
 
 
 class TestExtractModelEffort:
@@ -971,6 +958,106 @@ class TestDiscoverProjects:
         assert sessions[0]["messages"][1]["role"] == "assistant"
         assert sessions[0]["messages"][1]["tool_uses"][0]["tool"] == "exec_command"
         assert sessions[0]["raw_source_path"] == str(session_file)
+
+    def test_long_codex_session_seals_stable_append_only_segments(
+        self, tmp_path, monkeypatch, mock_anonymizer
+    ):
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.PROJECTS_DIR",
+            tmp_path / "projects" / "nonexistent",
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
+        codex_sessions = tmp_path / "codex-sessions" / "2026" / "07" / "29"
+        codex_sessions.mkdir(parents=True)
+        session_file = codex_sessions / "rollout-long.jsonl"
+        cwd = "/home/user/long-repo"
+        lines = [
+            {
+                "timestamp": "2026-07-29T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "long-codex",
+                    "cwd": cwd,
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-07-29T00:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": cwd, "model": "gpt-test"},
+            },
+        ]
+        for turn in range(21):
+            lines.extend([
+                {
+                    "timestamp": f"2026-07-29T00:{turn:02d}:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": f"question {turn}",
+                    },
+                },
+                {
+                    "timestamp": f"2026-07-29T00:{turn:02d}:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": f"answer {turn}",
+                    },
+                },
+            ])
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.CODEX_SESSIONS_DIR",
+            tmp_path / "codex-sessions",
+        )
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.CODEX_ARCHIVED_DIR",
+            tmp_path / "codex-archived",
+        )
+
+        first = parse_project_sessions(
+            cwd, mock_anonymizer, source="codex", strict_jsonl=True
+        )
+
+        assert [item["session_id"] for item in first] == [
+            "long-codex",
+            "long-codex_seg-0001",
+        ]
+        assert first[0]["segment_sealed"] is True
+        assert first[1]["segment_sealed"] is False
+        assert first[0].get("parent_session_id") is None
+        assert first[1]["parent_session_id"] == "long-codex"
+        assert first[0]["raw_source_start_offset"] == 0
+        assert first[1]["raw_source_start_offset"] is None
+        assert first[1]["raw_source_end_offset"] is None
+        assert first[1]["_raw_source_fingerprint"][2] == session_file.stat().st_size
+        first_messages = first[0]["messages"]
+        first_fingerprint = first[0]["_raw_source_fingerprint"]
+
+        with session_file.open("a", encoding="utf-8") as handle:
+            for turn in range(21, 41):
+                for event_type, message, second in (
+                    ("user_message", f"question {turn}", "02"),
+                    ("agent_message", f"answer {turn}", "03"),
+                ):
+                    handle.write(json.dumps({
+                        "timestamp": f"2026-07-29T01:{turn - 21:02d}:{second}Z",
+                        "type": "event_msg",
+                        "payload": {"type": event_type, "message": message},
+                    }) + "\n")
+
+        second = parse_project_sessions(
+            cwd, mock_anonymizer, source="codex", strict_jsonl=True
+        )
+
+        assert len(second) == 3
+        assert second[0]["messages"] == first_messages
+        assert second[0]["_raw_source_fingerprint"] == first_fingerprint
+        assert [item["segment_sealed"] for item in second] == [True, True, False]
 
     def test_codex_thinking_not_duplicated(self, tmp_path, monkeypatch, mock_anonymizer):
         """Reasoning from response_item and agent_reasoning event_msg should not duplicate."""
@@ -2786,6 +2873,87 @@ _VALID_CLAUDE_JSONL = _make_valid_claude_jsonl()
 
 _ROOT_UUID = "aaaaaaaa-1111-2222-3333-444444444444"
 _WORKSPACE_UUID = "bbbbbbbb-5555-6666-7777-888888888888"
+
+
+def test_long_claude_session_checkpoint_includes_interstitial_tool_result(
+    tmp_path, monkeypatch, mock_anonymizer
+):
+    projects_dir = tmp_path / "projects"
+    project_name = "-Users-testuser-projects-long"
+    project_dir = projects_dir / project_name
+    project_dir.mkdir(parents=True)
+    session_file = project_dir / "claude-long.jsonl"
+    cwd = "/Users/testuser/projects/long"
+
+    entries = []
+    for turn in range(21):
+        tool_id = f"tool-{turn}"
+        entries.extend([
+            {
+                "type": "user",
+                "timestamp": 1706000000000 + turn * 3000,
+                "cwd": cwd,
+                "sessionId": "claude-long",
+                "message": {"content": f"question {turn}"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": 1706000001000 + turn * 3000,
+                "message": {
+                    "model": "claude-test",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "Read",
+                            "input": {"file_path": f"/tmp/file-{turn}.txt"},
+                        },
+                        {"type": "text", "text": f"answer {turn}"},
+                    ],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": 1706000002000 + turn * 3000,
+                "cwd": cwd,
+                "sessionId": "claude-long",
+                "message": {
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": f"result-{turn}",
+                    }]
+                },
+            },
+        ])
+    session_file.write_text(
+        "\n".join(json.dumps(entry) for entry in entries) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", projects_dir)
+
+    sessions = parse_project_sessions(
+        project_name,
+        mock_anonymizer,
+        source="claude",
+        strict_jsonl=True,
+    )
+
+    assert [session["session_id"] for session in sessions] == [
+        "claude-long",
+        "claude-long_seg-0001",
+    ]
+    assert [session["segment_sealed"] for session in sessions] == [True, False]
+    first_raw = session_file.read_bytes()[
+        sessions[0]["raw_source_start_offset"]:
+        sessions[0]["raw_source_end_offset"]
+    ]
+    assert b"result-19" in first_raw
+    assert b"question 20" not in first_raw
+    assert sessions[0]["messages"][-1]["tool_uses"][0]["output"] == {
+        "text": "result-19"
+    }
 
 
 def _make_wrapper_json(

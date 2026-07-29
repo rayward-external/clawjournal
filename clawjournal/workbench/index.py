@@ -69,6 +69,7 @@ FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "
 SHARE_RECOMMENDATION_LIMIT = 10
 AUTO_UPLOAD_CANDIDATE_LIMIT = 5
 AUTO_UPLOAD_STABILITY_HOURS = 24
+FTS_TRANSCRIPT_MAX_CHARS = 1024 * 1024
 
 
 class RevisionConflictError(ValueError):
@@ -141,6 +142,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     reviewed_at        TEXT,
     blob_path          TEXT,
     raw_source_path    TEXT,
+    raw_source_start_offset INTEGER,
+    raw_source_end_offset   INTEGER,
     session_key        TEXT,
     indexed_at         TEXT NOT NULL,
     updated_at         TEXT,
@@ -157,6 +160,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ai_scorer_model        TEXT,
     ai_rubric_git_sha      TEXT,
     ai_scored_at           TEXT,
+    segment_sealed         INTEGER DEFAULT 0,
     content_revision       TEXT,
     revision_stable_since  TEXT
 );
@@ -239,6 +243,30 @@ CREATE TABLE IF NOT EXISTS auto_upload_enrollment (
     current_run_stage               TEXT,
     revocation_pending              INTEGER NOT NULL DEFAULT 0 CHECK (revocation_pending IN (0, 1)),
     updated_at                      TEXT NOT NULL
+);
+
+-- A manual Share can queue recurring enrollment after its hosted receipt is
+-- final.  Keep that expensive strict-refresh/enrollment work independent of
+-- the browser request so closing the tab cannot lose it.  This is a net-new,
+-- idempotent table (like the benchmark tables below), so existing databases
+-- gain it on open without rewriting a historical migration.
+CREATE TABLE IF NOT EXISTS auto_upload_enrollment_job (
+    singleton_id       INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    job_id             TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (
+        state IN ('queued', 'running', 'retrying', 'action_required', 'failed')
+    ),
+    request_json       TEXT NOT NULL,
+    current_stage      TEXT NOT NULL,
+    current_source     TEXT,
+    progress_position  INTEGER,
+    progress_total     INTEGER,
+    attempt_count      INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    error_code         TEXT,
+    error_message      TEXT,
+    retryable          INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS findings (
@@ -407,17 +435,17 @@ def compute_content_revision(session: dict[str, Any]) -> str:
     enrichment can refresh metadata without making a reviewed trace stale,
     while an appended or edited message always creates a new revision.
     """
-    payload = {
-        "messages": _revision_json_value(session.get("messages", [])),
-    }
-    encoded = json.dumps(
-        payload,
+    payload = {"messages": session.get("messages", [])}
+    encoder = json.JSONEncoder(
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         default=str,
-    ).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    )
+    digest = hashlib.sha256()
+    for chunk in encoder.iterencode(payload):
+        digest.update(chunk.encode("utf-8"))
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _legacy_content_revision(session_id: str) -> str:
@@ -569,6 +597,9 @@ def open_index() -> sqlite3.Connection:
         ("segment_start_message", "INTEGER"),
         ("segment_end_message", "INTEGER"),
         ("segment_reason", "TEXT"),
+        ("segment_sealed", "INTEGER DEFAULT 0"),
+        ("raw_source_start_offset", "INTEGER"),
+        ("raw_source_end_offset", "INTEGER"),
         ("client_origin", "TEXT"),
         ("runtime_channel", "TEXT"),
         ("outer_session_id", "TEXT"),
@@ -1321,46 +1352,64 @@ def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
 
 
 def _flatten_transcript(session: dict[str, Any]) -> str:
-    """Extract all message content and tool I/O as plain text for FTS indexing."""
+    """Extract a bounded search prefix without duplicating huge transcripts."""
+
     parts: list[str] = []
+    remaining = FTS_TRANSCRIPT_MAX_CHARS
+
+    def append(value: Any) -> None:
+        nonlocal remaining
+        if remaining <= 0 or not isinstance(value, str) or not value:
+            return
+        clipped = value[:remaining]
+        parts.append(clipped)
+        remaining -= len(clipped)
+        if remaining > 0:
+            parts.append("\n")
+            remaining -= 1
+
     for msg in session.get("messages", []):
-        role = msg.get("role", "")
         content = msg.get("content")
         if isinstance(content, str):
-            parts.append(content)
+            append(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, str):
-                    parts.append(block)
+                    append(block)
                 elif isinstance(block, dict):
-                    # Text blocks
-                    text = block.get("text")
-                    if text:
-                        parts.append(text)
-                    # Tool use input
+                    append(block.get("text"))
                     tool_input = block.get("input")
                     if isinstance(tool_input, dict):
                         for v in tool_input.values():
-                            if isinstance(v, str):
-                                parts.append(v)
+                            append(v)
                     elif isinstance(tool_input, str):
-                        parts.append(tool_input)
-                    # Tool result output
-                    output = block.get("output")
-                    if isinstance(output, str):
-                        parts.append(output)
-        # Handle clawjournal's parsed format: tool uses stored as dicts with "tool" key
+                        append(tool_input)
+                    append(block.get("output"))
+        for tool_use in msg.get("tool_uses", []):
+            tool_input = tool_use.get("input")
+            if isinstance(tool_input, dict):
+                for value in tool_input.values():
+                    append(value)
+            else:
+                append(tool_input)
+            output = tool_use.get("output")
+            if isinstance(output, dict):
+                for value in output.values():
+                    append(value)
+            else:
+                append(output)
         tool = msg.get("tool")
         if tool:
             inp = msg.get("input")
             if isinstance(inp, dict):
                 for v in inp.values():
-                    if isinstance(v, str):
-                        parts.append(v)
-            out = msg.get("output")
-            if isinstance(out, str):
-                parts.append(out)
-    return "\n".join(parts)
+                    append(v)
+            else:
+                append(inp)
+            append(msg.get("output"))
+        if remaining <= 0:
+            break
+    return "".join(parts).rstrip("\n")
 
 
 def _with_legacy_bundle_alias(item: dict[str, Any]) -> dict[str, Any]:
@@ -2351,6 +2400,17 @@ def upsert_sessions(
 
     now = _now_iso()
     new_count = 0
+    emitted_session_ids = {
+        str(session.get("session_id"))
+        for session in sessions
+        if session.get("session_id")
+    }
+    segmented_parent_ids = {
+        str(session.get("parent_session_id"))
+        for session in sessions
+        if session.get("parent_session_id")
+        and session.get("segment_reason") in {"bounded_checkpoint", "active_tail"}
+    } - emitted_session_ids
 
     # Check FTS availability
     has_fts = _has_fts(conn)
@@ -2498,6 +2558,7 @@ def upsert_sessions(
                 sensitivity_score, task_type,
                 files_touched, commands_run,
                 blob_path, raw_source_path,
+                raw_source_start_offset, raw_source_end_offset,
                 session_key,
                 indexed_at, updated_at,
                 review_status,
@@ -2509,7 +2570,7 @@ def upsert_sessions(
                 share_id,
                 parent_session_id, subagent_session_ids, segment_index,
                 segment_start_message, segment_end_message,
-                segment_reason,
+                segment_reason, segment_sealed,
                 client_origin, runtime_channel, outer_session_id,
                 estimated_cost_usd,
                 tool_counts, user_interrupts,
@@ -2521,9 +2582,10 @@ def upsert_sessions(
                 ?, ?, ?,
                 ?, ?,
                 ?, ?,
+                ?, ?,
                 ?,
                 ?, ?, ?,
-                ?, ?,
+                ?, ?, ?,
                 ?, ?,
                 ?, ?,
                 ?, ?,
@@ -2568,6 +2630,8 @@ def upsert_sessions(
                 commands_run = excluded.commands_run,
                 blob_path = excluded.blob_path,
                 raw_source_path = excluded.raw_source_path,
+                raw_source_start_offset = excluded.raw_source_start_offset,
+                raw_source_end_offset = excluded.raw_source_end_offset,
                 session_key = COALESCE(excluded.session_key, session_key),
                 updated_at = CASE
                     WHEN sessions.content_revision IS NOT excluded.content_revision
@@ -2657,6 +2721,7 @@ def upsert_sessions(
                 segment_start_message = excluded.segment_start_message,
                 segment_end_message = excluded.segment_end_message,
                 segment_reason = excluded.segment_reason,
+                segment_sealed = excluded.segment_sealed,
                 client_origin = excluded.client_origin,
                 runtime_channel = excluded.runtime_channel,
                 outer_session_id = excluded.outer_session_id,
@@ -2690,6 +2755,8 @@ def upsert_sessions(
                 json.dumps(commands),
                 str(blob_path),
                 session.get("raw_source_path"),
+                session.get("raw_source_start_offset"),
+                session.get("raw_source_end_offset"),
                 session_key or preserved_session_key,
                 preserved_indexed_at,
                 now,
@@ -2714,6 +2781,7 @@ def upsert_sessions(
                 session.get("segment_message_range", [None, None])[0] if session.get("segment_message_range") else None,
                 session.get("segment_message_range", [None, None])[1] if session.get("segment_message_range") else None,
                 session.get("segment_reason"),
+                1 if session.get("segment_sealed") else 0,
                 session.get("client_origin"),
                 session.get("runtime_channel"),
                 session.get("outer_session_id"),
@@ -2762,6 +2830,11 @@ def upsert_sessions(
         else:
             counts["unchanged"] += 1
 
+    if segmented_parent_ids:
+        conn.executemany(
+            "UPDATE sessions SET review_status = 'segmented' WHERE session_id = ?",
+            [(session_id,) for session_id in sorted(segmented_parent_ids)],
+        )
     conn.commit()
     if stats is not None:
         stats.update(counts)
@@ -4578,6 +4651,9 @@ def get_shares(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 _AUTO_UPLOAD_MODES = frozenset({"off", "enabled", "paused"})
 _AUTO_UPLOAD_HEALTH_VALUES = frozenset({"ready", "action_required", "retrying"})
+_AUTO_UPLOAD_ENROLLMENT_JOB_STATES = frozenset(
+    {"queued", "running", "retrying", "action_required", "failed"}
+)
 _AUTO_UPLOAD_LIST_FIELDS = {
     "enrolled_sources": "enrolled_sources_json",
     "enrolled_projects": "enrolled_projects_json",
@@ -4953,6 +5029,187 @@ def update_auto_upload_enrollment(
     return cursor.rowcount == 1
 
 
+def _decode_auto_upload_enrollment_job(row: sqlite3.Row) -> dict[str, Any]:
+    job = dict(row)
+    try:
+        request = json.loads(job.pop("request_json"))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("corrupt automatic-upload enrollment job") from exc
+    if not isinstance(request, dict):
+        raise ValueError("corrupt automatic-upload enrollment job request")
+    job["request"] = request
+    job["retryable"] = bool(job["retryable"])
+    job.pop("singleton_id", None)
+    return job
+
+
+def get_auto_upload_enrollment_job(
+    conn: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    """Return the durable singleton enrollment job, if this DB has one."""
+
+    try:
+        row = conn.execute(
+            "SELECT * FROM auto_upload_enrollment_job WHERE singleton_id = 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        # Read-only status may inspect an older DB before a writable open has
+        # created this net-new table.  Treat that exactly like no queued job.
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+    return _decode_auto_upload_enrollment_job(row) if row is not None else None
+
+
+def save_auto_upload_enrollment_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    state: str,
+    request: Mapping[str, Any],
+    current_stage: str,
+    current_source: str | None = None,
+    progress_position: int | None = None,
+    progress_total: int | None = None,
+    attempt_count: int = 0,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    retryable: bool = False,
+) -> dict[str, Any]:
+    """Create or replace the one durable background-enrollment job."""
+
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise ValueError("job_id must be a non-empty string")
+    if state not in _AUTO_UPLOAD_ENROLLMENT_JOB_STATES:
+        raise ValueError(f"invalid automatic-upload enrollment job state: {state!r}")
+    if not isinstance(request, Mapping):
+        raise ValueError("request must be a mapping")
+    if not isinstance(current_stage, str) or not current_stage.strip():
+        raise ValueError("current_stage must be a non-empty string")
+    for field, value in (
+        ("progress_position", progress_position),
+        ("progress_total", progress_total),
+        ("attempt_count", attempt_count),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"{field} must be a non-negative integer")
+    now = _now_iso()
+    payload = {
+        "job_id": job_id.strip(),
+        "state": state,
+        "request_json": json.dumps(
+            dict(request), sort_keys=True, separators=(",", ":")
+        ),
+        "current_stage": current_stage.strip(),
+        "current_source": current_source,
+        "progress_position": progress_position,
+        "progress_total": progress_total,
+        "attempt_count": attempt_count,
+        "error_code": error_code,
+        "error_message": error_message,
+        "retryable": int(bool(retryable)),
+        "created_at": now,
+        "updated_at": now,
+    }
+    columns = list(payload)
+    placeholders = ", ".join("?" for _ in columns)
+    assignments = ", ".join(
+        f"{column} = excluded.{column}" for column in columns
+    )
+    conn.execute(
+        "INSERT INTO auto_upload_enrollment_job "
+        f"(singleton_id, {', '.join(columns)}) VALUES (1, {placeholders}) "
+        f"ON CONFLICT(singleton_id) DO UPDATE SET {assignments}",
+        [payload[column] for column in columns],
+    )
+    conn.commit()
+    job = get_auto_upload_enrollment_job(conn)
+    assert job is not None
+    return job
+
+
+def update_auto_upload_enrollment_job(
+    conn: sqlite3.Connection,
+    *,
+    expected_job_id: str,
+    **changes: Any,
+) -> bool:
+    """CAS-update the durable background-enrollment job."""
+
+    if not changes:
+        job = get_auto_upload_enrollment_job(conn)
+        return bool(job and job.get("job_id") == expected_job_id)
+    allowed = {
+        "state",
+        "current_stage",
+        "current_source",
+        "progress_position",
+        "progress_total",
+        "attempt_count",
+        "error_code",
+        "error_message",
+        "retryable",
+    }
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(
+            "unknown automatic-upload enrollment job fields: "
+            + ", ".join(sorted(unknown))
+        )
+    if "state" in changes and changes["state"] not in _AUTO_UPLOAD_ENROLLMENT_JOB_STATES:
+        raise ValueError(
+            f"invalid automatic-upload enrollment job state: {changes['state']!r}"
+        )
+    if "current_stage" in changes and (
+        not isinstance(changes["current_stage"], str)
+        or not changes["current_stage"].strip()
+    ):
+        raise ValueError("current_stage must be a non-empty string")
+    for field in ("progress_position", "progress_total", "attempt_count"):
+        value = changes.get(field)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"{field} must be a non-negative integer")
+    if "retryable" in changes:
+        changes["retryable"] = int(bool(changes["retryable"]))
+    changes["updated_at"] = _now_iso()
+    assignments = ", ".join(f"{field} = ?" for field in changes)
+    cursor = conn.execute(
+        f"UPDATE auto_upload_enrollment_job SET {assignments} "
+        "WHERE singleton_id = 1 AND job_id = ?",
+        [*changes.values(), expected_job_id],
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def delete_auto_upload_enrollment_job(
+    conn: sqlite3.Connection,
+    *,
+    expected_job_id: str | None = None,
+) -> bool:
+    """Delete the durable enrollment job, optionally guarded by its id."""
+
+    where = "singleton_id = 1"
+    params: list[Any] = []
+    if expected_job_id is not None:
+        where += " AND job_id = ?"
+        params.append(expected_job_id)
+    try:
+        cursor = conn.execute(
+            f"DELETE FROM auto_upload_enrollment_job WHERE {where}", params
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
+    conn.commit()
+    return cursor.rowcount == 1
+
+
 _LATEST_SUCCESSFUL_REVISIONS_CTE = """
 WITH ranked_shared_revisions AS (
     SELECT
@@ -5031,8 +5288,10 @@ def get_auto_upload_candidate_report(
     ``completion_modes`` is the audited per-source contract supplied by the
     parser layer: each enrolled source maps to ``explicit_close`` or
     ``stable_revision``. The latter requires both ``end_time`` and the current
-    content revision to have remained unchanged for 24 hours. This helper only
-    reads stored scores; it never invokes scoring or mutates review state.
+    content revision to have remained unchanged for 24 hours, except for a
+    parser-sealed append-only segment whose complete-turn boundary is already
+    immutable. This helper only reads stored scores; it never invokes scoring
+    or mutates review state.
 
     Newly discovered sources/projects remain excluded without changing the
     enrollment. Removing confirmation for an enrolled scope fails closed.
@@ -5104,7 +5363,9 @@ def get_auto_upload_candidate_report(
         _LATEST_SUCCESSFUL_REVISIONS_CTE
         + "SELECT s.session_id, s.project, s.source, s.display_title, "
         "s.end_time, s.review_status, s.hold_state, s.embargo_until, "
-        "s.blob_path, s.raw_source_path, s.content_revision AS revision_hash, "
+        "s.blob_path, s.raw_source_path, s.raw_source_start_offset, "
+        "s.raw_source_end_offset, s.segment_sealed, "
+        "s.content_revision AS revision_hash, "
         "s.revision_stable_since, s.ai_failure_value_score, "
         "latest.content_revision AS last_shared_revision_hash, "
         f"({_SUCCESSFUL_EXACT_REVISION_EXISTS_SQL}) "
@@ -5148,7 +5409,7 @@ def get_auto_upload_candidate_report(
             continue
 
         completion_mode = completion_modes.get(row["source"])
-        if completion_mode == "stable_revision":
+        if completion_mode == "stable_revision" and not bool(row["segment_sealed"]):
             try:
                 stable_since = _parse_auto_upload_timestamp(
                     row["revision_stable_since"], field="revision_stable_since"
@@ -5159,7 +5420,7 @@ def get_auto_upload_candidate_report(
             if stable_since > stable_cutoff or end_time > stable_cutoff:
                 exclude(row, "unsupported_unsettled")
                 continue
-        elif completion_mode != "explicit_close":
+        elif completion_mode not in {"stable_revision", "explicit_close"}:
             exclude(row, "unsupported_unsettled")
             continue
 

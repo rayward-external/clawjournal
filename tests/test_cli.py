@@ -19,6 +19,7 @@ from clawjournal.cli import (
     _merge_config_list,
     _normalize_score_source_filter,
     _parse_csv_arg,
+    _resolve_source_choice,
     _scan_for_text_occurrences,
     _scan_high_entropy_strings,
     _scan_pii,
@@ -791,8 +792,8 @@ class TestWorkflowGateMessages:
             main()
         payload = self._extract_json(capsys.readouterr().out)
         assert payload["error"] == "Project selection is not confirmed yet."
-        assert payload["blocked_on_step"] == "Step 3/5"
-        assert len(payload["process_steps"]) == 5
+        assert payload["blocked_on_step"] == "Step 2/4"
+        assert len(payload["process_steps"]) == 4
         assert "prep && clawjournal list" in payload["process_steps"][0]
         assert payload["required_action"].startswith("Send the full project/folder list")
         assert "in a message" in payload["required_action"]
@@ -800,17 +801,8 @@ class TestWorkflowGateMessages:
         assert payload["projects"][0]["name"] == "proj1"
         assert payload["projects"][0]["sessions"] == 2
 
-    def test_export_requires_explicit_source_selection(self, monkeypatch, capsys):
-        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
-        monkeypatch.setattr("sys.argv", ["clawjournal", "export"])
-        with pytest.raises(SystemExit):
-            main()
-        payload = self._extract_json(capsys.readouterr().out)
-        assert payload["error"] == "Source scope is not confirmed yet."
-        assert payload["blocked_on_step"] == "Step 2/5"
-        assert len(payload["process_steps"]) == 5
-        assert payload["allowed_sources"] == ["aider", "all", "both", "claude", "claude-science", "codex", "copilot", "cursor", "custom", "gemini", "kimi", "openclaw", "opencode", "workbuddy"]
-        assert payload["next_command"] == "clawjournal config --source all"
+    def test_unconfigured_export_source_defaults_to_all(self):
+        assert _resolve_source_choice("auto", {}) == ("all", True)
 
     def test_configure_next_steps_require_full_folder_presentation(self):
         steps, _next = _build_status_next_steps(
@@ -822,7 +814,7 @@ class TestWorkflowGateMessages:
         assert any("clawjournal list" in step for step in steps)
         assert any("FULL project/folder list" in step for step in steps)
         assert any("in your next message" in step for step in steps)
-        assert any("source scope" in step.lower() for step in steps)
+        assert not any("source scope" in step.lower() for step in steps)
 
     def test_review_next_steps_explain_full_name_purpose_and_skip_option(self):
         steps, _next = _build_status_next_steps(

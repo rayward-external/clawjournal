@@ -473,6 +473,140 @@ def test_auto_upload_enable_forwards_manual_share_preparation(server, monkeypatc
     ]
 
 
+def test_auto_upload_enable_can_queue_background_enrollment(server, monkeypatch):
+    from clawjournal import auto_upload
+    from clawjournal.workbench import daemon
+
+    calls = []
+    starts = []
+    monkeypatch.setattr(
+        auto_upload,
+        "queue_enable",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "ok": True,
+            "mode": "off",
+            "health": "ready",
+            "overlay": "enrollment_pending",
+        },
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_start_auto_upload_enrollment_worker",
+        lambda: starts.append(True) or True,
+    )
+
+    status_code, body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+            "background": True,
+        },
+    )
+
+    assert status_code == 200
+    assert body["overlay"] == "enrollment_pending"
+    assert calls == [
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+        }
+    ]
+    assert starts == [True]
+
+
+def test_manual_upload_queues_enrollment_before_returning_receipt(
+    server,
+    monkeypatch,
+):
+    from clawjournal import auto_upload
+    from clawjournal.workbench import daemon
+
+    queued_calls = []
+    starts = []
+    monkeypatch.setattr(
+        daemon,
+        "submit_share_to_hosted",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "receipt_id": "receipt-background",
+            "hosted_status": "accepted",
+            "shared_at": "2026-07-29T00:00:00+00:00",
+            "session_count": 1,
+            "bundle_hash": "bundle-hash",
+            "redaction_summary": {"total_redactions": 0, "by_type": {}},
+        },
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_fetch_hosted_share_capabilities",
+        lambda: {"recurring_upload_api_version": 2},
+    )
+    monkeypatch.setattr(daemon, "_recurring_offer_available", lambda value: True)
+    monkeypatch.setattr(
+        auto_upload,
+        "queue_enable",
+        lambda **kwargs: queued_calls.append(kwargs)
+        or {
+            "ok": True,
+            "mode": "off",
+            "overlay": "enrollment_pending",
+            "code": "enrollment_queued",
+        },
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_start_auto_upload_enrollment_worker",
+        lambda: starts.append(True) or True,
+    )
+    daemon.WorkbenchHandler._last_share_time = 0.0
+
+    status_code, body = _post(
+        server,
+        "/api/shares/share-background/upload",
+        {
+            "accept_terms": True,
+            "ownership_certification": True,
+            "consent_version": "consent-v1",
+            "retention_policy_version": "retention-v1",
+            "automatic_upload": {
+                "agent": "codex",
+                "accepted_authorization_version": "auth-v1",
+                "accepted_retention_version": "ret-v1",
+                "accepted_ownership_certification_version": "own-v1",
+                "accepted_authorization_profile_hash": "profile-sha256",
+            },
+        },
+    )
+
+    assert status_code == 200
+    assert body["receipt_id"] == "receipt-background"
+    assert body["automatic_upload"] == {
+        "queued": True,
+        "mode": "off",
+        "code": "enrollment_queued",
+        "message": None,
+    }
+    assert queued_calls == [
+        {
+            "agent": "codex",
+            "accepted_authorization_version": "auth-v1",
+            "accepted_retention_version": "ret-v1",
+            "accepted_ownership_certification_version": "own-v1",
+            "accepted_authorization_profile_hash": "profile-sha256",
+        }
+    ]
+    assert starts == [True]
+
+
 def test_auto_upload_get_status_is_local_only(server, monkeypatch):
     from clawjournal import auto_upload
     from clawjournal.workbench import daemon

@@ -226,7 +226,7 @@ export interface WorkbenchConfig {
 
 export type AutoUploadMode = 'off' | 'enabled' | 'paused';
 export type AutoUploadHealth = 'ready' | 'action_required' | 'retrying';
-export type AutoUploadOverlay = 'running' | 'revocation_pending' | null;
+export type AutoUploadOverlay = 'running' | 'revocation_pending' | 'enrollment_pending' | null;
 export type AutoUploadAgent = 'claude' | 'codex' | 'all' | 'auto';
 
 export interface AutoUploadHookDiagnostic {
@@ -255,6 +255,17 @@ export interface AutoUploadStatus {
   health: AutoUploadHealth;
   run_now_allowed: boolean;
   overlay: AutoUploadOverlay;
+  enrollment_setup?: {
+    state: 'queued' | 'running' | 'retrying' | 'action_required' | 'failed';
+    stage: string;
+    source: string | null;
+    position: number | null;
+    total: number | null;
+    attempt_count: number;
+    error_code: string | null;
+    message: string | null;
+    retryable: boolean;
+  } | null;
   pending_submission_state: 'sealed' | 'submitting' | null;
   ui_visible: boolean;
   offer_available: boolean;

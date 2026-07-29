@@ -50,8 +50,6 @@ def auto_upload_egress_lock() -> Iterator[None]:
 
 
 _AUTO_UPLOAD_PROFILE_CONFIG_KEYS = (
-    "source",
-    "projects_confirmed",
     "excluded_projects",
     "redact_strings",
     "redact_usernames",
@@ -143,7 +141,7 @@ class ClawJournalConfig(TypedDict, total=False):
 
 DEFAULT_CONFIG: ClawJournalConfig = {
     "repo": None,
-    "source": None,
+    "source": "all",
     "excluded_projects": [],
     "redact_strings": [],
     "allowlist_entries": [],
@@ -171,7 +169,8 @@ def load_config() -> ClawJournalConfig:
             with open(CONFIG_FILE) as f:
                 stored = json.load(f)
             config = cast(ClawJournalConfig, {**DEFAULT_CONFIG, **stored})
-            changed = _migrate_excluded_projects(config)
+            changed = _migrate_default_source_scope(config)
+            changed |= _migrate_excluded_projects(config)
             changed |= _migrate_remove_device_credentials(config)
             changed |= _migrate_remove_auto_upload_ui_flag(config)
             changed |= _migrate_findings_engines(config)
@@ -181,6 +180,14 @@ def load_config() -> ClawJournalConfig:
         except (json.JSONDecodeError, OSError) as e:
             print(f"Warning: could not read {CONFIG_FILE}: {e}", file=sys.stderr)
     return cast(ClawJournalConfig, dict(DEFAULT_CONFIG))
+
+
+def _migrate_default_source_scope(config: ClawJournalConfig) -> bool:
+    source = config.get("source")
+    if isinstance(source, str) and source.strip().lower() not in ("", "auto"):
+        return False
+    config["source"] = "all"
+    return True
 
 
 def normalize_excluded_project_names(names: list[str]) -> list[str]:
@@ -199,9 +206,9 @@ def source_scope_sources(source: str | None) -> tuple[str, ...] | None:
     """Return allowed session sources for a confirmed source scope.
 
     ``None`` means unrestricted/all sources. ``both`` means the Claude+Codex
-    pair — it predates ``all`` and is also what the Auto Upload guided scope
-    setup writes, since those are exactly the recurring-capable sources —
-    while ``all`` intentionally means every supported indexed source.
+    pair and predates ``all``; ``all`` intentionally means every supported
+    indexed source. Recurring upload owns a separate exact scope and does not
+    consume this manual-export setting.
     """
     normalized = (source or "").strip().lower()
     if normalized in ("", "auto", "all"):

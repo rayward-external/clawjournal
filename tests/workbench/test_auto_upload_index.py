@@ -119,6 +119,11 @@ def test_fresh_schema_has_auto_upload_foundation(index_conn):
         row[1] for row in index_conn.execute("PRAGMA table_info(sessions)")
     }
     assert "revision_stable_since" in session_columns
+    assert {
+        "raw_source_start_offset",
+        "raw_source_end_offset",
+        "segment_sealed",
+    } <= session_columns
 
     share_columns = {
         row[1] for row in index_conn.execute("PRAGMA table_info(shares)")
@@ -522,6 +527,88 @@ def test_candidate_report_explains_each_safety_exclusion(index_conn):
         "missing-blob": "missing_blob",
         "missing-raw": "raw_source_unavailable",
     }
+
+
+def test_sealed_append_only_segment_is_stable_while_parent_is_hidden(index_conn):
+    _enroll(index_conn, sources=("codex",), projects=("project-one",))
+    parent = _session("long-parent", source="codex")
+    upsert_sessions(index_conn, [parent])
+    child = _session("long-parent_seg-0000", source="codex")
+    child.update({
+        "parent_session_id": "long-parent",
+        "segment_index": 0,
+        "segment_reason": "bounded_checkpoint",
+        "segment_message_range": [0, 1],
+        "segment_sealed": True,
+        "raw_source_start_offset": 0,
+        "raw_source_end_offset": 16,
+    })
+    upsert_sessions(index_conn, [child])
+
+    report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("codex",),
+        current_projects=("project-one",),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"codex": "stable_revision"},
+        now=NOW,
+    )
+
+    assert [item["session_id"] for item in report["selected"]] == [
+        "long-parent_seg-0000"
+    ]
+    parent_row = index_conn.execute(
+        "SELECT review_status FROM sessions WHERE session_id = 'long-parent'"
+    ).fetchone()
+    assert parent_row["review_status"] == "segmented"
+
+
+def test_first_checkpoint_keeps_parent_identity_without_being_hidden(index_conn):
+    _enroll(index_conn, sources=("codex",), projects=("project-one",))
+    first = _session("long-parent", source="codex")
+    first.update({
+        "segment_index": 0,
+        "segment_reason": "bounded_checkpoint",
+        "segment_message_range": [0, 1],
+        "segment_sealed": True,
+        "raw_source_start_offset": 0,
+        "raw_source_end_offset": 16,
+    })
+    second = _session("long-parent_seg-0001", source="codex")
+    second.update({
+        "parent_session_id": "long-parent",
+        "segment_index": 1,
+        "segment_reason": "bounded_checkpoint",
+        "segment_message_range": [2, 3],
+        "segment_sealed": True,
+        "raw_source_start_offset": 16,
+        "raw_source_end_offset": 32,
+    })
+    upsert_sessions(index_conn, [first, second])
+
+    rows = index_conn.execute(
+        "SELECT session_id, review_status FROM sessions "
+        "WHERE session_id LIKE 'long-parent%' ORDER BY session_id"
+    ).fetchall()
+    assert [(row["session_id"], row["review_status"]) for row in rows] == [
+        ("long-parent", "new"),
+        ("long-parent_seg-0001", "new"),
+    ]
+
+    report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("codex",),
+        current_projects=("project-one",),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"codex": "stable_revision"},
+        now=NOW,
+    )
+    assert [item["session_id"] for item in report["selected"]] == [
+        "long-parent",
+        "long-parent_seg-0001",
+    ]
 
 
 def test_candidate_report_uses_cheap_blob_presence_not_full_parse(

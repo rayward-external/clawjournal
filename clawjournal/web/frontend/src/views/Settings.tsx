@@ -6,7 +6,6 @@ import { AutoUploadPanel } from '../components/AutoUploadControls.tsx';
 import { colors, selectStyle, btnPrimary } from '../theme.ts';
 
 type ConfigPatch = Partial<{
-  source: string;
   scorer_backend: string;
   confirm_projects: boolean;
   ai_pii_review_enabled: boolean;
@@ -79,26 +78,6 @@ export function Settings() {
         Local configuration for this workbench. These mirror the <code>clawjournal config</code> flags.
       </p>
 
-      {/* Export source scope */}
-      <div style={cardStyle}>
-        <h3 style={titleStyle}>Export source scope</h3>
-        <p style={helpStyle}>
-          Which agents’ traces are eligible for export and sharing. Required (with project
-          confirmation below) before any export.
-        </p>
-        <select
-          style={{ ...selectStyle, minWidth: 200 }}
-          value={cfg.source ?? ''}
-          disabled={saving}
-          onChange={e => save({ source: e.target.value })}
-        >
-          <option value="" disabled>Select a source…</option>
-          {cfg.source_choices.map(s => (
-            <option key={s} value={s}>{s === 'all' ? 'All agents' : s === 'claude-science' ? 'Claude Science' : s === 'workbuddy' ? 'WorkBuddy' : s}</option>
-          ))}
-        </select>
-      </div>
-
       {/* Project confirmation */}
       <div style={cardStyle}>
         <h3 style={titleStyle}>Project confirmation</h3>
@@ -138,7 +117,7 @@ export function Settings() {
         </label>
       </div>
 
-      <AutoUploadPanel onConfigUpdated={setCfg} />
+      <AutoUploadPanel />
 
       {/* Advanced — scoring + UI toggles most users never change. Collapsed by
           default so the page leads with the export-gate essentials above. */}

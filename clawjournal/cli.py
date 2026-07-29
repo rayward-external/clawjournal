@@ -77,11 +77,10 @@ EXPORT_REVIEW_PUBLISH_STEPS = [
 ]
 
 SETUP_TO_PUBLISH_STEPS = [
-    "Step 1/5: Run prep/list to review project scope: clawjournal prep && clawjournal list",
-    "Step 2/5: Explicitly choose source scope: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>",
-    "Step 3/5: Configure exclusions/redactions and confirm projects: clawjournal config ...",
-    "Step 4/5: Export locally: clawjournal export --output /tmp/clawjournal_export.jsonl",
-    "Step 5/5: Review and confirm: clawjournal confirm ...",
+    "Step 1/4: Run prep/list to review project scope: clawjournal prep && clawjournal list",
+    "Step 2/4: Configure exclusions/redactions and confirm projects: clawjournal config ...",
+    "Step 3/4: Export locally: clawjournal export --output /tmp/clawjournal_export.jsonl",
+    "Step 4/4: Review and confirm: clawjournal confirm ...",
 ]
 
 EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"}
@@ -243,7 +242,7 @@ def _resolve_source_choice(
         configured_source = config.get("source")
         if _is_explicit_source_choice(configured_source):
             return str(configured_source), True
-    return "auto", False
+    return "all", True
 
 
 def _has_session_sources(source_filter: str = "auto") -> bool:
@@ -328,23 +327,12 @@ def _build_status_next_steps(
     """Return (next_steps, next_command) for the given stage."""
     if stage == "configure":
         projects_confirmed = config.get("projects_confirmed", False)
-        configured_source = config.get("source")
+        configured_source = config.get("source") or "all"
         source_confirmed = _is_explicit_source_choice(configured_source)
         list_command = (
             f"clawjournal list --source {configured_source}" if source_confirmed else "clawjournal list"
         )
         steps = []
-        if not source_confirmed:
-            steps.append(
-                "Ask the user to explicitly choose export source scope: Claude Code, Claude Science, Codex, Gemini, WorkBuddy, or all. "
-                "Then set it: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>. "
-                "Do not run export until source scope is explicitly confirmed."
-            )
-        else:
-            steps.append(
-                f"Source scope is currently set to '{configured_source}'. "
-                "If the user wants a different scope, run: clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>."
-            )
         if not projects_confirmed:
             steps.append(
                 f"Run: {list_command} — then send the FULL project/folder list to the user in your next message "
@@ -7096,27 +7084,8 @@ def _apply_pii_findings(file_path: Path, findings_path: Path, output_path: Path,
 def _run_export(args) -> None:
     """Run the export flow — discover, anonymize, and export locally."""
     config = load_config()
-    source_choice, source_explicit = _resolve_source_choice(args.source, config)
+    source_choice, _source_explicit = _resolve_source_choice(args.source, config)
     source_filter = _normalize_source_filter(source_choice)
-
-    if not source_explicit:
-        print(json.dumps({
-            "error": "Source scope is not confirmed yet.",
-            "hint": (
-                "Explicitly choose one source scope before exporting: "
-                "`claude`, `claude-science`, `codex`, `gemini`, `workbuddy`, or `all`."
-            ),
-            "required_action": (
-                "Ask the user whether to export Claude Code, Claude Science, Codex, Gemini, WorkBuddy, or all. "
-                "Then run `clawjournal config --source <claude|claude-science|codex|gemini|workbuddy|all>` "
-                "or pass `--source <claude|claude-science|codex|gemini|workbuddy|all>` on the export command."
-            ),
-            "allowed_sources": sorted(EXPLICIT_SOURCE_CHOICES),
-            "blocked_on_step": "Step 2/5",
-            "process_steps": SETUP_TO_PUBLISH_STEPS,
-            "next_command": "clawjournal config --source all",
-        }, indent=2))
-        sys.exit(1)
 
     print("=" * 50)
     print("  ClawJournal — Agent Trace Exporter")
@@ -7164,7 +7133,7 @@ def _run_export(args) -> None:
                 }
                 for p in projects
             ],
-            "blocked_on_step": "Step 3/5",
+            "blocked_on_step": "Step 2/4",
             "process_steps": SETUP_TO_PUBLISH_STEPS,
             "next_command": "clawjournal config --confirm-projects",
         }, indent=2))

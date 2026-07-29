@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -23,6 +24,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 from . import __version__, config as config_module
 from .agent_hooks import (
@@ -63,13 +66,13 @@ from .config import (
     RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
     load_config,
     save_config,
-    source_scope_sources,
 )
 from .paths import atomic_write_text, ensure_hash_salt
 from .raw_sources import (
     RawFingerprint,
     RawSourceChanged,
     fingerprint_raw_source,
+    fingerprint_raw_source_range,
     stat_raw_source,
 )
 from .scoring.backends import resolve_backend
@@ -77,18 +80,22 @@ from .share_flow import build_zip, package, verify_coverage
 from .workbench.index import (
     auto_upload_review_blockers,
     apply_share_redactions,
+    delete_auto_upload_enrollment_job,
     get_auto_upload_candidate_report,
     get_auto_upload_enrollment,
+    get_auto_upload_enrollment_job,
     get_effective_share_settings,
     get_session_detail,
     get_share,
     open_index,
     release_gate_blockers,
+    save_auto_upload_enrollment_job,
     save_auto_upload_enrollment,
     session_matches_excluded_projects,
     set_hold_state,
     share_revision_blockers,
     update_auto_upload_enrollment,
+    update_auto_upload_enrollment_job,
 )
 
 CADENCE_DAYS = RECURRING_CADENCE_DAYS
@@ -460,17 +467,14 @@ def _current_scope(
     conn: sqlite3.Connection,
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    source_value = str(config.get("source") or "").strip().lower()
-    source_confirmed = bool(source_value and source_value != "auto")
-    projects_confirmed = config.get("projects_confirmed") is True
-    configured_sources = source_scope_sources(source_value)
     rows = [dict(row) for row in conn.execute(
         "SELECT DISTINCT source, project FROM sessions ORDER BY source, project"
     ).fetchall()]
-    if configured_sources is None:
-        sources = sorted({str(row["source"]) for row in rows}) if source_confirmed else []
-    else:
-        sources = sorted(configured_sources)
+    sources = sorted({
+        str(row["source"])
+        for row in rows
+        if row.get("source") in COMPLETION_MODES
+    })
     # Candidate scope must use the same merged policy surface as packaging.
     # Otherwise a DB-level exclude policy can silently remove a disclosed
     # project only after the automatic share has already been selected.
@@ -497,25 +501,18 @@ def _current_scope(
         # consent, network, or the strict scan rather than as a server-worded
         # rejection after all three.
         blockers.append("scope_too_large")
-    if not source_confirmed:
-        blockers.append("source_confirmation_missing")
-    if not projects_confirmed:
-        blockers.append("project_confirmation_missing")
     if not sources:
         blockers.append("source_scope_empty")
     if not projects:
         blockers.append("project_scope_empty")
-    unsupported = sorted(set(sources) - set(COMPLETION_MODES))
-    if unsupported:
-        blockers.append("unsupported_source")
     return {
         "sources": sources,
         "projects": projects,
         "entries": entries,
-        "source_confirmed": source_confirmed,
-        "projects_confirmed": projects_confirmed,
+        "source_confirmed": True,
+        "projects_confirmed": True,
         "blockers": blockers,
-        "unsupported_sources": unsupported,
+        "unsupported_sources": [],
     }
 
 
@@ -572,8 +569,6 @@ def egress_profile_hash(
     return _keyed_digest(
         "clawjournal-recurring-egress-profile-v1",
         {
-            "source_selection": current.get("source"),
-            "projects_confirmed": current.get("projects_confirmed") is True,
             "sources": sorted(enrollment_scope["sources"]),
             "projects": sorted(enrollment_scope["projects"]),
             "policy_digest": policy_digest,
@@ -692,6 +687,7 @@ def _off_status(config: Mapping[str, Any]) -> dict[str, Any]:
         "health": "ready",
         "run_now_allowed": False,
         "overlay": None,
+        "enrollment_setup": None,
         "pending_submission_state": None,
         "ui_visible": True,
         "offer_available": False,
@@ -746,6 +742,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     try:
         try:
             enrollment = get_auto_upload_enrollment(db)
+            enrollment_job = get_auto_upload_enrollment_job(db)
         except sqlite3.DatabaseError:
             return _off_status(config)
         report = _candidate_report(db, enrollment, config=config)
@@ -757,6 +754,8 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             overlay = "revocation_pending"
         elif enrollment and enrollment.get("current_run_id"):
             overlay = "running"
+        elif enrollment_job and enrollment_job.get("state") in {"queued", "running"}:
+            overlay = "enrollment_pending"
         pending_share = _pending_submission(db)
         pending_submission_state = (
             str(pending_share["submission_state"]) if pending_share else None
@@ -775,7 +774,19 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
                 for row in hook_rows
             )
         )
-        health = "action_required" if hook_action_required else stored_health
+        job_state = enrollment_job.get("state") if enrollment_job else None
+        if job_state in {"queued", "running"}:
+            # The durable setup job owns progress while it is active.  The
+            # enrollment row may temporarily carry retrying state as the
+            # worker publishes its local intent, but that is not a user-facing
+            # failure while the same attempt is still running.
+            health = "ready"
+        elif job_state in {"action_required", "failed"}:
+            health = "action_required"
+        elif job_state == "retrying":
+            health = "retrying"
+        else:
+            health = "action_required" if hook_action_required else stored_health
         due_at = _due_at(enrollment) if enrollment else None
         last_result = None
         if enrollment and enrollment.get("last_result_code"):
@@ -795,12 +806,28 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
                 mode == "enabled" and stored_health != "action_required"
             ),
             "overlay": overlay,
+            "enrollment_setup": (
+                {
+                    "state": enrollment_job.get("state"),
+                    "stage": enrollment_job.get("current_stage"),
+                    "source": enrollment_job.get("current_source"),
+                    "position": enrollment_job.get("progress_position"),
+                    "total": enrollment_job.get("progress_total"),
+                    "attempt_count": enrollment_job.get("attempt_count", 0),
+                    "error_code": enrollment_job.get("error_code"),
+                    "message": enrollment_job.get("error_message"),
+                    "retryable": bool(enrollment_job.get("retryable")),
+                }
+                if enrollment_job
+                else None
+            ),
             "pending_submission_state": pending_submission_state,
             "ui_visible": True,
             "offer_available": bool(
                 mode == "off"
                 and successful_manual
                 and config.get("auto_upload_capability_available") is True
+                and job_state not in {"queued", "running"}
             ),
             "scope": {
                 "sources": list(enrollment.get("enrolled_sources", [])) if enrollment else [],
@@ -1198,6 +1225,123 @@ def _strict_scan_for_enable(
     return scan
 
 
+_BACKGROUND_ENROLLMENT_RESUMABLE_STATES = frozenset(
+    {"queued", "running", "retrying"}
+)
+
+
+def queue_enable(
+    *,
+    agent: str,
+    accepted_authorization_version: str | None,
+    accepted_retention_version: str | None,
+    accepted_ownership_certification_version: str | None,
+    accepted_authorization_profile_hash: str | None,
+) -> dict[str, Any]:
+    """Durably queue accepted enrollment work without scanning inline.
+
+    The exact acceptance is revalidated by :func:`enable` inside the worker;
+    this fast path grants no authority and performs no hosted request.  Its
+    only purpose is to make a successful manual receipt independent of the
+    expensive strict refresh that follows.
+    """
+
+    accepted = {
+        "agent": (agent or "all").strip().lower(),
+        "accepted_authorization_version": accepted_authorization_version,
+        "accepted_retention_version": accepted_retention_version,
+        "accepted_ownership_certification_version": (
+            accepted_ownership_certification_version
+        ),
+        "accepted_authorization_profile_hash": accepted_authorization_profile_hash,
+    }
+    for field in (
+        "accepted_authorization_version",
+        "accepted_retention_version",
+        "accepted_ownership_certification_version",
+        "accepted_authorization_profile_hash",
+    ):
+        value = accepted[field]
+        if not isinstance(value, str) or not value.strip():
+            return AutoUploadError(
+                "invalid_request",
+                "Background enrollment requires the exact accepted recurring terms.",
+            ).as_result()
+        accepted[field] = value.strip()
+
+    conn = open_index()
+    try:
+        config = load_config()
+        scope = _current_scope(conn, config)
+        if scope["blockers"]:
+            return {
+                "ok": False,
+                "code": scope["blockers"][0],
+                "message": "The current automatic-upload scope is not eligible.",
+                "scope_blockers": scope["blockers"],
+            }
+        try:
+            _hook_targets(str(accepted["agent"]), sources=scope["sources"])
+        except AutoUploadError as exc:
+            return exc.as_result()
+        if not _has_successful_manual_receipt(conn):
+            return AutoUploadError(
+                "manual_share_required",
+                "Complete one successful hosted manual share before enabling automatic uploads.",
+            ).as_result()
+
+        with control_mutation_lock():
+            enrollment = get_auto_upload_enrollment(conn)
+            if enrollment and enrollment.get("mode") in {"enabled", "paused"}:
+                delete_auto_upload_enrollment_job(conn)
+                return status(conn=conn)
+            if enrollment and enrollment.get("revocation_pending"):
+                return AutoUploadError(
+                    "revocation_pending",
+                    "Finish the prior enrollment revocation before enabling again.",
+                    retryable=True,
+                ).as_result()
+
+            existing_job = get_auto_upload_enrollment_job(conn)
+            if (
+                existing_job
+                and existing_job.get("state") in {"queued", "running"}
+            ):
+                if existing_job.get("request") == accepted:
+                    return status(conn=conn)
+                return AutoUploadError(
+                    "already_running",
+                    "Automatic-upload enrollment is already being prepared.",
+                    retryable=True,
+                ).as_result()
+
+            save_auto_upload_enrollment_job(
+                conn,
+                job_id=str(uuid.uuid4()),
+                state="queued",
+                request=accepted,
+                current_stage="queued",
+            )
+        result = status(conn=conn)
+        result["code"] = "enrollment_queued"
+        return result
+    finally:
+        conn.close()
+
+
+def has_pending_enrollment_job() -> bool:
+    """Return whether daemon startup should resume enrollment work."""
+
+    conn = open_index()
+    try:
+        job = get_auto_upload_enrollment_job(conn)
+        return bool(
+            job and job.get("state") in _BACKGROUND_ENROLLMENT_RESUMABLE_STATES
+        )
+    finally:
+        conn.close()
+
+
 def enable(
     *,
     agent: str = "all",
@@ -1209,6 +1353,7 @@ def enable(
     prepare_for_manual_share: bool = False,
     scan_progress: Callable[[str, int, int], None] | None = None,
     scan_wait_notice: Callable[[], None] | None = None,
+    background_job_id: str | None = None,
 ) -> dict[str, Any]:
     """Review or transactionally create/update a recurring enrollment.
 
@@ -1243,10 +1388,13 @@ def enable(
                 message = (
                     "The exact source/project scope exceeds the hosted limit of "
                     f"{MAX_SCOPE_ENTRIES} entries; exclude projects "
-                    "(config --exclude) or narrow the source scope first."
+                    "(config --exclude), then try again."
                 )
             else:
-                message = "Confirm a non-empty source and project scope before enabling."
+                message = (
+                    "Run a supported agent session and ensure at least one eligible "
+                    "project is available before enabling."
+                )
             return {
                 "ok": False,
                 "code": first_blocker,
@@ -1350,6 +1498,18 @@ def enable(
             # discipline requires accepting the refreshed challenge. The
             # re-accepted call reuses this refresh instead of scanning again.
             return challenge
+
+        if background_job_id is not None:
+            queued_job = get_auto_upload_enrollment_job(conn)
+            if (
+                queued_job is None
+                or queued_job.get("job_id") != background_job_id
+                or queued_job.get("state")
+                not in _BACKGROUND_ENROLLMENT_RESUMABLE_STATES
+            ):
+                return ControlChanged(
+                    "The queued automatic-upload setup was cancelled."
+                ).as_result()
 
         # Serialize enrollment mutations with running cycles.  Controls still
         # use generation CAS and can win immediately without waiting for this
@@ -1460,57 +1620,81 @@ def enable(
 
         # Persist a stable create intent before the network request.  It is Off
         # and therefore grants no egress authority if the request fails.
-        if updating:
-            assert existing is not None
-            if not update_auto_upload_enrollment(
-                conn,
-                expected_generation=int(existing["generation"]),
-                generation=generation,
-                health="retrying",
-                last_result_code="enrollment_pending",
-                current_run_id=None,
-                current_run_stage=None,
-            ):
-                raise ControlChanged("Automatic upload controls changed before enrollment.")
-        elif existing is not None:
-            if not update_auto_upload_enrollment(
-                conn,
-                expected_generation=int(existing["generation"]),
-                mode="off",
-                health="retrying",
-                generation=generation,
-                enrolled_at=intent_enrolled_at_text,
-                client_enrollment_id=client_enrollment_id,
-                enrolled_sources=scope["sources"],
-                enrolled_projects=scope["projects"],
-                enrolled_scope_entries=scope["entries"],
-                server_enrollment_id=None,
-                authorization_revision=None,
-                recurring_authorization_version=str(expected_auth),
-                retention_version=str(expected_retention),
-                egress_profile_hash=profile,
-                hook_targets=targets,
-                revocation_pending=False,
-                last_result_code="enrollment_pending",
-            ):
-                raise ControlChanged("Automatic upload controls changed before enrollment.")
+        def persist_intent() -> None:
+            if updating:
+                assert existing is not None
+                if not update_auto_upload_enrollment(
+                    conn,
+                    expected_generation=int(existing["generation"]),
+                    generation=generation,
+                    health="retrying",
+                    last_result_code="enrollment_pending",
+                    current_run_id=None,
+                    current_run_stage=None,
+                ):
+                    raise ControlChanged(
+                        "Automatic upload controls changed before enrollment."
+                    )
+            elif existing is not None:
+                if not update_auto_upload_enrollment(
+                    conn,
+                    expected_generation=int(existing["generation"]),
+                    mode="off",
+                    health="retrying",
+                    generation=generation,
+                    enrolled_at=intent_enrolled_at_text,
+                    client_enrollment_id=client_enrollment_id,
+                    enrolled_sources=scope["sources"],
+                    enrolled_projects=scope["projects"],
+                    enrolled_scope_entries=scope["entries"],
+                    server_enrollment_id=None,
+                    authorization_revision=None,
+                    recurring_authorization_version=str(expected_auth),
+                    retention_version=str(expected_retention),
+                    egress_profile_hash=profile,
+                    hook_targets=targets,
+                    revocation_pending=False,
+                    last_result_code="enrollment_pending",
+                ):
+                    raise ControlChanged(
+                        "Automatic upload controls changed before enrollment."
+                    )
+            else:
+                save_auto_upload_enrollment(
+                    conn,
+                    mode="off",
+                    health="retrying",
+                    generation=generation,
+                    enrolled_at=intent_enrolled_at_text,
+                    client_enrollment_id=client_enrollment_id,
+                    enrolled_sources=scope["sources"],
+                    enrolled_projects=scope["projects"],
+                    enrolled_scope_entries=scope["entries"],
+                    recurring_authorization_version=str(expected_auth),
+                    retention_version=str(expected_retention),
+                    egress_profile_hash=profile,
+                    hook_targets=targets,
+                    last_result_code="enrollment_pending",
+                )
+
+        if background_job_id is None:
+            persist_intent()
         else:
-            save_auto_upload_enrollment(
-                conn,
-                mode="off",
-                health="retrying",
-                generation=generation,
-                enrolled_at=intent_enrolled_at_text,
-                client_enrollment_id=client_enrollment_id,
-                enrolled_sources=scope["sources"],
-                enrolled_projects=scope["projects"],
-                enrolled_scope_entries=scope["entries"],
-                recurring_authorization_version=str(expected_auth),
-                retention_version=str(expected_retention),
-                egress_profile_hash=profile,
-                hook_targets=targets,
-                last_result_code="enrollment_pending",
-            )
+            # Disable deletes the job under this same control lock.  Once this
+            # block publishes an Off intent, the existing generation CAS makes
+            # every later Disable win safely even if hosted I/O has begun.
+            with control_mutation_lock():
+                queued_job = get_auto_upload_enrollment_job(conn)
+                if (
+                    queued_job is None
+                    or queued_job.get("job_id") != background_job_id
+                    or queued_job.get("state")
+                    not in _BACKGROUND_ENROLLMENT_RESUMABLE_STATES
+                ):
+                    raise ControlChanged(
+                        "The queued automatic-upload setup was cancelled."
+                    )
+                persist_intent()
 
         snapshots: dict[Path, str | None] = {}
         committed = False
@@ -2286,6 +2470,12 @@ def enable(
                     last_result_code=error.code,
                 )
             return error.as_result()
+        if background_job_id is None:
+            # A user may recover an action-required background attempt through
+            # the normal synchronous Settings flow.  Once that succeeds, the
+            # old job must not keep the otherwise healthy enrollment marked as
+            # requiring action.
+            delete_auto_upload_enrollment_job(conn)
         return status(conn=conn)
     except (AutoUploadError, CapabilityError, RecurringServiceError, CredentialStoreError) as exc:
         if isinstance(exc, (CapabilityError, RecurringServiceError)):
@@ -2296,6 +2486,140 @@ def enable(
     finally:
         if lock_context is not None:
             lock_context.__exit__(None, None, None)
+        conn.close()
+
+
+def run_pending_enrollment_job() -> dict[str, Any]:
+    """Resume one durable background-enrollment job to a terminal state."""
+
+    conn = open_index()
+    try:
+        job = get_auto_upload_enrollment_job(conn)
+        if (
+            job is None
+            or job.get("state") not in _BACKGROUND_ENROLLMENT_RESUMABLE_STATES
+        ):
+            return status(conn=conn)
+        job_id = str(job["job_id"])
+        attempt_count = int(job.get("attempt_count") or 0) + 1
+        if not update_auto_upload_enrollment_job(
+            conn,
+            expected_job_id=job_id,
+            state="running",
+            current_stage="refreshing_sources",
+            current_source=None,
+            progress_position=None,
+            progress_total=None,
+            attempt_count=attempt_count,
+            error_code=None,
+            error_message=None,
+            retryable=False,
+        ):
+            return status(conn=conn)
+
+        def update_progress(
+            stage: str,
+            *,
+            source: str | None = None,
+            position: int | None = None,
+            total: int | None = None,
+        ) -> None:
+            try:
+                update_auto_upload_enrollment_job(
+                    conn,
+                    expected_job_id=job_id,
+                    state="running",
+                    current_stage=stage,
+                    current_source=source,
+                    progress_position=position,
+                    progress_total=total,
+                )
+            except (sqlite3.Error, ValueError):
+                # Progress is diagnostic only.  The durable queued request and
+                # exact enable controls remain authoritative if this write is
+                # briefly contended by the scanner.
+                logger.debug(
+                    "Automatic-upload enrollment progress update failed",
+                    exc_info=True,
+                )
+
+        request = dict(job.get("request") or {})
+        try:
+            result = enable(
+                agent=str(request.get("agent") or "all"),
+                accepted_authorization_version=request.get(
+                    "accepted_authorization_version"
+                ),
+                accepted_retention_version=request.get(
+                    "accepted_retention_version"
+                ),
+                accepted_ownership_certification_version=request.get(
+                    "accepted_ownership_certification_version"
+                ),
+                accepted_authorization_profile_hash=request.get(
+                    "accepted_authorization_profile_hash"
+                ),
+                scan_progress=lambda source, position, total: update_progress(
+                    "scanning",
+                    source=source,
+                    position=position,
+                    total=total,
+                ),
+                scan_wait_notice=lambda: update_progress("waiting_for_scan"),
+                background_job_id=job_id,
+            )
+        except Exception:
+            logger.exception("Background automatic-upload enrollment crashed")
+            result = AutoUploadError(
+                "enrollment_worker_failed",
+                "Automatic-upload setup stopped unexpectedly and can be retried.",
+                retryable=True,
+            ).as_result()
+
+        current_job = get_auto_upload_enrollment_job(conn)
+        if current_job is None or current_job.get("job_id") != job_id:
+            # Disable or a newer accepted request won while this worker ran.
+            return result
+        if result.get("ok") is True and result.get("mode") in {
+            "enabled",
+            "paused",
+        }:
+            delete_auto_upload_enrollment_job(conn, expected_job_id=job_id)
+            return result
+
+        code = str(result.get("code") or "enrollment_failed")
+        message = str(
+            result.get("message")
+            or "Automatic-upload setup could not be completed."
+        )
+        retryable = bool(result.get("retryable"))
+        if code == "authorization_required":
+            state = "action_required"
+            stage = "review_required"
+            message = (
+                "The exact recurring scope or terms changed during refresh. "
+                "Review them before enabling automatic uploads."
+            )
+        elif retryable:
+            state = "retrying"
+            stage = "retry_required"
+        else:
+            state = "action_required"
+            stage = "review_required"
+        update_auto_upload_enrollment_job(
+            conn,
+            expected_job_id=job_id,
+            state=state,
+            current_stage=stage,
+            current_source=None,
+            progress_position=None,
+            progress_total=None,
+            error_code=code,
+            error_message=message,
+            retryable=retryable,
+        )
+        return result
+    finally:
         conn.close()
 
 
@@ -2386,6 +2710,10 @@ def disable() -> dict[str, Any]:
         # Hosted revocation stays outside the lock; every later DB write is a
         # CAS against the generation this Disable owns.
         with control_mutation_lock():
+            # A queued/running background setup grants no authority yet, but
+            # deleting its durable job under this lock prevents it from
+            # publishing an enrollment intent after the user turns it off.
+            delete_auto_upload_enrollment_job(conn)
             enrollment = get_auto_upload_enrollment(conn)
             if (
                 enrollment is not None
@@ -2630,9 +2958,23 @@ def _raw_fingerprints(
                 "raw_source_unavailable",
                 "A selected trace no longer has a verifiable raw source.",
             )
+        start_offset = candidate.get("raw_source_start_offset")
+        end_offset = candidate.get("raw_source_end_offset")
         try:
-            fingerprints[session_id] = fingerprint_raw_source(raw_path)
-        except (OSError, RawSourceChanged) as exc:
+            if start_offset is None and end_offset is None:
+                fingerprints[session_id] = fingerprint_raw_source(raw_path)
+            elif (
+                isinstance(start_offset, int)
+                and not isinstance(start_offset, bool)
+                and isinstance(end_offset, int)
+                and not isinstance(end_offset, bool)
+            ):
+                fingerprints[session_id] = fingerprint_raw_source_range(
+                    raw_path, start_offset, end_offset
+                )
+            else:
+                raise ValueError("raw source range is incomplete")
+        except (OSError, RawSourceChanged, ValueError) as exc:
             raise AutoUploadError(
                 "raw_source_unavailable",
                 "A selected trace's raw source is unavailable.",
@@ -3645,7 +3987,9 @@ def _validate_raw_fingerprint_ledger(
     conn: sqlite3.Connection, share: Mapping[str, Any]
 ) -> None:
     rows = conn.execute(
-        "SELECT s.session_id, s.raw_source_path FROM share_sessions ss "
+        "SELECT s.session_id, s.raw_source_path, "
+        "s.raw_source_start_offset, s.raw_source_end_offset "
+        "FROM share_sessions ss "
         "JOIN sessions s ON s.session_id = ss.session_id WHERE ss.share_id = ? "
         "ORDER BY s.session_id",
         (share["share_id"],),
@@ -3655,7 +3999,12 @@ def _validate_raw_fingerprint_ledger(
             "invalid_session_count", "A sealed recurring artifact must contain one to five traces."
         )
     candidates = [
-        {"session_id": str(row["session_id"]), "raw_source_path": row["raw_source_path"]}
+        {
+            "session_id": str(row["session_id"]),
+            "raw_source_path": row["raw_source_path"],
+            "raw_source_start_offset": row["raw_source_start_offset"],
+            "raw_source_end_offset": row["raw_source_end_offset"],
+        }
         for row in rows
     ]
     encoded_fingerprints = share.get("sealed_raw_fingerprints")
@@ -3679,15 +4028,19 @@ def _validate_raw_fingerprint_ledger(
 def _raw_stat_signatures(
     conn: sqlite3.Connection, share: Mapping[str, Any]
 ) -> dict[str, tuple]:
-    """Cheap stat-only signatures for a sealed share's raw inputs.
+    """Cheap lock-wait signatures for a sealed share's raw inputs.
 
     Detects a raw append/replace that happens while the egress lock is being
-    acquired, without the size-unbounded re-hash of the fingerprint ledger. A
-    vanished or unreadable source counts as a change (raises ``ControlChanged``).
+    acquired. Whole-session sources use stat-only metadata; sealed append-only
+    segments re-hash only their exact bounded byte range so later appends do
+    not invalidate an already-closed checkpoint. A vanished or unreadable
+    source counts as a change (raises ``ControlChanged``).
     """
 
     rows = conn.execute(
-        "SELECT s.session_id, s.raw_source_path FROM share_sessions ss "
+        "SELECT s.session_id, s.raw_source_path, "
+        "s.raw_source_start_offset, s.raw_source_end_offset "
+        "FROM share_sessions ss "
         "JOIN sessions s ON s.session_id = ss.session_id WHERE ss.share_id = ? "
         "ORDER BY s.session_id",
         (share["share_id"],),
@@ -3701,8 +4054,17 @@ def _raw_stat_signatures(
                 "A selected trace no longer has a verifiable raw source."
             )
         try:
-            signatures[session_id] = stat_raw_source(raw_path)
-        except (OSError, RawSourceChanged) as exc:
+            start_offset = row["raw_source_start_offset"]
+            end_offset = row["raw_source_end_offset"]
+            if start_offset is None and end_offset is None:
+                signatures[session_id] = stat_raw_source(raw_path)
+            elif isinstance(start_offset, int) and isinstance(end_offset, int):
+                signatures[session_id] = fingerprint_raw_source_range(
+                    raw_path, start_offset, end_offset
+                )
+            else:
+                raise ValueError("raw source range is incomplete")
+        except (OSError, RawSourceChanged, ValueError) as exc:
             raise ControlChanged(
                 "A selected raw trace became unavailable while acquiring the egress lock."
             ) from exc
