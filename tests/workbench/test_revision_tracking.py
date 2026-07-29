@@ -10,6 +10,7 @@ import pytest
 
 from clawjournal.workbench.index import (
     WORKBENCH_SCHEMA_VERSION,
+    PREDECESSOR_SOURCE_RECEIVER,
     RevisionConflictError,
     already_shared_revision_blockers,
     compute_content_revision,
@@ -490,9 +491,12 @@ def test_receiver_preflight_rebinds_only_the_unsubmitted_share(index_conn):
     ).fetchone()
     assert row["content_revision"] == revision_r2
     assert row["replaces_revision"] == receiver_head
-    assert share_predecessor_blockers(index_conn, share_r2)[0][
-        "reason"
-    ] == "stale_predecessor"
+    # This assertion used to expect `stale_predecessor` without an explicit
+    # `accepted_predecessors`. That reading is what stranded a rebound share
+    # after a failed attempt, so the redirected row now carries the receiver
+    # marker and clears the gate on its own; see
+    # test_receiver_rebound_predecessor_survives_a_retry.
+    assert share_predecessor_blockers(index_conn, share_r2) == []
     assert share_predecessor_blockers(
         index_conn,
         share_r2,
@@ -668,3 +672,114 @@ def test_v5_migration_missing_blob_uses_safe_legacy_baseline(tmp_path, monkeypat
         assert get_share_ready_stats(conn)["sessions"] == []
     finally:
         conn.close()
+
+
+def test_receiver_rebound_predecessor_survives_a_retry(index_conn):
+    """A rebound share must stay submittable after a failed attempt.
+
+    The rebase persists before the upload, so any transient failure leaves a
+    receiver-authoritative predecessor in the row. Read strictly, that looks
+    exactly like a third revision overtaking the share, and the up-front gate
+    stranded it permanently — the preflight that would re-authorize it never
+    ran.
+    """
+    upsert_sessions(index_conn, [_session(content="r1")])
+    _approve(index_conn)
+    share_r1 = create_share(index_conn, ["trace-1"])
+    _mark_shared(index_conn, share_r1, "2026-07-02T00:00:00+00:00")
+
+    upsert_sessions(index_conn, [_session(content="r2")])
+    _approve(index_conn)
+    share_r2 = create_share(index_conn, ["trace-1"])
+    revision_r2 = index_conn.execute(
+        "SELECT content_revision FROM sessions WHERE session_id = 'trace-1'"
+    ).fetchone()[0]
+    receiver_head = "sha256:" + ("b" * 64)
+
+    synchronize_share_predecessors(
+        index_conn,
+        share_r2,
+        expected_revisions={"trace-1": revision_r2},
+        required_predecessors={"trace-1": receiver_head},
+    )
+
+    assert index_conn.execute(
+        "SELECT predecessor_source FROM share_sessions WHERE share_id = ?",
+        (share_r2,),
+    ).fetchone()[0] == PREDECESSOR_SOURCE_RECEIVER
+
+    # The retry: no preflight response in hand, so no `accepted_predecessors`.
+    assert share_predecessor_blockers(index_conn, share_r2) == []
+
+
+def test_receiver_marker_does_not_excuse_a_duplicate_revision(index_conn):
+    """The exemption covers stale predecessors, never a duplicate upload."""
+    upsert_sessions(index_conn, [_session(content="r1")])
+    _approve(index_conn)
+    share_r1 = create_share(index_conn, ["trace-1"])
+
+    upsert_sessions(index_conn, [_session(content="r2")])
+    _approve(index_conn)
+    share_r2 = create_share(index_conn, ["trace-1"])
+    revision_r2 = index_conn.execute(
+        "SELECT content_revision FROM sessions WHERE session_id = 'trace-1'"
+    ).fetchone()[0]
+    receiver_head = "sha256:" + ("b" * 64)
+
+    synchronize_share_predecessors(
+        index_conn,
+        share_r2,
+        expected_revisions={"trace-1": revision_r2},
+        required_predecessors={"trace-1": receiver_head},
+    )
+    # A sibling share uploads this share's own revision.
+    index_conn.execute(
+        "UPDATE share_sessions SET content_revision = ? WHERE share_id = ?",
+        (revision_r2, share_r1),
+    )
+    _mark_shared(index_conn, share_r1, "2026-07-03T00:00:00+00:00")
+
+    blockers = share_predecessor_blockers(index_conn, share_r2)
+    assert [b["reason"] for b in blockers] == ["already_shared_revision"]
+
+
+def test_ordinary_shares_keep_the_strict_stale_predecessor_check(index_conn):
+    """Only redirected rows are exempt; an untouched share stays strict."""
+    upsert_sessions(index_conn, [_session(content="r1")])
+    _approve(index_conn)
+    share_r1 = create_share(index_conn, ["trace-1"])
+    _mark_shared(index_conn, share_r1, "2026-07-02T00:00:00+00:00")
+
+    upsert_sessions(index_conn, [_session(content="r2")])
+    _approve(index_conn)
+    share_r2 = create_share(index_conn, ["trace-1"])
+    revision_r2 = index_conn.execute(
+        "SELECT content_revision FROM sessions WHERE session_id = 'trace-1'"
+    ).fetchone()[0]
+
+    # The receiver confirms the predecessor the share already declared, so
+    # nothing is redirected and the row must not be marked.
+    local_predecessor = index_conn.execute(
+        "SELECT replaces_revision FROM share_sessions WHERE share_id = ?",
+        (share_r2,),
+    ).fetchone()[0]
+    assert synchronize_share_predecessors(
+        index_conn,
+        share_r2,
+        expected_revisions={"trace-1": revision_r2},
+        required_predecessors={"trace-1": local_predecessor},
+    ) == 0
+    assert index_conn.execute(
+        "SELECT predecessor_source FROM share_sessions WHERE share_id = ?",
+        (share_r2,),
+    ).fetchone()[0] is None
+
+    # A third revision then wins the race locally.
+    upsert_sessions(index_conn, [_session(content="r3")])
+    _approve(index_conn)
+    share_r3 = create_share(index_conn, ["trace-1"])
+    _mark_shared(index_conn, share_r3, "2026-07-04T00:00:00+00:00")
+
+    assert [
+        b["reason"] for b in share_predecessor_blockers(index_conn, share_r2)
+    ] == ["stale_predecessor"]

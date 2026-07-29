@@ -3725,6 +3725,13 @@ def test_finalize_reraises_control_gate_instead_of_swallowing(
     from clawjournal.redaction.pii import _AgentCallGateError
     from clawjournal.auto_upload import ControlChanged
 
+    # This test does not take `index_setup`, so without these it opens the
+    # developer's real ~/.clawjournal/index.db — writing to live data and
+    # contending with a running `clawjournal serve` for the write lock.
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path / "config")
+
     export_dir = tmp_path / "share"
     export_dir.mkdir()
     (export_dir / "sessions.jsonl").write_text('{"session_id":"s1"}\n', encoding="utf-8")
@@ -5165,6 +5172,120 @@ class TestShareAPI:
         assert status == 200, data
         uploaded = captured["manifest"]["sessions"][0]
         assert uploaded["replaces_revision_hash"] == receiver_head
+
+    def test_rebound_share_can_be_retried_after_a_failed_upload(
+        self, server, monkeypatch
+    ):
+        """The rebase persists before the upload, so a retry must still work.
+
+        A transient upload failure leaves a receiver-authoritative predecessor
+        in the row. Read strictly that looks like a third revision overtaking
+        the share, and the up-front gate rejected the retry before the preflight
+        that would re-authorize it could run — stranding the share for good.
+        """
+        from clawjournal.workbench.index import (
+            create_share,
+            open_index,
+            update_session,
+        )
+
+        WorkbenchHandler._last_share_time = 0.0
+        session_id = "retryable-hosted-session"
+        self._seed_released_session(session_id, "first locally shared revision")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            first_share = create_share(conn, [session_id])
+            conn.execute(
+                "UPDATE shares SET status='shared', shared_at=? WHERE share_id=?",
+                ("2026-07-01T00:00:00+00:00", first_share),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self._seed_released_session(session_id, "continued work after first upload")
+        conn = open_index()
+        try:
+            update_session(conn, session_id, status="approved")
+            share_id = create_share(conn, [session_id])
+        finally:
+            conn.close()
+
+        status, exported = _post(server, f"/api/shares/{share_id}/export")
+        assert status == 200, exported
+        receiver_head = "sha256:" + ("b" * 64)
+
+        def lineage_preflight(payload):
+            claim = payload["sessions"][0]
+            ready = claim["replaces_revision_hash"] == receiver_head
+            return {
+                "lineage_contract": "logical_sessions_v1",
+                "sessions": [{
+                    "session_id": session_id,
+                    "status": "ready" if ready else "rebase_required",
+                    "current_head_revision_hash": receiver_head,
+                    "current_head_accepted_at": "2026-07-02T00:00:00+00:00",
+                    "required_replaces_revision_hash": receiver_head,
+                }],
+            }
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: _share_config(),
+        )
+
+        def fail_upload(_req):
+            raise urllib.error.URLError("connection reset during upload")
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=fail_upload,
+            ),
+        ):
+            status, _data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+        assert status != 200
+
+        conn = open_index()
+        try:
+            row = conn.execute(
+                "SELECT replaces_revision, predecessor_source "
+                "FROM share_sessions WHERE share_id = ?",
+                (share_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row["replaces_revision"] == receiver_head
+        assert row["predecessor_source"] == "receiver"
+
+        # The retry: same healthy server, nothing changed remotely.
+        WorkbenchHandler._last_share_time = 0.0
+        captured = {}
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(
+                lineage_preflight=lineage_preflight,
+                upload_assert=lambda req: captured.update(
+                    manifest=self._manifest_from_upload(req)
+                ),
+            ),
+        ):
+            status, data = _post(
+                server,
+                f"/api/shares/{share_id}/upload",
+                self._consent_body(),
+            )
+
+        assert status == 200, data
+        assert captured["manifest"]["sessions"][0][
+            "replaces_revision_hash"
+        ] == receiver_head
 
     def test_hosted_upload_does_not_rebase_draft_older_than_receiver_head(
         self, server, monkeypatch
