@@ -512,6 +512,105 @@ def test_auto_upload_enable_reports_lock_wait_and_scan_progress(server, monkeypa
     assert body["message"] == "Automatic upload enabled."
 
 
+@pytest.mark.parametrize(
+    ("label", "progress_id"),
+    [
+        ("path traversal", "../../etc/passwd"),
+        ("over the length cap", "a" * 129),
+        ("embedded whitespace", "has spaces"),
+        ("non-ascii", "pr\u00f6gress"),
+    ],
+)
+def test_auto_upload_enable_rejects_an_unusable_progress_id(
+    server, monkeypatch, label, progress_id
+):
+    """The progress id is client-supplied and becomes a URL path segment.
+
+    It is only ever a dict key today, but the filter is what keeps it that way,
+    so it is pinned rather than left to the reader to re-derive.
+    """
+    from clawjournal import auto_upload
+
+    called = []
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: called.append(kwargs) or {"ok": True, "mode": "enabled"},
+    )
+
+    status, body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "accepted_authorization_profile_hash": "profile-hash",
+            "progress_id": progress_id,
+        },
+    )
+
+    assert status == 400, label
+    assert body["error"] == "Invalid progress identifier"
+    # Rejected before the enrollment call, not after.
+    assert called == []
+
+
+def test_read_only_challenge_creates_no_progress_state(server, monkeypatch):
+    """`challenge_only` cannot enroll, so it must not publish enable progress."""
+    from clawjournal import auto_upload
+
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: {"ok": True, "mode": "off", "challenge": {}},
+    )
+
+    status, _body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "accepted_authorization_profile_hash": "profile-hash",
+            "progress_id": "challenge-only-probe",
+            "challenge_only": True,
+        },
+    )
+    assert status == 200
+
+    status, _body = _get(
+        server, "/api/auto-upload/enable-progress/challenge-only-probe"
+    )
+    assert status == 404
+
+
+def test_auto_upload_enable_publishes_the_refusal_reason(server, monkeypatch):
+    """A refused enrollment ends in a terminal stage carrying its reason.
+
+    Without this the poller's last word is whatever stage it happened to catch,
+    so the dialog would sit on "scanning" after the attempt was already over.
+    """
+    from clawjournal import auto_upload
+
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: {"ok": False, "message": "Hosted submissions are closed."},
+    )
+
+    _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "accepted_authorization_profile_hash": "profile-hash",
+            "progress_id": "refused-enrollment",
+        },
+    )
+
+    status, body = _get(
+        server, "/api/auto-upload/enable-progress/refused-enrollment"
+    )
+    assert status == 200
+    assert body["stage"] == "failed"
+    assert body["message"] == "Hosted submissions are closed."
+
+
 def test_auto_upload_enable_forwards_manual_share_preparation(server, monkeypatch):
     from clawjournal import auto_upload
 
