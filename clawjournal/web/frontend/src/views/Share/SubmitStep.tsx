@@ -222,8 +222,13 @@ export function SubmitStep(p: SubmitStepProps) {
         setSubmitProgress((prev) => Math.max(prev, stage.progress));
       }, stage.delayMs)
     ));
+    // `Math.min` alone would claw a higher value back down to the ceiling once
+    // the enrollment phase reports real progress above it, so the crawl only
+    // ever moves forward.
     const tick = window.setInterval(() => {
-      setSubmitProgress((prev) => Math.min(92, prev + (prev < 64 ? 3 : 1)));
+      setSubmitProgress((prev) => (
+        prev >= 92 ? prev : Math.min(92, prev + (prev < 64 ? 3 : 1))
+      ));
     }, 700);
 
     return () => {
@@ -717,7 +722,14 @@ export function SubmitStep(p: SubmitStepProps) {
                     }} />
                     {currentSubmitStage.detail}
                   </div>
-                  <div style={{ height: 4, background: colors.gray200, borderRadius: 2, overflow: 'hidden' }}>
+                  <div
+                    role="progressbar"
+                    aria-label="Submission progress"
+                    aria-valuenow={submitProgress}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    style={{ height: 4, background: colors.gray200, borderRadius: 2, overflow: 'hidden' }}
+                  >
                     <div style={{
                       width: `${submitProgress}%`,
                       height: '100%',

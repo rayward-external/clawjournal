@@ -177,7 +177,7 @@ describe('SubmitStep automatic-upload opt-in', () => {
     vi.spyOn(api.autoUpload, 'status').mockResolvedValue(
       automaticUploadStatus(),
     );
-    let rejectChallenge = (_reason: unknown): void => {
+    let rejectChallenge: (reason: unknown) => void = () => {
       throw new Error('Automatic-upload challenge did not start');
     };
     vi.spyOn(api.autoUpload, 'enable').mockImplementation(() => new Promise(

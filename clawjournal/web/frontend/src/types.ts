@@ -229,6 +229,21 @@ export type AutoUploadHealth = 'ready' | 'action_required' | 'retrying';
 export type AutoUploadOverlay = 'running' | 'revocation_pending' | 'enrollment_pending' | null;
 export type AutoUploadAgent = 'claude' | 'codex' | 'all' | 'auto';
 
+export interface AutoUploadEnableProgress {
+  progress_id: string;
+  stage:
+    | 'checking_hosted_service'
+    | 'waiting_for_scan_lock'
+    | 'scanning'
+    | 'complete'
+    | 'failed';
+  message: string;
+  source: string | null;
+  current_project: number | null;
+  total_projects: number | null;
+  updated_at: string | null;
+}
+
 export interface AutoUploadHookDiagnostic {
   agent: string;
   selected: boolean;

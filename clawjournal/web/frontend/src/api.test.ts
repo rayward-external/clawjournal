@@ -98,6 +98,75 @@ describe('automatic-upload API normalization', () => {
       },
     ]);
   });
+
+  it('tracks accepted enrollment requests and reads their local progress', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ mode: 'enabled' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          progress_id: 'progress-issue165',
+          stage: 'scanning',
+          message: 'Refreshing Codex source logs: 42/118 projects',
+          source: 'codex',
+          current_project: 42,
+          total_projects: 118,
+          updated_at: '2026-07-29T00:00:00Z',
+        }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.autoUpload.enable({
+      agent: 'auto',
+      accepted_authorization_profile_hash: 'profile-hash-v2',
+      progress_id: 'progress-issue165',
+    });
+    await expect(
+      api.autoUpload.enableProgress('progress-issue165'),
+    ).resolves.toMatchObject({
+      stage: 'scanning',
+      source: 'codex',
+      current_project: 42,
+      total_projects: 118,
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/auto-upload/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent: 'auto',
+        accepted_authorization_profile_hash: 'profile-hash-v2',
+        progress_id: 'progress-issue165',
+      }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/auto-upload/enable-progress/progress-issue165',
+      { headers: {} },
+    );
+  });
+
+  it('does not create progress state for a read-only challenge', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ mode: 'off' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.autoUpload.enable({ agent: 'auto', challenge_only: true });
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/auto-upload/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent: 'auto', challenge_only: true }),
+    });
+  });
 });
 
 describe('share scanner recovery API', () => {
