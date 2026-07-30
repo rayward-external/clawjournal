@@ -129,9 +129,12 @@ function normalizeAutoUploadStatus(raw: Partial<AutoUploadStatus>): AutoUploadSt
       ? raw.health
       : 'ready',
     run_now_allowed: raw.run_now_allowed === true,
-    overlay: raw.overlay === 'running' || raw.overlay === 'revocation_pending'
+    overlay: raw.overlay === 'running'
+      || raw.overlay === 'revocation_pending'
+      || raw.overlay === 'enrollment_pending'
       ? raw.overlay
       : null,
+    enrollment_setup: raw.enrollment_setup ?? null,
     pending_submission_state: raw.pending_submission_state === 'sealed'
       || raw.pending_submission_state === 'submitting'
       ? raw.pending_submission_state
@@ -365,6 +368,7 @@ export const api = {
       accepted_authorization_profile_hash?: string;
       challenge_only?: boolean;
       prepare_for_manual_share?: boolean;
+      background?: boolean;
       progress_id?: string;
     }): Promise<AutoUploadStatus> {
       const status = await request<Partial<AutoUploadStatus>>('/auto-upload/enable', {
@@ -665,11 +669,24 @@ export const api = {
       consent_version: string;
       retention_policy_version: string;
       ai_pii?: boolean;
+      automatic_upload?: {
+        agent: AutoUploadAgent;
+        accepted_authorization_version: string;
+        accepted_retention_version: string;
+        accepted_ownership_certification_version: string;
+        accepted_authorization_profile_hash: string;
+      };
     }): Promise<{
       ok: boolean; shared_at: string; receipt_id: string; hosted_status?: string | null;
       session_count: number; bundle_hash: string;
       zip_size_bytes?: number;
       redaction_summary: { total_redactions: number; by_type: Record<string, number> };
+      automatic_upload?: {
+        queued: boolean;
+        mode: AutoUploadStatus['mode'];
+        code?: string | null;
+        message?: string | null;
+      };
     }> {
       return request(`/shares/${encodeURIComponent(id)}/upload`, {
         method: 'POST',

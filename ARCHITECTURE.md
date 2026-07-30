@@ -84,6 +84,10 @@ Optional hosted recurring path:
 - It remains unavailable unless hosted discovery advertises protocol v2 and the participant has a successful manual receipt.
 - A successful manual share may return a short-lived, single-use enrollment grant bound to that receipt and participant. The client prefers that grant for immediate enrollment and falls back to fresh email verification when it is unavailable, expired, or rejected.
 - The final manual-submit screen may collect the separate recurring authorization before upload, but only as a read-only, exact-version challenge. When that challenge is available, the combined submit-and-enable choice is selected by default and remains removable before Submit. The client cannot create recurring authority until the manual receipt exists; after success it consumes the receipt grant and falls back to the normal receipt-page enrollment flow if scope or terms changed.
+- The successful manual-upload request durably queues accepted recurring setup before returning its receipt. A daemon-owned worker performs the strict refresh and enrollment, publishes progress for polling clients, survives browser closure, and resumes after daemon restart. Disable cancels the queued authority before it can publish enrollment intent; manual-share success never depends on the background result.
+- Recurring scope does not inherit the manual-export source selector. It includes every observed source with an audited unattended completion contract (currently Claude Code and Codex), applies effective project exclusions, and presents the resulting exact pairs read-only for authorization.
+- Growing Claude Code and Codex JSONL files are parsed record-by-record. Once a bounded message, user-turn, normalized-text, or raw-byte threshold is reached, the first complete assistant turn seals a deterministic checkpoint when the next user turn confirms its raw boundary; the unfinished tail remains local until it reaches another checkpoint or the normal stability window. The first checkpoint keeps the source session ID and later checkpoints use deterministic child IDs, preserving an existing hosted revision chain without repeatedly uploading the whole conversation.
+- Each sealed checkpoint stores and revalidates the exact raw byte range that produced it. Appending a later turn does not invalidate an earlier checkpoint, while truncation, replacement, or an edit inside that checkpoint still fails closed before egress.
 - Enrollment sends the explicit (source, project) scope entries and requires two distinct affirmative acts: the versioned recurring authorization/retention acceptance and the versioned ownership certification. The server computes and owns the scope hash; the client pins the value read back at enrollment and fails closed on any drift.
 - The local SQLite singleton owns mode, generation, accepted exact scope/profile, cadence, health, and run overlay. Private files own active/recovery credentials; `config.json` never does.
 - The hosted service owns versioned recurring authorization, credential hashes, exact-byte idempotency, cross-enrollment duplicate-revision rejection, storage, and receipts.
@@ -93,7 +97,7 @@ The default configuration is local-first and does not require any hosted backend
 
 ### Trace revision contract
 
-`session_id` is the stable identity of a source trace, including traces that continue growing after an upload. Each normalized message snapshot also carries:
+`session_id` is the stable identity of a source trace. For a bounded checkpoint of a growing append-only trace, checkpoint zero retains that identity and later checkpoints use deterministic `_seg-NNNN` child identities. Each normalized message snapshot also carries:
 
 - `revision_hash`: `sha256:<hex>` over the canonical normalized `messages` array.
 - `replaces_revision_hash`: the last successfully uploaded revision for that `session_id`, or `null` for its first upload.

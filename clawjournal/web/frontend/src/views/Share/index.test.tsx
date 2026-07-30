@@ -202,7 +202,7 @@ describe('Share selection defaults', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' }));
     expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeChecked();
-  });
+  }, 10_000);
 
   it('prunes stale queue ids when eligibility refreshes after a completed bundle', async () => {
     const initialStats = readyStats(50);

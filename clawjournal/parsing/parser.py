@@ -10,6 +10,7 @@ import platform
 import re
 import sqlite3
 import zipfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -202,33 +203,94 @@ def _iter_jsonl_bytes(data: bytes, *, filepath: Path):
             ) from exc
 
 
+def _iter_binary_jsonl_records(handle):
+    """Yield records and delimiters without buffering the whole file."""
+
+    offset = 0
+    for raw_line in handle:
+        line_start = 0
+        for delimiter in re.finditer(br"\r\n|\r|\n", raw_line):
+            yield (
+                raw_line[line_start:delimiter.start()],
+                raw_line[delimiter.start():delimiter.end()],
+                offset + line_start,
+                offset + delimiter.end(),
+            )
+            line_start = delimiter.end()
+        if line_start < len(raw_line):
+            yield (
+                raw_line[line_start:],
+                b"",
+                offset + line_start,
+                offset + len(raw_line),
+            )
+        offset += len(raw_line)
+
+
 def _iter_jsonl(
     filepath: Path,
     *,
     strict: bool = False,
     snapshot_out: dict[str, Any] | None = None,
 ):
-    """Yield JSONL objects, with an exact fail-closed mode for auto-upload."""
+    """Yield JSONL objects with bounded memory and exact strict snapshots."""
 
-    if strict:
-        from ..raw_sources import read_raw_source_snapshot
-
-        snapshots, fingerprint = read_raw_source_snapshot(filepath)
-        if len(snapshots) != 1:
-            raise ValueError("file JSONL source resolved to multiple parser inputs")
-        if snapshot_out is not None:
-            snapshot_out["fingerprint"] = fingerprint
-        yield from _iter_jsonl_bytes(snapshots[0][1], filepath=filepath)
-        return
-    with open(filepath, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
+    if snapshot_out is not None:
+        snapshot_out.clear()
+    with filepath.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        digest = hashlib.sha256()
+        line_number = 0
+        for (
+            record_bytes,
+            delimiter_bytes,
+            record_start,
+            record_end,
+        ) in _iter_binary_jsonl_records(handle):
+            digest.update(record_bytes)
+            digest.update(delimiter_bytes)
+            line_number += 1
+            if snapshot_out is not None:
+                snapshot_out["record_start"] = record_start
+                snapshot_out["record_end"] = record_end
+            try:
+                line = record_bytes.decode(
+                    "utf-8", errors="strict" if strict else "replace"
+                ).strip()
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"invalid UTF-8 JSONL input at line {line_number}: {filepath.name}"
+                ) from exc
             if not line:
                 continue
             try:
                 yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(
+                        f"malformed JSONL input at line {line_number}: {filepath.name}"
+                    ) from exc
+
+        after = os.fstat(handle.fileno())
+
+    if strict and (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        from ..raw_sources import RawSourceChanged
+
+        raise RawSourceChanged("raw source changed while it was parsed")
+    if snapshot_out is not None:
+        snapshot_out["file_size"] = int(after.st_size)
+        snapshot_out["fingerprint"] = (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_size),
+            int(after.st_mtime_ns),
+            digest.hexdigest(),
+        )
 
 
 def _path_to_dir_name(absolute_path: str) -> str:
@@ -1845,6 +1907,43 @@ def _anonymize_claude_science_value(value: Any, anonymizer: Anonymizer, key: str
     return value
 
 
+def _finalize_append_only_segments(
+    session: dict[str, Any],
+    raw_path: Path,
+    *,
+    strict_jsonl: bool,
+) -> list[dict[str, Any]]:
+    from .segmenter import segment_append_only_session
+
+    full_fingerprint = session.get("_raw_source_fingerprint")
+    offsets = session.pop("_raw_message_end_offsets", None)
+    start_offsets = session.pop("_raw_message_start_offsets", None)
+    raw_source_size = session.pop("_raw_source_size", None)
+    if not isinstance(offsets, list):
+        return [session]
+    segments = segment_append_only_session(
+        session,
+        offsets,
+        message_start_offsets=start_offsets,
+        raw_source_size=raw_source_size,
+    )
+    if len(segments) <= 1:
+        return [session]
+    if strict_jsonl:
+        from ..raw_sources import fingerprint_raw_source_range
+
+        for segment in segments:
+            if segment.get("segment_sealed"):
+                segment["_raw_source_fingerprint"] = fingerprint_raw_source_range(
+                    raw_path,
+                    int(segment["raw_source_start_offset"]),
+                    int(segment["raw_source_end_offset"]),
+                )
+            elif isinstance(full_fingerprint, tuple) and len(full_fingerprint) == 5:
+                segment["_raw_source_fingerprint"] = full_fingerprint
+    return segments
+
+
 def parse_project_sessions(
     project_dir_name: str,
     anonymizer: Anonymizer,
@@ -1946,6 +2045,7 @@ def parse_project_sessions(
                 include_thinking=include_thinking,
                 target_cwd=project_dir_name,
                 strict_jsonl=strict_jsonl,
+                capture_raw_offsets=True,
             )
             if parsed and parsed["messages"]:
                 parsed["project"] = _build_codex_project_name(project_dir_name)
@@ -1958,7 +2058,11 @@ def parse_project_sessions(
                     parsed["client_origin"] = "desktop"
                 elif originator:
                     parsed["client_origin"] = "cli"
-                sessions.append(parsed)
+                sessions.extend(
+                    _finalize_append_only_segments(
+                        parsed, session_file, strict_jsonl=strict_jsonl
+                    )
+                )
         return sessions
 
     if source == CURSOR_SOURCE:
@@ -2018,6 +2122,7 @@ def parse_project_sessions(
                 anonymizer,
                 include_thinking,
                 strict_jsonl=strict_jsonl,
+                capture_raw_offsets=True,
             )
             if parsed and parsed["messages"]:
                 parsed["project"] = project_name
@@ -2032,7 +2137,11 @@ def parse_project_sessions(
                     parsed["runtime_channel"] = "local-agent"
                 elif ep:
                     parsed["client_origin"] = ep
-                sessions.append(parsed)
+                sessions.extend(
+                    _finalize_append_only_segments(
+                        parsed, session_file, strict_jsonl=strict_jsonl
+                    )
+                )
                 seen_session_ids.add(parsed["session_id"])
                 seen_session_ids.add(session_file.stem)
 
@@ -2073,6 +2182,7 @@ def parse_project_sessions(
                 anonymizer,
                 include_thinking,
                 strict_jsonl=strict_jsonl,
+                capture_raw_offsets=True,
             )
             if parsed and parsed["messages"]:
                 parsed.pop("entrypoint", None)
@@ -2086,7 +2196,11 @@ def parse_project_sessions(
                 meta = la_session.get("wrapper_meta", {})
                 if not parsed.get("model") and meta.get("model"):
                     parsed["model"] = meta["model"]
-                sessions.append(parsed)
+                sessions.extend(
+                    _finalize_append_only_segments(
+                        parsed, jsonl_path, strict_jsonl=strict_jsonl
+                    )
+                )
                 seen_session_ids.add(parsed["session_id"])
                 if cli_id != parsed["session_id"]:
                     seen_session_ids.add(cli_id)
@@ -2264,7 +2378,9 @@ def _make_session_result(
     return result
 
 
-def _build_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer) -> dict[str, dict]:
+def _build_tool_result_map(
+    entries: Iterable[dict[str, Any]], anonymizer: Anonymizer
+) -> dict[str, dict]:
     """Pre-pass: build a map of tool_use_id -> {output, status} from tool_result blocks."""
     result: dict[str, dict] = {}
     for entry in entries:
@@ -2298,6 +2414,7 @@ def _parse_claude_session_file(
     include_thinking: bool = True,
     *,
     strict_jsonl: bool = False,
+    capture_raw_offsets: bool = False,
 ) -> dict | None:
     messages: list[dict[str, Any]] = []
     metadata = {
@@ -2313,27 +2430,66 @@ def _parse_claude_session_file(
     }
     stats = _make_stats()
 
-    snapshot: dict[str, Any] = {}
+    tool_snapshot: dict[str, Any] = {}
     try:
-        entries = list(
+        tool_result_map = _build_tool_result_map(
             _iter_jsonl(
                 filepath,
                 strict=strict_jsonl,
-                snapshot_out=snapshot,
-            )
+                snapshot_out=tool_snapshot,
+            ),
+            anonymizer,
         )
     except OSError:
         if strict_jsonl:
             raise
         return None
 
-    tool_result_map = _build_tool_result_map(entries, anonymizer)
-    for entry in entries:
-        _process_entry(entry, messages, metadata, stats, anonymizer, include_thinking, tool_result_map)
+    parse_snapshot: dict[str, Any] = {}
+    raw_message_start_offsets: list[int] = []
+    raw_message_end_offsets: list[int] = []
+    try:
+        for entry in _iter_jsonl(
+            filepath,
+            strict=strict_jsonl,
+            snapshot_out=parse_snapshot,
+        ):
+            before_messages = len(messages)
+            _process_entry(
+                entry,
+                messages,
+                metadata,
+                stats,
+                anonymizer,
+                include_thinking,
+                tool_result_map,
+            )
+            if capture_raw_offsets and len(messages) > before_messages:
+                raw_message_start_offsets.extend(
+                    [int(parse_snapshot["record_start"])]
+                    * (len(messages) - before_messages)
+                )
+                raw_message_end_offsets.extend(
+                    [int(parse_snapshot["record_end"])]
+                    * (len(messages) - before_messages)
+                )
+    except OSError:
+        if strict_jsonl:
+            raise
+        return None
+
+    if strict_jsonl and tool_snapshot.get("fingerprint") != parse_snapshot.get("fingerprint"):
+        from ..raw_sources import RawSourceChanged
+
+        raise RawSourceChanged("raw source changed between parser passes")
 
     result = _make_session_result(metadata, messages, stats)
     if result is not None and strict_jsonl:
-        result["_raw_source_fingerprint"] = snapshot.get("fingerprint")
+        result["_raw_source_fingerprint"] = parse_snapshot.get("fingerprint")
+    if result is not None and capture_raw_offsets:
+        result["_raw_message_start_offsets"] = raw_message_start_offsets
+        result["_raw_message_end_offsets"] = raw_message_end_offsets
+        result["_raw_source_size"] = parse_snapshot.get("file_size")
     return result
 
 
@@ -2879,7 +3035,9 @@ def _coalesce_codex_output(raw: Any) -> str:
     return ""
 
 
-def _build_codex_tool_result_map(entries: list[dict[str, Any]], anonymizer: Anonymizer) -> dict[str, dict]:
+def _build_codex_tool_result_map(
+    entries: Iterable[dict[str, Any]], anonymizer: Anonymizer
+) -> dict[str, dict]:
     """Pre-pass: build call_id -> {output, status} from function_call_output and custom_tool_call_output."""
     result: dict[str, dict] = {}
     for entry in entries:
@@ -2950,6 +3108,7 @@ def _parse_codex_session_file(
     include_thinking: bool,
     target_cwd: str,
     strict_jsonl: bool = False,
+    capture_raw_offsets: bool = False,
 ) -> dict | None:
     state = _CodexParseState(
         metadata={
@@ -2969,48 +3128,85 @@ def _parse_codex_session_file(
         },
     )
 
-    snapshot: dict[str, Any] = {}
+    tool_snapshot: dict[str, Any] = {}
     try:
-        entries = list(
+        state.tool_result_map = _build_codex_tool_result_map(
             _iter_jsonl(
                 filepath,
                 strict=strict_jsonl,
-                snapshot_out=snapshot,
-            )
+                snapshot_out=tool_snapshot,
+            ),
+            anonymizer,
         )
     except OSError:
         if strict_jsonl:
             raise
         return None
 
-    state.tool_result_map = _build_codex_tool_result_map(entries, anonymizer)
+    parse_snapshot: dict[str, Any] = {}
+    raw_message_start_offsets: list[int] = []
+    raw_message_end_offsets: list[int] = []
+    try:
+        for entry in _iter_jsonl(
+            filepath,
+            strict=strict_jsonl,
+            snapshot_out=parse_snapshot,
+        ):
+            before_messages = len(state.messages)
+            timestamp = _normalize_timestamp(entry.get("timestamp"))
+            entry_type = entry.get("type")
 
-    for entry in entries:
-        timestamp = _normalize_timestamp(entry.get("timestamp"))
-        entry_type = entry.get("type")
+            if entry_type == "session_meta":
+                _handle_codex_session_meta(state, entry, filepath, anonymizer)
+            elif entry_type == "turn_context":
+                _handle_codex_turn_context(state, entry, anonymizer)
+            elif entry_type == "response_item":
+                _handle_codex_response_item(state, entry, anonymizer, include_thinking)
+            elif entry_type == "event_msg":
+                payload = entry.get("payload", {})
+                event_type = payload.get("type")
+                if event_type == "token_count":
+                    _handle_codex_token_count(state, payload)
+                elif event_type == "agent_reasoning" and include_thinking:
+                    thinking = payload.get("text")
+                    if isinstance(thinking, str) and thinking.strip():
+                        cleaned = anonymizer.text(thinking.strip())
+                        if cleaned not in state._pending_thinking_seen:
+                            state._pending_thinking_seen.add(cleaned)
+                            state.pending_thinking.append(cleaned)
+                elif event_type == "user_message":
+                    _handle_codex_user_message(state, payload, timestamp, anonymizer)
+                elif event_type == "agent_message":
+                    _handle_codex_agent_message(
+                        state, payload, timestamp, anonymizer, include_thinking
+                    )
+            if capture_raw_offsets and len(state.messages) > before_messages:
+                added_messages = len(state.messages) - before_messages
+                raw_message_start_offsets.extend(
+                    [int(parse_snapshot["record_start"])] * added_messages
+                )
+                if (
+                    entry_type == "event_msg"
+                    and payload.get("type") == "user_message"
+                    and added_messages == 2
+                ):
+                    raw_message_end_offsets.extend([
+                        int(parse_snapshot["record_start"]),
+                        int(parse_snapshot["record_end"]),
+                    ])
+                else:
+                    raw_message_end_offsets.extend(
+                        [int(parse_snapshot["record_end"])] * added_messages
+                    )
+    except OSError:
+        if strict_jsonl:
+            raise
+        return None
 
-        if entry_type == "session_meta":
-            _handle_codex_session_meta(state, entry, filepath, anonymizer)
-        elif entry_type == "turn_context":
-            _handle_codex_turn_context(state, entry, anonymizer)
-        elif entry_type == "response_item":
-            _handle_codex_response_item(state, entry, anonymizer, include_thinking)
-        elif entry_type == "event_msg":
-            payload = entry.get("payload", {})
-            event_type = payload.get("type")
-            if event_type == "token_count":
-                _handle_codex_token_count(state, payload)
-            elif event_type == "agent_reasoning" and include_thinking:
-                thinking = payload.get("text")
-                if isinstance(thinking, str) and thinking.strip():
-                    cleaned = anonymizer.text(thinking.strip())
-                    if cleaned not in state._pending_thinking_seen:
-                        state._pending_thinking_seen.add(cleaned)
-                        state.pending_thinking.append(cleaned)
-            elif event_type == "user_message":
-                _handle_codex_user_message(state, payload, timestamp, anonymizer)
-            elif event_type == "agent_message":
-                _handle_codex_agent_message(state, payload, timestamp, anonymizer, include_thinking)
+    if strict_jsonl and tool_snapshot.get("fingerprint") != parse_snapshot.get("fingerprint"):
+        from ..raw_sources import RawSourceChanged
+
+        raise RawSourceChanged("raw source changed between parser passes")
 
     state.stats["input_tokens"] = state.max_input_tokens
     state.stats["output_tokens"] = state.max_output_tokens
@@ -3019,7 +3215,17 @@ def _parse_codex_session_file(
     if state.raw_cwd != target_cwd:
         return None
 
+    before_flush = len(state.messages)
     _flush_codex_pending(state, timestamp=state.metadata["end_time"])
+    if capture_raw_offsets and len(state.messages) > before_flush:
+        raw_message_start_offsets.extend(
+            [int(parse_snapshot.get("record_start") or 0)]
+            * (len(state.messages) - before_flush)
+        )
+        raw_message_end_offsets.extend(
+            [int(parse_snapshot.get("file_size") or 0)]
+            * (len(state.messages) - before_flush)
+        )
 
     if state.metadata["model"] is None:
         model_provider = state.metadata.get("model_provider")
@@ -3030,7 +3236,11 @@ def _parse_codex_session_file(
 
     result = _make_session_result(state.metadata, state.messages, state.stats)
     if result is not None and strict_jsonl:
-        result["_raw_source_fingerprint"] = snapshot.get("fingerprint")
+        result["_raw_source_fingerprint"] = parse_snapshot.get("fingerprint")
+    if result is not None and capture_raw_offsets:
+        result["_raw_message_start_offsets"] = raw_message_start_offsets
+        result["_raw_message_end_offsets"] = raw_message_end_offsets
+        result["_raw_source_size"] = parse_snapshot.get("file_size")
     return result
 
 
@@ -3159,7 +3369,7 @@ def _resolve_codex_tool_uses(state: _CodexParseState) -> list[dict]:
     for tu in state.pending_tool_uses:
         call_id = tu.pop("_call_id", None)
         if call_id and call_id in state.tool_result_map:
-            r = state.tool_result_map[call_id]
+            r = state.tool_result_map.pop(call_id)
             tu["output"] = r["output"]
             tu["status"] = r["status"]
         resolved.append(tu)
@@ -3723,7 +3933,7 @@ def _extract_assistant_content(
                 "input": _parse_tool_input(block.get("name"), block.get("input", {}), anonymizer),
             }
             if tool_result_map is not None:
-                result = tool_result_map.get(block.get("id", ""))
+                result = tool_result_map.pop(block.get("id", ""), None)
                 if result:
                     tu["output"] = result["output"]
                     tu["status"] = result["status"]

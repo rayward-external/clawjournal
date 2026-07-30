@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from clawjournal.raw_sources import fingerprint_raw_source, read_raw_source_snapshot
+from clawjournal.raw_sources import (
+    fingerprint_raw_source,
+    fingerprint_raw_source_range,
+    read_raw_source_snapshot,
+)
 
 
 def test_file_fingerprint_is_bound_to_content(tmp_path: Path) -> None:
@@ -13,6 +17,30 @@ def test_file_fingerprint_is_bound_to_content(tmp_path: Path) -> None:
     source.write_text('{"first":1}\n{"second":2}\n', encoding="utf-8")
 
     assert fingerprint_raw_source(source) != before
+
+
+def test_range_fingerprint_allows_append_after_sealed_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "session.jsonl"
+    prefix = b'{"first":1}\n'
+    source.write_bytes(prefix)
+    before = fingerprint_raw_source_range(source, 0, len(prefix))
+
+    with source.open("ab") as handle:
+        handle.write(b'{"second":2}\n')
+
+    assert fingerprint_raw_source_range(source, 0, len(prefix)) == before
+    assert fingerprint_raw_source(source) != before
+
+
+def test_range_fingerprint_rejects_edit_inside_sealed_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "session.jsonl"
+    prefix = b'{"first":1}\n'
+    source.write_bytes(prefix)
+    before = fingerprint_raw_source_range(source, 0, len(prefix))
+
+    source.write_bytes(b'{"first":2}\n')
+
+    assert fingerprint_raw_source_range(source, 0, len(prefix)) != before
 
 
 def test_subagent_fingerprint_detects_existing_member_append(tmp_path: Path) -> None:

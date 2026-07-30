@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError } from '../../api.ts';
 import type { AutoUploadStatus } from '../../types.ts';
@@ -10,16 +10,6 @@ vi.mock('./successChime.ts', () => ({
   playSuccessChime: vi.fn(),
   primeSuccessChime: vi.fn(),
 }));
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 
 function automaticUploadStatus(
   overrides: Partial<AutoUploadStatus> = {},
@@ -171,9 +161,50 @@ describe('SubmitStep automatic-upload opt-in', () => {
     expect(screen.queryByText(/^Accepted domains:/)).not.toBeInTheDocument();
   });
 
+  it('shows the default automatic-upload choice before email verification finishes', async () => {
+    vi.spyOn(api.share, 'consent').mockResolvedValue({
+      consent_text: 'Manual share consent.',
+      retention_text: 'Manual retention terms.',
+      consent_version: 'consent-v1',
+      retention_policy_version: 'retention-v1',
+    });
+    vi.spyOn(api.share, 'uploadStatus').mockResolvedValue({
+      verified_email: null,
+      token_valid: false,
+      expires_at: null,
+      pending_email: null,
+    });
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(
+      automaticUploadStatus(),
+    );
+    let rejectChallenge: (reason: unknown) => void = () => {
+      throw new Error('Automatic-upload challenge did not start');
+    };
+    vi.spyOn(api.autoUpload, 'enable').mockImplementation(() => new Promise(
+      (_resolve, reject) => {
+        rejectChallenge = reject;
+      },
+    ));
+
+    renderSubmit();
+
+    expect(await screen.findByRole('button', { name: 'Send code' })).toBeInTheDocument();
+    const loadingChoice = screen.getByLabelText(
+      'Enable automatic uploads after this share (loading details)',
+    );
+    expect(loadingChoice).toBeChecked();
+    expect(screen.getByText(/Loading exact scope and terms/)).toBeInTheDocument();
+
+    rejectChallenge(authorizationRequired());
+
+    const readyChoice = await screen.findByLabelText(
+      'Enable automatic uploads after this share',
+    );
+    expect(readyChoice).toBeChecked();
+  });
+
   it('uses the manual receipt grant to enable automatic uploads in one submit', async () => {
     const calls: string[] = [];
-    const enableRequest = deferred<AutoUploadStatus>();
     vi.spyOn(api.share, 'consent').mockResolvedValue({
       consent_text: 'Manual share consent.',
       retention_text: 'Manual retention terms.',
@@ -190,21 +221,8 @@ describe('SubmitStep automatic-upload opt-in', () => {
       automaticUploadStatus(),
     );
     const enableSpy = vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(authorizationRequired())
-      .mockImplementationOnce(async () => {
-        calls.push('enable');
-        return enableRequest.promise;
-      });
-    vi.spyOn(api.autoUpload, 'enableProgress').mockResolvedValue({
-      progress_id: 'progress-issue165',
-      stage: 'scanning',
-      message: 'Refreshing Codex source logs: 42/118 projects',
-      source: 'codex',
-      current_project: 42,
-      total_projects: 118,
-      updated_at: '2026-07-29T00:00:00Z',
-    });
-    vi.spyOn(api.shares, 'upload').mockImplementation(async () => {
+      .mockRejectedValueOnce(authorizationRequired());
+    const uploadSpy = vi.spyOn(api.shares, 'upload').mockImplementation(async () => {
       calls.push('upload');
       return {
         ok: true,
@@ -214,6 +232,11 @@ describe('SubmitStep automatic-upload opt-in', () => {
         session_count: 1,
         bundle_hash: 'bundle-hash',
         redaction_summary: { total_redactions: 0, by_type: {} },
+        automatic_upload: {
+          queued: true,
+          mode: 'off',
+          code: 'enrollment_queued',
+        },
       };
     });
     const { onSubmitted, toast } = renderSubmit();
@@ -238,27 +261,6 @@ describe('SubmitStep automatic-upload opt-in', () => {
       name: 'Submit and enable automatic uploads',
     }));
 
-    expect(await screen.findByText(
-      'Refreshing Codex source logs: 42/118 projects',
-      {},
-      { timeout: 2_000 },
-    )).toBeInTheDocument();
-    expect(screen.getByRole('button', {
-      name: 'Refreshing history...',
-    })).toBeDisabled();
-    // The reported scan has to reach the bar itself, not just the text under
-    // it: 42 of 118 projects sits inside the enrollment band, above anything
-    // the timed crawl can reach on its own.
-    await waitFor(() => {
-      expect(
-        Number(screen.getByRole('progressbar').getAttribute('aria-valuenow')),
-      ).toBe(97);
-    });
-    await act(async () => {
-      enableRequest.resolve(automaticUploadStatus({ mode: 'enabled' }));
-      await Promise.resolve();
-    });
-
     await waitFor(() => {
       expect(onSubmitted).toHaveBeenCalledWith(
         'receipt-1',
@@ -266,17 +268,19 @@ describe('SubmitStep automatic-upload opt-in', () => {
         null,
       );
     });
-    expect(calls).toEqual(['upload', 'enable']);
-    expect(enableSpy).toHaveBeenNthCalledWith(2, {
-      agent: 'codex',
-      accepted_authorization_version: 'recurring-v3',
-      accepted_retention_version: 'retention-v1',
-      accepted_ownership_certification_version: 'ownership-v1',
-      accepted_authorization_profile_hash: 'profile-hash-v3',
-      progress_id: expect.any(String),
-    });
+    expect(calls).toEqual(['upload']);
+    expect(enableSpy).toHaveBeenCalledTimes(1);
+    expect(uploadSpy).toHaveBeenCalledWith('share-1', expect.objectContaining({
+      automatic_upload: {
+        agent: 'codex',
+        accepted_authorization_version: 'recurring-v3',
+        accepted_retention_version: 'retention-v1',
+        accepted_ownership_certification_version: 'ownership-v1',
+        accepted_authorization_profile_hash: 'profile-hash-v3',
+      },
+    }));
     expect(toast).toHaveBeenCalledWith(
-      'Submitted and automatic uploads enabled',
+      'Submitted. Automatic upload setup continues in the background.',
       'success',
     );
   });
@@ -390,8 +394,7 @@ describe('SubmitStep automatic-upload opt-in', () => {
       automaticUploadStatus(),
     );
     const enableSpy = vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(authorizationRequired())
-      .mockResolvedValueOnce(automaticUploadStatus({ mode: 'enabled' }));
+      .mockRejectedValueOnce(authorizationRequired());
     let completeUpload: (
       result: Awaited<ReturnType<typeof api.shares.upload>>,
     ) => void = () => {};
@@ -438,7 +441,7 @@ describe('SubmitStep automatic-upload opt-in', () => {
         null,
       );
     });
-    expect(enableSpy).toHaveBeenCalledTimes(2);
+    expect(enableSpy).toHaveBeenCalledTimes(1);
   });
 
   it('shows an existing enrollment as checked and locked without re-enrolling', async () => {

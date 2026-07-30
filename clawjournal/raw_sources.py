@@ -130,6 +130,69 @@ def fingerprint_raw_source(raw_path: str | Path) -> RawFingerprint:
     return fingerprint
 
 
+def fingerprint_raw_source_range(
+    raw_path: str | Path,
+    start_offset: int,
+    end_offset: int,
+) -> RawFingerprint:
+    """Fingerprint one immutable byte range of an append-only JSONL file.
+
+    The returned tuple keeps the existing five-field fingerprint shape. Its
+    fourth integer is the range start rather than an mtime; the digest binds
+    exactly ``[start_offset, end_offset)``. Bytes appended after the range do
+    not invalidate it, while replacement, truncation, or edits inside the
+    range still fail closed.
+    """
+
+    if (
+        not isinstance(start_offset, int)
+        or isinstance(start_offset, bool)
+        or not isinstance(end_offset, int)
+        or isinstance(end_offset, bool)
+        or start_offset < 0
+        or end_offset <= start_offset
+    ):
+        raise ValueError("raw source range must be a non-empty byte interval")
+
+    path = Path(raw_path)
+    if not path.is_file():
+        raise RawSourceChanged("raw source range is not a file")
+
+    remaining = end_offset - start_offset
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if before.st_size < end_offset:
+                raise RawSourceChanged("raw source range was truncated")
+            handle.seek(start_offset)
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RawSourceChanged("raw source range became unavailable")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(handle.fileno())
+    except RawSourceChanged:
+        raise
+    except OSError as exc:
+        raise RawSourceChanged("raw source range is unavailable") from exc
+
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or after.st_size < end_offset
+    ):
+        raise RawSourceChanged("raw source range changed while it was read")
+    return (
+        int(after.st_dev),
+        int(after.st_ino),
+        int(end_offset - start_offset),
+        int(start_offset),
+        digest.hexdigest(),
+    )
+
+
 def stat_raw_source(raw_path: str | Path) -> tuple:
     """Cheap change-detection signature for a parser input — stat metadata only.
 

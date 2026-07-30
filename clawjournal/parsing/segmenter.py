@@ -16,6 +16,173 @@ from pathlib import Path
 from typing import Any
 
 
+APPEND_ONLY_MAX_MESSAGES = 40
+APPEND_ONLY_MAX_USER_MESSAGES = 20
+APPEND_ONLY_MAX_TEXT_BYTES = 4 * 1024 * 1024
+APPEND_ONLY_MAX_RAW_BYTES = 8 * 1024 * 1024
+
+
+def _message_text_bytes(message: dict[str, Any]) -> int:
+    total = 0
+    stack: list[Any] = [message]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            total += len(value.encode("utf-8"))
+        elif isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    return total
+
+
+def segment_append_only_session(
+    session: dict[str, Any],
+    message_end_offsets: list[int],
+    *,
+    message_start_offsets: list[int] | None = None,
+    raw_source_size: int | None = None,
+    max_messages: int = APPEND_ONLY_MAX_MESSAGES,
+    max_user_messages: int = APPEND_ONLY_MAX_USER_MESSAGES,
+    max_text_bytes: int = APPEND_ONLY_MAX_TEXT_BYTES,
+    max_raw_bytes: int = APPEND_ONLY_MAX_RAW_BYTES,
+) -> list[dict[str, Any]]:
+    """Split a growing Claude/Codex trace at complete assistant turns.
+
+    Boundaries are deterministic: the first complete assistant turn at or
+    beyond any limit closes the current segment once the next user message
+    confirms the raw boundary. Appending later records can therefore only
+    extend the active tail or create new segments; it never changes an
+    already-closed segment.
+    """
+
+    messages = session.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        return [session]
+    if len(message_end_offsets) != len(messages):
+        return [session]
+    if message_start_offsets is None:
+        message_start_offsets = [
+            0 if index == 0 else message_end_offsets[index - 1]
+            for index in range(len(messages))
+        ]
+    if len(message_start_offsets) != len(messages):
+        return [session]
+    if any(
+        not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset <= 0
+        or (index and offset < message_end_offsets[index - 1])
+        for index, offset in enumerate(message_end_offsets)
+    ):
+        return [session]
+    if any(
+        not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset < 0
+        or offset > message_end_offsets[index]
+        for index, offset in enumerate(message_start_offsets)
+    ):
+        return [session]
+
+    boundaries: list[int] = []
+    segment_start = 0
+    raw_start = 0
+    user_messages = 0
+    text_bytes = 0
+
+    for index, message in enumerate(messages):
+        if message.get("role") == "user":
+            user_messages += 1
+        text_bytes += _message_text_bytes(message)
+        raw_bytes = message_end_offsets[index] - raw_start
+        over_limit = (
+            index + 1 - segment_start >= max_messages
+            or user_messages >= max_user_messages
+            or text_bytes >= max_text_bytes
+            or raw_bytes >= max_raw_bytes
+        )
+        next_role = (
+            messages[index + 1].get("role")
+            if index + 1 < len(messages)
+            else None
+        )
+        complete_turn = (
+            message.get("role") == "assistant"
+            and next_role == "user"
+        )
+        if over_limit and complete_turn:
+            boundary = index + 1
+            boundaries.append(boundary)
+            segment_start = boundary
+            raw_start = message_start_offsets[boundary]
+            user_messages = 0
+            text_bytes = 0
+
+    interior_boundaries = [boundary for boundary in boundaries if boundary < len(messages)]
+    starts = [0, *interior_boundaries]
+    ends = [*interior_boundaries, len(messages)]
+    if len(starts) <= 1:
+        return [session]
+
+    parent_id = str(session.get("session_id") or "")
+    if not parent_id:
+        return [session]
+    closed_boundaries = set(boundaries)
+    children: list[dict[str, Any]] = []
+    for segment_index, (start, end) in enumerate(zip(starts, ends)):
+        segment_messages = messages[start:end]
+        raw_segment_start = 0 if start == 0 else message_start_offsets[start]
+        raw_segment_end = (
+            message_start_offsets[end]
+            if end < len(messages)
+            else int(raw_source_size or message_end_offsets[end - 1])
+        )
+        sealed = end in closed_boundaries
+        child = {
+            key: value
+            for key, value in session.items()
+            if key not in {
+                "session_id",
+                "messages",
+                "stats",
+                "_raw_message_end_offsets",
+                "_raw_source_fingerprint",
+            }
+        }
+        child.update({
+            # Keep the first checkpoint on the source session's established
+            # identity. If that trace was shared before it grew large, the
+            # hosted receiver sees a normal revision chain instead of a new,
+            # overlapping trace. Later checkpoints are independent children.
+            "session_id": (
+                parent_id
+                if segment_index == 0
+                else f"{parent_id}_seg-{segment_index:04d}"
+            ),
+            "segment_index": segment_index,
+            "segment_title": _extract_segment_title(segment_messages),
+            "segment_reason": "bounded_checkpoint" if sealed else "active_tail",
+            "segment_message_range": [start, end - 1],
+            "segment_sealed": sealed,
+            # Only a closed checkpoint may tolerate bytes appended after its
+            # boundary. The active tail deliberately keeps no range so the
+            # normal whole-file fingerprint catches a concurrent append.
+            "raw_source_start_offset": raw_segment_start if sealed else None,
+            "raw_source_end_offset": raw_segment_end if sealed else None,
+            "start_time": _first_timestamp(segment_messages),
+            "end_time": _last_timestamp(segment_messages),
+            "messages": segment_messages,
+            "stats": _compute_stats(segment_messages),
+        })
+        if segment_index == 0:
+            child.pop("parent_session_id", None)
+        else:
+            child["parent_session_id"] = parent_id
+        children.append(child)
+    return children
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: Raw JSONL pre-scan (optional, OpenClaw-specific)
 # ---------------------------------------------------------------------------

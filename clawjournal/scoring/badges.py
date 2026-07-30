@@ -1,6 +1,7 @@
 """Compute trace card badges for the scientist workbench inbox."""
 
 import re
+from collections.abc import Iterator
 
 from ..redaction.secrets import scan_text
 
@@ -187,45 +188,64 @@ _TASK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # Text extraction helpers
 # ---------------------------------------------------------------------------
 
-def _iter_all_text(session: dict) -> list[str]:
-    """Collect all textual content from a session into a flat list."""
-    texts: list[str] = []
+def _iter_all_text(session: dict) -> Iterator[str]:
+    """Yield textual content without duplicating the whole transcript."""
+
     for msg in session.get("messages", []):
         if msg.get("content"):
-            texts.append(msg["content"])
+            yield msg["content"]
         if msg.get("thinking"):
-            texts.append(msg["thinking"])
+            yield msg["thinking"]
         for tu in msg.get("tool_uses", []):
             inp = tu.get("input")
             if isinstance(inp, str):
-                texts.append(inp)
+                yield inp
             elif isinstance(inp, dict):
                 for v in inp.values():
                     if isinstance(v, str):
-                        texts.append(v)
+                        yield v
             out = tu.get("output")
             if isinstance(out, str):
-                texts.append(out)
+                yield out
             elif isinstance(out, dict):
                 for v in out.values():
                     if isinstance(v, str):
-                        texts.append(v)
-    return texts
+                        yield v
 
 
-def _iter_tool_outputs(session: dict) -> list[str]:
-    """Collect all tool-use output strings."""
-    outputs: list[str] = []
+def _iter_text_chunks(text: str, *, size: int = 256 * 1024) -> Iterator[str]:
+    """Yield bounded overlapping chunks so regex scans stay memory-stable."""
+
+    overlap = 512
+    if len(text) <= size:
+        yield text
+        return
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + size)
+        yield text[start:end]
+        if end == len(text):
+            break
+        start = end - overlap
+
+
+def _iter_all_text_chunks(session: dict) -> Iterator[str]:
+    for text in _iter_all_text(session):
+        yield from _iter_text_chunks(text)
+
+
+def _iter_tool_outputs(session: dict) -> Iterator[str]:
+    """Yield all tool-use output strings."""
+
     for msg in session.get("messages", []):
         for tu in msg.get("tool_uses", []):
             out = tu.get("output")
             if isinstance(out, str):
-                outputs.append(out)
+                yield out
             elif isinstance(out, dict):
                 for v in out.values():
                     if isinstance(v, str):
-                        outputs.append(v)
-    return outputs
+                        yield v
 
 
 def _get_all_tool_uses(session: dict) -> list[dict]:
@@ -265,15 +285,12 @@ def compute_outcome_badge(session: dict) -> str:
     if tool_names and tool_names <= _READ_ONLY_TOOLS:
         return "analysis_only"
 
-    outputs = _iter_tool_outputs(session)
-    combined = "\n".join(outputs)
-
     # Check for test results -- scan in priority order (failures trump passes)
     has_test_pass = False
     has_test_fail = False
     has_build_fail = False
 
-    for output in outputs:
+    for output in _iter_tool_outputs(session):
         # Build failures (check first so "BUILD FAILED" isn't caught as test failure)
         if re.search(r"BUILD FAILED|build failed", output):
             has_build_fail = True
@@ -318,24 +335,29 @@ def compute_outcome_badge(session: dict) -> str:
     # Check for error indicators in the last third of tool outputs
     messages = session.get("messages", [])
     last_third_start = max(len(messages) * 2 // 3, 0)
-    late_outputs: list[str] = []
+    has_late_error = False
     for msg in messages[last_third_start:]:
         for tu in msg.get("tool_uses", []):
             out = tu.get("output")
             if isinstance(out, str):
-                late_outputs.append(out)
+                values = [out]
             elif isinstance(out, dict):
-                for v in out.values():
-                    if isinstance(v, str):
-                        late_outputs.append(v)
-
-    late_combined = "\n".join(late_outputs)
-
-    has_late_error = bool(re.search(
-        r"\b(?:Error|Exception|Traceback|FAILED|FATAL|panic|Segmentation fault"
-        r"|Permission denied|No such file|command not found)\b",
-        late_combined,
-    ))
+                values = [v for v in out.values() if isinstance(v, str)]
+            else:
+                values = []
+            if any(
+                re.search(
+                    r"\b(?:Error|Exception|Traceback|FAILED|FATAL|panic|Segmentation fault"
+                    r"|Permission denied|No such file|command not found)\b",
+                    chunk,
+                )
+                for value in values
+                for chunk in _iter_text_chunks(value)
+            ):
+                has_late_error = True
+                break
+        if has_late_error:
+            break
 
     # Check if session appears interrupted (user spoke last, no agent reply)
     last_role = None
@@ -359,10 +381,19 @@ def compute_value_badges(session: dict) -> list[str]:
     """
     badges: list[str] = []
     stats = session.get("stats", {})
-    all_text = "\n".join(_iter_all_text(session))
+    scientific_libraries: set[str] = set()
+    has_sci_files = False
+    has_sci_signal = False
+    for chunk in _iter_all_text_chunks(session):
+        scientific_libraries.update(
+            match.lower() for match in _SCIENTIFIC_LIBS.findall(chunk)
+        )
+        has_sci_files = has_sci_files or bool(_SCIENTIFIC_EXTENSIONS.search(chunk))
+        has_sci_signal = has_sci_signal or bool(_SCIENTIFIC_TERMS.search(chunk))
+        has_sci_signal = has_sci_signal or bool(_SCIENTIFIC_LIBS.search(chunk))
 
     # novel_domain: specialized/scientific libraries (require 2+ distinct matches)
-    if len(set(_SCIENTIFIC_LIBS.findall(all_text.lower()))) >= 2:
+    if len(scientific_libraries) >= 2:
         badges.append("novel_domain")
 
     # long_horizon: truly extended sessions (require both many turns AND high tokens)
@@ -378,8 +409,6 @@ def compute_value_badges(session: dict) -> list[str]:
         badges.append("tool_rich")
 
     # scientific_workflow: require scientific file extensions AND scientific terms/libs
-    has_sci_files = bool(_SCIENTIFIC_EXTENSIONS.search(all_text))
-    has_sci_signal = bool(_SCIENTIFIC_TERMS.search(all_text)) or bool(_SCIENTIFIC_LIBS.search(all_text))
     if has_sci_files and has_sci_signal:
         badges.append("scientific_workflow")
 
@@ -388,27 +417,35 @@ def compute_value_badges(session: dict) -> list[str]:
     if len(messages) >= 3:
         # Split messages into thirds
         third = max(len(messages) // 3, 1)
-        early = "\n".join(
-            msg.get("content", "") for msg in messages[:third] if msg.get("content")
+        has_early_error = any(
+            re.search(
+                r"\b(?:error|bug|broken|crash|traceback|exception|failing)\b",
+                chunk,
+                re.IGNORECASE,
+            )
+            for msg in messages[:third]
+            for value in [msg.get("content")]
+            if isinstance(value, str)
+            for chunk in _iter_text_chunks(value)
         )
-        late = "\n".join(
-            msg.get("content", "") for msg in messages[third * 2:] if msg.get("content")
-        )
-        late_tools = "\n".join(
-            tu.get("output", "")
+        late_values = (
+            value
             for msg in messages[third * 2:]
-            for tu in msg.get("tool_uses", [])
-            if isinstance(tu.get("output"), str)
+            for value in (
+                [msg.get("content")]
+                + [tu.get("output") for tu in msg.get("tool_uses", [])]
+            )
+            if isinstance(value, str)
         )
-
-        has_early_error = bool(re.search(
-            r"\b(?:error|bug|broken|crash|traceback|exception|failing)\b",
-            early, re.IGNORECASE,
-        ))
-        has_late_verify = bool(re.search(
-            r"\b(?:passed|works|fixed|resolved|success|OK|verified)\b",
-            late + " " + late_tools, re.IGNORECASE,
-        ))
+        has_late_verify = any(
+            re.search(
+                r"\b(?:passed|works|fixed|resolved|success|OK|verified)\b",
+                chunk,
+                re.IGNORECASE,
+            )
+            for value in late_values
+            for chunk in _iter_text_chunks(value)
+        )
         if has_early_error and has_late_verify:
             badges.append("debugging")
 
@@ -423,29 +460,22 @@ def _compute_risk_and_sensitivity(session: dict) -> tuple[list[str], float]:
 
     Returns (risk_badges, sensitivity_score).
     """
-    all_texts = _iter_all_text(session)
-    combined = "\n".join(all_texts)
-
-    # Count secrets (one scan_text pass)
     secret_count = 0
-    for text in all_texts:
-        secret_count += len(scan_text(text))
-
-    # Count names
     name_count = 0
     distinct_names: set[str] = set()
-    for m in _PROPER_NAME.finditer(combined):
-        name = m.group(0)
-        if _NAME_ALLOWLIST.search(name):
-            continue
-        first_word = name.split()[0]
-        if _CODE_PHRASE_PREFIX.match(first_word):
-            continue
-        distinct_names.add(name.lower())
-        name_count += 1
-
-    # Count private URLs
-    url_count = len(_PRIVATE_URL.findall(combined))
+    url_count = 0
+    for chunk in _iter_all_text_chunks(session):
+        secret_count += len(scan_text(chunk))
+        for match in _PROPER_NAME.finditer(chunk):
+            name = match.group(0)
+            if _NAME_ALLOWLIST.search(name):
+                continue
+            first_word = name.split()[0]
+            if _CODE_PHRASE_PREFIX.match(first_word):
+                continue
+            distinct_names.add(name.lower())
+            name_count += 1
+        url_count += len(_PRIVATE_URL.findall(chunk))
 
     # --- Badges ---
     badges: list[str] = []

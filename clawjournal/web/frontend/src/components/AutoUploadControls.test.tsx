@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError } from '../api.ts';
-import type { AutoUploadStatus, WorkbenchConfig } from '../types.ts';
+import type { AutoUploadStatus } from '../types.ts';
 import { AutoUploadOffer, AutoUploadPanel } from './AutoUploadControls.tsx';
 import { ToastProvider } from './Toast.tsx';
 
@@ -32,28 +32,16 @@ function status(overrides: Partial<AutoUploadStatus> = {}): AutoUploadStatus {
   };
 }
 
-function workbenchConfig(overrides: Partial<WorkbenchConfig> = {}): WorkbenchConfig {
-  return {
-    source: null,
-    projects_confirmed: false,
-    ai_pii_review_enabled: false,
-    scorer_backend: null,
-    scorer_backend_confirmed_at: null,
-    benchmark_tab_enabled: true,
-    scoring_warmup_declined: false,
-    source_choices: ['all', 'claude', 'codex'],
-    scorer_backend_choices: [],
-    scorer_backend_detected: null,
-    ...overrides,
-  };
-}
-
 function renderControl(ui: React.ReactNode) {
   return render(
     <MemoryRouter>
       <ToastProvider>{ui}</ToastProvider>
     </MemoryRouter>,
   );
+}
+
+async function openPanelDetails() {
+  fireEvent.click(await screen.findByRole('button', { name: 'View details' }));
 }
 
 function deferred<T>() {
@@ -95,28 +83,6 @@ function authorizationRequired() {
   });
 }
 
-function scopeRequired() {
-  return new ApiError(400, 'Scope confirmation required', {
-    code: 'source_confirmation_missing',
-    message: 'Confirm a non-empty source and project scope before enabling.',
-    scope_blockers: [
-      'source_confirmation_missing',
-      'project_confirmation_missing',
-      'source_scope_empty',
-      'project_scope_empty',
-    ],
-  });
-}
-
-function unsupportedScopeRequired() {
-  return new ApiError(400, 'Unsupported source', {
-    code: 'unsupported_source',
-    message: 'Confirm a non-empty source and project scope before enabling.',
-    scope_blockers: ['unsupported_source'],
-    unsupported_sources: ['gemini'],
-  });
-}
-
 async function flushPromises() {
   await Promise.resolve();
   await Promise.resolve();
@@ -137,6 +103,35 @@ describe('AutoUploadOffer', () => {
     await flushPromises();
 
     expect(screen.queryByText('Share future traces automatically?')).not.toBeInTheDocument();
+  });
+
+  it('shows durable background setup progress after the receipt', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(status({
+      overlay: 'enrollment_pending',
+      enrollment_setup: {
+        state: 'running',
+        stage: 'scanning',
+        source: 'codex',
+        position: 3,
+        total: 8,
+        attempt_count: 1,
+        error_code: null,
+        message: null,
+        retryable: false,
+      },
+    }));
+
+    const view = renderControl(
+      <AutoUploadOffer manualReceiptId="receipt-background" />,
+    );
+
+    expect(await screen.findByText(
+      'Setting up automatic uploads in the background',
+    )).toBeInTheDocument();
+    expect(screen.getByText(/Refreshing codex logs: 3\/8/)).toBeInTheDocument();
+    expect(screen.getByText(/You can close this page/)).toBeInTheDocument();
+    expect(screen.queryByText('Share future traces automatically?')).not.toBeInTheDocument();
+    view.unmount();
   });
 
   it('requires a manual receipt and server capability, then persists dismissal', async () => {
@@ -180,288 +175,34 @@ describe('AutoUploadOffer', () => {
     expect(await screen.findByText('Share future traces automatically?')).toBeInTheDocument();
   });
 
-  it('keeps missing scope setup inside the enable flow and continues to authorization', async () => {
+  it('goes directly to the exact all-supported-source authorization', async () => {
     vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
       offer_available: true,
     }));
-    const bothSourcesChallenge = authorizationRequired();
-    (bothSourcesChallenge.body.scope as Record<string, unknown>).sources = ['claude', 'codex'];
-    (bothSourcesChallenge.body.scope as Record<string, unknown>).projects = [
+    const allSupportedChallenge = authorizationRequired();
+    (allSupportedChallenge.body.scope as Record<string, unknown>).sources = ['claude', 'codex'];
+    (allSupportedChallenge.body.scope as Record<string, unknown>).projects = [
       'project-a',
       'project-b',
     ];
-    (bothSourcesChallenge.body.scope as Record<string, unknown>).entries = [
+    (allSupportedChallenge.body.scope as Record<string, unknown>).entries = [
       ['claude', 'project-a'],
       ['codex', 'project-b'],
     ];
     const enableSpy = vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(scopeRequired())
-      .mockRejectedValueOnce(bothSourcesChallenge);
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
-    const updateSpy = vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
-      source: 'both',
-      projects_confirmed: true,
-      source_choices: ['all', 'both', 'claude', 'codex'],
-    }));
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'research-notes',
-        session_count: 2,
-        total_tokens: 1_200,
-      },
-      {
-        source: 'codex',
-        project: 'analysis-pipeline',
-        session_count: 1,
-        total_tokens: 800,
-      },
-    ]);
+      .mockRejectedValueOnce(allSupportedChallenge);
 
-    renderControl(<AutoUploadOffer manualReceiptId="receipt-needs-scope" />);
+    renderControl(<AutoUploadOffer manualReceiptId="receipt-all-supported" />);
 
-    expect(await screen.findByText('Choose what automatic uploads may include')).toBeInTheDocument();
-    expect(screen.queryByText('Confirm a non-empty source and project scope before enabling.')).not.toBeInTheDocument();
-    // Inline presentation: still dismissible, and the run-trigger select stays
-    // hidden while its labels would duplicate the source-scope options below.
-    expect(screen.getByRole('heading', { name: 'Share future traces automatically?' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Not now' })).toBeInTheDocument();
-    expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('Export source scope')).toHaveValue('');
-
-    fireEvent.change(screen.getByLabelText('Export source scope'), {
-      target: { value: 'both' },
-    });
-    expect(screen.getByLabelText('Claude Code · research-notes · 2 sessions')).toBeInTheDocument();
-    expect(screen.getByLabelText('Codex · analysis-pipeline · 1 session')).toBeInTheDocument();
-
-    const projectConfirmation = screen.getByLabelText('Confirm all eligible projects for automatic upload');
-    expect(projectConfirmation).not.toBeChecked();
-    expect(screen.getByText('Confirm all eligible projects')).toBeInTheDocument();
-    expect(screen.getByText('I reviewed all 2 projects listed above. Only these projects may enter this automatic-upload scope.')).toBeInTheDocument();
-    fireEvent.click(projectConfirmation);
-    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
-
-    await waitFor(() => expect(updateSpy).toHaveBeenCalledWith({
-      source: 'both',
-      confirm_projects: true,
-    }));
-    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
-    expect(enableSpy).toHaveBeenNthCalledWith(2, {
-      agent: 'auto',
-      challenge_only: true,
-    });
     expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
-    expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
+    expect(enableSpy).toHaveBeenCalledOnce();
+    expect(enableSpy).toHaveBeenCalledWith({ agent: 'auto', challenge_only: true });
+    expect(screen.queryByLabelText('Export source scope')).not.toBeInTheDocument();
+    expect(screen.queryByText('Choose what automatic uploads may include')).not.toBeInTheDocument();
     expect(screen.getByText('Claude Code and Codex - matches exact upload scope')).toBeInTheDocument();
     expect(screen.getByText(/claude \u2192 project-a/)).toBeInTheDocument();
     expect(screen.getByText(/codex \u2192 project-b/)).toBeInTheDocument();
-  });
-
-  it('retries with the hook matching a single-source scope after saving', async () => {
-    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
-      offer_available: true,
-    }));
-    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(scopeRequired())
-      .mockRejectedValueOnce(authorizationRequired());
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
-    vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
-      source: 'claude',
-      projects_confirmed: true,
-    }));
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'research-notes',
-        session_count: 2,
-        total_tokens: 1_200,
-      },
-    ]);
-
-    renderControl(<AutoUploadOffer manualReceiptId="receipt-claude-only-scope" />);
-    fireEvent.change(await screen.findByLabelText('Export source scope'), {
-      target: { value: 'claude' },
-    });
-    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
-    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
-
-    // The daemon derives SessionStart hooks from the exact saved scope.
-    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
-    expect(enableSpy).toHaveBeenNthCalledWith(2, {
-      agent: 'auto',
-      challenge_only: true,
-    });
-  });
-
-  it('keeps scope setup open when saving the scope fails', async () => {
-    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
-      offer_available: true,
-    }));
-    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(scopeRequired());
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
-    vi.spyOn(api.config, 'update').mockRejectedValueOnce(
-      new ApiError(500, 'Config persistence could not be confirmed.'),
-    );
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'research-notes',
-        session_count: 2,
-        total_tokens: 1_200,
-      },
-    ]);
-
-    renderControl(<AutoUploadOffer manualReceiptId="receipt-scope-save-fails" />);
-    fireEvent.change(await screen.findByLabelText('Export source scope'), {
-      target: { value: 'claude' },
-    });
-    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
-    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Config persistence could not be confirmed.',
-    );
-    expect(screen.getByText('Choose what automatic uploads may include')).toBeInTheDocument();
-    expect(screen.getByLabelText('Confirm all eligible projects for automatic upload')).toBeChecked();
-    expect(screen.getByRole('button', { name: 'Save scope and continue' })).toBeEnabled();
-    expect(enableSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('guides unsupported export scopes to the supported recurring sources', async () => {
-    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
-      offer_available: true,
-    }));
-    const enableSpy = vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(unsupportedScopeRequired())
-      .mockRejectedValueOnce(authorizationRequired());
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig({
-      source: 'all',
-      projects_confirmed: true,
-      source_choices: ['aider', 'all', 'claude', 'codex', 'gemini'],
-    }));
-    const updateSpy = vi.spyOn(api.config, 'update').mockResolvedValueOnce(workbenchConfig({
-      source: 'both',
-      projects_confirmed: true,
-      source_choices: ['all', 'both', 'claude', 'codex'],
-    }));
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'research-notes',
-        session_count: 2,
-        total_tokens: 1_200,
-      },
-      {
-        source: 'gemini',
-        project: 'unsupported-project',
-        session_count: 1,
-        total_tokens: 500,
-      },
-    ]);
-
-    renderControl(<AutoUploadOffer manualReceiptId="receipt-unsupported-scope" />);
-
-    const source = await screen.findByLabelText('Export source scope');
-    expect(source).toHaveValue('');
-    expect(within(source).getByRole('option', { name: 'Claude Code and Codex' })).toBeInTheDocument();
-    expect(within(source).getByRole('option', { name: 'Claude Code' })).toBeInTheDocument();
-    expect(within(source).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
-    expect(within(source).queryByRole('option', { name: 'All agents' })).not.toBeInTheDocument();
-    expect(within(source).queryByRole('option', { name: 'Gemini' })).not.toBeInTheDocument();
-
-    fireEvent.change(source, { target: { value: 'both' } });
-    expect(screen.getByLabelText('Claude Code · research-notes · 2 sessions')).toBeInTheDocument();
-    expect(screen.queryByText('unsupported-project')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
-    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
-
-    await waitFor(() => expect(updateSpy).toHaveBeenCalledWith({
-      source: 'both',
-      confirm_projects: true,
-    }));
-    await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
-  });
-
-  it('omits excluded projects from the project confirmation step', async () => {
-    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
-      offer_available: true,
-    }));
-    vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(scopeRequired());
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'eligible-project',
-        session_count: 2,
-        total_tokens: 1_200,
-        excluded: false,
-      },
-      {
-        source: 'claude',
-        project: 'excluded-project',
-        session_count: 1,
-        total_tokens: 500,
-        excluded: true,
-      },
-    ]);
-
-    renderControl(<AutoUploadOffer manualReceiptId="receipt-with-exclusion" />);
-    fireEvent.change(await screen.findByLabelText('Export source scope'), {
-      target: { value: 'claude' },
-    });
-
-    expect(screen.getByLabelText('Claude Code · eligible-project · 2 sessions')).toBeInTheDocument();
-    expect(screen.queryByText('excluded-project')).not.toBeInTheDocument();
-  });
-
-  it('requires fresh project confirmation when the source selection changes', async () => {
-    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
-      offer_available: true,
-    }));
-    vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(scopeRequired());
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig({
-      source: 'both',
-      projects_confirmed: true,
-      source_choices: ['all', 'both', 'claude', 'codex'],
-    }));
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'claude-project',
-        session_count: 1,
-        total_tokens: 500,
-      },
-      {
-        source: 'codex',
-        project: 'codex-project',
-        session_count: 1,
-        total_tokens: 500,
-      },
-    ]);
-
-    renderControl(<AutoUploadOffer manualReceiptId="receipt-change-source" />);
-
-    const source = await screen.findByLabelText('Export source scope');
-    const projectConfirmation = screen.getByLabelText('Confirm all eligible projects for automatic upload');
-    expect(source).toHaveValue('both');
-    // A stored projects_confirmed never pre-checks the box: the confirmation
-    // attests to the list rendered here, not to an older one.
-    expect(projectConfirmation).not.toBeChecked();
-    expect(screen.getByRole('button', { name: 'Save scope and continue' })).toBeDisabled();
-    expect(screen.getByLabelText('Claude Code · claude-project · 1 session')).toBeInTheDocument();
-    expect(screen.getByLabelText('Codex · codex-project · 1 session')).toBeInTheDocument();
-
-    fireEvent.click(projectConfirmation);
-    expect(projectConfirmation).toBeChecked();
-    fireEvent.change(source, { target: { value: 'codex' } });
-
-    expect(projectConfirmation).not.toBeChecked();
-    expect(screen.getByRole('button', { name: 'Save scope and continue' })).toBeDisabled();
-    expect(screen.queryByLabelText('Claude Code · claude-project · 1 session')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('Codex · codex-project · 1 session')).toBeInTheDocument();
+    expect(screen.getByText('All currently supported agent sources are included automatically.')).toBeInTheDocument();
   });
 
   it('explains an oversized scope instead of echoing the CLI-worded error', async () => {
@@ -471,7 +212,7 @@ describe('AutoUploadOffer', () => {
     vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(new ApiError(400, 'Scope too large', {
       code: 'scope_too_large',
       message: 'The exact source/project scope exceeds the hosted limit of 200 entries; '
-        + 'exclude projects (config --exclude) or narrow the source scope first.',
+        + 'exclude projects (config --exclude), then try again.',
       scope_blockers: ['scope_too_large'],
     }));
 
@@ -558,6 +299,7 @@ describe('AutoUploadPanel visibility', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
+    await openPanelDetails();
     expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Turn off' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
@@ -565,43 +307,6 @@ describe('AutoUploadPanel visibility', () => {
 });
 
 describe('AutoUploadPanel authorization', () => {
-  it('reports an inline scope save so Settings can update without a reload', async () => {
-    const savedConfig = workbenchConfig({
-      source: 'both',
-      projects_confirmed: true,
-      source_choices: ['all', 'both', 'claude', 'codex'],
-    });
-    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
-      offer_available: true,
-    }));
-    vi.spyOn(api.autoUpload, 'enable')
-      .mockRejectedValueOnce(scopeRequired())
-      .mockRejectedValueOnce(authorizationRequired());
-    vi.spyOn(api.config, 'get').mockResolvedValueOnce(workbenchConfig());
-    vi.spyOn(api.config, 'update').mockResolvedValueOnce(savedConfig);
-    vi.spyOn(api, 'projects').mockResolvedValueOnce([
-      {
-        source: 'claude',
-        project: 'research-notes',
-        session_count: 2,
-        total_tokens: 1_200,
-      },
-    ]);
-    const onConfigUpdated = vi.fn();
-
-    renderControl(<AutoUploadPanel onConfigUpdated={onConfigUpdated} />);
-    fireEvent.click(await screen.findByRole('button', { name: 'Review and enable' }));
-    fireEvent.change(await screen.findByLabelText('Export source scope'), {
-      target: { value: 'both' },
-    });
-    fireEvent.click(screen.getByLabelText('Confirm all eligible projects for automatic upload'));
-    fireEvent.click(screen.getByRole('button', { name: 'Save scope and continue' }));
-
-    await waitFor(() => expect(onConfigUpdated).toHaveBeenCalledWith(savedConfig));
-    expect(onConfigUpdated).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
-  });
-
   it('shows the distinct recurring wording, derives hooks from scope, and rejects a stale GET after enable', async () => {
     const initial = status({
       mode: 'enabled',
@@ -630,32 +335,33 @@ describe('AutoUploadPanel authorization', () => {
       .mockResolvedValueOnce(enabled);
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     expect(await screen.findByText('recurring-v1')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     fireEvent.click(screen.getByRole('button', { name: 'Review scope and terms' }));
 
-    await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
+    await screen.findByRole('heading', { name: 'Enable automatic uploads?' });
     expect(screen.queryByLabelText('Run on agent sessions')).not.toBeInTheDocument();
     expect(enableSpy).toHaveBeenNthCalledWith(1, { agent: 'auto', challenge_only: true });
+    expect(screen.getByText(/automatically upload up to 5 eligible/i)).toBeInTheDocument();
+    expect(screen.queryByText('Claude Code - matches exact upload scope')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'View scope and terms' }));
     expect(screen.getByText('Claude Code - matches exact upload scope')).toBeInTheDocument();
-    expect(screen.getByText(/separate from the consent you gave/i)).toBeInTheDocument();
     expect(screen.getByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();
     expect(screen.getByText('Every 1 day, on the next supported agent session')).toBeInTheDocument();
     expect(screen.getByText('claude → project-a')).toBeInTheDocument();
-    expect(screen.getByText(/exact source\/project pairs shown above/i)).toBeInTheDocument();
-    expect(screen.getByText(/can upload without my reviewing each bundle/i)).toBeInTheDocument();
 
     expect(
       screen.getByText('I certify every automatically uploaded bundle is my own lawful content.'),
     ).toBeInTheDocument();
 
-    // Both affirmative acts are required: terms acceptance alone must not
-    // enable the button, and the enable POST carries the certification version.
+    // The explicit Enable click accepts the displayed authorization; ownership
+    // remains a separate affirmative checkbox required by protocol v2.
     const checkboxes = screen.getAllByRole('checkbox');
-    expect(checkboxes).toHaveLength(2);
-    fireEvent.click(checkboxes[0]);
+    expect(checkboxes).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'Enable automatic upload' })).toBeDisabled();
     fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
@@ -721,11 +427,10 @@ describe('AutoUploadPanel authorization', () => {
       });
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
-    await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
-    const checkboxes = screen.getAllByRole('checkbox');
-    fireEvent.click(checkboxes[0]);
-    fireEvent.click(checkboxes[1]);
+    await screen.findByRole('heading', { name: 'Enable automatic uploads?' });
+    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     expect(screen.getByText(
@@ -783,12 +488,11 @@ describe('AutoUploadPanel authorization', () => {
     });
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
-    await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
+    await screen.findByRole('heading', { name: 'Enable automatic uploads?' });
 
-    const checkboxes = screen.getAllByRole('checkbox');
-    fireEvent.click(checkboxes[0]);
-    fireEvent.click(checkboxes[1]);
+    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     expect(await screen.findByText(/single-use email verification/i)).toBeInTheDocument();
@@ -797,6 +501,50 @@ describe('AutoUploadPanel authorization', () => {
 });
 
 describe('AutoUploadPanel status and controls', () => {
+  it('keeps Settings compact until details are requested', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: {
+        sources: ['codex'],
+        projects: ['project-a'],
+        entries: [['codex', 'project-a']],
+      },
+    }));
+
+    renderControl(<AutoUploadPanel />);
+
+    const toggle = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+    expect(screen.queryByText('Sources represented')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Run now' })).not.toBeInTheDocument();
+
+    await openPanelDetails();
+    expect(screen.getByText('Sources represented')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Run now' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide details' }));
+    expect(screen.queryByText('Sources represented')).not.toBeInTheDocument();
+  });
+
+  it('starts the existing authorization flow from the off switch', async () => {
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
+      mode: 'off',
+      offer_available: true,
+    }));
+    vi.spyOn(api.autoUpload, 'enable').mockRejectedValueOnce(authorizationRequired());
+
+    renderControl(<AutoUploadPanel />);
+
+    const toggle = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    fireEvent.click(toggle);
+
+    expect(
+      await screen.findByRole('heading', { name: 'Enable automatic uploads?' }),
+    ).toBeInTheDocument();
+  });
+
   it('shows every durable exact pair instead of implying a Cartesian scope', async () => {
     vi.spyOn(api.autoUpload, 'status').mockResolvedValueOnce(status({
       mode: 'enabled',
@@ -811,6 +559,7 @@ describe('AutoUploadPanel status and controls', () => {
     }));
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
 
     const title = await screen.findByText(
       'Exact enrolled scope · 2 source/project pairs',
@@ -834,7 +583,10 @@ describe('AutoUploadPanel status and controls', () => {
       pending_submission_state: 'submitting',
     }));
     const first = renderControl(<AutoUploadPanel />);
-    expect(await screen.findByText('On')).toBeInTheDocument();
+    const firstSwitch = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(firstSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(firstSwitch).toHaveTextContent('On');
+    await openPanelDetails();
     expect(screen.getByText('Action required')).toBeInTheDocument();
     expect(screen.getByText('Running')).toBeInTheDocument();
     expect(screen.getByText('Request may be in flight')).toBeInTheDocument();
@@ -846,14 +598,20 @@ describe('AutoUploadPanel status and controls', () => {
       pending_submission_state: 'sealed',
     }));
     const second = renderControl(<AutoUploadPanel />);
-    expect(await screen.findByText('Paused')).toBeInTheDocument();
+    const secondSwitch = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(secondSwitch).toHaveAttribute('aria-checked', 'true');
+    expect(secondSwitch).toHaveTextContent('Paused');
+    await openPanelDetails();
     expect(screen.getByText('Retrying')).toBeInTheDocument();
     expect(screen.getByText('Sealed recovery pending')).toBeInTheDocument();
     second.unmount();
 
     statusSpy.mockResolvedValueOnce(status({ overlay: 'revocation_pending' }));
     renderControl(<AutoUploadPanel />);
-    await waitFor(() => expect(screen.getAllByText('Off')).toHaveLength(2));
+    const thirdSwitch = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(thirdSwitch).toHaveAttribute('aria-checked', 'false');
+    expect(thirdSwitch).toHaveTextContent('Off');
+    await openPanelDetails();
     expect(screen.getByText('Revocation pending')).toBeInTheDocument();
   });
 
@@ -880,7 +638,6 @@ describe('AutoUploadPanel status and controls', () => {
   });
 
   it('does not let an older poll overwrite a pause response', async () => {
-    vi.useFakeTimers();
     const enabled = status({ mode: 'enabled', run_now_allowed: true });
     const paused = status({ mode: 'paused' });
     const stalePoll = deferred<AutoUploadStatus>();
@@ -890,25 +647,21 @@ describe('AutoUploadPanel status and controls', () => {
     vi.spyOn(api.autoUpload, 'pause').mockResolvedValue(paused);
 
     renderControl(<AutoUploadPanel />);
-    await act(flushPromises);
-    expect(screen.getByText('On')).toBeInTheDocument();
+    const toggle = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(toggle).toHaveTextContent('On');
+    await openPanelDetails();
 
-    await act(async () => {
-      vi.advanceTimersByTime(30_000);
-      await flushPromises();
-    });
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     expect(statusSpy).toHaveBeenCalledTimes(2);
 
     fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
-    await act(flushPromises);
-    expect(screen.getByText('Paused')).toBeInTheDocument();
+    await waitFor(() => expect(toggle).toHaveTextContent('Paused'));
 
     await act(async () => {
       stalePoll.resolve(enabled);
       await flushPromises();
     });
-    expect(screen.getByText('Paused')).toBeInTheDocument();
-    expect(screen.queryByText('On')).not.toBeInTheDocument();
+    expect(toggle).toHaveTextContent('Paused');
   });
 
   it('does not let an older status request overwrite a disable response', async () => {
@@ -921,21 +674,24 @@ describe('AutoUploadPanel status and controls', () => {
     const disableSpy = vi.spyOn(api.autoUpload, 'disable').mockResolvedValue(disabled);
 
     renderControl(<AutoUploadPanel />);
-    expect(await screen.findByText('On')).toBeInTheDocument();
+    const toggle = await screen.findByRole('switch', { name: 'Automatic uploads' });
+    expect(toggle).toHaveTextContent('On');
 
+    await openPanelDetails();
     fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Turn off' }));
+    fireEvent.click(toggle);
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Turn off' }));
 
     await waitFor(() => expect(disableSpy).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getAllByText('Off')).toHaveLength(2));
+    await waitFor(() => expect(toggle).toHaveTextContent('Off'));
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
 
     await act(async () => {
       staleGet.resolve(enabled);
       await flushPromises();
     });
-    expect(screen.getAllByText('Off')).toHaveLength(2);
-    expect(screen.queryByText('On')).not.toBeInTheDocument();
+    expect(toggle).toHaveTextContent('Off');
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
   });
 
   it('links reviewable exclusions back to Share', async () => {
@@ -953,6 +709,7 @@ describe('AutoUploadPanel status and controls', () => {
     }));
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
 
     const reviewLink = await screen.findByRole('link', { name: 'Review 2 in Share' });
     expect(reviewLink).toHaveAttribute('href', '/share');
@@ -968,12 +725,15 @@ describe('AutoUploadPanel status and controls', () => {
 
     renderControl(<AutoUploadPanel />);
 
+    await openPanelDetails();
     expect(await screen.findByText(/it will not retry automatically/i)).toBeInTheDocument();
     expect(screen.queryByText(/can be offered after a successful hosted manual share/i)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Retry revocation' }));
 
     await waitFor(() => expect(disableSpy).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getAllByText('Off')).toHaveLength(2));
+    await waitFor(() => expect(
+      screen.getByRole('switch', { name: 'Automatic uploads' }),
+    ).toHaveAttribute('aria-checked', 'false'));
     expect(screen.queryByText('Revocation pending')).not.toBeInTheDocument();
   });
 });
@@ -999,6 +759,7 @@ describe('AuthorizationDialog daemon version skew', () => {
     vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(v1Error);
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
 
     expect(
@@ -1030,6 +791,7 @@ describe('AuthorizationDialog daemon version skew', () => {
     vi.spyOn(api.autoUpload, 'enable').mockRejectedValue(malformed);
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
 
     expect(await screen.findByText(/incompatible authorization challenge/i)).toBeInTheDocument();
@@ -1060,6 +822,7 @@ describe('AuthorizationDialog focus and dismissal', () => {
     );
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
 
     const dialog = await screen.findByRole('dialog');
@@ -1097,6 +860,7 @@ describe('AuthorizationDialog focus and dismissal', () => {
       .mockReturnValueOnce(freshChallenge.promise);
 
     renderControl(<AutoUploadPanel />);
+    await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
     fireEvent.click(screen.getByRole('button', { name: 'Review scope and terms' }));
@@ -1105,6 +869,7 @@ describe('AuthorizationDialog focus and dismissal', () => {
       freshChallenge.reject(freshError);
       await flushPromises();
     });
+    fireEvent.click(await screen.findByRole('button', { name: 'View scope and terms' }));
     expect(await screen.findByText('Fresh authorization text')).toBeInTheDocument();
 
     await act(async () => {
