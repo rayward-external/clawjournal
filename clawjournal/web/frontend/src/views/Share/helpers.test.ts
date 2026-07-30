@@ -1,11 +1,30 @@
 import { describe, expect, it } from 'vitest';
 import type { ReadySession, ShareReadyStats } from './types.ts';
 import {
+  classify,
   hasLockedQueueSelection,
   queueFromSelectionParams,
   queueFromStats,
   writeQueueSelectionParams,
 } from './helpers.ts';
+
+describe('Share review defaults', () => {
+  it('auto-clears deterministic-only results when AI was intentionally disabled', () => {
+    expect(classify({ messages: [], loading: false, aiCoverage: 'disabled' })).toBe('clear');
+  });
+
+  it('fails closed when an enabled AI pass was unavailable or uncertain', () => {
+    expect(classify({ messages: [], loading: false, aiCoverage: 'rules_only' })).toBe('review');
+    expect(classify({
+      messages: [],
+      loading: false,
+      aiCoverage: 'full',
+      aiPiiFindings: [{
+        entity_type: 'person', entity_text: 'masked', confidence: 0.5, field: 'content', source: 'ai',
+      }],
+    })).toBe('review');
+  });
+});
 
 export function readySession(id: string): ReadySession {
   return {

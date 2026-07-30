@@ -3,7 +3,7 @@ import { RedactedText } from '../../components/RedactedText.tsx';
 import { ToolUseCard } from '../../components/ToolUseCard.tsx';
 import { colors } from '../../theme.ts';
 import type { ReadySession, RedactedSessionData } from './types.ts';
-import { aggregateCategories, classify, formatTokens, hexAlpha, sessionTotalTokens } from './helpers.ts';
+import { aggregateCategories, classify, formatTokens, sessionTotalTokens } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { HelpModal, Icon, SourceBadge, StatusDot, ThinkingBlock, UsageDisclosure } from './shared.tsx';
 
@@ -18,8 +18,7 @@ export interface ReviewStepProps {
   aiPiiEnabled: boolean;
   onToggleExpand: (id: string) => void;
   onApprove: (id: string) => void;
-  onApproveAllClean: () => void;
-  onRemove: (id: string) => void;
+  onExclude: (id: string) => void;
   onRetryAi: (id: string) => void;
   onBack: () => void;
   onPackage: () => void;
@@ -30,6 +29,7 @@ export interface ReviewStepProps {
 
 export function ReviewStep(p: ReviewStepProps) {
   const [visibleCount, setVisibleCount] = useState(REVIEW_PAGE_SIZE);
+  const [showDetails, setShowDetails] = useState(false);
   const sorted = [...p.queuedSessions].sort((a, b) => {
     const sa = classify(p.redactedSessions[a.session_id]);
     const sb = classify(p.redactedSessions[b.session_id]);
@@ -38,10 +38,11 @@ export function ReviewStep(p: ReviewStepProps) {
   });
 
   const approvedCount = p.queuedSessions.filter((s) => p.approvedIds.has(s.session_id)).length;
-  const allApproved = p.queuedSessions.length > 0 && approvedCount === p.queuedSessions.length;
-  const cleanUnapprovedCount = p.queuedSessions.filter((s) => (
-    classify(p.redactedSessions[s.session_id]) === 'clear' && !p.approvedIds.has(s.session_id)
+  const needsReviewCount = p.queuedSessions.filter((s) => (
+    classify(p.redactedSessions[s.session_id]) === 'review'
   )).length;
+  const excludedCount = p.queuedSessions.length - approvedCount;
+  const canPackage = approvedCount > 0;
   const visibleSessions = sorted.slice(0, visibleCount);
   const hiddenCount = sorted.length - visibleSessions.length;
 
@@ -53,52 +54,41 @@ export function ReviewStep(p: ReviewStepProps) {
         <button onClick={p.onBack} style={btnGhost}>&larr; Back to redaction</button>
       </div>
       <h1 style={{ margin: '0 0 6px', fontSize: 22, fontWeight: 600, color: colors.gray900 }}>
-        Review what you&rsquo;re sharing
+        Ready to package
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
-        You&rsquo;re the last checkpoint before packaging. Include each trace &mdash; or drop it
-        &mdash; so you know exactly what&rsquo;s in the zip.
+        Safe traces are included automatically. Anything uncertain stays out unless you
+        choose to review and include it.
       </p>
 
       <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
 
-      {/* Bulk progress bar */}
       <div style={{
-        position: 'sticky', top: 0, zIndex: 6,
-        background: allApproved
-          ? `linear-gradient(90deg, rgba(250,248,245,0.95), ${hexAlpha('#558745', 0.12)}, rgba(250,248,245,0.95))`
-          : 'rgba(250,248,245,0.95)',
-        backdropFilter: 'blur(6px)',
-        padding: '10px 14px', marginBottom: 14,
+        padding: '16px', marginBottom: 14, background: colors.white,
         border: `1px solid ${colors.gray200}`, borderRadius: 8,
-        display: 'flex', alignItems: 'center', gap: 12, fontSize: 13,
+        display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12,
       }}>
-        <span style={{
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-          fontVariantNumeric: 'tabular-nums', color: colors.gray900,
-        }}>
-          <strong style={{ color: allApproved ? colors.green500 : colors.gray900 }}>{approvedCount}</strong>
-          <span style={{ color: colors.gray500 }}> / {p.queuedSessions.length} included</span>
-        </span>
-        <span style={{ color: colors.gray500, fontSize: 12, marginRight: 'auto' }}>
-          {allApproved
-            ? 'All traces included. Ready to package.'
-            : 'Tap each card to inspect. You can include one-by-one or all clean ones at once.'}
-        </span>
-        <button
-          onClick={p.onApproveAllClean}
-          disabled={cleanUnapprovedCount === 0}
-          style={{
-            ...btnSecondary, padding: '6px 12px', fontSize: 12.5,
-            opacity: cleanUnapprovedCount === 0 ? 0.4 : 1,
-            cursor: cleanUnapprovedCount === 0 ? 'not-allowed' : 'pointer',
-          }}
-        >
-          Include all clean ({cleanUnapprovedCount})
-        </button>
+        <SummaryStat value={p.queuedSessions.length} label="traces processed" />
+        <SummaryStat value={approvedCount} label="ready to share" color={colors.green500} />
+        <SummaryStat
+          value={excludedCount}
+          label={needsReviewCount > 0 ? `not included · ${needsReviewCount} need review` : 'not included'}
+          color={excludedCount > 0 ? colors.yellow700 : colors.gray500}
+        />
       </div>
 
-      <div>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: showDetails ? 12 : 0 }}>
+        <button onClick={() => setShowDetails((shown) => !shown)} style={btnSecondary} aria-expanded={showDetails}>
+          {showDetails ? 'Hide review details' : 'Review details'}
+        </button>
+        {!showDetails && needsReviewCount > 0 && (
+          <span style={{ marginLeft: 10, color: colors.gray500, fontSize: 12.5 }}>
+            Optional: inspect {needsReviewCount} excluded trace{needsReviewCount === 1 ? '' : 's'}.
+          </span>
+        )}
+      </div>
+
+      {showDetails && <div>
         {visibleSessions.map((s) => (
           <ReviewRow
             key={s.session_id}
@@ -109,7 +99,7 @@ export function ReviewStep(p: ReviewStepProps) {
             aiPiiEnabled={p.aiPiiEnabled}
             onToggle={() => p.onToggleExpand(s.session_id)}
             onApprove={() => p.onApprove(s.session_id)}
-            onRemove={() => p.onRemove(s.session_id)}
+            onExclude={() => p.onExclude(s.session_id)}
             onRetryAi={() => p.onRetryAi(s.session_id)}
           />
         ))}
@@ -124,7 +114,7 @@ export function ReviewStep(p: ReviewStepProps) {
             </button>
           </div>
         )}
-      </div>
+      </div>}
 
       <div style={{
         position: 'sticky', bottom: 0, marginTop: 14, paddingTop: 14,
@@ -138,7 +128,7 @@ export function ReviewStep(p: ReviewStepProps) {
         }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             <div style={{ fontSize: 13, color: colors.gray900 }}>
-              {allApproved ? 'All included — ready to package' : `${p.queuedSessions.length - approvedCount} still waiting on you`}
+              {canPackage ? `${approvedCount} trace${approvedCount === 1 ? '' : 's'} ready to package` : 'No traces are included yet'}
             </div>
             <div style={{ fontSize: 11.5, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
               Included traces will be packaged into draft-bundle.zip
@@ -147,11 +137,11 @@ export function ReviewStep(p: ReviewStepProps) {
           <div style={{ marginLeft: 'auto' }}>
             <button
               onClick={p.onPackage}
-              disabled={!allApproved}
-              style={{ ...btnPrimary, opacity: allApproved ? 1 : 0.4, cursor: allApproved ? 'pointer' : 'not-allowed' }}
+              disabled={!canPackage}
+              style={{ ...btnPrimary, opacity: canPackage ? 1 : 0.4, cursor: canPackage ? 'pointer' : 'not-allowed' }}
             >
               <Icon name="check" size={14} />
-              Package bundle
+              Package {approvedCount} trace{approvedCount === 1 ? '' : 's'}
             </button>
           </div>
         </div>
@@ -161,8 +151,21 @@ export function ReviewStep(p: ReviewStepProps) {
   );
 }
 
+function SummaryStat({ value, label, color = colors.gray900 }: { value: number; label: string; color?: string }) {
+  return (
+    <div>
+      <div style={{
+        color, fontSize: 22, fontWeight: 600,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontVariantNumeric: 'tabular-nums',
+      }}>{value}</div>
+      <div style={{ color: colors.gray500, fontSize: 12, marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
 function ReviewRow({
-  session, data, approved, expanded, aiPiiEnabled, onToggle, onApprove, onRemove, onRetryAi,
+  session, data, approved, expanded, aiPiiEnabled, onToggle, onApprove, onExclude, onRetryAi,
 }: {
   session: ReadySession;
   data: RedactedSessionData | undefined;
@@ -171,7 +174,7 @@ function ReviewRow({
   aiPiiEnabled: boolean;
   onToggle: () => void;
   onApprove: () => void;
-  onRemove: () => void;
+  onExclude: () => void;
   onRetryAi: () => void;
 }) {
   const status = classify(data);
@@ -255,7 +258,7 @@ function ReviewRow({
                 width: 16, height: 16, borderRadius: '50%',
                 border: `1.5px dashed ${colors.gray400}`,
               }} />
-              {status === 'review' ? 'Needs your eyes' : 'Awaiting you'}
+              {status === 'review' ? 'Excluded — needs review' : 'Not included'}
             </span>
           )}
         </div>
@@ -398,12 +401,13 @@ function ReviewRow({
             <span style={{ fontSize: 12, color: colors.gray500, marginRight: 'auto' }}>
               {approved
                 ? 'Included with the redactions shown above.'
-                : 'Include if the redacted version looks good. Remove if not.'}
+                : 'This trace is currently excluded. Include it only if the redacted version looks good.'}
             </span>
-            <button onClick={onRemove} style={btnSecondary}>
-              Remove from bundle
-            </button>
-            {!approved && (
+            {approved ? (
+              <button onClick={onExclude} style={btnSecondary}>
+                Exclude from bundle
+              </button>
+            ) : (
               <button onClick={onApprove} style={btnPrimary}>
                 <Icon name="check" size={13} />
                 Include in bundle
