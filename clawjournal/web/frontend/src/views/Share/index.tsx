@@ -211,6 +211,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   // Review state
   const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
+  const [manuallyExcludedIds, setManuallyExcludedIds] = useState<Set<string>>(new Set());
   const [expandedReviewIds, setExpandedReviewIds] = useState<Set<string>>(new Set());
 
   // Package state
@@ -338,6 +339,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setPackagedShareId(searchParams.get('share'));
     setRedactedSessions({});
     setApprovedIds(new Set());
+    setManuallyExcludedIds(new Set());
     setExpandedReviewIds(new Set());
     setBundleInfo(null);
     setReceiptId(null);
@@ -403,6 +405,15 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       return changed ? next : prev;
     });
     setApprovedIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (queueSet.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+    setManuallyExcludedIds((prev) => {
       let changed = false;
       const next = new Set<string>();
       for (const id of prev) {
@@ -618,6 +629,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setConfirmedLargeQueueIds(null);
     setRedactedSessions({});
     setApprovedIds(new Set());
+    setManuallyExcludedIds(new Set());
     setExpandedReviewIds(new Set());
     setPackagedShareId(null);
     setPackageProgress(0);
@@ -672,6 +684,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setAiPiiEnabled(false);
     setRedactedSessions({});
     setApprovedIds(new Set());
+    setManuallyExcludedIds(new Set());
     setExpandedReviewIds(new Set());
     setBundleInfo(null);
     setReceiptId(null);
@@ -889,11 +902,21 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   const goToReview = () => {
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact']));
-    // Auto-expand the first unapproved trace for immediate attention.
-    const firstUnapproved = queuedSessions.find((s) => !approvedIds.has(s.session_id));
-    if (firstUnapproved) {
-      setExpandedReviewIds(new Set([firstUnapproved.session_id]));
-    }
+    // The deterministic/AI result supplies the safe default. Clear traces are
+    // included in one batch; uncertain traces fail closed but no longer block
+    // packaging the safe subset. Details remain available for manual changes.
+    setApprovedIds((previous) => new Set(
+      queuedSessions
+        .filter((s) => (
+          previous.has(s.session_id)
+          || (
+            !manuallyExcludedIds.has(s.session_id)
+            && classify(redactedSessions[s.session_id]) === 'clear'
+          )
+        ))
+        .map((s) => s.session_id),
+    ));
+    setExpandedReviewIds(new Set());
     setActiveStep('review');
   };
 
@@ -903,6 +926,12 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
   const approveTrace = (id: string) => {
     setApprovedIds((prev) => new Set([...prev, id]));
+    setManuallyExcludedIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     // auto-advance: collapse this row, expand next unapproved
     setExpandedReviewIds((prev) => {
       const n = new Set(prev);
@@ -920,14 +949,13 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     });
   };
 
-  const approveAllClean = () => {
+  const excludeTrace = (id: string) => {
     setApprovedIds((prev) => {
-      const n = new Set(prev);
-      queuedSessions.forEach((s) => {
-        if (classify(redactedSessions[s.session_id]) === 'clear') n.add(s.session_id);
-      });
-      return n;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
     });
+    setManuallyExcludedIds((prev) => new Set([...prev, id]));
   };
 
   const retryAiReview = async (id: string) => {
@@ -1136,7 +1164,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   }, [installingScanners, runPackage, toast]);
 
   const handleStartPackage = () => {
-    if (queuedSessions.length === 0) return;
+    if (approvedSessions.length === 0) return;
     cancelAiRetries();
     setCompletedKeys((prev) => new Set([...prev, 'queue', 'redact', 'review']));
     setActiveStep('package');
@@ -1352,8 +1380,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         aiPiiEnabled={aiPiiEnabled}
         onToggleExpand={toggleReviewExpand}
         onApprove={approveTrace}
-        onApproveAllClean={approveAllClean}
-        onRemove={removeFromQueue}
+        onExclude={excludeTrace}
         onRetryAi={retryAiReview}
         onBack={() => {
           cancelAiRetries();

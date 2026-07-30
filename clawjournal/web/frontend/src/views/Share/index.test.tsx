@@ -624,3 +624,68 @@ describe('Redaction completion', () => {
     expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual(['s1', 's2']);
   });
 });
+
+describe('One-click review defaults', () => {
+  it('auto-includes deterministic-only traces and preserves a manual exclusion', async () => {
+    mockInitialLoad(readyStats(2));
+    vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'disabled',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+
+    expect(await screen.findByRole('heading', { name: 'Ready to package' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Package 2 traces' })).toBeEnabled();
+    expect(screen.queryByText('Trace s1')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
+    fireEvent.click(screen.getByText('Trace s1'));
+    fireEvent.click(screen.getByRole('button', { name: 'Exclude from bundle' }));
+    expect(screen.getByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: /Back to redaction/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+  });
+
+  it('leaves an AI-unavailable trace out without blocking the safe subset', async () => {
+    mockInitialLoad(readyStats(2));
+    vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: id === 's1' ? 'full' : 'rules_only',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+    expect(screen.getByText('Optional: inspect 1 excluded trace.')).toBeInTheDocument();
+    expect(screen.getByText('not included · 1 need review')).toBeInTheDocument();
+  });
+});
