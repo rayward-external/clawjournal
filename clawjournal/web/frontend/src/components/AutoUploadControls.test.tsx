@@ -667,6 +667,7 @@ describe('AutoUploadPanel authorization', () => {
       accepted_retention_version: 'retention-v3',
       accepted_ownership_certification_version: 'ownership-v1',
       accepted_authorization_profile_hash: 'profile-hash-v2',
+      progress_id: expect.any(String),
     });
     expect(await screen.findByText('recurring-v2')).toBeInTheDocument();
 
@@ -677,6 +678,79 @@ describe('AutoUploadPanel authorization', () => {
 
     expect(screen.getByText('recurring-v2')).toBeInTheDocument();
     expect(screen.queryByText('recurring-v1')).not.toBeInTheDocument();
+  });
+
+  it('shows scan-lock waiting and live source project progress while enabling', async () => {
+    const initial = status({
+      mode: 'enabled',
+      run_now_allowed: true,
+      scope: {
+        sources: ['claude'],
+        projects: ['project-a'],
+        entries: [['claude', 'project-a']],
+      },
+      authorization: { version: 'recurring-v1', text: 'old terms' },
+    });
+    const enabled = status({
+      ...initial,
+      authorization: { version: 'recurring-v2', text: 'new terms' },
+    });
+    const enableRequest = deferred<AutoUploadStatus>();
+    vi.spyOn(api.autoUpload, 'status').mockResolvedValue(initial);
+    vi.spyOn(api.autoUpload, 'enable')
+      .mockRejectedValueOnce(authorizationRequired())
+      .mockReturnValueOnce(enableRequest.promise);
+    vi.spyOn(api.autoUpload, 'enableProgress')
+      .mockResolvedValueOnce({
+        progress_id: 'progress-issue165',
+        stage: 'waiting_for_scan_lock',
+        message: 'Waiting for another scan to finish before refreshing...',
+        source: null,
+        current_project: null,
+        total_projects: null,
+        updated_at: '2026-07-29T00:00:00Z',
+      })
+      .mockResolvedValue({
+        progress_id: 'progress-issue165',
+        stage: 'scanning',
+        message: 'Refreshing Codex source logs: 42/118 projects',
+        source: 'codex',
+        current_project: 42,
+        total_projects: 118,
+        updated_at: '2026-07-29T00:00:01Z',
+      });
+
+    renderControl(<AutoUploadPanel />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
+    await screen.findByRole('heading', { name: 'Authorize future automatic uploads' });
+    const checkboxes = screen.getAllByRole('checkbox');
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
+
+    expect(screen.getByText(
+      'Checking the hosted service and current terms...',
+    )).toBeInTheDocument();
+    expect(await screen.findByText(
+      'Waiting for another scan to finish before refreshing...',
+      {},
+      { timeout: 2_000 },
+    )).toBeInTheDocument();
+    expect(await screen.findByText(
+      'Refreshing Codex source logs: 42/118 projects',
+      {},
+      { timeout: 2_000 },
+    )).toBeInTheDocument();
+    const progress = screen.getByRole('progressbar', {
+      name: 'Automatic upload enrollment refresh',
+    });
+    expect(progress).toHaveAttribute('value', '42');
+    expect(progress).toHaveAttribute('max', '118');
+
+    await act(async () => {
+      enableRequest.resolve(enabled);
+      await flushPromises();
+    });
   });
 
   it('never blames a receipt grant when rotating an active enrollment', async () => {

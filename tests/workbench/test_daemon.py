@@ -336,6 +336,7 @@ def _delete(port, path, *, skip_auth=False):
     ("method", "path"),
     [
         ("get", "/api/auto-upload/status"),
+        ("get", "/api/auto-upload/enable-progress/missing-profile"),
         ("get", "/api/auto-upload/preview"),
         ("post", "/api/auto-upload/preview"),
         ("post", "/api/auto-upload/enable"),
@@ -431,6 +432,183 @@ def test_auto_upload_enable_forwards_authorization_profile_hash(server, monkeypa
             "prepare_for_manual_share": False,
         }
     ]
+
+
+def test_auto_upload_enable_reports_lock_wait_and_scan_progress(server, monkeypatch):
+    from clawjournal import auto_upload
+
+    waiting = Event()
+    continue_to_scan = Event()
+    scanning = Event()
+    finish = Event()
+    response = {}
+    profile_hash = "profile-progress-v2"
+    progress_id = "progress-issue165"
+
+    def fake_enable(**kwargs):
+        kwargs["scan_wait_notice"]()
+        waiting.set()
+        if not continue_to_scan.wait(timeout=5):
+            raise AssertionError("test did not release scan-lock wait")
+        kwargs["scan_progress"]("codex", 42, 118)
+        scanning.set()
+        if not finish.wait(timeout=5):
+            raise AssertionError("test did not release scan progress")
+        return {"ok": True, "mode": "enabled", "health": "ready"}
+
+    monkeypatch.setattr(auto_upload, "enable", fake_enable)
+
+    def post_enable():
+        response["value"] = _post(
+            server,
+            "/api/auto-upload/enable",
+            {
+                "agent": "codex",
+                "accepted_authorization_profile_hash": profile_hash,
+                "progress_id": progress_id,
+            },
+        )
+
+    thread = Thread(target=post_enable, daemon=True)
+    thread.start()
+    try:
+        assert waiting.wait(timeout=5)
+        status_code, body = _get(
+            server, f"/api/auto-upload/enable-progress/{progress_id}"
+        )
+        assert status_code == 200
+        assert body == {
+            "progress_id": progress_id,
+            "stage": "waiting_for_scan_lock",
+            "message": "Waiting for another scan to finish before refreshing...",
+            "source": None,
+            "current_project": None,
+            "total_projects": None,
+            "updated_at": body["updated_at"],
+        }
+
+        continue_to_scan.set()
+        assert scanning.wait(timeout=5)
+        status_code, body = _get(
+            server, f"/api/auto-upload/enable-progress/{progress_id}"
+        )
+        assert status_code == 200
+        assert body["stage"] == "scanning"
+        assert body["source"] == "codex"
+        assert body["current_project"] == 42
+        assert body["total_projects"] == 118
+        assert body["message"] == "Refreshing Codex source logs: 42/118 projects"
+    finally:
+        continue_to_scan.set()
+        finish.set()
+        thread.join(timeout=5)
+
+    assert response["value"][0] == 200
+    status_code, body = _get(
+        server, f"/api/auto-upload/enable-progress/{progress_id}"
+    )
+    assert status_code == 200
+    assert body["stage"] == "complete"
+    assert body["message"] == "Automatic upload enabled."
+
+
+@pytest.mark.parametrize(
+    ("label", "progress_id"),
+    [
+        ("path traversal", "../../etc/passwd"),
+        ("over the length cap", "a" * 129),
+        ("embedded whitespace", "has spaces"),
+        ("non-ascii", "pr\u00f6gress"),
+    ],
+)
+def test_auto_upload_enable_rejects_an_unusable_progress_id(
+    server, monkeypatch, label, progress_id
+):
+    """The progress id is client-supplied and becomes a URL path segment.
+
+    It is only ever a dict key today, but the filter is what keeps it that way,
+    so it is pinned rather than left to the reader to re-derive.
+    """
+    from clawjournal import auto_upload
+
+    called = []
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: called.append(kwargs) or {"ok": True, "mode": "enabled"},
+    )
+
+    status, body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "accepted_authorization_profile_hash": "profile-hash",
+            "progress_id": progress_id,
+        },
+    )
+
+    assert status == 400, label
+    assert body["error"] == "Invalid progress identifier"
+    # Rejected before the enrollment call, not after.
+    assert called == []
+
+
+def test_read_only_challenge_creates_no_progress_state(server, monkeypatch):
+    """`challenge_only` cannot enroll, so it must not publish enable progress."""
+    from clawjournal import auto_upload
+
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: {"ok": True, "mode": "off", "challenge": {}},
+    )
+
+    status, _body = _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "accepted_authorization_profile_hash": "profile-hash",
+            "progress_id": "challenge-only-probe",
+            "challenge_only": True,
+        },
+    )
+    assert status == 200
+
+    status, _body = _get(
+        server, "/api/auto-upload/enable-progress/challenge-only-probe"
+    )
+    assert status == 404
+
+
+def test_auto_upload_enable_publishes_the_refusal_reason(server, monkeypatch):
+    """A refused enrollment ends in a terminal stage carrying its reason.
+
+    Without this the poller's last word is whatever stage it happened to catch,
+    so the dialog would sit on "scanning" after the attempt was already over.
+    """
+    from clawjournal import auto_upload
+
+    monkeypatch.setattr(
+        auto_upload,
+        "enable",
+        lambda **kwargs: {"ok": False, "message": "Hosted submissions are closed."},
+    )
+
+    _post(
+        server,
+        "/api/auto-upload/enable",
+        {
+            "accepted_authorization_profile_hash": "profile-hash",
+            "progress_id": "refused-enrollment",
+        },
+    )
+
+    status, body = _get(
+        server, "/api/auto-upload/enable-progress/refused-enrollment"
+    )
+    assert status == 200
+    assert body["stage"] == "failed"
+    assert body["message"] == "Hosted submissions are closed."
 
 
 def test_auto_upload_enable_forwards_manual_share_preparation(server, monkeypatch):

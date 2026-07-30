@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api.ts';
+import {
+  createAutoUploadEnableProgressId,
+  startAutoUploadEnableProgressPolling,
+} from '../../autoUploadEnableProgress.ts';
 import { colors } from '../../theme.ts';
 import { Spinner } from '../../components/Spinner.tsx';
 import { challengeFromError } from '../../components/autoUploadChallenge.ts';
 import type {
   AutoUploadAgent,
   AutoUploadAuthorizationChallenge,
+  AutoUploadEnableProgress,
   AutoUploadStatus,
 } from '../../types.ts';
 import type { HostedConsent, ShareDestination } from './types.ts';
@@ -68,6 +73,8 @@ export function SubmitStep(p: SubmitStepProps) {
   const [showAutomaticUploadDetails, setShowAutomaticUploadDetails] = useState(false);
   const [showAcceptedDomains, setShowAcceptedDomains] = useState(false);
   const [enablingAutomaticUploads, setEnablingAutomaticUploads] = useState(false);
+  const [automaticUploadEnableProgress, setAutomaticUploadEnableProgress] =
+    useState<AutoUploadEnableProgress | null>(null);
   const [busy, setBusy] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitStageIndex, setSubmitStageIndex] = useState(0);
@@ -211,8 +218,13 @@ export function SubmitStep(p: SubmitStepProps) {
         setSubmitProgress((prev) => Math.max(prev, stage.progress));
       }, stage.delayMs)
     ));
+    // `Math.min` alone would claw a higher value back down to the ceiling once
+    // the enrollment phase reports real progress above it, so the crawl only
+    // ever moves forward.
     const tick = window.setInterval(() => {
-      setSubmitProgress((prev) => Math.min(92, prev + (prev < 64 ? 3 : 1)));
+      setSubmitProgress((prev) => (
+        prev >= 92 ? prev : Math.min(92, prev + (prev < 64 ? 3 : 1))
+      ));
     }, 700);
 
     return () => {
@@ -220,6 +232,31 @@ export function SubmitStep(p: SubmitStepProps) {
       window.clearInterval(tick);
     };
   }, [submitting, submitStages]);
+
+  // Enrollment is the one phase that knows how much work is left, so it drives
+  // the bar directly instead of leaving it on the timed crawl. The band starts
+  // at the value the phase already showed, so beginning the refresh never
+  // reads as losing ground.
+  const enrollmentProgress = useMemo(() => {
+    if (!enablingAutomaticUploads) return null;
+    const scan = automaticUploadEnableProgress;
+    if (
+      scan?.stage === 'scanning'
+      && scan.current_project !== null
+      && scan.total_projects
+    ) {
+      return Math.min(
+        99,
+        96 + Math.round(3 * scan.current_project / scan.total_projects),
+      );
+    }
+    return 96;
+  }, [enablingAutomaticUploads, automaticUploadEnableProgress]);
+
+  useEffect(() => {
+    if (enrollmentProgress === null) return;
+    setSubmitProgress((prev) => Math.max(prev, enrollmentProgress));
+  }, [enrollmentProgress]);
 
   const sendCode = async () => {
     if (!email.trim()) return;
@@ -280,6 +317,11 @@ export function SubmitStep(p: SubmitStepProps) {
       let automaticUploadEnabled = false;
       if (enableAutomaticUploads && autoUploadChallenge) {
         setEnablingAutomaticUploads(true);
+        const progressId = createAutoUploadEnableProgressId();
+        const stopProgressPolling = startAutoUploadEnableProgressPolling(
+          progressId,
+          setAutomaticUploadEnableProgress,
+        );
         try {
           await api.autoUpload.enable({
             agent: automaticUploadAgent(autoUploadChallenge),
@@ -290,6 +332,7 @@ export function SubmitStep(p: SubmitStepProps) {
               autoUploadChallenge.ownership_certification.version,
             accepted_authorization_profile_hash:
               autoUploadChallenge.authorization_profile_hash,
+            progress_id: progressId,
           });
           automaticUploadEnabled = true;
         } catch {
@@ -301,6 +344,8 @@ export function SubmitStep(p: SubmitStepProps) {
             'info',
           );
         } finally {
+          stopProgressPolling();
+          setAutomaticUploadEnableProgress(null);
           setEnablingAutomaticUploads(false);
         }
       }
@@ -354,9 +399,14 @@ export function SubmitStep(p: SubmitStepProps) {
   const supportContact = consent?.support_contact || p.shareDestination?.support_contact || null;
   const currentSubmitStage = enablingAutomaticUploads
     ? {
-        buttonLabel: 'Enabling automatic uploads...',
-        detail: 'Confirming the exact recurring scope and installing the session hook.',
-        progress: 96,
+        buttonLabel: automaticUploadEnableProgress?.stage === 'waiting_for_scan_lock'
+          ? 'Waiting for scanner...'
+          : automaticUploadEnableProgress?.stage === 'scanning'
+            ? 'Refreshing history...'
+            : 'Enabling automatic uploads...',
+        detail: automaticUploadEnableProgress?.message
+          ?? 'Confirming the exact recurring scope and installing the session hook.',
+        progress: enrollmentProgress ?? 96,
       }
     : submitStages[submitStageIndex] ?? submitStages[0];
   const submitPipelineLabel = p.aiPiiEnabled
@@ -697,7 +747,14 @@ export function SubmitStep(p: SubmitStepProps) {
                     }} />
                     {currentSubmitStage.detail}
                   </div>
-                  <div style={{ height: 4, background: colors.gray200, borderRadius: 2, overflow: 'hidden' }}>
+                  <div
+                    role="progressbar"
+                    aria-label="Submission progress"
+                    aria-valuenow={submitProgress}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    style={{ height: 4, background: colors.gray200, borderRadius: 2, overflow: 'hidden' }}
+                  >
                     <div style={{
                       width: `${submitProgress}%`,
                       height: '100%',
