@@ -7,9 +7,11 @@ import sqlite3
 import time
 import urllib.error
 import zipfile
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 from io import BytesIO
+from pathlib import Path
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -330,6 +332,366 @@ def _delete(port, path, *, skip_auth=False):
     resp = conn.getresponse()
     resp_body = resp.read().decode()
     return resp.status, json.loads(resp_body) if resp.getheader("Content-Type", "").startswith("application/json") else resp_body
+
+
+def test_index_recovery_gate_leaves_only_health_probe_available(server):
+    from clawjournal.workbench import index_recovery
+
+    recovery_health = {
+        "status": "recovery_required",
+        "message": "The test index is damaged.",
+        "automatic_recovery_available": True,
+    }
+    index_recovery._set_health(recovery_health)
+    try:
+        status, features = _get(server, "/api/features")
+        assert status == 200
+        assert features["index_health"] == recovery_health
+
+        requests = (
+            _get(server, "/api/stats"),
+            _post(server, "/api/scan"),
+            _patch(server, "/api/findings"),
+            _delete(server, "/api/policies/test-policy"),
+        )
+        for status, body in requests:
+            assert status == 503
+            assert body["code"] == "index_recovery_required"
+    finally:
+        index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index is ready.",
+        })
+
+
+def test_external_recovery_marker_blocks_and_then_resumes_cached_daemon(
+    server,
+    index_setup,
+):
+    from clawjournal.workbench import index as index_module
+    from clawjournal.workbench import index_recovery
+
+    database = Path(index_module.INDEX_DB)
+    backup = index_setup / "index-backups" / "external-recovery"
+    backup.mkdir(parents=True)
+    (backup / "index.db").write_bytes(database.read_bytes())
+    marker = index_setup / index_recovery.RECOVERY_MARKER_FILENAME
+    index_recovery._write_marker(
+        database,
+        {"version": 1, "backup_path": str(backup), "stage": "backed_up"},
+    )
+    index_recovery._set_health({
+        "status": "ready",
+        "message": "Stale ready state from this daemon.",
+    })
+    try:
+        status, features = _get(server, "/api/features")
+        assert status == 200
+        assert features["index_health"]["status"] == "recovery_required"
+        assert features["index_health"]["interrupted_recovery"] is True
+
+        status, body = _get(server, "/api/stats")
+        assert status == 503
+        assert body["code"] == "index_recovery_required"
+
+        marker.unlink()
+        status, features = _get(server, "/api/features")
+        assert status == 200
+        assert features["index_health"]["status"] == "ready"
+        status, _body = _get(server, "/api/stats")
+        assert status == 200
+    finally:
+        marker.unlink(missing_ok=True)
+        index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index is ready.",
+        })
+
+
+def test_index_rebuild_endpoint_still_requires_bearer_auth(server):
+    status, _body = _post(
+        server,
+        "/api/index/rebuild",
+        skip_auth=True,
+    )
+
+    assert status == 401
+
+
+def test_index_rebuild_endpoint_runs_once_and_resumes_scanner(
+    server_with_scanner,
+    monkeypatch,
+):
+    from clawjournal.workbench import daemon, index_recovery
+
+    port, scanner = server_with_scanner
+    resumed = Event()
+    scanner._stop_event = Event()
+    scanner.start = resumed.set
+
+    def rebuild_damaged_index():
+        return index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index was rebuilt.",
+            "backup_path": "test-backup",
+        })
+
+    scanner.rebuild_damaged_index = rebuild_damaged_index
+    monkeypatch.setattr(
+        daemon,
+        "trigger_scoring_warmup",
+        lambda _scanner: {"status": "disabled"},
+    )
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "message": "The test index is damaged.",
+        "automatic_recovery_available": True,
+    })
+    try:
+        status, body = _post(port, "/api/index/rebuild")
+
+        assert status == 202
+        assert body["ok"] is True
+        assert resumed.wait(2)
+        assert index_recovery.current_index_health()["status"] == "ready"
+    finally:
+        thread = daemon._index_recovery_thread
+        if thread is not None:
+            thread.join(timeout=2)
+        index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index is ready.",
+        })
+
+
+def test_index_rebuild_keeps_workers_stopped_when_result_is_not_ready(
+    server_with_scanner,
+    monkeypatch,
+):
+    from clawjournal.workbench import daemon, index_recovery
+
+    port, scanner = server_with_scanner
+    finished = Event()
+    resumed = Event()
+    scanner._stop_event = Event()
+    scanner.start = resumed.set
+
+    def rebuild_damaged_index():
+        try:
+            return index_recovery._set_health({
+                "status": "unavailable",
+                "message": "The rebuilt index could not be opened.",
+                "automatic_recovery_available": False,
+            })
+        finally:
+            finished.set()
+
+    scanner.rebuild_damaged_index = rebuild_damaged_index
+    monkeypatch.setattr(
+        daemon,
+        "trigger_scoring_warmup",
+        lambda _scanner: pytest.fail("warmup must remain stopped"),
+    )
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "message": "The test index is damaged.",
+        "automatic_recovery_available": True,
+    })
+    try:
+        status, body = _post(port, "/api/index/rebuild")
+
+        assert status == 202
+        assert body["ok"] is True
+        assert finished.wait(2)
+        thread = daemon._index_recovery_thread
+        if thread is not None:
+            thread.join(timeout=2)
+        assert not resumed.is_set()
+        assert index_recovery.current_index_health()["status"] == "unavailable"
+    finally:
+        index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index is ready.",
+        })
+
+
+def test_rebuild_skips_when_another_process_already_recovered(
+    monkeypatch,
+):
+    from clawjournal import auto_upload, config
+    from clawjournal.workbench import daemon
+
+    scanner = Scanner()
+    expected = {"status": "ready", "message": "Already recovered."}
+    monkeypatch.setattr(
+        auto_upload,
+        "whole_run_lock",
+        lambda **_kwargs: nullcontext(True),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_scan_process_lock",
+        lambda **_kwargs: nullcontext(True),
+    )
+    monkeypatch.setattr(
+        config,
+        "auto_upload_egress_lock",
+        lambda: nullcontext(),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "inspect_index_health",
+        lambda: {"status": "ready"},
+    )
+    monkeypatch.setattr(
+        daemon,
+        "initialize_index_health",
+        lambda: expected,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "guided_rebuild",
+        lambda *_args, **_kwargs: pytest.fail("healthy index was rebuilt"),
+    )
+
+    assert scanner.rebuild_damaged_index() == expected
+
+
+def test_rebuild_uses_automatic_upload_lock_order(monkeypatch):
+    from clawjournal import auto_upload, config
+    from clawjournal.workbench import daemon
+
+    events: list[str] = []
+
+    class RecordingContext:
+        def __init__(self, name, result=None):
+            self.name = name
+            self.result = result
+
+        def __enter__(self):
+            events.append(f"enter:{self.name}")
+            return self.result
+
+        def __exit__(self, *_args):
+            events.append(f"exit:{self.name}")
+
+    def whole_run_lock(*, blocking=False):
+        assert blocking is True
+        return RecordingContext("whole_run", True)
+
+    scanner = Scanner()
+    scanner._scan_lock = RecordingContext("local_scan")
+    monkeypatch.setattr(auto_upload, "whole_run_lock", whole_run_lock)
+    monkeypatch.setattr(
+        daemon,
+        "_scan_process_lock",
+        lambda **_kwargs: RecordingContext("process_scan", True),
+    )
+    monkeypatch.setattr(
+        config,
+        "auto_upload_egress_lock",
+        lambda: RecordingContext("egress"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "inspect_index_health",
+        lambda: {"status": "recovery_required"},
+    )
+    monkeypatch.setattr(
+        daemon,
+        "guided_rebuild",
+        lambda *_args, **_kwargs: events.append("rebuild") or {"status": "ready"},
+    )
+
+    assert scanner.rebuild_damaged_index() == {"status": "ready"}
+    assert events == [
+        "enter:whole_run",
+        "enter:local_scan",
+        "enter:process_scan",
+        "enter:egress",
+        "rebuild",
+        "exit:egress",
+        "exit:process_scan",
+        "exit:local_scan",
+        "exit:whole_run",
+    ]
+
+
+def test_rebuild_stops_when_automatic_upload_lock_is_unavailable(monkeypatch):
+    from clawjournal import auto_upload
+    from clawjournal.workbench import daemon
+
+    scanner = Scanner()
+    monkeypatch.setattr(
+        auto_upload,
+        "whole_run_lock",
+        lambda **_kwargs: nullcontext(False),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_scan_process_lock",
+        lambda **_kwargs: pytest.fail("scan lock must not be entered"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "guided_rebuild",
+        lambda *_args, **_kwargs: pytest.fail("rebuild must not start"),
+    )
+
+    with pytest.raises(ScanBusyError, match="could not be paused"):
+        scanner.rebuild_damaged_index()
+
+
+def test_rebuild_ignores_serve_source_filter_for_complete_rescan(monkeypatch):
+    from clawjournal import auto_upload, config
+    from clawjournal.workbench import daemon
+
+    scanner = Scanner(source_filter="claude")
+    observed_filters: list[str | None] = []
+    scanner._scan_once_report = lambda **_kwargs: (
+        observed_filters.append(scanner.source_filter) or {"ok": True}
+    )
+    monkeypatch.setattr(
+        auto_upload,
+        "whole_run_lock",
+        lambda **_kwargs: nullcontext(True),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_scan_process_lock",
+        lambda **_kwargs: nullcontext(True),
+    )
+    monkeypatch.setattr(
+        config,
+        "auto_upload_egress_lock",
+        lambda: nullcontext(),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "inspect_index_health",
+        lambda: {"status": "recovery_required"},
+    )
+    monkeypatch.setattr(
+        daemon,
+        "guided_rebuild",
+        lambda callback: callback(),
+    )
+
+    assert scanner.rebuild_damaged_index() == {"ok": True}
+    assert observed_filters == [None]
+    assert scanner.source_filter == "claude"
+
+
+def test_index_recovery_worker_blocks_graceful_reexec(monkeypatch):
+    from clawjournal.workbench import daemon
+
+    monkeypatch.setattr(
+        daemon,
+        "_index_recovery_thread",
+        SimpleNamespace(is_alive=lambda: True),
+    )
+
+    assert daemon._background_workers_active() is True
 
 
 @pytest.mark.parametrize(
@@ -4163,7 +4525,11 @@ def test_finalized_ai_manifest_requires_complete_nested_coverage():
     assert not _manifest_is_finalized_for_upload(legacy, ai_pii=True)
 
 
-def test_finalize_blocks_rules_only_fallback_when_ai_configured(tmp_path, monkeypatch):
+def test_finalize_blocks_rules_only_fallback_when_ai_configured(
+    tmp_path,
+    monkeypatch,
+    index_setup,
+):
     from clawjournal.workbench import daemon
 
     (tmp_path / "sessions.jsonl").write_text("{}\n", encoding="utf-8")

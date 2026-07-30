@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom';
 import { Inbox } from './views/Inbox.tsx';
 import { Search } from './views/Search.tsx';
@@ -12,11 +12,12 @@ import { Benchmark } from './views/Benchmark.tsx';
 import { Settings } from './views/Settings.tsx';
 import { ToastProvider } from './components/Toast.tsx';
 import { ConfirmDialog } from './components/ConfirmDialog.tsx';
+import { IndexRecoveryScreen } from './components/IndexRecoveryScreen.tsx';
 import { WorkflowProgress } from './components/WorkflowProgress.tsx';
 import { workflowProgressStageFor } from './components/workflowProgressStage.ts';
 import { colors, fontFamily } from './theme.ts';
 import { api, ApiError } from './api.ts';
-import type { Features } from './types.ts';
+import type { Features, IndexHealth } from './types.ts';
 
 interface SidebarCounts {
   toReview: number;
@@ -153,38 +154,97 @@ function WorkflowProgressTracker({ submittedShareId }: { submittedShareId: strin
   return <WorkflowProgress stage={stage} />;
 }
 
+function IndexRecoverySummary({ health }: { health: IndexHealth }) {
+  if (!health.backup_path) return null;
+  const warnings = Array.isArray(health.warnings) ? health.warnings : [];
+  const restoredCounts = health.restored_state_counts ?? health.restored_counts ?? {};
+  const restoredTotal = Object.values(restoredCounts).reduce(
+    (total, value) => total + (Number.isFinite(value) && value > 0 ? value : 0),
+    0,
+  );
+  const hasWarnings = warnings.length > 0;
+
+  return (
+    <div
+      role={hasWarnings ? 'alert' : 'status'}
+      aria-live="polite"
+      style={{
+        padding: '10px 16px',
+        flexShrink: 0,
+        borderBottom: `1px solid ${hasWarnings ? colors.yellow200 : colors.green200}`,
+        background: hasWarnings ? colors.yellow50 : colors.green50,
+        color: hasWarnings ? colors.yellow700 : colors.green700,
+        fontSize: 12.5,
+        lineHeight: 1.5,
+      }}
+    >
+      <strong>Index rebuilt and verified.</strong>{' '}
+      The original index is backed up at <code style={{ overflowWrap: 'anywhere' }}>{health.backup_path}</code>.
+      {restoredTotal > 0 && <> Restored {restoredTotal} saved state record{restoredTotal === 1 ? '' : 's'}.</>}
+      {hasWarnings && (
+        <ul style={{ margin: '5px 0 0', paddingLeft: 20 }}>
+          {warnings.map((warning) => <li key={warning}>{warning}</li>)}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
-  // Feature flags + the persisted auto-scorer decline come from /api/features.
-  // benchmark_tab_enabled is initialised true so the common case never flashes;
-  // only an explicitly-disabled install briefly shows the tab before it resolves.
-  const [features, setFeatures] = useState<Features>({
-    benchmark_tab_enabled: true,
-    scoring_warmup_declined: false,
-  });
-  const benchmarkEnabled = features.benchmark_tab_enabled;
+  // /api/features is deliberately DB-free and carries the cached startup
+  // integrity diagnosis. Keep DB-backed views unmounted until its first
+  // successful ready result.
+  const [features, setFeatures] = useState<Features | null>(null);
+  const [featuresError, setFeaturesError] = useState<string | null>(null);
+  const indexHealth = features?.index_health ?? null;
+  const indexReady = indexHealth?.status === 'ready';
+  const benchmarkEnabled = features?.benchmark_tab_enabled ?? true;
   const [submittedShareId, setSubmittedShareId] = useState<string | null>(null);
 
   // The same probe doubles as a connectivity check: the loopback daemon going
   // away (e.g. `clawjournal serve` stopped) otherwise just renders zero counts
   // silently. A persistent banner makes that state visible.
   const [daemonReachable, setDaemonReachable] = useState(true);
+  const featureProbeVersion = useRef(0);
   useEffect(() => {
     let cancelled = false;
-    const probe = () => api.features()
-      .then(f => { if (!cancelled) { setFeatures(f); setDaemonReachable(true); } })
+    const probe = () => {
+      const version = ++featureProbeVersion.current;
+      return api.features()
+        .then(f => {
+          if (cancelled || version !== featureProbeVersion.current) return;
+          const next = f.index_health
+            ? f
+            : {
+                ...f,
+                index_health: {
+                  status: 'unavailable' as const,
+                  message: 'This workbench version did not report index health.',
+                },
+              };
+          setFeatures(next);
+          setFeaturesError(null);
+          setDaemonReachable(true);
+        })
       // An ApiError means the daemon answered (any HTTP status) — connectivity is
       // fine. Only a fetch-level failure (network/daemon down) flips the banner.
-      .catch(err => { if (!cancelled) setDaemonReachable(err instanceof ApiError); });
+        .catch(err => {
+          if (cancelled || version !== featureProbeVersion.current) return;
+          setFeaturesError(err instanceof Error ? err.message : 'Could not check index health.');
+          setDaemonReachable(err instanceof ApiError);
+        });
+    };
     probe();
-    const iv = setInterval(probe, 20_000);
+    const iv = setInterval(probe, indexHealth?.status === 'rebuilding' ? 1_000 : 20_000);
     return () => { cancelled = true; clearInterval(iv); };
-  }, []);
+  }, [indexHealth?.status]);
 
   // Deferred, non-blocking warmup prompt (replaces the old mount-time
   // window.confirm). The server gates this: a previously-declined install
   // returns status 'declined', so we never re-prompt.
   const [warmupPrompt, setWarmupPrompt] = useState<{ backend: string; displayName: string } | null>(null);
   useEffect(() => {
+    if (!indexReady) return;
     let cancelled = false;
     const timer = window.setTimeout(async () => {
       try {
@@ -201,7 +261,7 @@ export default function App() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, []);
+  }, [indexReady]);
 
   const confirmWarmup = async () => {
     const prompt = warmupPrompt;
@@ -214,10 +274,16 @@ export default function App() {
 
   const declineWarmup = async () => {
     setWarmupPrompt(null);
-    setFeatures(f => ({ ...f, scoring_warmup_declined: true }));
+    setFeatures(f => f ? ({ ...f, scoring_warmup_declined: true }) : f);
     try {
       await api.scoringWarmup({ decline: true });
     } catch { /* opportunistic */ }
+  };
+
+  const updateIndexHealth = (health: IndexHealth) => {
+    // Invalidate a slower probe that may still contain the pre-rebuild state.
+    featureProbeVersion.current += 1;
+    setFeatures(current => current ? ({ ...current, index_health: health }) : current);
   };
 
   return (
@@ -244,40 +310,51 @@ export default function App() {
               Can’t reach the ClawJournal workbench. Is <code>clawjournal serve</code> still running?
             </div>
           )}
-          <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-            <Sidebar />
-            <div style={{ display: 'flex', flex: 1, flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
-              <main style={{ flex: 1, minHeight: 0, overflow: 'auto', background: colors.white }}>
-                <Routes>
-                  <Route path="/" element={<Inbox />} />
-                  <Route path="/search" element={<Search />} />
-                  <Route path="/session/:id" element={<SessionDetail />} />
-                  {/* Analytics groups the three read-only "understand" views as sub-tabs. */}
-                  <Route path="/analytics" element={<Analytics benchmarkEnabled={benchmarkEnabled} />}>
-                    <Route index element={<Dashboard />} />
-                    <Route path="insights" element={<Insights />} />
-                    <Route
-                      path="benchmark"
-                      element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/analytics" replace />}
-                    />
-                  </Route>
-                  <Route path="/share" element={<Share onSubmittedShareChange={setSubmittedShareId} />} />
-                  <Route path="/share/rules" element={<Policies />} />
-                  <Route path="/settings" element={<Settings />} />
-                  {/* Back-compat redirects for the pre-regroup routes + bookmarks. */}
-                  <Route path="/dashboard" element={<Navigate to="/analytics" replace />} />
-                  <Route path="/insights" element={<Navigate to="/analytics/insights" replace />} />
-                  <Route path="/benchmark" element={<Navigate to="/analytics/benchmark" replace />} />
-                  <Route path="/bundles" element={<Navigate to="/share" replace />} />
-                  <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
-                </Routes>
-              </main>
-              <WorkflowProgressTracker submittedShareId={submittedShareId} />
-            </div>
-          </div>
+          {indexReady && indexHealth ? (
+            <>
+              <IndexRecoverySummary health={indexHealth} />
+              <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+                <Sidebar />
+                <div style={{ display: 'flex', flex: 1, flexDirection: 'column', minWidth: 0, minHeight: 0 }}>
+                  <main style={{ flex: 1, minHeight: 0, overflow: 'auto', background: colors.white }}>
+                    <Routes>
+                      <Route path="/" element={<Inbox />} />
+                      <Route path="/search" element={<Search />} />
+                      <Route path="/session/:id" element={<SessionDetail />} />
+                      {/* Analytics groups the three read-only "understand" views as sub-tabs. */}
+                      <Route path="/analytics" element={<Analytics benchmarkEnabled={benchmarkEnabled} />}>
+                        <Route index element={<Dashboard />} />
+                        <Route path="insights" element={<Insights />} />
+                        <Route
+                          path="benchmark"
+                          element={benchmarkEnabled ? <Benchmark /> : <Navigate to="/analytics" replace />}
+                        />
+                      </Route>
+                      <Route path="/share" element={<Share onSubmittedShareChange={setSubmittedShareId} />} />
+                      <Route path="/share/rules" element={<Policies />} />
+                      <Route path="/settings" element={<Settings />} />
+                      {/* Back-compat redirects for the pre-regroup routes + bookmarks. */}
+                      <Route path="/dashboard" element={<Navigate to="/analytics" replace />} />
+                      <Route path="/insights" element={<Navigate to="/analytics/insights" replace />} />
+                      <Route path="/benchmark" element={<Navigate to="/analytics/benchmark" replace />} />
+                      <Route path="/bundles" element={<Navigate to="/share" replace />} />
+                      <Route path="/policies" element={<Navigate to="/share/rules" replace />} />
+                    </Routes>
+                  </main>
+                  <WorkflowProgressTracker submittedShareId={submittedShareId} />
+                </div>
+              </div>
+            </>
+          ) : (
+            <IndexRecoveryScreen
+              health={indexHealth}
+              probeError={featuresError}
+              onHealthChange={updateIndexHealth}
+            />
+          )}
         </div>
         <ConfirmDialog
-          open={warmupPrompt !== null}
+          open={indexReady && warmupPrompt !== null}
           title="Turn on background AI scoring?"
           message={warmupPrompt
             ? `Run ${warmupPrompt.displayName} on your recent traces in the background to grade them? Each trace is anonymized on this machine (home-dir paths and usernames removed) before it is sent to your configured AI backend (${warmupPrompt.displayName}), which runs locally as a subprocess but may call its provider and incur usage cost.`

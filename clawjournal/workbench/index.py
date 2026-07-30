@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,21 @@ from ..pricing import estimate_cost
 
 INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
+INDEX_JOURNAL_MODE = "delete"
+INDEX_RECOVERY_MARKER_FILENAME = "index-recovery-in-progress.json"
+_INDEX_RECOVERY_ACCESS = threading.local()
+
+
+def _set_index_recovery_access(enabled: bool) -> bool:
+    """Allow only the recovery worker to open the marker-guarded live index."""
+
+    previous = bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
+    _INDEX_RECOVERY_ACCESS.enabled = enabled
+    return previous
+
+
+def _index_recovery_marker_path() -> Path:
+    return Path(str(INDEX_DB)).parent / INDEX_RECOVERY_MARKER_FILENAME
 
 # Schema version sentinels. Version 1 is the bundles→shares migration,
 # version 2 is the security refactor, version 3 adds the
@@ -549,6 +565,15 @@ def open_index() -> sqlite3.Connection:
     if they do not already exist. Returns a connection with
     row_factory set to sqlite3.Row for dict-like access.
     """
+    if (
+        _index_recovery_marker_path().exists()
+        and not bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
+    ):
+        raise sqlite3.DatabaseError(
+            "The workbench index is guarded by an unfinished recovery. "
+            "Open the workbench and finish or retry the backup-first rebuild."
+        )
+
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     BLOBS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -560,7 +585,18 @@ def open_index() -> sqlite3.Connection:
 
     conn = sqlite3.connect(str(INDEX_DB), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    journal_row = conn.execute(
+        f"PRAGMA journal_mode={INDEX_JOURNAL_MODE}"
+    ).fetchone()
+    actual_journal_mode = str(journal_row[0]).lower() if journal_row else ""
+    if actual_journal_mode != INDEX_JOURNAL_MODE:
+        conn.close()
+        raise sqlite3.DatabaseError(
+            "ClawJournal could not select the safe SQLite journal mode "
+            f"{INDEX_JOURNAL_MODE!r} for {INDEX_DB}; SQLite returned "
+            f"{actual_journal_mode or 'no mode'!r}. Close other ClawJournal "
+            "processes and try again."
+        )
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
 
@@ -3365,7 +3401,8 @@ def effective_hold_state(
     Callers that gate on the effective state (share/upload) should use
     this; UI/audit surfaces read the raw column directly.
     """
-    state = hold_state or "auto_redacted"
+    # Missing or unknown state is corruption, not implied consent to share.
+    state = hold_state if hold_state in HOLD_STATES else "pending_review"
     if state != "embargoed" or not embargo_until:
         return state
     try:

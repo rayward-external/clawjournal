@@ -1,4 +1,4 @@
-"""Persistent config for ClawJournal — stored at ~/.clawjournal/config.json"""
+"""Persistent ClawJournal state rooted at ``CLAWJOURNAL_HOME`` or ``~/.clawjournal``."""
 
 import json
 import os
@@ -9,7 +9,20 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Mapping, TypedDict, cast
 
-CONFIG_DIR = Path.home() / ".clawjournal"
+# Keep the install as one coherent state root: the index, blobs, API token,
+# finding hash salt, share ledger, and recurring-upload authority are coupled.
+# An environment override gives shared-home/HPC users a supported way to place
+# that whole state on SQLite-safe storage without splitting those invariants.
+def _resolve_config_dir() -> Path:
+    override = os.environ.get("CLAWJOURNAL_HOME", "").strip()
+    return (
+        Path(override).expanduser().resolve()
+        if override
+        else Path.home() / ".clawjournal"
+    )
+
+
+CONFIG_DIR = _resolve_config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 AUTO_UPLOAD_EGRESS_LOCK_FILENAME = "auto-upload-egress.lock"
 

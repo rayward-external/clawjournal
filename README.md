@@ -150,6 +150,7 @@ If you are unsure at any point, stop before **Submit**. Your review and package 
 ## Privacy in plain English
 
 - **Local by default.** Scanning and reviewing create a local index and local copies of your agent sessions. Those copies can contain the original text.
+- **Index recovery is backup-first.** The workbench checks its local SQLite index at startup. If the index is damaged, database-backed work and uploads stay stopped while the UI offers one guided action that backs up the old index before rebuilding it from the original agent logs.
 - **AI features are optional.** If you enable them, ClawJournal removes home-folder paths and usernames locally first. The remaining session text is sent to the AI service you choose and may still contain identifying details.
 - **Sharing has safety checks.** Redaction and secret scans run before a package can be submitted. One scanner may contact a credential provider to check whether a suspected secret is live. A missing or failed required scan blocks sharing.
 - **Automatic uploads remain off until a successful manual share.** When the hosted recurring terms are available, the final Submit screen selects the combined “submit and enable” action by default, automatically includes every observed recurring-capable source, shows the exact cadence/cap, and links to the full terms and source/project pairs. You can uncheck it before submitting. After the manual receipt is saved, recurring setup is queued locally and continues in the daemon without holding the receipt screen open; closing the browser does not cancel it, and restarting `clawjournal serve` resumes it. If automatic uploads are already configured, the same row stays checked and locked; review, pause, or turn them off from Settings.
@@ -175,6 +176,14 @@ clawjournal --help                       # see every command
 ```
 
 If `clawjournal` is not found, use the full command printed by the installer.
+
+On a cluster or another machine whose home directory is on a shared/network
+filesystem, set `CLAWJOURNAL_HOME` to a private, persistent local-filesystem
+directory before first use. For an existing install, stop ClawJournal and move
+the whole state directory together (index, review state, tokens, and local trace
+copies) before setting the variable; setting it alone selects a separate state
+root. For example, use `export CLAWJOURNAL_HOME=/local/path/clawjournal` on
+macOS/Linux or `$env:CLAWJOURNAL_HOME='D:\local\clawjournal'` in PowerShell.
 
 `clawjournal skill` uses one optional AI distill call to propose up to five
 coding-agent lessons. Its preview names one human-facing weekly focus only when a

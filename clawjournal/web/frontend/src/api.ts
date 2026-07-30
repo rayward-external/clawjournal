@@ -18,6 +18,7 @@ import type {
   FindingsAllowlistEntry,
   HoldHistoryEntry,
   HoldState,
+  IndexRebuildResponse,
   Benchmark,
   BenchmarkSummary,
   BenchmarkTrend,
@@ -318,6 +319,12 @@ export const api = {
 
   features(): Promise<Features> {
     return request('/features');
+  },
+
+  index: {
+    rebuild(): Promise<IndexRebuildResponse> {
+      return request('/index/rebuild', { method: 'POST' });
+    },
   },
 
   config: {

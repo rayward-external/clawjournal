@@ -10,10 +10,18 @@ from clawjournal.config import (
     _migrate_excluded_projects,
     _migrate_findings_engines,
     _migrate_remove_auto_upload_ui_flag,
+    _resolve_config_dir,
     load_config,
     normalize_excluded_project_names,
     save_config,
 )
+
+
+def test_clawjournal_home_relocates_the_complete_state_root(tmp_path, monkeypatch):
+    state_root = tmp_path / "private local state"
+    monkeypatch.setenv("CLAWJOURNAL_HOME", str(state_root))
+
+    assert _resolve_config_dir() == state_root.resolve()
 
 
 class TestAutoUploadProfileProjection:
