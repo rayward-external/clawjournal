@@ -146,7 +146,9 @@ class TestEffectiveHoldState:
 
     def test_non_embargo_state_passes_through(self):
         assert effective_hold_state("released", None) == "released"
-        assert effective_hold_state(None, None) == "auto_redacted"
+
+    def test_missing_state_fails_closed(self):
+        assert effective_hold_state(None, None) == "pending_review"
 
 
 class TestFindingsVerb:

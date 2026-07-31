@@ -208,7 +208,11 @@ def test_blocked_all_blocked_aborts(monkeypatch):
 # ---- time-range windows (rolling 24h / 168h) --------------------------------
 
 def _row(fv=None, end_delta_hours=None, **extra):
-    r = {"hold_state": None, "shared_at": None, "ai_failure_value_score": fv}
+    r = {
+        "hold_state": "auto_redacted",
+        "shared_at": None,
+        "ai_failure_value_score": fv,
+    }
     if end_delta_hours is not None:
         r["end_time"] = (datetime.now(timezone.utc) - timedelta(hours=end_delta_hours)).isoformat()
     r.update(extra)
