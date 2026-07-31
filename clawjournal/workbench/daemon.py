@@ -64,6 +64,7 @@ from .index import (
     add_policy,
     already_shared_revision_blockers,
     apply_share_redactions,
+    bulk_update_review_status,
     create_share,
     export_share_to_disk,
     FAILURE_VALUE_SOURCE_SCOPE,
@@ -4026,7 +4027,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        if path.startswith("/api/sessions/") and path.endswith("/score"):
+        if path == "/api/session-status/bulk":
+            self._handle_bulk_update_review_status()
+        elif path.startswith("/api/sessions/") and path.endswith("/score"):
             session_id = _api_session_id(path, suffix="/score")
             self._handle_score_session(session_id)
         elif path.startswith("/api/sessions/") and path.endswith("/scan"):
@@ -4269,6 +4272,70 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": True})
             else:
                 _json_response(self, {"error": "Session not found"}, 404)
+        finally:
+            conn.close()
+
+    def _handle_bulk_update_review_status(self) -> None:
+        body = _read_body(self)
+        if not isinstance(body, dict):
+            _json_response(self, {"error": "Request body must be an object"}, 400)
+            return
+
+        session_ids = body.get("session_ids")
+        status = body.get("status")
+        if not isinstance(session_ids, list) or not (
+            1 <= len(session_ids) <= 100
+        ):
+            _json_response(
+                self,
+                {"error": "session_ids must be an array containing 1-100 entries"},
+                400,
+            )
+            return
+        if any(
+            not isinstance(session_id, str) or not session_id
+            for session_id in session_ids
+        ):
+            _json_response(
+                self,
+                {"error": "session_ids must contain non-empty strings"},
+                400,
+            )
+            return
+        if not isinstance(status, str) or status not in {"approved", "blocked"}:
+            _json_response(
+                self,
+                {"error": "status must be 'approved' or 'blocked'"},
+                400,
+            )
+            return
+
+        conn = open_index()
+        try:
+            try:
+                updated_ids, missing_ids = bulk_update_review_status(
+                    conn,
+                    session_ids,
+                    status,
+                )
+            except ValueError as exc:
+                _json_response(self, {"error": str(exc)}, 400)
+                return
+            except Exception:
+                logger.exception("Could not update review statuses in bulk")
+                _json_response(
+                    self,
+                    {"error": "Could not update review statuses"},
+                    500,
+                )
+                return
+            _json_response(
+                self,
+                {
+                    "updated_ids": updated_ids,
+                    "missing_ids": missing_ids,
+                },
+            )
         finally:
             conn.close()
 
