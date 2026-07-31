@@ -557,6 +557,11 @@ def test_cli_selfupdate_command_skips_pre_parse_auto_update():
     from clawjournal.cli import _should_auto_update
 
     assert _should_auto_update(["clawjournal", "selfupdate", "--check"]) is False
+    assert _should_auto_update(["clawjournal", "open"]) is False
+    assert _should_auto_update(["clawjournal", "desktop", "launch"]) is False
+    assert _should_auto_update(
+        ["clawjournal", "--repo", "launch", "desktop", "status"]
+    ) is True
     assert _should_auto_update(["clawjournal", "status"]) is True
 
 

@@ -116,7 +116,10 @@ def test_no_snapshot_when_the_tree_keeps_changing_mid_capture(tmp_path, monkeypa
     [
         (Path("/repo"), ["clawjournal", "serve"], True),
         (Path("/repo"), ["clawjournal", "serve", "--port", "8384"], True),
-        (Path("/repo"), ["clawjournal", "desktop", "launch"], True),
+        # These are one-shot controllers; the detached `serve` child pins its
+        # own imported frontend/backend pair.
+        (Path("/repo"), ["clawjournal", "desktop", "launch"], False),
+        (Path("/repo"), ["clawjournal", "open"], False),
         # No checkout to fast-forward: a wheel install's dist/ never moves.
         (None, ["clawjournal", "serve"], False),
         # Never binds a socket, so it has nothing to keep serving.

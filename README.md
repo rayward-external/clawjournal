@@ -164,7 +164,7 @@ For the complete details, see [PRIVACY.md](PRIVACY.md).
 These are the main commands:
 
 ```bash
-clawjournal serve                        # open the local workbench
+clawjournal open                         # open the local workbench, then return
 clawjournal skill --preview              # preview lessons + one evidence-backed weekly focus
 clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring
 clawjournal status                       # check your setup
@@ -175,6 +175,13 @@ clawjournal --help                       # see every command
 ```
 
 If `clawjournal` is not found, use the full command printed by the installer.
+
+`clawjournal open` starts or reuses the local workbench, waits briefly for it to
+be ready, opens your browser, and then returns. `clawjournal serve` is the
+foreground, long-running daemon command for manual process management and
+debugging; agents and scripts should not wait for it to exit. On a remote or
+headless machine, use `clawjournal serve --remote` in a dedicated terminal or
+background process and follow the SSH tunnel instructions it prints.
 
 `clawjournal skill` uses one optional AI distill call to propose up to five
 coding-agent lessons. Its preview names one human-facing weekly focus only when a
@@ -208,7 +215,7 @@ Set-Location "$HOME\clawjournal"
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -WithFrontend -WithSharing
 ```
 
-When installation finishes, use the exact `clawjournal serve` command it prints, then open [http://localhost:8384](http://localhost:8384).
+When installation finishes, run `clawjournal open`. It starts or reuses the local workbench, opens [http://localhost:8384](http://localhost:8384), and returns once the launch attempt finishes.
 
 Re-running the installer safely updates an existing install to the latest published version. It never overwrites your local changes; if your checkout can't be updated cleanly, it says why and installs the code you already have.
 
