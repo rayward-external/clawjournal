@@ -188,3 +188,156 @@ def test_default_caller_never_relaxes_tool_isolation(monkeypatch):
     d.DefaultCaller(backend="claude")(system_prompt="s", task_prompt="t")
     assert captured["claude_permission_mode"] == "default"
     assert captured["claude_tools"] == ""
+
+
+# --- CH-2 must-cover: objective candidates cannot be silently dropped --------
+
+def _objective_corpus(n=5):
+    from clawjournal.skill.turns import EnvExcerpt
+    env = SkillCandidate(
+        "env-signature-0", "proj", "claude", "avoid",
+        title="Recurring Bash error", support_count=n,
+        learning_summary="Objective environment feedback: recurring tool error",
+        pivotal_excerpts=[EnvExcerpt(
+            action="Bash: pytest -x",
+            error="ModuleNotFoundError: No module named 'foo'",
+            recovery="Bash: pip install foo")],
+    )
+    return SkillCorpus(window_start="a", window_end="b", failures=[env])
+
+
+def test_must_cover_block_lists_objective_candidates():
+    from clawjournal.skill.distill import _candidate_aliases
+    corpus = _objective_corpus()
+    prompt = build_prompt(corpus, Anonymizer(), _candidate_aliases(corpus))
+    assert "MUST-COVER" in prompt
+    assert "case-01" in prompt
+
+
+def test_must_cover_block_absent_without_objective_candidates():
+    from clawjournal.skill.distill import _candidate_aliases
+    corpus = _corpus()
+    prompt = build_prompt(corpus, Anonymizer(), _candidate_aliases(corpus))
+    assert "MUST-COVER" not in prompt
+
+
+def test_uncovered_objective_candidate_gets_deterministic_fallback():
+    corpus = _objective_corpus(n=5)
+    fake = FakeCaller({"rules": [
+        {"kind": "do", "trigger": "t", "guidance": "read source", "why": "w"}]})  # cites nothing
+    rules = distill_skills(corpus, caller=fake)
+    assert len(fake.calls) == 1                       # STILL exactly one call — no re-ask
+    fallbacks = [r for r in rules if "auto-added" in r.why]
+    assert len(fallbacks) == 1
+    fb = fallbacks[0]
+    assert fb.kind == "avoid"
+    assert fb.evidence_session_ids == ["case-01"]
+    assert fb.support == 5
+    # guidance embeds the NORMALIZED signature (stable fingerprint), not the
+    # verbatim error head; the run-specific recovery sample rides in `why`.
+    assert "no module named 'foo'" in fb.guidance
+    assert "pip install foo" in fb.why
+
+
+def test_covered_objective_candidate_gets_no_fallback():
+    corpus = _objective_corpus()
+    fake = FakeCaller({"rules": [
+        {"kind": "avoid", "trigger": "t", "guidance": "read the file first", "why": "w",
+         "evidence_session_ids": ["case-01"]}]})
+    rules = distill_skills(corpus, caller=fake)
+    assert len(rules) == 1
+    assert "auto-added" not in rules[0].why
+
+
+def test_fallbacks_capped_and_highest_support_first():
+    from clawjournal.skill.turns import EnvExcerpt, TurnExcerpt
+
+    def env(i, n):
+        name = "abc"[i]
+        return SkillCandidate(
+            f"env-signature-{i}", "p", "claude", "avoid",
+            title=f"Recurring Tool{name} error", support_count=n,
+            pivotal_excerpts=[EnvExcerpt(f"Tool{name}: x",
+                                         f"err-{name} exploded badly", "")])
+
+    rejection = SkillCandidate(
+        "human-rejection", "p", "claude", "avoid",
+        title="User-Rejected Actions", support_count=9,
+        pivotal_excerpts=[TurnExcerpt("attempted: rm", "rejected: destructive", "")])
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         failures=[env(0, 3), env(1, 7), rejection])
+    rules = distill_skills(corpus, caller=FakeCaller({"rules": []}))
+    assert len(rules) == 2                            # capped at MAX_FALLBACK_RULES
+    assert rules[0].title == "Ask Before Rejected Actions"   # support 9 first
+    assert "err-b" in rules[1].guidance                       # support 7 env second
+
+
+def test_backend_failure_still_degrades_without_fallback():
+    # a raised call keeps the existing degrade-to-[] contract: fallbacks only
+    # guarantee coverage of a SUCCESSFUL distill, never replace a failed one.
+    class Boom:
+        def __call__(self, *, system_prompt, task_prompt):
+            raise RuntimeError("timeout")
+
+    assert distill_skills(_objective_corpus(), caller=Boom(), model="opus") == []
+
+
+def test_fallback_guidance_is_scrubbed():
+    from clawjournal.skill.turns import EnvExcerpt
+    env = SkillCandidate(
+        "env-signature-0", "proj", "claude", "avoid",
+        title="Recurring Bash error", support_count=4,
+        pivotal_excerpts=[EnvExcerpt("Bash: cat config",
+                                     "leaked AKIAIOSFODNN7EXAMPLE token", "")])
+    corpus = SkillCorpus(window_start="a", window_end="b", failures=[env])
+    rules = distill_skills(corpus, caller=FakeCaller({"rules": []}))
+    assert rules
+    assert "AKIAIOSFODNN7EXAMPLE" not in rules[0].guidance
+
+
+def test_env_fallback_fingerprint_stable_across_first_seen_sessions():
+    # the excerpt text varies by whichever session the signature scan saw first;
+    # the fallback's fingerprint (kind + guidance) must NOT — else a --rejected
+    # fallback reappears as [NEW] under a fresh fingerprint every window roll.
+    from clawjournal.skill import store as _store
+    from clawjournal.skill.turns import EnvExcerpt
+
+    def one(error, recovery):
+        env = SkillCandidate(
+            "env-signature-0", "proj", "claude", "avoid",
+            title="Recurring Bash error", support_count=4,
+            pivotal_excerpts=[EnvExcerpt("Bash: pytest", error, recovery)])
+        corpus = SkillCorpus(window_start="a", window_end="b", failures=[env])
+        (rule,) = distill_skills(corpus, caller=FakeCaller({"rules": []}))
+        return rule
+
+    r1 = one("KeyError: 'x' in /tmp/aaa/file.py line 12", "Bash: fix-a")
+    r2 = one("KeyError: 'x' in /tmp/bbb/other.py line 99", "Bash: fix-b")
+    assert _store.fingerprint(r1) == _store.fingerprint(r2)
+    assert "fix-a" in r1.why and "fix-b" in r2.why    # the sample still surfaces
+
+
+def test_fallback_templates_survive_the_render_gates():
+    # the guarantee is only real if the templates actually pass the gates a
+    # distilled rule passes; a template drifting into the hard-deny or policy
+    # regexes would silently void must-cover.
+    from clawjournal.skill import render as _render
+    from clawjournal.skill.turns import EnvExcerpt, TurnExcerpt
+
+    env = SkillCandidate(
+        "env-signature-0", "p", "claude", "avoid",
+        title="Recurring Bash error", support_count=4,
+        pivotal_excerpts=[EnvExcerpt("Bash: npm test",
+                                     "Cannot find module 'left-pad'",
+                                     "Bash: npm install")])
+    rejection = SkillCandidate(
+        "human-rejection", "p", "claude", "avoid",
+        title="User-Rejected Actions", support_count=5,
+        pivotal_excerpts=[TurnExcerpt("attempted: push", "rejected: force push", "")])
+    corpus = SkillCorpus(window_start="a", window_end="b", failures=[env, rejection])
+    rules = distill_skills(corpus, caller=FakeCaller({"rules": []}))
+    assert len(rules) == 2
+    kept, blocked = _render.gate_rules(rules)
+    assert blocked == [] and len(kept) == 2
+    kept, secret_blocked = _render.gate_secret_pii_per_rule(kept)
+    assert secret_blocked == [] and len(kept) == 2

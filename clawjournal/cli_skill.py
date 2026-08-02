@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .skill import distill as _distill
+from .skill import due as _due
 from .skill import focus as _focus
 from .skill import install as _install
 from .skill import render as _render
@@ -798,6 +799,13 @@ def run_skill(args) -> None:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model, effort=effort,
                              sources=_config_sources(cfg),
                              excluded_projects=_config_excluded_projects(cfg, conn), cfg=cfg)
+        # Any completed pipeline attempt — even one that ends rule-less or
+        # gate-blocked and so never touches skill_rules — cools the SessionStart
+        # nudge for a full cycle (plan §16 CH-1). Best-effort bookkeeping only.
+        try:
+            _due.record_skill_run(conn)
+        except Exception:
+            pass
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and

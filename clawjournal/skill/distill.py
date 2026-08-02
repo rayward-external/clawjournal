@@ -1,4 +1,6 @@
-"""The one LLM step: distill selected candidates into <=5 skill rules.
+"""The one LLM step: distill selected candidates into skill rules (<=5 from the
+model, plus at most 2 deterministic MUST-COVER fallbacks; the installed set is
+still capped by ``merge_rules``).
 
 All substrate is anonymized (home/username) AND deterministically secrets-scrubbed
 *before* the call — the only AI egress in default Mode A is this single call,
@@ -117,6 +119,10 @@ _SYSTEM = (
     "sessions that hit it, ground truth rather than judge opinion. For these, teach the "
     "mechanical habit that avoids the error (or the failed→working delta), stated "
     "generally (no session-specific paths/values). "
+    "If the input includes a MUST-COVER list, EVERY case on it must appear in some "
+    "rule's evidence_session_ids: give it a dedicated rule, or fold it into a "
+    "closely-related rule and cite it there. Never drop a MUST-COVER case — it is "
+    "verified objective evidence, not an optional suggestion. "
     "De-identify PII ONLY — never emit a person's name, email, URL, "
     "home path, secret, or verbatim shell command — but KEEP technical specifics (repo and "
     "module names, failure surfaces, tool categories, architectural patterns). "
@@ -161,6 +167,131 @@ def _scrub(value: Any, anon: Anonymizer, settings: dict[str, Any] | None = None)
 
 def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
     return {c.session_id: f"case-{i:02d}" for i, c in enumerate(corpus.candidates, 1)}
+
+
+# --- must-cover: objective candidates cannot be silently dropped (CH-2) ------
+# The synthetic env-signature / human-rejection candidates are the objective
+# channel's whole yield; leaving their coverage to the distiller's discretion
+# means a verified >=3-session signal can produce no rule. The prompt lists them
+# as MUST-COVER, and any candidate the returned rules leave uncited becomes a
+# deterministic templated fallback rule — zero extra egress (D6: one distill
+# call per run, so there is no re-ask), flowing through the same hard-deny /
+# secret / PII gates and the same preview as every distilled rule.
+
+MAX_FALLBACK_RULES = 2   # keep templated prose rare; highest-support signals first
+
+_SYNTHETIC_ID_PREFIXES = ("env-signature-",)
+_SYNTHETIC_IDS = frozenset({"human-rejection"})
+
+
+def _is_objective_candidate(candidate: Any) -> bool:
+    sid = str(getattr(candidate, "session_id", "") or "")
+    return sid.startswith(_SYNTHETIC_ID_PREFIXES) or sid in _SYNTHETIC_IDS
+
+
+def _must_cover_block(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None,
+) -> str:
+    objective = [c for c in corpus.candidates if _is_objective_candidate(c)]
+    if not objective:
+        return ""
+    lines = ["", "MUST-COVER (verified objective evidence; every case below must be "
+             "cited in some rule's evidence_session_ids):"]
+    for c in objective:
+        lines.append(
+            f"- {aliases[c.session_id]}: {_scrub(c.title, anon, settings)} "
+            f"(recurred in {int(c.support_count or 0)} distinct sessions)"
+        )
+    return "\n".join(lines)
+
+
+def _fallback_rule(
+    candidate: Any,
+    alias: str,
+    anon: Anonymizer,
+    settings: dict[str, Any] | None,
+) -> SkillRule | None:
+    """Deterministic rule for an objective candidate the distiller left uncited.
+
+    Templated, not distilled — honest placeholder prose so the verified signal
+    reaches the preview instead of vanishing. The user judges it there.
+    """
+    n = int(candidate.support_count or 0)
+    why = (f"Objective evidence (auto-added, not distilled): recurred in {n} "
+           f"distinct sessions this window — a verified count, not judge opinion.")
+    if candidate.session_id in _SYNTHETIC_IDS:   # the human-rejection candidate
+        return SkillRule(
+            kind="avoid",
+            title="Ask Before Rejected Actions",
+            trigger=("When about to attempt an action class the user or their "
+                     "permission gate has previously declined"),
+            guidance=("Propose the action and wait for approval instead of "
+                      "attempting it directly; rejected action classes recur "
+                      "across sessions."),
+            why=why, evidence_session_ids=[alias], support=n,
+        )
+    from .turns import _signal_label, error_signature
+
+    excerpt = next(iter(candidate.pivotal_excerpts or []), None)
+    raw_error = getattr(excerpt, "error", "") if excerpt is not None else ""
+    action = _scrub(getattr(excerpt, "action", ""), anon, settings)
+    recovery = _scrub(getattr(excerpt, "recovery", ""), anon, settings)
+    # Fingerprint stability: the verbatim error/recovery heads come from whichever
+    # gated session the signature scan saw FIRST, so they change as the window
+    # rolls — and store.fingerprint keys on kind+guidance, so verbatim text there
+    # would re-propose a --rejected fallback under a fresh fingerprint every roll.
+    # The guidance embeds the NORMALIZED signature (paths/hex/numbers collapsed —
+    # the stable cluster key); the run-specific recovery sample rides in `why`,
+    # which is not fingerprinted and refreshes on re-propose.
+    label = _scrub(_signal_label(error_signature(raw_error)), anon, settings)
+    if not label:
+        return None   # nothing concrete to teach; don't emit an empty template
+    tool = action.split(":", 1)[0].strip() if ":" in action else ""
+    if recovery:
+        why += f" A changed call that then worked: {recovery}."
+    return SkillRule(
+        kind="avoid",
+        title=_scrub(candidate.title, anon, settings) or "Recurring Tool Error",
+        trigger=(f"When a {tool} call fails with this recurring error" if tool
+                 else "When a tool call fails with this recurring error"),
+        guidance=(f"Address the recurring failure before retrying: {label}. "
+                  "Check the failing precondition first instead of repeating "
+                  "the same call."),
+        why=why, evidence_session_ids=[alias], support=n,
+    )
+
+
+def _ensure_objective_coverage(
+    rules: list[SkillRule],
+    corpus: SkillCorpus,
+    aliases: dict[str, str],
+    anon: Anonymizer,
+    settings: dict[str, Any] | None,
+) -> list[SkillRule]:
+    """Append fallback rules for MUST-COVER candidates no returned rule cites.
+
+    May push the fresh set past MAX_RULES; ``merge_rules`` still caps the
+    installed set at 5, ranking objective support against everything else —
+    that ranking, not this guarantee, decides what installs.
+    """
+    cited = {sid for r in rules for sid in r.evidence_session_ids}
+    uncovered = [
+        c for c in corpus.candidates
+        if _is_objective_candidate(c) and aliases.get(c.session_id) not in cited
+    ]
+    uncovered.sort(key=lambda c: -int(c.support_count or 0))
+    added = 0
+    for candidate in uncovered:
+        if added >= MAX_FALLBACK_RULES:
+            break
+        fallback = _fallback_rule(candidate, aliases[candidate.session_id], anon, settings)
+        if fallback is not None:
+            rules.append(fallback)
+            added += 1
+    return rules
 
 
 def _format_candidates(
@@ -212,7 +343,8 @@ def build_prompt(
 ) -> str:
     return (
         "# Distill up to 5 durable skills from this user's own scored sessions.\n\n"
-        f"{_format_candidates(corpus, anon, aliases, settings)}\n\n{_RULE_SHAPE}"
+        f"{_format_candidates(corpus, anon, aliases, settings)}"
+        f"{_must_cover_block(corpus, anon, aliases, settings)}\n\n{_RULE_SHAPE}"
     )
 
 
@@ -263,10 +395,13 @@ def distill_skills(
     cfg: dict | None = None,
     redaction_settings: dict[str, Any] | None = None,
 ) -> list[SkillRule]:
-    """Run the single distill call and return <=MAX_RULES validated SkillRules.
+    """Run the single distill call and return the validated SkillRules.
 
-    ``caller`` is injected in tests; default hits the user's own agent CLI. ``cfg``
-    reuses an already-loaded config (for redact_usernames) instead of re-reading it.
+    At most MAX_RULES come from the model; deterministic MUST-COVER fallbacks may
+    push the total to MAX_RULES + MAX_FALLBACK_RULES — ``merge_rules`` still caps
+    the *installed* set. ``caller`` is injected in tests; default hits the user's
+    own agent CLI. ``cfg`` reuses an already-loaded config (for redact_usernames)
+    instead of re-reading it.
     """
     if corpus.is_empty():
         return []
@@ -356,4 +491,7 @@ def distill_skills(
         cited = [support_by_alias[a] for a in r.evidence_session_ids if a in support_by_alias]
         if cited:
             r.support = max(r.support, max(cited))
-    return rules
+    # CH-2 must-cover: an objective candidate the distiller left uncited gets a
+    # deterministic fallback (only after a SUCCESSFUL call — a backend failure
+    # above still degrades to [], unchanged).
+    return _ensure_objective_coverage(rules, corpus, aliases, anon, settings)

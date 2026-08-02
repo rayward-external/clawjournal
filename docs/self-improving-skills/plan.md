@@ -316,7 +316,10 @@ bypassed by the autouse fixture). Cover:
    target, e.g. `~/.codex/AGENTS.md`).
 2. **Claude skill loading** — exact trigger wording and load-rate/invocation metric
    for the on-demand Agent Skill body.
-3. **Weekly trigger** — manual re-run only in v1, or a nudge/cron?
+3. **Weekly trigger** — manual re-run only in v1, or a nudge/cron? → **Answered
+   2026-08-02 (§16 CH-1):** a bounded, fail-open SessionStart nudge (one printed
+   line when distillation is due) — never an auto-run; distill + install stay
+   manual and confirmed.
 4. **First-run cost** — full-history indexing/scoring can be large; cap or chunk it, and surface
    progress.
 
@@ -379,6 +382,102 @@ mapped to where each would land:
   add/evolve/prune as an explicit policy; tier rules by specificity.
 
 These are design references, not locked decisions — §0 iteration rules still apply.
+
+### Continual Harness review (added 2026-08-02)
+
+[Continual Harness](https://arxiv.org/abs/2605.09998) (Karten et al. 2026; MIT
+reference impl `sethkarten/continual-harness`) is a reset-free game agent whose
+Refiner CRUD-edits four surfaces (system prompt, memory, skills, subagents) from
+trajectory windows. **Not directly usable** — the public repo is a Pokémon
+emulator stack, its "skills" are executable Python routines, and its signal model
+assumes dense in-episode rewards — but a full code + paper review (three readers,
+three lenses, adversarial critic) produced this adoption list. Evidence-honesty
+caveats up front: CH's 1–5 memory-confidence field has **no read-time mechanism**
+(decorative); its `effectiveness` field is refiner opinion with zero counters; no
+surface ablation or cadence ablation exists; the 62%-skill-reuse number measures
+executable-routine replay, not prose-lesson loads. The one result that transfers
+directly: bootstrap-frozen (inherit harness, disable refinement) goes **flat** —
+an unrun refiner is worth zero.
+
+Adoption list, ranked by payoff-per-effort:
+
+- **CH-1 — event-driven cadence nudge (ADOPTED 2026-08-02).** Distillation was
+  manual-only (`cli_skill.run_skill`) and the installed skill went weeks stale —
+  the local instance of CH's frozen-flat curve. A cheap SQLite due-check
+  (`skill/due.py`) rides the existing bounded fail-open `SessionStart` hook
+  (`agent_hooks.py`): when the lessons are stale *and* new sessions accumulated
+  (with a failure-evidence event trigger), the hook prints one nudge line
+  suggesting `clawjournal skill --preview`. Never auto-runs the LLM (egress stays
+  user-initiated); cooldown-limited; fail-open on any DB/parse error. Background
+  auto-`--preview` gated by an explicit distill-backend confirmation (parallel to
+  `_confirmed_scoring_backend`) is a possible later opt-in, per the critic's
+  adjudication.
+- **CH-2 — must-cover guarantee for objective candidates (ADOPTED 2026-08-02).**
+  Port of CH's computed antipattern-detector *shape* (deterministic signal →
+  injected MUST directive), adopted on internal grounds (CH never evaluated it in
+  isolation). Closes the §16-era gap: a ≥3-session env signature or the rejection
+  candidate reaching the distiller could still silently produce no rule. Now the
+  distill prompt lists synthetic candidates as MUST-COVER, and any left uncited
+  gets a deterministic templated fallback rule (≤2/run, scrubbed, through the
+  same hard-deny/PII/TruffleHog gates + preview). **No re-ask** — D6's
+  one-distill-call invariant holds; the fallback path is zero-egress.
+- **CH-3 — usage/outcome tracking on installed rules (NEXT).** Do what CH
+  couldn't: real counters instead of judged `effectiveness`. A
+  `skill_rule_events` table (fingerprint, ts, `installed|loaded|violated|
+  confirmed|revised|retired`, session_id) mined at ingest: `loaded` via the
+  injected-SKILL.md detector `turns.py` already uses as a noise *filter*;
+  `violated` when a rule's origin signature recurs in a loaded session;
+  `confirmed` when absent across ≥3 loaded sessions. Constraints: event ingest
+  must mirror the hold-state gate (`_release_blocked_ids`) so embargoed sessions
+  can't leak into rendered revisions; Claude (model-invoked) vs Codex
+  (always-read) need separate denominators. Answers §15 Q2.
+- **CH-4 — deterministic `evidence_grade` (NEXT, with CH-3).** Adopt CH's
+  confidence-ladder *semantics* ("untested guess → repeatedly confirmed"), reject
+  its dead judge-written field: compute the grade in Python from channel
+  provenance (corrections/env-signatures/rejections ≥2 sessions = grounded;
+  single objective event = weak; judge-only = speculative), never parsed from
+  distiller output. Drives `merge_rules` eviction (judge-only rules lose ties for
+  the 5 slots) and replaces the bare `seen ~N×` badge. Delivers the
+  falsifiable-claim taxonomy borrow above cheaply.
+- **CH-5 — revision/retire pass with code-enforced caps (AFTER CH-3).** Decay
+  handles idleness, not *wrongness* (a year-1 lesson about a deprecated API is
+  harmful in year 3). Separate LLM pass fed only installed rules + their
+  objective `violated`/`confirmed` events, CH's conservatism framing, but caps
+  enforced in code (max 2 revisions + 1 retirement per run; CH only *requested*
+  its caps), re-fingerprint with `superseded_by`, preview/confirm. Structural
+  guard from CH's fixed-vs-evolvable split: the SKILL.md frontmatter/description
+  (the model-invocation trigger) is FIXED; only lesson bodies are evolvable.
+- **CH-6 — mutation history + changelog (WITH CH-3's schema).** Append-only field
+  diffs + a "Changed since last install: +2 new, 1 revised, 1 retired" block in
+  preview and SKILL.md header; durable workbench session ids in event rows fix
+  the lossy `case-NN` provenance.
+- **CH-7 — pinned rules (SMALL).** CH's one hard protection (built-ins
+  undeletable) → user-pinned rules exempt from decay and 5-cap eviction (§13's
+  deferred pin, promoted).
+- **CH-8 — lab lesson packs (MODE B PREP).** CH's `bootstrap.py` re-import
+  (`source="bootstrapped"`) is the PI→student advising workflow: export/import
+  rule packs, imported rows tagged `imported:<lab>`, entering the normal merge +
+  decay so they must corroborate locally (frozen inheritance is flat — CH's own
+  data). Defer until CH-3 exists; do now: keep any rule-provenance enum
+  extensible, and note import is a new *ingress* — the exec/external-token
+  hard-deny + rule_policy must run on import, not just export.
+- Smaller: inline computed annotations on distiller excerpts ("third identical
+  retry", "same signature as case-03") — CH annotates the evidence the refiner
+  reads, we only extract candidates; and cap-hit events (context compaction,
+  max-turn, permission caps) as a new objective signal class.
+
+**Explicitly rejected from CH:** judge-written confidence/effectiveness fields
+(dead at read time; opinion laundered as evidence — the dilution Mode A exists to
+avoid); full prompt rewrites (unconditional replacement, no rollback — our
+render-from-DB + fingerprint merge is categorically safer); executable skills +
+their `exec` sandbox (`__import__` exposed; our schema hard-denies exec tokens by
+design); subagent CRUD (the host agent owns subagents; CH documents "sub-agent
+collapse"); verbatim code lifting (plain-JSON store swallows save errors, live
+`entry.id`/dropped-`code` bugs — lift prompt fragments and detector predicates,
+write code fresh); the 25/100-step cadence numbers (no ablation supports any
+schedule); an agent-invocable `evolve_harness` tool (muddies the manual-confirm
+consent model); always-in-context 200-entry store overviews (contradicted by CH's
+own thin-working-set finding).
 
 ---
 
