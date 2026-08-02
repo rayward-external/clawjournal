@@ -77,11 +77,13 @@ describe('success sound', () => {
     vi.advanceTimersByTime(1);
     expect(sound.pause).not.toHaveBeenCalled();
     expect(sound.volume).toBe(0.05);
-    vi.advanceTimersByTime(250);
+    vi.advanceTimersByTime(1000);
     expect(sound.pause).not.toHaveBeenCalled();
-    expect(sound.volume).toBeGreaterThan(0);
-    expect(sound.volume).toBeLessThan(0.05);
-    vi.advanceTimersByTime(250);
+    expect(sound.volume).toBeCloseTo(0.0125);
+    vi.advanceTimersByTime(999);
+    expect(sound.pause).not.toHaveBeenCalled();
+    expect(sound.volume).toBeLessThan(0.00001);
+    vi.advanceTimersByTime(1);
     expect(sound.pause).toHaveBeenCalledOnce();
     expect(sound.currentTime).toBe(0);
     expect(sound.volume).toBe(0.05);
