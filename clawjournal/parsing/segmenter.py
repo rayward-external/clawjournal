@@ -42,6 +42,7 @@ def segment_append_only_session(
     *,
     message_start_offsets: list[int] | None = None,
     raw_source_size: int | None = None,
+    message_token_snapshots: list[tuple[int, int, int, int]] | None = None,
     max_messages: int = APPEND_ONLY_MAX_MESSAGES,
     max_user_messages: int = APPEND_ONLY_MAX_USER_MESSAGES,
     max_text_bytes: int = APPEND_ONLY_MAX_TEXT_BYTES,
@@ -54,6 +55,11 @@ def segment_append_only_session(
     confirms the raw boundary. Appending later records can therefore only
     extend the active tail or create new segments; it never changes an
     already-closed segment.
+
+    ``message_token_snapshots`` carries the cumulative
+    (input, output, cache_read, cache_creation) token totals as of each
+    message; each child's stats get the delta over its message range so the
+    file-level totals partition across segments instead of being dropped.
     """
 
     messages = session.get("messages", [])
@@ -84,6 +90,10 @@ def segment_append_only_session(
         for index, offset in enumerate(message_start_offsets)
     ):
         return [session]
+
+    token_snapshots = _validated_token_snapshots(
+        message_token_snapshots, len(messages)
+    )
 
     boundaries: list[int] = []
     segment_start = 0
@@ -132,6 +142,9 @@ def segment_append_only_session(
     children: list[dict[str, Any]] = []
     for segment_index, (start, end) in enumerate(zip(starts, ends)):
         segment_messages = messages[start:end]
+        segment_stats = _compute_stats(segment_messages)
+        if token_snapshots is not None:
+            segment_stats.update(_segment_token_deltas(token_snapshots, start, end))
         raw_segment_start = 0 if start == 0 else message_start_offsets[start]
         raw_segment_end = (
             message_start_offsets[end]
@@ -173,7 +186,7 @@ def segment_append_only_session(
             "start_time": _first_timestamp(segment_messages),
             "end_time": _last_timestamp(segment_messages),
             "messages": segment_messages,
-            "stats": _compute_stats(segment_messages),
+            "stats": segment_stats,
         })
         if segment_index == 0:
             child.pop("parent_session_id", None)
@@ -667,6 +680,45 @@ def _same_project(path_a: str, path_b: str) -> bool:
     if prefix_a and prefix_b:
         return prefix_a == prefix_b
     return path_a == path_b
+
+
+_TOKEN_SNAPSHOT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+)
+
+
+def _validated_token_snapshots(
+    snapshots: Any, message_count: int
+) -> list[tuple[int, int, int, int]] | None:
+    """Return the snapshots only when they align 1:1 with the messages."""
+    if not isinstance(snapshots, list) or len(snapshots) != message_count:
+        return None
+    for snapshot in snapshots:
+        if not isinstance(snapshot, (list, tuple)) or len(snapshot) != len(
+            _TOKEN_SNAPSHOT_FIELDS
+        ):
+            return None
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in snapshot
+        ):
+            return None
+    return snapshots
+
+
+def _segment_token_deltas(
+    snapshots: list[tuple[int, int, int, int]], start: int, end: int
+) -> dict[str, int]:
+    """Token totals accrued across messages[start:end], from cumulative snapshots."""
+    previous = snapshots[start - 1] if start else (0, 0, 0, 0)
+    last = snapshots[end - 1]
+    return {
+        field: max(0, int(last[index]) - int(previous[index]))
+        for index, field in enumerate(_TOKEN_SNAPSHOT_FIELDS)
+    }
 
 
 def _compute_stats(messages: list[dict]) -> dict[str, int]:
