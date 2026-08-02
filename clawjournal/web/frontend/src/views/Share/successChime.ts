@@ -1,5 +1,5 @@
 const SUCCESS_SOUND_URL = '/sounds/submission-success.mp3';
-const SUCCESS_CHIME_VOLUME = 0.1;
+const SUCCESS_CHIME_VOLUME = 0.05;
 const SUCCESS_CHIME_HOLD_MS = 1500;
 const SUCCESS_CHIME_FADE_MS = 500;
 const SUCCESS_CHIME_FADE_STEP_MS = 25;
