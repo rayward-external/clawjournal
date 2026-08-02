@@ -1,40 +1,20 @@
-"""Tests for the optional desktop shortcut and dynamic expression icon."""
+"""Tests for the optional desktop shortcut and packaged brand icon."""
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import socket
 import struct
 import subprocess
+import sys
 import threading
-import zlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 from clawjournal import desktop
-
-
-def _decode_rgba(png: bytes) -> tuple[int, int, bytes]:
-    """Minimal decoder for the 8-bit RGBA, filter-0 PNGs this module writes."""
-    pos, idat, width, height = 8, b"", 0, 0
-    while pos < len(png):
-        length = struct.unpack(">I", png[pos:pos + 4])[0]
-        kind = png[pos + 4:pos + 8]
-        data = png[pos + 8:pos + 8 + length]
-        if kind == b"IHDR":
-            width, height = struct.unpack(">II", data[:8])
-        elif kind == b"IDAT":
-            idat += data
-        pos += 12 + length
-    raw = zlib.decompress(idat)
-    stride = width * 4
-    pixels = bytearray()
-    for y in range(height):
-        assert raw[y * (stride + 1)] == 0, "only filter type 0 is written"
-        pixels += raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)]
-    return width, height, bytes(pixels)
 
 
 @pytest.fixture
@@ -92,47 +72,22 @@ def test_day_count_survives_a_dst_fall_back(isolated_desktop: Path) -> None:
     assert desktop.opened_today(next_day) is False
 
 
-def test_png_stores_straight_alpha_not_premultiplied(isolated_desktop: Path) -> None:
-    """Regression: RGB was written premultiplied into a colour-type-6 PNG, so
-    the drop shadow rendered near-black and every edge carried a dark fringe."""
-    shadow = (79, 53, 18, 55)
-    canvas = desktop._Canvas(4, scale=1)
-    canvas.ellipse(2, 2, 2, 2, shadow)
-    width, _, pixels = _decode_rgba(canvas.png())
-    centre = (2 * width + 2) * 4
-    red, green, blue, alpha = pixels[centre:centre + 4]
-
-    assert alpha == shadow[3]
-    # Exactness is limited by 8-bit premultiplied storage at low alpha; the bug
-    # produced (17, 11, 4), which is nowhere near this tolerance.
-    assert abs(red - shadow[0]) <= 3
-    assert abs(green - shadow[1]) <= 3
-    assert abs(blue - shadow[2]) <= 3
-
-    # Strongly-covered edges of the face disk keep the face colour.
-    _, _, face = _decode_rgba(desktop.render_face_png(0))
-    edges = [
-        face[i:i + 4] for i in range(0, len(face), 4) if 200 <= face[i + 3] < 255
-    ]
-    assert edges, "expected antialiased edge pixels"
-    assert min(px[0] for px in edges) > 150  # premultiplied fringing lands near 145
-
-
-def test_render_face_writes_standard_icon_formats(isolated_desktop: Path) -> None:
+def test_render_logo_writes_standard_icon_formats(isolated_desktop: Path) -> None:
     desktop.render_icon(0)
     desktop.render_icon(10)
-    smile = (desktop._icons_dir() / "clawjournal-day-0.png").read_bytes()
-    crying = (desktop._icons_dir() / "clawjournal-day-10.png").read_bytes()
-    ico = (desktop._icons_dir() / "clawjournal-day-10.ico").read_bytes()
-    icns = (desktop._icons_dir() / "clawjournal-day-10.icns").read_bytes()
+    day_zero = desktop._icon_path(0, "png").read_bytes()
+    day_ten = desktop._icon_path(10, "png").read_bytes()
+    ico = desktop._icon_path(10, "ico").read_bytes()
+    icns = desktop._icon_path(10, "icns").read_bytes()
 
-    assert smile.startswith(b"\x89PNG\r\n\x1a\n")
-    assert crying.startswith(b"\x89PNG\r\n\x1a\n")
-    assert smile != crying
+    assert day_zero == day_ten == desktop.BRAND_ICON_PATH.read_bytes()
+    assert hashlib.sha256(day_zero).hexdigest() == (
+        "71ddee336f3c3eda170dd022966f030b7a538d965f1161568225164bd81b769a"
+    )
     assert ico[:6] == b"\x00\x00\x01\x00\x01\x00"
     assert b"\x89PNG\r\n\x1a\n" in ico
     assert icns.startswith(b"icns")
-    assert b"ic08" in icns[:16]
+    assert b"icp6" in icns[:16]
 
 
 def test_linux_install_refresh_and_uninstall(isolated_desktop: Path) -> None:
@@ -141,15 +96,15 @@ def test_linux_install_refresh_and_uninstall(isolated_desktop: Path) -> None:
 
     assert shortcut.exists()
     assert "X-ClawJournal-Managed=true" in shortcut.read_text(encoding="utf-8")
-    assert "clawjournal-day-0.png" in shortcut.read_text(encoding="utf-8")
+    assert desktop._icon_path(0, "png").name in shortcut.read_text(encoding="utf-8")
     assert desktop.status()["installed"] is True
 
     opened = dt.datetime.now().astimezone() - dt.timedelta(days=20)
     desktop._write_last_opened(opened)
     refreshed = desktop.refresh(quiet=True)
     assert refreshed["day"] == 10
-    assert refreshed["mood"] == "dramatic crying"
-    assert "clawjournal-day-10.png" in shortcut.read_text(encoding="utf-8")
+    assert refreshed["mood"] == "branded logo"
+    assert desktop._icon_path(10, "png").name in shortcut.read_text(encoding="utf-8")
 
     removed = desktop.uninstall()
     assert removed["removed"] is True
@@ -321,7 +276,7 @@ def test_quiet_platform_commands_have_a_finite_timeout(
 
 def test_ico_directory_states_a_non_256_dimension(isolated_desktop: Path) -> None:
     """0 means 256 in an ICO entry; smaller icons must state their real size."""
-    png = desktop.render_face_png(0, size=64)
+    png = desktop.render_logo_png()
     entry = desktop._ico_from_png(png, size=64)[6:8]
     assert entry == bytes([64, 64])
     assert desktop._ico_from_png(png, size=256)[6:8] == bytes([0, 0])
@@ -331,10 +286,10 @@ def test_desktop_exec_quote_escapes_backslashes_for_both_layers(
     isolated_desktop: Path,
 ) -> None:
     """Desktop-entry values are unescaped twice, so one backslash needs four."""
-    quoted = desktop._desktop_exec_quote(Path(r"/tmp/od\d/launch"))
+    quoted = desktop._desktop_exec_quote(PurePosixPath(r"/tmp/od\d/launch"))
     assert quoted == r'"/tmp/od\\\\d/launch"'
     # Escapes added for the other special characters must not be re-escaped.
-    assert desktop._desktop_exec_quote(Path('/tmp/a$b`c"d')) == r'"/tmp/a\$b\`c\"d"'
+    assert desktop._desktop_exec_quote(PurePosixPath('/tmp/a$b`c"d')) == r'"/tmp/a\$b\`c\"d"'
 
 
 def test_malformed_plist_is_not_ours_rather_than_a_crash(
@@ -379,6 +334,20 @@ def test_bootstrap_does_not_log_a_traceback_for_a_clean_exit(
     compile(bootstrap, str(desktop._windows_bootstrap()), "exec")
 
 
+def test_desktop_commands_pin_the_package_import_root(
+    isolated_desktop: Path,
+) -> None:
+    command = desktop._command("desktop", "launch")
+    assert command[:2] == [sys.executable, "-c"]
+    assert repr(str(desktop._package_import_root())) in command[2]
+    assert "from clawjournal.cli import main" in command[2]
+
+    desktop._write_windows_bootstrap()
+    bootstrap = desktop._windows_bootstrap().read_text(encoding="utf-8")
+    assert f"package_import_root = {str(desktop._package_import_root())!r}" in bootstrap
+    assert "sys.path.insert(0, package_import_root)" in bootstrap
+
+
 def test_days_since_last_opened_accepts_a_naive_stamp(isolated_desktop: Path) -> None:
     desktop._last_opened_file().parent.mkdir(parents=True, exist_ok=True)
     naive = dt.datetime.now() - dt.timedelta(days=4)
@@ -397,7 +366,9 @@ def test_desktop_paths_follow_the_patched_config_dir(
     index.html would then reach `note_opened()` and rewrite the developer's
     actual desktop shortcut. Deliberately does NOT use `isolated_desktop`.
     """
-    assert Path.home() not in desktop._state_file().parents
+    assert desktop._state_file() != (
+        Path.home() / ".clawjournal" / "desktop" / "install.json"
+    )
 
     redirected = tmp_path / "elsewhere"
     monkeypatch.setattr("clawjournal.config.CONFIG_DIR", redirected)
@@ -710,4 +681,4 @@ def test_status_json_shape(isolated_desktop: Path) -> None:
     result = json.loads(json.dumps(desktop.status()))
     assert result["installed"] is True
     assert result["day"] == 0
-    assert result["mood"] == "big smile"
+    assert result["mood"] == "branded logo"

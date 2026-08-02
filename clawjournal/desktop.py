@@ -1,20 +1,19 @@
-"""One-click desktop launcher with a locally rendered reminder icon.
+"""One-click desktop launcher with a packaged ClawJournal icon.
 
 The shortcut starts the workbench, whose daemon performs an immediate
 background scan.  When the workbench is already running, the launcher asks it
 to scan again and opens the existing instance instead.
 
-No icon assets are downloaded.  Eleven expressions (Day 0 through Day 10) are
-rendered with the Python standard library and a user-level daily task points
-the shortcut at the appropriate one.
+No icon assets are downloaded.  The packaged brand artwork is converted into
+the native icon format for each supported desktop platform.
 """
 
 from __future__ import annotations
 
 import ctypes
 import datetime as dt
+import hashlib
 import json
-import math
 import os
 import plistlib
 import secrets
@@ -27,7 +26,6 @@ import threading
 import urllib.error
 import urllib.request
 import webbrowser
-import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -82,7 +80,8 @@ MACOS_LAUNCH_AGENT = "ai.rayward.clawjournal.desktop-icon"
 LINUX_SYSTEMD_UNIT = "clawjournal-desktop-icon"
 
 MAX_SAD_DAYS = 10
-ICON_SIZE = 256
+ICON_SIZE = 64
+BRAND_ICON_PATH = Path(__file__).resolve().parent / "assets" / "desktop-icon.png"
 
 # The shortcut redirects the daemon's stdout/stderr here, and the daemon logs
 # every HTTP request, so the log needs a ceiling to stay bounded over months.
@@ -123,9 +122,18 @@ def _platform() -> str:
     return sys.platform
 
 
+def _package_import_root() -> Path:
+    """Directory Python must search to import this exact ClawJournal build."""
+    return Path(__file__).resolve().parent.parent
+
+
 def _command(*args: str) -> list[str]:
-    """Use this interpreter so editable, venv, and wheel installs all work."""
-    return [sys.executable, "-m", "clawjournal.cli", *args]
+    """Use this interpreter and pin the build that installed the shortcut."""
+    entrypoint = (
+        f"import sys; sys.path.insert(0, {str(_package_import_root())!r}); "
+        "from clawjournal.cli import main; main()"
+    )
+    return [sys.executable, "-c", entrypoint, *args]
 
 
 def _windows_background_python() -> str:
@@ -224,213 +232,27 @@ def opened_today(now: dt.datetime | None = None) -> bool:
     return opened is not None and opened.date() == (now or _now()).date()
 
 
-class _Canvas:
-    """Tiny supersampled RGBA rasterizer used to avoid an image dependency."""
-
-    def __init__(self, size: int, scale: int = 2) -> None:
-        self.size = size
-        self.scale = scale
-        self.width = size * scale
-        self.pixels = bytearray(self.width * self.width * 4)
-
-    def _blend(self, x: int, y: int, color: tuple[int, int, int, int]) -> None:
-        if x < 0 or y < 0 or x >= self.width or y >= self.width:
-            return
-        i = (y * self.width + x) * 4
-        alpha = color[3] / 255.0
-        inverse = 1.0 - alpha
-        self.pixels[i] = round(color[0] * alpha + self.pixels[i] * inverse)
-        self.pixels[i + 1] = round(color[1] * alpha + self.pixels[i + 1] * inverse)
-        self.pixels[i + 2] = round(color[2] * alpha + self.pixels[i + 2] * inverse)
-        self.pixels[i + 3] = round(255 * (alpha + (self.pixels[i + 3] / 255.0) * inverse))
-
-    def ellipse(
-        self,
-        cx: float,
-        cy: float,
-        rx: float,
-        ry: float,
-        color: tuple[int, int, int, int],
-    ) -> None:
-        s = self.scale
-        x0, x1 = int((cx - rx) * s), int((cx + rx) * s) + 1
-        y0, y1 = int((cy - ry) * s), int((cy + ry) * s) + 1
-        for y in range(y0, y1):
-            dy = ((y + 0.5) / s - cy) / ry
-            if abs(dy) > 1:
-                continue
-            span = rx * math.sqrt(max(0.0, 1.0 - dy * dy))
-            left, right = int((cx - span) * s), int((cx + span) * s) + 1
-            for x in range(max(x0, left), min(x1, right)):
-                self._blend(x, y, color)
-
-    def line(
-        self,
-        points: list[tuple[float, float]],
-        width: float,
-        color: tuple[int, int, int, int],
-    ) -> None:
-        if len(points) < 2:
-            return
-        for start, end in zip(points, points[1:]):
-            dx, dy = end[0] - start[0], end[1] - start[1]
-            # Adjacent curve samples are already close together.  Spacing the
-            # round stamps by roughly a quarter stroke width keeps joins solid
-            # without doing hundreds of redundant ellipse fills.
-            steps = max(1, int(max(abs(dx), abs(dy)) * 4 / max(width, 1)))
-            for n in range(steps + 1):
-                t = n / steps
-                self.ellipse(
-                    start[0] + dx * t,
-                    start[1] + dy * t,
-                    width / 2,
-                    width / 2,
-                    color,
-                )
-
-    def quadratic(
-        self,
-        start: tuple[float, float],
-        control: tuple[float, float],
-        end: tuple[float, float],
-        width: float,
-        color: tuple[int, int, int, int],
-    ) -> None:
-        points: list[tuple[float, float]] = []
-        for n in range(49):
-            t = n / 48
-            inv = 1 - t
-            points.append((
-                inv * inv * start[0] + 2 * inv * t * control[0] + t * t * end[0],
-                inv * inv * start[1] + 2 * inv * t * control[1] + t * t * end[1],
-            ))
-        self.line(points, width, color)
-
-    def png(self) -> bytes:
-        s, out_size = self.scale, self.size
-        reduced = bytearray(out_size * out_size * 4)
-        for y in range(out_size):
-            for x in range(out_size):
-                dst = (y * out_size + x) * 4
-                if s == 2:
-                    top = ((y * 2) * self.width + x * 2) * 4
-                    bottom = top + self.width * 4
-                    for channel in range(4):
-                        reduced[dst + channel] = (
-                            self.pixels[top + channel]
-                            + self.pixels[top + 4 + channel]
-                            + self.pixels[bottom + channel]
-                            + self.pixels[bottom + 4 + channel]
-                        ) // 4
-                else:
-                    samples = s * s
-                    for channel in range(4):
-                        total = 0
-                        for sy in range(s):
-                            for sx in range(s):
-                                src = (((y * s + sy) * self.width) + x * s + sx) * 4
-                                total += self.pixels[src + channel]
-                        reduced[dst + channel] = total // samples
-
-        # `_blend` composites in premultiplied space, which is also what makes
-        # the box filter above correct. PNG colour type 6 stores *straight*
-        # alpha, so undo the premultiplication on the way out — otherwise the
-        # translucent drop shadow renders near-black instead of warm brown and
-        # every antialiased edge of the face carries a dark fringe.
-        for i in range(0, len(reduced), 4):
-            alpha = reduced[i + 3]
-            if alpha in (0, 255):
-                continue
-            for channel in range(3):
-                reduced[i + channel] = min(
-                    255, (reduced[i + channel] * 255 + alpha // 2) // alpha
-                )
-
-        rows = b"".join(
-            b"\x00" + bytes(reduced[y * out_size * 4:(y + 1) * out_size * 4])
-            for y in range(out_size)
+def render_logo_png() -> bytes:
+    """Return the exact packaged brand artwork used by desktop shortcuts."""
+    try:
+        png = BRAND_ICON_PATH.read_bytes()
+    except OSError as exc:
+        raise DesktopError(f"Packaged desktop icon is unavailable: {BRAND_ICON_PATH}") from exc
+    if not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) < 24:
+        raise DesktopError(f"Packaged desktop icon is not a valid PNG: {BRAND_ICON_PATH}")
+    width, height = struct.unpack(">II", png[16:24])
+    if (width, height) != (ICON_SIZE, ICON_SIZE):
+        raise DesktopError(
+            f"Packaged desktop icon must be {ICON_SIZE}x{ICON_SIZE}, got {width}x{height}."
         )
-
-        def chunk(kind: bytes, data: bytes) -> bytes:
-            return (
-                struct.pack(">I", len(data)) + kind + data
-                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-            )
-
-        header = struct.pack(">IIBBBBB", out_size, out_size, 8, 6, 0, 0, 0)
-        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(
-            b"IDAT", zlib.compress(rows, 9)
-        ) + chunk(b"IEND", b"")
+    return png
 
 
-def render_face_png(day: int, *, size: int = ICON_SIZE) -> bytes:
-    """Render the Day 0 smile through the Day 10 crying face."""
+def _icon_path(day: int, suffix: str, *, png: bytes | None = None) -> Path:
+    """Return a content-addressed path so desktop shells cannot reuse stale art."""
     day = max(0, min(MAX_SAD_DAYS, int(day)))
-    mood = day / MAX_SAD_DAYS
-    c = _Canvas(size)
-    ratio = size / ICON_SIZE
-
-    # Soft shadow and warm face disk.
-    c.ellipse(128 * ratio, 134 * ratio, 103 * ratio, 103 * ratio, (79, 53, 18, 55))
-    c.ellipse(128 * ratio, 126 * ratio, 104 * ratio, 104 * ratio, (181, 116, 15, 255))
-    c.ellipse(128 * ratio, 123 * ratio, 98 * ratio, 98 * ratio, (255, 202, 40, 255))
-    c.ellipse(101 * ratio, 80 * ratio, 48 * ratio, 35 * ratio, (255, 235, 121, 85))
-
-    ink = (77, 48, 24, 255)
-    brow_y = 78 + 10 * mood
-    brow_slant = 14 * mood
-    c.line(
-        [((70) * ratio, (brow_y + brow_slant / 2) * ratio),
-         ((105) * ratio, (brow_y - brow_slant / 2) * ratio)],
-        7 * ratio,
-        ink,
-    )
-    c.line(
-        [((151) * ratio, (brow_y - brow_slant / 2) * ratio),
-         ((186) * ratio, (brow_y + brow_slant / 2) * ratio)],
-        7 * ratio,
-        ink,
-    )
-
-    if day <= 2:
-        # Joyful squinting eyes.
-        c.quadratic((70 * ratio, 111 * ratio), (88 * ratio, 92 * ratio),
-                    (106 * ratio, 111 * ratio), 9 * ratio, ink)
-        c.quadratic((150 * ratio, 111 * ratio), (168 * ratio, 92 * ratio),
-                    (186 * ratio, 111 * ratio), 9 * ratio, ink)
-    else:
-        eye_ry = (10 + 4 * mood) * ratio
-        c.ellipse(88 * ratio, 109 * ratio, 8 * ratio, eye_ry, ink)
-        c.ellipse(168 * ratio, 109 * ratio, 8 * ratio, eye_ry, ink)
-        c.ellipse(85 * ratio, 104 * ratio, 2.2 * ratio, 3 * ratio, (255, 255, 255, 210))
-        c.ellipse(165 * ratio, 104 * ratio, 2.2 * ratio, 3 * ratio, (255, 255, 255, 210))
-
-    if day < 8:
-        # The smile flattens and then begins to turn down.
-        center_y = 198 - 7.2 * day
-        c.quadratic((72 * ratio, 155 * ratio), (128 * ratio, center_y * ratio),
-                    (184 * ratio, 155 * ratio), 11 * ratio, ink)
-        if day <= 3:
-            # A light mouth highlight makes Day 0 read as a big grin at icon size.
-            c.quadratic((85 * ratio, 165 * ratio), (128 * ratio, (184 - 4 * day) * ratio),
-                        (171 * ratio, 165 * ratio), 4 * ratio, (255, 238, 190, 210))
-    else:
-        # Open, increasingly dramatic wail.
-        mouth_ry = (12 + (day - 8) * 8) * ratio
-        c.ellipse(128 * ratio, 169 * ratio, (28 + (day - 8) * 4) * ratio, mouth_ry, ink)
-        c.ellipse(128 * ratio, (176 + (day - 8) * 3) * ratio,
-                  (16 + (day - 8) * 3) * ratio, 6 * ratio, (201, 65, 70, 255))
-
-    if day >= 7:
-        tear = (75, 178, 255, 230)
-        length = 10 + (day - 7) * 10
-        for x in (88, 168):
-            c.ellipse(x * ratio, (125 + length / 2) * ratio, (5 + mood * 3) * ratio,
-                      (length / 2) * ratio, tear)
-            c.ellipse(x * ratio, (125 + length) * ratio, (8 + mood * 3) * ratio,
-                      (7 + mood * 3) * ratio, tear)
-
-    return c.png()
+    digest = hashlib.sha256(png if png is not None else render_logo_png()).hexdigest()[:12]
+    return _icons_dir() / f"clawjournal-day-{day}-{digest}.{suffix}"
 
 
 def _ico_from_png(png: bytes, size: int = ICON_SIZE) -> bytes:
@@ -442,18 +264,19 @@ def _ico_from_png(png: bytes, size: int = ICON_SIZE) -> bytes:
     return header + entry + png
 
 
-def _icns_from_png(png: bytes) -> bytes:
-    element = b"ic08" + struct.pack(">I", len(png) + 8) + png
+def _icns_from_png(png: bytes, size: int = ICON_SIZE) -> bytes:
+    icon_type = b"ic08" if size >= 256 else b"icp6"
+    element = icon_type + struct.pack(">I", len(png) + 8) + png
     return b"icns" + struct.pack(">I", len(element) + 8) + element
 
 
 def render_icon(day: int) -> None:
     day = max(0, min(MAX_SAD_DAYS, int(day)))
     _icons_dir().mkdir(parents=True, exist_ok=True)
-    png = render_face_png(day)
-    _write_bytes(_icons_dir() / f"clawjournal-day-{day}.png", png)
-    _write_bytes(_icons_dir() / f"clawjournal-day-{day}.ico", _ico_from_png(png))
-    _write_bytes(_icons_dir() / f"clawjournal-day-{day}.icns", _icns_from_png(png))
+    png = render_logo_png()
+    _write_bytes(_icon_path(day, "png", png=png), png)
+    _write_bytes(_icon_path(day, "ico", png=png), _ico_from_png(png))
+    _write_bytes(_icon_path(day, "icns", png=png), _icns_from_png(png))
 
 
 def render_icon_set() -> None:
@@ -560,6 +383,10 @@ def _write_windows_bootstrap() -> None:
         "from pathlib import Path",
         "import sys",
         "import traceback",
+        "",
+        f"package_import_root = {str(_package_import_root())!r}",
+        "if package_import_root not in sys.path:",
+        "    sys.path.insert(0, package_import_root)",
         "",
         "# pythonw has no console to inherit. Force console-mode children such",
         "# as Scoop shims to remain invisible instead of flashing a new window.",
@@ -699,7 +526,7 @@ def _install_windows(day: int) -> tuple[Path, str, list[str]]:
     shortcut.parent.mkdir(parents=True, exist_ok=True)
     _ensure_available(shortcut, _windows_shortcut_is_managed)
     # Writes the bootstrap the shortcut and the daily task both point at.
-    _write_windows_shortcut(shortcut, _icons_dir() / f"clawjournal-day-{day}.ico")
+    _write_windows_shortcut(shortcut, _icon_path(day, "ico"))
     _notify_windows_shortcut(shortcut)
 
     task_parts = [
@@ -714,7 +541,7 @@ def _install_windows(day: int) -> tuple[Path, str, list[str]]:
     warnings = []
     refresh_mode = "daily task"
     if result.returncode != 0:
-        warnings.append("Could not register the daily icon task; the face will still update whenever ClawJournal opens.")
+        warnings.append("Could not register the daily icon task; the icon will still update whenever ClawJournal opens.")
         refresh_mode = "when opened"
     else:
         # schtasks.exe defaults to refusing/terminating tasks on battery power,
@@ -771,7 +598,7 @@ def _install_macos(day: int) -> tuple[Path, str, list[str]]:
         )
         _write_bytes(
             resources / "ClawJournal.icns",
-            (_icons_dir() / f"clawjournal-day-{day}.icns").read_bytes(),
+            _icon_path(day, "icns").read_bytes(),
         )
         _write_bytes(staging / "Contents" / "Info.plist", plistlib.dumps(info))
         if app.exists():
@@ -817,7 +644,7 @@ def _install_linux(day: int) -> tuple[Path, str, list[str]]:
     _write_executable(refresher, _shell_launcher(_command("desktop", "refresh", "--quiet"), log=False))
     atomic_write_text(
         desktop,
-        _linux_desktop_content(launcher, _icons_dir() / f"clawjournal-day-{day}.png"),
+        _linux_desktop_content(launcher, _icon_path(day, "png")),
         parents=True,
     )
     desktop.chmod(0o755)
@@ -841,7 +668,7 @@ def _install_linux(day: int) -> tuple[Path, str, list[str]]:
     atomic_write_text(
         service,
         "\n".join([
-            "[Unit]", "Description=Refresh the ClawJournal desktop expression", "",
+            "[Unit]", "Description=Refresh the ClawJournal desktop icon", "",
             "[Service]", "Type=oneshot", f"ExecStart={_systemd_quote(refresher)}", "",
         ]),
         parents=True,
@@ -849,7 +676,7 @@ def _install_linux(day: int) -> tuple[Path, str, list[str]]:
     atomic_write_text(
         timer,
         "\n".join([
-            "[Unit]", "Description=Daily ClawJournal desktop expression refresh", "",
+            "[Unit]", "Description=Daily ClawJournal desktop icon refresh", "",
             "[Timer]", "OnCalendar=daily", "Persistent=true", "RandomizedDelaySec=15m", "",
             "[Install]", "WantedBy=timers.target", "",
         ]),
@@ -952,14 +779,14 @@ def _require_managed(path: Path, is_managed: Callable[[Path], bool], kind: str) 
 
 def _refresh_windows(shortcut: Path, day: int) -> None:
     _require_managed(shortcut, _windows_shortcut_is_managed, "shortcut")
-    _write_windows_shortcut(shortcut, _icons_dir() / f"clawjournal-day-{day}.ico")
+    _write_windows_shortcut(shortcut, _icon_path(day, "ico"))
     _notify_windows_shortcut(shortcut)
 
 
 def _refresh_macos(app: Path, day: int) -> None:
     _require_managed(app, _macos_app_is_managed, "app")
     icon = app / "Contents" / "Resources" / "ClawJournal.icns"
-    _write_bytes(icon, (_icons_dir() / f"clawjournal-day-{day}.icns").read_bytes())
+    _write_bytes(icon, _icon_path(day, "icns").read_bytes())
     os.utime(app, None)
 
 
@@ -968,7 +795,7 @@ def _refresh_linux(shortcut: Path, day: int) -> None:
     launcher = _state_dir() / "launch"
     atomic_write_text(
         shortcut,
-        _linux_desktop_content(launcher, _icons_dir() / f"clawjournal-day-{day}.png"),
+        _linux_desktop_content(launcher, _icon_path(day, "png")),
         parents=True,
     )
     shortcut.chmod(0o755)
@@ -982,7 +809,7 @@ def refresh(*, quiet: bool = False) -> dict[str, Any]:
     shortcut = Path(str(state.get("shortcut", "")))
     day = days_since_last_opened()
     if not all(
-        (_icons_dir() / f"clawjournal-day-{day}.{suffix}").exists()
+        _icon_path(day, suffix).exists()
         for suffix in ("png", "ico", "icns")
     ):
         render_icon(day)
@@ -997,20 +824,13 @@ def refresh(*, quiet: bool = False) -> dict[str, Any]:
         raise DesktopError(f"Unknown desktop integration platform: {platform_name}") from exc
     result = {**state, "day": day, "mood": mood_label(day)}
     if not quiet:
-        print(f"ClawJournal icon: Day {day} — {result['mood']}")
+        print("ClawJournal icon refreshed.")
     return result
 
 
 def mood_label(day: int) -> str:
-    if day == 0:
-        return "big smile"
-    if day <= 3:
-        return "happy"
-    if day <= 6:
-        return "missing you"
-    if day <= 9:
-        return "crying"
-    return "dramatic crying"
+    """Legacy status field retained for clients that already read it."""
+    return "branded logo"
 
 
 def note_opened() -> None:
