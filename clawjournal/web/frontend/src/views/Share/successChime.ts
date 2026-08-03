@@ -1,7 +1,7 @@
 const SUCCESS_SOUND_URL = '/sounds/submission-success.mp3';
-const SUCCESS_CHIME_VOLUME = 0.15;
+const SUCCESS_CHIME_VOLUME = 0.05;
 const SUCCESS_CHIME_HOLD_MS = 1500;
-const SUCCESS_CHIME_FADE_MS = 500;
+const SUCCESS_CHIME_FADE_MS = 2000;
 const SUCCESS_CHIME_FADE_STEP_MS = 25;
 
 let successSound: HTMLAudioElement | null = null;
@@ -51,7 +51,9 @@ function schedulePlaybackStop(sound: HTMLAudioElement) {
       try {
         const elapsed = Date.now() - fadeStartedAt;
         const progress = Math.min(1, elapsed / SUCCESS_CHIME_FADE_MS);
-        sound.volume = initialVolume * (1 - progress);
+        const remaining = 1 - progress;
+        // Ease into silence so the final pause happens below an audible level.
+        sound.volume = initialVolume * remaining * remaining;
         if (progress >= 1) {
           stopPlaybackTimer = null;
           finishPlayback(sound);
