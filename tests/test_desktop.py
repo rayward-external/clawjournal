@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import socket
 import struct
 import subprocess
@@ -346,6 +347,38 @@ def test_desktop_commands_pin_the_package_import_root(
     bootstrap = desktop._windows_bootstrap().read_text(encoding="utf-8")
     assert f"package_import_root = {str(desktop._package_import_root())!r}" in bootstrap
     assert "sys.path.insert(0, package_import_root)" in bootstrap
+
+
+def test_windows_bootstrap_prioritizes_pinned_package_root(
+    isolated_desktop: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pinned_root = tmp_path / "pinned root"
+    shadow_root = tmp_path / "shadow root"
+    for root, marker in ((pinned_root, "pinned"), (shadow_root, "shadow")):
+        package = root / "clawjournal"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "cli.py").write_text(
+            f"def main():\n    print({marker!r})\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(desktop, "_package_import_root", lambda: pinned_root)
+    desktop._write_windows_bootstrap()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join((str(shadow_root), str(pinned_root)))
+
+    subprocess.run(
+        [sys.executable, str(desktop._windows_bootstrap())],
+        cwd=tmp_path,
+        env=env,
+        check=True,
+        timeout=10,
+    )
+
+    assert desktop._log_file().read_text(encoding="utf-8").splitlines() == ["pinned"]
 
 
 def test_days_since_last_opened_accepts_a_naive_stamp(isolated_desktop: Path) -> None:
