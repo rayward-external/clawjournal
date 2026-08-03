@@ -235,7 +235,9 @@ export default function App() {
         });
     };
     probe();
-    const iv = setInterval(probe, indexHealth?.status === 'rebuilding' ? 1_000 : 20_000);
+    const checkInProgress = indexHealth?.status === 'checking'
+      || indexHealth?.status === 'rebuilding';
+    const iv = setInterval(probe, checkInProgress ? 1_000 : 20_000);
     return () => { cancelled = true; clearInterval(iv); };
   }, [indexHealth?.status]);
 

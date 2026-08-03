@@ -312,6 +312,20 @@ def current_index_health() -> dict[str, Any]:
         return dict(_INDEX_HEALTH)
 
 
+def begin_index_health_check() -> dict[str, Any]:
+    """Publish the fail-closed startup state before HTTP begins serving."""
+
+    database = _index_path()
+    return _set_health({
+        "status": "checking",
+        "message": "Checking the local index before enabling database work...",
+        "database_path": str(database.resolve()),
+        "sqlite_version": sqlite3.sqlite_version,
+        "journal_mode": index_module.INDEX_JOURNAL_MODE,
+        "automatic_recovery_available": False,
+    })
+
+
 def recovery_marker_exists(path: Path | None = None) -> bool:
     """Return whether any process has published an index-recovery marker."""
 
@@ -331,7 +345,7 @@ def synchronize_index_health() -> dict[str, Any]:
     marker_exists = recovery_marker_exists()
     if (
         marker_exists
-        and health.get("status") != "rebuilding"
+        and health.get("status") not in {"checking", "rebuilding"}
         and health.get("interrupted_recovery") is not True
     ):
         return initialize_index_health()
@@ -725,14 +739,27 @@ def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
 def initialize_index_health() -> dict[str, Any]:
     """Inspect once at daemon startup, before any scanner or egress worker."""
 
-    report = inspect_index_health()
+    try:
+        report = inspect_index_health()
+    except Exception as exc:
+        logger.exception("Workbench index startup check failed unexpectedly")
+        return _set_health({
+            "status": "unavailable",
+            "message": "The workbench index could not be checked safely.",
+            "detail": str(exc),
+            "database_path": str(_index_path().resolve()),
+            "sqlite_version": sqlite3.sqlite_version,
+            "journal_mode": index_module.INDEX_JOURNAL_MODE,
+            "automatic_recovery_available": False,
+        })
     if report["status"] != "ready":
         return _set_health(report)
     try:
         conn = index_module.open_index()
         conn.close()
         report["journal_mode"] = index_module.INDEX_JOURNAL_MODE
-    except (OSError, sqlite3.DatabaseError) as exc:
+    except Exception as exc:
+        logger.exception("Workbench index bootstrap failed unexpectedly")
         report = {
             **report,
             "status": "unavailable",

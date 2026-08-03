@@ -97,6 +97,7 @@ from .index import (
 )
 from .index_recovery import (
     UnsafeIndexRecovery,
+    begin_index_health_check,
     begin_guided_rebuild,
     current_index_health,
     guided_rebuild,
@@ -7172,12 +7173,11 @@ def run_server(
 
     scanner = Scanner(source_filter=source_filter)
     _open_request_admission()
-    index_health = initialize_index_health()
-    if index_health.get("status") != "ready":
-        logger.warning(
-            "Workbench index startup gate: %s",
-            index_health.get("message", "index recovery is required"),
-        )
+    # Publish a non-ready state before accepting requests. The authenticated
+    # identity/features endpoints can now make ``clawjournal open`` and the SPA
+    # responsive while the potentially long SQLite check runs, but every
+    # database-backed route and background worker remains fail-closed.
+    begin_index_health_check()
 
     # Start HTTP server first so it's responsive immediately. The primary socket
     # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
@@ -7204,12 +7204,6 @@ def run_server(
 
     _warn_if_frontend_stale(pinned=frontend_snapshot is not None)
 
-    # A manual Share may have queued recurring enrollment immediately before
-    # the daemon or machine stopped.  The accepted request lives in SQLite, so
-    # resume it before the ordinary background scan; no browser tab is needed.
-    if index_health.get("status") == "ready":
-        _start_auto_upload_enrollment_worker()
-
     if remote:
         import socket
         hostname = socket.gethostname()
@@ -7222,6 +7216,8 @@ def run_server(
 
     # Run initial scan in background, then start periodic scanner
     def _initial_scan() -> None:
+        if scanner._stop_event.is_set():
+            return
         logger.info("Running initial scan...")
         try:
             results = scanner.scan_once()
@@ -7245,31 +7241,27 @@ def run_server(
             scanner.start()
             logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
 
-    if index_health.get("status") == "ready":
-        threading.Thread(target=_initial_scan, daemon=True).start()
-    else:
-        logger.warning(
-            "Scanner, scoring, benchmarks, and automatic uploads remain "
-            "stopped until the index is recovered."
-        )
-
     # Watch the editable checkout: once the background auto-update has both
     # moved HEAD and reconciled the install, restart at a quiet moment so the
     # new frontend/backend pair becomes visible together. No-op for wheel
     # installs and under the --reload supervisor.
     restart_to: dict[str, str | None] = {"head": None}
+    startup_done = threading.Event()
+    stopping = threading.Event()
 
     def _watch_for_update() -> None:
         from .. import selfupdate
 
+        startup_done.wait()
+        if stopping.is_set():
+            return
         repo = selfupdate._package_repo_root()
         if repo is None:
             return  # wheel install — nothing to watch
         initial_head = startup_head or selfupdate._rev_parse(repo, "HEAD")
         if not initial_head:
             return
-        while True:
-            time.sleep(_RESTART_POLL_SECONDS)
+        while not stopping.wait(_RESTART_POLL_SECONDS):
             try:
                 head = _update_restart_due(repo, initial_head, scanner=scanner)
             except Exception:
@@ -7287,6 +7279,7 @@ def run_server(
                 restart_to["head"] = head
                 # Prevent the periodic/initial scanner from starting another
                 # pass or scoring batch while the listening loops stop.
+                stopping.set()
                 scanner._stop_event.set()
                 logger.info(
                     "ClawJournal updated (%s -> %s) — restarting the workbench "
@@ -7298,12 +7291,12 @@ def run_server(
                 server.shutdown()
                 return
 
-    threading.Thread(target=_watch_for_update, daemon=True,
-                     name="update-restart").start()
+    def _reconcile_stale_benchmarks() -> None:
+        """Fail stale benchmark work only after the index passes its gate."""
 
-    # Reconcile benchmark rows orphaned in 'generating' by a previous crash/restart
-    # (the only normal exit from 'generating' is the in-process worker).
-    if index_health.get("status") == "ready":
+        # Reconcile benchmark rows orphaned in 'generating' by a previous
+        # crash/restart (the only normal exit from 'generating' is the
+        # in-process worker).
         try:
             from ..benchmark import store as _bstore
             _bconn = open_index()
@@ -7319,15 +7312,71 @@ def run_server(
         except Exception:
             logger.warning("benchmark stale-row reconcile skipped", exc_info=True)
 
+    def _finish_startup() -> None:
+        """Check the index off the HTTP loop, then release background work."""
+
+        try:
+            index_health = initialize_index_health()
+            if stopping.is_set() or scanner._stop_event.is_set():
+                return
+
+            if index_health.get("status") != "ready":
+                logger.warning(
+                    "Workbench index startup gate: %s",
+                    index_health.get("message", "index recovery is required"),
+                )
+                logger.warning(
+                    "Scanner, scoring, benchmarks, and automatic uploads remain "
+                    "stopped until the index is recovered."
+                )
+                return
+
+            # A manual Share may have queued recurring enrollment immediately
+            # before the daemon or machine stopped. The accepted request lives
+            # in SQLite, so resume it before the ordinary background scan.
+            _start_auto_upload_enrollment_worker()
+            if stopping.is_set() or scanner._stop_event.is_set():
+                return
+            _reconcile_stale_benchmarks()
+            if stopping.is_set() or scanner._stop_event.is_set():
+                return
+            # Keep all startup DB work in one tracked thread. The HTTP loop is
+            # already serving, and the update watcher cannot restart over it.
+            _initial_scan()
+        except Exception:
+            logger.exception("Workbench background startup failed")
+        finally:
+            startup_done.set()
+
+    update_watch_thread = threading.Thread(
+        target=_watch_for_update,
+        daemon=True,
+        name="update-restart",
+    )
+    update_watch_thread.start()
+
+    startup_health_thread = threading.Thread(
+        target=_finish_startup,
+        daemon=True,
+        name="index-startup-health",
+    )
+    startup_health_thread.start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        stopping.set()
+        startup_done.set()
         scanner.stop()
-        server.shutdown()
         if v6_server is not None:
             v6_server.shutdown()
+        startup_health_thread.join(timeout=1.0)
+        update_watch_thread.join(timeout=1.0)
+        server.server_close()
+        if v6_server is not None:
+            v6_server.server_close()
         if restart_to["head"]:
             # A scan that began just before admission froze may outlive
             # Scanner.stop()'s bounded join.  Never exec over any durable or

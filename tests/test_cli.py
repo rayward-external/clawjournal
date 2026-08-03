@@ -1485,6 +1485,28 @@ class TestScanOutput:
 
 
 class TestWorkbenchSourceChoices:
+    def test_open_dispatches_to_one_shot_desktop_controller(
+        self, monkeypatch, capsys
+    ):
+        from clawjournal import desktop
+
+        calls = []
+        monkeypatch.setattr(
+            "clawjournal.cli._should_auto_update", lambda argv=None: False
+        )
+
+        def launch(**kwargs):
+            calls.append(kwargs)
+            return "http://localhost:8384/"
+
+        monkeypatch.setattr(desktop, "launch", launch)
+        monkeypatch.setattr(sys, "argv", ["clawjournal", "open"])
+
+        main()
+
+        assert calls == [{}]
+        assert "Workbench ready: http://localhost:8384/" in capsys.readouterr().out
+
     def test_scan_accepts_cursor_source(self, monkeypatch):
         seen = {}
         monkeypatch.setattr("clawjournal.cli._run_scan", lambda source_filter=None: seen.setdefault("source", source_filter))
@@ -1505,6 +1527,33 @@ class TestWorkbenchSourceChoices:
         main()
 
         assert seen["source_filter"] == "aider"
+
+    def test_serve_hidden_no_port_fallback_flag_is_forwarded(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            "clawjournal.cli._should_auto_update", lambda argv=None: False
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.run_server",
+            lambda **kwargs: seen.update(kwargs),
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "clawjournal",
+                "serve",
+                "--port",
+                "9384",
+                "--no-browser",
+                "--no-port-fallback",
+            ],
+        )
+
+        main()
+
+        assert seen["port"] == 9384
+        assert seen["allow_port_fallback"] is False
 
     def test_recent_accepts_copilot_source(self, monkeypatch):
         seen = {}

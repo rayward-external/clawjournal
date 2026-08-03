@@ -62,6 +62,41 @@ describe('workbench index startup gate', () => {
     expect(scoringWarmup).not.toHaveBeenCalled();
   });
 
+  it('keeps DB-backed UI unmounted while checking and polls quickly until ready', async () => {
+    const checking = features({
+      status: 'checking',
+      message: 'Checking the local index before enabling database work...',
+    });
+    const ready = features({ status: 'ready' });
+    let resolveReady!: (value: Features) => void;
+    const readyResponse = new Promise<Features>(resolve => { resolveReady = resolve; });
+    const featureProbe = vi.spyOn(api, 'features')
+      .mockResolvedValueOnce(checking)
+      // The status transition recreates the polling effect and probes once
+      // immediately before the 1s checking interval begins.
+      .mockResolvedValueOnce(checking)
+      .mockReturnValue(readyResponse);
+    const stats = vi.spyOn(api, 'stats').mockResolvedValue(emptyStats);
+    const advisor = vi.spyOn(api, 'advisor').mockResolvedValue(emptyAdvisor);
+    const sessions = vi.spyOn(api.sessions, 'list').mockResolvedValue([]);
+    const scoringWarmup = vi.spyOn(api, 'scoringWarmup').mockResolvedValue({ status: 'declined' });
+    localStorage.setItem('cj.gettingStartedGuideV2Dismissed', '1');
+
+    render(<App />);
+
+    expect(await screen.findByText('Checking the local index before enabling database work...')).toBeInTheDocument();
+    await waitFor(() => expect(featureProbe).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('link', { name: 'Sessions' })).not.toBeInTheDocument();
+    expect(stats).not.toHaveBeenCalled();
+    expect(advisor).not.toHaveBeenCalled();
+    expect(sessions).not.toHaveBeenCalled();
+    expect(scoringWarmup).not.toHaveBeenCalled();
+
+    resolveReady(ready);
+    expect(await screen.findByRole('link', { name: 'Sessions' }, { timeout: 3_000 })).toBeInTheDocument();
+    expect(featureProbe.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
   it('mounts the normal workbench only after a successful ready probe', async () => {
     vi.spyOn(api, 'features').mockResolvedValue(features({ status: 'ready' }));
     vi.spyOn(api, 'stats').mockResolvedValue(emptyStats);

@@ -364,6 +364,186 @@ def test_index_recovery_gate_leaves_only_health_probe_available(server):
         })
 
 
+def test_run_server_serves_checking_health_before_releasing_database_workers(
+    index_setup,
+    monkeypatch,
+):
+    """A slow integrity check must not trip the one-shot launch timeout.
+
+    The authenticated identity and DB-free features endpoints come up while
+    inspection is blocked. Database routes and every database worker remain
+    fail-closed until the check publishes ``ready``.
+    """
+
+    from http.server import ThreadingHTTPServer
+
+    from clawjournal import config, selfupdate
+    from clawjournal.paths import api_health_proof
+    from clawjournal.workbench import daemon, index_recovery
+
+    check_entered = Event()
+    release_check = Event()
+    serve_entered = Event()
+    periodic_scanner_started = Event()
+    server_created = Event()
+    holder: dict[str, ThreadingHTTPServer] = {}
+    run_errors: list[BaseException] = []
+    worker_events: list[str] = []
+    database_opened_while_checking: list[bool] = []
+
+    class ControlledScanner:
+        def __init__(self, source_filter=None):
+            self.source_filter = source_filter
+            self._stop_event = Event()
+            self._thread = None
+            self._score_thread = None
+            self._scan_lock = Lock()
+            self.last_updated_count = 0
+            self.last_linked_count = 0
+
+        def scan_once(self):
+            worker_events.append("initial-scan")
+            return {}
+
+        def start(self):
+            worker_events.append("periodic-scanner")
+            periodic_scanner_started.set()
+
+        def stop(self):
+            self._stop_event.set()
+
+    real_open_index = daemon.open_index
+
+    def guarded_open_index(*args, **kwargs):
+        if not release_check.is_set():
+            database_opened_while_checking.append(True)
+            raise AssertionError("database opened before startup health was ready")
+        return real_open_index(*args, **kwargs)
+
+    def blocked_initialize():
+        assert index_recovery.current_index_health()["status"] == "checking"
+        check_entered.set()
+        if not release_check.wait(5):
+            return index_recovery._set_health({
+                "status": "unavailable",
+                "message": "Test startup health check timed out.",
+                "automatic_recovery_available": False,
+            })
+        return index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index is ready.",
+        })
+
+    def make_server(address, handler):
+        server = ThreadingHTTPServer(address, handler)
+        real_serve_forever = server.serve_forever
+
+        def serve_forever(*args, **kwargs):
+            serve_entered.set()
+            return real_serve_forever(*args, **kwargs)
+
+        server.serve_forever = serve_forever
+        holder["server"] = server
+        server_created.set()
+        return server
+
+    monkeypatch.setattr(daemon, "Scanner", ControlledScanner)
+    monkeypatch.setattr(daemon, "ThreadingHTTPServer", make_server)
+    monkeypatch.setattr(
+        daemon,
+        "_try_serve_ipv6_loopback",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(daemon, "initialize_index_health", blocked_initialize)
+    monkeypatch.setattr(daemon, "open_index", guarded_open_index)
+    monkeypatch.setattr(daemon, "_warn_if_frontend_stale", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        daemon,
+        "_start_auto_upload_enrollment_worker",
+        lambda: worker_events.append("auto-upload-enrollment"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "trigger_scoring_warmup",
+        lambda _scanner: worker_events.append("scoring-warmup"),
+    )
+    monkeypatch.setattr(selfupdate, "_package_repo_root", lambda: None)
+    monkeypatch.setattr(config, "load_config", lambda: {})
+
+    def run() -> None:
+        try:
+            daemon.run_server(port=0, open_browser=False)
+        except BaseException as exc:  # surface background assertion failures
+            run_errors.append(exc)
+
+    run_thread = Thread(target=run, daemon=True)
+    run_thread.start()
+    try:
+        assert server_created.wait(2)
+        assert check_entered.wait(2)
+        assert serve_entered.wait(2)
+        server = holder["server"]
+        port = server.server_address[1]
+
+        challenge = "a" * 32
+        status, identity = _get(
+            port,
+            f"/.well-known/clawjournal?challenge={challenge}",
+            skip_auth=True,
+        )
+        assert status == 200
+        assert identity["service"] == "clawjournal"
+        token = _api_auth_headers()["Authorization"].removeprefix("Bearer ")
+        assert identity["proof"] == api_health_proof(token, challenge)
+
+        status, features = _get(port, "/api/features")
+        assert status == 200
+        assert features["index_health"]["status"] == "checking"
+
+        for status, body in (
+            _get(port, "/api/stats"),
+            _post(port, "/api/scan"),
+        ):
+            assert status == 503
+            assert body["index_health"]["status"] == "checking"
+
+        assert worker_events == []
+        assert database_opened_while_checking == []
+
+        release_check.set()
+        assert periodic_scanner_started.wait(3)
+
+        deadline = time.monotonic() + 3
+        while True:
+            status, features = _get(port, "/api/features")
+            if status == 200 and features["index_health"]["status"] == "ready":
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+        assert worker_events[:3] == [
+            "auto-upload-enrollment",
+            "initial-scan",
+            "scoring-warmup",
+        ]
+        assert "periodic-scanner" in worker_events
+        assert database_opened_while_checking == []
+    finally:
+        release_check.set()
+        if serve_entered.is_set() and "server" in holder:
+            holder["server"].shutdown()
+        run_thread.join(timeout=5)
+        if "server" in holder:
+            holder["server"].server_close()
+        index_recovery._set_health({
+            "status": "ready",
+            "message": "The test index is ready.",
+        })
+
+    assert not run_thread.is_alive()
+    assert run_errors == []
+
+
 def test_external_recovery_marker_blocks_and_then_resumes_cached_daemon(
     server,
     index_setup,

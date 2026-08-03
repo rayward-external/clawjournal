@@ -119,6 +119,93 @@ def test_initialize_new_index_uses_delete_journal(recovery_install):
         conn.close()
 
 
+def test_begin_index_health_check_is_fail_closed_and_not_reinspected(
+    recovery_install,
+    monkeypatch,
+):
+    """Requests must see a stable non-ready state while startup inspection runs."""
+
+    health = index_recovery.begin_index_health_check()
+
+    assert health["status"] == "checking"
+    assert health["automatic_recovery_available"] is False
+    assert health["database_path"] == str(
+        (recovery_install / "index.db").resolve()
+    )
+    assert index_recovery.current_index_health() == health
+
+    # A stale cross-process recovery marker must not make an HTTP request run a
+    # second integrity check concurrently with the startup check.
+    monkeypatch.setattr(index_recovery, "recovery_marker_exists", lambda: True)
+    monkeypatch.setattr(
+        index_recovery,
+        "initialize_index_health",
+        lambda: pytest.fail("checking health must not be reinspected"),
+    )
+
+    assert index_recovery.synchronize_index_health() == health
+
+
+def test_initialize_unexpected_inspection_error_becomes_unavailable(
+    recovery_install,
+    monkeypatch,
+):
+    """An ordinary startup exception must fail closed instead of leaking checking."""
+
+    index_recovery.begin_index_health_check()
+    monkeypatch.setattr(
+        index_recovery,
+        "inspect_index_health",
+        lambda: (_ for _ in ()).throw(RuntimeError("unexpected health failure")),
+    )
+    monkeypatch.setattr(
+        index_module,
+        "open_index",
+        lambda: pytest.fail("an unchecked index must never be opened"),
+    )
+
+    report = index_recovery.initialize_index_health()
+
+    assert report["status"] == "unavailable"
+    assert report["automatic_recovery_available"] is False
+    assert report["detail"] == "unexpected health failure"
+    assert report["database_path"] == str(
+        (recovery_install / "index.db").resolve()
+    )
+    assert index_recovery.current_index_health() == report
+
+
+def test_initialize_unexpected_open_error_becomes_unavailable(
+    recovery_install,
+    monkeypatch,
+):
+    """The post-inspection schema/bootstrap open is part of the same gate."""
+
+    index_recovery.begin_index_health_check()
+    monkeypatch.setattr(
+        index_recovery,
+        "inspect_index_health",
+        lambda: {
+            "status": "ready",
+            "message": "The test index passed inspection.",
+            "database_path": str((recovery_install / "index.db").resolve()),
+            "automatic_recovery_available": False,
+        },
+    )
+    monkeypatch.setattr(
+        index_module,
+        "open_index",
+        lambda: (_ for _ in ()).throw(RuntimeError("unexpected open failure")),
+    )
+
+    report = index_recovery.initialize_index_health()
+
+    assert report["status"] == "unavailable"
+    assert report["automatic_recovery_available"] is False
+    assert report["detail"] == "unexpected open failure"
+    assert index_recovery.current_index_health() == report
+
+
 def test_initialize_healthy_wal_index_converts_to_delete(recovery_install):
     database = recovery_install / "index.db"
     database.parent.mkdir(parents=True)

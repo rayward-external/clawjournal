@@ -33,6 +33,25 @@ jobs:
           tests/test_install_scripts.py
           tests/workbench/test_update_restart.py
           -v
+      - name: One-shot workbench open (native Windows)
+        run: >-
+          python -m pytest
+          tests/test_desktop.py::test_port_probe_requires_a_valid_health_challenge_response
+          tests/test_desktop.py::test_wait_for_workbench_uses_a_fixed_deadline
+          tests/test_desktop.py::test_browser_open_attempt_is_bounded_and_called_once
+          tests/test_desktop.py::test_launch_reuses_live_workbench
+          tests/test_desktop.py::test_launch_starts_daemon_then_scans_and_opens_exactly_once
+          tests/test_desktop.py::test_update_restart_launch_suppresses_launch_only_actions
+          tests/test_desktop.py::test_launch_timeout_terminates_child_and_reports_command_log_and_output
+          tests/test_desktop.py::test_launch_early_exit_terminates_child_and_reports_exit_code
+          tests/test_desktop.py::test_spawn_workbench_daemon_uses_windows_detached_creation_flags
+          tests/test_desktop.py::test_occupied_unknown_port_is_not_opened_or_replaced
+          tests/test_desktop.py::test_losing_the_startup_race_does_not_spawn_a_duplicate
+          tests/test_desktop.py::test_losing_startup_race_to_another_service_reports_an_error
+          tests/test_desktop.py::test_run_server_can_refuse_the_ephemeral_port_fallback
+          tests/test_cli.py::TestWorkbenchSourceChoices::test_open_dispatches_to_one_shot_desktop_controller
+          tests/test_cli.py::TestWorkbenchSourceChoices::test_serve_hidden_no_port_fallback_flag_is_forwarded
+          -v
 
   smoke:
     runs-on: ubuntu-latest

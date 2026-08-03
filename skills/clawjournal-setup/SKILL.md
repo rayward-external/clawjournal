@@ -133,8 +133,11 @@ powershell -ExecutionPolicy Bypass -File "$HOME\clawjournal\scripts\install.ps1"
 Then start the workbench:
 
 ```bash
-~/.clawjournal-venv/bin/clawjournal serve
+~/.clawjournal-venv/bin/clawjournal open
 ```
+
+This starts or reuses the local daemon, waits a bounded time for readiness, opens
+the browser, and then returns. Do not wait for a foreground daemon to exit.
 
 Tell the user: "Your workbench is open at localhost:8384. Everything is 100% local. Use the Inbox to triage traces, Search to find sessions, and Bundles to assemble exports."
 
@@ -146,7 +149,10 @@ Tell the user: "Your workbench is open at localhost:8384. Everything is 100% loc
 
 Parse the JSON and present traces as a numbered list. Then guide triage interactively.
 
-**For remote VMs:** `clawjournal serve --remote` prints the SSH tunnel command.
+**For remote VMs:** use `clawjournal serve --remote` in a dedicated terminal or
+background process and follow the SSH tunnel command it prints. `serve` is a
+foreground, long-running daemon command; do not wait for it to exit before
+continuing the setup conversation.
 
 ## 5. Done
 

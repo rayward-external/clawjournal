@@ -206,6 +206,7 @@ export interface Policy {
 
 export type IndexHealthStatus =
   | 'ready'
+  | 'checking'
   | 'recovery_required'
   | 'rebuilding'
   | 'unavailable';

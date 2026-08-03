@@ -12,6 +12,7 @@ interface IndexRecoveryScreenProps {
 
 const HEALTH_STATUSES = new Set([
   'ready',
+  'checking',
   'recovery_required',
   'rebuilding',
   'unavailable',
@@ -87,6 +88,12 @@ export function IndexRecoveryScreen({
       </div>
     ) : (
       <Spinner text="Checking the local index..." />
+    );
+  } else if (health.status === 'checking') {
+    content = (
+      <div role="status" aria-live="polite" aria-busy="true">
+        <Spinner text={health.message || 'Checking the local index...'} />
+      </div>
     );
   } else if (health.status === 'rebuilding') {
     content = (

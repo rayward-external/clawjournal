@@ -19,6 +19,23 @@ afterEach(() => {
 });
 
 describe('IndexRecoveryScreen', () => {
+  it('shows a passive spinner while the startup integrity check is running', () => {
+    render(
+      <IndexRecoveryScreen
+        health={{
+          status: 'checking',
+          message: 'Checking the local index before enabling database work...',
+        }}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    const status = screen.getByRole('status');
+    expect(status).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByText('Checking the local index before enabling database work...')).toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
   it('offers one explicit action without adding a second confirmation dialog', () => {
     render(
       <IndexRecoveryScreen
