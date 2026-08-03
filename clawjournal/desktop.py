@@ -101,6 +101,8 @@ _UPDATE_RESTART_CHILD_ENV = "CLAWJOURNAL_RESTART_CHILD"
 _PORT_FREE = "free"
 _PORT_WORKBENCH = "workbench"
 _PORT_OCCUPIED = "occupied"
+_IPV4_LOOPBACK_HOST = "127.0.0.1"
+_BROWSER_LOOPBACK_HOST = "localhost"
 _NOTE_OPENED_LOCK = threading.Lock()
 _NOTE_OPENED_THREAD_LOCK = threading.Lock()
 _note_opened_thread: threading.Thread | None = None
@@ -1063,30 +1065,44 @@ def _daemon_port_is_open(port: int) -> bool:
     return _daemon_port_is_open(port)
 
 
-def _workbench_port_state(port: int) -> str:
-    """Classify the configured port without mistaking another service for us."""
-    if not _daemon_port_is_open(port):
-        return _PORT_FREE
-
+def _workbench_health_matches(port: int, host: str) -> bool:
+    """Authenticate a loopback endpoint without sending it the API token."""
     token = ensure_api_token(_config_dir())
     challenge = secrets.token_hex(HEALTH_CHALLENGE_BYTES)
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/.well-known/clawjournal?challenge={challenge}",
+        f"http://{host}:{port}/.well-known/clawjournal?challenge={challenge}",
     )
     try:
         with urllib.request.urlopen(request, timeout=0.75) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
-        return _PORT_OCCUPIED
+        return False
     expected_proof = api_health_proof(token, challenge)
-    if (
+    return bool(
         isinstance(payload, dict)
         and payload.get("service") == "clawjournal"
         and isinstance(payload.get("proof"), str)
         and secrets.compare_digest(payload["proof"], expected_proof)
-    ):
+    )
+
+
+def _workbench_port_state(port: int) -> str:
+    """Classify the configured port without mistaking another service for us."""
+    if not _daemon_port_is_open(port):
+        return _PORT_FREE
+    if _workbench_health_matches(port, _IPV4_LOOPBACK_HOST):
         return _PORT_WORKBENCH
     return _PORT_OCCUPIED
+
+
+def _workbench_browser_url(port: int) -> str:
+    """Preserve the localhost origin only when that exact endpoint is ours."""
+    if _workbench_health_matches(port, _BROWSER_LOOPBACK_HOST):
+        return f"http://{_BROWSER_LOOPBACK_HOST}:{port}/"
+    # This helper is called only after the primary IPv4 listener passed the
+    # authenticated health check. A failed localhost proof can therefore mean
+    # that an unrelated service owns the preferred ::1 endpoint.
+    return f"http://{_IPV4_LOOPBACK_HOST}:{port}/"
 
 
 def _occupied_port_error(port: int) -> DesktopError:
@@ -1333,13 +1349,9 @@ def launch(
         note_opened()
     config = load_config()
     port = int(config.get("daemon_port") or 8384)
-    # Open the exact IPv4 endpoint authenticated by _workbench_port_state().
-    # The daemon's best-effort ::1 companion may be unavailable because a
-    # different local service already owns that port; using localhost here
-    # could otherwise send the browser to that unrelated IPv6 listener.
-    url = f"http://127.0.0.1:{port}/"
     port_state = _workbench_port_state(port)
     if port_state == _PORT_WORKBENCH:
+        url = _workbench_browser_url(port)
         if not is_restart_child:
             _request_scan(port)
             _open_browser_once(url)
@@ -1379,6 +1391,7 @@ def launch(
                     timeout_seconds=startup_timeout,
                     timed_out=timed_out,
                 )
+    url = _workbench_browser_url(port)
     if not is_restart_child:
         _request_scan(port)
         _open_browser_once(url)

@@ -551,6 +551,33 @@ def test_port_probe_requires_a_valid_health_challenge_response(
     assert desktop._workbench_port_state(8384) == desktop._PORT_OCCUPIED
 
 
+def test_browser_url_preserves_an_authenticated_localhost_origin(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[int, str]] = []
+
+    def health_matches(port: int, host: str) -> bool:
+        calls.append((port, host))
+        return True
+
+    monkeypatch.setattr(desktop, "_workbench_health_matches", health_matches)
+
+    assert desktop._workbench_browser_url(8384) == "http://localhost:8384/"
+    assert calls == [(8384, "localhost")]
+
+
+def test_browser_url_falls_back_when_localhost_is_not_authenticated(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        desktop,
+        "_workbench_health_matches",
+        lambda _port, _host: False,
+    )
+
+    assert desktop._workbench_browser_url(8384) == "http://127.0.0.1:8384/"
+
+
 class _FakeWorkbenchProcess:
     def __init__(self, returncode: int | None = None) -> None:
         self.returncode = returncode
@@ -617,18 +644,21 @@ def test_launch_reuses_live_workbench(
         "_workbench_port_state",
         lambda port: desktop._PORT_WORKBENCH if port == 9001 else desktop._PORT_FREE,
     )
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://localhost:9001/"
+    )
     monkeypatch.setattr(desktop, "_request_scan", lambda port: calls.append(("scan", port)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda url: calls.append(("browser", url)))
     monkeypatch.setattr(
         desktop, "_trigger_self_update", lambda: calls.append("selfupdate")
     )
 
-    assert desktop.launch() == "http://127.0.0.1:9001/"
+    assert desktop.launch() == "http://localhost:9001/"
 
     assert calls == [
         "opened",
         ("scan", 9001),
-        ("browser", "http://127.0.0.1:9001/"),
+        ("browser", "http://localhost:9001/"),
         "selfupdate",
     ]
 
@@ -644,6 +674,9 @@ def test_launch_starts_daemon_then_scans_and_opens_exactly_once(
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
     monkeypatch.setattr(
         desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE
+    )
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://localhost:9001/"
     )
     monkeypatch.setattr(
         desktop,
@@ -669,13 +702,13 @@ def test_launch_starts_daemon_then_scans_and_opens_exactly_once(
         lambda _proc: pytest.fail("a ready daemon must not be terminated"),
     )
 
-    assert desktop.launch(startup_timeout=4.5) == "http://127.0.0.1:9001/"
+    assert desktop.launch(startup_timeout=4.5) == "http://localhost:9001/"
 
     assert calls == [
         "opened",
         ("wait", process, 9001, 4.5),
         ("scan", 9001),
-        ("browser", "http://127.0.0.1:9001/"),
+        ("browser", "http://localhost:9001/"),
         "selfupdate",
     ]
 
@@ -690,6 +723,9 @@ def test_update_restart_launch_suppresses_launch_only_actions(
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
     monkeypatch.setattr(
         desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE
+    )
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://localhost:9001/"
     )
     monkeypatch.setattr(
         desktop,
@@ -870,6 +906,9 @@ def test_losing_the_startup_race_does_not_spawn_a_duplicate(
     monkeypatch.setattr(desktop.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(desktop, "_request_scan", lambda p: calls.append(("scan", p)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://127.0.0.1:8384/"
+    )
     monkeypatch.setattr(
         desktop,
         "_spawn_workbench_daemon",
