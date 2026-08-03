@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ def segment_append_only_session(
     *,
     message_start_offsets: list[int] | None = None,
     raw_source_size: int | None = None,
-    message_token_snapshots: list[tuple[int, int, int, int]] | None = None,
+    message_token_snapshots: list[Sequence[int]] | None = None,
     max_messages: int = APPEND_ONLY_MAX_MESSAGES,
     max_user_messages: int = APPEND_ONLY_MAX_USER_MESSAGES,
     max_text_bytes: int = APPEND_ONLY_MAX_TEXT_BYTES,
@@ -60,6 +61,8 @@ def segment_append_only_session(
     (input, output, cache_read, cache_creation) token totals as of each
     message; each child's stats get the delta over its message range so the
     file-level totals partition across segments instead of being dropped.
+    Snapshots that do not line up with the messages are ignored, leaving the
+    children with the zeroed token counts they had before.
     """
 
     messages = session.get("messages", [])
@@ -160,6 +163,9 @@ def segment_append_only_session(
                 "messages",
                 "stats",
                 "_raw_message_end_offsets",
+                "_raw_message_start_offsets",
+                "_raw_message_token_snapshots",
+                "_raw_source_size",
                 "_raw_source_fingerprint",
             }
         }
@@ -692,8 +698,13 @@ _TOKEN_SNAPSHOT_FIELDS = (
 
 def _validated_token_snapshots(
     snapshots: Any, message_count: int
-) -> list[tuple[int, int, int, int]] | None:
-    """Return the snapshots only when they align 1:1 with the messages."""
+) -> list[Sequence[int]] | None:
+    """Return the snapshots only when they align 1:1 with the messages.
+
+    Elements may be lists rather than tuples: a session dict that round-trips
+    through JSON loses the tuple type, and dropping token stats for that reason
+    alone would be a silent regression.
+    """
     if not isinstance(snapshots, list) or len(snapshots) != message_count:
         return None
     for snapshot in snapshots:
@@ -710,13 +721,15 @@ def _validated_token_snapshots(
 
 
 def _segment_token_deltas(
-    snapshots: list[tuple[int, int, int, int]], start: int, end: int
+    snapshots: list[Sequence[int]], start: int, end: int
 ) -> dict[str, int]:
     """Token totals accrued across messages[start:end], from cumulative snapshots."""
     previous = snapshots[start - 1] if start else (0, 0, 0, 0)
     last = snapshots[end - 1]
+    # Both parsers accumulate monotonically, so the clamp only guards against a
+    # caller handing us snapshots that go backwards.
     return {
-        field: max(0, int(last[index]) - int(previous[index]))
+        field: max(0, last[index] - previous[index])
         for index, field in enumerate(_TOKEN_SNAPSHOT_FIELDS)
     }
 
@@ -729,6 +742,8 @@ def _compute_stats(messages: list[dict]) -> dict[str, int]:
         "tool_uses": 0,
         "input_tokens": 0,
         "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
     }
     for msg in messages:
         role = msg.get("role")

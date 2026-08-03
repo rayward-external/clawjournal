@@ -3100,6 +3100,10 @@ def test_long_claude_session_checkpoint_includes_interstitial_tool_result(
     assert sessions[0]["messages"][-1]["tool_uses"][0]["output"] == {
         "text": "result-19"
     }
+    # Each turn bills 1 input / 1 output token, so the per-segment deltas must
+    # partition the 21 turns instead of being reset to zero by _compute_stats.
+    assert [session["stats"]["input_tokens"] for session in sessions] == [20, 1]
+    assert [session["stats"]["output_tokens"] for session in sessions] == [20, 1]
 
 
 def _make_wrapper_json(

@@ -2468,27 +2468,22 @@ def _parse_claude_session_file(
                 tool_result_map,
             )
             if capture_raw_offsets and len(messages) > before_messages:
+                added_messages = len(messages) - before_messages
                 raw_message_start_offsets.extend(
-                    [int(parse_snapshot["record_start"])]
-                    * (len(messages) - before_messages)
+                    [int(parse_snapshot["record_start"])] * added_messages
                 )
                 raw_message_end_offsets.extend(
-                    [int(parse_snapshot["record_end"])]
-                    * (len(messages) - before_messages)
+                    [int(parse_snapshot["record_end"])] * added_messages
                 )
-            if capture_raw_offsets:
-                token_snapshot = (
+                # Cumulative totals as of each message. Claude bills usage on
+                # the same entry that carries the assistant message, so an
+                # entry that adds no message never moves these counters.
+                raw_message_token_snapshots.extend([(
                     stats["input_tokens"],
                     stats["output_tokens"],
                     stats["cache_read_tokens"],
                     stats["cache_creation_tokens"],
-                )
-                if len(messages) > before_messages:
-                    raw_message_token_snapshots.extend(
-                        [token_snapshot] * (len(messages) - before_messages)
-                    )
-                elif raw_message_token_snapshots:
-                    raw_message_token_snapshots[-1] = token_snapshot
+                )] * added_messages)
     except OSError:
         if strict_jsonl:
             raise
@@ -3119,6 +3114,19 @@ def _build_codex_tool_result_map(
     return result
 
 
+def _codex_token_snapshot(state: _CodexParseState) -> tuple[int, int, int, int]:
+    """Cumulative (input, output, cache_read, cache_creation) totals so far.
+
+    Codex rollouts report no cache-creation counter, so that slot stays zero.
+    """
+    return (
+        state.max_input_tokens,
+        state.max_output_tokens,
+        state.max_cached_tokens,
+        0,
+    )
+
+
 def _parse_codex_session_file(
     filepath: Path,
     anonymizer: Anonymizer,
@@ -3220,12 +3228,7 @@ def _parse_codex_session_file(
                 # Cumulative totals as of each message. A token_count arriving
                 # between messages belongs to the response it concludes, so it
                 # updates the latest message's snapshot in place.
-                token_snapshot = (
-                    state.max_input_tokens,
-                    state.max_output_tokens,
-                    state.max_cached_tokens,
-                    0,
-                )
+                token_snapshot = _codex_token_snapshot(state)
                 if len(state.messages) > before_messages:
                     raw_message_token_snapshots.extend(
                         [token_snapshot] * (len(state.messages) - before_messages)
@@ -3261,13 +3264,7 @@ def _parse_codex_session_file(
             * (len(state.messages) - before_flush)
         )
         raw_message_token_snapshots.extend(
-            [(
-                state.max_input_tokens,
-                state.max_output_tokens,
-                state.max_cached_tokens,
-                0,
-            )]
-            * (len(state.messages) - before_flush)
+            [_codex_token_snapshot(state)] * (len(state.messages) - before_flush)
         )
 
     if state.metadata["model"] is None:
