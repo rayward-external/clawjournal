@@ -12,8 +12,12 @@ from clawjournal.skill.due import (
 NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _seed_skill_state(conn, *, installed_days_ago=15.0, last_seen_days_ago=None):
+def _seed_skill_state(conn, *, installed_days_ago=15.0, last_seen_days_ago=None,
+                      nudge_enabled=True):
     """Insert one skill_rules row anchoring the user's last skill activity."""
+    from clawjournal.skill.due import set_nudge_hook_requested
+    if nudge_enabled:   # the nudge is opt-in via `skill --install-nudge`
+        set_nudge_hook_requested(conn, True, now=NOW - timedelta(days=30))
     _store.ensure_table(conn)
     installed = (NOW - timedelta(days=installed_days_ago)).isoformat()
     seen = (NOW - timedelta(days=last_seen_days_ago)).isoformat() \
@@ -34,8 +38,34 @@ def _seed_sessions(conn, ins, n, *, failures=0, days_ago=2.0):
             learning="x" if i < failures else None)
 
 
+def test_nudge_requires_explicit_opt_in(index_conn, ins):
+    # the SessionStart hook is shared with auto-upload, so hook presence is not
+    # consent: without --install-nudge the check is inert (Codex re-review)
+    _seed_skill_state(index_conn, installed_days_ago=15, nudge_enabled=False)
+    _seed_sessions(index_conn, ins, 6)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert not status.due and status.reason == "nudge-not-enabled"
+
+
+def test_uninstall_nudge_silences_an_installed_hook(index_conn, ins):
+    # --uninstall-nudge may leave the shared hook installed for uploads; the
+    # nudge itself must still stop firing
+    from clawjournal.skill.due import set_nudge_hook_requested
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    _seed_sessions(index_conn, ins, 6)
+    assert distill_due_on_connection(index_conn, NOW).due
+    set_nudge_hook_requested(index_conn, False)
+    lines: list[str] = []
+    assert emit_session_start_nudge(
+        "claude", now=NOW, conn_factory=lambda: index_conn,
+        printer=lines.append) is False
+    assert lines == []
+
+
 def test_never_distilled_is_never_nudged(index_conn):
-    # no skill_rules table at all (fresh DB) -> the user never opted in
+    # opted in, but no skill_rules rows yet (never ran the pipeline)
+    from clawjournal.skill.due import set_nudge_hook_requested
+    set_nudge_hook_requested(index_conn, True, now=NOW)
     status = distill_due_on_connection(index_conn, NOW)
     assert not status.due and status.reason == "never-distilled"
 
@@ -202,6 +232,8 @@ def test_auto_upload_teardown_guard_fails_open(tmp_path, monkeypatch):
 
 
 def test_skill_rules_table_present_but_empty_is_never_distilled(index_conn):
+    from clawjournal.skill.due import set_nudge_hook_requested
+    set_nudge_hook_requested(index_conn, True, now=NOW)
     _store.ensure_table(index_conn)   # table exists, no rows (e.g. everything rejected)
     status = distill_due_on_connection(index_conn, NOW)
     assert not status.due and status.reason == "never-distilled"
@@ -267,6 +299,31 @@ def test_malformed_iso_lookalike_start_time_never_counts(index_conn, ins):
         ins(index_conn, f"f{i}", start_time="2027-01-01T00:00:00+00:00")
     status = distill_due_on_connection(index_conn, NOW)
     assert not status.due and status.reason == "quiet"
+
+
+def test_held_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
+    # the row cap is applied AFTER the cheap eligibility filters, so a pile of
+    # held sessions can no longer hide real activity (Codex re-review)
+    from clawjournal.skill.due import _COUNT_CAP
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    start_old = (NOW - timedelta(days=5)).isoformat()
+    for i in range(_COUNT_CAP + 50):
+        ins(index_conn, f"held{i}", start_time=start_old, hold_state="pending_review")
+    start_new = (NOW - timedelta(days=1)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"ok{i}", start_time=start_new)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_saturated_count_is_reported_as_a_floor(index_conn, ins):
+    from clawjournal.skill.due import _COUNT_CAP
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    start = (NOW - timedelta(days=1)).isoformat()
+    for i in range(_COUNT_CAP + 10):
+        ins(index_conn, f"s{i}", start_time=start)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and f"{_COUNT_CAP}+" in status.message
 
 
 def test_nudge_hook_requested_flag_round_trip(index_conn):

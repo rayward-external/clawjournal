@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 from ..workbench.index import (
     FAILURE_VALUE_SOURCE_SCOPE,
+    SHAREABLE_HOLD_STATES,
     session_matches_excluded_projects,
 )
 from .select import _parse_start_time, _release_blocked_ids
@@ -41,7 +42,12 @@ NUDGE_BURST_SESSIONS = 25
 NUDGE_FAILURE_SESSIONS = 3
 NUDGE_COOLDOWN_DAYS = 3.0   # an emitted nudge suppresses repeats across sessions
 
-_COUNT_CAP = 1000           # counts saturate here; thresholds sit far below it
+# Rows examined per check. The SQL narrows to plausibly-eligible rows FIRST
+# (source scope, shareable hold state, well-formed timestamp) so a pile of
+# held/foreign rows can no longer consume the cap and hide real activity; the
+# remaining precise filters run in Python. Sits far above every threshold, and
+# a saturated count is reported as "N+".
+_COUNT_CAP = 300
 
 _STATE_TABLE = "skill_nudge_state"
 _LAST_NUDGED_KEY = "last_nudged_at"
@@ -181,6 +187,13 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
     ``upsert_seen``) — so a user who consciously previewed recently is not
     nagged again for a full cycle.
     """
+    # The nudge is opt-in: the SessionStart hook file is shared with the
+    # auto-upload scheduler, so hook presence alone is not consent. Only an
+    # explicit `clawjournal skill --install-nudge` enables it, and
+    # `--uninstall-nudge` disables it even while the hook stays installed for
+    # uploads.
+    if not nudge_hook_requested(conn):
+        return DueStatus(False, "nudge-not-enabled")
     try:
         row = conn.execute(
             "SELECT MAX(installed_at), MAX(last_seen_at) FROM skill_rules"
@@ -214,15 +227,22 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
     # future-dated rows can never count as new activity forever.
     sources, excluded = _scope_and_exclusions(conn)
     placeholders = ",".join("?" for _ in sources)
+    hold_placeholders = ",".join("?" for _ in sorted(SHAREABLE_HOLD_STATES))
+    # The hold-state prefilter is what keeps the cap honest (a pile of held rows
+    # can no longer crowd out eligible ones); `_release_blocked_ids` below is
+    # still authoritative for the rest of the gate. Rows whose embargo has since
+    # expired are undercounted here — conservative, never over-reporting.
     rows = conn.execute(
         "SELECT session_id, project, source, start_time, "
         "ai_failure_value_score, ai_outcome_badge "
         "FROM sessions WHERE review_status != 'segmented' "
-        f"AND source IN ({placeholders}) AND start_time > ? "
+        f"AND source IN ({placeholders}) "
+        f"AND hold_state IN ({hold_placeholders}) AND start_time > ? "
         "AND start_time GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
-        f"LIMIT {_COUNT_CAP}",
-        [*sources, anchor.isoformat()],
+        f"ORDER BY start_time DESC LIMIT {_COUNT_CAP}",
+        [*sources, *sorted(SHAREABLE_HOLD_STATES), anchor.isoformat()],
     ).fetchall()
+    saturated = len(rows) >= _COUNT_CAP
     kept = []
     for r in rows:
         parsed = _parse_start_time(r["start_time"])
@@ -258,8 +278,9 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
 
     fail_part = (f", {failure_sessions} with failure evidence"
                  if failure_sessions else "")
+    shown = f"{new_sessions}+" if saturated else str(new_sessions)
     message = (
-        f"ClawJournal lessons refresher: {new_sessions} new sessions since the "
+        f"ClawJournal lessons refresher: {shown} new sessions since the "
         f"last clawjournal-lessons refresh {int(days_since)}d ago{fail_part}. "
         "Suggest running `clawjournal skill --preview` to refresh the skill "
         "(the user reviews before install; nothing runs automatically)."

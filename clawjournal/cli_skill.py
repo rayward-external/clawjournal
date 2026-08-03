@@ -24,7 +24,7 @@ from .skill import render as _render
 from .skill import select as _select
 from .skill import store as _store
 from .skill import turns as _turns
-from .skill.schema import MAX_INSTALLED_RULES, SkillRule
+from .skill.schema import MAX_INSTALLED_RULES, ORIGIN_OBJECTIVE, SkillRule
 from .workbench.index import FAILURE_VALUE_SOURCE_SCOPE
 
 # A wide window approximates "all history" for the first run.
@@ -49,6 +49,10 @@ class SkillResult:
     objective_trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
     # Preview framing only; the underlying rule already belongs to ``rules``.
     focus: _focus.FocusSpotlight | None = None
+    # MUST-COVER rules that ranking pushed out of the capped install set. The
+    # guarantee is that objective evidence is never *silently* lost — the 5-slot
+    # budget still decides what installs, but the user is told what it displaced.
+    objective_not_installed: list[SkillRule] = field(default_factory=list)
 
 
 _SUPPORT_HALFLIFE_DAYS = 30.0  # a rule's effective support halves every 30 idle days
@@ -178,6 +182,14 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     shared mode (e.g. 'do' rules, which carry no taxonomy) fall back to word overlap at a
     lowered threshold so real rewrites still collapse.
     """
+    # Two deterministic MUST-COVER fallbacks teach DISTINCT verified signals (a
+    # different recurring tool error each) even though their templated wording
+    # is near-identical by construction — "Recurring Toola error" vs "Recurring
+    # Toolb error" shares enough title stems to trip every fuzzy path below.
+    # Collapsing them would silently drop objective evidence the guarantee
+    # exists to preserve, so only identical guidance merges them.
+    if a.origin == ORIGIN_OBJECTIVE and b.origin == ORIGIN_OBJECTIVE:
+        return a.kind == b.kind and a.guidance.strip() == b.guidance.strip()
     # An identical title => the same lesson even ACROSS kinds — the distiller often emits
     # one lesson as both 'do X' and 'avoid not-X' (e.g. "Verify Beyond Green Tests" as
     # both), which a within-kind check never compares.
@@ -457,6 +469,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
+    objective_not_installed = [
+        r for r in fresh
+        if r.origin == ORIGIN_OBJECTIVE and _store.fingerprint(r) not in merged_fps
+    ]
     dropped = [
         r for r in stored_rules
         if _store.fingerprint(r) in (prev_installed - merged_fps)
@@ -486,7 +502,8 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     objective_trend = {k: (prev_obj.get(k), cur_obj.get(k, 0.0)) for k in sorted(obj_keys)}
 
     return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta,
-                       added_fps, dropped, trend, objective_trend, focus)
+                       added_fps, dropped, trend, objective_trend, focus,
+                       objective_not_installed)
 
 
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
@@ -673,6 +690,22 @@ def _format_install_targets(targets: list[str]) -> str:
     return ", ".join(labels[:-1]) + f" + {labels[-1]}"
 
 
+def _print_objective_not_installed(res: SkillResult) -> None:
+    """Name the objective signals the capped install set could not fit.
+
+    MUST-COVER guarantees objective evidence reaches the user, not that it wins
+    a slot — so when ranking displaces one, say so instead of dropping it
+    silently.
+    """
+    displaced = getattr(res, "objective_not_installed", None)
+    if not displaced:
+        return
+    print(f"\n  {len(displaced)} objective signal(s) did not fit the "
+          f"{MAX_INSTALLED_RULES}-rule budget this run:")
+    for rule in displaced:
+        print(f"    - {rule.display_title()}  (seen in {rule.support} session(s))")
+
+
 def _print_blocked_rules(res: SkillResult) -> None:
     blocked = getattr(res, "blocked", None)
     if blocked:
@@ -742,6 +775,7 @@ def _print_preview(res: SkillResult) -> None:
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {sig}: {prev:.0%} → {cur:.0%}  ({arrow})"))
+    _print_objective_not_installed(res)
     _print_blocked_rules(res)
     if res.gate_issues:
         print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {', '.join(res.gate_issues)}"))

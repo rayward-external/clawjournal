@@ -25,7 +25,13 @@ from ..scoring.backends import (
     default_model_for_backend,
     resolve_backend,
 )
-from .schema import FAILURE_MODES, MAX_RULES, SkillRule, parse_rules
+from .schema import (
+    FAILURE_MODES,
+    MAX_RULES,
+    ORIGIN_OBJECTIVE,
+    SkillRule,
+    parse_rules,
+)
 from .select import SkillCorpus
 
 # A distill failure caused by an OLD agent CLI that doesn't recognize the newer
@@ -235,9 +241,10 @@ def _fallback_rule(
                       "attempting it directly; rejected action classes recur "
                       "across sessions."),
             why=why, evidence_session_ids=[alias], support=n,
+            origin=ORIGIN_OBJECTIVE,
         )
     from .schema import find_injection_phrases
-    from .turns import _signal_label, error_signature
+    from .turns import _signal_label, error_signature  # noqa: PLC0415 (cycle)
 
     excerpt = next(iter(candidate.pivotal_excerpts or []), None)
     raw_error = getattr(excerpt, "error", "") if excerpt is not None else ""
@@ -253,17 +260,27 @@ def _fallback_rule(
     label = _scrub(_signal_label(error_signature(raw_error)), anon, settings)
     if not label:
         return None   # nothing concrete to teach; don't emit an empty template
-    # This label is the ONE machine-inserted untrusted span (tool-error output
-    # reaches it without the LLM paraphrase step). Error text that reads as
-    # instruction injection is withheld — the rule still ships (coverage), the
-    # preview's cited sessions carry the detail.
+    # EVERY machine-inserted span (error label, tool name, recovery sample,
+    # title) carries environment/attacker-influenced text into rule fields
+    # without the LLM paraphrase step that launders distilled prose. Each is
+    # withheld independently when it reads as instruction injection — the rule
+    # still ships (coverage), and the preview's cited sessions carry the detail.
+    withheld = False
     if find_injection_phrases(label):
-        label = ""
-        why += (" Error text withheld: it matched instruction-injection "
-                "phrasing; inspect the cited sessions instead.")
+        label, withheld = "", True
     tool = action.split(":", 1)[0].strip() if ":" in action else ""
-    if recovery:
+    if find_injection_phrases(tool):
+        tool, withheld = "", True
+    if recovery and not find_injection_phrases(recovery):
         why += f" A changed call that then worked: {recovery}."
+    elif recovery:
+        withheld = True
+    title = _scrub(candidate.title, anon, settings)
+    if not title or find_injection_phrases(title):
+        title = "Recurring Tool Error"
+    if withheld:
+        why += (" Some error text was withheld: it matched instruction-injection "
+                "phrasing; inspect the cited sessions instead.")
     guidance = (
         f'Address the recurring failure before retrying: "{label}". '
         if label else
@@ -271,11 +288,12 @@ def _fallback_rule(
     ) + "Check the failing precondition first instead of repeating the same call."
     return SkillRule(
         kind="avoid",
-        title=_scrub(candidate.title, anon, settings) or "Recurring Tool Error",
+        title=title,
         trigger=(f"When a {tool} call fails with this recurring error" if tool
                  else "When a tool call fails with this recurring error"),
         guidance=guidance,
         why=why, evidence_session_ids=[alias], support=n,
+        origin=ORIGIN_OBJECTIVE,
     )
 
 
