@@ -126,7 +126,34 @@ def test_partial_suggestion_does_not_reference_nonexistent_inspect_flag():
         matrix_supported_count=11,
         verdict=VERDICT_PARTIAL,
     )
-    text = render.render_human(_base_report(clients=[obs]))
+    text = render.render_human(
+        _base_report(
+            clients=[obs],
+            index_db_path="/relocated/clawjournal/index.db",
+        )
+    )
     assert "Suggested next steps" in text
     assert "--type schema_unknown" not in text
     assert "events inspect <event_id>" in text
+    assert 'sqlite3 "/relocated/clawjournal/index.db"' in text
+
+
+def test_partial_suggestion_quotes_relocated_index_path_with_spaces():
+    obs = ClientObservation(
+        client="claude",
+        client_version="1.45.0",
+        sessions_count=1,
+        event_types_observed=["schema_unknown"],
+        unknown_event_types=[],
+        unsupported_event_types=[],
+        schema_unknown_rows=2,
+        matrix_supported_count=11,
+        verdict=VERDICT_PARTIAL,
+    )
+    text = render.render_human(
+        _base_report(
+            clients=[obs],
+            index_db_path="/private local state/index.db",
+        )
+    )
+    assert 'sqlite3 "/private local state/index.db"' in text

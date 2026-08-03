@@ -178,7 +178,7 @@ def _suggested_next_steps(report: DoctorReport) -> list[str]:
         )
         lines.append(
             "inspect a schema_unknown row: `clawjournal events inspect "
-            "<event_id>` (find ids via `sqlite3 ~/.clawjournal/index.db "
+            f"<event_id>` (find ids via `sqlite3 \"{report.index_db_path}\" "
             "\"SELECT id FROM events WHERE type='schema_unknown' LIMIT 5\"`)"
         )
     if has_unknown:

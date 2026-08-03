@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from clawjournal import config as config_module
 from clawjournal.events.capabilities import effective_matrix
 from clawjournal.events.export.bundle import (
     BUNDLE_SCHEMA_VERSION,
@@ -27,6 +28,7 @@ from clawjournal.events.export.bundle import (
 from clawjournal.events.types import EVENT_TYPE_SET
 from clawjournal.parsing import parser as parser_mod
 from clawjournal.redaction import trufflehog as th
+from clawjournal.workbench import index as index_module
 
 # Install-state branches (per plan 08 §Install-state probe)
 INSTALL_FRESH = "fresh"
@@ -116,7 +118,7 @@ class DoctorReport:
 
 
 def config_dir() -> Path:
-    return Path.home() / ".clawjournal"
+    return Path(config_module.CONFIG_DIR)
 
 
 def index_db_path() -> Path:
@@ -252,10 +254,12 @@ def _classify_install_state(
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection | None:
+    conn: sqlite3.Connection | None = None
     try:
-        uri = f"file:{path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = index_module.open_existing_index(
+            database=path,
+            readonly=True,
+        )
         # Single read transaction snapshot — every query runs against
         # one consistent view even when serve is writing.
         conn.execute("BEGIN")
@@ -263,9 +267,9 @@ def _open_readonly(path: Path) -> sqlite3.Connection | None:
         # `sqlite_master` is the cheapest read that will surface that.
         conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
         return conn
-    except sqlite3.OperationalError:
-        return None
-    except sqlite3.DatabaseError:
+    except (OSError, sqlite3.Error):
+        if conn is not None:
+            conn.close()
         return None
 
 

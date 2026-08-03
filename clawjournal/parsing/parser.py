@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..config import CONFIG_DIR
 from ..redaction.anonymizer import Anonymizer
 from ..redaction.secrets import redact_text
 
@@ -63,13 +64,13 @@ COPILOT_DIR = Path.home() / ".copilot" / "session-state"
 AIDER_HISTORY_FILENAME = ".aider.chat.history.md"
 WORKBUDDY_DIR = Path.home() / "WorkBuddy"
 WORKBUDDY_AI_PROJECTS_DIR = Path.home() / ".workbuddy-ai" / "projects"
-WORKBUDDY_IMPORT_DIR = Path.home() / ".clawjournal" / "workbuddy"
+WORKBUDDY_IMPORT_DIR = CONFIG_DIR / "workbuddy"
 WORKBUDDY_MAX_FILE_BYTES = 100 * 1024 * 1024
 WORKBUDDY_MAX_ZIP_MEMBER_BYTES = 25 * 1024 * 1024
 WORKBUDDY_TRACE_SUFFIXES = {".json", ".jsonl", ".ndjson", ".log"}
 WORKBUDDY_ARCHIVE_SUFFIXES = {".zip"}
 
-CUSTOM_DIR = Path.home() / ".clawjournal" / "custom"
+CUSTOM_DIR = CONFIG_DIR / "custom"
 
 # Claude Desktop local-agent-mode-sessions (macOS only for now)
 LOCAL_AGENT_DIR = (

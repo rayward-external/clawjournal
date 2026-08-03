@@ -86,7 +86,172 @@ _DURABLE_TABLES = (
     "session_hold_history",
     "auto_upload_enrollment",
     "auto_upload_enrollment_job",
+    "benchmarks",
+    "benchmark_tasks",
+    "benchmark_exports",
 )
+
+_EVENT_SESSION_COLUMNS = (
+    "id",
+    "session_key",
+    "parent_session_key",
+    "parent_session_id",
+    "client",
+    "client_version",
+    "started_at",
+    "ended_at",
+    "status",
+)
+_EVENT_COLUMNS = (
+    "id",
+    "session_id",
+    "type",
+    "event_key",
+    "event_at",
+    "ingested_at",
+    "source",
+    "source_path",
+    "source_offset",
+    "seq",
+    "client",
+    "confidence",
+    "lossiness",
+    "raw_json",
+)
+_EVENT_OVERRIDE_COLUMNS = (
+    "session_id",
+    "event_key",
+    "type",
+    "source",
+    "confidence",
+    "lossiness",
+    "event_at",
+    "payload_json",
+    "origin",
+    "created_at",
+    "write_seq",
+)
+_EVENT_SNIPPET_COLUMNS = (
+    "source_path",
+    "source_offset",
+    "seq",
+    "text",
+    "imported_at",
+)
+_CAPTURE_CURSOR_COLUMNS = (
+    "consumer_id",
+    "source_path",
+    "inode",
+    "last_offset",
+    "last_modified",
+    "client",
+    "first_seen",
+    "last_seen",
+)
+_TOKEN_USAGE_COLUMNS = (
+    "event_id",
+    "session_id",
+    "model",
+    "model_family",
+    "model_tier",
+    "model_provider",
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "reasoning",
+    "service_tier",
+    "data_source",
+    "cost_estimate",
+    "pricing_table_version",
+    "event_at",
+)
+_COST_ANOMALY_COLUMNS = (
+    "id",
+    "session_id",
+    "turn_event_id",
+    "kind",
+    "confidence",
+    "evidence_json",
+    "created_at",
+)
+_COST_INGEST_STATE_COLUMNS = ("consumer_id", "last_event_id")
+_INCIDENT_COLUMNS = (
+    "id",
+    "session_id",
+    "kind",
+    "first_event_id",
+    "last_event_id",
+    "evidence_json",
+    "count",
+    "confidence",
+    "created_at",
+)
+_LOOP_INGEST_STATE_COLUMNS = (
+    "consumer_id",
+    "last_event_id",
+    "last_override_write_seq",
+    "last_override_created_at",
+    "last_override_session_id",
+    "last_override_event_key",
+)
+
+_EVENT_REQUIRED_COLUMNS = frozenset({
+    "id",
+    "session_id",
+    "type",
+    "ingested_at",
+    "source",
+    "source_path",
+    "source_offset",
+    "client",
+    "confidence",
+    "lossiness",
+    "raw_json",
+})
+_EVENT_SESSION_REQUIRED_COLUMNS = frozenset({"id", "session_key", "client"})
+_EVENT_OVERRIDE_REQUIRED_COLUMNS = frozenset({
+    "session_id",
+    "event_key",
+    "type",
+    "source",
+    "confidence",
+    "lossiness",
+    "payload_json",
+    "created_at",
+})
+_EVENT_SNIPPET_REQUIRED_COLUMNS = frozenset(_EVENT_SNIPPET_COLUMNS)
+_CAPTURE_CURSOR_REQUIRED_COLUMNS = frozenset(_CAPTURE_CURSOR_COLUMNS)
+_TOKEN_USAGE_REQUIRED_COLUMNS = frozenset({
+    "event_id",
+    "session_id",
+    "data_source",
+})
+_COST_ANOMALY_REQUIRED_COLUMNS = frozenset(_COST_ANOMALY_COLUMNS)
+_COST_INGEST_STATE_REQUIRED_COLUMNS = frozenset(_COST_INGEST_STATE_COLUMNS)
+_INCIDENT_REQUIRED_COLUMNS = frozenset(_INCIDENT_COLUMNS)
+_LOOP_INGEST_STATE_REQUIRED_COLUMNS = frozenset({
+    "consumer_id",
+    "last_event_id",
+})
+
+_EXECUTION_RECORDER_TABLES = frozenset({
+    "event_sessions",
+    "events",
+    "event_overrides",
+    "event_source_snippets",
+    "token_usage",
+    "cost_anomalies",
+    "cost_ingest_state",
+    "incidents",
+    "loop_ingest_state",
+    "capture_cursors",
+})
+_NON_SAFETY_RELATIONAL_TABLES = _EXECUTION_RECORDER_TABLES | frozenset({
+    "benchmarks",
+    "benchmark_tasks",
+    "benchmark_exports",
+})
 
 
 class UnsafeIndexRecovery(RuntimeError):
@@ -180,7 +345,7 @@ def synchronize_index_health() -> dict[str, Any]:
 
 
 def begin_guided_rebuild() -> dict[str, Any]:
-    """Atomically reserve the one recovery worker slot."""
+    """Reserve the worker and publish the cross-process gate before returning."""
 
     with _STATE_LOCK:
         if _INDEX_HEALTH.get("status") == "rebuilding":
@@ -191,10 +356,20 @@ def begin_guided_rebuild() -> dict[str, Any]:
             raise UnsafeIndexRecovery(
                 "Automatic recovery is not available for this index state."
             )
+        database = _index_path()
+        marker = _load_marker(database)
+        if marker is None:
+            marker = {
+                "version": 1,
+                "database_path": str(database.resolve()),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "stage": "draining",
+            }
+            _write_marker(database, marker)
         _INDEX_HEALTH.update({
             "status": "rebuilding",
-            "stage": "queued",
-            "message": "Starting the safe index recovery...",
+            "stage": "draining",
+            "message": "Waiting for active index work to finish safely...",
         })
         return dict(_INDEX_HEALTH)
 
@@ -210,6 +385,25 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _exclusive_source_connection(path: Path) -> sqlite3.Connection:
+    """Hold the source stable while its decisions and exact files are copied."""
+
+    conn = sqlite3.connect(
+        path.resolve().as_uri() + "?mode=rw",
+        uri=True,
+        timeout=5,
+        isolation_level=None,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.execute("BEGIN EXCLUSIVE")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
 def _health_connection(path: Path) -> sqlite3.Connection:
     """Open for checks while allowing SQLite's own hot-journal rollback.
 
@@ -221,12 +415,10 @@ def _health_connection(path: Path) -> sqlite3.Connection:
     therefore never alter a damaged source or its backup.
     """
 
-    conn = sqlite3.connect(
-        path.resolve().as_uri() + "?mode=rw",
-        uri=True,
+    conn = index_module.open_existing_index(
+        database=path,
         timeout=5,
     )
-    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     return conn
 
@@ -301,7 +493,11 @@ def _recovery_snapshot(
         return {}, ["database schema"]
 
     try:
-        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if any(
+            str(row[0]) not in _NON_SAFETY_RELATIONAL_TABLES
+            for row in violations
+        ):
             errors.append("relational safety state")
     except sqlite3.DatabaseError:
         errors.append("relational safety state")
@@ -349,6 +545,20 @@ def _recovery_snapshot(
     return snapshot, errors
 
 
+def _snapshot_from_path(
+    path: Path,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _read_only_connection(path)
+        return _recovery_snapshot(conn)
+    except (OSError, sqlite3.DatabaseError):
+        return {}, ["database schema and durable safety state"]
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
     database = Path(path) if path is not None else _index_path()
     base: dict[str, Any] = {
@@ -379,7 +589,7 @@ def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
                 "A previous index rebuild was interrupted. The original backup "
                 "is still available and recovery can be retried safely."
             )
-        elif marker.get("stage") == "preparing" and database.is_file():
+        elif marker.get("stage") in {"draining", "preparing"} and database.is_file():
             message = (
                 "A previous index rebuild stopped before its backup completed. "
                 "The original index has not been replaced and recovery can be "
@@ -388,7 +598,7 @@ def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
         else:
             detail = (
                 "The original index is missing from the preparation stage."
-                if marker.get("stage") == "preparing"
+                if marker.get("stage") in {"draining", "preparing"}
                 else str(_marker_path(database).resolve())
             )
             return {
@@ -481,8 +691,8 @@ def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
             "unreadable_state": errors,
             "recoverable_state_counts": counts,
         }
-    except sqlite3.DatabaseError as exc:
-        if _is_storage_or_lock_error(exc):
+    except (OSError, sqlite3.DatabaseError) as exc:
+        if isinstance(exc, OSError) or _is_storage_or_lock_error(exc):
             return {
                 **base,
                 "status": "unavailable",
@@ -621,6 +831,400 @@ def _insert_rows(
         )
         inserted += 1
     return inserted
+
+
+def _attached_table_names(
+    conn: sqlite3.Connection,
+    schema: str,
+) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            f'SELECT name FROM "{schema}".sqlite_master WHERE type = \'table\''
+        ).fetchall()
+    }
+
+
+def _attached_table_columns(
+    conn: sqlite3.Connection,
+    schema: str,
+    table: str,
+) -> set[str]:
+    # Schema and table names come only from fixed constants in this module.
+    return {
+        str(row[1])
+        for row in conn.execute(
+            f'PRAGMA "{schema}".table_info("{table}")'
+        ).fetchall()
+    }
+
+
+def _copy_attached_rows(
+    conn: sqlite3.Connection,
+    *,
+    schema: str,
+    table: str,
+    requested: tuple[str, ...],
+    required: frozenset[str],
+    where: str = "",
+    params: tuple[Any, ...] = (),
+) -> int:
+    source_columns = _attached_table_columns(conn, schema, table)
+    missing = required - source_columns
+    if missing:
+        raise sqlite3.DatabaseError(
+            f'{table} is missing recovery column(s): {", ".join(sorted(missing))}'
+        )
+    target_columns = _table_columns(conn, table)
+    columns = [
+        column
+        for column in requested
+        if column in source_columns and column in target_columns
+    ]
+    if not columns:
+        return 0
+    quoted = ", ".join(f'"{column}"' for column in columns)
+    sql = (
+        f'INSERT INTO main."{table}" ({quoted}) '
+        f'SELECT {quoted} FROM "{schema}"."{table}"'
+    )
+    if where:
+        sql += f" WHERE {where}"
+    conn.execute(sql, params)
+    return int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+
+
+def _restore_execution_recorder(
+    conn: sqlite3.Connection,
+    source_database: Path,
+) -> tuple[dict[str, int], list[str]]:
+    """Restore non-rebuildable event data from the fsynced backup database.
+
+    The large ``events.raw_json`` payload stays inside SQLite via
+    ``INSERT ... SELECT``; it is never materialized as a Python ``fetchall``.
+    Historical cost and incident rows are copied exactly; only FTS is rebuilt.
+    """
+
+    counts: dict[str, int] = {}
+    warnings: list[str] = []
+    if not source_database.is_file():
+        return counts, warnings
+
+    from clawjournal.capture.cursors import ensure_schema as ensure_cursor_schema
+    from clawjournal.events.cost.schema import ensure_cost_schema
+    from clawjournal.events.export.schema import ensure_export_schema
+    from clawjournal.events.incidents.schema import ensure_incidents_schema
+    from clawjournal.events.schema import ensure_schema as ensure_event_schema
+    from clawjournal.events.view import ensure_view_schema
+
+    ensure_event_schema(conn)
+    ensure_view_schema(conn)
+    ensure_cost_schema(conn)
+    ensure_incidents_schema(conn)
+    ensure_export_schema(conn)
+    ensure_cursor_schema(conn)
+    conn.commit()
+
+    schema = "recovery_source"
+    attached = False
+    try:
+        conn.execute(
+            f'ATTACH DATABASE ? AS "{schema}"',
+            (source_database.resolve().as_uri() + "?mode=ro",),
+        )
+        attached = True
+        source_tables = _attached_table_names(conn, schema)
+    except sqlite3.DatabaseError as exc:
+        if attached:
+            try:
+                conn.execute(f'DETACH DATABASE "{schema}"')
+            except sqlite3.DatabaseError:
+                pass
+        warnings.append(
+            "Execution-recorder state could not be read and remains in the "
+            f"index backup ({exc})."
+        )
+        return counts, warnings
+
+    core_restored = False
+    override_frontier_restored = False
+    try:
+        has_sessions = "event_sessions" in source_tables
+        has_events = "events" in source_tables
+        if has_sessions != has_events:
+            warnings.append(
+                "Execution-recorder state was incomplete and remains in the "
+                "index backup."
+            )
+        elif has_sessions and has_events:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("PRAGMA defer_foreign_keys=ON")
+                conn.execute("DELETE FROM events")
+                conn.execute("DELETE FROM event_sessions")
+                counts["event_sessions"] = _copy_attached_rows(
+                    conn,
+                    schema=schema,
+                    table="event_sessions",
+                    requested=_EVENT_SESSION_COLUMNS,
+                    required=_EVENT_SESSION_REQUIRED_COLUMNS,
+                )
+                counts["events"] = _copy_attached_rows(
+                    conn,
+                    schema=schema,
+                    table="events",
+                    requested=_EVENT_COLUMNS,
+                    required=_EVENT_REQUIRED_COLUMNS,
+                )
+                foreign_key_errors = [
+                    row
+                    for row in conn.execute("PRAGMA foreign_key_check").fetchall()
+                    if str(row[0]) in {"event_sessions", "events"}
+                ]
+                if foreign_key_errors:
+                    raise sqlite3.DatabaseError(
+                        "restored execution-recorder rows violate a foreign key"
+                    )
+                conn.commit()
+                core_restored = True
+            except Exception as exc:
+                conn.rollback()
+                counts.pop("event_sessions", None)
+                counts.pop("events", None)
+                warnings.append(
+                    "Execution-recorder state could not be restored and remains "
+                    f"in the index backup ({exc})."
+                )
+
+            if core_restored and "event_overrides" in source_tables:
+                conn.execute("SAVEPOINT restore_event_overrides")
+                try:
+                    source_override_columns = _attached_table_columns(
+                        conn,
+                        schema,
+                        "event_overrides",
+                    )
+                    conn.execute("DELETE FROM event_overrides")
+                    counts["event_overrides"] = _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="event_overrides",
+                        requested=_EVENT_OVERRIDE_COLUMNS,
+                        required=_EVENT_OVERRIDE_REQUIRED_COLUMNS,
+                    )
+                    conn.execute("RELEASE SAVEPOINT restore_event_overrides")
+                    # The loop detector can retain its exact frontier only
+                    # when the source rows carried their original sequence.
+                    # Legacy rows are restored, then assigned fresh sequences
+                    # below, so their old cursor must be replayed from zero.
+                    override_frontier_restored = (
+                        "write_seq" in source_override_columns
+                    )
+                except Exception as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT restore_event_overrides")
+                    conn.execute("RELEASE SAVEPOINT restore_event_overrides")
+                    counts.pop("event_overrides", None)
+                    warnings.append(
+                        "Execution-recorder overrides could not be restored and "
+                        f"remain in the index backup ({exc})."
+                    )
+            elif core_restored:
+                counts["event_overrides"] = 0
+
+            if core_restored and "capture_cursors" in source_tables:
+                conn.execute("SAVEPOINT restore_event_cursors")
+                try:
+                    conn.execute(
+                        "DELETE FROM capture_cursors WHERE consumer_id = ?",
+                        ("events",),
+                    )
+                    _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="capture_cursors",
+                        requested=_CAPTURE_CURSOR_COLUMNS,
+                        required=_CAPTURE_CURSOR_REQUIRED_COLUMNS,
+                        where='"consumer_id" = ?',
+                        params=("events",),
+                    )
+                    counts["event_capture_cursors"] = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM capture_cursors "
+                            "WHERE consumer_id = ?",
+                            ("events",),
+                        ).fetchone()[0]
+                    )
+                    conn.execute("RELEASE SAVEPOINT restore_event_cursors")
+                except Exception as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT restore_event_cursors")
+                    conn.execute("RELEASE SAVEPOINT restore_event_cursors")
+                    counts.pop("event_capture_cursors", None)
+                    warnings.append(
+                        "Execution-recorder cursors could not be restored and "
+                        f"remain in the index backup ({exc})."
+                    )
+
+            cost_tables = {
+                "token_usage",
+                "cost_anomalies",
+                "cost_ingest_state",
+            }
+            available_cost_tables = cost_tables & source_tables
+            if core_restored and available_cost_tables == cost_tables:
+                conn.execute("SAVEPOINT restore_event_cost")
+                try:
+                    conn.execute("DELETE FROM cost_anomalies")
+                    conn.execute("DELETE FROM token_usage")
+                    conn.execute("DELETE FROM cost_ingest_state")
+                    counts["token_usage"] = _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="token_usage",
+                        requested=_TOKEN_USAGE_COLUMNS,
+                        required=_TOKEN_USAGE_REQUIRED_COLUMNS,
+                    )
+                    counts["cost_anomalies"] = _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="cost_anomalies",
+                        requested=_COST_ANOMALY_COLUMNS,
+                        required=_COST_ANOMALY_REQUIRED_COLUMNS,
+                    )
+                    counts["cost_ingest_state"] = _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="cost_ingest_state",
+                        requested=_COST_INGEST_STATE_COLUMNS,
+                        required=_COST_INGEST_STATE_REQUIRED_COLUMNS,
+                    )
+                    conn.execute("RELEASE SAVEPOINT restore_event_cost")
+                except Exception as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT restore_event_cost")
+                    conn.execute("RELEASE SAVEPOINT restore_event_cost")
+                    for name in cost_tables:
+                        counts.pop(name, None)
+                    warnings.append(
+                        "Historical event cost data could not be restored and "
+                        f"remains in the index backup ({exc})."
+                    )
+            elif core_restored and available_cost_tables:
+                warnings.append(
+                    "Historical event cost state was incomplete and remains in "
+                    "the index backup."
+                )
+
+            incident_tables = {"incidents", "loop_ingest_state"}
+            available_incident_tables = incident_tables & source_tables
+            if core_restored and available_incident_tables == incident_tables:
+                conn.execute("SAVEPOINT restore_event_incidents")
+                try:
+                    reset_override_cursor = not override_frontier_restored
+                    conn.execute("DELETE FROM incidents")
+                    conn.execute("DELETE FROM loop_ingest_state")
+                    counts["incidents"] = _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="incidents",
+                        requested=_INCIDENT_COLUMNS,
+                        required=_INCIDENT_REQUIRED_COLUMNS,
+                    )
+                    counts["loop_ingest_state"] = _copy_attached_rows(
+                        conn,
+                        schema=schema,
+                        table="loop_ingest_state",
+                        requested=_LOOP_INGEST_STATE_COLUMNS,
+                        required=_LOOP_INGEST_STATE_REQUIRED_COLUMNS,
+                    )
+                    if reset_override_cursor:
+                        conn.execute(
+                            "UPDATE loop_ingest_state SET "
+                            "last_override_write_seq = 0, "
+                            "last_override_created_at = NULL, "
+                            "last_override_session_id = 0, "
+                            "last_override_event_key = ''"
+                        )
+                    conn.execute("RELEASE SAVEPOINT restore_event_incidents")
+                    if reset_override_cursor:
+                        warnings.append(
+                            "The execution-incident override cursor was reset so "
+                            "future hook events cannot be skipped."
+                        )
+                except Exception as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT restore_event_incidents")
+                    conn.execute("RELEASE SAVEPOINT restore_event_incidents")
+                    for name in incident_tables:
+                        counts.pop(name, None)
+                    warnings.append(
+                        "Historical execution incidents could not be restored and "
+                        f"remain in the index backup ({exc})."
+                    )
+            elif core_restored and available_incident_tables:
+                warnings.append(
+                    "Historical execution-incident state was incomplete and "
+                    "remains in the index backup."
+                )
+
+        if "event_source_snippets" in source_tables:
+            conn.execute("SAVEPOINT restore_event_snippets")
+            try:
+                conn.execute("DELETE FROM event_source_snippets")
+                counts["event_source_snippets"] = _copy_attached_rows(
+                    conn,
+                    schema=schema,
+                    table="event_source_snippets",
+                    requested=_EVENT_SNIPPET_COLUMNS,
+                    required=_EVENT_SNIPPET_REQUIRED_COLUMNS,
+                )
+                conn.execute("RELEASE SAVEPOINT restore_event_snippets")
+            except Exception as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT restore_event_snippets")
+                conn.execute("RELEASE SAVEPOINT restore_event_snippets")
+                counts.pop("event_source_snippets", None)
+                warnings.append(
+                    "Imported event source snippets could not be restored and "
+                    f"remain in the index backup ({exc})."
+                )
+        conn.commit()
+    finally:
+        try:
+            conn.execute(f'DETACH DATABASE "{schema}"')
+        except sqlite3.DatabaseError:
+            logger.warning("Could not detach the index-recovery source", exc_info=True)
+
+    if not core_restored:
+        return counts, warnings
+
+    # Legacy override tables may not carry write_seq. Re-running the additive
+    # schema helper assigns a stable frontier after all rows have landed. When
+    # override restoration failed or its exact sequence was unavailable, the
+    # loop cursor above was reset so low-numbered hook writes cannot be skipped.
+    # A usable ordering frontier is part of the recorder's durable state. If
+    # this additive migration cannot complete, leave recovery failed (with the
+    # verified backup retained) instead of reporting a ready index that could
+    # silently skip later hook overrides.
+    ensure_view_schema(conn)
+    conn.commit()
+
+    try:
+        from clawjournal.events.search.schema import ensure_search_schema
+
+        ensure_search_schema(conn)
+    except Exception as exc:
+        conn.rollback()
+        warnings.append(
+            "The event search index could not be rebuilt; the base events were "
+            f"preserved ({exc})."
+        )
+    try:
+        index_module.backfill_session_keys(conn)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        warnings.append(
+            "Workbench-to-event links could not be refreshed; event data was "
+            f"preserved ({exc})."
+        )
+    return counts, warnings
 
 
 def _filter_rows_with_references(
@@ -862,6 +1466,47 @@ def _restore_snapshot(
     warnings: list[str] = []
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("SAVEPOINT restore_benchmarks")
+        try:
+            counts["benchmarks"] = _insert_rows(
+                conn, "benchmarks", snapshot.get("benchmarks", [])
+            )
+            benchmark_tasks, skipped_benchmark_tasks = _filter_rows_with_references(
+                conn,
+                snapshot.get("benchmark_tasks", []),
+                (("benchmark_id", "benchmarks", "benchmark_id"),),
+            )
+            counts["benchmark_tasks"] = _insert_rows(
+                conn, "benchmark_tasks", benchmark_tasks
+            )
+            benchmark_exports, skipped_benchmark_exports = (
+                _filter_rows_with_references(
+                    conn,
+                    snapshot.get("benchmark_exports", []),
+                    (("benchmark_id", "benchmarks", "benchmark_id"),),
+                )
+            )
+            counts["benchmark_exports"] = _insert_rows(
+                conn, "benchmark_exports", benchmark_exports
+            )
+            skipped_benchmark_rows = (
+                skipped_benchmark_tasks + skipped_benchmark_exports
+            )
+            if skipped_benchmark_rows:
+                warnings.append(
+                    f"{skipped_benchmark_rows} orphaned benchmark row(s) remain "
+                    "in the backup."
+                )
+            conn.execute("RELEASE SAVEPOINT restore_benchmarks")
+        except Exception as exc:
+            conn.execute("ROLLBACK TO SAVEPOINT restore_benchmarks")
+            conn.execute("RELEASE SAVEPOINT restore_benchmarks")
+            for name in ("benchmarks", "benchmark_tasks", "benchmark_exports"):
+                counts.pop(name, None)
+            warnings.append(
+                "Historical benchmark state could not be restored and remains "
+                f"in the index backup ({exc})."
+            )
         counts["shares"] = _insert_rows(conn, "shares", snapshot.get("shares", []))
         restored, needs_review, skipped_session_share_links = _restore_session_state(
             conn, snapshot.get("sessions", [])
@@ -935,7 +1580,23 @@ def _restore_snapshot(
             warnings.append(
                 "An unfinished automatic-upload setup was left in the backup."
             )
-        if unreadable_state:
+        benchmark_state_names = {
+            "benchmarks",
+            "benchmark tasks",
+            "benchmark exports",
+        }
+        unreadable_benchmark_state = [
+            name for name in unreadable_state if name in benchmark_state_names
+        ]
+        unreadable_safety_state = [
+            name for name in unreadable_state if name not in benchmark_state_names
+        ]
+        if unreadable_benchmark_state:
+            warnings.append(
+                "Some historical benchmark state was unreadable and remains in "
+                "the index backup."
+            )
+        if unreadable_safety_state:
             # Losing hold/share history must never silently make a rebuilt
             # trace eligible for egress. The user can review and release
             # individual traces after seeing the recovery warning.
@@ -954,8 +1615,10 @@ def _restore_snapshot(
     return counts, warnings
 
 
-def guided_rebuild(
+def _guided_rebuild_locked(
     scan_callback: Callable[[], dict[str, Any]],
+    *,
+    on_source_retired: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Back up, rebuild, rescan, and restore durable state synchronously."""
 
@@ -974,6 +1637,13 @@ def guided_rebuild(
     if isinstance(raw_backup, str) and raw_backup:
         backup_dir, backup_files = _backup_from_marker(database, marker)
         recovery_source = backup_dir / database.name
+        snapshot, errors = _snapshot_from_path(recovery_source)
+        _set_health({
+            **current_index_health(),
+            "status": "rebuilding",
+            "stage": "backing_up",
+            "message": "Using the verified backup from the previous attempt...",
+        })
     else:
         marker = dict(marker or {})
         marker.setdefault("started_at", datetime.now(timezone.utc).isoformat())
@@ -989,27 +1659,42 @@ def guided_rebuild(
         # tells a retry to create a fresh backup rather than guess.
         _write_marker(database, marker)
         recovery_source = database
+        source_guard: sqlite3.Connection | None = None
+        snapshot = {}
+        errors = []
+        try:
+            try:
+                source_guard = _exclusive_source_connection(database)
+            except sqlite3.DatabaseError as exc:
+                if _is_storage_or_lock_error(exc):
+                    raise UnsafeIndexRecovery(
+                        "The workbench index is still in use. Close other "
+                        "ClawJournal processes and retry recovery."
+                    ) from exc
+                # A structurally unreadable SQLite file cannot provide a
+                # transaction snapshot. Preserve its exact bytes first, then
+                # make one best-effort read from that immutable backup.
+                errors = ["database schema and durable safety state"]
+            if source_guard is not None:
+                snapshot, errors = _recovery_snapshot(source_guard)
 
-    snapshot: dict[str, list[dict[str, Any]]] = {}
-    errors: list[str] = []
-    conn: sqlite3.Connection | None = None
-    try:
-        conn = _read_only_connection(recovery_source)
-        snapshot, errors = _recovery_snapshot(conn)
-    except (OSError, sqlite3.DatabaseError):
-        errors = ["database schema and durable safety state"]
-    finally:
-        if conn is not None:
-            conn.close()
+            _set_health({
+                **current_index_health(),
+                "status": "rebuilding",
+                "stage": "backing_up",
+                "message": "Backing up the damaged index before changing anything...",
+            })
+            backup_dir, backup_files = _backup_index_files(database)
+        finally:
+            if source_guard is not None:
+                try:
+                    source_guard.rollback()
+                finally:
+                    source_guard.close()
 
-    _set_health({
-        **current_index_health(),
-        "status": "rebuilding",
-        "stage": "backing_up",
-        "message": "Backing up the damaged index before changing anything...",
-    })
-    if backup_dir is None:
-        backup_dir, backup_files = _backup_index_files(database)
+        recovery_source = backup_dir / database.name
+        if not snapshot and errors == ["database schema and durable safety state"]:
+            snapshot, errors = _snapshot_from_path(recovery_source)
         manifest = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "database_path": str(database.resolve()),
@@ -1037,6 +1722,14 @@ def guided_rebuild(
     previous_recovery_access = index_module._set_index_recovery_access(True)
     try:
         _remove_index_files(database)
+        if on_source_retired is not None:
+            try:
+                on_source_retired()
+            except Exception:
+                logger.exception(
+                    "Could not resume workbench request admission after retiring "
+                    "the damaged index"
+                )
         marker["stage"] = "reindexing"
         _write_marker(database, marker)
         _set_health({
@@ -1062,11 +1755,19 @@ def guided_rebuild(
         })
         rebuilt = index_module.open_index()
         try:
+            event_counts, event_warnings = _restore_execution_recorder(
+                rebuilt,
+                recovery_source,
+            )
             restored_counts, warnings = _restore_snapshot(
                 rebuilt,
                 snapshot,
                 unreadable_state=errors,
             )
+            restored_counts.update(event_counts)
+            warnings = event_warnings + warnings
+            index_module.backfill_session_keys(rebuilt)
+            rebuilt.commit()
             check = [str(row[0]) for row in rebuilt.execute("PRAGMA quick_check(1)")]
             if check != ["ok"]:
                 raise sqlite3.DatabaseError(check[0] if check else "integrity check failed")
@@ -1115,3 +1816,47 @@ def guided_rebuild(
         "warnings": warnings,
     }
     return _set_health(ready)
+
+
+def guided_rebuild(
+    scan_callback: Callable[[], dict[str, Any]],
+    *,
+    on_source_retired: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Rebuild only after every guarded cross-process connection has closed."""
+
+    database = _index_path()
+    marker = _load_marker(database)
+    if marker is None:
+        marker = {
+            "version": 1,
+            "database_path": str(database.resolve()),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "stage": "preparing",
+        }
+        _write_marker(database, marker)
+    lease = index_module._exclusive_index_recovery_lease(timeout=30.0)
+    try:
+        lease.__enter__()
+    except sqlite3.OperationalError as exc:
+        failed = {
+            **current_index_health(),
+            "status": "recovery_required",
+            "stage": "waiting_for_connections",
+            "message": (
+                "Close other ClawJournal processes that are using the index, "
+                "then retry recovery. The original index was not changed."
+            ),
+            "detail": str(exc),
+            "automatic_recovery_available": True,
+            "interrupted_recovery": True,
+        }
+        _set_health(failed)
+        raise UnsafeIndexRecovery(failed["message"]) from exc
+    try:
+        return _guided_rebuild_locked(
+            scan_callback,
+            on_source_retired=on_source_retired,
+        )
+    finally:
+        lease.__exit__(None, None, None)

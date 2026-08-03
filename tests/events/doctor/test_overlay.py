@@ -26,6 +26,13 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def test_overlay_path_follows_configured_state_root(monkeypatch, tmp_path):
+    state_root = tmp_path / "relocated-state"
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", state_root)
+
+    assert overlay_mod.overlay_path() == state_root / "capability_overlay.yaml"
+
+
 def test_no_overlay_returns_shipped_matrix():
     matrix = overlay_mod.effective_matrix()
     # Sanity: claude/user_message ships as supported.

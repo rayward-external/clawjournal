@@ -729,11 +729,11 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         from .workbench import index as index_module
 
         path = Path(index_module.INDEX_DB)
-        if not path.exists():
+        if not path.exists() or index_module._index_recovery_marker_path().exists():
             return _off_status(config)
         try:
-            db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-        except sqlite3.Error:
+            db = index_module.open_existing_index(readonly=True)
+        except (OSError, sqlite3.Error):
             return _off_status(config)
         db.row_factory = sqlite3.Row
         own_connection = True
@@ -743,7 +743,7 @@ def status(*, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         try:
             enrollment = get_auto_upload_enrollment(db)
             enrollment_job = get_auto_upload_enrollment_job(db)
-        except sqlite3.DatabaseError:
+        except (OSError, sqlite3.DatabaseError):
             return _off_status(config)
         report = _candidate_report(db, enrollment, config=config)
         successful_manual = _has_successful_manual_receipt(db)
@@ -887,7 +887,7 @@ def preview(
         from .workbench import index as index_module
 
         path = Path(index_module.INDEX_DB)
-        if not path.exists():
+        if not path.exists() or index_module._index_recovery_marker_path().exists():
             return {
                 "ok": True,
                 "eligible": [],
@@ -902,15 +902,14 @@ def preview(
                 "limit": MAX_SESSIONS,
             }
         try:
-            readonly = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-            readonly.row_factory = sqlite3.Row
+            readonly = index_module.open_existing_index(readonly=True)
             try:
                 enrollment = get_auto_upload_enrollment(readonly)
                 report = _candidate_report(readonly, enrollment, now=now)
                 return {"ok": True, **report}
             finally:
                 readonly.close()
-        except sqlite3.DatabaseError:
+        except (OSError, sqlite3.DatabaseError):
             return AutoUploadError(
                 "index_upgrade_required",
                 "Refresh the local index before previewing automatic uploads.",
@@ -5039,15 +5038,15 @@ def _open_existing_hook_index() -> sqlite3.Connection | None:
 
     path = Path(index_module.INDEX_DB)
     try:
-        if not path.is_file():
+        if (
+            not path.is_file()
+            or index_module._index_recovery_marker_path().exists()
+        ):
             return None
-        conn = sqlite3.connect(
-            path.resolve().as_uri() + "?mode=rw",
-            uri=True,
+        conn = index_module.open_existing_index(
             timeout=HOOK_DB_BUSY_TIMEOUT_MS / 1000,
             isolation_level=None,
         )
-        conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={HOOK_DB_BUSY_TIMEOUT_MS}")
         return conn
     except (OSError, sqlite3.Error):

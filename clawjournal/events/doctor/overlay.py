@@ -18,6 +18,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Mapping
 
+from clawjournal import config as config_module
 from clawjournal.events.capabilities import CAPABILITY_MATRIX
 from clawjournal.events.types import EVENT_TYPES
 
@@ -28,7 +29,7 @@ SUPPORTED_OVERLAY_CLIENTS = ("claude", "codex", "openclaw")
 
 
 def overlay_path() -> Path:
-    return Path.home() / ".clawjournal" / OVERLAY_FILENAME
+    return Path(config_module.CONFIG_DIR) / OVERLAY_FILENAME
 
 
 _cached_matrix: dict[tuple[str, str], tuple[bool, str]] | None = None

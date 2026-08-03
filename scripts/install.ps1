@@ -400,16 +400,39 @@ elseif (Test-Path $FeSrcDir) {
     }
 }
 
-$managedBetterleaks = Join-Path $HOME ".clawjournal\bin\betterleaks.exe"
-if (-not $WithSharing -and -not (Get-Command betterleaks -ErrorAction SilentlyContinue) -and -not (Test-Path $managedBetterleaks)) {
+$betterleaksAvailable = $WithSharing
+$trufflehogAvailable = $WithSharing
+if (-not $WithSharing) {
+    # Ask the installed CLI so managed binaries follow CLAWJOURNAL_HOME and
+    # PATH-based installs use the same validation as the share gate. Keep the
+    # installer's own probes from starting a nested background update.
+    $previousNoAutoUpdate = $env:CLAWJOURNAL_NO_AUTO_UPDATE
+    $previousProbeEap = $ErrorActionPreference
+    $env:CLAWJOURNAL_NO_AUTO_UPDATE = '1'
+    $ErrorActionPreference = 'Continue'
+    try {
+        Invoke-ClawJournal betterleaks status --json *> $null
+        $betterleaksAvailable = $LASTEXITCODE -eq 0
+        Invoke-ClawJournal trufflehog status --json *> $null
+        $trufflehogAvailable = $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousProbeEap
+        if ($null -eq $previousNoAutoUpdate) {
+            Remove-Item Env:CLAWJOURNAL_NO_AUTO_UPDATE -ErrorAction SilentlyContinue
+        } else {
+            $env:CLAWJOURNAL_NO_AUTO_UPDATE = $previousNoAutoUpdate
+        }
+    }
+}
+
+if (-not $betterleaksAvailable) {
     Write-Host ""
     Write-Host "[i] Betterleaks is required when sharing exports."
     Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalDisplay betterleaks install"
     Write-Host "    Or re-run: .\scripts\install.ps1 -WithSharing"
 }
 
-$managedTrufflehog = Join-Path $HOME ".clawjournal\bin\trufflehog.exe"
-if (-not $WithSharing -and -not (Get-Command trufflehog -ErrorAction SilentlyContinue) -and -not (Test-Path $managedTrufflehog)) {
+if (-not $trufflehogAvailable) {
     Write-Host ""
     Write-Host "[i] TruffleHog is required when sharing exports."
     Write-Host "    Install a pinned, checksum-verified copy: $ClawJournalDisplay trufflehog install"
