@@ -91,12 +91,18 @@ Ask:
 If user chooses the UI:
 
 ```bash
-clawjournal serve
+clawjournal open
 ```
+
+This starts or reuses the local daemon, waits a bounded time for readiness, opens
+the browser, and then returns. Continue the conversation after the command
+returns; do not wait for a foreground daemon to exit.
 
 Tell user: "Workbench is open at localhost:8384. Triage sessions in the Inbox, then come back and say 'share' when ready."
 
-For remote VMs: `clawjournal serve --remote` prints the SSH tunnel command.
+For remote VMs: use `clawjournal serve --remote` in a dedicated terminal or
+background process and follow the SSH tunnel command it prints. `serve` is a
+foreground, long-running daemon command; do not wait for it to exit.
 
 When user returns, continue to Step 2.
 
@@ -214,10 +220,11 @@ Map the user's index numbers to session_ids from the inbox JSON output.
 ### Full Review (web UI)
 
 ```bash
-clawjournal serve
+clawjournal open
 ```
 
-Opens a browser at `localhost:8384` with:
+Starts or reuses the local workbench, opens a browser at `localhost:8384`, and
+returns after a bounded readiness check. The workbench includes:
 - **Inbox**: Trace cards with value/risk/outcome badges and one-click triage
 - **Search**: Full-text search across all session transcripts
 - **Session Detail**: Three-pane view (timeline | transcript | metadata)
@@ -329,6 +336,7 @@ clawjournal export [--no-push] [--no-thinking] [--pii-review --pii-apply]
 clawjournal confirm --full-name "NAME" --attest-full-name "..." --attest-sensitive "..." --attest-manual-scan "..."
 
 # Workbench
+clawjournal open
 clawjournal serve [--port 8384] [--no-browser] [--remote]
 ```
 
@@ -336,5 +344,6 @@ clawjournal serve [--port 8384] [--no-browser] [--remote]
 
 - **`--exclude`, `--redact`, `--redact-usernames` APPEND** — they never overwrite. Safe to call repeatedly.
 - **`clawjournal inbox --json`** is the preferred way for agents to read trace data.
-- **`clawjournal serve`** opens a browser automatically. Use `--no-browser` to suppress.
+- **`clawjournal open`** is the local UI command for agents: it starts or reuses the daemon, opens the browser, and returns after a bounded readiness check.
+- **`clawjournal serve`** is a foreground, long-running daemon command. Use it only when explicitly managing the process (including `--remote`); do not wait for it to exit.
 - **Everything is local by default** — nothing leaves the machine unless the user explicitly submits from the workbench or uses a configured self-hosted ingest command.

@@ -24,6 +24,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -88,6 +89,10 @@ ICON_SIZE = 256
 # every HTTP request, so the log needs a ceiling to stay bounded over months.
 LOG_MAX_BYTES = 1_000_000
 DESKTOP_COMMAND_TIMEOUT_SECONDS = 30.0
+WORKBENCH_START_TIMEOUT_SECONDS = 30.0
+WORKBENCH_POLL_INTERVAL_SECONDS = 0.25
+WORKBENCH_LOG_TAIL_BYTES = 8_192
+BROWSER_OPEN_TIMEOUT_SECONDS = 5.0
 # Shared environment contract with workbench.daemon.RESTART_CHILD_ENV.  Keep
 # this lightweight launcher independent of importing the full daemon merely
 # to detect its own post-update re-exec.
@@ -96,6 +101,8 @@ _UPDATE_RESTART_CHILD_ENV = "CLAWJOURNAL_RESTART_CHILD"
 _PORT_FREE = "free"
 _PORT_WORKBENCH = "workbench"
 _PORT_OCCUPIED = "occupied"
+_IPV4_LOOPBACK_HOST = "127.0.0.1"
+_BROWSER_LOOPBACK_HOST = "localhost"
 _NOTE_OPENED_LOCK = threading.Lock()
 _NOTE_OPENED_THREAD_LOCK = threading.Lock()
 _note_opened_thread: threading.Thread | None = None
@@ -1058,30 +1065,44 @@ def _daemon_port_is_open(port: int) -> bool:
     return _daemon_port_is_open(port)
 
 
-def _workbench_port_state(port: int) -> str:
-    """Classify the configured port without mistaking another service for us."""
-    if not _daemon_port_is_open(port):
-        return _PORT_FREE
-
+def _workbench_health_matches(port: int, host: str) -> bool:
+    """Authenticate a loopback endpoint without sending it the API token."""
     token = ensure_api_token(_config_dir())
     challenge = secrets.token_hex(HEALTH_CHALLENGE_BYTES)
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/.well-known/clawjournal?challenge={challenge}",
+        f"http://{host}:{port}/.well-known/clawjournal?challenge={challenge}",
     )
     try:
         with urllib.request.urlopen(request, timeout=0.75) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
-        return _PORT_OCCUPIED
+        return False
     expected_proof = api_health_proof(token, challenge)
-    if (
+    return bool(
         isinstance(payload, dict)
         and payload.get("service") == "clawjournal"
         and isinstance(payload.get("proof"), str)
         and secrets.compare_digest(payload["proof"], expected_proof)
-    ):
+    )
+
+
+def _workbench_port_state(port: int) -> str:
+    """Classify the configured port without mistaking another service for us."""
+    if not _daemon_port_is_open(port):
+        return _PORT_FREE
+    if _workbench_health_matches(port, _IPV4_LOOPBACK_HOST):
         return _PORT_WORKBENCH
     return _PORT_OCCUPIED
+
+
+def _workbench_browser_url(port: int) -> str:
+    """Preserve the localhost origin only when that exact endpoint is ours."""
+    if _workbench_health_matches(port, _BROWSER_LOOPBACK_HOST):
+        return f"http://{_BROWSER_LOOPBACK_HOST}:{port}/"
+    # This helper is called only after the primary IPv4 listener passed the
+    # authenticated health check. A failed localhost proof can therefore mean
+    # that an unrelated service owns the preferred ::1 endpoint.
+    return f"http://{_IPV4_LOOPBACK_HOST}:{port}/"
 
 
 def _occupied_port_error(port: int) -> DesktopError:
@@ -1105,12 +1126,214 @@ def _request_scan(port: int) -> None:
         pass
 
 
+def _open_browser_once(
+    url: str,
+    *,
+    timeout_seconds: float = BROWSER_OPEN_TIMEOUT_SECONDS,
+) -> bool:
+    """Make one bounded browser-open attempt.
+
+    Some custom ``BROWSER`` commands wait for the browser process to exit.
+    Keep that platform integration from extending the one-shot controller to
+    the browser's lifetime.
+    """
+    finished = threading.Event()
+    result = False
+
+    def _open() -> None:
+        nonlocal result
+        try:
+            result = bool(webbrowser.open(url))
+        except Exception:
+            result = False
+        finally:
+            finished.set()
+
+    threading.Thread(
+        target=_open,
+        name="clawjournal-browser-open",
+        daemon=True,
+    ).start()
+    if not finished.wait(max(0.0, timeout_seconds)):
+        return False
+    return result
+
+
+def _trigger_self_update() -> None:
+    """Restore the hourly update trigger only after daemon readiness is safe."""
+    try:
+        from .selfupdate import maybe_self_update
+
+        maybe_self_update()
+    except Exception:
+        # Auto-update is always best-effort and must not fail an open request.
+        pass
+
+
+def _render_command(command: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(command)
+    return shlex.join(command)
+
+
+def _workbench_daemon_command(port: int) -> list[str]:
+    return _command(
+        "serve",
+        "--port",
+        str(port),
+        "--no-browser",
+        "--no-port-fallback",
+    )
+
+
+def _detached_process_kwargs(log_stream: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_stream,
+        "stderr": subprocess.STDOUT,
+        "close_fds": True,
+        # Do not let a caller's project directory shadow the installed
+        # `clawjournal` package resolved by `python -m`.
+        "cwd": str(_state_dir()),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _spawn_workbench_daemon(
+    port: int,
+) -> tuple[subprocess.Popen[Any], list[str], int]:
+    """Start a strict-port daemon detached from this one-shot controller."""
+    log_path = _log_file()
+    command = _workbench_daemon_command(port)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _trim_log()
+        with log_path.open("ab", buffering=0) as log_stream:
+            header = (
+                f"\n[{_now().isoformat(timespec='seconds')}] "
+                f"Starting: {_render_command(command)}\n"
+            ).encode("utf-8", "replace")
+            log_stream.write(header)
+            log_offset = log_stream.tell()
+            process = subprocess.Popen(
+                command,
+                **_detached_process_kwargs(log_stream),
+            )
+    except OSError as exc:
+        raise DesktopError(
+            "Could not start the ClawJournal workbench.\n"
+            f"Executable: {command[0]}\n"
+            f"Startup command: {_render_command(command)}\n"
+            f"Error: {exc}\n"
+            f"Log: {log_path}\n"
+            "Fix the reported error, then run `clawjournal open` again."
+        ) from exc
+    return process, command, log_offset
+
+
+def _wait_for_workbench(
+    process: subprocess.Popen[Any],
+    port: int,
+    timeout_seconds: float,
+) -> bool:
+    """Wait only for authenticated readiness, never for daemon completion."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        port_state = _workbench_port_state(port)
+        if port_state == _PORT_WORKBENCH:
+            return True
+        if process.poll() is not None and port_state == _PORT_FREE:
+            return False
+        # If our strict-bind child exited while the port is occupied, another
+        # launcher may have bound ClawJournal but not started serving requests
+        # yet. Keep authenticating it within the original deadline. A foreign
+        # listener present before spawn was already rejected by launch().
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(WORKBENCH_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _terminate_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    except OSError:
+        pass
+
+
+def _read_launch_log_tail(offset: int) -> str:
+    try:
+        log_path = _log_file()
+        size = log_path.stat().st_size
+        start = max(offset, size - WORKBENCH_LOG_TAIL_BYTES)
+        with log_path.open("rb") as handle:
+            handle.seek(start)
+            raw = handle.read()
+    except OSError:
+        return ""
+    if start > offset:
+        newline = raw.find(b"\n")
+        raw = raw[newline + 1:] if newline >= 0 else raw
+    return raw.decode("utf-8", "replace").strip()
+
+
+def _startup_error(
+    *,
+    port: int,
+    process: subprocess.Popen[Any],
+    command: list[str],
+    log_offset: int,
+    timeout_seconds: float,
+    timed_out: bool,
+) -> DesktopError:
+    returncode = process.poll()
+    if timed_out:
+        reason = (
+            f"The workbench did not become ready within "
+            f"{timeout_seconds:g} seconds on port {port}."
+        )
+    else:
+        reason = (
+            f"The workbench process exited before it became ready "
+            f"(exit code {returncode})."
+        )
+    lines = [
+        reason,
+        f"Executable: {command[0]}",
+        f"Startup command: {_render_command(command)}",
+        f"Log: {_log_file()}",
+    ]
+    tail = _read_launch_log_tail(log_offset)
+    if tail:
+        lines.extend(("Last startup output:", tail))
+    lines.append(
+        "Review the startup output, fix the reported error, then run "
+        "`clawjournal open` again."
+    )
+    return DesktopError("\n".join(lines))
+
+
 def launch(
     *,
-    startup_head: str | None = None,
-    frontend_snapshot: Any = None,
-) -> None:
-    """Open the workbench and ensure a scan happens, reusing a live daemon."""
+    startup_timeout: float = WORKBENCH_START_TIMEOUT_SECONDS,
+) -> str:
+    """Start or reuse the workbench, open it once, and return after readiness."""
     # pythonw.exe gives Windows a true no-console launcher. Preserve diagnostics
     # by supplying streams before logging and the daemon are initialized.
     _trim_log()
@@ -1126,41 +1349,54 @@ def launch(
         note_opened()
     config = load_config()
     port = int(config.get("daemon_port") or 8384)
-    url = f"http://localhost:{port}/"
     port_state = _workbench_port_state(port)
     if port_state == _PORT_WORKBENCH:
+        url = _workbench_browser_url(port)
         if not is_restart_child:
             _request_scan(port)
-            webbrowser.open(url)
-        return
+            _open_browser_once(url)
+        _trigger_self_update()
+        return url
     if port_state == _PORT_OCCUPIED:
         raise _occupied_port_error(port)
 
-    from .pricing import ensure_pricing_fresh
-    from .workbench.daemon import run_server
-
-    ensure_pricing_fresh()
+    process: subprocess.Popen[Any] | None = None
     try:
-        run_server(
-            port=port,
-            open_browser=not is_restart_child,
-            allow_port_fallback=False,
-            startup_head=startup_head,
-            frontend_snapshot=frontend_snapshot,
-        )
-    except OSError as exc:
-        # Another click won the race between the probe above and the bind.
-        # Verify that the winner is ClawJournal before joining it; another
-        # local service must never be opened under the ClawJournal name.
-        port_state = _workbench_port_state(port)
-        if port_state == _PORT_WORKBENCH:
-            if not is_restart_child:
-                _request_scan(port)
-                webbrowser.open(url)
-            return
-        if port_state == _PORT_OCCUPIED:
-            raise _occupied_port_error(port) from exc
-        raise DesktopError(f"Could not start the workbench on port {port}: {exc}") from exc
+        process, command, log_offset = _spawn_workbench_daemon(port)
+        ready = _wait_for_workbench(process, port, startup_timeout)
+    except BaseException:
+        if process is not None:
+            _terminate_process(process)
+        raise
+    if not ready:
+        # Give a daemon that crossed the readiness boundary exactly at the
+        # deadline one final authenticated chance before stopping our child.
+        final_state = _workbench_port_state(port)
+        if final_state == _PORT_WORKBENCH:
+            ready = True
+        else:
+            timed_out = process.poll() is None
+            _terminate_process(process)
+            final_state = _workbench_port_state(port)
+            if final_state == _PORT_WORKBENCH:
+                ready = True
+            elif final_state == _PORT_OCCUPIED and process.poll() is not None:
+                raise _occupied_port_error(port)
+            else:
+                raise _startup_error(
+                    port=port,
+                    process=process,
+                    command=command,
+                    log_offset=log_offset,
+                    timeout_seconds=startup_timeout,
+                    timed_out=timed_out,
+                )
+    url = _workbench_browser_url(port)
+    if not is_restart_child:
+        _request_scan(port)
+        _open_browser_once(url)
+    _trigger_self_update()
+    return url
 
 
 def _remove_file(path: Path) -> None:
@@ -1244,14 +1480,20 @@ def run_desktop_command(args: Any) -> int:
             print(json.dumps(status(), indent=2))
             return 0
         if args.desktop_command == "launch":
-            launch(
-                startup_head=getattr(args, "daemon_startup_head", None),
-                frontend_snapshot=getattr(
-                    args, "daemon_frontend_snapshot", None
-                ),
-            )
+            launch()
             return 0
     except DesktopError as exc:
         print(f"[x] {exc}", file=sys.stderr)
         return 1
     raise DesktopError(f"Unknown desktop command: {args.desktop_command}")
+
+
+def run_open_command() -> int:
+    """CLI adapter for the bounded, one-shot local workbench opener."""
+    try:
+        url = launch()
+    except DesktopError as exc:
+        print(f"[x] {exc}", file=sys.stderr)
+        return 1
+    print(f"[ok] Workbench ready: {url}")
+    return 0

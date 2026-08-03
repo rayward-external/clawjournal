@@ -3968,9 +3968,12 @@ def _requested_subcommand(argv: list[str] | None = None) -> str | None:
 def _should_auto_update(argv: list[str] | None = None) -> bool:
     """Return False for commands where a pre-parse update changes semantics.
 
-    Suppresses in two cases:
+    Suppresses in these cases:
       - The user explicitly invoked `clawjournal selfupdate` — let
         that command be the only updater for this invocation.
+      - A one-shot workbench controller is about to start a `serve` child.
+        The child must pin its imported backend/frontend pair before it starts
+        the updater, so the parent must not race an update ahead of that pin.
       - The user invoked help/version (`-h`, `--help`, `--version`)
         with no real subcommand — argparse prints and exits, so a
         background fetch is wasted work that surprises the user.
@@ -3985,7 +3988,14 @@ def _should_auto_update(argv: list[str] | None = None) -> bool:
             return True
         # All tokens were flags — no subcommand. Skip when any are help/version.
         return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
-    return command != "selfupdate"
+    if command in {"selfupdate", "open"}:
+        return False
+    # `desktop launch` has no options of its own, so its subcommand is the
+    # final token. Avoid mistaking an unrelated global option value named
+    # "launch" for the desktop action.
+    if command == "desktop" and tokens[-1:] == ["launch"]:
+        return False
+    return True
 
 
 def _should_pin_frontend(
@@ -3999,7 +4009,7 @@ def _should_pin_frontend(
       - a wheel install has no checkout for the updater to fast-forward, so
         there is nothing to defend against (and `_package_repo_root` is the
         same gate `daemon_startup_head` already uses);
-      - `desktop status` / `desktop stop` exit without binding a socket;
+      - one-shot `open` and all `desktop` commands exit without serving;
       - `--reload` opts out on purpose — picking up rebuilds is the dev
         supervisor's whole job.
     """
@@ -4008,8 +4018,8 @@ def _should_pin_frontend(
     tokens = (sys.argv if argv is None else argv)[1:]
     if "--reload" in tokens:
         return False
-    if _requested_subcommand(argv) == "desktop":
-        return "launch" in tokens
+    if _requested_subcommand(argv) in {"open", "desktop"}:
+        return False
     return True
 
 
@@ -4019,7 +4029,7 @@ def main() -> None:
     # updater can fast-forward the checkout or rebuild dist/.
     daemon_startup_head: str | None = None
     daemon_frontend_snapshot: Any = None
-    if _requested_subcommand() in {"serve", "desktop"}:
+    if _requested_subcommand() == "serve":
         try:
             from .selfupdate import _package_repo_root, _rev_parse
 
@@ -4554,6 +4564,10 @@ def main() -> None:
     desktop_sub.add_parser("launch", help="Open the workbench and request a fresh scan")
 
     # Workbench commands
+    sub.add_parser(
+        "open",
+        help="Start or reuse the local workbench, open it, and return when ready",
+    )
     serve_parser = sub.add_parser("serve", help="Start the workbench daemon + web UI")
     serve_parser.add_argument("--port", type=int, default=8384, help="Port (default: 8384)")
     serve_parser.add_argument("--no-browser", action="store_true", help="Don't open browser")
@@ -4564,6 +4578,11 @@ def main() -> None:
     serve_parser.add_argument("--reload", action="store_true",
                               help="Dev: restart the server automatically when backend "
                                    "(*.py) files change")
+    serve_parser.add_argument(
+        "--no-port-fallback",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     scan_parser = sub.add_parser("scan", help="One-shot index sessions into local workbench DB")
     scan_parser.add_argument("--source", choices=WORKBENCH_SOURCE_CHOICES, default=None,
@@ -4948,10 +4967,15 @@ def main() -> None:
     args = parser.parse_args()
     command = args.command or "export"
 
+    if command == "open":
+        from .desktop import run_open_command
+        exit_code = run_open_command()
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
     if command == "desktop":
         from .desktop import run_desktop_command
-        args.daemon_startup_head = daemon_startup_head
-        args.daemon_frontend_snapshot = daemon_frontend_snapshot
         exit_code = run_desktop_command(args)
         if exit_code:
             raise SystemExit(exit_code)
@@ -4999,6 +5023,7 @@ def main() -> None:
             open_browser=open_browser,
             source_filter=args.source,
             remote=args.remote,
+            allow_port_fallback=not args.no_port_fallback,
             startup_head=daemon_startup_head,
             frontend_snapshot=daemon_frontend_snapshot,
         )

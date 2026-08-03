@@ -51,6 +51,7 @@ def isolated_desktop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(desktop, "_desktop_dir", lambda _platform: desktop_dir)
     monkeypatch.setattr(desktop, "_platform", lambda: "linux")
     monkeypatch.setattr(desktop, "_frontend_available", lambda: True)
+    monkeypatch.setattr(desktop, "_trigger_self_update", lambda: None)
     monkeypatch.setattr(desktop.shutil, "which", lambda _name: None)
     monkeypatch.setattr(
         desktop,
@@ -550,6 +551,88 @@ def test_port_probe_requires_a_valid_health_challenge_response(
     assert desktop._workbench_port_state(8384) == desktop._PORT_OCCUPIED
 
 
+def test_browser_url_preserves_an_authenticated_localhost_origin(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[int, str]] = []
+
+    def health_matches(port: int, host: str) -> bool:
+        calls.append((port, host))
+        return True
+
+    monkeypatch.setattr(desktop, "_workbench_health_matches", health_matches)
+
+    assert desktop._workbench_browser_url(8384) == "http://localhost:8384/"
+    assert calls == [(8384, "localhost")]
+
+
+def test_browser_url_falls_back_when_localhost_is_not_authenticated(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        desktop,
+        "_workbench_health_matches",
+        lambda _port, _host: False,
+    )
+
+    assert desktop._workbench_browser_url(8384) == "http://127.0.0.1:8384/"
+
+
+class _FakeWorkbenchProcess:
+    def __init__(self, returncode: int | None = None) -> None:
+        self.returncode = returncode
+        self.pid = 4321
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def test_wait_for_workbench_uses_a_fixed_deadline(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _FakeWorkbenchProcess()
+    now = [100.0]
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(
+        desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE
+    )
+    monkeypatch.setattr(desktop.time, "monotonic", lambda: now[0])
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(desktop.time, "sleep", advance)
+
+    assert desktop._wait_for_workbench(process, 8384, 0.6) is False
+    assert sum(sleeps) == pytest.approx(0.6)
+    assert max(sleeps) <= desktop.WORKBENCH_POLL_INTERVAL_SECONDS
+    assert now[0] == pytest.approx(100.6)
+
+
+def test_browser_open_attempt_is_bounded_and_called_once(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+    calls: list[str] = []
+
+    def blocking_open(url: str) -> bool:
+        calls.append(url)
+        release.wait(1.0)
+        return True
+
+    monkeypatch.setattr(desktop.webbrowser, "open", blocking_open)
+    try:
+        assert desktop._open_browser_once(
+            "http://localhost:8384/",
+            timeout_seconds=0.01,
+        ) is False
+        assert calls == ["http://localhost:8384/"]
+    finally:
+        release.set()
+
+
 def test_launch_reuses_live_workbench(
     isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -561,48 +644,219 @@ def test_launch_reuses_live_workbench(
         "_workbench_port_state",
         lambda port: desktop._PORT_WORKBENCH if port == 9001 else desktop._PORT_FREE,
     )
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://localhost:9001/"
+    )
     monkeypatch.setattr(desktop, "_request_scan", lambda port: calls.append(("scan", port)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda url: calls.append(("browser", url)))
+    monkeypatch.setattr(
+        desktop, "_trigger_self_update", lambda: calls.append("selfupdate")
+    )
 
-    desktop.launch()
+    assert desktop.launch() == "http://localhost:9001/"
 
     assert calls == [
         "opened",
         ("scan", 9001),
         ("browser", "http://localhost:9001/"),
+        "selfupdate",
     ]
 
 
-def test_update_restart_launch_suppresses_launch_only_actions(
+def test_launch_starts_daemon_then_scans_and_opens_exactly_once(
     isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[object] = []
-    captured: dict[str, object] = {}
-    frontend_snapshot = object()
-    monkeypatch.setenv(desktop._UPDATE_RESTART_CHILD_ENV, "1")
+    process = _FakeWorkbenchProcess()
+    command = ["python", "-m", "clawjournal.cli", "serve"]
+
     monkeypatch.setattr(desktop, "note_opened", lambda: calls.append("opened"))
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
     monkeypatch.setattr(
         desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE
     )
     monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://localhost:9001/"
+    )
+    monkeypatch.setattr(
+        desktop,
+        "_spawn_workbench_daemon",
+        lambda port: (process, command, 0),
+    )
+
+    def wait_for_workbench(proc, port, timeout_seconds):
+        calls.append(("wait", proc, port, timeout_seconds))
+        return True
+
+    monkeypatch.setattr(desktop, "_wait_for_workbench", wait_for_workbench)
+    monkeypatch.setattr(desktop, "_request_scan", lambda port: calls.append(("scan", port)))
+    monkeypatch.setattr(
         desktop.webbrowser, "open", lambda url: calls.append(("browser", url))
     )
-    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda: None)
     monkeypatch.setattr(
-        "clawjournal.workbench.daemon.run_server",
-        lambda **kwargs: captured.update(kwargs),
+        desktop, "_trigger_self_update", lambda: calls.append("selfupdate")
+    )
+    monkeypatch.setattr(
+        desktop,
+        "_terminate_process",
+        lambda _proc: pytest.fail("a ready daemon must not be terminated"),
     )
 
-    desktop.launch(
-        startup_head="a" * 40,
-        frontend_snapshot=frontend_snapshot,
+    assert desktop.launch(startup_timeout=4.5) == "http://localhost:9001/"
+
+    assert calls == [
+        "opened",
+        ("wait", process, 9001, 4.5),
+        ("scan", 9001),
+        ("browser", "http://localhost:9001/"),
+        "selfupdate",
+    ]
+
+
+def test_update_restart_launch_suppresses_launch_only_actions(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _FakeWorkbenchProcess()
+    calls: list[object] = []
+
+    monkeypatch.setenv(desktop._UPDATE_RESTART_CHILD_ENV, "1")
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9001})
+    monkeypatch.setattr(
+        desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE
+    )
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://localhost:9001/"
+    )
+    monkeypatch.setattr(
+        desktop,
+        "_spawn_workbench_daemon",
+        lambda port: calls.append(("spawn", port))
+        or (process, ["clawjournal", "serve"], 0),
+    )
+    monkeypatch.setattr(
+        desktop,
+        "_wait_for_workbench",
+        lambda proc, port, timeout: calls.append(("wait", proc, port, timeout))
+        or True,
+    )
+    monkeypatch.setattr(desktop, "note_opened", lambda: calls.append("opened"))
+    monkeypatch.setattr(desktop, "_request_scan", lambda port: calls.append(("scan", port)))
+    monkeypatch.setattr(
+        desktop.webbrowser, "open", lambda url: calls.append(("browser", url))
     )
 
-    assert calls == []
-    assert captured["open_browser"] is False
-    assert captured["startup_head"] == "a" * 40
-    assert captured["frontend_snapshot"] is frontend_snapshot
+    desktop.launch(startup_timeout=4.5)
+
+    assert calls == [
+        ("spawn", 9001),
+        ("wait", process, 9001, 4.5),
+    ]
+
+
+def test_launch_timeout_terminates_child_and_reports_command_log_and_output(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _FakeWorkbenchProcess()
+    command = [
+        "python",
+        "-m",
+        "clawjournal.cli",
+        "serve",
+        "--port",
+        "9002",
+        "--no-browser",
+    ]
+    log = desktop._log_file()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("startup stalled while opening the index\n", encoding="utf-8")
+    terminated: list[object] = []
+
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9002})
+    monkeypatch.setattr(desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE)
+    monkeypatch.setattr(
+        desktop,
+        "_spawn_workbench_daemon",
+        lambda _port: (process, command, 0),
+    )
+
+    def time_out(_proc, _port, timeout_seconds):
+        assert timeout_seconds == 2.5
+        return False
+
+    monkeypatch.setattr(desktop, "_wait_for_workbench", time_out)
+    monkeypatch.setattr(
+        desktop, "_terminate_process", lambda proc: terminated.append(proc)
+    )
+
+    with pytest.raises(desktop.DesktopError) as exc_info:
+        desktop.launch(startup_timeout=2.5)
+
+    message = str(exc_info.value)
+    assert terminated == [process]
+    assert "startup stalled while opening the index" in message
+    assert "clawjournal.cli" in message
+    assert str(log) in message
+
+
+def test_launch_early_exit_terminates_child_and_reports_exit_code(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _FakeWorkbenchProcess(returncode=7)
+    command = ["python", "-m", "clawjournal.cli", "serve", "--port", "9003"]
+    log = desktop._log_file()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("fatal: daemon could not bind\n", encoding="utf-8")
+    terminated: list[object] = []
+
+    monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 9003})
+    monkeypatch.setattr(desktop, "_workbench_port_state", lambda _port: desktop._PORT_FREE)
+    monkeypatch.setattr(
+        desktop,
+        "_spawn_workbench_daemon",
+        lambda _port: (process, command, 0),
+    )
+    monkeypatch.setattr(desktop, "_wait_for_workbench", lambda *_args: False)
+    monkeypatch.setattr(
+        desktop, "_terminate_process", lambda proc: terminated.append(proc)
+    )
+
+    with pytest.raises(desktop.DesktopError) as exc_info:
+        desktop.launch(startup_timeout=30)
+
+    message = str(exc_info.value)
+    assert terminated == [process]
+    assert "7" in message
+    assert "fatal: daemon could not bind" in message
+    assert str(log) in message
+
+
+def test_spawn_workbench_daemon_uses_windows_detached_creation_flags(
+    isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    process = _FakeWorkbenchProcess()
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setattr(desktop.os, "name", "nt")
+    monkeypatch.setattr(desktop.subprocess, "Popen", popen)
+
+    spawned, command, log_offset = desktop._spawn_workbench_daemon(9384)
+
+    assert spawned is process
+    assert captured["command"] == command
+    assert "serve" in command
+    assert command[command.index("--port") + 1] == "9384"
+    assert "--no-browser" in command
+    assert "--no-port-fallback" in command
+    assert captured["cwd"] == str(desktop._state_dir())
+    assert captured["cwd"] != str(isolated_desktop)
+    assert int(captured["creationflags"]) & 0x00000208 == 0x00000208
+    assert "start_new_session" not in captured
+    assert log_offset > 0
 
 
 def test_occupied_unknown_port_is_not_opened_or_replaced(
@@ -620,10 +874,10 @@ def test_occupied_unknown_port_is_not_opened_or_replaced(
     monkeypatch.setattr(desktop, "_request_scan", lambda p: calls.append(("scan", p)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
 
-    def must_not_run(**kwargs: object) -> None:
+    def must_not_spawn(_port: int):
         raise AssertionError("started a second daemon against a live port")
 
-    monkeypatch.setattr("clawjournal.workbench.daemon.run_server", must_not_run)
+    monkeypatch.setattr(desktop, "_spawn_workbench_daemon", must_not_spawn)
     try:
         assert desktop._workbench_port_state(port) == desktop._PORT_OCCUPIED
         with pytest.raises(desktop.DesktopError, match="another local service"):
@@ -640,35 +894,51 @@ def test_losing_the_startup_race_does_not_spawn_a_duplicate(
 ) -> None:
     """Two fast clicks: the loser must join the winner, not take a random port."""
     calls: list[object] = []
+    process = _FakeWorkbenchProcess(returncode=1)
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 8384})
-    states = iter((desktop._PORT_FREE, desktop._PORT_WORKBENCH))
+    states = iter((
+        desktop._PORT_FREE,
+        desktop._PORT_OCCUPIED,
+        desktop._PORT_OCCUPIED,
+        desktop._PORT_WORKBENCH,
+    ))
     monkeypatch.setattr(desktop, "_workbench_port_state", lambda _p: next(states))
+    monkeypatch.setattr(desktop.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(desktop, "_request_scan", lambda p: calls.append(("scan", p)))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
-    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda *a, **k: None)
+    monkeypatch.setattr(
+        desktop, "_workbench_browser_url", lambda _port: "http://127.0.0.1:8384/"
+    )
+    monkeypatch.setattr(
+        desktop,
+        "_spawn_workbench_daemon",
+        lambda _port: (process, ["clawjournal", "serve"], 0),
+    )
+    assert desktop.launch() == "http://127.0.0.1:8384/"
 
-    def bind_conflict(**kwargs: object) -> None:
-        assert kwargs["allow_port_fallback"] is False
-        raise OSError(48, "Address already in use")
-
-    monkeypatch.setattr("clawjournal.workbench.daemon.run_server", bind_conflict)
-    desktop.launch()
-
-    assert calls == [("scan", 8384), ("browser", "http://localhost:8384/")]
+    assert calls == [("scan", 8384), ("browser", "http://127.0.0.1:8384/")]
 
 
 def test_losing_startup_race_to_another_service_reports_an_error(
     isolated_desktop: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[object] = []
+    process = _FakeWorkbenchProcess(returncode=1)
     monkeypatch.setattr(desktop, "load_config", lambda: {"daemon_port": 8384})
-    states = iter((desktop._PORT_FREE, desktop._PORT_OCCUPIED))
+    states = iter((
+        desktop._PORT_FREE,
+        desktop._PORT_OCCUPIED,
+        desktop._PORT_OCCUPIED,
+        desktop._PORT_OCCUPIED,
+    ))
+    times = iter((0.0, 30.0))
     monkeypatch.setattr(desktop, "_workbench_port_state", lambda _p: next(states))
+    monkeypatch.setattr(desktop.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(desktop.webbrowser, "open", lambda u: calls.append(("browser", u)))
-    monkeypatch.setattr("clawjournal.pricing.ensure_pricing_fresh", lambda *a, **k: None)
     monkeypatch.setattr(
-        "clawjournal.workbench.daemon.run_server",
-        lambda **_kwargs: (_ for _ in ()).throw(OSError(48, "Address already in use")),
+        desktop,
+        "_spawn_workbench_daemon",
+        lambda _port: (process, ["clawjournal", "serve"], 0),
     )
 
     with pytest.raises(desktop.DesktopError, match="another local service"):
