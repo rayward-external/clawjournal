@@ -592,6 +592,55 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
 
 # --- IO / CLI ---------------------------------------------------------------
 
+def _auto_upload_needs_hooks(conn) -> bool:
+    """Whether the recurring-upload scheduler still needs the shared hook.
+
+    Fails toward True: never remove a hook automatic uploads might still use.
+    """
+    try:
+        from .workbench.index import get_auto_upload_enrollment
+        enrollment = get_auto_upload_enrollment(conn)
+        return bool(enrollment and enrollment.get("mode") in ("enabled", "paused"))
+    except Exception:
+        return True
+
+
+def _run_nudge_hook_command(*, install: bool) -> None:
+    """Enable/disable the stale-lessons SessionStart nudge (plan §16 CH-1).
+
+    The hook file is shared with the auto-upload scheduler: enabling records a
+    durable ownership flag (so disabling recurring uploads keeps the hook), and
+    disabling removes the hook only when uploads no longer need it.
+    """
+    from .agent_hooks import SUPPORTED_AGENTS, install_hooks, uninstall_agent_hook
+    from .workbench.index import open_index
+
+    conn = open_index()
+    try:
+        if install:
+            results = install_hooks(agent="all")
+            _due.set_nudge_hook_requested(conn, True)
+            for r in results:
+                state = "updated" if r.get("changed") else "already installed"
+                print(f"  - {r['agent']}: SessionStart hook {state} ({r['path']})")
+            print("Stale-lessons nudge enabled: when your lessons go stale, the next "
+                  "agent session start prints one line suggesting `clawjournal skill "
+                  "--preview`. Nothing runs automatically. Disable with "
+                  "`clawjournal skill --uninstall-nudge`.")
+            return
+        _due.set_nudge_hook_requested(conn, False)
+        if _auto_upload_needs_hooks(conn):
+            print("Nudge disabled. The shared SessionStart hook stays installed for "
+                  "automatic uploads; disable those to remove it.")
+            return
+        for agent in SUPPORTED_AGENTS:
+            uninstall_agent_hook(agent)
+        print("Nudge disabled; SessionStart hook removed.")
+    finally:
+        conn.close()
+
+
+
 def _ascii_safe(text: str) -> str:
     """Downgrade the glyphs we print when the console can't encode them (e.g. cp1252)."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
@@ -768,6 +817,16 @@ def run_skill(args) -> None:
               if hit else f"No rule with fingerprint {args.reject}.")
         return
 
+    # --install-nudge / --uninstall-nudge: own the SessionStart hook explicitly
+    # for skill-only users (plan §16 CH-1) instead of coupling its lifecycle to
+    # recurring-upload enrollment, then stop.
+    if getattr(args, "install_nudge", False) or getattr(args, "uninstall_nudge", False):
+        if getattr(args, "install_nudge", False) and getattr(args, "uninstall_nudge", False):
+            print("--install-nudge and --uninstall-nudge are mutually exclusive")
+            sys.exit(2)
+        _run_nudge_hook_command(install=bool(getattr(args, "install_nudge", False)))
+        return
+
     from .config import load_config
     cfg = load_config()  # read the config ONCE and thread it through preflight/scan/select
 
@@ -845,6 +904,7 @@ def run_skill(args) -> None:
         # the next run mislabels every rule [NEW] and the trend snapshot is lost.
         installed: list[str] = []
         failures: list[str] = []
+        offer_nudge_tip = False
         for name, fn, payload in (("claude", _install.install_claude, res.skill_md),
                                   ("codex", _install.install_codex, res.region)):
             if name not in targets:
@@ -870,6 +930,10 @@ def run_skill(args) -> None:
             except Exception as exc:
                 print(f"note: installed to disk, but failed to record state "
                       f"({exc.__class__.__name__}); the next run may re-propose these rules.")
+            try:
+                offer_nudge_tip = not _due.nudge_hook_requested(conn)
+            except Exception:
+                offer_nudge_tip = False
         else:
             _persist_seen()  # nothing landed -> at least keep 'seen' state for next run
     finally:
@@ -882,6 +946,9 @@ def run_skill(args) -> None:
         print("\nNote: these lessons reach your model provider when your agent loads them "
               "(that's how any skill/CLAUDE.md works) — nothing is uploaded to us.")
         print("Re-run weekly (`clawjournal skill`) to keep them fresh.")
+        if offer_nudge_tip:
+            print("Tip: `clawjournal skill --install-nudge` adds a session-start "
+                  "reminder when these lessons go stale.")
     if failures:
         print("\nInstall problems (fix and re-run):")
         for f in failures:

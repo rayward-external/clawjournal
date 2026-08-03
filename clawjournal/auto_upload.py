@@ -1728,8 +1728,9 @@ def enable(
                     "hook_install_failed",
                     "A selected SessionStart hook could not be installed.",
                 )
+            nudge_keeps_hooks = _skill_nudge_keeps_hooks()
             for target in SUPPORTED_HOOK_TARGETS:
-                if target not in targets:
+                if target not in targets and not nudge_keeps_hooks:
                     uninstall_agent_hook(target)
 
             if updating and not rotating_credentials:
@@ -2795,11 +2796,12 @@ def disable() -> dict[str, Any]:
                 ).as_result()
 
         hook_error = False
-        for target in SUPPORTED_HOOK_TARGETS:
-            try:
-                uninstall_agent_hook(target)
-            except Exception:
-                hook_error = True
+        if not _skill_nudge_keeps_hooks():
+            for target in SUPPORTED_HOOK_TARGETS:
+                try:
+                    uninstall_agent_hook(target)
+                except Exception:
+                    hook_error = True
 
         enrollment_id = (
             str(credentials.get("enrollment_id"))
@@ -5030,6 +5032,22 @@ def run_cycle(
         scheduled_client=scheduled_client,
     )
     return result
+
+
+def _skill_nudge_keeps_hooks() -> bool:
+    """True when the lessons nudge (skill.due) explicitly owns the shared hook.
+
+    The SessionStart hook file serves both the auto-upload scheduler and the
+    stale-lessons nudge; auto-upload teardown must not silently remove a hook
+    the user enabled with ``clawjournal skill --install-nudge``. Fails toward
+    False: an unreadable flag never blocks hook removal.
+    """
+    try:
+        from .skill.due import nudge_hook_active
+
+        return bool(nudge_hook_active())
+    except Exception:
+        return False
 
 
 def _open_existing_hook_index() -> sqlite3.Connection | None:

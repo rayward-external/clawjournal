@@ -408,8 +408,14 @@ Adoption list, ranked by payoff-per-effort:
   (`agent_hooks.py`): when the lessons are stale *and* new sessions accumulated
   (with a failure-evidence event trigger), the hook prints one nudge line
   suggesting `clawjournal skill --preview`. Never auto-runs the LLM (egress stays
-  user-initiated); cooldown-limited; fail-open on any DB/parse error. Background
-  auto-`--preview` gated by an explicit distill-backend confirmation (parallel to
+  user-initiated); cooldown-limited; fail-open on any DB/parse error. The
+  printed counts reach agent context, so they honor the corpus boundaries:
+  hold-state gated (`_release_blocked_ids`), scoped to confirmed
+  sources/projects, and timestamps precisely parsed (per the Codex review of
+  PR #181). Hook lifecycle is owned by `clawjournal skill --install-nudge` /
+  `--uninstall-nudge` — decoupled from recurring-upload enrollment; the shared
+  hook survives whichever feature is disabled last. Background auto-`--preview`
+  gated by an explicit distill-backend confirmation (parallel to
   `_confirmed_scoring_backend`) is a possible later opt-in, per the critic's
   adjudication.
 - **CH-2 — must-cover guarantee for objective candidates (ADOPTED 2026-08-02).**
@@ -417,10 +423,15 @@ Adoption list, ranked by payoff-per-effort:
   injected MUST directive), adopted on internal grounds (CH never evaluated it in
   isolation). Closes the §16-era gap: a ≥3-session env signature or the rejection
   candidate reaching the distiller could still silently produce no rule. Now the
-  distill prompt lists synthetic candidates as MUST-COVER, and any left uncited
-  gets a deterministic templated fallback rule (≤2/run, scrubbed, through the
-  same hard-deny/PII/TruffleHog gates + preview). **No re-ask** — D6's
-  one-distill-call invariant holds; the fallback path is zero-egress.
+  distill prompt lists synthetic candidates as MUST-COVER, and **every** one left
+  uncited gets a deterministic templated fallback rule (bounded only by the
+  upstream candidate caps, ≤4; scrubbed, through the same
+  hard-deny/PII/TruffleHog gates + preview). The fallback's one machine-inserted
+  untrusted span (the normalized error signature) is checked against
+  instruction-injection phrasing (`schema.find_injection_phrases`) and withheld
+  when it matches — the rule still ships for coverage (per the Codex review of
+  PR #181). **No re-ask** — D6's one-distill-call invariant holds; the fallback
+  path is zero-egress.
 - **CH-3 — usage/outcome tracking on installed rules (NEXT).** Do what CH
   couldn't: real counters instead of judged `effectiveness`. A
   `skill_rule_events` table (fingerprint, ts, `installed|loaded|violated|

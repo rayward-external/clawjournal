@@ -178,7 +178,10 @@ def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
 # call per run, so there is no re-ask), flowing through the same hard-deny /
 # secret / PII gates and the same preview as every distilled rule.
 
-MAX_FALLBACK_RULES = 2   # keep templated prose rare; highest-support signals first
+# The guarantee must reach EVERY objective candidate or it isn't one: the
+# upstream caps (turns.MAX_ENV_CANDIDATES = 3 env signatures + 1 rejection)
+# bound this at 4, so it is a defensive backstop, not a coverage limit.
+MAX_FALLBACK_RULES = 4
 
 _SYNTHETIC_ID_PREFIXES = ("env-signature-",)
 _SYNTHETIC_IDS = frozenset({"human-rejection"})
@@ -233,6 +236,7 @@ def _fallback_rule(
                       "across sessions."),
             why=why, evidence_session_ids=[alias], support=n,
         )
+    from .schema import find_injection_phrases
     from .turns import _signal_label, error_signature
 
     excerpt = next(iter(candidate.pivotal_excerpts or []), None)
@@ -249,17 +253,28 @@ def _fallback_rule(
     label = _scrub(_signal_label(error_signature(raw_error)), anon, settings)
     if not label:
         return None   # nothing concrete to teach; don't emit an empty template
+    # This label is the ONE machine-inserted untrusted span (tool-error output
+    # reaches it without the LLM paraphrase step). Error text that reads as
+    # instruction injection is withheld — the rule still ships (coverage), the
+    # preview's cited sessions carry the detail.
+    if find_injection_phrases(label):
+        label = ""
+        why += (" Error text withheld: it matched instruction-injection "
+                "phrasing; inspect the cited sessions instead.")
     tool = action.split(":", 1)[0].strip() if ":" in action else ""
     if recovery:
         why += f" A changed call that then worked: {recovery}."
+    guidance = (
+        f'Address the recurring failure before retrying: "{label}". '
+        if label else
+        "Address this recurring tool failure before retrying. "
+    ) + "Check the failing precondition first instead of repeating the same call."
     return SkillRule(
         kind="avoid",
         title=_scrub(candidate.title, anon, settings) or "Recurring Tool Error",
         trigger=(f"When a {tool} call fails with this recurring error" if tool
                  else "When a tool call fails with this recurring error"),
-        guidance=(f"Address the recurring failure before retrying: {label}. "
-                  "Check the failing precondition first instead of repeating "
-                  "the same call."),
+        guidance=guidance,
         why=why, evidence_session_ids=[alias], support=n,
     )
 

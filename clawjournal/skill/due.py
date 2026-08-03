@@ -10,13 +10,12 @@ automatically: the nudge is text, the distill call and install remain manual
 and confirmed.
 
 Only users who have already run the skill pipeline are nudged (the anchor is
-``skill_rules`` state plus a run marker); a fresh install nudges nobody. Session
-counts here are an *activity metric* for a locally printed line — nothing leaves
-the machine — so they deliberately skip the per-session release-gate pass the
-egress paths run (a held session still counts as "new activity"; it just can
-never feed the distill corpus itself). They DO mirror the confirmed
-source/project scope, so the nudge never advertises sessions the suggested run
-would not even select.
+``skill_rules`` state plus a run marker); a fresh install nudges nobody. The
+printed counts reach agent context (and therefore the model provider when the
+agent loads them), so they honor the same boundaries as the corpus itself:
+hold-state gated via ``_release_blocked_ids`` and scoped to the confirmed
+sources/projects — the nudge never advertises, even in aggregate, sessions the
+suggested run could not select.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ from ..workbench.index import (
     FAILURE_VALUE_SOURCE_SCOPE,
     session_matches_excluded_projects,
 )
+from .select import _parse_start_time, _release_blocked_ids
 
 # Never nudge within a week of the last skill run; past two weeks staleness
 # alone is enough. In between, an event must justify the nudge: failure
@@ -46,6 +46,7 @@ _COUNT_CAP = 1000           # counts saturate here; thresholds sit far below it
 _STATE_TABLE = "skill_nudge_state"
 _LAST_NUDGED_KEY = "last_nudged_at"
 _LAST_RUN_KEY = "last_skill_run_at"
+_HOOK_REQUESTED_KEY = "nudge_hook_requested_at"
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,51 @@ def record_skill_run(conn: sqlite3.Connection, *, now: datetime | None = None) -
     """
     _write_state_ts(conn, _LAST_RUN_KEY, now or datetime.now(timezone.utc))
     conn.commit()
+
+
+def nudge_hook_requested(conn: sqlite3.Connection) -> bool:
+    """True when the user explicitly enabled the nudge via ``--install-nudge``."""
+    return _read_state_ts(conn, _HOOK_REQUESTED_KEY) is not None
+
+
+def set_nudge_hook_requested(
+    conn: sqlite3.Connection, requested: bool, *, now: datetime | None = None
+) -> None:
+    """Durable marker that the user explicitly owns the SessionStart hook.
+
+    The hook file is shared with the auto-upload scheduler; this flag is what
+    lets each feature's teardown know the other still needs it.
+    """
+    if requested:
+        _write_state_ts(conn, _HOOK_REQUESTED_KEY, now or datetime.now(timezone.utc))
+    else:
+        try:
+            conn.execute(
+                f"DELETE FROM {_STATE_TABLE} WHERE key = ?", (_HOOK_REQUESTED_KEY,)
+            )
+        except sqlite3.Error:   # table never created -> nothing to clear
+            pass
+    conn.commit()
+
+
+def nudge_hook_active() -> bool:
+    """Fail-open(False) flag read for auto-upload teardown paths.
+
+    Opens the existing index read-write like the hook does; any error means
+    "not requested" so an unreadable flag can never block hook removal.
+    """
+    try:
+        from ..auto_upload import _open_existing_hook_index
+
+        conn = _open_existing_hook_index()
+        if conn is None:
+            return False
+        try:
+            return nudge_hook_requested(conn)
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 
 def _scope_and_exclusions(conn: sqlite3.Connection) -> tuple[list[str], list[str]]:
@@ -161,27 +207,38 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
         return DueStatus(False, "cooldown", days_since=days_since)
 
     # Activity since the anchor, in the same source/project scope the suggested
-    # run would use. start_time is an ISO string with per-source offsets; a
-    # lexicographic compare can skew by up to ~14h, which is noise at nudge
-    # granularity (thresholds are days, not hours). The GLOB guard drops
-    # unparseable timestamps ('unknown', raw vendor stamps) that would compare
-    # greater than any ISO anchor and count as new activity forever —
-    # select.py excludes exactly these from the corpus.
+    # run would use. The SQL is a cheap narrowing pass (the GLOB drops obvious
+    # non-ISO strings like 'unknown' that compare greater than any anchor); the
+    # precise instant check happens on the parsed timestamp below, bounding both
+    # ends like select.py so malformed ISO-lookalikes ('9999-99-99garbage') and
+    # future-dated rows can never count as new activity forever.
     sources, excluded = _scope_and_exclusions(conn)
     placeholders = ",".join("?" for _ in sources)
     rows = conn.execute(
-        "SELECT project, source, ai_failure_value_score, ai_outcome_badge "
+        "SELECT session_id, project, source, start_time, "
+        "ai_failure_value_score, ai_outcome_badge "
         "FROM sessions WHERE review_status != 'segmented' "
         f"AND source IN ({placeholders}) AND start_time > ? "
         "AND start_time GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
         f"LIMIT {_COUNT_CAP}",
         [*sources, anchor.isoformat()],
     ).fetchall()
-    kept = [
-        r for r in rows
-        if not excluded or not session_matches_excluded_projects(
-            {"project": r["project"], "source": r["source"]}, excluded)
-    ]
+    kept = []
+    for r in rows:
+        parsed = _parse_start_time(r["start_time"])
+        if parsed is None or not (anchor < parsed <= now):
+            continue
+        if excluded and session_matches_excluded_projects(
+                {"project": r["project"], "source": r["source"]}, excluded):
+            continue
+        kept.append(r)
+    # Hold-state gate: the nudge line reaches agent context (and so the model
+    # provider), so even aggregate counts must not derive from held/embargoed
+    # sessions — mirror the corpus egress gate rather than counting sessions
+    # selection could never use.
+    if kept:
+        blocked = _release_blocked_ids(conn, [r["session_id"] for r in kept], now=now)
+        kept = [r for r in kept if r["session_id"] not in blocked]
     new_sessions = len(kept)
     if new_sessions < NUDGE_MIN_NEW_SESSIONS:
         return DueStatus(False, "quiet", new_sessions=new_sessions, days_since=days_since)

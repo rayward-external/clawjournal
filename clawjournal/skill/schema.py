@@ -176,6 +176,35 @@ _DENY = [
 ]
 
 
+def find_injection_phrases(text: str) -> bool:
+    """True when MACHINE-INSERTED untrusted text reads as instruction injection.
+
+    The deterministic MUST-COVER fallback interpolates a normalized tool-ERROR
+    signature — environment/attacker-influenced text — into rule fields without
+    the LLM paraphrase step that launders distilled prose ("state the lesson in
+    your own words"). ``find_external_tokens`` catches concrete actionable
+    tokens but not imperative injection ("ignore previous instructions…").
+    Applied ONLY to those machine-inserted spans: distilled prose would
+    false-positive on legitimate lessons that mention instructions.
+    """
+    return bool(_INJECTION_RE.search(text or ""))
+
+
+_INJECTION_RE = re.compile(
+    r"(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+|the\s+|every\s+)?"
+    r"(?:previous|prior|above|earlier|system|other)\s+(?:instruction|prompt|rule|message|context)"
+    r"|new\s+instructions?\s*[:\-]"
+    r"|system\s+prompt"
+    r"|you\s+are\s+now\b"
+    r"|act\s+as\b|pretend\s+to\s+be\b|role[\s-]?play"
+    r"|do\s+not\s+(?:tell|inform|mention|reveal|alert)"
+    r"|\b(?:upload|send|post|exfiltrate|transmit|email|leak|share)\b[^.\n]{0,60}"
+    r"\b(?:source|code|file|secret|token|key|credential|password|data|repo)"
+    r"|\b(?:run|execute)\s+the\s+following\b",
+    re.I,
+)
+
+
 def find_external_tokens(rule: SkillRule) -> list[str]:
     """Return reasons a rule must be hard-denied (empty list = clean).
 

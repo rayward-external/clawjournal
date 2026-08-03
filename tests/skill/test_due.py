@@ -142,6 +142,65 @@ def test_not_due_prints_nothing(index_conn):
     assert lines == []
 
 
+# --- hook lifecycle (decoupled from auto-upload enrollment) -------------------
+
+def test_install_nudge_command_sets_flag_and_installs(index_conn, monkeypatch, capsys):
+    from clawjournal.cli_skill import _run_nudge_hook_command
+    from clawjournal.skill.due import nudge_hook_requested
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "clawjournal.agent_hooks.install_hooks",
+        lambda agent: calls.append(agent) or [
+            {"agent": "claude", "changed": True, "path": "p1"},
+            {"agent": "codex", "changed": False, "path": "p2"}])
+    _run_nudge_hook_command(install=True)
+    assert calls == ["all"]
+    assert nudge_hook_requested(index_conn) is True
+    assert "Nothing runs automatically" in capsys.readouterr().out
+
+
+def test_uninstall_nudge_keeps_hook_while_uploads_need_it(index_conn, monkeypatch, capsys):
+    from clawjournal.cli_skill import _run_nudge_hook_command
+    from clawjournal.skill import due as due_mod
+    due_mod.set_nudge_hook_requested(index_conn, True, now=NOW)
+    removed: list[str] = []
+    monkeypatch.setattr("clawjournal.agent_hooks.uninstall_agent_hook",
+                        lambda agent: removed.append(agent))
+    monkeypatch.setattr("clawjournal.workbench.index.get_auto_upload_enrollment",
+                        lambda conn: {"mode": "enabled"})
+    _run_nudge_hook_command(install=False)
+    assert removed == []                                  # uploads still own it
+    assert due_mod.nudge_hook_requested(index_conn) is False
+    assert "stays installed" in capsys.readouterr().out
+
+
+def test_uninstall_nudge_removes_hook_when_uploads_do_not(index_conn, monkeypatch, capsys):
+    from clawjournal.cli_skill import _run_nudge_hook_command
+    removed: list[str] = []
+    monkeypatch.setattr("clawjournal.agent_hooks.uninstall_agent_hook",
+                        lambda agent: removed.append(agent))
+    monkeypatch.setattr("clawjournal.workbench.index.get_auto_upload_enrollment",
+                        lambda conn: None)
+    _run_nudge_hook_command(install=False)
+    assert removed == ["claude", "codex"]
+    assert "hook removed" in capsys.readouterr().out
+
+
+def test_auto_upload_teardown_respects_nudge_flag(index_conn):
+    # disabling recurring uploads must not remove the hook the nudge owns
+    from clawjournal import auto_upload
+    from clawjournal.skill import due as due_mod
+    assert auto_upload._skill_nudge_keeps_hooks() is False   # flag unset
+    due_mod.set_nudge_hook_requested(index_conn, True, now=NOW)
+    assert auto_upload._skill_nudge_keeps_hooks() is True
+
+
+def test_auto_upload_teardown_guard_fails_open(tmp_path, monkeypatch):
+    from clawjournal import auto_upload
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    assert auto_upload._skill_nudge_keeps_hooks() is False   # no DB -> removable
+
+
 def test_skill_rules_table_present_but_empty_is_never_distilled(index_conn):
     _store.ensure_table(index_conn)   # table exists, no rows (e.g. everything rejected)
     status = distill_due_on_connection(index_conn, NOW)
@@ -185,6 +244,44 @@ def test_excluded_projects_do_not_count(index_conn, ins):
         ins(index_conn, f"c{i}", source="claude", project="proj", start_time=start)
     status = distill_due_on_connection(index_conn, NOW)
     assert not status.due and status.reason == "quiet"
+
+
+def test_held_sessions_do_not_count(index_conn, ins):
+    # the nudge line reaches agent context, so even aggregate counts must honor
+    # the hold-state gate (Codex review, PR #181)
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    start = (NOW - timedelta(days=2)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"h{i}", start_time=start, hold_state="pending_review")
+    status = distill_due_on_connection(index_conn, NOW)
+    assert not status.due and status.reason == "quiet"
+
+
+def test_malformed_iso_lookalike_start_time_never_counts(index_conn, ins):
+    # '9999-99-99garbage' passes the GLOB prefix but must fail the precise
+    # parse; future-dated rows are bounded out too
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    for i in range(3):
+        ins(index_conn, f"m{i}", start_time="9999-99-99garbage")
+    for i in range(3):
+        ins(index_conn, f"f{i}", start_time="2027-01-01T00:00:00+00:00")
+    status = distill_due_on_connection(index_conn, NOW)
+    assert not status.due and status.reason == "quiet"
+
+
+def test_nudge_hook_requested_flag_round_trip(index_conn):
+    from clawjournal.skill.due import nudge_hook_requested, set_nudge_hook_requested
+    assert nudge_hook_requested(index_conn) is False   # table may not even exist
+    set_nudge_hook_requested(index_conn, True, now=NOW)
+    assert nudge_hook_requested(index_conn) is True
+    set_nudge_hook_requested(index_conn, False)
+    assert nudge_hook_requested(index_conn) is False
+
+
+def test_nudge_hook_active_fails_open_without_db(tmp_path, monkeypatch):
+    from clawjournal.skill.due import nudge_hook_active
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    assert nudge_hook_active() is False
 
 
 def test_rule_less_run_still_cools_the_nudge(index_conn, ins):

@@ -4632,6 +4632,12 @@ def main() -> None:
     skill_p.add_argument("--no-score", action="store_true", help="Skip scoring unscored sessions in the window")
     skill_p.add_argument("--score-limit", type=int, default=25,
                          help="Max unscored sessions to score this run (cost bound; default 25)")
+    skill_p.add_argument("--install-nudge", action="store_true",
+                         help="Install the SessionStart hook that prints a one-line reminder "
+                              "when these lessons go stale (it never runs anything itself)")
+    skill_p.add_argument("--uninstall-nudge", action="store_true",
+                         help="Disable the stale-lessons reminder (removes the shared hook "
+                              "unless automatic uploads still need it)")
     skill_p.add_argument("--reject", metavar="FINGERPRINT",
                          help="Reject a rule by fingerprint so it is never re-proposed")
     skill_p.add_argument("--skip-preflight", action="store_true",
