@@ -1333,7 +1333,11 @@ def launch(
         note_opened()
     config = load_config()
     port = int(config.get("daemon_port") or 8384)
-    url = f"http://localhost:{port}/"
+    # Open the exact IPv4 endpoint authenticated by _workbench_port_state().
+    # The daemon's best-effort ::1 companion may be unavailable because a
+    # different local service already owns that port; using localhost here
+    # could otherwise send the browser to that unrelated IPv6 listener.
+    url = f"http://127.0.0.1:{port}/"
     port_state = _workbench_port_state(port)
     if port_state == _PORT_WORKBENCH:
         if not is_restart_child:

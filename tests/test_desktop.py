@@ -623,12 +623,12 @@ def test_launch_reuses_live_workbench(
         desktop, "_trigger_self_update", lambda: calls.append("selfupdate")
     )
 
-    desktop.launch()
+    assert desktop.launch() == "http://127.0.0.1:9001/"
 
     assert calls == [
         "opened",
         ("scan", 9001),
-        ("browser", "http://localhost:9001/"),
+        ("browser", "http://127.0.0.1:9001/"),
         "selfupdate",
     ]
 
@@ -669,13 +669,13 @@ def test_launch_starts_daemon_then_scans_and_opens_exactly_once(
         lambda _proc: pytest.fail("a ready daemon must not be terminated"),
     )
 
-    desktop.launch(startup_timeout=4.5)
+    assert desktop.launch(startup_timeout=4.5) == "http://127.0.0.1:9001/"
 
     assert calls == [
         "opened",
         ("wait", process, 9001, 4.5),
         ("scan", 9001),
-        ("browser", "http://localhost:9001/"),
+        ("browser", "http://127.0.0.1:9001/"),
         "selfupdate",
     ]
 
@@ -875,9 +875,9 @@ def test_losing_the_startup_race_does_not_spawn_a_duplicate(
         "_spawn_workbench_daemon",
         lambda _port: (process, ["clawjournal", "serve"], 0),
     )
-    desktop.launch()
+    assert desktop.launch() == "http://127.0.0.1:8384/"
 
-    assert calls == [("scan", 8384), ("browser", "http://localhost:8384/")]
+    assert calls == [("scan", 8384), ("browser", "http://127.0.0.1:8384/")]
 
 
 def test_losing_startup_race_to_another_service_reports_an_error(
