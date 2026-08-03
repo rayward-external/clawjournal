@@ -404,6 +404,7 @@ def add_env_candidates(
             rank_score=_candidate_rank(support=n, impact=2.0, recency=recency,
                                        corrections=1),
             pivotal_excerpts=[excerpt],
+            objective_signature=sig,
         ))
         corpus.total_failures += 1
 

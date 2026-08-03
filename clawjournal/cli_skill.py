@@ -691,19 +691,24 @@ def _format_install_targets(targets: list[str]) -> str:
 
 
 def _print_objective_not_installed(res: SkillResult) -> None:
-    """Name the objective signals the capped install set could not fit.
+    """Name the objective signals that did not reach the installed set.
 
     MUST-COVER guarantees objective evidence reaches the user, not that it wins
-    a slot — so when ranking displaces one, say so instead of dropping it
-    silently.
+    a slot — so say why each is absent (ranking, an earlier rejection, or the
+    safety gate) instead of dropping it silently. The reason is deliberately not
+    attributed to the budget alone: a rule can also be missing because its
+    fingerprint was ``--reject``ed or a gate dropped it.
     """
     displaced = getattr(res, "objective_not_installed", None)
     if not displaced:
         return
-    print(f"\n  {len(displaced)} objective signal(s) did not fit the "
-          f"{MAX_INSTALLED_RULES}-rule budget this run:")
+    print(f"\n  {len(displaced)} objective signal(s) not in the installed set "
+          f"this run (the {MAX_INSTALLED_RULES}-rule budget, a previous "
+          f"--reject, or the safety gate):")
     for rule in displaced:
         print(f"    - {rule.display_title()}  (seen in {rule.support} session(s))")
+        if rule.preview_note:
+            print(f"        {rule.preview_note}")
 
 
 def _print_blocked_rules(res: SkillResult) -> None:
@@ -726,6 +731,9 @@ def _print_preview(res: SkillResult) -> None:
         else:
             print("No usable rules this run.")
         _print_focus(res)
+        # also on this early return: displaced objective signals must never be
+        # dropped without a word, even when every slot-winner was gate-dropped
+        _print_objective_not_installed(res)
         _print_blocked_rules(res)
         return
     print(f"Proposed skill set ({len(res.rules)} rule(s)):\n")
@@ -740,6 +748,8 @@ def _print_preview(res: SkillResult) -> None:
             print(f"        when: {r.trigger}")
         if r.why:
             print(f"        why:  {r.why}")
+        if r.preview_note:   # terminal-only; never installed into agent context
+            print(f"        {r.preview_note}")
     _print_focus(res)
     if res.dropped:
         print(

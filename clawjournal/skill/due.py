@@ -227,20 +227,34 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
     # future-dated rows can never count as new activity forever.
     sources, excluded = _scope_and_exclusions(conn)
     placeholders = ",".join("?" for _ in sources)
-    hold_placeholders = ",".join("?" for _ in sorted(SHAREABLE_HOLD_STATES))
-    # The hold-state prefilter is what keeps the cap honest (a pile of held rows
-    # can no longer crowd out eligible ones); `_release_blocked_ids` below is
-    # still authoritative for the rest of the gate. Rows whose embargo has since
-    # expired are undercounted here — conservative, never over-reporting.
+    # Everything cheap happens BEFORE the cap, so no class of ineligible row can
+    # crowd out real activity: source scope, hold state, both time bounds, and
+    # the excluded projects (in their stored and source-prefixed forms).
+    # ``embargoed`` is included because an EXPIRED embargo is shareable again —
+    # `_release_blocked_ids` below resolves that and stays authoritative.
+    hold_states = sorted(SHAREABLE_HOLD_STATES | {"embargoed"})
+    hold_placeholders = ",".join("?" for _ in hold_states)
+    exclusion_clause = ""
+    exclusion_params: list[str] = []
+    if excluded:
+        ex_placeholders = ",".join("?" for _ in excluded)
+        exclusion_clause = (
+            f" AND project NOT IN ({ex_placeholders})"
+            f" AND (source || ':' || project) NOT IN ({ex_placeholders})"
+        )
+        exclusion_params = [*excluded, *excluded]
     rows = conn.execute(
         "SELECT session_id, project, source, start_time, "
         "ai_failure_value_score, ai_outcome_badge "
         "FROM sessions WHERE review_status != 'segmented' "
         f"AND source IN ({placeholders}) "
-        f"AND hold_state IN ({hold_placeholders}) AND start_time > ? "
+        f"AND hold_state IN ({hold_placeholders}) "
+        "AND start_time > ? AND start_time <= ? "
         "AND start_time GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
+        f"{exclusion_clause}"
         f"ORDER BY start_time DESC LIMIT {_COUNT_CAP}",
-        [*sources, *sorted(SHAREABLE_HOLD_STATES), anchor.isoformat()],
+        [*sources, *hold_states, anchor.isoformat(), now.isoformat(),
+         *exclusion_params],
     ).fetchall()
     saturated = len(rows) >= _COUNT_CAP
     kept = []

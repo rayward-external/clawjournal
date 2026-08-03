@@ -316,6 +316,64 @@ def test_held_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
     assert status.due and status.new_sessions == 6
 
 
+def test_future_dated_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
+    # both time bounds are applied before the cap, so a pile of future-dated
+    # rows can't consume it (Codex re-review round 2)
+    from clawjournal.skill.due import _COUNT_CAP
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    future = (NOW + timedelta(days=400)).isoformat()
+    for i in range(_COUNT_CAP + 50):
+        ins(index_conn, f"fut{i}", start_time=future)
+    start = (NOW - timedelta(days=1)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"ok{i}", start_time=start)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_excluded_project_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
+    from clawjournal.config import load_config, save_config
+    from clawjournal.skill.due import _COUNT_CAP
+    cfg = load_config()
+    cfg["excluded_projects"] = ["secret"]
+    save_config(cfg)
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    old = (NOW - timedelta(days=5)).isoformat()
+    for i in range(_COUNT_CAP + 50):
+        ins(index_conn, f"ex{i}", source="claude", project="secret", start_time=old)
+    recent = (NOW - timedelta(days=1)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"ok{i}", source="claude", project="fine", start_time=recent)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_expired_embargo_counts_again(index_conn, ins):
+    # an embargo that has lapsed is shareable again; the SQL prefilter must not
+    # hard-exclude it before the release gate can resolve that
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    start = (NOW - timedelta(days=2)).isoformat()
+    past = (NOW - timedelta(days=1)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"emb{i}", start_time=start, hold_state="embargoed")
+    index_conn.execute("UPDATE sessions SET embargo_until = ?", (past,))
+    index_conn.commit()
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_active_embargo_still_does_not_count(index_conn, ins):
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    start = (NOW - timedelta(days=2)).isoformat()
+    future = (NOW + timedelta(days=30)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"emb{i}", start_time=start, hold_state="embargoed")
+    index_conn.execute("UPDATE sessions SET embargo_until = ?", (future,))
+    index_conn.commit()
+    status = distill_due_on_connection(index_conn, NOW)
+    assert not status.due and status.reason == "quiet"
+
+
 def test_saturated_count_is_reported_as_a_floor(index_conn, ins):
     from clawjournal.skill.due import _COUNT_CAP
     _seed_skill_state(index_conn, installed_days_ago=15)

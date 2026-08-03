@@ -57,6 +57,11 @@ class SkillRule:
     # verified signals even when their templated wording looks alike, so the
     # paraphrase collapse in cli_skill must not merge them.
     origin: str = ""
+    # Terminal-only context for the preview (e.g. the raw error signature behind
+    # a deterministic fallback). NEVER rendered into an agent-facing file and
+    # never fingerprinted: it may hold untrusted tool output, which is safe to
+    # show a human in their own terminal but not to install as agent context.
+    preview_note: str = ""
 
     def display_title(self) -> str:
         """The heading to render; falls back to guidance when unnamed."""
@@ -232,4 +237,10 @@ def find_external_tokens(rule: SkillRule) -> list[str]:
     for label, rx in _DENY:
         if rx.search(text):
             hits.append(label)
+    # Backstop only. Deterministic fallbacks keep untrusted text out of rule
+    # fields by construction (see distill._fallback_rule), and distilled prose is
+    # paraphrased by the model; this catches a blatant imperative that slipped
+    # through either path. It is NOT the control — a denylist cannot be one.
+    if find_injection_phrases(text):
+        hits.append("injection_phrase")
     return hits

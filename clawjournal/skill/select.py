@@ -60,6 +60,10 @@ class SkillCandidate:
     # pivotal user-correction excerpts (skill.turns.TurnExcerpt), attached post-selection
     # by enrich_corpus_with_turns; raw here, scrubbed at prompt-format time.
     pivotal_excerpts: list[Any] = field(default_factory=list)
+    # For synthetic objective candidates: the CLUSTER-TIME normalized error
+    # signature (skill.turns.error_signature). Recomputing it later from a
+    # truncated excerpt loses tracebacks entirely, so carry it here.
+    objective_signature: str = ""
 
 
 @dataclass
