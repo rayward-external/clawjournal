@@ -273,6 +273,17 @@ export const api = {
       });
     },
 
+    bulkStatus(sessionIds: string[], status: 'approved' | 'blocked'): Promise<{
+      updated_ids: string[];
+      missing_ids: string[];
+    }> {
+      return request('/session-status/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_ids: sessionIds, status }),
+      });
+    },
+
     findings(id: string, opts: { groupBy?: 'entity'; status?: FindingStatus } = {}): Promise<{ total: number; entities?: FindingEntityGroup[]; findings?: Finding[] }> {
       const params: Record<string, string> = {};
       if (opts.groupBy) params.group_by = opts.groupBy;

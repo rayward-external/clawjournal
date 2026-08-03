@@ -15,6 +15,7 @@ import { colors, selectStyle, btnPrimary, btnDanger, btnSecondary } from '../the
 // chips wrapping across the viewport.
 const TYPE_CHIP_PREVIEW_LIMIT = 6;
 const GETTING_STARTED_DISMISSED_KEY = 'cj.gettingStartedGuideV2Dismissed';
+const BULK_STATUS_BATCH_SIZE = 100;
 
 function failureBadge(score: number | null): string {
   if (score == null) return '\u2014';
@@ -162,6 +163,14 @@ export function Inbox() {
 
   // Bulk selection
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkUpdate, setBulkUpdate] = useState<{
+    action: 'approved' | 'blocked';
+    ids: string[];
+  } | null>(null);
+  // State updates do not become visible until the next render. Keep a
+  // synchronous guard as well so a double click cannot submit the same batch
+  // twice while React is closing the confirmation dialog.
+  const bulkUpdateInFlightRef = useRef(false);
 
   // Keyboard navigation
   const [focusIndex, setFocusIndex] = useState(-1);
@@ -182,7 +191,10 @@ export function Inbox() {
   const loadingIdsRef = useRef<Set<string>>(new Set());
 
   // Confirm dialog
-  const [confirm, setConfirm] = useState<{ action: string; ids: string[] } | null>(null);
+  const [confirm, setConfirm] = useState<{
+    action: 'approved' | 'blocked';
+    ids: string[];
+  } | null>(null);
 
   const loadStats = useCallback(async () => {
     try {
@@ -191,7 +203,13 @@ export function Inbox() {
     } catch { /* ignore */ }
   }, []);
 
-  const loadSessions = useCallback(async (currentOffset: number, append: boolean) => {
+  const loadSessions = useCallback(async (
+    currentOffset: number,
+    append: boolean,
+    preserveDeselectedIds?: ReadonlySet<string>,
+    preserveSelectedIds?: ReadonlySet<string>,
+  ) => {
+    if (bulkUpdateInFlightRef.current) return;
     const requestSeq = loadRequestSeqRef.current + 1;
     loadRequestSeqRef.current = requestSeq;
     setLoading(true);
@@ -223,7 +241,17 @@ export function Inbox() {
           return next;
         });
       } else {
-        setSelectedIds(new Set(visibleRows.map((session) => session.session_id)));
+        setSelectedIds(new Set(
+          visibleRows
+            .filter(session => (
+              preserveSelectedIds?.has(session.session_id)
+              || (
+                selectNewRowsRef.current
+                && !preserveDeselectedIds?.has(session.session_id)
+              )
+            ))
+            .map(session => session.session_id),
+        ));
       }
       setOffset(currentOffset);
       setHasMore(data.length > pageSize);
@@ -278,23 +306,116 @@ export function Inbox() {
     }
   }, [focusIndex]);
 
-  const handleBulkAction = async (action: 'approved' | 'blocked') => {
-    const ids = [...selectedIds];
+  const handleBulkAction = async (
+    action: 'approved' | 'blocked',
+    ids: string[],
+  ) => {
+    if (bulkUpdateInFlightRef.current || ids.length === 0) return;
+    bulkUpdateInFlightRef.current = true;
+    // Ignore any list response that started before this write. Otherwise a
+    // slow "Load more" response could restore rows after they were approved.
+    loadRequestSeqRef.current += 1;
+    setLoading(false);
     const verb = action === 'approved' ? 'approved' : 'skipped';
-    // Per-item settle so one failed update doesn't strand the rest: remove only
-    // the ones that actually succeeded and keep the failures selected.
-    const results = await Promise.allSettled(ids.map(id => api.sessions.update(id, { status: action })));
-    const okIds = new Set(ids.filter((_, i) => results[i].status === 'fulfilled'));
-    const failed = ids.length - okIds.size;
-    setSessions(prev => prev.filter(s => !okIds.has(s.session_id)));
-    setSelectedIds(prev => new Set([...prev].filter(id => !okIds.has(id))));
-    loadStats();
+    const requestedIds = new Set(ids);
+    const deselectedVisibleIds = new Set(
+      sessionsRef.current
+        .filter(session => !requestedIds.has(session.session_id))
+        .map(session => session.session_id),
+    );
+    let shouldReloadSessions = false;
+    let unresolvedSubmittedIds = new Set<string>();
+    // Close the modal immediately and replace the toolbar actions with a
+    // durable progress message. Success is only announced after the server
+    // confirms which rows were updated.
     setConfirm(null);
-    if (okIds.size > 0) {
-      toast(`${okIds.size} session${okIds.size > 1 ? 's' : ''} ${verb}`, 'success');
-    }
-    if (failed > 0) {
-      toast(`${failed} session${failed > 1 ? 's' : ''} failed to update`, 'error');
+    setBulkUpdate({ action, ids });
+
+    try {
+      const updatedIds = new Set<string>();
+      let completedBatchCount = 0;
+      let firstRequestError: unknown = null;
+
+      // The daemon caps each atomic update at 100 rows. Loaded pages can exceed
+      // that after "Load more", so split only when necessary and preserve the
+      // outcome of every completed batch if a later request fails.
+      for (let start = 0; start < ids.length; start += BULK_STATUS_BATCH_SIZE) {
+        const batchIds = ids.slice(start, start + BULK_STATUS_BATCH_SIZE);
+        try {
+          const result = await api.sessions.bulkStatus(batchIds, action);
+          completedBatchCount += 1;
+          result.updated_ids.forEach(id => {
+            if (requestedIds.has(id)) updatedIds.add(id);
+          });
+        } catch (error) {
+          firstRequestError ??= error;
+        }
+      }
+
+      if (completedBatchCount === 0 && firstRequestError) {
+        throw firstRequestError;
+      }
+
+      const unresolvedIds = ids.filter(id => !updatedIds.has(id));
+      unresolvedSubmittedIds = new Set(unresolvedIds);
+      shouldReloadSessions = updatedIds.size > 0 && hasMore;
+      const visibleIds = new Set(
+        sessionsRef.current.map(session => session.session_id),
+      );
+
+      setSessions(prev => prev.filter(s => !updatedIds.has(s.session_id)));
+      setSelectedIds(prev => {
+        const next = new Set([...prev].filter(id => !updatedIds.has(id)));
+        unresolvedIds.forEach(id => {
+          if (visibleIds.has(id)) next.add(id);
+        });
+        return next;
+      });
+
+      if (updatedIds.size > 0) {
+        toast(`${updatedIds.size} session${updatedIds.size > 1 ? 's' : ''} ${verb}`, 'success');
+      }
+      if (unresolvedIds.length > 0) {
+        toast(
+          `${unresolvedIds.length} session${unresolvedIds.length === 1 ? '' : 's'} could not be updated; visible items remain selected`,
+          'error',
+        );
+      }
+    } catch (error) {
+      // A request-level failure has no confirmed successes. Preserve the exact
+      // submitted selection still visible in the current filter so retrying is
+      // a single click without creating hidden selections from an old view.
+      const visibleIds = new Set(
+        sessionsRef.current.map(session => session.session_id),
+      );
+      setSelectedIds(prev => {
+        const next = new Set(prev);
+        ids.forEach(id => {
+          if (visibleIds.has(id)) next.add(id);
+        });
+        return next;
+      });
+      const detail = error instanceof Error && error.message
+        ? `: ${error.message}`
+        : '';
+      toast(`Failed to update sessions${detail}`, 'error');
+    } finally {
+      bulkUpdateInFlightRef.current = false;
+      setBulkUpdate(null);
+      // Stats are supplemental. Do not keep the primary interaction in its
+      // pending state while a slower refresh waits on the database or network.
+      void loadStats();
+      if (shouldReloadSessions) {
+        // Removing rows changes the offset basis. Refill from the first page so
+        // the next unreviewed rows are not skipped, while retaining deliberate
+        // deselections from the page the user just acted on.
+        void loadSessions(
+          0,
+          false,
+          deselectedVisibleIds,
+          unresolvedSubmittedIds,
+        );
+      }
     }
   };
 
@@ -407,7 +528,13 @@ export function Inbox() {
               cursor: 'text',
             }}
           />
-          <select value={sort} onChange={e => setSort(e.target.value)} style={selectStyle}>
+          <select
+            value={sort}
+            onChange={e => setSort(e.target.value)}
+            disabled={bulkUpdate !== null}
+            aria-label="Sort sessions"
+            style={selectStyle}
+          >
             <option value="ai_failure_value_score:desc">Most instructive failures</option>
             <option value="ai_quality_score:desc">Highest productivity</option>
             <option value="start_time:desc">Newest first</option>
@@ -416,6 +543,7 @@ export function Inbox() {
           <select
             value={pageSize}
             onChange={e => setPageSize(Number(e.target.value))}
+            disabled={bulkUpdate !== null}
             aria-label="Sessions per page"
             style={selectStyle}
           >
@@ -441,31 +569,48 @@ export function Inbox() {
         <GettingStartedGuide stats={stats} onDismiss={dismissGettingStartedGuide} />
       )}
 
-      {selectedIds.size > 0 && (
+      {(bulkUpdate !== null || selectedIds.size > 0) && (
         <div style={{
           display: 'flex', alignItems: 'center', gap: 10,
           padding: '8px 12px', marginBottom: 8,
           background: colors.primary50, border: `1px solid ${colors.primary200}`, borderRadius: 8,
+          opacity: bulkUpdate ? 0.85 : 1,
         }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: colors.gray800 }}>
-            {selectedIds.size} selected
+            {bulkUpdate ? `${bulkUpdate.ids.length} submitted` : `${selectedIds.size} selected`}
           </span>
-          <button onClick={toggleSelectAll} style={{ ...btnSecondary, padding: '4px 10px', fontSize: 12 }}>
-            {selectedIds.size === sessions.length ? 'Clear' : 'Select all'}
-          </button>
-          <div style={{ flex: 1 }} />
-          <button
-            onClick={() => setConfirm({ action: 'approved', ids: [...selectedIds] })}
-            style={{ ...btnPrimary, padding: '4px 12px', fontSize: 12, fontWeight: 600 }}
-          >
-            Approve
-          </button>
-          <button
-            onClick={() => setConfirm({ action: 'blocked', ids: [...selectedIds] })}
-            style={{ ...btnDanger, padding: '4px 12px', fontSize: 12, fontWeight: 600 }}
-          >
-            Skip
-          </button>
+          {bulkUpdate ? (
+            <>
+              <div style={{ flex: 1 }} />
+              <span
+                role="status"
+                aria-live="polite"
+                style={{ fontSize: 13, fontWeight: 600, color: colors.primary500 }}
+              >
+                {bulkUpdate.action === 'approved' ? 'Approving' : 'Skipping'}{' '}
+                {bulkUpdate.ids.length} session{bulkUpdate.ids.length > 1 ? 's' : ''}…
+              </span>
+            </>
+          ) : (
+            <>
+              <button onClick={toggleSelectAll} style={{ ...btnSecondary, padding: '4px 10px', fontSize: 12 }}>
+                {selectedIds.size === sessions.length ? 'Clear' : 'Select all'}
+              </button>
+              <div style={{ flex: 1 }} />
+              <button
+                onClick={() => setConfirm({ action: 'approved', ids: [...selectedIds] })}
+                style={{ ...btnPrimary, padding: '4px 12px', fontSize: 12, fontWeight: 600 }}
+              >
+                Approve
+              </button>
+              <button
+                onClick={() => setConfirm({ action: 'blocked', ids: [...selectedIds] })}
+                style={{ ...btnDanger, padding: '4px 12px', fontSize: 12, fontWeight: 600 }}
+              >
+                Skip
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -474,6 +619,7 @@ export function Inbox() {
           <select
             value={sourceFilter || ''}
             onChange={e => setSourceFilter(e.target.value || null)}
+            disabled={bulkUpdate !== null}
             style={selectStyle}
           >
             <option value="">All sources</option>
@@ -484,6 +630,7 @@ export function Inbox() {
           <select
             value={recoveryFilter || ''}
             onChange={e => setRecoveryFilter(e.target.value || null)}
+            disabled={bulkUpdate !== null}
             style={selectStyle}
           >
             <option value="">All recovery</option>
@@ -495,6 +642,7 @@ export function Inbox() {
           <select
             value={attributionFilter || ''}
             onChange={e => setAttributionFilter(e.target.value || null)}
+            disabled={bulkUpdate !== null}
             style={selectStyle}
           >
             <option value="">All attribution</option>
@@ -507,6 +655,7 @@ export function Inbox() {
           <select
             value={modeFilter || ''}
             onChange={e => setModeFilter(e.target.value || null)}
+            disabled={bulkUpdate !== null}
             style={selectStyle}
           >
             <option value="">All modes</option>
@@ -526,6 +675,7 @@ export function Inbox() {
           <select
             value={projectFilter || ''}
             onChange={e => setProjectFilter(e.target.value || null)}
+            disabled={bulkUpdate !== null}
             style={selectStyle}
           >
             <option value="">All projects</option>
@@ -541,6 +691,7 @@ export function Inbox() {
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 10 }}>
           <button
             onClick={() => setTypeFilter(null)}
+            disabled={bulkUpdate !== null}
             style={{
               padding: '4px 12px',
               borderRadius: 9999,
@@ -561,6 +712,7 @@ export function Inbox() {
               <button
                 key={type}
                 onClick={() => setTypeFilter(active ? null : type)}
+                disabled={bulkUpdate !== null}
                 style={{
                   padding: '4px 12px',
                   borderRadius: 9999,
@@ -630,6 +782,7 @@ export function Inbox() {
           {hasActiveFilter && (
             <button
               onClick={clearAllFilters}
+              disabled={bulkUpdate !== null}
               style={{
                 display: 'inline-block', padding: '7px 18px', background: colors.primary500, color: colors.white,
                 borderRadius: '6px', fontSize: '13px', fontWeight: 600, border: 'none', cursor: 'pointer',
@@ -681,10 +834,11 @@ export function Inbox() {
                 <input
                   type="checkbox"
                   checked={isSelected}
+                  disabled={bulkUpdate !== null}
                   aria-label={`Select session: ${s.display_title || 'Untitled'}`}
                   onClick={e => e.stopPropagation()}
                   onChange={() => toggleSelect(s.session_id)}
-                  style={{ flexShrink: 0, cursor: 'pointer' }}
+                  style={{ flexShrink: 0, cursor: bulkUpdate ? 'wait' : 'pointer' }}
                 />
                 {/* Failure + productivity scores */}
                 <div style={{
@@ -726,9 +880,15 @@ export function Inbox() {
                           color: typeColor(s.task_type),
                           fontWeight: 600,
                           flexShrink: 0,
-                          cursor: 'pointer',
+                          cursor: bulkUpdate ? 'wait' : 'pointer',
                         }}
-                        onClick={(e) => { e.stopPropagation(); setTypeFilter(s.task_type); }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (!bulkUpdateInFlightRef.current) {
+                            setTypeFilter(s.task_type);
+                          }
+                        }}
+                        aria-disabled={bulkUpdate !== null}
                         title={`Filter by ${LABELS[s.task_type] ?? s.task_type}`}
                       >
                         {LABELS[s.task_type] ?? s.task_type.replace(/_/g, ' ')}
@@ -803,7 +963,7 @@ export function Inbox() {
         <div style={{ textAlign: 'center', marginTop: '8px' }}>
           <button
             onClick={() => { void loadSessions(offset + pageSize, true); }}
-            disabled={loading}
+            disabled={loading || bulkUpdate !== null}
             style={{
               padding: '5px 18px', background: colors.gray100, color: colors.gray700, border: `1px solid ${colors.gray300}`,
               borderRadius: '4px', fontSize: '13px', cursor: 'pointer',
@@ -823,7 +983,7 @@ export function Inbox() {
         message={`This will ${confirm?.action === 'approved' ? 'approve' : 'skip'} ${confirm?.ids.length ?? 0} session${(confirm?.ids.length ?? 0) > 1 ? 's' : ''}.`}
         confirmLabel={confirm?.action === 'approved' ? 'Approve' : 'Skip'}
         variant={confirm?.action === 'blocked' ? 'danger' : 'primary'}
-        onConfirm={() => confirm && handleBulkAction(confirm.action as 'approved' | 'blocked')}
+        onConfirm={() => confirm && handleBulkAction(confirm.action, confirm.ids)}
         onCancel={() => setConfirm(null)}
       />
     </div>

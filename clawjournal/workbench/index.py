@@ -3215,6 +3215,83 @@ def update_session(
     return True
 
 
+REVIEW_BULK_STATUSES = frozenset({"approved", "blocked"})
+REVIEW_BULK_LIMIT = 100
+
+
+def bulk_update_review_status(
+    conn: sqlite3.Connection,
+    session_ids: Sequence[str],
+    status: str,
+) -> tuple[list[str], list[str]]:
+    """Set one review status for a bounded set of sessions atomically.
+
+    Duplicate IDs are collapsed while preserving request order. Existing
+    sessions are returned in ``updated_ids`` and unknown sessions in
+    ``missing_ids``. As with :func:`update_session`, ``updated_at`` advances
+    for every existing row while ``reviewed_at`` advances only when the review
+    status actually changes.
+    """
+    if not isinstance(status, str) or status not in REVIEW_BULK_STATUSES:
+        raise ValueError("status must be 'approved' or 'blocked'")
+    if (
+        isinstance(session_ids, (str, bytes))
+        or not isinstance(session_ids, Sequence)
+        or not (
+            1 <= len(session_ids) <= REVIEW_BULK_LIMIT
+        )
+    ):
+        raise ValueError(
+            f"session_ids must contain 1-{REVIEW_BULK_LIMIT} entries"
+        )
+    if any(
+        not isinstance(session_id, str) or not session_id
+        for session_id in session_ids
+    ):
+        raise ValueError("session_ids must contain non-empty strings")
+
+    requested_ids = list(dict.fromkeys(session_ids))
+    placeholders = ", ".join("?" for _ in requested_ids)
+    now = _now_iso()
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "bulk review status updates require a connection without "
+            "an active transaction"
+        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            f"SELECT session_id FROM sessions WHERE session_id IN ({placeholders})",
+            requested_ids,
+        ).fetchall()
+        found_ids = {str(row["session_id"]) for row in rows}
+        updated_ids = [
+            session_id for session_id in requested_ids if session_id in found_ids
+        ]
+        missing_ids = [
+            session_id for session_id in requested_ids if session_id not in found_ids
+        ]
+
+        if updated_ids:
+            update_placeholders = ", ".join("?" for _ in updated_ids)
+            conn.execute(
+                "UPDATE sessions SET "
+                "review_status = ?, "
+                "reviewed_at = CASE "
+                "WHEN review_status = ? THEN reviewed_at ELSE ? END, "
+                "updated_at = ? "
+                f"WHERE session_id IN ({update_placeholders})",
+                (status, status, now, now, *updated_ids),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return updated_ids, missing_ids
+
+
 # ---------------------------------------------------------------------------
 # Hold-state lifecycle
 # ---------------------------------------------------------------------------
