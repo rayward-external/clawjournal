@@ -10,6 +10,7 @@ from clawjournal.workbench.index import (
     _migrate_bundles_to_shares,
     add_policy,
     backfill_session_keys,
+    bulk_update_review_status,
     create_share,
     get_effective_share_settings,
     get_dashboard_analytics,
@@ -705,6 +706,135 @@ class TestUpdateSession:
 
     def test_not_found(self, index_conn):
         assert update_session(index_conn, "nope", status="blocked") is False
+
+
+class TestBulkUpdateReviewStatus:
+    def test_updates_existing_rows_and_preserves_reviewed_at_when_unchanged(
+        self, index_conn, monkeypatch
+    ):
+        upsert_sessions(index_conn, [
+            _make_session("already-approved"),
+            _make_session("needs-approval"),
+        ])
+        index_conn.execute(
+            "UPDATE sessions SET review_status = 'approved', "
+            "reviewed_at = 'old-review-time', updated_at = 'old-update-time' "
+            "WHERE session_id = 'already-approved'"
+        )
+        index_conn.commit()
+        monkeypatch.setattr(
+            "clawjournal.workbench.index._now_iso",
+            lambda: "2026-07-31T12:00:00+00:00",
+        )
+
+        updated_ids, missing_ids = bulk_update_review_status(
+            index_conn,
+            ["already-approved", "needs-approval"],
+            "approved",
+        )
+
+        assert updated_ids == ["already-approved", "needs-approval"]
+        assert missing_ids == []
+        rows = {
+            row["session_id"]: row
+            for row in index_conn.execute(
+                "SELECT session_id, review_status, reviewed_at, updated_at "
+                "FROM sessions"
+            ).fetchall()
+        }
+        assert rows["already-approved"]["review_status"] == "approved"
+        assert rows["already-approved"]["reviewed_at"] == "old-review-time"
+        assert (
+            rows["already-approved"]["updated_at"]
+            == "2026-07-31T12:00:00+00:00"
+        )
+        assert rows["needs-approval"]["review_status"] == "approved"
+        assert (
+            rows["needs-approval"]["reviewed_at"]
+            == "2026-07-31T12:00:00+00:00"
+        )
+
+    def test_deduplicates_ids_and_reports_missing_in_request_order(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("first"),
+            _make_session("second"),
+        ])
+
+        updated_ids, missing_ids = bulk_update_review_status(
+            index_conn,
+            ["second", "missing", "second", "first", "missing"],
+            "blocked",
+        )
+
+        assert updated_ids == ["second", "first"]
+        assert missing_ids == ["missing"]
+
+    @pytest.mark.parametrize(
+        ("session_ids", "status"),
+        [
+            ([], "approved"),
+            (["session"] * 101, "approved"),
+            ([""], "approved"),
+            (["session"], "new"),
+            (["session"], []),
+            (["session"], {}),
+            (["session"], None),
+        ],
+    )
+    def test_rejects_invalid_input(self, index_conn, session_ids, status):
+        with pytest.raises(ValueError):
+            bulk_update_review_status(index_conn, session_ids, status)
+
+    def test_rolls_back_every_row_if_the_update_fails(self, index_conn):
+        upsert_sessions(index_conn, [
+            _make_session("first"),
+            _make_session("second"),
+        ])
+        index_conn.executescript(
+            """
+            CREATE TRIGGER reject_second_bulk_review
+            BEFORE UPDATE OF review_status ON sessions
+            WHEN NEW.session_id = 'second'
+            BEGIN
+                SELECT RAISE(ABORT, 'reject second');
+            END;
+            """
+        )
+        index_conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="reject second"):
+            bulk_update_review_status(
+                index_conn,
+                ["first", "second"],
+                "approved",
+            )
+
+        rows = index_conn.execute(
+            "SELECT session_id, review_status FROM sessions "
+            "WHERE session_id IN ('first', 'second') ORDER BY session_id"
+        ).fetchall()
+        assert [(row["session_id"], row["review_status"]) for row in rows] == [
+            ("first", "new"),
+            ("second", "new"),
+        ]
+
+    def test_rejects_an_existing_caller_transaction(self, index_conn):
+        upsert_sessions(index_conn, [_make_session("first")])
+        index_conn.execute(
+            "UPDATE sessions SET reviewer_notes = 'caller-owned' "
+            "WHERE session_id = 'first'"
+        )
+
+        with pytest.raises(RuntimeError, match="active transaction"):
+            bulk_update_review_status(index_conn, ["first"], "approved")
+
+        index_conn.rollback()
+        row = index_conn.execute(
+            "SELECT review_status, reviewer_notes FROM sessions "
+            "WHERE session_id = 'first'"
+        ).fetchone()
+        assert row["review_status"] == "new"
+        assert row["reviewer_notes"] is None
 
 
 class TestStats:

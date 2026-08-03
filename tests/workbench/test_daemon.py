@@ -1309,6 +1309,74 @@ class TestSessionsAPI:
         status, detail = _get(server, "/api/sessions/sess-0")
         assert detail["review_status"] == "approved"
 
+    def test_bulk_route_does_not_shadow_a_session_id(self, server):
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": "bulk-status",
+                "project": "test-project",
+                "source": "codex",
+                "messages": [],
+                "stats": {},
+            }])
+        finally:
+            conn.close()
+
+        status, data = _post(
+            server,
+            "/api/sessions/bulk-status",
+            {"status": "approved"},
+        )
+
+        assert status == 200
+        assert data["ok"] is True
+        assert _get(
+            server,
+            "/api/sessions/bulk-status",
+        )[1]["review_status"] == "approved"
+
+    def test_bulk_update_review_status_deduplicates_and_reports_missing(self, server):
+        status, data = _post(
+            server,
+            "/api/session-status/bulk",
+            {
+                "session_ids": [
+                    "sess-1",
+                    "missing-session",
+                    "sess-0",
+                    "sess-1",
+                ],
+                "status": "approved",
+            },
+        )
+
+        assert status == 200
+        assert data == {
+            "updated_ids": ["sess-1", "sess-0"],
+            "missing_ids": ["missing-session"],
+        }
+        assert _get(server, "/api/sessions/sess-0")[1]["review_status"] == "approved"
+        assert _get(server, "/api/sessions/sess-1")[1]["review_status"] == "approved"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"session_ids": [], "status": "approved"},
+            {"session_ids": ["sess-0"] * 101, "status": "approved"},
+            {"session_ids": ["sess-0", 1], "status": "approved"},
+            {"session_ids": ["sess-0"], "status": "new"},
+            {"session_ids": ["sess-0"], "status": []},
+            {"session_ids": ["sess-0"], "status": {}},
+            {"session_ids": ["sess-0"], "status": None},
+        ],
+    )
+    def test_bulk_update_review_status_validates_request(self, server, body):
+        status, data = _post(server, "/api/session-status/bulk", body)
+
+        assert status == 400
+        assert "error" in data
+
     def test_skipped_session_stays_out_of_new_queue_after_reindex(self, server):
         status, data = _post(server, "/api/sessions/sess-0", {"status": "blocked"})
         assert status == 200
