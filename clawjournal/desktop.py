@@ -81,7 +81,8 @@ LINUX_SYSTEMD_UNIT = "clawjournal-desktop-icon"
 
 MAX_SAD_DAYS = 10
 ICON_SIZE = 64
-BRAND_ICON_PATH = Path(__file__).resolve().parent / "assets" / "desktop-icon.png"
+_PACKAGE_DIR = Path(__file__).resolve().parent
+BRAND_ICON_PATH = _PACKAGE_DIR / "assets" / "desktop-icon.png"
 
 # The shortcut redirects the daemon's stdout/stderr here, and the daemon logs
 # every HTTP request, so the log needs a ceiling to stay bounded over months.
@@ -124,7 +125,7 @@ def _platform() -> str:
 
 def _package_import_root() -> Path:
     """Directory Python must search to import this exact ClawJournal build."""
-    return Path(__file__).resolve().parent.parent
+    return _PACKAGE_DIR.parent
 
 
 def _command(*args: str) -> list[str]:
