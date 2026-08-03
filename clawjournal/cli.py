@@ -4575,14 +4575,14 @@ def main() -> None:
     )
     desktop_sub = desktop_parser.add_subparsers(dest="desktop_command", required=True)
     desktop_sub.add_parser(
-        "install", help="Install the shortcut and dynamic daily expression icon"
+        "install", help="Install the shortcut and branded desktop icon"
     )
     desktop_sub.add_parser("uninstall", help="Remove the shortcut and icon refresh task")
     desktop_refresh = desktop_sub.add_parser(
-        "refresh", help="Refresh the icon for the current days-since-opened value"
+        "refresh", help="Refresh the shortcut's branded icon"
     )
     desktop_refresh.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
-    desktop_sub.add_parser("status", help="Show shortcut and expression status as JSON")
+    desktop_sub.add_parser("status", help="Show shortcut and icon status as JSON")
     desktop_sub.add_parser("launch", help="Open the workbench and request a fresh scan")
 
     # Workbench commands

@@ -43,6 +43,7 @@ exclude = ["clawjournal.web*"]
 
 [tool.setuptools.package-data]
 "clawjournal" = [
+    "assets/*.png",
     "prompts/agents/*/*.md",
     "web/frontend/dist/**/*",
     "events/docs/*.md",
