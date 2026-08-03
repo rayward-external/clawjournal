@@ -7173,11 +7173,6 @@ def run_server(
 
     scanner = Scanner(source_filter=source_filter)
     _open_request_admission()
-    # Publish a non-ready state before accepting requests. The authenticated
-    # identity/features endpoints can now make ``clawjournal open`` and the SPA
-    # responsive while the potentially long SQLite check runs, but every
-    # database-backed route and background worker remains fail-closed.
-    begin_index_health_check()
 
     # Start HTTP server first so it's responsive immediately. The primary socket
     # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
@@ -7191,6 +7186,12 @@ def run_server(
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]
     server._frontend_snapshot = frontend_snapshot  # type: ignore[attr-defined]
+
+    # Publish a non-ready state only after the primary socket binds. A rejected
+    # launch (for example, the desktop port is already occupied) must not leave
+    # this process's cached health stuck at ``checking``. No serving loop or
+    # background worker starts before this fail-closed state is visible.
+    begin_index_health_check()
 
     # Companion IPv6 loopback socket on the same port. Browsers resolve
     # `localhost` to ::1 (IPv6) first and don't all fall back to IPv4, so an

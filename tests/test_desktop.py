@@ -947,10 +947,18 @@ def test_losing_startup_race_to_another_service_reports_an_error(
     assert calls == []
 
 
-def test_run_server_can_refuse_the_ephemeral_port_fallback() -> None:
-    """`serve` keeps the fallback; the launcher opts out of it."""
+def test_run_server_can_refuse_the_ephemeral_port_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected launch neither falls back nor publishes startup health."""
     from clawjournal.workbench import daemon as daemon_mod
 
+    health_starts = []
+    monkeypatch.setattr(
+        daemon_mod,
+        "begin_index_health_check",
+        lambda: health_starts.append(True),
+    )
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(64)
@@ -962,6 +970,7 @@ def test_run_server_can_refuse_the_ephemeral_port_fallback() -> None:
             )
     finally:
         listener.close()
+    assert health_starts == []
 
 
 def test_status_json_shape(isolated_desktop: Path) -> None:
