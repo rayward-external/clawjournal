@@ -12,12 +12,14 @@ import pytest
 
 @pytest.fixture
 def isolated_home(monkeypatch, tmp_path):
-    """Run CLI in a subprocess with HOME pointing at a tmp dir."""
+    """Run CLI with isolated agent-home and ClawJournal state roots."""
 
     env = {
         "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
         "PATH": "/usr/bin:/bin",
         "PYTHONPATH": str(Path(__file__).parent.parent.parent.parent),
+        "CLAWJOURNAL_HOME": str(tmp_path / ".clawjournal"),
         "CLAWJOURNAL_SKIP_TRUFFLEHOG": "1",
     }
     return env

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,14 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_install_lock_follows_clawjournal_home(monkeypatch, tmp_path):
+    state_root = tmp_path / "private local state"
+    monkeypatch.setenv("CLAWJOURNAL_HOME", str(state_root))
+    namespace = runpy.run_path(str(ROOT / "scripts" / "install_lock.py"))
+
+    assert namespace["_lock_path"]() == state_root.resolve() / "reinstall.lock"
 
 
 def test_posix_installer_supports_managed_sharing_dependencies():
@@ -68,6 +77,15 @@ def test_powershell_installer_supports_managed_sharing_dependencies():
     assert "$RepoDir $script:SyncFrom $script:SyncTo" in script
     assert script.index("record_install_sync") < script.index("pip install")
     assert "--clear-pending" not in script
+
+
+def test_powershell_installer_uses_canonical_scanner_status_for_relocated_state():
+    script = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    assert "Invoke-ClawJournal betterleaks status --json" in script
+    assert "Invoke-ClawJournal trufflehog status --json" in script
+    assert "CLAWJOURNAL_NO_AUTO_UPDATE" in script
+    assert 'Join-Path $HOME ".clawjournal\\bin' not in script
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX installer invocation")

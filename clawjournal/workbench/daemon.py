@@ -95,6 +95,16 @@ from .index import (
     update_session,
     upsert_sessions,
 )
+from .index_recovery import (
+    UnsafeIndexRecovery,
+    begin_index_health_check,
+    begin_guided_rebuild,
+    current_index_health,
+    guided_rebuild,
+    initialize_index_health,
+    inspect_index_health,
+    synchronize_index_health,
+)
 from .timeline import (
     canonical_session_path,
     load_timeline_page,
@@ -353,6 +363,8 @@ _auto_upload_run_lock = threading.Lock()
 _auto_upload_run_thread: threading.Thread | None = None
 _auto_upload_enrollment_lock = threading.Lock()
 _auto_upload_enrollment_thread: threading.Thread | None = None
+_index_recovery_lock = threading.Lock()
+_index_recovery_thread: threading.Thread | None = None
 _HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
 _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 
@@ -716,6 +728,48 @@ class Scanner:
                         "Another scan is still refreshing the index; try again shortly."
                     )
                 return self._scan_once_report(required_sources=None)["new_by_source"]
+
+    def rebuild_damaged_index(self) -> dict[str, Any]:
+        """Run recovery after every automatic-upload and scan writer is idle."""
+
+        from ..auto_upload import whole_run_lock
+        from ..config import auto_upload_egress_lock
+
+        # Keep the same global order used by the automatic-upload runner. This
+        # prevents a runner from retaining an open connection to the old file
+        # while recovery backs it up and replaces it.
+        with whole_run_lock(blocking=True) as run_acquired:
+            if not run_acquired:
+                raise ScanBusyError(
+                    "Automatic-upload activity could not be paused for recovery."
+                )
+            with self._scan_lock:
+                with _scan_process_lock(
+                    wait_seconds=SCAN_LOCK_WAIT_SECONDS
+                ) as scan_acquired:
+                    if not scan_acquired:
+                        raise ScanBusyError(
+                            "Another scan is still using the workbench index."
+                        )
+                    with auto_upload_egress_lock():
+                        # A second daemon may have completed recovery while this
+                        # process waited on the cross-process locks. Do not
+                        # rebuild a now-healthy database from stale cached health.
+                        if inspect_index_health().get("status") == "ready":
+                            return initialize_index_health()
+
+                        def recovery_scan() -> dict[str, Any]:
+                            # A serve-time --source filter is a UI/runtime
+                            # preference, not permission to omit other source
+                            # logs from a full index reconstruction.
+                            original_filter = self.source_filter
+                            self.source_filter = None
+                            try:
+                                return self._scan_once_report(required_sources=None)
+                            finally:
+                                self.source_filter = original_filter
+
+                        return guided_rebuild(recovery_scan)
 
     def _scan_tick(self) -> dict[str, int] | None:
         """One background-loop pass; skips when another process is scanning.
@@ -3865,6 +3919,23 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _reject_unhealthy_index(self) -> bool:
+        """Fail every DB-backed API closed while guided recovery is active."""
+
+        health = synchronize_index_health()
+        if health.get("status") == "ready":
+            return False
+        _json_response(
+            self,
+            {
+                "error": "The workbench index is unavailable until recovery finishes.",
+                "code": "index_recovery_required",
+                "index_health": health,
+            },
+            status=503,
+        )
+        return True
+
     def do_OPTIONS(self) -> None:
         self.send_response(200)
         origin = _cors_origin(self)
@@ -3911,6 +3982,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "proof": api_health_proof(token, challenge),
                 },
             )
+        # This DB-free probe carries the cached startup diagnosis so the SPA
+        # can render recovery guidance without touching the damaged index.
+        elif path == "/api/features":
+            self._handle_features()
+        elif path.startswith("/api/") and self._reject_unhealthy_index():
+            return
         # API routes
         elif path == "/api/sessions":
             self._handle_list_sessions(params)
@@ -3999,8 +4076,6 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_list_findings_allowlist()
         elif path == "/api/config":
             self._handle_get_config()
-        elif path == "/api/features":
-            self._handle_features()
         elif path == "/api/benchmarks":
             self._handle_benchmarks_list()
         elif path == "/api/benchmarks/latest":
@@ -4012,6 +4087,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/benchmarks/"):
             self._handle_benchmark_get(path[len("/api/benchmarks/"):])
         elif path.startswith("/timeline/"):
+            if self._reject_unhealthy_index():
+                return
             if self._handle_session_timeline(path):
                 return
             self._serve_static(parsed.path)
@@ -4027,7 +4104,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        if path == "/api/session-status/bulk":
+        if path == "/api/index/rebuild":
+            self._handle_index_rebuild()
+        elif path.startswith("/api/") and self._reject_unhealthy_index():
+            return
+        elif path == "/api/session-status/bulk":
             self._handle_bulk_update_review_status()
         elif path.startswith("/api/sessions/") and path.endswith("/score"):
             session_id = _api_session_id(path, suffix="/score")
@@ -4112,6 +4193,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+        if path.startswith("/api/") and self._reject_unhealthy_index():
+            return
         if path == "/api/findings":
             self._handle_patch_findings()
         else:
@@ -4124,6 +4207,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        if path.startswith("/api/") and self._reject_unhealthy_index():
+            return
 
         if path.startswith("/api/policies/"):
             policy_id = path[len("/api/policies/"):]
@@ -4917,7 +5003,94 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         _json_response(self, {
             "benchmark_tab_enabled": bool(config.get("benchmark_tab_enabled", True)),
             "scoring_warmup_declined": bool(config.get("scoring_warmup_declined", False)),
+            "index_health": synchronize_index_health(),
         })
+
+    def _handle_index_rebuild(self) -> None:
+        """Start the one-click, backup-first index rebuild in the background."""
+
+        global _index_recovery_thread
+
+        scanner = getattr(self.server, "_scanner", None)
+        if scanner is None:
+            _json_response(
+                self,
+                {"error": "The recovery worker is unavailable."},
+                status=503,
+            )
+            return
+
+        with _index_recovery_lock:
+            health = synchronize_index_health()
+            if (
+                health.get("status") == "rebuilding"
+                and _index_recovery_thread is not None
+                and _index_recovery_thread.is_alive()
+            ):
+                _json_response(
+                    self,
+                    {"ok": True, "index_health": health},
+                    status=202,
+                )
+                return
+            try:
+                begin_guided_rebuild()
+            except UnsafeIndexRecovery as exc:
+                _json_response(
+                    self,
+                    {
+                        "error": str(exc),
+                        "index_health": current_index_health(),
+                    },
+                    status=409,
+                )
+                return
+
+            def _recover() -> None:
+                try:
+                    recovery_result = scanner.rebuild_damaged_index()
+                except Exception:
+                    logger.exception("Workbench index recovery worker failed")
+                    # Lock acquisition can fail before guided_rebuild() creates
+                    # its persistent marker. Re-run the read-only startup check
+                    # so the UI is offered Retry instead of polling forever.
+                    if current_index_health().get("status") == "rebuilding":
+                        initialize_index_health()
+                    return
+                if recovery_result.get("status") != "ready":
+                    logger.warning(
+                        "Index recovery did not produce a ready index; "
+                        "background workers remain stopped."
+                    )
+                    return
+                if scanner._stop_event.is_set():
+                    return
+                try:
+                    trigger_scoring_warmup(scanner)
+                except Exception:
+                    logger.warning(
+                        "Scoring warmup after index recovery was skipped",
+                        exc_info=True,
+                    )
+                scanner.start()
+                logger.info(
+                    "Index recovery completed; background scanner resumed "
+                    "(interval: %ds)",
+                    SCAN_INTERVAL,
+                )
+
+            _index_recovery_thread = threading.Thread(
+                target=_recover,
+                daemon=True,
+                name="index-recovery",
+            )
+            _index_recovery_thread.start()
+
+        _json_response(
+            self,
+            {"ok": True, "index_health": current_index_health()},
+            status=202,
+        )
 
     def _handle_get_config(self) -> None:
         """Return the UI-editable config subset plus the valid option lists.
@@ -6729,6 +6902,9 @@ def _background_workers_active(scanner: Scanner | None = None) -> bool:
     """Whether re-exec would interrupt durable or expensive background work."""
     if _BENCHMARK_GEN_LOCK.locked():
         return True
+    recovery_thread = _index_recovery_thread
+    if recovery_thread is not None and recovery_thread.is_alive():
+        return True
     upload_thread = _auto_upload_run_thread
     if upload_thread is not None and upload_thread.is_alive():
         return True
@@ -7011,6 +7187,12 @@ def run_server(
     server._scanner = scanner  # type: ignore[attr-defined]
     server._frontend_snapshot = frontend_snapshot  # type: ignore[attr-defined]
 
+    # Publish a non-ready state only after the primary socket binds. A rejected
+    # launch (for example, the desktop port is already occupied) must not leave
+    # this process's cached health stuck at ``checking``. No serving loop or
+    # background worker starts before this fail-closed state is visible.
+    begin_index_health_check()
+
     # Companion IPv6 loopback socket on the same port. Browsers resolve
     # `localhost` to ::1 (IPv6) first and don't all fall back to IPv4, so an
     # IPv4-only daemon leaves the workbench unreachable via localhost on
@@ -7022,11 +7204,6 @@ def run_server(
     logger.info("Workbench running at %s", url)
 
     _warn_if_frontend_stale(pinned=frontend_snapshot is not None)
-
-    # A manual Share may have queued recurring enrollment immediately before
-    # the daemon or machine stopped.  The accepted request lives in SQLite, so
-    # resume it before the ordinary background scan; no browser tab is needed.
-    _start_auto_upload_enrollment_worker()
 
     if remote:
         import socket
@@ -7040,6 +7217,8 @@ def run_server(
 
     # Run initial scan in background, then start periodic scanner
     def _initial_scan() -> None:
+        if scanner._stop_event.is_set():
+            return
         logger.info("Running initial scan...")
         try:
             results = scanner.scan_once()
@@ -7063,25 +7242,27 @@ def run_server(
             scanner.start()
             logger.info("Background scanner started (interval: %ds)", SCAN_INTERVAL)
 
-    threading.Thread(target=_initial_scan, daemon=True).start()
-
     # Watch the editable checkout: once the background auto-update has both
     # moved HEAD and reconciled the install, restart at a quiet moment so the
     # new frontend/backend pair becomes visible together. No-op for wheel
     # installs and under the --reload supervisor.
     restart_to: dict[str, str | None] = {"head": None}
+    startup_done = threading.Event()
+    stopping = threading.Event()
 
     def _watch_for_update() -> None:
         from .. import selfupdate
 
+        startup_done.wait()
+        if stopping.is_set():
+            return
         repo = selfupdate._package_repo_root()
         if repo is None:
             return  # wheel install — nothing to watch
         initial_head = startup_head or selfupdate._rev_parse(repo, "HEAD")
         if not initial_head:
             return
-        while True:
-            time.sleep(_RESTART_POLL_SECONDS)
+        while not stopping.wait(_RESTART_POLL_SECONDS):
             try:
                 head = _update_restart_due(repo, initial_head, scanner=scanner)
             except Exception:
@@ -7099,6 +7280,7 @@ def run_server(
                 restart_to["head"] = head
                 # Prevent the periodic/initial scanner from starting another
                 # pass or scoring batch while the listening loops stop.
+                stopping.set()
                 scanner._stop_event.set()
                 logger.info(
                     "ClawJournal updated (%s -> %s) — restarting the workbench "
@@ -7110,32 +7292,92 @@ def run_server(
                 server.shutdown()
                 return
 
-    threading.Thread(target=_watch_for_update, daemon=True,
-                     name="update-restart").start()
+    def _reconcile_stale_benchmarks() -> None:
+        """Fail stale benchmark work only after the index passes its gate."""
 
-    # Reconcile benchmark rows orphaned in 'generating' by a previous crash/restart
-    # (the only normal exit from 'generating' is the in-process worker).
-    try:
-        from ..benchmark import store as _bstore
-        _bconn = open_index()
+        # Reconcile benchmark rows orphaned in 'generating' by a previous
+        # crash/restart (the only normal exit from 'generating' is the
+        # in-process worker).
         try:
-            n = _bstore.reconcile_stale_generating(_bconn)
-            if n:
-                logger.info("Reconciled %d stale 'generating' benchmark row(s) -> failed", n)
+            from ..benchmark import store as _bstore
+            _bconn = open_index()
+            try:
+                n = _bstore.reconcile_stale_generating(_bconn)
+                if n:
+                    logger.info(
+                        "Reconciled %d stale 'generating' benchmark row(s) -> failed",
+                        n,
+                    )
+            finally:
+                _bconn.close()
+        except Exception:
+            logger.warning("benchmark stale-row reconcile skipped", exc_info=True)
+
+    def _finish_startup() -> None:
+        """Check the index off the HTTP loop, then release background work."""
+
+        try:
+            index_health = initialize_index_health()
+            if stopping.is_set() or scanner._stop_event.is_set():
+                return
+
+            if index_health.get("status") != "ready":
+                logger.warning(
+                    "Workbench index startup gate: %s",
+                    index_health.get("message", "index recovery is required"),
+                )
+                logger.warning(
+                    "Scanner, scoring, benchmarks, and automatic uploads remain "
+                    "stopped until the index is recovered."
+                )
+                return
+
+            # A manual Share may have queued recurring enrollment immediately
+            # before the daemon or machine stopped. The accepted request lives
+            # in SQLite, so resume it before the ordinary background scan.
+            _start_auto_upload_enrollment_worker()
+            if stopping.is_set() or scanner._stop_event.is_set():
+                return
+            _reconcile_stale_benchmarks()
+            if stopping.is_set() or scanner._stop_event.is_set():
+                return
+            # Keep all startup DB work in one tracked thread. The HTTP loop is
+            # already serving, and the update watcher cannot restart over it.
+            _initial_scan()
+        except Exception:
+            logger.exception("Workbench background startup failed")
         finally:
-            _bconn.close()
-    except Exception:
-        logger.warning("benchmark stale-row reconcile skipped", exc_info=True)
+            startup_done.set()
+
+    update_watch_thread = threading.Thread(
+        target=_watch_for_update,
+        daemon=True,
+        name="update-restart",
+    )
+    update_watch_thread.start()
+
+    startup_health_thread = threading.Thread(
+        target=_finish_startup,
+        daemon=True,
+        name="index-startup-health",
+    )
+    startup_health_thread.start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        stopping.set()
+        startup_done.set()
         scanner.stop()
-        server.shutdown()
         if v6_server is not None:
             v6_server.shutdown()
+        startup_health_thread.join(timeout=1.0)
+        update_watch_thread.join(timeout=1.0)
+        server.server_close()
+        if v6_server is not None:
+            v6_server.server_close()
         if restart_to["head"]:
             # A scan that began just before admission froze may outlive
             # Scanner.stop()'s bounded join.  Never exec over any durable or

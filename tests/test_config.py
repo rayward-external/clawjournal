@@ -1,6 +1,10 @@
 """Tests for clawjournal.config — config persistence."""
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -10,10 +14,94 @@ from clawjournal.config import (
     _migrate_excluded_projects,
     _migrate_findings_engines,
     _migrate_remove_auto_upload_ui_flag,
+    _resolve_config_dir,
     load_config,
     normalize_excluded_project_names,
     save_config,
 )
+
+
+def test_clawjournal_home_relocates_the_complete_state_root(tmp_path, monkeypatch):
+    state_root = tmp_path / "private local state"
+    monkeypatch.setenv("CLAWJOURNAL_HOME", str(state_root))
+
+    assert _resolve_config_dir() == state_root.resolve()
+
+
+def test_clawjournal_home_routes_parser_state_without_moving_agent_sources(tmp_path):
+    state_root = tmp_path / "private local state"
+    probe = (
+        "import json\n"
+        "from pathlib import Path\n"
+        "from clawjournal.parsing import parser\n"
+        "print(json.dumps({\n"
+        "    'home': str(Path.home()),\n"
+        "    'workbuddy_import': str(parser.WORKBUDDY_IMPORT_DIR),\n"
+        "    'custom': str(parser.CUSTOM_DIR),\n"
+        "    'claude': str(parser.CLAUDE_DIR),\n"
+        "    'codex': str(parser.CODEX_DIR),\n"
+        "    'workbuddy': str(parser.WORKBUDDY_DIR),\n"
+        "}))\n"
+    )
+    env = os.environ.copy()
+    env["CLAWJOURNAL_HOME"] = str(state_root)
+    repo_root = Path(__file__).resolve().parents[1]
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(repo_root)
+        if not existing_pythonpath
+        else os.pathsep.join((str(repo_root), existing_pythonpath))
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    paths = json.loads(result.stdout)
+    home = Path(paths["home"])
+
+    assert Path(paths["workbuddy_import"]) == state_root.resolve() / "workbuddy"
+    assert Path(paths["custom"]) == state_root.resolve() / "custom"
+    assert Path(paths["claude"]) == home / ".claude"
+    assert Path(paths["codex"]) == home / ".codex"
+    assert Path(paths["workbuddy"]) == home / "WorkBuddy"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("trufflehog", "--help"),
+        ("betterleaks", "--help"),
+        ("events", "export", "--help"),
+    ),
+)
+def test_clawjournal_home_percent_is_safe_in_argparse_help(tmp_path, arguments):
+    state_root = tmp_path / "100%safe-state"
+    env = os.environ.copy()
+    env["CLAWJOURNAL_HOME"] = str(state_root)
+    repo_root = Path(__file__).resolve().parents[1]
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(repo_root), env.get("PYTHONPATH")))
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "clawjournal.cli", *arguments],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+    compact_help = "".join(result.stdout.split())
+    assert "100%safe-state" in compact_help
+    assert "'option_strings'" not in result.stdout
 
 
 class TestAutoUploadProfileProjection:

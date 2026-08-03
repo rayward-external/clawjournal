@@ -10,6 +10,7 @@ import pytest
 from clawjournal.events.doctor import overlay as overlay_mod
 from clawjournal.events.doctor import probes
 from clawjournal.events.schema import ensure_schema as ensure_events_schema
+from clawjournal.workbench import index as index_module
 from clawjournal.workbench.index import open_index
 
 
@@ -38,6 +39,35 @@ def _make_workbench_only(tmp_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def test_paths_follow_configured_state_root(monkeypatch, tmp_path):
+    state_root = tmp_path / "relocated-state"
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", state_root)
+
+    assert probes.config_dir() == state_root
+    assert probes.index_db_path() == state_root / "index.db"
+
+
+def test_readonly_probe_honors_recovery_marker_for_relocated_special_path(tmp_path):
+    database = tmp_path / "state %23#relocated" / "index.db"
+    database.parent.mkdir()
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute("CREATE TABLE sessions (session_id TEXT PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    probe = probes._open_readonly(database)
+    assert probe is not None
+    probes._close_readonly(probe)
+
+    index_module._index_recovery_marker_path(database).write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    assert probes._open_readonly(database) is None
 
 
 def test_fresh_install_returns_zero(monkeypatch, tmp_path):

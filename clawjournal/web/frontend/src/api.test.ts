@@ -24,6 +24,37 @@ describe('desktop open notification API', () => {
   });
 });
 
+describe('index recovery API', () => {
+  afterEach(() => {
+    delete window.__CLAWJOURNAL_API_TOKEN__;
+    vi.unstubAllGlobals();
+  });
+
+  it('starts the authenticated guided rebuild and returns its initial health', async () => {
+    window.__CLAWJOURNAL_API_TOKEN__ = 'recovery-test-token';
+    const payload = {
+      ok: true,
+      index_health: {
+        status: 'rebuilding' as const,
+        stage: 'queued',
+        message: 'Starting the safe index recovery...',
+      },
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 202,
+      json: async () => payload,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.index.rebuild()).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith('/api/index/rebuild', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer recovery-test-token' },
+    });
+  });
+});
+
 describe('automatic-upload API normalization', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

@@ -1,4 +1,4 @@
-"""Persistent config for ClawJournal — stored at ~/.clawjournal/config.json"""
+"""Persistent ClawJournal state rooted at ``CLAWJOURNAL_HOME`` or ``~/.clawjournal``."""
 
 import json
 import os
@@ -9,9 +9,23 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Mapping, TypedDict, cast
 
-CONFIG_DIR = Path.home() / ".clawjournal"
+# Keep the install as one coherent state root: the index, blobs, API token,
+# finding hash salt, share ledger, and recurring-upload authority are coupled.
+# An environment override gives shared-home/HPC users a supported way to place
+# that whole state on SQLite-safe storage without splitting those invariants.
+def _resolve_config_dir() -> Path:
+    override = os.environ.get("CLAWJOURNAL_HOME", "").strip()
+    return (
+        Path(override).expanduser().resolve()
+        if override
+        else Path.home() / ".clawjournal"
+    )
+
+
+CONFIG_DIR = _resolve_config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 AUTO_UPLOAD_EGRESS_LOCK_FILENAME = "auto-upload-egress.lock"
+INDEX_RECOVERY_MARKER_FILENAME = "index-recovery-in-progress.json"
 
 
 @contextmanager
@@ -321,9 +335,15 @@ def save_config(config: ClawJournalConfig) -> bool:
                 # a caller holding its own write transaction while saving
                 # config) must not stall for long or fail the config write.
                 index_path = CONFIG_DIR / "index.db"
-                if index_path.exists():
+                recovery_marker = CONFIG_DIR / INDEX_RECOVERY_MARKER_FILENAME
+                if index_path.exists() and not recovery_marker.exists():
                     try:
-                        conn = sqlite3.connect(index_path, timeout=5)
+                        # Import lazily: ``workbench.index`` imports this module.
+                        # The guarded opener holds a cross-process lease so a
+                        # recovery cannot retire the database under this stamp.
+                        from .workbench.index import open_existing_index
+
+                        conn = open_existing_index(timeout=5)
                         try:
                             conn.execute("BEGIN IMMEDIATE")
                             mark_auto_upload_profile_changed(conn)
@@ -333,7 +353,7 @@ def save_config(config: ClawJournalConfig) -> bool:
                             raise
                         finally:
                             conn.close()
-                    except sqlite3.Error as e:
+                    except (OSError, sqlite3.Error) as e:
                         print(
                             "Warning: could not pause automatic upload after a "
                             f"profile change: {e}",

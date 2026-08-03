@@ -204,11 +204,45 @@ export interface Policy {
   created_at: string;
 }
 
+export type IndexHealthStatus =
+  | 'ready'
+  | 'checking'
+  | 'recovery_required'
+  | 'rebuilding'
+  | 'unavailable';
+
+export interface IndexHealth {
+  status: IndexHealthStatus;
+  message?: string | null;
+  detail?: string | null;
+  stage?: string | null;
+  database_path?: string | null;
+  backup_path?: string | null;
+  sqlite_version?: string | null;
+  journal_mode?: string | null;
+  automatic_recovery_available?: boolean;
+  interrupted_recovery?: boolean;
+  unreadable_state?: string[];
+  recoverable_state_counts?: Record<string, number>;
+  /** Counts returned by the current guided-recovery implementation. */
+  restored_state_counts?: Record<string, number>;
+  /** Backward-compatible alias accepted from early recovery builds. */
+  restored_counts?: Record<string, number>;
+  warnings?: string[];
+}
+
+export interface IndexRebuildResponse {
+  ok: boolean;
+  index_health: IndexHealth;
+}
+
 export interface Features {
   /** Whether the Benchmark tab is shown in the workbench UI (config: benchmark_tab_enabled). */
   benchmark_tab_enabled: boolean;
   /** Whether the user declined the background auto-scorer warmup (config: scoring_warmup_declined). */
   scoring_warmup_declined: boolean;
+  /** Cached startup integrity result. Database-backed UI mounts only when ready. */
+  index_health: IndexHealth;
 }
 
 export interface WorkbenchConfig {

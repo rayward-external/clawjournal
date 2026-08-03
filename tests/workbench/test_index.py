@@ -12,6 +12,7 @@ from clawjournal.workbench.index import (
     backfill_session_keys,
     bulk_update_review_status,
     create_share,
+    effective_hold_state,
     get_effective_share_settings,
     get_dashboard_analytics,
     get_share,
@@ -34,6 +35,11 @@ from clawjournal.workbench.index import (
     update_session,
     upsert_sessions,
 )
+
+
+@pytest.mark.parametrize("damaged_state", [None, "", "unknown-state"])
+def test_effective_hold_state_fails_closed_for_invalid_values(damaged_state):
+    assert effective_hold_state(damaged_state, None) == "pending_review"
 
 
 @pytest.fixture

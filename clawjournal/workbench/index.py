@@ -6,11 +6,14 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, BinaryIO, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,7 @@ from ..redaction.secrets import (
 from ..scoring.badges import compute_all_badges
 from ..config import (
     CONFIG_DIR,
+    INDEX_RECOVERY_MARKER_FILENAME,
     load_config,
     mark_auto_upload_profile_changed,
     normalize_excluded_project_names,
@@ -32,6 +36,215 @@ from ..pricing import estimate_cost
 
 INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
+INDEX_JOURNAL_MODE = "delete"
+INDEX_CONNECTION_LEASE_FILENAME = "index-connections.lock"
+_INDEX_CONNECTION_LEASE_SLOTS = 256
+_INDEX_RECOVERY_ACCESS = threading.local()
+
+
+def _set_index_recovery_access(enabled: bool) -> bool:
+    """Allow only the recovery worker to open the marker-guarded live index."""
+
+    previous = bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
+    _INDEX_RECOVERY_ACCESS.enabled = enabled
+    return previous
+
+
+def _index_recovery_marker_path(database: Path | None = None) -> Path:
+    path = Path(str(INDEX_DB)) if database is None else Path(database)
+    return path.parent / INDEX_RECOVERY_MARKER_FILENAME
+
+
+def _index_connection_lease_path(database: Path | None = None) -> Path:
+    path = Path(str(INDEX_DB)) if database is None else Path(database)
+    return path.parent / INDEX_CONNECTION_LEASE_FILENAME
+
+
+def _open_index_lease_file(database: Path | None = None) -> BinaryIO:
+    path = _index_connection_lease_path(database)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file = path.open("a+b")
+    file.seek(0, os.SEEK_END)
+    if file.tell() < _INDEX_CONNECTION_LEASE_SLOTS:
+        # ``a+b`` forces writes to EOF even after seek on Windows. truncate()
+        # is the portable way to make every byte-range lock slot addressable.
+        file.truncate(_INDEX_CONNECTION_LEASE_SLOTS)
+        file.flush()
+    return file
+
+
+def _release_index_lease(file: BinaryIO, slot: int | None) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            file.seek(0 if slot is None else slot)
+            msvcrt.locking(
+                file.fileno(),
+                msvcrt.LK_UNLCK,
+                _INDEX_CONNECTION_LEASE_SLOTS if slot is None else 1,
+            )
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+    finally:
+        file.close()
+
+
+def _acquire_index_connection_lease(
+    *, database: Path | None = None, timeout: float = 30.0,
+) -> tuple[BinaryIO, int | None]:
+    """Register one live ``open_index`` connection across processes."""
+
+    file = _open_index_lease_file(database)
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        while True:
+            if os.name == "nt":
+                import msvcrt
+
+                for slot in range(_INDEX_CONNECTION_LEASE_SLOTS):
+                    try:
+                        file.seek(slot)
+                        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        continue
+                    return file, slot
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    return file, None
+            if time.monotonic() >= deadline:
+                raise sqlite3.OperationalError(
+                    "Timed out waiting for the workbench index recovery lock."
+                )
+            time.sleep(0.05)
+    except Exception:
+        file.close()
+        raise
+
+
+@contextmanager
+def _exclusive_index_recovery_lease(
+    *, timeout: float = 30.0,
+) -> Iterator[None]:
+    """Wait for every guarded connection and prevent another from opening."""
+
+    file = _open_index_lease_file()
+    deadline = time.monotonic() + max(0.0, timeout)
+    locked = False
+    try:
+        while not locked:
+            if os.name == "nt":
+                import msvcrt
+
+                try:
+                    file.seek(0)
+                    msvcrt.locking(
+                        file.fileno(),
+                        msvcrt.LK_NBLCK,
+                        _INDEX_CONNECTION_LEASE_SLOTS,
+                    )
+                except OSError:
+                    pass
+                else:
+                    locked = True
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    locked = True
+            if locked:
+                break
+            if time.monotonic() >= deadline:
+                raise sqlite3.OperationalError(
+                    "Timed out waiting for other ClawJournal processes to close "
+                    "the workbench index."
+                )
+            time.sleep(0.05)
+        yield
+    finally:
+        if locked:
+            _release_index_lease(file, None)
+        else:
+            file.close()
+
+
+class _LeasedIndexConnection(sqlite3.Connection):
+    """SQLite connection that releases its cross-process lease on close."""
+
+    _index_lease: tuple[BinaryIO, int | None] | None = None
+
+    def close(self) -> None:
+        lease = self._index_lease
+        self._index_lease = None
+        try:
+            super().close()
+        finally:
+            if lease is not None:
+                _release_index_lease(*lease)
+
+
+def open_existing_index(
+    *,
+    database: Path | None = None,
+    readonly: bool = False,
+    timeout: float = 5.0,
+    isolation_level: str | None = "",
+) -> sqlite3.Connection:
+    """Open the existing DB without migrations while honoring recovery leases."""
+
+    recovery_access = bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
+    path = Path(str(INDEX_DB)) if database is None else Path(database)
+    marker = _index_recovery_marker_path(path)
+    if marker.exists() and not recovery_access:
+        raise sqlite3.DatabaseError(
+            "The workbench index is guarded by an unfinished recovery."
+        )
+    if not path.is_file():
+        raise sqlite3.OperationalError("The workbench index does not exist.")
+
+    lease: tuple[BinaryIO, int | None] | None = None
+    if not recovery_access:
+        lease = _acquire_index_connection_lease(
+            database=path,
+            timeout=timeout,
+        )
+        if marker.exists():
+            _release_index_lease(*lease)
+            raise sqlite3.DatabaseError(
+                "The workbench index is guarded by an unfinished recovery."
+            )
+    try:
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + ("?mode=ro" if readonly else "?mode=rw"),
+            uri=True,
+            timeout=timeout,
+            isolation_level=isolation_level,
+            factory=_LeasedIndexConnection,
+        )
+    except Exception:
+        if lease is not None:
+            _release_index_lease(*lease)
+        raise
+    conn._index_lease = lease
+    if marker.exists() and not recovery_access:
+        conn.close()
+        raise sqlite3.DatabaseError(
+            "The workbench index is guarded by an unfinished recovery."
+        )
+    conn.row_factory = sqlite3.Row
+    return conn
 
 # Schema version sentinels. Version 1 is the bundles→shares migration,
 # version 2 is the security refactor, version 3 adds the
@@ -549,6 +762,13 @@ def open_index() -> sqlite3.Connection:
     if they do not already exist. Returns a connection with
     row_factory set to sqlite3.Row for dict-like access.
     """
+    recovery_access = bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
+    if _index_recovery_marker_path().exists() and not recovery_access:
+        raise sqlite3.DatabaseError(
+            "The workbench index is guarded by an unfinished recovery. "
+            "Open the workbench and finish or retry the backup-first rebuild."
+        )
+
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     BLOBS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -558,9 +778,50 @@ def open_index() -> sqlite3.Connection:
     # keeps them isolated to the test directory.
     ensure_install_files(Path(str(INDEX_DB)).parent)
 
-    conn = sqlite3.connect(str(INDEX_DB), timeout=30)
+    lease: tuple[BinaryIO, int | None] | None = None
+    if not recovery_access:
+        lease = _acquire_index_connection_lease()
+        # Close the marker/connect race: a recovery that published its marker
+        # after the first check will wait on this lease, while this opener now
+        # declines to create or migrate the guarded database.
+        if _index_recovery_marker_path().exists():
+            _release_index_lease(*lease)
+            raise sqlite3.DatabaseError(
+                "The workbench index is guarded by an unfinished recovery. "
+                "Open the workbench and finish or retry the backup-first rebuild."
+            )
+
+    try:
+        conn = sqlite3.connect(
+            Path(str(INDEX_DB)).resolve().as_uri() + "?mode=rwc",
+            uri=True,
+            timeout=30,
+            factory=_LeasedIndexConnection,
+        )
+    except Exception:
+        if lease is not None:
+            _release_index_lease(*lease)
+        raise
+    conn._index_lease = lease
+    if _index_recovery_marker_path().exists() and not recovery_access:
+        conn.close()
+        raise sqlite3.DatabaseError(
+            "The workbench index is guarded by an unfinished recovery. "
+            "Open the workbench and finish or retry the backup-first rebuild."
+        )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    journal_row = conn.execute(
+        f"PRAGMA journal_mode={INDEX_JOURNAL_MODE}"
+    ).fetchone()
+    actual_journal_mode = str(journal_row[0]).lower() if journal_row else ""
+    if actual_journal_mode != INDEX_JOURNAL_MODE:
+        conn.close()
+        raise sqlite3.DatabaseError(
+            "ClawJournal could not select the safe SQLite journal mode "
+            f"{INDEX_JOURNAL_MODE!r} for {INDEX_DB}; SQLite returned "
+            f"{actual_journal_mode or 'no mode'!r}. Close other ClawJournal "
+            "processes and try again."
+        )
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
 
@@ -3442,7 +3703,8 @@ def effective_hold_state(
     Callers that gate on the effective state (share/upload) should use
     this; UI/audit surfaces read the raw column directly.
     """
-    state = hold_state or "auto_redacted"
+    # Missing or unknown state is corruption, not implied consent to share.
+    state = hold_state if hold_state in HOLD_STATES else "pending_review"
     if state != "embargoed" or not embargo_until:
         return state
     try:

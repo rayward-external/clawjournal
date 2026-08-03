@@ -19,8 +19,19 @@ LOCK_FILENAME = "reinstall.lock"
 LOCK_HELD_ENV = "CLAWJOURNAL_INSTALL_LOCK_HELD"
 
 
+def _state_dir() -> Path:
+    """Resolve the state root without importing the not-yet-installed package."""
+
+    override = os.environ.get("CLAWJOURNAL_HOME", "").strip()
+    return (
+        Path(override).expanduser().resolve()
+        if override
+        else Path.home() / ".clawjournal"
+    )
+
+
 def _lock_path() -> Path:
-    return Path.home() / ".clawjournal" / LOCK_FILENAME
+    return _state_dir() / LOCK_FILENAME
 
 
 def _acquire_lock(path: Path) -> int:

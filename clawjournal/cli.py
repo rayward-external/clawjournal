@@ -14,6 +14,7 @@ from typing import Any, Mapping, cast
 
 from .redaction.anonymizer import Anonymizer
 from .config import (
+    CONFIG_DIR,
     CONFIG_FILE,
     ClawJournalConfig,
     load_config,
@@ -46,6 +47,13 @@ from .redaction.secrets import _has_mixed_char_types, _shannon_entropy, redact_s
 
 REPO_URL = "https://github.com/rayward-external/clawjournal"
 SKILL_URL = "https://raw.githubusercontent.com/rayward-external/clawjournal/main/skills/clawjournal/SKILL.md"
+
+
+def _argparse_path(path: Path) -> str:
+    """Escape a dynamic path for argparse's percent-formatted help text."""
+
+    return str(path).replace("%", "%%")
+
 
 REQUIRED_REVIEW_ATTESTATIONS: dict[str, str] = {
     "asked_full_name": "I asked the user for their full name and scanned for it.",
@@ -1195,7 +1203,12 @@ def prep(source_filter: str = "auto") -> None:
             from .parsing.parser import GEMINI_DIR
             err = f"{GEMINI_DIR} was not found."
         else:
-            err = "None of ~/.claude, ~/.claude-science, ~/.codex, ~/.gemini/tmp, ~/WorkBuddy, or ~/.clawjournal/workbuddy were found."
+            err = (
+                "No supported session sources were found. Checked the standard "
+                "agent directories (~/.claude, ~/.claude-science, ~/.codex, "
+                f"~/.gemini/tmp, ~/WorkBuddy), {WORKBUDDY_IMPORT_DIR}, and "
+                f"{CUSTOM_DIR}."
+            )
         print(json.dumps({"error": err}))
         sys.exit(1)
 
@@ -4211,7 +4224,10 @@ def main() -> None:
     th_sub = th.add_subparsers(dest="trufflehog_command")
     th_install = th_sub.add_parser(
         "install",
-        help="Download the pinned, checksum-verified TruffleHog into ~/.clawjournal/bin")
+        help=(
+            "Download the pinned, checksum-verified TruffleHog into "
+            f"{_argparse_path(CONFIG_DIR / 'bin')}"
+        ))
     th_install.add_argument("--force", action="store_true",
                             help="Reinstall even if a managed binary already exists")
     th_install.add_argument("--json", action="store_true", help="Output result as JSON")
@@ -4224,7 +4240,10 @@ def main() -> None:
     bl_sub = bl.add_subparsers(dest="betterleaks_command")
     bl_install = bl_sub.add_parser(
         "install",
-        help="Download the pinned, checksum-verified Betterleaks into ~/.clawjournal/bin")
+        help=(
+            "Download the pinned, checksum-verified Betterleaks into "
+            f"{_argparse_path(CONFIG_DIR / 'bin')}"
+        ))
     bl_install.add_argument("--force", action="store_true",
                             help="Reinstall even if a managed binary already exists")
     bl_install.add_argument("--json", action="store_true", help="Output result as JSON")
@@ -4345,7 +4364,10 @@ def main() -> None:
         dest="output",
         type=str,
         default=None,
-        help="Output path (default: ~/.clawjournal/exports/clawjournal-bundle-<hash>.json)",
+        help=(
+            "Output path (default: "
+            f"{_argparse_path(CONFIG_DIR / 'exports' / 'clawjournal-bundle-<hash>.json')})"
+        ),
     )
     events_export.add_argument(
         "--no-snippets",
@@ -6645,7 +6667,7 @@ def _run_events_search(args) -> None:
                     code=9,
                     kind=KIND_UNSPECIFIED,
                     message=f"FTS rebuild failed: {exc}",
-                    hint="check `~/.clawjournal/index.db` is writable",
+                    hint=f"check `{CONFIG_DIR / 'index.db'}` is writable",
                     request_id=request_id,
                     json_mode=json_mode,
                 )
@@ -7127,7 +7149,13 @@ def _run_export(args) -> None:
             from .parsing.parser import GEMINI_DIR
             print(f"Error: {GEMINI_DIR} not found.", file=sys.stderr)
         else:
-            print("Error: none of ~/.claude, ~/.claude-science, ~/.codex, ~/.gemini/tmp, ~/WorkBuddy, or ~/.clawjournal/workbuddy were found.", file=sys.stderr)
+            print(
+                "Error: no supported session sources were found. Checked the "
+                "standard agent directories (~/.claude, ~/.claude-science, "
+                f"~/.codex, ~/.gemini/tmp, ~/WorkBuddy), {WORKBUDDY_IMPORT_DIR}, "
+                f"and {CUSTOM_DIR}.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     projects = discover_projects(source_filter=source_filter)

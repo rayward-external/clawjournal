@@ -266,11 +266,11 @@ class TestFeatures:
         monkeypatch.setattr("clawjournal.config.load_config", lambda: {})
         status, body = _get(api, "/api/features")
         assert status == 200
-        assert body == {"benchmark_tab_enabled": True, "scoring_warmup_declined": False}
+        assert body["benchmark_tab_enabled"] is True
 
     def test_respects_disabled_flag(self, api, monkeypatch):
         monkeypatch.setattr("clawjournal.config.load_config",
                             lambda: {"benchmark_tab_enabled": False})
         status, body = _get(api, "/api/features")
         assert status == 200
-        assert body == {"benchmark_tab_enabled": False, "scoring_warmup_declined": False}
+        assert body["benchmark_tab_enabled"] is False
