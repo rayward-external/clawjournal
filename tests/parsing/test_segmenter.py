@@ -127,6 +127,90 @@ class TestAppendOnlySegmentation:
         assert result[1]["raw_source_start_offset"] is None
         assert result[1]["raw_source_end_offset"] is None
 
+    def test_token_snapshots_split_into_per_segment_deltas(self):
+        messages = [
+            _user("question one"),
+            _assistant("answer one"),
+            _user("question two"),
+            _assistant("answer two"),
+            _user("question three"),
+        ]
+        session = _session(messages, session_id="growing", source="codex")
+        session["stats"]["input_tokens"] = 500
+        session["stats"]["output_tokens"] = 80
+        # Cumulative (input, output, cache_read, cache_creation) after each
+        # message, mirroring what the parsers capture alongside raw offsets.
+        snapshots = [
+            (100, 10, 5, 0),
+            (200, 30, 5, 0),
+            (200, 30, 5, 0),
+            (500, 80, 25, 0),
+            (500, 80, 25, 0),
+        ]
+
+        result = segment_append_only_session(
+            session,
+            [10, 20, 30, 40, 55],
+            message_start_offsets=[0, 10, 20, 30, 50],
+            raw_source_size=55,
+            message_token_snapshots=snapshots,
+            max_messages=2,
+            max_user_messages=99,
+            max_text_bytes=999_999,
+            max_raw_bytes=999_999,
+        )
+
+        assert [item["session_id"] for item in result] == [
+            "growing",
+            "growing_seg-0001",
+            "growing_seg-0002",
+        ]
+        per_segment = [
+            (
+                item["stats"]["input_tokens"],
+                item["stats"]["output_tokens"],
+                item["stats"]["cache_read_tokens"],
+                item["stats"]["cache_creation_tokens"],
+            )
+            for item in result
+        ]
+        assert per_segment == [
+            (200, 30, 5, 0),
+            (300, 50, 20, 0),
+            (0, 0, 0, 0),
+        ]
+        # Deltas partition the file totals: nothing double-counted or lost.
+        assert sum(tokens[0] for tokens in per_segment) == 500
+        assert sum(tokens[1] for tokens in per_segment) == 80
+        assert result[0]["stats"]["user_messages"] == 1
+        assert result[0]["stats"]["assistant_messages"] == 1
+
+    def test_invalid_token_snapshots_are_ignored(self):
+        messages = [
+            _user("question one"),
+            _assistant("answer one"),
+            _user("question two"),
+            _assistant("answer two"),
+            _user("question three"),
+        ]
+        session = _session(messages, session_id="growing", source="codex")
+
+        result = segment_append_only_session(
+            session,
+            [10, 20, 30, 40, 55],
+            message_start_offsets=[0, 10, 20, 30, 50],
+            raw_source_size=55,
+            message_token_snapshots=[(100, 10, 5, 0)],  # wrong length
+            max_messages=2,
+            max_user_messages=99,
+            max_text_bytes=999_999,
+            max_raw_bytes=999_999,
+        )
+
+        assert len(result) == 3
+        assert all(item["stats"]["input_tokens"] == 0 for item in result)
+        assert all(item["stats"]["output_tokens"] == 0 for item in result)
+
 
 # ---------------------------------------------------------------------------
 # Time gap detection

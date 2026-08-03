@@ -1185,6 +1185,152 @@ class TestDiscoverProjects:
             "assistant",
         ]
 
+    def test_codex_parser_captures_per_message_token_snapshots(
+        self, tmp_path, mock_anonymizer
+    ):
+        """token_count events land on the message they conclude, so segmenting
+        the trace later can recover per-segment token deltas."""
+        session_file = tmp_path / "rollout-token-snapshots.jsonl"
+
+        def token_count(input_tokens, cached, output):
+            return {
+                "timestamp": "2026-07-28T07:13:24.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input_tokens,
+                            "cached_input_tokens": cached,
+                            "output_tokens": output,
+                        }
+                    },
+                },
+            }
+
+        lines = [
+            {
+                "timestamp": "2026-07-28T07:13:20.000Z",
+                "type": "session_meta",
+                "payload": {"id": "session-tokens", "cwd": "/repo"},
+            },
+            {
+                "timestamp": "2026-07-28T07:13:21.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "question one"},
+            },
+            {
+                "timestamp": "2026-07-28T07:13:22.000Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "answer one"},
+            },
+            token_count(100, 20, 10),
+            {
+                "timestamp": "2026-07-28T07:13:25.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "question two"},
+            },
+            {
+                "timestamp": "2026-07-28T07:13:26.000Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "answer two"},
+            },
+            token_count(300, 50, 40),
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+            capture_raw_offsets=True,
+        )
+
+        assert result is not None
+        assert len(result["messages"]) == 4
+        # Cumulative (non-cached input, output, cache_read, cache_creation)
+        # as of each message; the count that concludes a response is folded
+        # into that assistant message, not the following user message.
+        assert result["_raw_message_token_snapshots"] == [
+            (0, 0, 0, 0),
+            (80, 10, 20, 0),
+            (80, 10, 20, 0),
+            (250, 40, 50, 0),
+        ]
+        assert result["stats"]["input_tokens"] == 250
+        assert result["stats"]["output_tokens"] == 40
+        assert result["stats"]["cache_read_tokens"] == 50
+
+    def test_claude_parser_captures_per_message_token_snapshots(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = tmp_path / "claude-token-snapshots.jsonl"
+        lines = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-28T07:13:20.000Z",
+                "cwd": "/repo",
+                "sessionId": "claude-tokens",
+                "message": {"content": "question one"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-28T07:13:21.000Z",
+                "message": {
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "answer one"}],
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 10,
+                        "cache_read_input_tokens": 5,
+                        "cache_creation_input_tokens": 2,
+                    },
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-07-28T07:13:22.000Z",
+                "message": {"content": "question two"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-28T07:13:23.000Z",
+                "message": {
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "answer two"}],
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 30,
+                        "cache_read_input_tokens": 7,
+                        "cache_creation_input_tokens": 3,
+                    },
+                },
+            },
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+        result = _parse_claude_session_file(
+            session_file,
+            mock_anonymizer,
+            capture_raw_offsets=True,
+        )
+
+        assert result is not None
+        assert len(result["messages"]) == 4
+        assert result["_raw_message_token_snapshots"] == [
+            (0, 0, 0, 0),
+            (100, 10, 5, 2),
+            (100, 10, 5, 2),
+            (300, 40, 12, 5),
+        ]
+
     def test_discover_opencode_projects(self, tmp_path, monkeypatch):
         self._disable_codex(tmp_path, monkeypatch)
         db_path = tmp_path / "opencode.db"
@@ -2954,6 +3100,10 @@ def test_long_claude_session_checkpoint_includes_interstitial_tool_result(
     assert sessions[0]["messages"][-1]["tool_uses"][0]["output"] == {
         "text": "result-19"
     }
+    # Each turn bills 1 input / 1 output token, so the per-segment deltas must
+    # partition the 21 turns instead of being reset to zero by _compute_stats.
+    assert [session["stats"]["input_tokens"] for session in sessions] == [20, 1]
+    assert [session["stats"]["output_tokens"] for session in sessions] == [20, 1]
 
 
 def _make_wrapper_json(

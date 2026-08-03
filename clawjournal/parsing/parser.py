@@ -1920,6 +1920,7 @@ def _finalize_append_only_segments(
     offsets = session.pop("_raw_message_end_offsets", None)
     start_offsets = session.pop("_raw_message_start_offsets", None)
     raw_source_size = session.pop("_raw_source_size", None)
+    token_snapshots = session.pop("_raw_message_token_snapshots", None)
     if not isinstance(offsets, list):
         return [session]
     segments = segment_append_only_session(
@@ -1927,6 +1928,7 @@ def _finalize_append_only_segments(
         offsets,
         message_start_offsets=start_offsets,
         raw_source_size=raw_source_size,
+        message_token_snapshots=token_snapshots,
     )
     if len(segments) <= 1:
         return [session]
@@ -2449,6 +2451,7 @@ def _parse_claude_session_file(
     parse_snapshot: dict[str, Any] = {}
     raw_message_start_offsets: list[int] = []
     raw_message_end_offsets: list[int] = []
+    raw_message_token_snapshots: list[tuple[int, int, int, int]] = []
     try:
         for entry in _iter_jsonl(
             filepath,
@@ -2466,14 +2469,22 @@ def _parse_claude_session_file(
                 tool_result_map,
             )
             if capture_raw_offsets and len(messages) > before_messages:
+                added_messages = len(messages) - before_messages
                 raw_message_start_offsets.extend(
-                    [int(parse_snapshot["record_start"])]
-                    * (len(messages) - before_messages)
+                    [int(parse_snapshot["record_start"])] * added_messages
                 )
                 raw_message_end_offsets.extend(
-                    [int(parse_snapshot["record_end"])]
-                    * (len(messages) - before_messages)
+                    [int(parse_snapshot["record_end"])] * added_messages
                 )
+                # Cumulative totals as of each message. Claude bills usage on
+                # the same entry that carries the assistant message, so an
+                # entry that adds no message never moves these counters.
+                raw_message_token_snapshots.extend([(
+                    stats["input_tokens"],
+                    stats["output_tokens"],
+                    stats["cache_read_tokens"],
+                    stats["cache_creation_tokens"],
+                )] * added_messages)
     except OSError:
         if strict_jsonl:
             raise
@@ -2490,6 +2501,7 @@ def _parse_claude_session_file(
     if result is not None and capture_raw_offsets:
         result["_raw_message_start_offsets"] = raw_message_start_offsets
         result["_raw_message_end_offsets"] = raw_message_end_offsets
+        result["_raw_message_token_snapshots"] = raw_message_token_snapshots
         result["_raw_source_size"] = parse_snapshot.get("file_size")
     return result
 
@@ -3103,6 +3115,19 @@ def _build_codex_tool_result_map(
     return result
 
 
+def _codex_token_snapshot(state: _CodexParseState) -> tuple[int, int, int, int]:
+    """Cumulative (input, output, cache_read, cache_creation) totals so far.
+
+    Codex rollouts report no cache-creation counter, so that slot stays zero.
+    """
+    return (
+        state.max_input_tokens,
+        state.max_output_tokens,
+        state.max_cached_tokens,
+        0,
+    )
+
+
 def _parse_codex_session_file(
     filepath: Path,
     anonymizer: Anonymizer,
@@ -3147,6 +3172,7 @@ def _parse_codex_session_file(
     parse_snapshot: dict[str, Any] = {}
     raw_message_start_offsets: list[int] = []
     raw_message_end_offsets: list[int] = []
+    raw_message_token_snapshots: list[tuple[int, int, int, int]] = []
     try:
         for entry in _iter_jsonl(
             filepath,
@@ -3199,6 +3225,17 @@ def _parse_codex_session_file(
                     raw_message_end_offsets.extend(
                         [int(parse_snapshot["record_end"])] * added_messages
                     )
+            if capture_raw_offsets:
+                # Cumulative totals as of each message. A token_count arriving
+                # between messages belongs to the response it concludes, so it
+                # updates the latest message's snapshot in place.
+                token_snapshot = _codex_token_snapshot(state)
+                if len(state.messages) > before_messages:
+                    raw_message_token_snapshots.extend(
+                        [token_snapshot] * (len(state.messages) - before_messages)
+                    )
+                elif raw_message_token_snapshots:
+                    raw_message_token_snapshots[-1] = token_snapshot
     except OSError:
         if strict_jsonl:
             raise
@@ -3227,6 +3264,9 @@ def _parse_codex_session_file(
             [int(parse_snapshot.get("file_size") or 0)]
             * (len(state.messages) - before_flush)
         )
+        raw_message_token_snapshots.extend(
+            [_codex_token_snapshot(state)] * (len(state.messages) - before_flush)
+        )
 
     if state.metadata["model"] is None:
         model_provider = state.metadata.get("model_provider")
@@ -3241,6 +3281,7 @@ def _parse_codex_session_file(
     if result is not None and capture_raw_offsets:
         result["_raw_message_start_offsets"] = raw_message_start_offsets
         result["_raw_message_end_offsets"] = raw_message_end_offsets
+        result["_raw_message_token_snapshots"] = raw_message_token_snapshots
         result["_raw_source_size"] = parse_snapshot.get("file_size")
     return result
 
