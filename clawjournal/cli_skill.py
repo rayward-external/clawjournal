@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any
 
+from .redaction.normalize import strip_terminal_control_sequences
 from .skill import distill as _distill
 from .skill import due as _due
 from .skill import focus as _focus
@@ -670,6 +671,18 @@ def _ascii_safe(text: str) -> str:
         return text
 
 
+def _out(text: Any) -> str:
+    """Make any untrusted string safe to write to the user's terminal.
+
+    Everything the preview prints is downstream of session traces: rule text the
+    model wrote from them, error signatures lifted out of them, project names.
+    An ANSI/OSC payload in any of those can retitle a window, rewrite the
+    clipboard, or forge output, so strip escapes and control bytes at the print
+    boundary — one chokepoint rather than one guard per field.
+    """
+    return _ascii_safe(strip_terminal_control_sequences(str(text)))
+
+
 _INSTALL_TARGET_LABELS = {
     "claude": "Claude Code",
     "codex": "Codex",
@@ -708,9 +721,9 @@ def _print_objective_not_installed(res: SkillResult) -> None:
           f"{MAX_INSTALLED_RULES}-rule budget, previously --rejected, or "
           f"dropped by the safety gate):")
     for rule in displaced:
-        print(f"    - {rule.display_title()}  (seen in {rule.support} session(s))")
+        print(f"    - {_out(rule.display_title())}  (seen in {rule.support} session(s))")
         if rule.preview_note:
-            print(f"        {rule.preview_note}")
+            print(f"        {_out(rule.preview_note)}")
 
 
 def _print_blocked_rules(res: SkillResult) -> None:
@@ -718,7 +731,7 @@ def _print_blocked_rules(res: SkillResult) -> None:
     if blocked:
         print(f"\n  {len(blocked)} rule(s) dropped by the safety gate:")
         for rule, reasons in blocked:
-            print(f"    - {rule.display_title()}  ({', '.join(reasons)})")
+            print(f"    - {_out(rule.display_title())}  ({', '.join(reasons)})")
 
 
 def _print_preview(res: SkillResult) -> None:
@@ -743,15 +756,15 @@ def _print_preview(res: SkillResult) -> None:
         fp = _store.fingerprint(r)
         state = "NEW " if fp in res.added_fps else "KEPT"
         tag = "AVOID" if r.kind == "avoid" else "DO"
-        print(f"  {i}. [{state}] [{tag}] {r.display_title()}   ({fp})")
+        print(f"  {i}. [{state}] [{tag}] {_out(r.display_title())}   ({fp})")
         if r.guidance and r.guidance.strip() != r.display_title():
-            print(f"        rule: {r.guidance}")
+            print(f"        rule: {_out(r.guidance)}")
         if r.trigger:
-            print(f"        when: {r.trigger}")
+            print(f"        when: {_out(r.trigger)}")
         if r.why:
-            print(f"        why:  {r.why}")
+            print(f"        why:  {_out(r.why)}")
         if r.preview_note:   # terminal-only; never installed into agent context
-            print(f"        {r.preview_note}")
+            print(f"        {_out(r.preview_note)}")
     _print_focus(res)
     if res.dropped:
         print(
@@ -759,12 +772,12 @@ def _print_preview(res: SkillResult) -> None:
             "no longer in the install set:"
         )
         for r in res.dropped:
-            print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
+            print(f"    - {_out(r.guidance)}  ({_store.fingerprint(r)})")
     if res.trend:
         n = res.corpus.eligible_scored
         print(_ascii_safe(f"\n  Recurrence of targeted failure modes vs your last run "
                           f"(rate over {n} scored session(s) — directional, not a powered metric):"))
-        for mode, (prev, cur) in res.trend.items():
+        for mode, (prev, cur) in ((_out(m), v) for m, v in res.trend.items()):
             if n < 10:
                 print(_ascii_safe(f"    - {mode}: {cur:.0%}  (insufficient data — n={n})"))
             elif prev is None:
@@ -779,7 +792,7 @@ def _print_preview(res: SkillResult) -> None:
         # most-recurrent first; cap so a long tail of rare signatures doesn't flood output
         ordered = sorted(res.objective_trend.items(),
                          key=lambda kv: -max(kv[1][0] or 0.0, kv[1][1]))[:6]
-        for sig, (prev, cur) in ordered:
+        for sig, (prev, cur) in ((_out(k), v) for k, v in ordered):
             if n < 10:
                 print(_ascii_safe(f"    - {sig}: {cur:.0%}  (insufficient data — n={n})"))
             elif prev is None:
@@ -813,10 +826,10 @@ def _print_focus(res: SkillResult) -> None:
     print(_ascii_safe(
         "\nFocus this week (coding-agent behavior; preview spotlight only)"
     ))
-    print(f"  Pattern: {rule.display_title()}")
-    print(f"  Observed cost: {rule.why}")
-    print(f"  Replacement trigger: {rule.trigger}")
-    print(f"  Replacement habit: {rule.guidance}")
+    print(f"  Pattern: {_out(rule.display_title())}")
+    print(f"  Observed cost: {_out(rule.why)}")
+    print(f"  Replacement trigger: {_out(rule.trigger)}")
+    print(f"  Replacement habit: {_out(rule.guidance)}")
     print(
         f"  Evidence: {focus.session_count} directly cited sessions across "
         f"{focus.day_count} days and {focus.project_count} projects."

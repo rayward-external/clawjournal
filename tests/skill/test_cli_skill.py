@@ -343,3 +343,44 @@ def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path
     from clawjournal.skill import install
     assert installed_text.count(install.BEGIN_MARKER) == 1
     assert capsys.readouterr().out.count("Installed:") == 2
+
+
+# --- terminal-control safety on the preview path (Codex round 4) -------------
+
+def test_preview_strips_terminal_control_from_every_untrusted_field(capsys):
+    """Model text, error signatures, and trend keys all reach a TTY.
+
+    An OSC/ANSI payload that survived a session trace must not be able to drive
+    the user's terminal from any preview surface.
+    """
+    from clawjournal import cli_skill
+    from clawjournal.skill.schema import SkillRule
+    from clawjournal.skill.select import SkillCorpus
+
+    osc = "\x1b]0;pwned\x07\x1b[31m"
+    rule = SkillRule(
+        kind="avoid", trigger=f"{osc}when editing",
+        guidance=f"{osc}read the file first", why=f"{osc}it failed",
+        title=f"{osc}Read First", support=3,
+        preview_note=f"{osc}error signature: boom",
+    )
+    blocked_rule = SkillRule(kind="do", trigger="t", guidance="g", why="w",
+                             title=f"{osc}Blocked One")
+    displaced = SkillRule(kind="avoid", trigger="t", guidance="g", why="w",
+                          title=f"{osc}Displaced", support=4,
+                          preview_note=f"{osc}sig")
+    res = cli_skill.SkillResult(
+        rules=[rule], skill_md="x", region="y",
+        blocked=[(blocked_rule, ["url"])], gate_issues=[],
+        corpus=SkillCorpus(window_start="a", window_end="b",
+                           objective_recurrence={f"{osc}sig-key": 3},
+                           objective_session_ids=[f"s{i}" for i in range(12)]),
+        meta={}, added_fps=set(), dropped=[rule],
+        trend={}, objective_trend={f"{osc}sig-key": (0.5, 0.2)},
+        focus=None, objective_not_installed=[displaced],
+    )
+    cli_skill._print_preview(res)
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "pwned" not in out
+    assert "Read First" in out and "Displaced" in out and "Blocked One" in out

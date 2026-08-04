@@ -412,6 +412,47 @@ def test_active_embargo_still_does_not_count(index_conn, ins):
     assert not status.due and status.reason == "quiet"
 
 
+def test_active_embargoes_do_not_consume_the_scan_budget(index_conn, ins):
+    # the full hold gate is expressed in SQL, so held rows are never scanned at
+    # all — 2000 of them used to starve the six real sessions behind them
+    from clawjournal.skill.due import _SCAN_BUDGET
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    recent = (NOW - timedelta(days=1)).isoformat()
+    future = (NOW + timedelta(days=30)).isoformat()
+    for i in range(_SCAN_BUDGET):
+        ins(index_conn, f"emb{i}", start_time=recent, hold_state="embargoed")
+    index_conn.execute("UPDATE sessions SET embargo_until = ?", (future,))
+    older = (NOW - timedelta(days=5)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"ok{i}", start_time=older)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_short_final_page_over_threshold_still_reports_a_floor(index_conn, ins):
+    # stopping early because the count settled every threshold makes it a floor,
+    # even when the last page was short (the flag must not key off the loop exit)
+    from clawjournal.skill.due import _PAGE_SIZE, NUDGE_BURST_SESSIONS
+    assert NUDGE_BURST_SESSIONS < 30 < _PAGE_SIZE
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    _seed_sessions(index_conn, ins, 30)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == NUDGE_BURST_SESSIONS
+    assert f"{NUDGE_BURST_SESSIONS}+" in status.message
+
+
+def test_far_offset_timestamps_are_not_excluded_lexically(index_conn, ins):
+    # a -12:00 session is in-window by instant but reads as out of range under a
+    # raw string compare; SQL bounds are widened and the parse decides
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    stamp = (NOW - timedelta(days=1)).astimezone(
+        timezone(timedelta(hours=-12))).isoformat()
+    for i in range(6):
+        ins(index_conn, f"tz{i}", start_time=stamp)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
 def test_saturated_count_is_reported_as_a_floor(index_conn, ins):
     from clawjournal.skill.due import _PAGE_SIZE
     _seed_skill_state(index_conn, installed_days_ago=15)

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from ..workbench.index import (
@@ -228,13 +228,19 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
     # future-dated rows can never count as new activity forever.
     sources, excluded = _scope_and_exclusions(conn)
     placeholders = ",".join("?" for _ in sources)
-    # Everything cheap happens BEFORE the cap, so no class of ineligible row can
-    # crowd out real activity: source scope, hold state, both time bounds, and
-    # the excluded projects (in their stored and source-prefixed forms).
-    # ``embargoed`` is included because an EXPIRED embargo is shareable again —
-    # `_release_blocked_ids` below resolves that and stays authoritative.
-    hold_states = sorted(SHAREABLE_HOLD_STATES | {"embargoed"})
+    # The FULL hold gate is expressible in SQL — `release_gate_blockers` decides
+    # purely on `effective_hold_state`, i.e. shareable states plus an embargo
+    # whose `embargo_until` has passed. Encoding it here means no held or
+    # actively-embargoed row consumes the scan budget at all (they used to, and
+    # 2000 of them starved six real sessions). `_release_blocked_ids` still runs
+    # on the survivors as the authoritative check.
+    hold_states = sorted(SHAREABLE_HOLD_STATES)
     hold_placeholders = ",".join("?" for _ in hold_states)
+    hold_clause = (
+        f"AND (hold_state IN ({hold_placeholders}) OR hold_state IS NULL "
+        "OR (hold_state = 'embargoed' AND embargo_until IS NOT NULL "
+        "AND embargo_until <= ?)) "
+    )
     exclusion_clause = ""
     exclusion_params: list[str] = []
     if excluded:
@@ -244,18 +250,24 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
             f" AND (source || ':' || project) NOT IN ({ex_placeholders})"
         )
         exclusion_params = [*excluded, *excluded]
+    # Lexical time bounds are WIDENED by 2 days (> the ~14h max UTC-offset skew)
+    # exactly as select.py does: a raw string compare on mixed-offset timestamps
+    # would otherwise drop genuinely in-window rows (a -12:00 session read as
+    # out of range). The precise instant check happens on the parsed value.
+    lex_lo = (anchor - timedelta(days=2)).isoformat()
+    lex_hi = (now + timedelta(days=2)).isoformat()
     sql = (
         "SELECT session_id, project, source, start_time, "
         "ai_failure_value_score, ai_outcome_badge "
         "FROM sessions WHERE review_status != 'segmented' "
         f"AND source IN ({placeholders}) "
-        f"AND hold_state IN ({hold_placeholders}) "
+        f"{hold_clause}"
         "AND start_time > ? AND start_time <= ? "
         "AND start_time GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
         f"{exclusion_clause}"
         f"ORDER BY start_time DESC LIMIT {_PAGE_SIZE} OFFSET ?"
     )
-    base_params = [*sources, *hold_states, anchor.isoformat(), now.isoformat(),
+    base_params = [*sources, *hold_states, now.isoformat(), lex_lo, lex_hi,
                    *exclusion_params]
     # Page rather than cap: the filters SQL cannot express (precise timestamp
     # parse, legacy claude: project forms, an ACTIVE embargo) would otherwise
@@ -265,7 +277,7 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
     # stopping as soon as the count settles every threshold.
     kept: list[Any] = []
     scanned = 0
-    saturated = False
+    budget_exhausted = False
     while scanned < _SCAN_BUDGET and len(kept) < NUDGE_BURST_SESSIONS:
         page = conn.execute(sql, [*base_params, scanned]).fetchall()
         if not page:
@@ -291,11 +303,14 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
             page_kept = [r for r in page_kept if r["session_id"] not in blocked]
         kept.extend(page_kept)
         if len(page) < _PAGE_SIZE:
-            break
+            break   # exhausted the matching rows
     else:
-        # Left via the loop condition: either the scan budget ran out or the
-        # count reached the highest threshold, so it is a floor, not a total.
-        saturated = True
+        budget_exhausted = scanned >= _SCAN_BUDGET
+    # The count is a FLOOR whenever scanning stopped early — either the budget
+    # ran out, or enough rows accumulated to settle every threshold (which can
+    # also happen on a short final page, so this must not be tied to the loop
+    # exit path).
+    saturated = budget_exhausted or len(kept) >= NUDGE_BURST_SESSIONS
     if len(kept) > NUDGE_BURST_SESSIONS:
         kept = kept[:NUDGE_BURST_SESSIONS]
     new_sessions = len(kept)
