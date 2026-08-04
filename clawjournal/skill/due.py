@@ -42,12 +42,13 @@ NUDGE_BURST_SESSIONS = 25
 NUDGE_FAILURE_SESSIONS = 3
 NUDGE_COOLDOWN_DAYS = 3.0   # an emitted nudge suppresses repeats across sessions
 
-# Rows examined per check. The SQL narrows to plausibly-eligible rows FIRST
-# (source scope, shareable hold state, well-formed timestamp) so a pile of
-# held/foreign rows can no longer consume the cap and hide real activity; the
-# remaining precise filters run in Python. Sits far above every threshold, and
-# a saturated count is reported as "N+".
-_COUNT_CAP = 300
+# Scanning is paged and bounded: each page is fully filtered and hold-state
+# gated before the next is read, so no class of ineligible row can consume the
+# budget (the earlier single-LIMIT form let 300 active embargoes hide six real
+# sessions). The scan stops early once the count settles every threshold; a
+# count that is a floor rather than a total is reported as "N+".
+_PAGE_SIZE = 100
+_SCAN_BUDGET = 2000
 
 _STATE_TABLE = "skill_nudge_state"
 _LAST_NUDGED_KEY = "last_nudged_at"
@@ -243,7 +244,7 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
             f" AND (source || ':' || project) NOT IN ({ex_placeholders})"
         )
         exclusion_params = [*excluded, *excluded]
-    rows = conn.execute(
+    sql = (
         "SELECT session_id, project, source, start_time, "
         "ai_failure_value_score, ai_outcome_badge "
         "FROM sessions WHERE review_status != 'segmented' "
@@ -252,27 +253,51 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
         "AND start_time > ? AND start_time <= ? "
         "AND start_time GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' "
         f"{exclusion_clause}"
-        f"ORDER BY start_time DESC LIMIT {_COUNT_CAP}",
-        [*sources, *hold_states, anchor.isoformat(), now.isoformat(),
-         *exclusion_params],
-    ).fetchall()
-    saturated = len(rows) >= _COUNT_CAP
-    kept = []
-    for r in rows:
-        parsed = _parse_start_time(r["start_time"])
-        if parsed is None or not (anchor < parsed <= now):
-            continue
-        if excluded and session_matches_excluded_projects(
-                {"project": r["project"], "source": r["source"]}, excluded):
-            continue
-        kept.append(r)
-    # Hold-state gate: the nudge line reaches agent context (and so the model
-    # provider), so even aggregate counts must not derive from held/embargoed
-    # sessions — mirror the corpus egress gate rather than counting sessions
-    # selection could never use.
-    if kept:
-        blocked = _release_blocked_ids(conn, [r["session_id"] for r in kept], now=now)
-        kept = [r for r in kept if r["session_id"] not in blocked]
+        f"ORDER BY start_time DESC LIMIT {_PAGE_SIZE} OFFSET ?"
+    )
+    base_params = [*sources, *hold_states, anchor.isoformat(), now.isoformat(),
+                   *exclusion_params]
+    # Page rather than cap: the filters SQL cannot express (precise timestamp
+    # parse, legacy claude: project forms, an ACTIVE embargo) would otherwise
+    # run after a single LIMIT and let a pile of ineligible rows hide real
+    # activity. Every page is fully filtered and gated before the next, so no
+    # row class can consume the budget. Bounded by _SCAN_BUDGET rows and by
+    # stopping as soon as the count settles every threshold.
+    kept: list[Any] = []
+    scanned = 0
+    saturated = False
+    while scanned < _SCAN_BUDGET and len(kept) < NUDGE_BURST_SESSIONS:
+        page = conn.execute(sql, [*base_params, scanned]).fetchall()
+        if not page:
+            break
+        scanned += len(page)
+        page_kept = []
+        for r in page:
+            parsed = _parse_start_time(r["start_time"])
+            if parsed is None or not (anchor < parsed <= now):
+                continue
+            if excluded and session_matches_excluded_projects(
+                    {"project": r["project"], "source": r["source"]}, excluded):
+                continue
+            page_kept.append(r)
+        # Hold-state gate: the nudge line reaches agent context (and so the
+        # model provider), so even aggregate counts must not derive from
+        # held/embargoed sessions — mirror the corpus egress gate rather than
+        # counting sessions selection could never use. Applied per page so an
+        # active embargo cannot occupy the budget either.
+        if page_kept:
+            blocked = _release_blocked_ids(
+                conn, [r["session_id"] for r in page_kept], now=now)
+            page_kept = [r for r in page_kept if r["session_id"] not in blocked]
+        kept.extend(page_kept)
+        if len(page) < _PAGE_SIZE:
+            break
+    else:
+        # Left via the loop condition: either the scan budget ran out or the
+        # count reached the highest threshold, so it is a floor, not a total.
+        saturated = True
+    if len(kept) > NUDGE_BURST_SESSIONS:
+        kept = kept[:NUDGE_BURST_SESSIONS]
     new_sessions = len(kept)
     if new_sessions < NUDGE_MIN_NEW_SESSIONS:
         return DueStatus(False, "quiet", new_sessions=new_sessions, days_since=days_since)

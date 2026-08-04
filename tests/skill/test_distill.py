@@ -356,6 +356,24 @@ def test_distinct_signatures_stay_distinct_without_carrying_their_bytes():
     assert _store.fingerprint(a) == _store.fingerprint(same)  # and stable
 
 
+def test_preview_note_is_terminal_control_sanitized():
+    # preview_note is untrusted tool output printed to a TTY: an OSC/ANSI
+    # payload in an error message must not reach the terminal (Codex round 3)
+    from clawjournal.skill.turns import EnvExcerpt
+
+    payload = "\x1b]0;pwned\x07\x1b[31mkeyerror: 'x'\x1b[0m"
+    env = SkillCandidate(
+        "env-signature-0", "proj", "claude", "avoid",
+        title="Recurring Bash error", support_count=4,
+        objective_signature=payload,
+        pivotal_excerpts=[EnvExcerpt("Bash: pytest", payload, "")])
+    corpus = SkillCorpus(window_start="a", window_end="b", failures=[env])
+    (rule,) = distill_skills(corpus, caller=FakeCaller({"rules": []}))
+    assert "\x1b" not in rule.preview_note and "\x07" not in rule.preview_note
+    assert "pwned" not in rule.preview_note    # the whole OSC sequence goes
+    assert "keyerror" in rule.preview_note     # the real error text survives
+
+
 def test_traceback_signature_still_produces_a_rule():
     # the cluster-time signature is carried on the candidate; recomputing it from
     # the truncated excerpt dropped tracebacks entirely and silently voided the

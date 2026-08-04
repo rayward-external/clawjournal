@@ -304,10 +304,10 @@ def test_malformed_iso_lookalike_start_time_never_counts(index_conn, ins):
 def test_held_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
     # the row cap is applied AFTER the cheap eligibility filters, so a pile of
     # held sessions can no longer hide real activity (Codex re-review)
-    from clawjournal.skill.due import _COUNT_CAP
+    from clawjournal.skill.due import _PAGE_SIZE
     _seed_skill_state(index_conn, installed_days_ago=15)
     start_old = (NOW - timedelta(days=5)).isoformat()
-    for i in range(_COUNT_CAP + 50):
+    for i in range(_PAGE_SIZE * 3):
         ins(index_conn, f"held{i}", start_time=start_old, hold_state="pending_review")
     start_new = (NOW - timedelta(days=1)).isoformat()
     for i in range(6):
@@ -319,10 +319,10 @@ def test_held_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
 def test_future_dated_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
     # both time bounds are applied before the cap, so a pile of future-dated
     # rows can't consume it (Codex re-review round 2)
-    from clawjournal.skill.due import _COUNT_CAP
+    from clawjournal.skill.due import _PAGE_SIZE
     _seed_skill_state(index_conn, installed_days_ago=15)
     future = (NOW + timedelta(days=400)).isoformat()
-    for i in range(_COUNT_CAP + 50):
+    for i in range(_PAGE_SIZE * 3):
         ins(index_conn, f"fut{i}", start_time=future)
     start = (NOW - timedelta(days=1)).isoformat()
     for i in range(6):
@@ -333,17 +333,55 @@ def test_future_dated_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
 
 def test_excluded_project_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
     from clawjournal.config import load_config, save_config
-    from clawjournal.skill.due import _COUNT_CAP
+    from clawjournal.skill.due import _PAGE_SIZE
     cfg = load_config()
     cfg["excluded_projects"] = ["secret"]
     save_config(cfg)
     _seed_skill_state(index_conn, installed_days_ago=15)
     old = (NOW - timedelta(days=5)).isoformat()
-    for i in range(_COUNT_CAP + 50):
+    for i in range(_PAGE_SIZE * 3):
         ins(index_conn, f"ex{i}", source="claude", project="secret", start_time=old)
     recent = (NOW - timedelta(days=1)).isoformat()
     for i in range(6):
         ins(index_conn, f"ok{i}", source="claude", project="fine", start_time=recent)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_active_embargo_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
+    # an ACTIVE embargo is only detectable via the release gate, i.e. after SQL;
+    # paging (not a single LIMIT) keeps such rows from consuming the budget
+    from clawjournal.skill.due import _PAGE_SIZE
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    recent = (NOW - timedelta(days=1)).isoformat()
+    future = (NOW + timedelta(days=30)).isoformat()
+    for i in range(_PAGE_SIZE * 3):
+        ins(index_conn, f"emb{i}", start_time=recent, hold_state="embargoed")
+    index_conn.execute("UPDATE sessions SET embargo_until = ?", (future,))
+    older = (NOW - timedelta(days=5)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"ok{i}", start_time=older)
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.due and status.new_sessions == 6
+
+
+def test_legacy_claude_exclusion_rows_cannot_crowd_out_eligible_ones(index_conn, ins):
+    # the legacy `claude:<long-path>` exclusion form is resolved in Python, so
+    # those rows also survive SQL and must not consume the budget either
+    from clawjournal.config import load_config, save_config
+    from clawjournal.skill.due import _PAGE_SIZE
+    cfg = load_config()
+    cfg["excluded_projects"] = ["claude:Users-kai-code-my-proj"]
+    save_config(cfg)
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    recent = (NOW - timedelta(days=1)).isoformat()
+    for i in range(_PAGE_SIZE * 3):
+        ins(index_conn, f"leg{i}", source="claude", project="claude:my-proj",
+            start_time=recent)
+    older = (NOW - timedelta(days=5)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"ok{i}", source="claude", project="claude:other",
+            start_time=older)
     status = distill_due_on_connection(index_conn, NOW)
     assert status.due and status.new_sessions == 6
 
@@ -375,13 +413,13 @@ def test_active_embargo_still_does_not_count(index_conn, ins):
 
 
 def test_saturated_count_is_reported_as_a_floor(index_conn, ins):
-    from clawjournal.skill.due import _COUNT_CAP
+    from clawjournal.skill.due import _PAGE_SIZE
     _seed_skill_state(index_conn, installed_days_ago=15)
     start = (NOW - timedelta(days=1)).isoformat()
-    for i in range(_COUNT_CAP + 10):
+    for i in range(_PAGE_SIZE * 3):
         ins(index_conn, f"s{i}", start_time=start)
     status = distill_due_on_connection(index_conn, NOW)
-    assert status.due and f"{_COUNT_CAP}+" in status.message
+    assert status.due and "+" in status.message  # a floor, not a total
 
 
 def test_nudge_hook_requested_flag_round_trip(index_conn):

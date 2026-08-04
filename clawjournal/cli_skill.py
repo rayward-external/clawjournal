@@ -694,17 +694,19 @@ def _print_objective_not_installed(res: SkillResult) -> None:
     """Name the objective signals that did not reach the installed set.
 
     MUST-COVER guarantees objective evidence reaches the user, not that it wins
-    a slot — so say why each is absent (ranking, an earlier rejection, or the
-    safety gate) instead of dropping it silently. The reason is deliberately not
-    attributed to the budget alone: a rule can also be missing because its
-    fingerprint was ``--reject``ed or a gate dropped it.
+    a slot — so say each absence out loud instead of dropping it silently. The
+    reason is deliberately left open: besides the rule budget, a rule can be
+    missing because a distilled rule taught the same lesson (semantic dedup
+    keeps one), because its fingerprint was ``--reject``ed, or because a gate
+    dropped it.
     """
     displaced = getattr(res, "objective_not_installed", None)
     if not displaced:
         return
     print(f"\n  {len(displaced)} objective signal(s) not in the installed set "
-          f"this run (the {MAX_INSTALLED_RULES}-rule budget, a previous "
-          f"--reject, or the safety gate):")
+          f"this run (merged into a similar rule, outranked by the "
+          f"{MAX_INSTALLED_RULES}-rule budget, previously --rejected, or "
+          f"dropped by the safety gate):")
     for rule in displaced:
         print(f"    - {rule.display_title()}  (seen in {rule.support} session(s))")
         if rule.preview_note:

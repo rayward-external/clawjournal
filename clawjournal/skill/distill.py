@@ -19,6 +19,7 @@ from typing import Any, Callable, Protocol
 from ..benchmark.generate import _extract_json_object, run_agent_json_call
 from ..config import load_config
 from ..redaction.anonymizer import Anonymizer
+from ..redaction.normalize import strip_terminal_control_sequences
 from ..redaction.secrets import redact_custom_strings, redact_text
 from ..scoring.backends import (
     default_distill_effort_for_backend,
@@ -292,8 +293,11 @@ def _fallback_rule(
             "error text and fix its cause instead of retrying unchanged."),
         why=why, evidence_session_ids=[alias], support=n,
         origin=ORIGIN_OBJECTIVE,
-        # terminal-only: the raw signature never enters agent context
-        preview_note=f"error signature: {label}",
+        # Terminal-only: the raw signature never enters agent context. It is
+        # still untrusted tool output being written to a TTY, so strip ANSI /
+        # control sequences — otherwise an OSC payload in an error message could
+        # drive the user's terminal (title rewrite, clipboard, hyperlink).
+        preview_note=f"error signature: {strip_terminal_control_sequences(label)}",
     )
 
 
