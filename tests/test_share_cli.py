@@ -28,6 +28,7 @@ def test_arg_parsing_defaults():
     assert a.certify_ownership is False
     assert a.yes is False
     assert a.indices == []
+    assert a.no_score is False
 
 
 def test_arg_parsing_flags():
@@ -295,7 +296,7 @@ def test_step_queue_scores_only_settled_unscored_candidates(monkeypatch):
             ]
         },
     )
-    monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: "codex")
+    monkeypatch.setattr(share_cli, "_enabled_scoring_backend", lambda: "codex")
 
     def fake_unscored(conn, **kwargs):
         unscored_kwargs.update(kwargs)
@@ -318,6 +319,52 @@ def test_step_queue_scores_only_settled_unscored_candidates(monkeypatch):
     assert scored_ids == ["settled"]
     assert rows[0]["ai_failure_value_score"] is None
     assert chosen[0]["session_id"] == "settled"
+
+
+def test_step_queue_does_not_auto_detect_scoring_backend(monkeypatch):
+    rows = [_row(fv=None, session_id="settled", display_title="Settled", source="codex")]
+    monkeypatch.setattr(share_cli, "query_sessions", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        share_cli,
+        "get_share_ready_stats",
+        lambda *a, **k: {"sessions": [{"session_id": "settled", "revision_hash": "rev"}]},
+    )
+    monkeypatch.setattr(share_cli, "_enabled_scoring_backend", lambda: None)
+    monkeypatch.setattr(
+        share_cli,
+        "score_traces",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("scoring must stay off")),
+    )
+    monkeypatch.setattr(share_cli, "ensure_titles", lambda *a, **k: None)
+
+    chosen = share_cli.step_queue(None, _SETTINGS, _qargs(source="codex"))
+
+    assert chosen[0]["session_id"] == "settled"
+    assert chosen[0]["ai_failure_value_score"] is None
+
+
+def test_enabled_scoring_backend_requires_prior_confirmation(monkeypatch):
+    monkeypatch.delenv("CLAWJOURNAL_SCORER_BACKEND", raising=False)
+    monkeypatch.setattr(share_cli, "load_config", lambda: {"scorer_backend": "codex"})
+    monkeypatch.setattr(
+        share_cli,
+        "resolve_backend",
+        lambda backend: (_ for _ in ()).throw(AssertionError("must not auto-detect")),
+    )
+
+    assert share_cli._enabled_scoring_backend() is None
+
+
+def test_enabled_scoring_backend_reuses_confirmed_choice(monkeypatch):
+    monkeypatch.delenv("CLAWJOURNAL_SCORER_BACKEND", raising=False)
+    monkeypatch.setattr(
+        share_cli,
+        "load_config",
+        lambda: {"scorer_backend": "codex", "scorer_backend_confirmed_at": "now"},
+    )
+    monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: backend)
+
+    assert share_cli._enabled_scoring_backend() == "codex"
 
 
 # ---- title logic ------------------------------------------------------------
