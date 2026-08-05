@@ -4888,16 +4888,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_projects(self) -> None:
         conn = open_index()
         try:
+            settings = get_effective_share_settings(conn, load_config())
+            source_filter = settings.get("source_filter")
+            if source_filter is None:
+                allowed_sources = None
+            elif isinstance(source_filter, str):
+                allowed_sources = {source_filter}
+            else:
+                allowed_sources = set(source_filter)
             rows = conn.execute(
                 "SELECT project, source, COUNT(*) as session_count, "
                 "SUM(input_tokens + output_tokens) as total_tokens "
                 "FROM sessions GROUP BY project, source ORDER BY project"
             ).fetchall()
-            settings = get_effective_share_settings(conn, load_config())
             excluded_projects = settings["excluded_projects"]
             projects = []
             for row in rows:
                 project = dict(row)
+                if (
+                    allowed_sources is not None
+                    and project["source"] not in allowed_sources
+                ):
+                    continue
                 project["excluded"] = session_matches_excluded_projects(
                     project,
                     excluded_projects,
