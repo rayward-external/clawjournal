@@ -33,6 +33,7 @@ from pathlib import Path
 
 from .config import load_config
 from .scoring.backends import (
+    SUPPORTED_BACKENDS,
     default_model_for_backend,
     installed_fallback_chain,
     is_backend_unavailable_error,
@@ -71,6 +72,30 @@ _ANSI_RE = re.compile(r"(\033\[[0-9;]*m)")
 # (untrusted) agent logs can't manipulate the reviewer's terminal.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 NSTEPS = 6
+
+
+def _enabled_scoring_backend() -> str | None:
+    """Return a backend only when the user has already enabled scoring.
+
+    Detecting an installed agent CLI is not consent to send trace content to
+    it. The share wizard may reuse an explicitly configured scorer without
+    adding another prompt or setup step.
+    """
+    config = load_config()
+    if config.get("scoring_warmup_declined"):
+        return None
+
+    requested = os.environ.get("CLAWJOURNAL_SCORER_BACKEND", "").strip().lower()
+    if not requested:
+        requested = str(config.get("scorer_backend") or "").strip().lower()
+        if not config.get("scorer_backend_confirmed_at"):
+            return None
+    if requested not in SUPPORTED_BACKENDS:
+        return None
+    try:
+        return resolve_backend(requested)
+    except Exception:  # noqa: BLE001 - unavailable scoring degrades gracefully
+        return None
 
 
 def _rl(prompt: str) -> str:
@@ -526,17 +551,13 @@ def step_queue(conn, settings, args) -> list[dict]:
         ):
             row[field] = eligible.get(field)
 
-    # By default (like the web), score the in-window unscored traces on open so
-    # the queue shows real failure values instead of "—". Skip with --no-score.
-    # (Scored before the --min-failure-value filter so freshly-scored ones can
-    # still qualify; only runs if an agent backend is available.)
+    # Reuse scoring only after the user has enabled and confirmed a backend.
+    # Merely detecting an agent CLI must not trigger an unexpected AI call (or
+    # usage cost) while opening the share wizard. Scoring still happens before
+    # the failure-value filter so freshly scored traces can qualify.
     if not getattr(args, "no_score", False):
-        try:
-            resolve_backend("auto")
-            backend_ok = True
-        except Exception:  # noqa: BLE001
-            backend_ok = False
-        if backend_ok:
+        scoring_backend = _enabled_scoring_backend()
+        if scoring_backend is not None:
             # Scoring uses the backend's fast default model via score_session;
             # --score-model overrides.
             score_model = getattr(args, "score_model", None)
@@ -556,7 +577,14 @@ def step_queue(conn, settings, args) -> list[dict]:
                 )
             }
             pool = [r for r in pool if r["session_id"] in ready_ids]
-            score_traces(conn, pool, model=score_model, cap=args.limit, force_ids=ready_ids)
+            score_traces(
+                conn,
+                pool,
+                backend=scoring_backend,
+                model=score_model,
+                cap=args.limit,
+                force_ids=ready_ids,
+            )
 
     rows = select_queue_rows(candidates, settings, args)
     if not rows:
@@ -1074,8 +1102,7 @@ def add_interactive_flags(parser: argparse.ArgumentParser) -> argparse.ArgumentP
     parser.add_argument("--summary-model", default=None, metavar="MODEL",
                         help="model for --summary titles (implies --summary)")
     parser.add_argument("--no-score", action="store_true",
-                        help="don't score unscored traces on open (default: score them so the "
-                             "queue shows real failure values, like the web)")
+                        help="don't reuse an already-enabled scoring backend while opening the queue")
     parser.add_argument("--score-model", default=None, metavar="MODEL",
                         help="model for on-open scoring (default: backend default)")
     parser.add_argument("--accept-terms", action="store_true",
