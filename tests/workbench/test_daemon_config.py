@@ -86,6 +86,41 @@ class TestGetConfig:
 
 
 class TestProjects:
+    @pytest.mark.parametrize(
+        ("source", "expected_sources"),
+        [
+            ("all", {"claude", "codex", "openclaw"}),
+            ("both", {"claude", "codex"}),
+            ("codex", {"codex"}),
+        ],
+    )
+    def test_lists_only_projects_in_manual_export_source_scope(
+        self,
+        api,
+        source,
+        expected_sources,
+    ):
+        save_config({"source": source})
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [
+                {
+                    "session_id": f"{session_source}-session",
+                    "project": f"{session_source}:project",
+                    "source": session_source,
+                    "messages": [{"role": "user", "content": session_source}],
+                    "stats": {"input_tokens": 10, "output_tokens": 5},
+                }
+                for session_source in ("claude", "codex", "openclaw")
+            ])
+        finally:
+            conn.close()
+
+        status, body = _get(api, "/api/projects")
+
+        assert status == 200
+        assert {row["source"] for row in body} == expected_sources
+
     def test_marks_projects_excluded_by_effective_share_policy(self, api):
         save_config({"excluded_projects": ["claude:private-project"]})
         conn = open_index()
