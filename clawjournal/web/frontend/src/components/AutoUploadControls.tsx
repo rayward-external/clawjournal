@@ -860,6 +860,7 @@ function SummaryItem({ label, value }: { label: string; value: string }) {
 
 export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string | null }) {
   const [status, setStatus] = useState<AutoUploadStatus | null>(null);
+  const statusInFlightRef = useRef(false);
   // Dismissal is scoped to the receipt it was shown for: "Not now" on one
   // share must not suppress the offer after every future manual share.
   const [dismissedReceipt, setDismissedReceipt] = useState<string | null>(() => {
@@ -872,20 +873,18 @@ export function AutoUploadOffer({ manualReceiptId }: { manualReceiptId: string |
   const dismissed = manualReceiptId !== null && dismissedReceipt === manualReceiptId;
 
   const loadStatus = useCallback(() => {
-    if (!manualReceiptId || dismissed) return;
+    if (!manualReceiptId || dismissed || statusInFlightRef.current) return;
+    statusInFlightRef.current = true;
     api.autoUpload.status()
       .then(setStatus)
-      .catch(() => { /* The optional offer disappears if capability/status is unavailable. */ });
+      .catch(() => { /* The optional offer disappears if capability/status is unavailable. */ })
+      .finally(() => { statusInFlightRef.current = false; });
   }, [dismissed, manualReceiptId]);
 
   useEffect(() => {
     if (!manualReceiptId || dismissed) return;
-    let cancelled = false;
-    api.autoUpload.status()
-      .then(next => { if (!cancelled) setStatus(next); })
-      .catch(() => { /* The optional offer disappears if capability/status is unavailable. */ });
-    return () => { cancelled = true; };
-  }, [dismissed, manualReceiptId]);
+    loadStatus();
+  }, [dismissed, loadStatus, manualReceiptId]);
 
   useEffect(() => {
     if (status?.overlay !== 'enrollment_pending') return;
@@ -946,6 +945,7 @@ export function AutoUploadPanel() {
   const [preview, setPreview] = useState<AutoUploadCandidateReport | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const busyRef = useRef(false);
+  const statusInFlightRef = useRef(false);
   const statusGenerationRef = useRef(0);
   const statusRequestRef = useRef(0);
 
@@ -957,7 +957,8 @@ export function AutoUploadPanel() {
   }, []);
 
   const loadStatus = useCallback(async (quiet = false) => {
-    if (busyRef.current) return;
+    if (busyRef.current || statusInFlightRef.current) return;
+    statusInFlightRef.current = true;
     const generation = statusGenerationRef.current;
     const requestId = statusRequestRef.current + 1;
     statusRequestRef.current = requestId;
@@ -973,6 +974,8 @@ export function AutoUploadPanel() {
         || generation !== statusGenerationRef.current
         || requestId !== statusRequestRef.current) return;
       if (!quiet) setLoadError(errorMessage(error, 'Could not load automatic-upload status.'));
+    } finally {
+      statusInFlightRef.current = false;
     }
   }, []);
 

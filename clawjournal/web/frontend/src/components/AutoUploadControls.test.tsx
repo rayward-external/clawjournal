@@ -637,6 +637,27 @@ describe('AutoUploadPanel status and controls', () => {
     expect(statusSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('does not overlap transient status polls when the daemon is slow', async () => {
+    vi.useFakeTimers();
+    const running = status({ mode: 'enabled', overlay: 'running' });
+    const slowPoll = deferred<AutoUploadStatus>();
+    const statusSpy = vi.spyOn(api.autoUpload, 'status')
+      .mockResolvedValueOnce(running)
+      .mockReturnValue(slowPoll.promise);
+
+    renderControl(<AutoUploadPanel />);
+    await act(flushPromises);
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+      await flushPromises();
+    });
+    expect(statusSpy).toHaveBeenCalledTimes(2);
+
+    slowPoll.resolve(running);
+    await act(flushPromises);
+  });
+
   it('does not let an older poll overwrite a pause response', async () => {
     const enabled = status({ mode: 'enabled', run_now_allowed: true });
     const paused = status({ mode: 'paused' });
