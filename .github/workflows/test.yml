@@ -52,6 +52,13 @@ jobs:
           tests/test_cli.py::TestWorkbenchSourceChoices::test_open_dispatches_to_one_shot_desktop_controller
           tests/test_cli.py::TestWorkbenchSourceChoices::test_serve_hidden_no_port_fallback_flag_is_forwarded
           -v
+      - name: Cross-platform capture and scanner installers
+        run: >-
+          python -m pytest
+          tests/capture
+          tests/redaction/test_betterleaks_install.py
+          tests/redaction/test_trufflehog_install.py
+          -v
 
   smoke:
     runs-on: ubuntu-latest
@@ -67,6 +74,8 @@ jobs:
       - working-directory: clawjournal/web/frontend
         run: |
           npm ci
+          npm run lint
+          npm test -- --reporter=dot
           npm run build
       - run: test -f clawjournal/web/frontend/dist/index.html
       - run: python -m pip wheel . --no-deps --no-build-isolation -w /tmp/clawjournal-wheelcheck

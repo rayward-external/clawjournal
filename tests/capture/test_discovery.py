@@ -370,7 +370,7 @@ def test_local_agent_matching_native_session_is_still_surfaced(isolated_homedir)
     (proj / "dup.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
-    paths = sorted(str(f.path.relative_to(isolated_homedir)) for f in files)
+    paths = sorted(f.path.relative_to(isolated_homedir).as_posix() for f in files)
     assert paths == [
         "claude/projects/-Users-me-shared/dup.jsonl",
         "local_agent/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/local_dup/.claude/projects/-sessions-proc/dup.jsonl",
@@ -435,7 +435,7 @@ def test_duplicate_local_agent_wrappers_same_cli_session_id_are_both_surfaced(
     (proj_two / "dup-cli.jsonl").write_text("{}\n")
 
     files = list(discovery.iter_source_files(source_filter="claude"))
-    paths = sorted(str(f.path.relative_to(isolated_homedir)) for f in files)
+    paths = sorted(f.path.relative_to(isolated_homedir).as_posix() for f in files)
     assert paths == [
         "local_agent/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/local_one/.claude/projects/-sessions-proc/dup-cli.jsonl",
         "local_agent/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/local_two/.claude/projects/-sessions-proc/dup-cli.jsonl",
@@ -911,4 +911,4 @@ def test_size_bytes_matches_file_size(isolated_homedir):
     proj.mkdir(parents=True)
     (proj / "s.jsonl").write_text("{}\n")
     files = list(discovery.iter_source_files(source_filter="claude"))
-    assert all(f.size_bytes == 3 for f in files)
+    assert all(f.size_bytes == f.path.stat().st_size for f in files)

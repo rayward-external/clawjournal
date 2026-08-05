@@ -59,7 +59,9 @@ def install_env(tmp_path, monkeypatch):
     table to that payload.
     """
     config_dir = tmp_path / ".clawjournal"
+    target = config_dir / "bin" / "trufflehog"
     monkeypatch.setattr("clawjournal.config.CONFIG_DIR", config_dir)
+    monkeypatch.setattr(trufflehog_install, "managed_binary_path", lambda: target)
     monkeypatch.setattr(trufflehog_install, "platform_key", lambda: "testos_amd64")
     monkeypatch.setattr(
         trufflehog_install, "_verify_installed_binary", lambda path: "3.95.5"
@@ -92,7 +94,7 @@ def install_env(tmp_path, monkeypatch):
     state["serve"] = serve
     state["pin_checksum"] = pin_checksum
     state["config_dir"] = config_dir
-    state["target"] = config_dir / "bin" / trufflehog.managed_binary_path().name
+    state["target"] = target
     return state
 
 
@@ -411,7 +413,7 @@ class TestVerifyInstalledBinary:
     def test_parses_version_banner(self, monkeypatch):
         version, seen = self._run(monkeypatch, stdout="trufflehog 3.95.5\n")
         assert version == "3.95.5"
-        assert seen["argv"] == ["/x/trufflehog", "--version"]
+        assert seen["argv"] == [str(Path("/x/trufflehog")), "--version"]
         # Scrubbed env, not the parent's (None would inherit API keys).
         assert isinstance(seen["env"], dict)
 

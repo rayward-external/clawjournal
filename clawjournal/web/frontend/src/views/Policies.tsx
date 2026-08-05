@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Policy } from '../types.ts';
 import { api } from '../api.ts';
@@ -37,7 +37,7 @@ export function Policies() {
   const [loading, setLoading] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<Policy | null>(null);
 
-  async function loadPolicies() {
+  const loadPolicies = useCallback(async () => {
     try {
       const data = await api.policies.list();
       setPolicies(data);
@@ -46,11 +46,11 @@ export function Policies() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [toast]);
 
   useEffect(() => {
     loadPolicies();
-  }, []);
+  }, [loadPolicies]);
 
   async function handleAdd() {
     if (!newValue.trim()) return;
