@@ -1256,17 +1256,17 @@ class TestBundleExport:
         captured = capsys.readouterr()
         assert "--ai-pii-review only applies when building the uploadable zip" in captured.err
 
-    def test_export_zip_appends_suffix_to_output_directory(self, bundle_index, tmp_path, capsys):
+    def test_export_zip_path_is_used_as_the_archive_destination(self, bundle_index, tmp_path, capsys):
         from clawjournal.workbench.index import create_share, open_index
         conn = open_index()
         bundle_id = create_share(conn, ["sess-0"])
         conn.close()
 
-        output_dir = Path("/tmp") / f"clawjournal-manual-export-{bundle_id}.zip"
+        output_zip = tmp_path / f"clawjournal-manual-export-{bundle_id}.zip"
         from clawjournal.cli import _run_bundle_export
         args = MagicMock(
             share_id=bundle_id,
-            output=str(output_dir),
+            output=str(output_zip),
             json=True,
             zip=True,
             training_format=False,
@@ -1275,13 +1275,12 @@ class TestBundleExport:
             _run_bundle_export(args)
             output = json.loads(capsys.readouterr().out)
 
-            resolved_output_dir = output_dir.resolve()
-            assert Path(output["export_path"]) == resolved_output_dir
-            assert Path(output["zip_path"]) == resolved_output_dir.with_name(f"{resolved_output_dir.name}.zip")
-            assert Path(output["zip_path"]).is_file()
+            assert Path(output["export_path"]) == output_zip.with_suffix("").resolve()
+            assert Path(output["zip_path"]) == output_zip.resolve()
+            assert output_zip.is_file()
         finally:
-            shutil.rmtree(output_dir, ignore_errors=True)
-            output_dir.with_name(f"{output_dir.name}.zip").unlink(missing_ok=True)
+            shutil.rmtree(output_zip.with_suffix(""), ignore_errors=True)
+            output_zip.unlink(missing_ok=True)
 
     def test_export_redacts_custom_strings(self, tmp_path, monkeypatch, capsys):
         """Bundle export applies redact_strings from config."""

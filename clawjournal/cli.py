@@ -1669,8 +1669,8 @@ def _run_bundle_view(args) -> None:
         conn.close()
 
 
-def _write_bundle_zip(export_dir: Path) -> Path:
-    zip_path = export_dir.with_name(f"{export_dir.name}.zip")
+def _write_bundle_zip(export_dir: Path, zip_path: Path | None = None) -> Path:
+    zip_path = zip_path or export_dir.with_name(f"{export_dir.name}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for name in (
             "sessions.jsonl",
@@ -1744,11 +1744,21 @@ def _run_bundle_export(args) -> None:
             print("Bundle contains sessions outside the confirmed source scope.")
             sys.exit(1)
 
+        output_path = args.output
+        requested_zip_path: Path | None = None
+        if (
+            getattr(args, "zip", False) is True
+            and output_path
+            and Path(output_path).suffix.lower() == ".zip"
+        ):
+            requested_zip_path = Path(output_path).expanduser().resolve()
+            output_path = str(requested_zip_path.with_suffix(""))
+
         export_dir, manifest = export_share_to_disk(
             conn,
             share_id,
             share,
-            output_path=args.output,
+            output_path=output_path,
             custom_strings=settings["custom_strings"],
             extra_usernames=settings["extra_usernames"],
             excluded_projects=settings["excluded_projects"],
@@ -1756,7 +1766,7 @@ def _run_bundle_export(args) -> None:
             allowlist_entries=settings["allowlist_entries"],
         )
         if export_dir is None:
-            print("Output path must be under home directory or /tmp.")
+            print("Output path must not be a filesystem root directory.")
             sys.exit(1)
 
         if manifest.get("blocked"):
@@ -1797,7 +1807,7 @@ def _run_bundle_export(args) -> None:
             files.append("sessions.training.jsonl")
 
         if getattr(args, "zip", False) is True:
-            zip_path = _write_bundle_zip(export_dir)
+            zip_path = _write_bundle_zip(export_dir, requested_zip_path)
 
         if getattr(args, "json", False):
             result = {
@@ -4824,7 +4834,13 @@ def main() -> None:
 
     be = sub.add_parser("bundle-export", help="Export bundle to disk as JSONL + manifest")
     be.add_argument("share_id", help="Bundle ID (or prefix)")
-    be.add_argument("--output", "-o", type=str, default=None, help="Custom output directory")
+    be.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output directory, or the archive path when used with --zip and a .zip suffix",
+    )
     be.add_argument("--training-format", action="store_true",
                     help="Also produce a training-format JSONL (turn-based, cleaned)")
     be.add_argument("--zip", action="store_true", help="Also write an uploadable zip")
