@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api.ts';
-import type { WorkbenchConfig } from '../types.ts';
+import type { ProjectSummary, WorkbenchConfig } from '../types.ts';
 import { useToast } from '../components/Toast.tsx';
 import { AutoUploadPanel } from '../components/AutoUploadControls.tsx';
 import { colors, selectStyle, btnPrimary } from '../theme.ts';
@@ -35,12 +35,24 @@ export function Settings() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
+  const [projectError, setProjectError] = useState<string | null>(null);
+
+  const loadProjects = useCallback(async () => {
+    setProjectError(null);
+    try {
+      setProjects(await api.projects());
+    } catch (e) {
+      setProjectError(e instanceof Error ? e.message : 'Could not load projects');
+    }
+  }, []);
 
   useEffect(() => {
     api.config.get()
       .then(setCfg)
       .catch(e => setError(e instanceof Error ? e.message : 'Could not load settings'));
-  }, []);
+    loadProjects();
+  }, [loadProjects]);
 
   async function save(patch: ConfigPatch) {
     setSaving(true);
@@ -85,15 +97,53 @@ export function Settings() {
           Confirms you’ve reviewed which project folders are included (after applying any
           exclusions). Required before export.
         </p>
+        {projectError ? (
+          <div style={{ marginBottom: 12, fontSize: 12.5, color: colors.red700 }}>
+            Could not load the project list.{' '}
+            <button
+              type="button"
+              onClick={loadProjects}
+              style={{ border: 0, padding: 0, background: 'none', color: colors.red700, textDecoration: 'underline', cursor: 'pointer' }}
+            >
+              Try again
+            </button>
+          </div>
+        ) : projects === null ? (
+          <p style={{ margin: '0 0 12px', fontSize: 12.5, color: colors.gray500 }}>Loading projects...</p>
+        ) : (
+          <div style={{ border: `1px solid ${colors.gray200}`, borderRadius: 8, marginBottom: 12, maxHeight: 220, overflowY: 'auto' }}>
+            {projects.length === 0 ? (
+              <p style={{ margin: 0, padding: '10px 12px', fontSize: 12.5, color: colors.gray500 }}>
+                No indexed projects found yet.
+              </p>
+            ) : projects.map(project => (
+              <div
+                key={`${project.source}:${project.project}`}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderBottom: `1px solid ${colors.gray100}`, fontSize: 12.5 }}
+              >
+                <span aria-hidden="true" style={{ color: project.excluded ? colors.gray400 : colors.green500 }}>
+                  {project.excluded ? '○' : '✓'}
+                </span>
+                <span style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere', color: project.excluded ? colors.gray500 : colors.gray800 }}>
+                  {project.project}
+                </span>
+                <span style={{ color: colors.gray400 }}>{project.source}</span>
+                <span style={{ color: project.excluded ? colors.gray500 : colors.green500, fontWeight: 600 }}>
+                  {project.excluded ? 'Excluded' : 'Included'}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         {cfg.projects_confirmed ? (
           <span style={{ fontSize: 13, color: colors.green500, fontWeight: 600 }}>✓ Projects confirmed</span>
         ) : (
           <button
             style={{ ...btnPrimary, fontWeight: 600 }}
-            disabled={saving}
+            disabled={saving || projects === null || projectError !== null}
             onClick={() => save({ confirm_projects: true })}
           >
-            Confirm all projects
+            Confirm reviewed projects
           </button>
         )}
       </div>
