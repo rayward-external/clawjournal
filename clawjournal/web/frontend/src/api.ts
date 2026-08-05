@@ -48,6 +48,7 @@ export class ApiError extends Error {
 // seconds for the daemon to serialize the report and the browser to receive it.
 // A wedged daemon or dropped response still gets a finite browser deadline.
 export const REDACTION_REPORT_TIMEOUT_MS = 200_000;
+export const AUTO_UPLOAD_STATUS_TIMEOUT_MS = 15_000;
 
 declare global {
   interface Window {
@@ -360,8 +361,25 @@ export const api = {
 
   autoUpload: {
     async status(): Promise<AutoUploadStatus> {
-      const status = await request<Partial<AutoUploadStatus>>('/auto-upload/status');
-      return normalizeAutoUploadStatus(status);
+      const controller = new AbortController();
+      const timeout = globalThis.setTimeout(
+        () => controller.abort(),
+        AUTO_UPLOAD_STATUS_TIMEOUT_MS,
+      );
+      try {
+        const status = await request<Partial<AutoUploadStatus>>(
+          '/auto-upload/status',
+          { signal: controller.signal },
+        );
+        return normalizeAutoUploadStatus(status);
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new ApiError(408, 'Automatic-upload status timed out');
+        }
+        throw error;
+      } finally {
+        globalThis.clearTimeout(timeout);
+      }
     },
 
     async preview(opts?: { refresh?: boolean }): Promise<AutoUploadCandidateReport> {

@@ -103,6 +103,7 @@ describe('automatic-upload API normalization', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/auto-upload/status', {
       headers: {},
+      signal: expect.any(AbortSignal),
     });
     expect(status.scope).toEqual({
       sources: ['claude', 'codex'],
@@ -128,6 +129,23 @@ describe('automatic-upload API normalization', () => {
         last_observed_at: null,
       },
     ]);
+  });
+
+  it('bounds an unresponsive automatic-upload status request', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(
+      (_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      }),
+    ));
+
+    const assertion = expect(api.autoUpload.status()).rejects.toMatchObject({
+      status: 408,
+      message: 'Automatic-upload status timed out',
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await assertion;
+    vi.useRealTimers();
   });
 
   it('tracks accepted enrollment requests and reads their local progress', async () => {
