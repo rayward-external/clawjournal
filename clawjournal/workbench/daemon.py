@@ -6064,7 +6064,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 allowlist_entries=settings["allowlist_entries"],
             )
             if export_dir is None:
-                _json_response(self, {"error": "output_path must be under home directory or /tmp"}, 400)
+                _json_response(self, {"error": "output_path must not be a filesystem root directory"}, 400)
                 return
 
             if manifest.get("blocked"):

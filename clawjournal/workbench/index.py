@@ -6238,8 +6238,10 @@ def export_share_to_disk(
     """
     if output_path:
         export_dir = Path(output_path).resolve()
-        home = Path.home().resolve()
-        if not export_dir.is_relative_to(home) and not export_dir.is_relative_to(Path("/tmp").resolve()):
+        # The caller explicitly selected this local destination. Keep the one
+        # dangerous ambiguity out: never place our fixed filenames directly in
+        # a filesystem root where they could collide with unrelated files.
+        if export_dir == Path(export_dir.anchor):
             return None, {}
     else:
         export_dir = CONFIG_DIR / "shares" / share_id
