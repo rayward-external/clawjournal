@@ -75,7 +75,7 @@ export function RedactionReportPanel({ sessionId, onScrollToMessage }: Redaction
     }
   };
 
-  const handleAllowExact = async (index: number) => {
+  const handleAllowExact = async () => {
     if (!allowText.trim()) return;
     try {
       await api.allowlist.add({
@@ -244,7 +244,7 @@ export function RedactionReportPanel({ sessionId, onScrollToMessage }: Redaction
                 />
                 <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
                   <button
-                    onClick={() => handleAllowExact(i)}
+                    onClick={handleAllowExact}
                     disabled={!allowText.trim()}
                     style={{
                       padding: '4px 12px', fontSize: 12, fontWeight: 600,

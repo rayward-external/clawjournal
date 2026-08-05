@@ -207,13 +207,11 @@ export function Dashboard() {
 
   if (!data) return null;
 
-  const { summary, weekly_activity, by_outcome_label, by_value_label, by_risk_level, by_task_type, by_model, by_agent, tokens_by_source, by_quality_score, by_failure_value_score = [], resolve_rate, resolve_rate_previous, read_edit_ratio, top_tools, avg_interrupts } = data;
+  const { summary, weekly_activity, by_outcome_label, by_value_label, by_task_type, by_model, by_agent, tokens_by_source, by_quality_score, by_failure_value_score = [], resolve_rate, resolve_rate_previous, read_edit_ratio, top_tools, avg_interrupts } = data;
 
   // Sort outcomes by count descending
   const sortedOutcomes = [...by_outcome_label].sort((a, b) => b.count - a.count);
   const sortedValues = [...by_value_label].sort((a, b) => b.count - a.count);
-  const sortedRisks = [...by_risk_level].sort((a, b) => b.count - a.count);
-
   const weeklyMax = Math.max(...(weekly_activity || []).map(w => w.count), 0);
   const modelMax = Math.max(...by_model.map(m => m.count), 0);
   const agentMax = Math.max(...(by_agent || []).map(a => a.count), 0);
@@ -221,7 +219,6 @@ export function Dashboard() {
   const totalSessions = summary.total_sessions;
   const outcomeMax = Math.max(...sortedOutcomes.map(b => b.count), 0);
   const valueMax = Math.max(...sortedValues.map(b => b.count), 0);
-  const riskMax = Math.max(...sortedRisks.map(b => b.count), 0);
   const tokenSources = tokens_by_source.filter(s => s.input_tokens > 0 || s.output_tokens > 0);
   const tokenSourceMax = Math.max(...tokenSources.map(s => Math.max(s.input_tokens, s.output_tokens)), 0);
 

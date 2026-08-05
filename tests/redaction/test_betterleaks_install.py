@@ -72,7 +72,9 @@ def install_env(tmp_path, monkeypatch):
     flavor (zip for windows keys).
     """
     config_dir = tmp_path / ".clawjournal"
+    target = config_dir / "bin" / "betterleaks"
     monkeypatch.setattr("clawjournal.config.CONFIG_DIR", config_dir)
+    monkeypatch.setattr(betterleaks_install, "managed_binary_path", lambda: target)
     monkeypatch.setattr(betterleaks_install, "platform_key", lambda: "testos_x64")
     monkeypatch.setattr(
         betterleaks_install, "_verify_installed_binary", lambda path: PINNED
@@ -106,7 +108,7 @@ def install_env(tmp_path, monkeypatch):
     state["pin_checksum"] = pin_checksum
     state["set_platform"] = set_platform
     state["config_dir"] = config_dir
-    state["target"] = config_dir / "bin" / betterleaks.managed_binary_path().name
+    state["target"] = target
     return state
 
 

@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
-import type { SessionDetail as SessionDetailType, Message, ToolUse } from '../types.ts';
+import type { SessionDetail as SessionDetailType, Message } from '../types.ts';
 import { BadgeChip } from '../components/BadgeChip.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { useToast } from '../components/Toast.tsx';
