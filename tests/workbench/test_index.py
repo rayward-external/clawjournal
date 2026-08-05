@@ -179,12 +179,60 @@ class TestUpsertSessions:
         upsert_sessions(index_conn, [_make_session()])
 
         monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", lambda *_args, **_kwargs: 56.78)
-        upsert_sessions(index_conn, [_make_session()])
+        reparsed = _make_session()
+        reparsed["stats"]["input_tokens"] = 999
+        upsert_sessions(index_conn, [reparsed])
 
         row = index_conn.execute(
             "SELECT estimated_cost_usd FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
         assert row["estimated_cost_usd"] == pytest.approx(12.34)
+
+    def test_upsert_repairs_zero_cost_when_completed_tokens_recovered(
+        self, index_conn, monkeypatch
+    ):
+        def fake_estimate(
+            _model,
+            input_tokens,
+            output_tokens,
+            *,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+        ):
+            return (
+                input_tokens
+                + output_tokens
+                + cache_read_tokens
+                + cache_creation_tokens
+            ) / 100
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.estimate_cost", fake_estimate
+        )
+        zeroed = _make_session()
+        zeroed["stats"].update({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+        })
+        upsert_sessions(index_conn, [zeroed])
+
+        recovered = _make_session()
+        recovered["stats"].update({
+            "cache_read_tokens": 200,
+            "cache_creation_tokens": 50,
+        })
+        stats = {}
+        upsert_sessions(index_conn, [recovered], stats=stats)
+
+        row = index_conn.execute(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, "
+            "cache_creation_tokens, estimated_cost_usd FROM sessions "
+            "WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert tuple(row) == (500, 100, 200, 50, pytest.approx(8.5))
+        assert stats == {"inserted": 0, "updated": 0, "unchanged": 1}
 
     def test_upsert_recomputes_estimated_cost_for_ongoing_session(self, index_conn, monkeypatch):
         monkeypatch.setattr("clawjournal.workbench.index.estimate_cost", lambda *_args, **_kwargs: 1.23)

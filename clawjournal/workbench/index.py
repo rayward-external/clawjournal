@@ -2579,11 +2579,38 @@ def _resolve_estimated_cost(
     """Choose which cost value to persist during session upsert.
 
     Completed sessions (with end_time) keep their first stored estimate so
-    dashboard totals stay stable. Ongoing sessions recompute as they grow.
+    dashboard totals stay stable. Ongoing sessions recompute as they grow. A
+    completed session whose zero cost came from zeroed parser token stats gets
+    one narrow exception when a later parse recovers non-zero token counts.
     """
     if existing is not None:
         preserved_cost = existing["estimated_cost_usd"]
-        if preserved_cost is not None and end_time is not None:
+        recovered_zeroed_tokens = (
+            preserved_cost == 0.0
+            and all(
+                (existing[column] or 0) == 0
+                for column in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_creation_tokens",
+                )
+            )
+            and any(
+                (value or 0) > 0
+                for value in (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                )
+            )
+        )
+        if (
+            preserved_cost is not None
+            and end_time is not None
+            and not recovered_zeroed_tokens
+        ):
             return preserved_cost
 
     return estimate_cost(
@@ -2718,7 +2745,8 @@ def upsert_sessions(
             "ai_value_badges, ai_risk_badges, "
             "ai_effort_estimate, ai_summary, "
             "share_id, session_key, parent_session_id, subagent_session_ids, "
-            "estimated_cost_usd, end_time, content_revision "
+            "estimated_cost_usd, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_creation_tokens, end_time, content_revision "
             "FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
