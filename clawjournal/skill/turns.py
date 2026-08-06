@@ -18,6 +18,7 @@ every other field when ``distill._format_candidates`` builds the prompt.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections import Counter
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from ..redaction.normalize import strip_terminal_control_sequences
 from ..scoring.scoring import extract_tool_uses, get_message_text
 
 logger = logging.getLogger(__name__)
@@ -312,9 +314,25 @@ MAX_ENV_CANDIDATES = 3       # appended on top of the ranked pool
 
 
 def _signal_label(sig: str) -> str:
-    """A short, stable, readable key for an error signature (drops the wrapper tags)."""
+    """A short readable label for an error signature (presentation only)."""
     text = re.sub(r"</?tool_use_error>", "", sig).strip(" .:")
     return (text[:60] + "…") if len(text) > 60 else text
+
+
+def _objective_trend_key(sig: str) -> str:
+    """Privacy-bounded display label plus identity from the complete signature.
+
+    Trend snapshots are durable metadata.  Keeping the complete error string as
+    the JSON key would expand that surface, while using only ``_signal_label``
+    merges errors with a common 60-character prefix.  Store the existing short
+    label and an opaque digest of the complete canonical value instead.
+    """
+    canonical = re.sub(
+        r"\s+", " ", strip_terminal_control_sequences(str(sig or ""))
+    ).strip().casefold()
+    label = _signal_label(canonical) or "tool error"
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
+    return f"{label} [{digest}]"
 
 
 def add_env_candidates(
@@ -374,11 +392,12 @@ def add_env_candidates(
                         entry["recovery"] = _head(_action_desc(tu), _ACTION_CHARS)
 
     clock = now or datetime.now(timezone.utc)
-    # record recurrence for the run-over-run objective trend (broader than the teach bar)
+    # Preserve identity from the COMPLETE normalized signature without persisting
+    # its full text: label + digest keeps common-prefix errors distinct.
     for sig, info in hits.items():
         c = len(info["sessions"])
         if c >= MIN_SIGNATURE_RECORD:
-            corpus.objective_recurrence[_signal_label(sig)] = c
+            corpus.objective_recurrence[_objective_trend_key(sig)] = c
     recurring = sorted(
         (item for item in hits.items() if len(item[1]["sessions"]) >= min_sessions),
         key=lambda item: -len(item[1]["sessions"]),
@@ -404,6 +423,7 @@ def add_env_candidates(
             rank_score=_candidate_rank(support=n, impact=2.0, recency=recency,
                                        corrections=1),
             pivotal_excerpts=[excerpt],
+            objective_signature=sig,
         ))
         corpus.total_failures += 1
 

@@ -60,6 +60,10 @@ class SkillCandidate:
     # pivotal user-correction excerpts (skill.turns.TurnExcerpt), attached post-selection
     # by enrich_corpus_with_turns; raw here, scrubbed at prompt-format time.
     pivotal_excerpts: list[Any] = field(default_factory=list)
+    # For synthetic objective candidates: the CLUSTER-TIME normalized error
+    # signature (skill.turns.error_signature). Recomputing it later from a
+    # truncated excerpt loses tracebacks entirely, so carry it here.
+    objective_signature: str = ""
 
 
 @dataclass
@@ -78,9 +82,10 @@ class SkillCorpus:
     # every gated session in the window, scored or not — the judge-independent scan
     # universe for tool-error signatures and human rejections (skill.turns)
     objective_session_ids: list[str] = field(default_factory=list)
-    # OBJECTIVE feedback recurrence: {readable signal key -> distinct-session count}
-    # for tool-error signatures + human rejections (skill.turns populates it). Judge-
-    # free ground truth; snapshotted run-over-run for a verifiable improvement trend.
+    # OBJECTIVE feedback recurrence: {bounded label + digest-of-complete-signature
+    # -> distinct-session count} for tool errors, plus stable named rejection keys
+    # (skill.turns populates it). This preserves full identity without persisting
+    # the full raw error tail in run-over-run snapshots.
     objective_recurrence: dict[str, int] = field(default_factory=dict)
 
     def mode_rates(self) -> dict[str, float]:

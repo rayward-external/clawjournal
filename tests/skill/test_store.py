@@ -55,6 +55,28 @@ def test_upsert_and_load_kept(index_conn):
     assert len(kept) == 1 and kept[0].support == 3
 
 
+def test_objective_origin_round_trips(index_conn):
+    rule = _r("objective rule", support=4)
+    rule.origin = "objective"
+    store.upsert_seen(index_conn, rule)
+    assert store.load_kept(index_conn)[0].origin == "objective"
+
+
+def test_pre_origin_table_migrates_additively(index_conn):
+    index_conn.execute(
+        """CREATE TABLE skill_rules (
+            fingerprint TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT,
+            trigger TEXT, guidance TEXT NOT NULL, why TEXT, taxonomy TEXT,
+            support INTEGER DEFAULT 0, evidence_json TEXT, state TEXT,
+            created_at TEXT, approved_at TEXT, rejected_at TEXT,
+            installed_at TEXT, last_seen_at TEXT
+        )"""
+    )
+    store.ensure_table(index_conn)
+    columns = {row[1] for row in index_conn.execute("PRAGMA table_info(skill_rules)")}
+    assert "origin" in columns
+
+
 def test_upsert_refreshes_support(index_conn):
     store.upsert_seen(index_conn, _r(support=2))
     store.upsert_seen(index_conn, _r(support=5))

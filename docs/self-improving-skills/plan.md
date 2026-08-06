@@ -378,6 +378,24 @@ mapped to where each would land:
 - **Learnable skill-bank policy + multi-granularity tiering** (CODESKILL / SkillX) → frame
   add/evolve/prune as an explicit policy; tier rules by specificity.
 
+### Objective MUST-COVER guarantee (adopted 2026-08-02)
+
+Port the deterministic-signal-to-mandatory-rule shape from the Continual Harness
+review, while keeping Mode A's one-distill-call and five-installed-rule limits. An
+environment-error signature recurring across at least three sessions, or the
+cross-session human-rejection candidate, is marked MUST-COVER in the prompt and
+also receives a deterministic fallback rule after a successful distill call.
+
+Model evidence aliases are not treated as semantic proof: every objective signal
+gets its own fixed rule, so an unrelated model rule cannot silently consume it.
+The installed wording contains only a validated tool identifier, verified support
+count, and a hash of the complete normalized signature. Trend snapshots keep only
+a bounded display label plus that full-signature digest; the complete raw tail is
+not persisted as metadata. Raw tool output never enters agent-facing files.
+All fallback rules pass through the same hard-deny, PII, secret, render, preview,
+and confirmation gates as distilled rules. If the five-rule budget displaces one,
+the preview names it rather than silently dropping the objective evidence.
+
 These are design references, not locked decisions — §0 iteration rules still apply.
 
 ---

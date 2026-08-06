@@ -28,6 +28,9 @@ MAX_INSTALLED_RULES = 5
 
 VALID_KINDS = ("avoid", "do")
 
+# Rule provenance: a deterministic MUST-COVER fallback, not model-distilled.
+ORIGIN_OBJECTIVE = "objective"
+
 # The judge's fixed failure-mode taxonomy (12 + 1 meta), reused so the distill
 # prompt and any per-rule ``taxonomy`` tag stay aligned with scoring.
 FAILURE_MODES = (
@@ -49,6 +52,16 @@ class SkillRule:
     taxonomy: str = ""      # the failure mode it targets (avoid) or "" (do)
     support: int = 0        # how many sessions this pattern recurred in
     last_seen: str = ""     # ISO ts a stored rule was last seen ("" = seen this run)
+    # "" = distilled by the model; ORIGIN_OBJECTIVE = deterministic MUST-COVER
+    # fallback for an objective candidate. Two objective rules teach DISTINCT
+    # verified signals even when their templated wording looks alike, so the
+    # paraphrase collapse in cli_skill must not merge them.
+    origin: str = ""
+    # Terminal-only context for the preview (e.g. the bounded error label behind
+    # a deterministic fallback). NEVER rendered into an agent-facing file and
+    # never fingerprinted: it may derive from untrusted tool output and must pass
+    # through cli_skill._out before it reaches a terminal.
+    preview_note: str = ""
 
     def display_title(self) -> str:
         """The heading to render; falls back to guidance when unnamed."""
