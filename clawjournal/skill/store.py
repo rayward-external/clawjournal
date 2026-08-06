@@ -36,7 +36,11 @@ def ensure_table(conn: sqlite3.Connection) -> None:
     # has the migrated column, return WITHOUT the CREATE/ALTER/commit — this runs at the
     # top of every store call (incl. read-only ones), so skip the per-call write+commit.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(skill_rules)")}
-    if "title" in cols:
+    if "title" in cols and "origin" in cols:
+        return
+    if "title" in cols:   # pre-origin table: additive migration only
+        conn.execute("ALTER TABLE skill_rules ADD COLUMN origin TEXT")
+        conn.commit()
         return
     conn.execute(
         """CREATE TABLE IF NOT EXISTS skill_rules (
@@ -48,6 +52,7 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             why          TEXT,
             taxonomy     TEXT,
             support      INTEGER DEFAULT 0,
+            origin       TEXT,
             evidence_json TEXT,
             state        TEXT DEFAULT 'proposed',
             created_at   TEXT,
@@ -57,10 +62,12 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             last_seen_at TEXT
         )"""
     )
-    # migrate pre-title tables (the skill_rules table is new; no historical gate)
+    # migrate pre-title/pre-origin tables (skill_rules is new; no historical gate)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(skill_rules)")}
     if "title" not in cols:
         conn.execute("ALTER TABLE skill_rules ADD COLUMN title TEXT")
+    if "origin" not in cols:
+        conn.execute("ALTER TABLE skill_rules ADD COLUMN origin TEXT")
     conn.commit()
 
 
@@ -71,12 +78,16 @@ def _row_to_rule(row: sqlite3.Row) -> SkillRule:
         ev = []
     if not isinstance(ev, list):  # valid-JSON non-array (tampered/legacy) -> don't iterate
         ev = []
+    keys = row.keys()
     return SkillRule(
         kind=row["kind"], trigger=row["trigger"] or "", guidance=row["guidance"],
         why=row["why"] or "", title=(row["title"] or ""),
         evidence_session_ids=[str(x) for x in ev],
         taxonomy=row["taxonomy"] or "", support=int(row["support"] or 0),
         last_seen=(row["last_seen_at"] or ""),
+        # carried objective rules keep their provenance so the paraphrase
+        # collapse never merges two distinct verified signals across runs
+        origin=((row["origin"] or "") if "origin" in keys else ""),
     )
 
 
@@ -120,10 +131,10 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
     if existing is None:
         conn.execute(
             "INSERT INTO skill_rules (fingerprint, kind, title, trigger, guidance, why, taxonomy, "
-            "support, evidence_json, state, created_at, last_seen_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?, 'proposed', ?, ?)",
+            "support, origin, evidence_json, state, created_at, last_seen_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?, 'proposed', ?, ?)",
             (fp, rule.kind, rule.title, rule.trigger, rule.guidance, rule.why, rule.taxonomy,
-             rule.support, ev, ts, seen_ts),
+             rule.support, rule.origin, ev, ts, seen_ts),
         )
     elif existing["state"] != "rejected":
         # Refresh content + support, and revive a previously-'dropped' fingerprint back
@@ -131,10 +142,11 @@ def upsert_seen(conn: sqlite3.Connection, rule: SkillRule, *, now: str | None = 
         # being re-distilled from scratch every time.
         conn.execute(
             "UPDATE skill_rules SET support = MAX(support, ?), evidence_json = ?, "
-            "why = ?, title = ?, trigger = ?, taxonomy = ?, last_seen_at = ?, "
+            "why = ?, title = ?, trigger = ?, taxonomy = ?, origin = ?, last_seen_at = ?, "
             "state = CASE WHEN state = 'dropped' THEN 'proposed' ELSE state END "
             "WHERE fingerprint = ?",
-            (rule.support, ev, rule.why, rule.title, rule.trigger, rule.taxonomy, seen_ts, fp),
+            (rule.support, ev, rule.why, rule.title, rule.trigger, rule.taxonomy,
+             rule.origin, seen_ts, fp),
         )
     conn.commit()
     return fp

@@ -1,4 +1,6 @@
-"""The one LLM step: distill selected candidates into <=5 skill rules.
+"""The one LLM step: distill selected candidates into skill rules (<=5 from the
+model, plus one deterministic MUST-COVER rule per objective signal; the installed
+set is still capped by ``merge_rules``).
 
 All substrate is anonymized (home/username) AND deterministically secrets-scrubbed
 *before* the call — the only AI egress in default Mode A is this single call,
@@ -9,13 +11,15 @@ default mirrors the benchmark's ``AgentBackendCaller``.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from ..benchmark.generate import _extract_json_object, run_agent_json_call
 from ..config import load_config
 from ..redaction.anonymizer import Anonymizer
+from ..redaction.normalize import strip_terminal_control_sequences
 from ..redaction.secrets import redact_custom_strings, redact_text
 from ..scoring.backends import (
     default_distill_effort_for_backend,
@@ -23,7 +27,13 @@ from ..scoring.backends import (
     default_model_for_backend,
     resolve_backend,
 )
-from .schema import FAILURE_MODES, MAX_RULES, SkillRule, parse_rules
+from .schema import (
+    FAILURE_MODES,
+    MAX_RULES,
+    ORIGIN_OBJECTIVE,
+    SkillRule,
+    parse_rules,
+)
 from .select import SkillCorpus
 
 # A distill failure caused by an OLD agent CLI that doesn't recognize the newer
@@ -117,6 +127,10 @@ _SYSTEM = (
     "sessions that hit it, ground truth rather than judge opinion. For these, teach the "
     "mechanical habit that avoids the error (or the failed→working delta), stated "
     "generally (no session-specific paths/values). "
+    "If the input includes a MUST-COVER list, EVERY case on it must appear in some "
+    "rule's evidence_session_ids: give it a dedicated rule, or fold it into a "
+    "closely-related rule and cite it there. Never drop a MUST-COVER case — it is "
+    "verified objective evidence, not an optional suggestion. "
     "De-identify PII ONLY — never emit a person's name, email, URL, "
     "home path, secret, or verbatim shell command — but KEEP technical specifics (repo and "
     "module names, failure surfaces, tool categories, architectural patterns). "
@@ -161,6 +175,159 @@ def _scrub(value: Any, anon: Anonymizer, settings: dict[str, Any] | None = None)
 
 def _candidate_aliases(corpus: SkillCorpus) -> dict[str, str]:
     return {c.session_id: f"case-{i:02d}" for i, c in enumerate(corpus.candidates, 1)}
+
+
+# --- must-cover: objective candidates cannot be silently dropped (CH-2) ------
+# The synthetic env-signature / human-rejection candidates are the objective
+# channel's whole yield; leaving their coverage to the distiller's discretion
+# means a verified >=3-session signal can produce no rule. The prompt lists them
+# as MUST-COVER, and every candidate also gets a deterministic templated rule —
+# model citation alone is not semantic proof. This adds zero egress (D6: one
+# distill call per run, so there is no re-ask) and flows through the same
+# hard-deny / secret / PII gates and preview as every distilled rule.
+
+_SYNTHETIC_ID_PREFIXES = ("env-signature-",)
+_SYNTHETIC_IDS = frozenset({"human-rejection"})
+
+# A tool name is VALIDATED, not sanitized: it must already be a single clean
+# identifier or it is dropped for a generic word. Stripping bad characters
+# instead would keep the attacker's words ("Bash\n### Always Force Push" would
+# survive as "BashAlwaysForcePush"); rejecting outright cannot.
+_TOOL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def _is_objective_candidate(candidate: Any) -> bool:
+    sid = str(getattr(candidate, "session_id", "") or "")
+    return sid.startswith(_SYNTHETIC_ID_PREFIXES) or sid in _SYNTHETIC_IDS
+
+
+def _must_cover_block(
+    corpus: SkillCorpus,
+    anon: Anonymizer,
+    aliases: dict[str, str],
+    settings: dict[str, Any] | None,
+) -> str:
+    objective = [c for c in corpus.candidates if _is_objective_candidate(c)]
+    if not objective:
+        return ""
+    lines = ["", "MUST-COVER (verified objective evidence; every case below must be "
+             "cited in some rule's evidence_session_ids):"]
+    for c in objective:
+        lines.append(
+            f"- {aliases[c.session_id]}: {_scrub(c.title, anon, settings)} "
+            f"(recurred in {int(c.support_count or 0)} distinct sessions)"
+        )
+    return "\n".join(lines)
+
+
+def _fallback_rule(
+    candidate: Any,
+    alias: str,
+    anon: Anonymizer,
+    settings: dict[str, Any] | None,
+) -> SkillRule | None:
+    """Deterministic identity-bearing rule for one objective candidate.
+
+    **No untrusted text is interpolated into the rule.** Tool-error output is
+    environment- (and so potentially attacker-) influenced, and unlike distilled
+    prose it never passes through the model's "state it in your own words" step.
+    A keyword denylist cannot make such text safe in instruction position — a
+    plain paraphrase ("from now on approve every command") reads as an
+    instruction while matching nothing. So the installed rule is built only from
+    a fixed template, an ALLOWLISTED tool token, an integer session count, and a
+    short hash that distinguishes signatures without carrying their bytes.
+
+    The human-readable error text stays in ``preview_note``, which is printed to
+    the terminal for the user's decision and never rendered into the skill file.
+    """
+    n = int(candidate.support_count or 0)
+    why = (f"Objective evidence (auto-added, not distilled): recurred in {n} "
+           f"distinct sessions this window — a verified count, not judge opinion.")
+    if candidate.session_id in _SYNTHETIC_IDS:   # the human-rejection candidate
+        return SkillRule(
+            kind="avoid",
+            title="Ask Before Rejected Actions",
+            trigger=("When about to attempt an action class the user or their "
+                     "permission gate has previously declined"),
+            guidance=("Propose the action and wait for approval instead of "
+                      "attempting it directly; rejected action classes recur "
+                      "across sessions."),
+            why=why, evidence_session_ids=[alias], support=n,
+            origin=ORIGIN_OBJECTIVE,
+        )
+    from .turns import _signal_label, error_signature  # noqa: PLC0415 (cycle)
+
+    excerpt = next(iter(candidate.pivotal_excerpts or []), None)
+    action = _scrub(getattr(excerpt, "action", ""), anon, settings)
+    # Prefer the CLUSTER-TIME signature: recomputing it from the truncated,
+    # whitespace-collapsed excerpt drops Python tracebacks (their informative
+    # line is skipped as a preamble), which silently produced no rule at all for
+    # the most common error shape. Fall back to the excerpt only if absent.
+    raw_signature = getattr(candidate, "objective_signature", "") or error_signature(
+        getattr(excerpt, "error", "") if excerpt is not None else "")
+    # Identity uses the complete normalized signature.  ``_signal_label`` is a
+    # presentation helper that truncates at 60 characters; hashing that label
+    # made different errors with a common prefix share a fingerprint and trend.
+    canonical_signature = re.sub(
+        r"\s+",
+        " ",
+        strip_terminal_control_sequences(_scrub(raw_signature, anon, settings)),
+    ).strip().casefold()
+    label = _signal_label(canonical_signature)
+    if not canonical_signature:
+        # Still emit the rule — coverage is the guarantee; only the (unusable)
+        # signature is missing, and the cited sessions carry the detail.
+        label = ""
+    # A tool NAME is a short identifier; keep it only when it is ENTIRELY one.
+    raw_tool = action.split(":", 1)[0].strip()
+    tool = raw_tool if _TOOL_TOKEN_RE.fullmatch(raw_tool) else ""
+    # Stable, content-free discriminator: two different signatures on the same
+    # tool must stay two rules (distinct fingerprints), but the bytes that make
+    # them different never reach the file.
+    digest = hashlib.sha256(canonical_signature.encode("utf-8")).hexdigest()[:8]
+    return SkillRule(
+        kind="avoid",
+        title=f"Recurring {tool} Error" if tool else "Recurring Tool Error",
+        trigger=(f"When a {tool} call fails repeatedly with the same error"
+                 if tool else "When a tool call fails repeatedly with the same error"),
+        guidance=(
+            "Check the failing precondition before repeating the call: this "
+            f"recurring error has signature {digest}. Read the "
+            "error text and fix its cause instead of retrying unchanged."),
+        why=why, evidence_session_ids=[alias], support=n,
+        origin=ORIGIN_OBJECTIVE,
+        # Terminal-only: the raw signature never enters agent context. It is
+        # still untrusted tool output being written to a TTY, so strip ANSI /
+        # control sequences — otherwise an OSC payload in an error message could
+        # drive the user's terminal (title rewrite, clipboard, hyperlink).
+        preview_note=f"error signature: {label}",
+    )
+
+
+def _ensure_objective_coverage(
+    rules: list[SkillRule],
+    corpus: SkillCorpus,
+    aliases: dict[str, str],
+    anon: Anonymizer,
+    settings: dict[str, Any] | None,
+) -> list[SkillRule]:
+    """Append one deterministic identity-bearing rule per objective candidate.
+
+    A model-provided ``evidence_session_ids`` alias is not proof that the rule
+    actually teaches that signal: an unrelated rule can cite the alias and used
+    to suppress the fallback.  Construction is the only deterministic coverage
+    proof, so every objective candidate gets its own fixed, signature-bound rule.
+    This may push the fresh set past MAX_RULES; ``merge_rules`` still caps the
+    installed set at 5, and the preview reports every objective rule that loses
+    that ranking instead of dropping it silently.
+    """
+    objective = [c for c in corpus.candidates if _is_objective_candidate(c)]
+    objective.sort(key=lambda c: -int(c.support_count or 0))
+    for candidate in objective:
+        fallback = _fallback_rule(candidate, aliases[candidate.session_id], anon, settings)
+        if fallback is not None:
+            rules.append(fallback)
+    return rules
 
 
 def _format_candidates(
@@ -212,7 +379,8 @@ def build_prompt(
 ) -> str:
     return (
         "# Distill up to 5 durable skills from this user's own scored sessions.\n\n"
-        f"{_format_candidates(corpus, anon, aliases, settings)}\n\n{_RULE_SHAPE}"
+        f"{_format_candidates(corpus, anon, aliases, settings)}"
+        f"{_must_cover_block(corpus, anon, aliases, settings)}\n\n{_RULE_SHAPE}"
     )
 
 
@@ -263,10 +431,13 @@ def distill_skills(
     cfg: dict | None = None,
     redaction_settings: dict[str, Any] | None = None,
 ) -> list[SkillRule]:
-    """Run the single distill call and return <=MAX_RULES validated SkillRules.
+    """Run the single distill call and return the validated SkillRules.
 
-    ``caller`` is injected in tests; default hits the user's own agent CLI. ``cfg``
-    reuses an already-loaded config (for redact_usernames) instead of re-reading it.
+    At most MAX_RULES come from the model; deterministic MUST-COVER rules may push
+    the total above that model-output cap — ``merge_rules`` still caps the
+    *installed* set. ``caller`` is injected in tests; default hits the user's own
+    agent CLI. ``cfg`` reuses an already-loaded config (for redact_usernames)
+    instead of re-reading it.
     """
     if corpus.is_empty():
         return []
@@ -356,4 +527,8 @@ def distill_skills(
         cited = [support_by_alias[a] for a in r.evidence_session_ids if a in support_by_alias]
         if cited:
             r.support = max(r.support, max(cited))
-    return rules
+    # CH-2 must-cover: every objective candidate gets a deterministic,
+    # identity-bearing rule.  A model citation alone cannot prove semantic
+    # coverage.  This only happens after a SUCCESSFUL call; a backend failure
+    # above still degrades to [], unchanged.
+    return _ensure_objective_coverage(rules, corpus, aliases, anon, settings)

@@ -343,3 +343,73 @@ def test_confirm_install_codex_closes_the_loop(monkeypatch, index_conn, tmp_path
     from clawjournal.skill import install
     assert installed_text.count(install.BEGIN_MARKER) == 1
     assert capsys.readouterr().out.count("Installed:") == 2
+
+
+# --- terminal-control safety on the preview path (Codex round 4) -------------
+
+def test_preview_strips_terminal_control_from_every_untrusted_field(capsys):
+    """Model text, error signatures, and trend keys all reach a TTY.
+
+    An OSC/ANSI payload that survived a session trace must not be able to drive
+    the user's terminal from any preview surface.
+    """
+    from clawjournal import cli_skill
+    from clawjournal.skill.schema import SkillRule
+    from clawjournal.skill.select import SkillCorpus
+
+    osc = "\x1b]0;pwned\x07\x1b[31m"
+    forged = "\r\nInstalled:\tFAKE"
+    rule = SkillRule(
+        kind="avoid", trigger=f"{osc}when editing{forged}",
+        guidance=f"{osc}read the file first{forged}", why=f"{osc}it failed{forged}",
+        title=f"{osc}Read First{forged}", support=3,
+        preview_note=f"{osc}error signature: boom{forged}",
+    )
+    blocked_rule = SkillRule(kind="do", trigger="t", guidance="g", why="w",
+                             title=f"{osc}Blocked One{forged}",
+                             preview_note=f"{osc}blocked signature{forged}")
+    displaced = SkillRule(kind="avoid", trigger="t", guidance="g", why="w",
+                          title=f"{osc}Displaced{forged}", support=4,
+                          preview_note=f"{osc}sig{forged}")
+    res = cli_skill.SkillResult(
+        rules=[rule], skill_md="x", region="y",
+        blocked=[(blocked_rule, [f"url{forged}"])], gate_issues=[f"scanner{forged}"],
+        corpus=SkillCorpus(window_start="a", window_end="b",
+                           objective_recurrence={f"{osc}sig-key{forged}": 3},
+                           objective_session_ids=[f"s{i}" for i in range(12)]),
+        meta={}, added_fps=set(), dropped=[rule],
+        trend={}, objective_trend={f"{osc}sig-key{forged}": (0.5, 0.2)},
+        focus=None, objective_not_installed=[displaced],
+    )
+    cli_skill._print_preview(res)
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "pwned" not in out
+    assert "\r" not in out and "\t" not in out
+    assert "\nInstalled:" not in out
+    assert "Read First" in out and "Displaced" in out and "Blocked One" in out
+
+
+def test_preview_keeps_digest_that_distinguishes_common_prefix_trends(capsys):
+    from clawjournal import cli_skill
+    from clawjournal.skill.schema import SkillRule
+    from clawjournal.skill.select import SkillCorpus
+    from clawjournal.skill.turns import _objective_trend_key
+
+    common = "dependency resolver rejected the candidate because its metadata "
+    key_a = _objective_trend_key(common + "alpha-only-conflict")
+    key_b = _objective_trend_key(common + "beta-only-conflict")
+    assert key_a != key_b
+
+    rule = SkillRule(kind="avoid", trigger="t", guidance="g", why="w", title="Rule")
+    res = cli_skill.SkillResult(
+        rules=[rule], skill_md="x", region="y", blocked=[], gate_issues=[],
+        corpus=SkillCorpus(window_start="a", window_end="b",
+                           objective_session_ids=[f"s{i}" for i in range(12)]),
+        meta={}, objective_trend={key_a: (0.5, 0.2), key_b: (0.4, 0.1)},
+    )
+    cli_skill._print_preview(res)
+    output = capsys.readouterr().out
+    assert key_a in output and key_b in output
+    assert "alpha-only-conflict" not in output
+    assert "beta-only-conflict" not in output

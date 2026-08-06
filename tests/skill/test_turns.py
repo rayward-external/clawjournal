@@ -334,7 +334,9 @@ def test_synthetic_candidates_get_noncolliding_ids():
 
 
 def test_objective_recurrence_populated_for_trend():
-    from clawjournal.skill.turns import add_env_candidates, add_rejection_candidate
+    from clawjournal.skill.turns import (
+        _objective_trend_key, add_env_candidates, add_rejection_candidate,
+    )
     corpus = SkillCorpus(
         window_start="a", window_end="b", eligible_scored=1,
         objective_session_ids=[f"s{i}" for i in range(1, 11)],
@@ -354,7 +356,8 @@ def test_objective_recurrence_populated_for_trend():
 
     add_env_candidates(None, corpus, loader=loader)
     add_rejection_candidate(None, corpus, loader=loader)
-    assert corpus.objective_recurrence["string to replace not found in file"] == 3
+    key = _objective_trend_key("string to replace not found in file.")
+    assert corpus.objective_recurrence[key] == 3
     assert corpus.objective_recurrence["user-rejected actions"] == 3
     assert abs(corpus.objective_rates()["user-rejected actions"] - 0.3) < 1e-9   # 3/10
 
@@ -362,7 +365,7 @@ def test_objective_recurrence_populated_for_trend():
 def test_objective_recurrence_records_below_teach_bar():
     # a signal at 2 sessions is RECORDED (so a later drop shows an improving trend)
     # but must NOT become a taught candidate (bar is 3).
-    from clawjournal.skill.turns import add_env_candidates
+    from clawjournal.skill.turns import _objective_trend_key, add_env_candidates
     corpus = SkillCorpus(window_start="a", window_end="b", eligible_scored=10,
                          objective_session_ids=["s1", "s2"])
 
@@ -371,8 +374,37 @@ def test_objective_recurrence_records_below_teach_bar():
                                      output="String to replace not found in file."))]}
 
     add_env_candidates(None, corpus, loader=loader)
-    assert corpus.objective_recurrence.get("string to replace not found in file") == 2
+    key = _objective_trend_key("string to replace not found in file.")
+    assert corpus.objective_recurrence.get(key) == 2
     assert corpus.failures == []   # below the teach bar
+
+
+def test_objective_trend_keeps_full_signature_identity():
+    from clawjournal.skill.turns import (
+        _objective_trend_key, _signal_label, add_env_candidates, error_signature,
+    )
+
+    common = "dependency resolver rejected the candidate because its metadata "
+    error_a = common + "alpha-only-conflict"
+    error_b = common + "beta-only-conflict"
+    sig_a, sig_b = error_signature(error_a), error_signature(error_b)
+    assert _signal_label(sig_a) == _signal_label(sig_b)
+
+    corpus = SkillCorpus(window_start="a", window_end="b",
+                         objective_session_ids=["s1", "s2"])
+
+    def loader(conn, sid):
+        return {"messages": [
+            _at(_tu("Bash", "x", status="error", output=error_a)),
+            _at(_tu("Bash", "y", status="error", output=error_b)),
+        ]}
+
+    add_env_candidates(None, corpus, loader=loader)
+    key_a, key_b = _objective_trend_key(sig_a), _objective_trend_key(sig_b)
+    assert key_a != key_b
+    assert "alpha-only-conflict" not in key_a
+    assert "beta-only-conflict" not in key_b
+    assert corpus.objective_recurrence == {key_a: 2, key_b: 2}
 
 
 def test_newer_rejection_phrasing_is_human_not_env():

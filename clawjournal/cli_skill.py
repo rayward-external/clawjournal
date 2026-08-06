@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Any
 
+from .redaction.normalize import strip_terminal_control_sequences
 from .skill import distill as _distill
 from .skill import focus as _focus
 from .skill import install as _install
@@ -23,7 +24,7 @@ from .skill import render as _render
 from .skill import select as _select
 from .skill import store as _store
 from .skill import turns as _turns
-from .skill.schema import MAX_INSTALLED_RULES, SkillRule
+from .skill.schema import MAX_INSTALLED_RULES, ORIGIN_OBJECTIVE, SkillRule
 from .workbench.index import FAILURE_VALUE_SOURCE_SCOPE
 
 # A wide window approximates "all history" for the first run.
@@ -48,6 +49,10 @@ class SkillResult:
     objective_trend: dict[str, tuple[float | None, float]] = field(default_factory=dict)
     # Preview framing only; the underlying rule already belongs to ``rules``.
     focus: _focus.FocusSpotlight | None = None
+    # MUST-COVER rules that ranking pushed out of the capped install set. The
+    # guarantee is that objective evidence is never *silently* lost — the 5-slot
+    # budget still decides what installs, but the user is told what it displaced.
+    objective_not_installed: list[SkillRule] = field(default_factory=list)
 
 
 _SUPPORT_HALFLIFE_DAYS = 30.0  # a rule's effective support halves every 30 idle days
@@ -177,6 +182,14 @@ def _same_lesson(a: SkillRule, b: SkillRule) -> bool:
     shared mode (e.g. 'do' rules, which carry no taxonomy) fall back to word overlap at a
     lowered threshold so real rewrites still collapse.
     """
+    # Two deterministic MUST-COVER fallbacks teach DISTINCT verified signals (a
+    # different recurring tool error each) even though their templated wording
+    # is near-identical by construction — "Recurring Toola error" vs "Recurring
+    # Toolb error" shares enough title stems to trip every fuzzy path below.
+    # Collapsing them would silently drop objective evidence the guarantee
+    # exists to preserve, so only identical guidance merges them.
+    if a.origin == ORIGIN_OBJECTIVE and b.origin == ORIGIN_OBJECTIVE:
+        return a.kind == b.kind and a.guidance.strip() == b.guidance.strip()
     # An identical title => the same lesson even ACROSS kinds — the distiller often emits
     # one lesson as both 'do X' and 'avoid not-X' (e.g. "Verify Beyond Green Tests" as
     # both), which a within-kind check never compares.
@@ -302,9 +315,11 @@ def merge_rules(existing: list[SkillRule], new: list[SkillRule], rejected: set[s
     ai = di = 0
     while len(out) < MAX_INSTALLED_RULES and (ai < len(avoid) or di < len(do)):
         if ai < len(avoid):
-            out.append(avoid[ai]); ai += 1
+            out.append(avoid[ai])
+            ai += 1
         if len(out) < MAX_INSTALLED_RULES and di < len(do):
-            out.append(do[di]); di += 1
+            out.append(do[di])
+            di += 1
     return out
 
 
@@ -456,6 +471,10 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
 
     merged_fps = {_store.fingerprint(r) for r in rules}
     added_fps = merged_fps - prev_installed
+    objective_not_installed = [
+        r for r in fresh
+        if r.origin == ORIGIN_OBJECTIVE and _store.fingerprint(r) not in merged_fps
+    ]
     dropped = [
         r for r in stored_rules
         if _store.fingerprint(r) in (prev_installed - merged_fps)
@@ -485,7 +504,8 @@ def generate_skill(conn, *, window_days: int, backend: str = "auto",
     objective_trend = {k: (prev_obj.get(k), cur_obj.get(k, 0.0)) for k in sorted(obj_keys)}
 
     return SkillResult(rules, skill_md, region, blocked, gate_issues, corpus, meta,
-                       added_fps, dropped, trend, objective_trend, focus)
+                       added_fps, dropped, trend, objective_trend, focus,
+                       objective_not_installed)
 
 
 # --- scan + score (§7.1, §7.2) ---------------------------------------------
@@ -603,6 +623,20 @@ def _ascii_safe(text: str) -> str:
         return text
 
 
+def _out(text: Any) -> str:
+    """Make an untrusted preview value safe to write as exactly one line.
+
+    Everything the preview prints is downstream of session traces: rule text the
+    model wrote from them, error signatures lifted out of them, project names.
+    An ANSI/OSC payload in any of those can retitle a window, rewrite the
+    clipboard, or forge output.  After stripping terminal controls, collapse all
+    whitespace (including CR/LF/tab) so a field cannot forge a sibling preview
+    row such as ``Installed:``.
+    """
+    clean = strip_terminal_control_sequences(str(text))
+    return _ascii_safe(re.sub(r"\s+", " ", clean).strip())
+
+
 _INSTALL_TARGET_LABELS = {
     "claude": "Claude Code",
     "codex": "Codex",
@@ -623,12 +657,37 @@ def _format_install_targets(targets: list[str]) -> str:
     return ", ".join(labels[:-1]) + f" + {labels[-1]}"
 
 
+def _print_objective_not_installed(res: SkillResult) -> None:
+    """Name the objective signals that did not reach the installed set.
+
+    MUST-COVER guarantees objective evidence reaches the user, not that it wins
+    a slot — so say each absence out loud instead of dropping it silently. The
+    reason is deliberately left open: besides the rule budget, a rule can be
+    missing because a distilled rule taught the same lesson (semantic dedup
+    keeps one), because its fingerprint was ``--reject``ed, or because a gate
+    dropped it.
+    """
+    displaced = getattr(res, "objective_not_installed", None)
+    if not displaced:
+        return
+    print(f"\n  {len(displaced)} objective signal(s) not in the installed set "
+          f"this run (merged into a similar rule, outranked by the "
+          f"{MAX_INSTALLED_RULES}-rule budget, previously --rejected, or "
+          f"dropped by the safety gate):")
+    for rule in displaced:
+        print(f"    - {_out(rule.display_title())}  (seen in {rule.support} session(s))")
+        if rule.preview_note:
+            print(f"        {_out(rule.preview_note)}")
+
+
 def _print_blocked_rules(res: SkillResult) -> None:
     blocked = getattr(res, "blocked", None)
     if blocked:
         print(f"\n  {len(blocked)} rule(s) dropped by the safety gate:")
         for rule, reasons in blocked:
-            print(f"    - {rule.display_title()}  ({', '.join(reasons)})")
+            print(f"    - {_out(rule.display_title())}  ({_out(', '.join(reasons))})")
+            if rule.preview_note:
+                print(f"        {_out(rule.preview_note)}")
 
 
 def _print_preview(res: SkillResult) -> None:
@@ -643,6 +702,9 @@ def _print_preview(res: SkillResult) -> None:
         else:
             print("No usable rules this run.")
         _print_focus(res)
+        # also on this early return: displaced objective signals must never be
+        # dropped without a word, even when every slot-winner was gate-dropped
+        _print_objective_not_installed(res)
         _print_blocked_rules(res)
         return
     print(f"Proposed skill set ({len(res.rules)} rule(s)):\n")
@@ -650,13 +712,15 @@ def _print_preview(res: SkillResult) -> None:
         fp = _store.fingerprint(r)
         state = "NEW " if fp in res.added_fps else "KEPT"
         tag = "AVOID" if r.kind == "avoid" else "DO"
-        print(f"  {i}. [{state}] [{tag}] {r.display_title()}   ({fp})")
+        print(f"  {i}. [{state}] [{tag}] {_out(r.display_title())}   ({fp})")
         if r.guidance and r.guidance.strip() != r.display_title():
-            print(f"        rule: {r.guidance}")
+            print(f"        rule: {_out(r.guidance)}")
         if r.trigger:
-            print(f"        when: {r.trigger}")
+            print(f"        when: {_out(r.trigger)}")
         if r.why:
-            print(f"        why:  {r.why}")
+            print(f"        why:  {_out(r.why)}")
+        if r.preview_note:   # terminal-only; never installed into agent context
+            print(f"        {_out(r.preview_note)}")
     _print_focus(res)
     if res.dropped:
         print(
@@ -664,12 +728,12 @@ def _print_preview(res: SkillResult) -> None:
             "no longer in the install set:"
         )
         for r in res.dropped:
-            print(f"    - {r.guidance}  ({_store.fingerprint(r)})")
+            print(f"    - {_out(r.guidance)}  ({_store.fingerprint(r)})")
     if res.trend:
         n = res.corpus.eligible_scored
         print(_ascii_safe(f"\n  Recurrence of targeted failure modes vs your last run "
                           f"(rate over {n} scored session(s) — directional, not a powered metric):"))
-        for mode, (prev, cur) in res.trend.items():
+        for mode, (prev, cur) in ((_out(m), v) for m, v in res.trend.items()):
             if n < 10:
                 print(_ascii_safe(f"    - {mode}: {cur:.0%}  (insufficient data — n={n})"))
             elif prev is None:
@@ -684,7 +748,10 @@ def _print_preview(res: SkillResult) -> None:
         # most-recurrent first; cap so a long tail of rare signatures doesn't flood output
         ordered = sorted(res.objective_trend.items(),
                          key=lambda kv: -max(kv[1][0] or 0.0, kv[1][1]))[:6]
-        for sig, (prev, cur) in ordered:
+        # Tool-error keys are already privacy-bounded display labels with a
+        # full-signature digest suffix. Do not pass them through _signal_label:
+        # that would truncate off the identity that distinguishes common prefixes.
+        for sig, (prev, cur) in ((_out(key), values) for key, values in ordered):
             if n < 10:
                 print(_ascii_safe(f"    - {sig}: {cur:.0%}  (insufficient data — n={n})"))
             elif prev is None:
@@ -692,9 +759,11 @@ def _print_preview(res: SkillResult) -> None:
             else:
                 arrow = "↓ improving" if cur < prev - 1e-9 else ("↑ worsening" if cur > prev + 1e-9 else "→ flat")
                 print(_ascii_safe(f"    - {sig}: {prev:.0%} → {cur:.0%}  ({arrow})"))
+    _print_objective_not_installed(res)
     _print_blocked_rules(res)
     if res.gate_issues:
-        print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {', '.join(res.gate_issues)}"))
+        issues = _out(", ".join(res.gate_issues))
+        print(_ascii_safe(f"\n  ⚠ render-time secret/PII gate blocked install: {issues}"))
         print("    (fail-closed — nothing was written. If the scanner itself errored, re-run; "
               "otherwise the flagged lesson spans rules — inspect the source sessions.)")
 
@@ -717,10 +786,10 @@ def _print_focus(res: SkillResult) -> None:
     print(_ascii_safe(
         "\nFocus this week (coding-agent behavior; preview spotlight only)"
     ))
-    print(f"  Pattern: {rule.display_title()}")
-    print(f"  Observed cost: {rule.why}")
-    print(f"  Replacement trigger: {rule.trigger}")
-    print(f"  Replacement habit: {rule.guidance}")
+    print(f"  Pattern: {_out(rule.display_title())}")
+    print(f"  Observed cost: {_out(rule.why)}")
+    print(f"  Replacement trigger: {_out(rule.trigger)}")
+    print(f"  Replacement habit: {_out(rule.guidance)}")
     print(
         f"  Evidence: {focus.session_count} directly cited sessions across "
         f"{focus.day_count} days and {focus.project_count} projects."
