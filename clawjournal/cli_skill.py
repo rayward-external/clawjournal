@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .skill import distill as _distill
+from .skill import due as _due
 from .skill import focus as _focus
 from .skill import install as _install
 from .skill import render as _render
@@ -591,6 +592,83 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
 
 # --- IO / CLI ---------------------------------------------------------------
 
+
+def _run_nudge_hook_command(*, install: bool) -> None:
+    """Enable or disable the opt-in stale-lessons SessionStart nudge."""
+    from . import auto_upload as _auto_upload
+    from .agent_hooks import SUPPORTED_AGENTS
+    from .workbench.index import open_index
+
+    conn = open_index()
+    try:
+        with _auto_upload.control_mutation_lock():
+            previous_ownership = _due.nudge_hook_ownership(conn)
+            if previous_ownership is None:
+                raise RuntimeError("Nudge hook ownership could not be read safely.")
+            snapshots = _auto_upload._snapshot_hook_files(SUPPORTED_AGENTS)
+            try:
+                _due.set_nudge_hook_requested(conn, install)
+                upload_targets = _auto_upload._current_auto_upload_hook_targets(conn)
+                results = _auto_upload._reconcile_shared_hooks(conn)
+            except Exception:
+                rollback_errors: list[Exception] = []
+                try:
+                    _auto_upload._restore_hook_files(snapshots)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _due.set_nudge_hook_requested(conn, previous_ownership)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError(
+                        "Nudge hook update failed and its prior marker/files could "
+                        "not be restored safely."
+                    ) from rollback_errors[0]
+                raise
+
+        if install:
+            for result in results:
+                state = "updated" if result.get("changed") else "already installed"
+                print(
+                    f"  - {result['agent']}: SessionStart hook {state} "
+                    f"({result['path']})"
+                )
+            print(
+                "Stale-lessons nudge enabled (opt-in). When lessons go stale, it "
+                "prints aggregate new-session and failure-evidence counts into "
+                "agent context (and therefore to the model provider), plus a "
+                "suggestion to run `clawjournal skill --preview`. Nothing runs "
+                "automatically. Disable any time with `clawjournal skill "
+                "--uninstall-nudge`."
+            )
+            return
+
+        if upload_targets is None:
+            print(
+                "Nudge disabled. SessionStart hook ownership could not be read, "
+                "so the shared hooks were preserved conservatively."
+            )
+            return
+
+        removed = [agent for agent in SUPPORTED_AGENTS if agent not in upload_targets]
+        kept = [agent for agent in SUPPORTED_AGENTS if agent in upload_targets]
+        if kept and removed:
+            print(
+                "Nudge disabled; removed the shared hook for "
+                f"{', '.join(removed)} and kept {', '.join(kept)} for automatic uploads."
+            )
+        elif kept:
+            print(
+                "Nudge disabled. The shared SessionStart hooks stay installed for "
+                "automatic uploads; disable those to remove them."
+            )
+        else:
+            print("Nudge disabled; SessionStart hook removed for all supported agents.")
+    finally:
+        conn.close()
+
+
 def _ascii_safe(text: str) -> str:
     """Downgrade the glyphs we print when the console can't encode them (e.g. cp1252)."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
@@ -767,6 +845,16 @@ def run_skill(args) -> None:
               if hit else f"No rule with fingerprint {args.reject}.")
         return
 
+    # The nudge owns the shared hook explicitly and never runs the distiller.
+    if getattr(args, "install_nudge", False) or getattr(args, "uninstall_nudge", False):
+        if getattr(args, "install_nudge", False) and getattr(args, "uninstall_nudge", False):
+            print("--install-nudge and --uninstall-nudge are mutually exclusive")
+            sys.exit(2)
+        _run_nudge_hook_command(
+            install=bool(getattr(args, "install_nudge", False))
+        )
+        return
+
     from .config import load_config
     cfg = load_config()  # read the config ONCE and thread it through preflight/scan/select
 
@@ -798,6 +886,13 @@ def run_skill(args) -> None:
         res = generate_skill(conn, window_days=window_days, backend=backend, model=model, effort=effort,
                              sources=_config_sources(cfg),
                              excluded_projects=_config_excluded_projects(cfg, conn), cfg=cfg)
+        # A completed empty or gate-blocked run is still conscious activity.
+        # Record it before those early exits so the SessionStart nudge does not
+        # immediately nag after the user already tried to refresh the skill.
+        try:
+            _due.record_skill_run(conn)
+        except Exception:
+            pass
         _print_preview(res)
         # Persist NOTHING when the gate fails: a rule the render-time gate flags would
         # otherwise be stored as 'proposed', reloaded by load_kept every run, and
@@ -837,6 +932,7 @@ def run_skill(args) -> None:
         # the next run mislabels every rule [NEW] and the trend snapshot is lost.
         installed: list[str] = []
         failures: list[str] = []
+        offer_nudge_tip = False
         for name, fn, payload in (("claude", _install.install_claude, res.skill_md),
                                   ("codex", _install.install_codex, res.region)):
             if name not in targets:
@@ -862,6 +958,10 @@ def run_skill(args) -> None:
             except Exception as exc:
                 print(f"note: installed to disk, but failed to record state "
                       f"({exc.__class__.__name__}); the next run may re-propose these rules.")
+            try:
+                offer_nudge_tip = not _due.nudge_hook_requested(conn)
+            except Exception:
+                offer_nudge_tip = False
         else:
             _persist_seen()  # nothing landed -> at least keep 'seen' state for next run
     finally:
@@ -874,6 +974,11 @@ def run_skill(args) -> None:
         print("\nNote: these lessons reach your model provider when your agent loads them "
               "(that's how any skill/CLAUDE.md works) — nothing is uploaded to us.")
         print("Re-run weekly (`clawjournal skill`) to keep them fresh.")
+        if offer_nudge_tip:
+            print("Tip (opt-in): `clawjournal skill --install-nudge` adds a stale-lessons "
+                  "reminder. Its aggregate new-session/failure-evidence counts enter agent "
+                  "context and therefore reach the model provider; disable any time with "
+                  "`clawjournal skill --uninstall-nudge`.")
     if failures:
         print("\nInstall problems (fix and re-run):")
         for f in failures:

@@ -167,6 +167,8 @@ These are the main commands:
 ```bash
 clawjournal open                         # open the local workbench, then return
 clawjournal skill --preview              # preview lessons + one evidence-backed weekly focus
+clawjournal skill --install-nudge        # opt in to a stale-lessons SessionStart reminder
+clawjournal skill --uninstall-nudge      # disable that reminder and its context output
 clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring
 clawjournal status                       # check your setup
 clawjournal selfupdate --check           # see whether a newer version is available
@@ -200,6 +202,14 @@ no rule also passes its focus safeguards. The spotlight framing and aggregate
 evidence are not installed into agent instructions; the underlying lesson remains in
 the proposed skill set. It does not claim to assess your personality or performance
 at work.
+
+The stale-lessons nudge is **off by default**. If you opt in with
+`clawjournal skill --install-nudge`, a due reminder includes aggregate counts of
+new sessions and sessions with failure evidence in agent context, so those counts
+also reach the model provider when the agent starts. It does not include session
+text, run distillation, or install lessons automatically. The count follows your
+confirmed source/project exclusions and hold/embargo boundaries. Disable it at any
+time with `clawjournal skill --uninstall-nudge`.
 
 The terminal guide keeps the essential selection, redaction, consent, and destination safeguards in a simpler interface.
 

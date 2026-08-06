@@ -1090,6 +1090,92 @@ def _restore_hook_files(snapshots: Mapping[Path, str | None]) -> None:
             atomic_write_text(path, previous, parents=True)
 
 
+def _enrollment_hook_targets(
+    enrollment: Mapping[str, Any] | None,
+) -> set[AgentName] | None:
+    """Return the hooks currently owned by recurring upload.
+
+    A durable first-enable intent owns its selected hooks while hosted setup is
+    in flight even though its mode is still ``off``.  This prevents a racing
+    nudge uninstall from removing the hook between local setup and the final
+    enrollment commit.  ``None`` means corrupt/unknown state and callers must
+    preserve every hook conservatively.
+    """
+    if enrollment is None:
+        return set()
+    mode = enrollment.get("mode")
+    if mode not in ("off", "enabled", "paused"):
+        return None
+    owns_hooks = mode in ("enabled", "paused") or (
+        mode == "off"
+        and enrollment.get("last_result_code") == "enrollment_pending"
+    )
+    if not owns_hooks:
+        return set()
+    raw_targets = enrollment.get("hook_targets")
+    if not isinstance(raw_targets, list):
+        return None
+    targets = set(raw_targets)
+    supported = set(SUPPORTED_HOOK_TARGETS)
+    if not targets or not targets <= supported:
+        return None
+    return targets  # type: ignore[return-value]
+
+
+def _current_auto_upload_hook_targets(
+    conn: sqlite3.Connection,
+) -> set[AgentName] | None:
+    try:
+        return _enrollment_hook_targets(get_auto_upload_enrollment(conn))
+    except Exception:
+        return None
+
+
+def _reconcile_shared_hooks(
+    conn: sqlite3.Connection,
+    *,
+    upload_targets: Sequence[AgentName] | None = None,
+) -> list[dict[str, Any]]:
+    """Make hook files match the union of upload and nudge ownership.
+
+    Callers hold :func:`control_mutation_lock`; keeping the marker/DB reads and
+    hook writes inside that one short critical section prevents either feature
+    from restoring or deleting the other's hook. Unknown ownership suppresses
+    deletion but never authorizes creating a missing hook.
+    """
+    from .skill.due import nudge_hook_ownership
+
+    owned_by_upload = (
+        set(upload_targets)
+        if upload_targets is not None
+        else _current_auto_upload_hook_targets(conn)
+    )
+    owned_by_nudge = nudge_hook_ownership(conn)
+    desired: set[str] = set()
+    if owned_by_upload is not None:
+        desired.update(owned_by_upload)
+    if owned_by_nudge is True:
+        desired.update(SUPPORTED_HOOK_TARGETS)
+
+    results: list[dict[str, Any]] = []
+    if desired:
+        hook_agent = "all" if len(desired) > 1 else next(iter(desired))
+        results = install_hooks(agent=hook_agent)
+        if not all(result.get("configured") for result in results):
+            raise AutoUploadError(
+                "hook_install_failed",
+                "A selected SessionStart hook could not be installed.",
+            )
+    # Unknown ownership is conservative only in the non-destructive direction:
+    # never delete a possibly-owned hook, but also never install a missing hook
+    # without a known owner authorizing that target.
+    if owned_by_upload is not None and owned_by_nudge is not None:
+        for target in SUPPORTED_HOOK_TARGETS:
+            if target not in desired:
+                uninstall_agent_hook(target)
+    return results
+
+
 def _reconcile_explicit_pause_after_reauthorization(
     conn: sqlite3.Connection,
     *,
@@ -1173,6 +1259,24 @@ def _reconcile_explicit_pause_after_reauthorization(
                     last_result_code="credential_store_failed",
                 )
                 raise
+        try:
+            _reconcile_shared_hooks(conn)
+        except Exception as exc:
+            try:
+                update_auto_upload_enrollment(
+                    conn,
+                    expected_generation=reconciled_generation,
+                    health="action_required",
+                    last_result_code="hook_update_failed",
+                )
+            except Exception:
+                pass
+            raise AutoUploadError(
+                "hook_update_failed",
+                "The paused enrollment was reconciled, but its SessionStart "
+                "hooks could not be updated safely.",
+                retryable=True,
+            ) from exc
         return True
 
 
@@ -1676,13 +1780,14 @@ def enable(
                     last_result_code="enrollment_pending",
                 )
 
-        if background_job_id is None:
-            persist_intent()
-        else:
-            # Disable deletes the job under this same control lock.  Once this
-            # block publishes an Off intent, the existing generation CAS makes
-            # every later Disable win safely even if hosted I/O has begun.
-            with control_mutation_lock():
+        # Publishing hook ownership is a local control mutation too. Serialize
+        # both synchronous and queued intents so a nudge command cannot observe
+        # a half-published pending target set.
+        with control_mutation_lock():
+            if background_job_id is not None:
+                # Disable deletes the job under this same control lock. Once
+                # this block publishes an Off intent, the generation CAS makes
+                # every later Disable win even if hosted I/O has begun.
                 queued_job = get_auto_upload_enrollment_job(conn)
                 if (
                     queued_job is None
@@ -1693,7 +1798,7 @@ def enable(
                     raise ControlChanged(
                         "The queued automatic-upload setup was cancelled."
                     )
-                persist_intent()
+            persist_intent()
 
         snapshots: dict[Path, str | None] = {}
         committed = False
@@ -1719,17 +1824,12 @@ def enable(
         # secret in config.
         sent_identity_kind: str | None = None
         try:
-            snapshots = _snapshot_hook_files(SUPPORTED_HOOK_TARGETS)
-            hook_agent = "all" if len(targets) > 1 else targets[0]
-            hook_results = install_hooks(agent=hook_agent)
-            if not all(result.get("configured") for result in hook_results):
-                raise AutoUploadError(
-                    "hook_install_failed",
-                    "A selected SessionStart hook could not be installed.",
-                )
-            for target in SUPPORTED_HOOK_TARGETS:
-                if target not in targets:
-                    uninstall_agent_hook(target)
+            # Only the local snapshot/install mutation is serialized. Hosted
+            # enrollment I/O below deliberately runs without the control lock
+            # so Disable and nudge controls remain responsive.
+            with control_mutation_lock():
+                snapshots = _snapshot_hook_files(SUPPORTED_HOOK_TARGETS)
+                _reconcile_shared_hooks(conn, upload_targets=targets)
 
             if updating and not rotating_credentials:
                 assert credentials is not None
@@ -2069,6 +2169,10 @@ def enable(
                     )
                 write_credentials(credential_record)
                 committed = True
+                # Re-read the nudge marker after hosted I/O and reconcile the
+                # final union while the enrollment commit is still ordered
+                # against nudge install/uninstall.
+                _reconcile_shared_hooks(conn)
         except Exception as exc:
             current_after_failure = get_auto_upload_enrollment(conn)
             if (
@@ -2120,14 +2224,22 @@ def enable(
                         delete_credentials()
                 except CredentialStoreError:
                     pass
-            if (
-                current_after_failure is not None
-                and int(current_after_failure.get("generation", 0)) == generation
-            ):
-                try:
-                    _restore_hook_files(snapshots)
-                except OSError:
-                    pass
+            try:
+                with control_mutation_lock():
+                    hook_owner = get_auto_upload_enrollment(conn)
+                    if (
+                        hook_owner is not None
+                        and int(hook_owner.get("generation", 0)) == generation
+                    ):
+                        _restore_hook_files(snapshots)
+                    # A nudge command may have completed while hosted I/O was
+                    # in flight. Rebuild from its CURRENT marker after any
+                    # snapshot restore so that restore cannot erase its hook.
+                    _reconcile_shared_hooks(conn)
+            except Exception:
+                # Preserve the original enrollment error. The failure tail
+                # retries reconciliation after final DB compensation.
+                pass
             fresh_recovery = (
                 response.get("recovery_token")
                 if isinstance(response, dict)
@@ -2237,11 +2349,17 @@ def enable(
                 )
 
             if committed:
-                return AutoUploadError(
-                    "status_failed",
-                    "Enrollment succeeded, but its status could not be rendered.",
-                    retryable=True,
-                ).as_result()
+                try:
+                    with control_mutation_lock():
+                        _reconcile_shared_hooks(conn)
+                except Exception:
+                    return AutoUploadError(
+                        "hook_update_failed",
+                        "Enrollment succeeded, but its SessionStart hooks could "
+                        "not be reconciled safely.",
+                        retryable=True,
+                    ).as_result()
+                return status(conn=conn)
 
             # If the server created an enrollment but local persistence failed,
             # revoke with recovery authority.  A failed revoke retains only the
@@ -2468,6 +2586,14 @@ def enable(
                     revocation_pending=False,
                     last_result_code=error.code,
                 )
+            try:
+                with control_mutation_lock():
+                    _reconcile_shared_hooks(conn)
+            except Exception:
+                # The primary enrollment error remains authoritative. A later
+                # Enable/Disable/nudge command will retry the idempotent hook
+                # reconciliation under the same lock.
+                pass
             return error.as_result()
         if background_job_id is None:
             # A user may recover an action-required background attempt through
@@ -2705,6 +2831,7 @@ def disable() -> dict[str, Any]:
 
     conn = open_index()
     try:
+        hook_error = False
         # Establish Off and strip active authority as one ordered local phase.
         # Hosted revocation stays outside the lock; every later DB write is a
         # CAS against the generation this Disable owns.
@@ -2792,11 +2919,8 @@ def disable() -> dict[str, Any]:
                 return AutoUploadError(
                     "credential_store_failed", str(exc)
                 ).as_result()
-
-        hook_error = False
-        for target in SUPPORTED_HOOK_TARGETS:
             try:
-                uninstall_agent_hook(target)
+                _reconcile_shared_hooks(conn)
             except Exception:
                 hook_error = True
 
