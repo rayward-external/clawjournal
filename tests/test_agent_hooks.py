@@ -383,6 +383,63 @@ def test_module_entrypoint_is_quiet_and_inert_by_default(capsys):
     assert captured.err == ""
 
 
+def test_module_entrypoint_runs_injected_nudge_emitter(capsys):
+    # the lessons nudge is the one deliberate output path (plan §16 CH-1)
+    calls: list[str] = []
+
+    def emit(client: str) -> bool:
+        calls.append(client)
+        print("nudge-line")
+        return True
+
+    assert hooks.main(
+        ["run", "--client", "claude"],
+        due_check=hooks._runner_not_configured,
+        nudge_emitter=emit,
+    ) == 0
+    assert calls == ["claude"]
+    assert "nudge-line" in capsys.readouterr().out
+
+
+def test_module_entrypoint_survives_nudge_emitter_error(capsys):
+    def boom(_client: str) -> bool:
+        raise RuntimeError("nudge failed")
+
+    assert hooks.main(
+        ["run", "--client", "claude"],
+        due_check=hooks._runner_not_configured,
+        nudge_emitter=boom,
+    ) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_module_entrypoint_default_binding_reaches_the_real_nudge(
+    tmp_path, monkeypatch, capsys
+):
+    # the all-adapters-None branch is what every installed hook runs in
+    # production: it must bind the auto-upload adapters AND the lessons nudge.
+    # With no index DB both fail open and print nothing.
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "clawjournal.skill.due.emit_session_start_nudge",
+        lambda client: calls.append(client) or True,
+    )
+    assert hooks.main(["run", "--client", "claude"]) == 0
+    assert calls == ["claude"]
+    assert capsys.readouterr().out == ""
+
+
+def test_module_entrypoint_default_binding_fails_open_without_db(
+    tmp_path, monkeypatch, capsys
+):
+    # same production branch, real (unpatched) nudge: a missing index DB must
+    # stay silent and inert end to end.
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
+    assert hooks.main(["run", "--client", "codex"]) == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_detached_process_options_do_not_inherit_stdio():
     posix = hooks.detached_process_kwargs(platform="posix")
     assert posix["start_new_session"] is True

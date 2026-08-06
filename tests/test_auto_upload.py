@@ -4124,11 +4124,15 @@ def test_reauthorization_discards_same_enrollment_sealed_artifact_after_patch(
 
 
 @pytest.mark.parametrize("rotating_credentials", [False, True])
-@pytest.mark.parametrize("restore_fails", [False, True])
+@pytest.mark.parametrize(
+    ("restore_fails", "hook_fails"),
+    [(False, False), (True, False), (False, True)],
+)
 def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
     isolated_auto_upload,
     monkeypatch,
     restore_fails,
+    hook_fails,
     rotating_credentials,
 ):
     config = _save_scope_config(upload_token="fresh-one-shot")
@@ -4148,6 +4152,20 @@ def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
         stored_credentials["active_token_expires_at"] = "2020-01-01T00:00:00+00:00"
     write_credentials(stored_credentials)
     _patch_enable_dependencies(monkeypatch)
+    if hook_fails:
+        real_reconcile_hooks = auto._reconcile_shared_hooks
+
+        def fail_paused_reconcile(conn, **kwargs):
+            enrollment = get_auto_upload_enrollment(conn)
+            if (
+                enrollment is not None
+                and enrollment.get("mode") == "paused"
+                and enrollment.get("authorization_revision") == 2
+            ):
+                raise OSError("hook write failed")
+            return real_reconcile_hooks(conn, **kwargs)
+
+        monkeypatch.setattr(auto, "_reconcile_shared_hooks", fail_paused_reconcile)
 
     patch_succeeded = threading.Event()
     recovery_only_written = threading.Event()
@@ -4223,6 +4241,8 @@ def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
     assert len(enable_results) == 1
     if restore_fails:
         assert enable_results[0]["code"] == "credential_store_failed"
+    elif hook_fails:
+        assert enable_results[0]["code"] == "hook_update_failed"
     else:
         assert enable_results[0]["mode"] == "paused"
         assert enable_results[0]["generation"] == 4
@@ -4232,10 +4252,12 @@ def test_pause_racing_successful_reauthorization_reconciles_hosted_revision(
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["mode"] == "paused"
         assert enrollment["health"] == (
-            "action_required" if restore_fails else "ready"
+            "action_required" if restore_fails or hook_fails else "ready"
         )
         assert enrollment["last_result_code"] == (
-            "credential_store_failed" if restore_fails else "paused"
+            "credential_store_failed" if restore_fails
+            else "hook_update_failed" if hook_fails
+            else "paused"
         )
         assert enrollment["authorization_revision"] == 2
         assert enrollment["recurring_authorization_version"] == AUTH_VERSION
@@ -4381,6 +4403,168 @@ def test_enable_rolls_back_hook_failure_before_server_or_credentials(
         assert enrollment["server_enrollment_id"] is None
     finally:
         conn.close()
+
+
+def _patch_in_memory_hook_state(monkeypatch, initial=()):
+    state = set(initial)
+
+    def snapshot(_targets):
+        return {"state": set(state)}
+
+    def restore(saved):
+        state.clear()
+        state.update(saved["state"])
+
+    def install_hooks(*, agent):
+        targets = ("claude", "codex") if agent == "all" else (agent,)
+        results = []
+        for target in targets:
+            changed = target not in state
+            state.add(target)
+            results.append({
+                "agent": target,
+                "configured": True,
+                "changed": changed,
+                "path": target,
+            })
+        return results
+
+    monkeypatch.setattr(auto, "_snapshot_hook_files", snapshot)
+    monkeypatch.setattr(auto, "_restore_hook_files", restore)
+    monkeypatch.setattr(auto, "install_hooks", install_hooks)
+    monkeypatch.setattr(auto, "uninstall_agent_hook", state.discard)
+    return state
+
+
+def test_nudge_install_during_enable_failure_survives_snapshot_restore(
+    isolated_auto_upload, monkeypatch
+):
+    """Hosted I/O is unlocked; failure restore rebuilds current nudge ownership."""
+    from clawjournal.cli_skill import _run_nudge_hook_command
+    from clawjournal.skill.due import nudge_hook_requested
+
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    hook_state = _patch_in_memory_hook_state(monkeypatch)
+    create_started = threading.Event()
+    release_create = threading.Event()
+
+    def blocked_create(*_args, **_kwargs):
+        create_started.set()
+        assert release_create.wait(timeout=5)
+        raise auto.AutoUploadError("forced_enable_failure", "forced")
+
+    monkeypatch.setattr(auto, "create_enrollment", blocked_create)
+    profile_hash = _current_authorization_profile_hash()
+    enable_results: list[dict[str, Any]] = []
+    enable_errors: list[BaseException] = []
+    nudge_errors: list[BaseException] = []
+
+    def run_enable():
+        try:
+            enable_results.append(auto.enable(
+                agent="claude",
+                accepted_authorization_version=AUTH_VERSION,
+                accepted_retention_version=RETENTION_VERSION,
+                accepted_ownership_certification_version=OWNERSHIP_VERSION,
+                accepted_authorization_profile_hash=profile_hash,
+            ))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            enable_errors.append(exc)
+
+    def install_nudge():
+        try:
+            _run_nudge_hook_command(install=True)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            nudge_errors.append(exc)
+
+    enable_thread = threading.Thread(target=run_enable)
+    enable_thread.start()
+    assert create_started.wait(timeout=5)
+
+    nudge_thread = threading.Thread(target=install_nudge)
+    nudge_thread.start()
+    nudge_thread.join(timeout=5)
+    assert not nudge_thread.is_alive(), "hosted I/O must not hold the control lock"
+    assert nudge_errors == []
+    assert hook_state == {"claude", "codex"}
+
+    release_create.set()
+    enable_thread.join(timeout=5)
+    assert not enable_thread.is_alive()
+    assert enable_errors == []
+    assert enable_results[0]["code"] == "forced_enable_failure"
+    assert hook_state == {"claude", "codex"}
+    conn = open_index()
+    try:
+        assert nudge_hook_requested(conn) is True
+    finally:
+        conn.close()
+
+
+def test_nudge_uninstall_during_pending_enable_keeps_exact_upload_hook(
+    isolated_auto_upload, monkeypatch
+):
+    from clawjournal.cli_skill import _run_nudge_hook_command
+    from clawjournal.skill.due import nudge_hook_requested, set_nudge_hook_requested
+
+    _save_scope_config(upload_token="fresh-one-shot")
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    set_nudge_hook_requested(conn, True)
+    conn.close()
+    _patch_enable_dependencies(monkeypatch)
+    hook_state = _patch_in_memory_hook_state(monkeypatch, ("claude", "codex"))
+    create_started = threading.Event()
+    release_create = threading.Event()
+
+    def blocked_create(*_args, **_kwargs):
+        create_started.set()
+        assert release_create.wait(timeout=5)
+        return _enrollment_response()
+
+    monkeypatch.setattr(auto, "create_enrollment", blocked_create)
+    profile_hash = _current_authorization_profile_hash()
+    enable_results: list[dict[str, Any]] = []
+    enable_errors: list[BaseException] = []
+
+    def run_enable():
+        try:
+            enable_results.append(auto.enable(
+                agent="claude",
+                accepted_authorization_version=AUTH_VERSION,
+                accepted_retention_version=RETENTION_VERSION,
+                accepted_ownership_certification_version=OWNERSHIP_VERSION,
+                accepted_authorization_profile_hash=profile_hash,
+            ))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            enable_errors.append(exc)
+
+    enable_thread = threading.Thread(target=run_enable)
+    enable_thread.start()
+    assert create_started.wait(timeout=5)
+
+    _run_nudge_hook_command(install=False)
+    assert hook_state == {"claude"}
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "off"
+        assert enrollment["last_result_code"] == "enrollment_pending"
+        assert enrollment["hook_targets"] == ["claude"]
+        assert nudge_hook_requested(conn) is False
+    finally:
+        conn.close()
+
+    release_create.set()
+    enable_thread.join(timeout=5)
+    assert not enable_thread.is_alive()
+    assert enable_errors == []
+    assert enable_results[0]["ok"] is True
+    assert hook_state == {"claude"}
 
 
 def test_enable_revokes_server_enrollment_when_credential_commit_fails(
@@ -4863,6 +5047,10 @@ def test_stale_disable_cannot_erase_later_rollback_recovery_handoff(
     assert disable_in_hook_cleanup.wait(timeout=5)
 
     allow_create_response.set()
+    assert not rollback_revoke_failed.wait(timeout=0.2)
+    # Disable's marker read + hook cleanup is one local control phase. The
+    # enable failure cannot publish recovery state until that phase releases.
+    allow_disable_to_finish.set()
     assert rollback_revoke_failed.wait(timeout=5)
 
     deadline = time.monotonic() + 5
@@ -4881,16 +5069,13 @@ def test_stale_disable_cannot_erase_later_rollback_recovery_handoff(
     assert tombstone["active_token"] is None
     assert tombstone["recovery_token"] == "recovery-secret"
 
-    allow_disable_to_finish.set()
     enable_thread.join(timeout=5)
     disable_thread.join(timeout=5)
     assert not enable_thread.is_alive()
     assert not disable_thread.is_alive()
     assert thread_errors == []
     assert enable_results[0]["code"] == "control_changed"
-    assert disable_results[0]["generation"] == 3
-    assert disable_results[0]["overlay"] == "revocation_pending"
-    assert disable_results[0]["last_result"]["code"] == "revocation_pending"
+    assert disable_results[0]["mode"] == "off"
     assert load_credentials(required=True)["recovery_token"] == "recovery-secret"
 
     recovered = auto.disable()

@@ -8,6 +8,10 @@ only owns agent configuration and the small, injectable hook dispatch seam.
 The module entry point binds the local due check and detached runner lazily;
 injected adapters keep that boundary directly testable. The hook process never
 packages or uploads a trace itself.
+
+Besides the silent auto-upload check, the entry point may print ONE bounded
+lessons-refresh nudge line (:mod:`clawjournal.skill.due`) suggesting a manual
+``clawjournal skill --preview`` — never running it.
 """
 
 from __future__ import annotations
@@ -491,6 +495,7 @@ def main(
     due_check: DueCheck | None = None,
     spawn_runner: RunnerSpawner | None = None,
     record_observed: ObservationRecorder | None = None,
+    nudge_emitter: Callable[[str], bool] | None = None,
 ) -> int:
     """Lightweight module entrypoint used by agent hook configuration."""
 
@@ -514,13 +519,31 @@ def main(
             # not-due and the agent session continues without spawning.
             due_check = hook_session_start_check
             spawn_runner = spawn_scheduled_runner
+            if nudge_emitter is None:
+                try:
+                    from .skill.due import emit_session_start_nudge
+
+                    nudge_emitter = emit_session_start_nudge
+                except Exception:
+                    # The nudge is optional garnish; a broken import must never
+                    # break the auto-upload check or the agent session.
+                    nudge_emitter = None
         run_session_start(
             client=args.client,
             due_check=due_check,
             spawn_runner=spawn_runner,
             record_observed=record_observed,
         )
-    # No output: SessionStart must never inject scheduler text into a trace.
+        # The auto-upload scheduler stays silent (its state must never reach a
+        # trace). The lessons-refresh nudge is the ONE deliberate exception: at
+        # most one printed line, bounded + fail-open + cooldown-limited, and it
+        # only ever *suggests* `clawjournal skill --preview` — nothing runs
+        # automatically (plan §16 CH-1).
+        if nudge_emitter is not None:
+            try:
+                nudge_emitter(args.client)
+            except Exception:
+                pass
     return 0
 
 
