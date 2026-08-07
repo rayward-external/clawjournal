@@ -1265,6 +1265,221 @@ class TestDiscoverProjects:
         assert result["stats"]["output_tokens"] == 40
         assert result["stats"]["cache_read_tokens"] == 50
 
+    def _write_codex_rollout(self, tmp_path, events):
+        session_file = tmp_path / "rollout-aborted.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-01T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": "session-aborted", "cwd": "/repo"},
+            },
+            *events,
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+        return session_file
+
+    @staticmethod
+    def _codex_event(event_type, **payload):
+        return {
+            "timestamp": "2026-08-01T10:00:01.000Z",
+            "type": "event_msg",
+            "payload": {"type": event_type, **payload},
+        }
+
+    def test_codex_turn_aborted_drops_unanswered_user_message(
+        self, tmp_path, mock_anonymizer
+    ):
+        """Retried turns re-log the same user message; aborted attempts with no
+        assistant output must not surface as duplicate messages."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="review the paper"),
+            self._codex_event("turn_aborted"),
+            self._codex_event("user_message", message="review the paper"),
+            self._codex_event("turn_aborted"),
+            self._codex_event("user_message", message="review the paper."),
+            self._codex_event("agent_message", message="Reviewing now."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+            capture_raw_offsets=True,
+        )
+
+        assert result is not None
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "review the paper."),
+            ("assistant", "Reviewing now."),
+        ]
+        assert result["stats"]["user_messages"] == 1
+        assert result["stats"]["assistant_messages"] == 1
+        # The parallel raw-offset/token arrays must shrink with the dropped
+        # messages, or segmentation silently rejects the session later.
+        assert len(result["_raw_message_start_offsets"]) == 2
+        assert len(result["_raw_message_end_offsets"]) == 2
+        assert len(result["_raw_message_token_snapshots"]) == 2
+
+    def test_codex_turn_aborted_keeps_answered_user_message(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="review the paper"),
+            self._codex_event("agent_message", message="Halfway done..."),
+            self._codex_event("turn_aborted"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [m["role"] for m in result["messages"]] == ["user", "assistant"]
+        assert result["stats"]["user_messages"] == 1
+
+    def test_codex_session_of_only_aborted_attempts_returns_none(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="never answered"),
+            self._codex_event("turn_aborted"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is None
+
+    def test_codex_parser_captures_fork_provenance(self, tmp_path, mock_anonymizer):
+        session_file = tmp_path / "rollout-fork.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-01T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "fork-child-id",
+                    "session_id": "parent-thread-id",
+                    "forked_from_id": "parent-thread-id",
+                    "parent_thread_id": "parent-thread-id",
+                    "thread_source": "subagent",
+                    "agent_nickname": "Kierkegaard",
+                    "cwd": "/repo",
+                },
+            },
+            self._codex_event("user_message", message="hello"),
+            self._codex_event("agent_message", message="hi"),
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert result["session_id"] == "fork-child-id"
+        assert result["fork_of"] == "parent-thread-id"
+        assert result["fork_source"] == "subagent"
+        assert result["fork_nickname"] == "Kierkegaard"
+
+    def test_codex_parser_plain_session_has_no_fork_fields(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="hello"),
+            self._codex_event("agent_message", message="hi"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert "fork_of" not in result
+        assert "fork_source" not in result
+        assert "fork_nickname" not in result
+
+    def test_codex_empty_completed_turn_drops_resent_user_message(
+        self, tmp_path, mock_anonymizer
+    ):
+        """Rollback / edit-and-resend re-logs the message after a task_complete
+        with no output at all; only the finally answered copy should remain."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="rename the aliases"),
+            self._codex_event("task_complete"),
+            self._codex_event("user_message", message="rename the aliases"),
+            self._codex_event("task_complete"),
+            self._codex_event("user_message", message="rename the aliases, please"),
+            self._codex_event("agent_message", message="Renaming."),
+            self._codex_event("task_complete"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "rename the aliases, please"),
+            ("assistant", "Renaming."),
+        ]
+
+    def test_codex_turn_aborted_keeps_user_message_when_tools_ran(
+        self, tmp_path, mock_anonymizer
+    ):
+        """An abort after the model already did work (pending tool call, no
+        final message yet) must not delete the prompt that produced it."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="apply the patch"),
+            {
+                "timestamp": "2026-08-01T10:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\": [\"ls\"]}",
+                    "call_id": "call-1",
+                },
+            },
+            self._codex_event("turn_aborted"),
+            self._codex_event("user_message", message="continue"),
+            self._codex_event("agent_message", message="Done."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        roles = [m["role"] for m in result["messages"]]
+        assert roles == ["user", "assistant", "user", "assistant"]
+        assert result["messages"][0]["content"] == "apply the patch"
+
     def test_claude_parser_captures_per_message_token_snapshots(
         self, tmp_path, mock_anonymizer
     ):

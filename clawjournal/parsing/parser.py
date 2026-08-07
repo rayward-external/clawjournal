@@ -2374,7 +2374,10 @@ def _make_session_result(
         "stats": stats,
     }
     # Pass through optional provenance fields from metadata
-    for key in ("entrypoint", "originator", "codex_source", "model_effort", "segment_title"):
+    for key in (
+        "entrypoint", "originator", "codex_source", "model_effort",
+        "segment_title", "fork_of", "fork_source", "fork_nickname",
+    ):
         val = metadata.get(key)
         if val is not None:
             result[key] = val
@@ -3207,6 +3210,29 @@ def _parse_codex_session_file(
                     _handle_codex_agent_message(
                         state, payload, timestamp, anonymizer, include_thinking
                     )
+                elif event_type in ("turn_aborted", "task_complete"):
+                    # A turn that ends with no visible output at all — no
+                    # assistant message and no pending reasoning/tool calls —
+                    # re-logs the same user message on the next attempt
+                    # (stop/retry, model switch, rollback edit-and-resend), so
+                    # keeping the unanswered copy surfaces duplicates. Drop it
+                    # together with its parallel-array entries; a turn that
+                    # produced anything is left untouched.
+                    if (
+                        state.messages
+                        and state.messages[-1].get("role") == "user"
+                        and not state.pending_tool_uses
+                        and not state.pending_thinking
+                    ):
+                        state.messages.pop()
+                        state.stats["user_messages"] -= 1
+                        if capture_raw_offsets:
+                            if raw_message_start_offsets:
+                                raw_message_start_offsets.pop()
+                            if raw_message_end_offsets:
+                                raw_message_end_offsets.pop()
+                            if raw_message_token_snapshots:
+                                raw_message_token_snapshots.pop()
             if capture_raw_offsets and len(state.messages) > before_messages:
                 added_messages = len(state.messages) - before_messages
                 raw_message_start_offsets.extend(
@@ -3312,6 +3338,19 @@ def _handle_codex_session_meta(
         codex_src = payload.get("source")
         if isinstance(codex_src, str):
             state.metadata["codex_source"] = codex_src
+    # Codex Desktop fork rollouts (retry branches, subagent threads) carry
+    # their lineage in the first session_meta; later metas are replayed
+    # parent records, so first-wins.
+    if state.metadata.get("fork_of") is None:
+        forked_from = payload.get("forked_from_id")
+        if isinstance(forked_from, str) and forked_from.strip():
+            state.metadata["fork_of"] = forked_from.strip()
+            thread_source = payload.get("thread_source")
+            if isinstance(thread_source, str) and thread_source.strip():
+                state.metadata["fork_source"] = thread_source.strip()
+            nickname = payload.get("agent_nickname")
+            if isinstance(nickname, str) and nickname.strip():
+                state.metadata["fork_nickname"] = nickname.strip()
 
 
 def _handle_codex_turn_context(

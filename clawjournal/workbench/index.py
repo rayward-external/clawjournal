@@ -885,6 +885,13 @@ def open_index() -> sqlite3.Connection:
         # them the Token Usage chart under-counts Claude input by ~50x.
         ("cache_read_tokens", "INTEGER DEFAULT 0"),
         ("cache_creation_tokens", "INTEGER DEFAULT 0"),
+        # Codex Desktop fork lineage (retry branches / subagent threads).
+        # A fork rollout replays its parent's history, so without these the
+        # index shows several identically titled traces with no hint of
+        # which one is the main thread.
+        ("fork_of", "TEXT"),
+        ("fork_source", "TEXT"),
+        ("fork_nickname", "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {col_type}")
@@ -2730,6 +2737,18 @@ def upsert_sessions(
         if display_title.startswith("/") and " " not in display_title.strip():
             continue
 
+        # A fork rollout replays its parent's opening message, so its derived
+        # title collides with the main thread's. Label it apart, preferring
+        # the nickname Codex Desktop assigns the fork; fall back to the fork
+        # file's own id tail, which is stable across rescans (a positional
+        # "fork N" would renumber whenever an older fork file is discovered).
+        fork_of = session.get("fork_of")
+        if fork_of:
+            fork_label = session.get("fork_nickname")
+            if not isinstance(fork_label, str) or not fork_label.strip():
+                fork_label = str(session_id).split("_seg-")[0][-4:]
+            display_title = f"{display_title} · fork: {fork_label.strip()}"
+
         # The sessions row is a plaintext surface — list views, search,
         # API responses all return `display_title` directly. Strip any
         # regex_secrets match before persisting so the body of a prompt
@@ -2861,6 +2880,7 @@ def upsert_sessions(
                 segment_start_message, segment_end_message,
                 segment_reason, segment_sealed,
                 client_origin, runtime_channel, outer_session_id,
+                fork_of, fork_source, fork_nickname,
                 estimated_cost_usd,
                 tool_counts, user_interrupts,
                 hold_state, content_revision, revision_stable_since
@@ -2888,6 +2908,7 @@ def upsert_sessions(
                 ?, ?, ?,
                 ?, ?,
                 ?,
+                ?, ?, ?,
                 ?, ?, ?,
                 ?,
                 ?, ?,
@@ -3014,6 +3035,9 @@ def upsert_sessions(
                 client_origin = excluded.client_origin,
                 runtime_channel = excluded.runtime_channel,
                 outer_session_id = excluded.outer_session_id,
+                fork_of = excluded.fork_of,
+                fork_source = excluded.fork_source,
+                fork_nickname = excluded.fork_nickname,
                 estimated_cost_usd = excluded.estimated_cost_usd,
                 tool_counts = excluded.tool_counts,
                 user_interrupts = excluded.user_interrupts,
@@ -3074,6 +3098,9 @@ def upsert_sessions(
                 session.get("client_origin"),
                 session.get("runtime_channel"),
                 session.get("outer_session_id"),
+                session.get("fork_of"),
+                session.get("fork_source"),
+                session.get("fork_nickname"),
                 cost,
                 json.dumps(badges.get("tool_counts", {})) or None,
                 session_stats.get("user_interrupts", 0),

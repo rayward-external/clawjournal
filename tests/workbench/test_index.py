@@ -114,6 +114,44 @@ class TestUpsertSessions:
         assert get_session_detail(index_conn, session_id)["messages"]
         assert not (tmp_path / "outside-the-blob-directory.json").exists()
 
+    def test_fork_provenance_stored_and_title_labeled(self, index_conn):
+        session = _make_session("fork-child-9976", source="codex")
+        session["fork_of"] = "parent-thread-id"
+        session["fork_source"] = "subagent"
+        session["fork_nickname"] = "Kierkegaard"
+
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT fork_of, fork_source, fork_nickname, display_title "
+            "FROM sessions WHERE session_id = 'fork-child-9976'"
+        ).fetchone()
+        assert row["fork_of"] == "parent-thread-id"
+        assert row["fork_source"] == "subagent"
+        assert row["fork_nickname"] == "Kierkegaard"
+        assert row["display_title"].endswith("· fork: Kierkegaard")
+
+    def test_fork_without_nickname_falls_back_to_short_id(self, index_conn):
+        session = _make_session("fork-child-9976_seg-0002", source="codex")
+        session["fork_of"] = "parent-thread-id"
+
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT display_title FROM sessions "
+            "WHERE session_id = 'fork-child-9976_seg-0002'"
+        ).fetchone()
+        # Label derives from the fork file's own id (stable), not the
+        # segment suffix and not a scan-order-dependent counter.
+        assert row["display_title"].endswith("· fork: 9976")
+
+    def test_non_fork_title_is_not_decorated(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        row = index_conn.execute(
+            "SELECT display_title FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert "fork" not in row["display_title"]
+
     @pytest.mark.parametrize("status", ["approved", "blocked"])
     def test_upsert_preserves_review_status(self, index_conn, status):
         upsert_sessions(index_conn, [_make_session()])
