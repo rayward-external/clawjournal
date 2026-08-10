@@ -78,3 +78,22 @@ class TestSelection:
         by_id = {c.session_id: c for c in result.candidates}
         assert by_id["evidenced"].has_trace_evidence is True
         assert by_id["bare-score"].has_trace_evidence is False
+
+    def test_ai_title_keeps_fork_identity(self, index_conn):
+        _ins(index_conn, "fork-child-9976", fvs=4, learning="concrete lesson")
+        index_conn.execute(
+            "UPDATE sessions SET display_title = ?, ai_display_title = ?, "
+            "fork_of = ?, fork_nickname = ? WHERE session_id = ?",
+            (
+                "Raw title · fork: Kierkegaard",
+                "AI title",
+                "parent-thread-id",
+                "Kierkegaard",
+                "fork-child-9976",
+            ),
+        )
+        index_conn.commit()
+
+        result = select_week_failures(index_conn, now=NOW)
+
+        assert result.candidates[0].title == "AI title · fork: Kierkegaard"

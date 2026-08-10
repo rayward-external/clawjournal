@@ -33,6 +33,7 @@ from ..config import (
 )
 from ..paths import ensure_install_files
 from ..pricing import estimate_cost
+from ..session_titles import append_fork_title_suffix
 
 INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
@@ -2711,16 +2712,10 @@ def upsert_sessions(
             continue
 
         # A fork rollout replays its parent's opening message, so its derived
-        # title collides with the main thread's. Label it apart, preferring
-        # the nickname Codex Desktop assigns the fork; fall back to the fork
-        # file's own id tail, which is stable across rescans (a positional
-        # "fork N" would renumber whenever an older fork file is discovered).
-        fork_of = session.get("fork_of")
-        if fork_of:
-            fork_label = session.get("fork_nickname")
-            if not isinstance(fork_label, str) or not fork_label.strip():
-                fork_label = str(session_id).split("_seg-")[0][-4:]
-            display_title = f"{display_title} · fork: {fork_label.strip()}"
+        # title collides with the main thread's.  Store the labeled heuristic
+        # title for plain-title consumers (including FTS and the web UI); AI
+        # title consumers use the same idempotent helper at display time.
+        display_title = append_fork_title_suffix(display_title, session)
 
         # The sessions row is a plaintext surface — list views, search,
         # API responses all return `display_title` directly. Strip any

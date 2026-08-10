@@ -14,6 +14,7 @@ from clawjournal.events.cost.schema import ensure_cost_schema
 from clawjournal.events.incidents.schema import ensure_incidents_schema
 from clawjournal.events.schema import ensure_schema as ensure_events_schema
 from clawjournal.events.view import canonical_events, capability_join, ensure_view_schema
+from clawjournal.session_titles import resolve_session_title
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _SUMMARY_KEYS = (
@@ -130,12 +131,13 @@ def load_timeline_page(
 def render_timeline_html(page: TimelinePage) -> str:
     """Render a full standalone HTML page for a timeline request."""
     workbench = page.workbench_row or {}
+    fallback_title = str(
+        page.canonical_session_key or page.requested_session_key
+    )
     title = (
-        (page.root.title if page.root is not None else None)
-        or workbench.get("ai_display_title")
-        or workbench.get("display_title")
-        or page.canonical_session_key
-        or page.requested_session_key
+        page.root.title
+        if page.root is not None
+        else resolve_session_title(workbench, fallback=fallback_title)
     )
     body = (
         _render_timeline_page(page)
@@ -514,7 +516,7 @@ def _load_workbench_session(
         """
         SELECT session_id, session_key, project, source, model,
                start_time, end_time, display_title, ai_display_title,
-               raw_source_path
+               raw_source_path, fork_of, fork_nickname
           FROM sessions
          WHERE session_key = ?
          ORDER BY COALESCE(updated_at, indexed_at, start_time, '') DESC
@@ -823,13 +825,12 @@ def _session_title(
     workbench: dict[str, Any] | None, session_row: sqlite3.Row
 ) -> str:
     if workbench:
-        return (
-            workbench.get("ai_display_title")
-            or workbench.get("display_title")
-            or workbench.get("project")
+        fallback = str(
+            workbench.get("project")
             or workbench.get("session_key")
-            or str(session_row["session_key"])
+            or session_row["session_key"]
         )
+        return resolve_session_title(workbench, fallback=fallback)
     return str(session_row["session_key"])
 
 

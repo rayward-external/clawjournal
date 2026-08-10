@@ -3029,6 +3029,10 @@ class _CodexParseState:
     max_output_tokens: int = 0
     max_cached_tokens: int = 0
     tool_result_map: dict[str, dict] = dataclasses.field(default_factory=dict)
+    retry_candidate_index: int | None = None
+    retry_candidate_replaced: bool = False
+    last_user_input_hash: str | None = None
+    retry_candidate_input_hash: str | None = None
 
 
 def _coalesce_codex_output(raw: Any) -> str:
@@ -3183,6 +3187,7 @@ def _parse_codex_session_file(
             snapshot_out=parse_snapshot,
         ):
             before_messages = len(state.messages)
+            replaced_retry_user = False
             timestamp = _normalize_timestamp(entry.get("timestamp"))
             entry_type = entry.get("type")
 
@@ -3191,6 +3196,12 @@ def _parse_codex_session_file(
             elif entry_type == "turn_context":
                 _handle_codex_turn_context(state, entry, anonymizer)
             elif entry_type == "response_item":
+                response_payload = entry.get("payload", {})
+                response_type = response_payload.get("type")
+                if response_type in ("function_call", "custom_tool_call") or (
+                    response_type == "reasoning" and include_thinking
+                ):
+                    _clear_codex_retry_candidate(state)
                 _handle_codex_response_item(state, entry, anonymizer, include_thinking)
             elif entry_type == "event_msg":
                 payload = entry.get("payload", {})
@@ -3198,6 +3209,7 @@ def _parse_codex_session_file(
                 if event_type == "token_count":
                     _handle_codex_token_count(state, payload)
                 elif event_type == "agent_reasoning" and include_thinking:
+                    _clear_codex_retry_candidate(state)
                     thinking = payload.get("text")
                     if isinstance(thinking, str) and thinking.strip():
                         cleaned = anonymizer.text(thinking.strip())
@@ -3205,34 +3217,39 @@ def _parse_codex_session_file(
                             state._pending_thinking_seen.add(cleaned)
                             state.pending_thinking.append(cleaned)
                 elif event_type == "user_message":
-                    _handle_codex_user_message(state, payload, timestamp, anonymizer)
+                    replaced_retry_user = _replace_codex_retry_user_message(
+                        state, payload, timestamp, anonymizer
+                    )
+                    if not replaced_retry_user:
+                        _handle_codex_user_message(
+                            state, payload, timestamp, anonymizer
+                        )
                 elif event_type == "agent_message":
+                    _clear_codex_retry_candidate(state)
                     _handle_codex_agent_message(
                         state, payload, timestamp, anonymizer, include_thinking
                     )
                 elif event_type in ("turn_aborted", "task_complete"):
-                    # A turn that ends with no visible output at all — no
-                    # assistant message and no pending reasoning/tool calls —
-                    # re-logs the same user message on the next attempt
-                    # (stop/retry, model switch, rollback edit-and-resend), so
-                    # keeping the unanswered copy surfaces duplicates. Drop it
-                    # together with its parallel-array entries; a turn that
-                    # produced anything is left untouched.
+                    # Do not delete the prompt at the terminal event: the log
+                    # may end here, or the next prompt may be an unrelated new
+                    # turn.  A confirmed retry replaces this slot later so its
+                    # original raw start remains an append-only boundary.
+                    _mark_codex_retry_candidate(state, event_type, payload)
+                elif event_type == "thread_rolled_back":
+                    # A rollback is an explicit edit-and-resend signal.  The
+                    # next user message replaces the output-free candidate even
+                    # when its text was edited.
                     if (
-                        state.messages
-                        and state.messages[-1].get("role") == "user"
-                        and not state.pending_tool_uses
-                        and not state.pending_thinking
+                        state.retry_candidate_index is not None
+                        and _safe_int(payload.get("num_turns")) == 1
                     ):
-                        state.messages.pop()
-                        state.stats["user_messages"] -= 1
-                        if capture_raw_offsets:
-                            if raw_message_start_offsets:
-                                raw_message_start_offsets.pop()
-                            if raw_message_end_offsets:
-                                raw_message_end_offsets.pop()
-                            if raw_message_token_snapshots:
-                                raw_message_token_snapshots.pop()
+                        state.retry_candidate_replaced = True
+            if (
+                capture_raw_offsets
+                and replaced_retry_user
+                and raw_message_end_offsets
+            ):
+                raw_message_end_offsets[-1] = int(parse_snapshot["record_end"])
             if capture_raw_offsets and len(state.messages) > before_messages:
                 added_messages = len(state.messages) - before_messages
                 raw_message_start_offsets.extend(
@@ -3350,7 +3367,9 @@ def _handle_codex_session_meta(
                 state.metadata["fork_source"] = thread_source.strip()
             nickname = payload.get("agent_nickname")
             if isinstance(nickname, str) and nickname.strip():
-                state.metadata["fork_nickname"] = nickname.strip()
+                cleaned_nickname = anonymizer.text(nickname.strip())
+                cleaned_nickname, _, _ = redact_text(cleaned_nickname)
+                state.metadata["fork_nickname"] = cleaned_nickname
 
 
 def _handle_codex_turn_context(
@@ -3426,20 +3445,124 @@ def _handle_codex_token_count(state: _CodexParseState, payload: dict[str, Any]) 
             state.max_cached_tokens = max(state.max_cached_tokens, cached_tokens)
 
 
+def _codex_user_message_parts(
+    payload: dict[str, Any], anonymizer: Anonymizer,
+) -> tuple[str, str] | None:
+    content = payload.get("message")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    raw_content = content.strip()
+    raw_identity = json.dumps(
+        {
+            "message": raw_content,
+            "images": payload.get("images") or [],
+            "local_images": payload.get("local_images") or [],
+            "text_elements": payload.get("text_elements") or [],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    input_hash = hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
+    return anonymizer.text(raw_content), input_hash
+
+
+def _clear_codex_retry_candidate(state: _CodexParseState) -> None:
+    state.retry_candidate_index = None
+    state.retry_candidate_replaced = False
+    state.retry_candidate_input_hash = None
+
+
+def _mark_codex_retry_candidate(
+    state: _CodexParseState, terminal: str, payload: dict[str, Any],
+) -> None:
+    """Remember an output-free turn without deleting its prompt yet."""
+    if (
+        not state.messages
+        or state.messages[-1].get("role") != "user"
+        or state.pending_tool_uses
+        or state.pending_thinking
+    ):
+        _clear_codex_retry_candidate(state)
+        return
+    last_agent_message = payload.get("last_agent_message")
+    if isinstance(last_agent_message, str) and last_agent_message.strip():
+        _clear_codex_retry_candidate(state)
+        return
+
+    candidate_index = len(state.messages) - 1
+    if state.retry_candidate_index != candidate_index:
+        state.retry_candidate_index = candidate_index
+        state.retry_candidate_replaced = False
+        state.retry_candidate_input_hash = state.last_user_input_hash
+    if terminal == "turn_aborted" and payload.get("reason") == "replaced":
+        state.retry_candidate_replaced = True
+
+
+def _replace_codex_retry_user_message(
+    state: _CodexParseState,
+    payload: dict[str, Any],
+    timestamp: str | None,
+    anonymizer: Anonymizer,
+) -> bool:
+    """Replace a confirmed retry in place, preserving its raw start boundary."""
+    candidate_index = state.retry_candidate_index
+    if candidate_index is None:
+        return False
+    replacement_parts = _codex_user_message_parts(payload, anonymizer)
+    if replacement_parts is None:
+        return False
+    replacement, replacement_hash = replacement_parts
+    if (
+        candidate_index != len(state.messages) - 1
+        or state.messages[candidate_index].get("role") != "user"
+    ):
+        _clear_codex_retry_candidate(state)
+        return False
+
+    should_replace = (
+        state.retry_candidate_replaced
+        or state.retry_candidate_input_hash == replacement_hash
+    )
+    _clear_codex_retry_candidate(state)
+    if not should_replace:
+        return False
+
+    # Mutating the existing slot keeps its first-attempt raw start offset.  A
+    # sealed segment immediately before this turn therefore keeps the exact
+    # same byte boundary as the rollout grows from user -> abort -> retry.
+    previous_timestamp = state.messages[candidate_index].get("timestamp")
+    state.messages[candidate_index]["content"] = replacement
+    if timestamp is not None:
+        state.messages[candidate_index]["timestamp"] = timestamp
+        if state.metadata.get("start_time") == previous_timestamp:
+            timestamps = [
+                message.get("timestamp")
+                for message in state.messages
+                if isinstance(message.get("timestamp"), str)
+            ]
+            state.metadata["start_time"] = min(timestamps, default=timestamp)
+    state.last_user_input_hash = replacement_hash
+    _update_time_bounds(state.metadata, timestamp)
+    return True
+
+
 def _handle_codex_user_message(
     state: _CodexParseState, payload: dict[str, Any],
     timestamp: str | None, anonymizer: Anonymizer,
 ) -> None:
     _flush_codex_pending(state, timestamp)
-    content = payload.get("message")
-    if isinstance(content, str) and content.strip():
+    message_parts = _codex_user_message_parts(payload, anonymizer)
+    if message_parts is not None:
+        content, input_hash = message_parts
         state.messages.append(
             {
                 "role": "user",
-                "content": anonymizer.text(content.strip()),
+                "content": content,
                 "timestamp": timestamp,
             }
         )
+        state.last_user_input_hash = input_hash
         state.stats["user_messages"] += 1
         _update_time_bounds(state.metadata, timestamp)
 

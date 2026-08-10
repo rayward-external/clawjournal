@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..session_titles import resolve_session_title
 from ..workbench.index import FAILURE_VALUE_SOURCE_SCOPE
 
 DEFAULT_WINDOW_DAYS = 7
@@ -92,7 +93,8 @@ def select_week_failures(
     sql = (
         "SELECT session_id, project, source, ai_failure_value_score, ai_failure_modes, "
         "ai_failure_attribution, ai_recovery_labels, ai_learning_summary, ai_score_reason, "
-        "ai_summary, COALESCE(ai_display_title, display_title) AS title, blob_path, start_time "
+        "ai_summary, ai_display_title, display_title, fork_of, fork_nickname, "
+        "blob_path, start_time "
         "FROM sessions WHERE start_time >= ? AND review_status != 'segmented' "
         "AND (ai_failure_value_score >= 3 OR (ai_failure_modes IS NOT NULL "
         "AND json_valid(ai_failure_modes) AND json_array_length(ai_failure_modes) > 0))"
@@ -124,7 +126,7 @@ def select_week_failures(
                 learning_summary=learning,
                 score_reason=reason,
                 summary=row["ai_summary"],
-                title=row["title"],
+                title=resolve_session_title(dict(row), fallback=row["session_id"]),
                 blob_path=row["blob_path"],
                 start_time=row["start_time"],
                 has_trace_evidence=has_evidence,

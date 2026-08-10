@@ -157,6 +157,15 @@ class TestComputeFindingsRevision:
         rev2 = compute_findings_revision(self._session(project="p2"))
         assert rev1 != rev2
 
+    def test_fork_nickname_change_flips_revision(self):
+        rev1 = compute_findings_revision(
+            self._session(fork_nickname="Kierkegaard")
+        )
+        rev2 = compute_findings_revision(
+            self._session(fork_nickname="Nietzsche")
+        )
+        assert rev1 != rev2
+
     def test_betterleaks_fingerprint_participates(self, monkeypatch):
         # Installing/upgrading the betterleaks binary must invalidate
         # cached findings, same as the trufflehog fingerprint fold.

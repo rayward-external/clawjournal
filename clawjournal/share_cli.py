@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
+from .session_titles import append_fork_title_suffix, resolve_session_title
 from .scoring.backends import (
     default_model_for_backend,
     installed_fallback_chain,
@@ -137,10 +138,9 @@ def user_prompt_title(conn, row: dict) -> str | None:
 
 
 def resolve_title(r: dict, summarized: bool) -> str:
-    raw = (r.get("display_title") or "").strip().replace("\n", " ") or "Untitled"
-    if summarized:
-        return (r.get("ai_display_title") or "").strip() or raw
-    return raw
+    return resolve_session_title(
+        r, prefer_ai=summarized, fallback="Untitled"
+    ).replace("\n", " ")
 
 
 def trace_title(r: dict, width: int = 52) -> str:
@@ -578,7 +578,9 @@ def step_queue(conn, settings, args) -> list[dict]:
     for r in rows:
         title = resolve_title(r, do_summary)
         if not do_summary and _looks_like_system_prompt(title):
-            title = user_prompt_title(conn, r) or title
+            replacement = user_prompt_title(conn, r)
+            if replacement:
+                title = append_fork_title_suffix(replacement, r)
         r["_clawshare_title"] = title
 
     print(f"\n  {'#':>3}  {'Fail':>4} {'Last turn':<11} {'Source':<8} {'Msgs':>5} "

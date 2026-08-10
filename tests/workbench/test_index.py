@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from clawjournal.session_titles import resolve_session_title
 from clawjournal.workbench.index import (
     _migrate_bundles_to_shares,
     add_policy,
@@ -151,6 +152,30 @@ class TestUpsertSessions:
             "SELECT display_title FROM sessions WHERE session_id = 'sess-1'"
         ).fetchone()
         assert "fork" not in row["display_title"]
+
+    def test_metadata_only_fork_reindex_keeps_effective_ai_title(self, index_conn):
+        session = _make_session("fork-child-9976", source="codex")
+        upsert_sessions(index_conn, [session])
+        update_session(
+            index_conn,
+            "fork-child-9976",
+            ai_display_title="AI title",
+        )
+
+        enriched = _make_session("fork-child-9976", source="codex")
+        enriched["fork_of"] = "parent-thread-id"
+        enriched["fork_nickname"] = "Kierkegaard"
+        upsert_sessions(index_conn, [enriched])
+
+        row = index_conn.execute(
+            "SELECT session_id, display_title, ai_display_title, "
+            "fork_of, fork_nickname FROM sessions "
+            "WHERE session_id = 'fork-child-9976'"
+        ).fetchone()
+        assert row["ai_display_title"] == "AI title"
+        assert resolve_session_title(dict(row)) == (
+            "AI title · fork: Kierkegaard"
+        )
 
     @pytest.mark.parametrize("status", ["approved", "blocked"])
     def test_upsert_preserves_review_status(self, index_conn, status):

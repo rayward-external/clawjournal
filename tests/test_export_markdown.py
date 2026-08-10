@@ -2,7 +2,7 @@
 
 import json
 
-from clawjournal.export.markdown import render_session_summary
+from clawjournal.export.markdown import render_session_markdown, render_session_summary
 
 
 def _summary_session(**overrides):
@@ -47,3 +47,18 @@ def test_summary_omits_failure_analysis_without_failure_data():
     text = render_session_summary(_summary_session())
 
     assert "## Failure Analysis" not in text
+
+
+def test_markdown_renderers_label_ai_title_for_fork_once():
+    session = _summary_session(
+        session_id="fork-child-9976",
+        display_title="Raw title · fork: Kierkegaard",
+        ai_display_title="AI title",
+        fork_of="parent-thread-id",
+        fork_nickname="Kierkegaard",
+        messages=[],
+    )
+
+    for rendered in (render_session_markdown(session), render_session_summary(session)):
+        assert rendered.startswith("# AI title · fork: Kierkegaard\n")
+        assert rendered.count(" · fork: Kierkegaard") == 1

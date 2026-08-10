@@ -19,6 +19,7 @@ from clawjournal.redaction.secrets import (
     redact_session,
     scan_session_for_findings,
 )
+from clawjournal.session_titles import resolve_session_title
 from clawjournal.workbench.index import open_index, upsert_sessions
 
 
@@ -198,6 +199,37 @@ def _field_text(blob, finding):
 
 
 class TestApplyFindingsToBlob:
+    def test_fork_nickname_secret_cannot_reappear_in_resolved_title(self, conn):
+        session = _session_with_secrets()
+        session.update({
+            "ai_display_title": "AI title",
+            "display_title": "Raw title",
+            "fork_of": "parent-thread-id",
+            "fork_nickname": _FAKE_GITHUB,
+        })
+
+        legacy_blob, legacy_count, _ = redact_session(copy.deepcopy(session))
+        assert legacy_count >= 1
+        assert legacy_blob["fork_nickname"] != _FAKE_GITHUB
+        assert _FAKE_GITHUB not in resolve_session_title(legacy_blob)
+
+        _seed_session_row(conn)
+        raw = scan_session_for_findings(session)
+        assert any(
+            finding.field == "fork_nickname"
+            and finding.entity_text == _FAKE_GITHUB
+            for finding in raw
+        )
+        write_findings_to_db(conn, "sess-1", raw, revision="v1:fork-title")
+        conn.commit()
+
+        db_blob, db_count = apply_findings_to_blob(
+            copy.deepcopy(session), conn, "sess-1",
+        )
+        assert db_count >= 1
+        assert db_blob["fork_nickname"] != _FAKE_GITHUB
+        assert _FAKE_GITHUB not in resolve_session_title(db_blob)
+
     def test_byte_equivalent_to_redact_session_all_accept(self, conn):
         """When every finding is open/accepted, DB-backed apply matches legacy."""
         _seed_session_row(conn)

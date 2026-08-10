@@ -25,6 +25,7 @@ from clawjournal.redaction.pii import (
     review_session_pii_with_agent,
     write_findings,
 )
+from clawjournal.session_titles import resolve_session_title
 
 
 def test_replacement_for_type_defaults():
@@ -129,6 +130,30 @@ def test_apply_findings_to_session_redacts_scoring_text():
     assert "Jane D" not in redacted["ai_learning_summary"]
     assert "Jane D" not in detail["reasoning"]
     assert "Jane D" not in detail["ai_failure_evidence"][0]
+
+
+def test_fork_nickname_pii_cannot_reappear_in_resolved_title():
+    email = "alice.private@example.com"
+    session = {
+        "session_id": "fork-child-9976",
+        "display_title": "Raw title",
+        "ai_display_title": "AI title",
+        "fork_of": "parent-thread-id",
+        "fork_nickname": email,
+        "messages": [],
+    }
+
+    findings = review_session_pii(session)
+    assert any(
+        finding["field"] == "fork_nickname"
+        and finding["entity_text"] == email
+        for finding in findings
+    )
+
+    redacted, count = apply_findings_to_session(session, findings)
+    assert count >= 1
+    assert redacted["fork_nickname"] != email
+    assert email not in resolve_session_title(redacted)
 
 
 def test_collect_text_work_items_includes_scoring_text():

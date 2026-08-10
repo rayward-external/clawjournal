@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from ..benchmark.select import _parse_json_list
+from ..session_titles import resolve_session_title
 from ..workbench.index import (
     FAILURE_VALUE_SOURCE_SCOPE,
     release_gate_blockers,
@@ -236,7 +237,7 @@ def select_skill_candidates(
         "session_id, project, source, ai_failure_value_score, ai_quality_score, "
         "ai_failure_modes, ai_recovery_labels, ai_outcome_badge, "
         "ai_learning_summary, ai_score_reason, "
-        "COALESCE(ai_display_title, display_title) AS title, start_time"
+        "ai_display_title, display_title, fork_of, fork_nickname, start_time"
     )
     base = f"FROM sessions WHERE start_time >= ? AND review_status != 'segmented'{src_clause}"
 
@@ -326,7 +327,8 @@ def select_skill_candidates(
             resolution=row["ai_outcome_badge"], failure_value=row["ai_failure_value_score"],
             quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
             score_reason=row["ai_score_reason"],
-            title=row["title"], start_time=row["start_time"],
+            title=resolve_session_title(dict(row), fallback=row["session_id"]),
+            start_time=row["start_time"],
             support_count=support, impact=impact, recency=recency,
             rank_score=_candidate_rank(support=support, impact=impact, recency=recency,
                                        corrections=len(excerpts)),
@@ -368,7 +370,8 @@ def select_skill_candidates(
             resolution=row["ai_outcome_badge"], failure_value=row["ai_failure_value_score"],
             quality=row["ai_quality_score"], learning_summary=row["ai_learning_summary"],
             score_reason=row["ai_score_reason"],
-            title=row["title"], start_time=row["start_time"],
+            title=resolve_session_title(dict(row), fallback=row["session_id"]),
+            start_time=row["start_time"],
             support_count=support, impact=impact, recency=recency,
             rank_score=_candidate_rank(support=support, impact=impact, recency=recency,
                                        corrections=len(excerpts)),
