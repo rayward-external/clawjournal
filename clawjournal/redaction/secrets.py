@@ -683,7 +683,7 @@ def _collect_all_text(session: dict) -> list[tuple[str, str, int | None, str | N
     """
     texts: list[tuple[str, str, int | None, str | None]] = []
 
-    for field in ("display_title", "project", "git_branch"):
+    for field in ("display_title", "project", "git_branch", "fork_nickname"):
         val = session.get(field)
         if val and isinstance(val, str):
             texts.append((val, field, None, None))
@@ -918,7 +918,7 @@ def redact_session(
         # Step 3: Apply typed redaction map across all fields
         pass_count = 0
 
-        for field in ("display_title", "project", "git_branch"):
+        for field in ("display_title", "project", "git_branch", "fork_nickname"):
             if session.get(field) and isinstance(session[field], str):
                 session[field], n = _apply_redaction_set(session[field], secret_map)
                 pass_count += n
@@ -965,15 +965,15 @@ def _iter_text_locations(
 
     Field-name convention matches `derive_preview`'s parser in
     findings.py: top-level fields use their own name (`display_title`,
-    `project`, `git_branch`); per-message string fields use `content`
-    or `thinking`; tool_use strings use `tool_uses[<idx>].<branch>` or
+    `project`, `git_branch`, `fork_nickname`); per-message string fields
+    use `content` or `thinking`; tool_use strings use `tool_uses[<idx>].<branch>` or
     `tool_uses[<idx>].<branch>.<key>` when nested under a dict.
     """
     # (text, field, message_index, tool_field)
     # parent_path / parent_key indicate how to write back; emitted as
     # (text, field, message_index, tool_field, "write_kind", "write_key")
     # where write_kind ∈ {"top", "msg", "tool_str", "tool_dict"}.
-    for field in ("display_title", "project", "git_branch"):
+    for field in ("display_title", "project", "git_branch", "fork_nickname"):
         val = session.get(field)
         if isinstance(val, str) and val:
             yield val, field, None, None, "top", field
@@ -1193,7 +1193,7 @@ def apply_findings_to_blob(
             break
 
         pass_count = 0
-        for field in ("display_title", "project", "git_branch"):
+        for field in ("display_title", "project", "git_branch", "fork_nickname"):
             val = blob.get(field)
             if isinstance(val, str) and val:
                 blob[field], n = _apply_redaction_set(val, secret_map)

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from clawjournal.session_titles import resolve_session_title
 from clawjournal.workbench.index import (
     _migrate_bundles_to_shares,
     add_policy,
@@ -113,6 +114,68 @@ class TestUpsertSessions:
         assert blob_path.name.startswith("session-")
         assert get_session_detail(index_conn, session_id)["messages"]
         assert not (tmp_path / "outside-the-blob-directory.json").exists()
+
+    def test_fork_provenance_stored_and_title_labeled(self, index_conn):
+        session = _make_session("fork-child-9976", source="codex")
+        session["fork_of"] = "parent-thread-id"
+        session["fork_source"] = "subagent"
+        session["fork_nickname"] = "Kierkegaard"
+
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT fork_of, fork_source, fork_nickname, display_title "
+            "FROM sessions WHERE session_id = 'fork-child-9976'"
+        ).fetchone()
+        assert row["fork_of"] == "parent-thread-id"
+        assert row["fork_source"] == "subagent"
+        assert row["fork_nickname"] == "Kierkegaard"
+        assert row["display_title"].endswith("· fork: Kierkegaard")
+
+    def test_fork_without_nickname_falls_back_to_short_id(self, index_conn):
+        session = _make_session("fork-child-9976_seg-0002", source="codex")
+        session["fork_of"] = "parent-thread-id"
+
+        upsert_sessions(index_conn, [session])
+
+        row = index_conn.execute(
+            "SELECT display_title FROM sessions "
+            "WHERE session_id = 'fork-child-9976_seg-0002'"
+        ).fetchone()
+        # Label derives from the fork file's own id (stable), not the
+        # segment suffix and not a scan-order-dependent counter.
+        assert row["display_title"].endswith("· fork: 9976")
+
+    def test_non_fork_title_is_not_decorated(self, index_conn):
+        upsert_sessions(index_conn, [_make_session()])
+        row = index_conn.execute(
+            "SELECT display_title FROM sessions WHERE session_id = 'sess-1'"
+        ).fetchone()
+        assert "fork" not in row["display_title"]
+
+    def test_metadata_only_fork_reindex_keeps_effective_ai_title(self, index_conn):
+        session = _make_session("fork-child-9976", source="codex")
+        upsert_sessions(index_conn, [session])
+        update_session(
+            index_conn,
+            "fork-child-9976",
+            ai_display_title="AI title",
+        )
+
+        enriched = _make_session("fork-child-9976", source="codex")
+        enriched["fork_of"] = "parent-thread-id"
+        enriched["fork_nickname"] = "Kierkegaard"
+        upsert_sessions(index_conn, [enriched])
+
+        row = index_conn.execute(
+            "SELECT session_id, display_title, ai_display_title, "
+            "fork_of, fork_nickname FROM sessions "
+            "WHERE session_id = 'fork-child-9976'"
+        ).fetchone()
+        assert row["ai_display_title"] == "AI title"
+        assert resolve_session_title(dict(row)) == (
+            "AI title · fork: Kierkegaard"
+        )
 
     @pytest.mark.parametrize("status", ["approved", "blocked"])
     def test_upsert_preserves_review_status(self, index_conn, status):

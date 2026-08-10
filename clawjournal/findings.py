@@ -40,16 +40,10 @@ from typing import Any, TypedDict
 from .config import mark_auto_upload_profile_changed
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 2  # round-4 bump: A2 added stripe_key, stripe_webhook_secret,
-                    # and bearer_generic patterns + tightened the JWT bearer
-                    # regex (`\b` prefix, case-insensitive keyword). Old
-                    # findings rows for sessions scanned with ENGINE_VERSION=1
-                    # missed these, so revision drift from this constant
-                    # forces a re-scan via `compute_findings_revision` next
-                    # time the session settles. `apply_findings_to_blob`
-                    # already re-scans live at share time, so the bump is
-                    # about the user-facing review UI showing accurate
-                    # findings counts on pre-A2 sessions.
+ENGINE_VERSION = 3  # Include fork_nickname in every session-level findings
+                    # scanner/apply path. Version 2 caches could not contain
+                    # findings from that metadata field, so force one rebuild
+                    # even when the transcript content itself is unchanged.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 
@@ -211,8 +205,9 @@ def compute_findings_revision(
 
     Inputs pinned per spec: ENGINE_VERSION, ENABLED_ENGINES,
     config.allowlist_entries (canonical JSON), display_title, project,
-    git_branch, then per-message role/content/thinking, then per-tool
-    tool/input/output. Any change flips the revision and forces rebuild.
+    git_branch, fork_nickname, then per-message role/content/thinking,
+    then per-tool tool/input/output. Any change flips the revision and
+    forces rebuild.
     """
     enabled = get_enabled_engines(config)
     parts: list[str] = [
@@ -222,6 +217,7 @@ def compute_findings_revision(
         f"display_title={session.get('display_title') or ''}",
         f"project={session.get('project') or ''}",
         f"git_branch={session.get('git_branch') or ''}",
+        f"fork_nickname={session.get('fork_nickname') or ''}",
     ]
     # Fold the scanner binary fingerprints into the revision so
     # installing a binary (or upgrading it) automatically invalidates
@@ -986,7 +982,7 @@ def apply_findings_to_session(
         return session, 0
 
     for meta_field in (
-        "project", "git_branch", "display_title",
+        "project", "git_branch", "display_title", "fork_nickname",
         "ai_learning_summary", "ai_score_reason", "ai_display_title",
         "ai_summary",
     ):

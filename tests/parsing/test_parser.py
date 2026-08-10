@@ -1059,6 +1059,174 @@ class TestDiscoverProjects:
         assert second[0]["_raw_source_fingerprint"] == first_fingerprint
         assert [item["segment_sealed"] for item in second] == [True, True, False]
 
+    def test_codex_retry_keeps_sealed_segment_stable_across_appends(
+        self, tmp_path, monkeypatch, mock_anonymizer
+    ):
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.PROJECTS_DIR",
+            tmp_path / "projects" / "nonexistent",
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
+        codex_sessions = tmp_path / "codex-sessions" / "2026" / "08" / "01"
+        codex_sessions.mkdir(parents=True)
+        session_file = codex_sessions / "rollout-retry-boundary.jsonl"
+        cwd = "/home/user/retry-repo"
+        lines = [
+            {
+                "timestamp": "2026-08-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "retry-boundary",
+                    "cwd": cwd,
+                    "model_provider": "openai",
+                },
+            },
+            {
+                "timestamp": "2026-08-01T00:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": cwd, "model": "gpt-test"},
+            },
+        ]
+        for turn in range(20):
+            lines.extend([
+                {
+                    "timestamp": f"2026-08-01T00:{turn:02d}:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": f"question {turn}",
+                    },
+                },
+                {
+                    "timestamp": f"2026-08-01T00:{turn:02d}:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": f"answer {turn}",
+                    },
+                },
+            ])
+        encoded_prefix = "".join(
+            json.dumps(line) + "\n" for line in lines
+        ).encode("utf-8")
+        open_user = {
+            "timestamp": "2026-08-01T00:20:02Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "retry me"},
+        }
+        session_file.write_bytes(
+            encoded_prefix + (json.dumps(open_user) + "\n").encode("utf-8")
+        )
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.CODEX_SESSIONS_DIR",
+            tmp_path / "codex-sessions",
+        )
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.CODEX_ARCHIVED_DIR",
+            tmp_path / "codex-archived",
+        )
+
+        def parse():
+            return parse_project_sessions(
+                cwd, mock_anonymizer, source="codex", strict_jsonl=True
+            )
+
+        def sealed_projection(session):
+            return {
+                key: session.get(key)
+                for key in (
+                    "messages",
+                    "stats",
+                    "start_time",
+                    "end_time",
+                    "raw_source_start_offset",
+                    "raw_source_end_offset",
+                    "_raw_source_fingerprint",
+                )
+            }
+
+        def append_events(*events):
+            with session_file.open("ab") as handle:
+                for event in events:
+                    handle.write((json.dumps(event) + "\n").encode("utf-8"))
+
+        first = parse()
+        assert [item["segment_sealed"] for item in first] == [True, False]
+        assert first[0]["raw_source_end_offset"] == len(encoded_prefix)
+        assert [message["content"] for message in first[1]["messages"]] == [
+            "retry me"
+        ]
+        sealed_before_retry = sealed_projection(first[0])
+
+        append_events(
+            {
+                "timestamp": "2026-08-01T00:20:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 120,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 10,
+                        }
+                    },
+                },
+            },
+            {
+                "timestamp": "2026-08-01T00:20:04Z",
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "reason": "interrupted"},
+            },
+        )
+        after_abort = parse()
+        assert sealed_projection(after_abort[0]) == sealed_before_retry
+        assert [message["content"] for message in after_abort[1]["messages"]] == [
+            "retry me"
+        ]
+
+        append_events({
+            "timestamp": "2026-08-01T00:20:05Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "retry me"},
+        })
+        after_retry = parse()
+        assert sealed_projection(after_retry[0]) == sealed_before_retry
+        assert [message["content"] for message in after_retry[1]["messages"]] == [
+            "retry me"
+        ]
+
+        append_events(
+            {
+                "timestamp": "2026-08-01T00:20:06Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "done"},
+            },
+            {
+                "timestamp": "2026-08-01T00:20:07Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 250,
+                            "cached_input_tokens": 50,
+                            "output_tokens": 40,
+                        }
+                    },
+                },
+            },
+        )
+        completed = parse()
+        assert sealed_projection(completed[0]) == sealed_before_retry
+        assert [message["role"] for message in completed[1]["messages"]] == [
+            "user",
+            "assistant",
+        ]
+        assert sum(item["stats"]["input_tokens"] for item in completed) == 200
+        assert sum(item["stats"]["cache_read_tokens"] for item in completed) == 50
+        assert sum(item["stats"]["output_tokens"] for item in completed) == 40
+
     def test_codex_thinking_not_duplicated(self, tmp_path, monkeypatch, mock_anonymizer):
         """Reasoning from response_item and agent_reasoning event_msg should not duplicate."""
         monkeypatch.setattr("clawjournal.parsing.parser.PROJECTS_DIR", tmp_path / "projects" / "nonexistent")
@@ -1264,6 +1432,416 @@ class TestDiscoverProjects:
         assert result["stats"]["input_tokens"] == 250
         assert result["stats"]["output_tokens"] == 40
         assert result["stats"]["cache_read_tokens"] == 50
+
+    def _write_codex_rollout(self, tmp_path, events):
+        session_file = tmp_path / "rollout-aborted.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-01T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": "session-aborted", "cwd": "/repo"},
+            },
+            *events,
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+        return session_file
+
+    @staticmethod
+    def _codex_event(
+        event_type, timestamp="2026-08-01T10:00:01.000Z", **payload
+    ):
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": event_type, **payload},
+        }
+
+    def test_codex_turn_aborted_deduplicates_confirmed_retries(
+        self, tmp_path, mock_anonymizer
+    ):
+        """Explicit replacements reuse one logical message and raw boundary."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event(
+                "user_message",
+                timestamp="2026-08-01T10:00:01.000Z",
+                message="review the paper",
+            ),
+            self._codex_event(
+                "turn_aborted",
+                timestamp="2026-08-01T10:00:02.000Z",
+                reason="interrupted",
+            ),
+            {
+                "timestamp": "2026-08-01T10:00:02.500Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "review the paper"}
+                    ],
+                },
+            },
+            self._codex_event(
+                "user_message",
+                timestamp="2026-08-01T10:00:03.000Z",
+                message="review the paper",
+            ),
+            self._codex_event(
+                "turn_aborted",
+                timestamp="2026-08-01T10:00:04.000Z",
+                reason="interrupted",
+            ),
+            self._codex_event(
+                "thread_rolled_back",
+                timestamp="2026-08-01T10:00:04.500Z",
+                num_turns=1,
+            ),
+            self._codex_event(
+                "user_message",
+                timestamp="2026-08-01T10:00:05.000Z",
+                message="review the paper.",
+            ),
+            self._codex_event(
+                "agent_message",
+                timestamp="2026-08-01T10:00:06.000Z",
+                message="Reviewing now.",
+            ),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+            capture_raw_offsets=True,
+        )
+
+        assert result is not None
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "review the paper."),
+            ("assistant", "Reviewing now."),
+        ]
+        assert result["stats"]["user_messages"] == 1
+        assert result["stats"]["assistant_messages"] == 1
+        assert result["messages"][0]["timestamp"] == "2026-08-01T10:00:05.000Z"
+        assert result["start_time"] == result["messages"][0]["timestamp"]
+        assert result["end_time"] == result["messages"][1]["timestamp"]
+        # The parallel raw-offset/token arrays stay aligned while the retained
+        # slot keeps the first attempt's start boundary.
+        assert len(result["_raw_message_start_offsets"]) == 2
+        assert len(result["_raw_message_end_offsets"]) == 2
+        assert len(result["_raw_message_token_snapshots"]) == 2
+        assert result["_raw_message_start_offsets"][0] < result["_raw_message_end_offsets"][0]
+
+    def test_codex_turn_aborted_keeps_answered_user_message(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="review the paper"),
+            self._codex_event("agent_message", message="Halfway done..."),
+            self._codex_event("turn_aborted"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [m["role"] for m in result["messages"]] == ["user", "assistant"]
+        assert result["stats"]["user_messages"] == 1
+
+    @pytest.mark.parametrize("terminal", ["turn_aborted", "task_complete"])
+    def test_codex_output_free_terminal_at_eof_keeps_user_message(
+        self, tmp_path, mock_anonymizer, terminal
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="never answered"),
+            self._codex_event(terminal),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+            capture_raw_offsets=True,
+        )
+
+        assert result is not None
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "never answered"),
+        ]
+        assert result["stats"]["user_messages"] == 1
+        assert len(result["_raw_message_start_offsets"]) == 1
+        assert len(result["_raw_message_end_offsets"]) == 1
+        assert len(result["_raw_message_token_snapshots"]) == 1
+
+    def test_codex_abort_before_different_prompt_keeps_both(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="review the paper"),
+            self._codex_event("turn_aborted", reason="interrupted"),
+            self._codex_event("user_message", message="write a release note"),
+            self._codex_event("agent_message", message="Writing it now."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "review the paper"),
+            ("user", "write a release note"),
+            ("assistant", "Writing it now."),
+        ]
+        assert result["stats"]["user_messages"] == 2
+
+    def test_codex_same_text_with_different_attachment_is_not_a_retry(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event(
+                "user_message", message="review this", local_images=["first.png"]
+            ),
+            self._codex_event("turn_aborted", reason="interrupted"),
+            self._codex_event(
+                "user_message", message="review this", local_images=["second.png"]
+            ),
+            self._codex_event("agent_message", message="Done."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [message.get("content") for message in result["messages"]] == [
+            "review this",
+            "review this",
+            "Done.",
+        ]
+
+    def test_codex_multi_turn_rollback_does_not_replace_one_candidate(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="original prompt"),
+            self._codex_event("task_complete"),
+            self._codex_event("thread_rolled_back", num_turns=2),
+            self._codex_event("user_message", message="edited prompt"),
+            self._codex_event("agent_message", message="Done."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [message.get("content") for message in result["messages"]] == [
+            "original prompt",
+            "edited prompt",
+            "Done.",
+        ]
+
+    def test_codex_terminal_with_last_agent_message_clears_retry_candidate(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="same prompt"),
+            self._codex_event("turn_aborted", reason="interrupted"),
+            self._codex_event(
+                "task_complete", last_agent_message="Completed out of band."
+            ),
+            self._codex_event("user_message", message="same prompt"),
+            self._codex_event("agent_message", message="Done."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [message.get("content") for message in result["messages"]] == [
+            "same prompt",
+            "same prompt",
+            "Done.",
+        ]
+
+    def test_codex_parser_captures_fork_provenance(self, tmp_path, mock_anonymizer):
+        session_file = tmp_path / "rollout-fork.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-01T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "fork-child-id",
+                    "session_id": "parent-thread-id",
+                    "forked_from_id": "parent-thread-id",
+                    "parent_thread_id": "parent-thread-id",
+                    "thread_source": "subagent",
+                    "agent_nickname": "Kierkegaard",
+                    "cwd": "/repo",
+                },
+            },
+            self._codex_event("user_message", message="hello"),
+            self._codex_event("agent_message", message="hi"),
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert result["session_id"] == "fork-child-id"
+        assert result["fork_of"] == "parent-thread-id"
+        assert result["fork_source"] == "subagent"
+        assert result["fork_nickname"] == "Kierkegaard"
+
+    def test_codex_parser_redacts_secret_in_fork_nickname(
+        self, tmp_path, mock_anonymizer
+    ):
+        token = "ghp_" + "a" * 36
+        session_file = tmp_path / "rollout-fork-secret.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-01T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "fork-child-secret",
+                    "forked_from_id": "parent-thread-id",
+                    "agent_nickname": token,
+                    "cwd": "/repo",
+                },
+            },
+            self._codex_event("user_message", message="hello"),
+            self._codex_event("agent_message", message="hi"),
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert token not in result["fork_nickname"]
+        assert result["fork_nickname"] == "[REDACTED_GITHUB_TOKEN]"
+
+    def test_codex_parser_plain_session_has_no_fork_fields(
+        self, tmp_path, mock_anonymizer
+    ):
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="hello"),
+            self._codex_event("agent_message", message="hi"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert "fork_of" not in result
+        assert "fork_source" not in result
+        assert "fork_nickname" not in result
+
+    def test_codex_empty_completed_turn_drops_resent_user_message(
+        self, tmp_path, mock_anonymizer
+    ):
+        """Rollback / edit-and-resend re-logs the message after a task_complete
+        with no output at all; only the finally answered copy should remain."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="rename the aliases"),
+            self._codex_event("task_complete"),
+            self._codex_event("user_message", message="rename the aliases"),
+            self._codex_event("task_complete"),
+            self._codex_event("thread_rolled_back", num_turns=1),
+            self._codex_event("user_message", message="rename the aliases, please"),
+            self._codex_event("agent_message", message="Renaming."),
+            self._codex_event("task_complete"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "rename the aliases, please"),
+            ("assistant", "Renaming."),
+        ]
+
+    def test_codex_turn_aborted_keeps_user_message_when_tools_ran(
+        self, tmp_path, mock_anonymizer
+    ):
+        """An abort after the model already did work (pending tool call, no
+        final message yet) must not delete the prompt that produced it."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event("user_message", message="apply the patch"),
+            {
+                "timestamp": "2026-08-01T10:00:02.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\": [\"ls\"]}",
+                    "call_id": "call-1",
+                },
+            },
+            self._codex_event("turn_aborted"),
+            self._codex_event("user_message", message="continue"),
+            self._codex_event("agent_message", message="Done."),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        roles = [m["role"] for m in result["messages"]]
+        assert roles == ["user", "assistant", "user", "assistant"]
+        assert result["messages"][0]["content"] == "apply the patch"
 
     def test_claude_parser_captures_per_message_token_snapshots(
         self, tmp_path, mock_anonymizer

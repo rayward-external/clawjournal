@@ -407,6 +407,7 @@ def _iter_session_level_text_locations(session: dict[str, Any]) -> Iterable[tupl
         "project",
         "git_branch",
         "display_title",
+        "fork_nickname",
         "ai_learning_summary",
         "ai_score_reason",
         "ai_display_title",

@@ -377,6 +377,23 @@ def test_resolve_title_modes():
     assert share_cli.resolve_title({"display_title": "x"}, True) == "x"  # falls back when no AI title
 
 
+def test_resolve_title_labels_raw_cached_ai_title_for_fork_once():
+    row = {
+        "session_id": "fork-child-9976",
+        "display_title": "raw first msg · fork: Kierkegaard",
+        "ai_display_title": "Cached AI title",
+        "fork_of": "parent-thread-id",
+        "fork_nickname": "Kierkegaard",
+    }
+
+    assert share_cli.resolve_title(row, summarized=False) == (
+        "raw first msg · fork: Kierkegaard"
+    )
+    assert share_cli.resolve_title(row, summarized=True) == (
+        "Cached AI title · fork: Kierkegaard"
+    )
+
+
 def test_looks_like_system_prompt():
     assert share_cli._looks_like_system_prompt("You are a strict evaluation judge")
     assert share_cli._looks_like_system_prompt("Your task is to ...")

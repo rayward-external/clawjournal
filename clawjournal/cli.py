@@ -7258,6 +7258,7 @@ def _run_export(args) -> None:
     export_format = getattr(args, "format", "jsonl")
     if export_format in ("md", "md-summary"):
         from .export.markdown import render_session_markdown, render_session_summary
+        from .session_titles import resolve_session_title
 
         output_dir = args.output or Path("clawjournal_markdown_export")
         if output_dir.is_file():
@@ -7292,7 +7293,9 @@ def _run_export(args) -> None:
                 safe_id = re.sub(r"[^\w\-]", "_", safe_id)
                 md_path = output_dir / f"{safe_id}.md"
                 md_path.write_text(md_content)
-                title = session.get("display_title", safe_id)
+                title = resolve_session_title(
+                    session, prefer_ai=False, fallback=safe_id,
+                )
                 index_lines.append(f"- [{title}]({safe_id}.md)")
                 count += 1
 

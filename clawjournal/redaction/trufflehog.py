@@ -693,7 +693,9 @@ def _iter_session_text_fields(session: dict, *, include_widened: bool = False):
     widened values would push big sessions past the engine's size cap."""
     from ..parsing.widened import iter_widened_text_locations  # noqa: PLC0415 — lazy
 
-    for field_name in ("display_title", "project", "git_branch"):
+    for field_name in (
+        "display_title", "project", "git_branch", "fork_nickname",
+    ):
         val = session.get(field_name)
         if isinstance(val, str) and val:
             yield val, field_name, None, None
@@ -856,7 +858,9 @@ def apply_trufflehog_pass(
                 log.append(dict(entry))
         return out, local
 
-    for field_name in ("display_title", "project", "git_branch"):
+    for field_name in (
+        "display_title", "project", "git_branch", "fork_nickname",
+    ):
         val = session.get(field_name)
         if isinstance(val, str) and val:
             new_val, n = _replace_in_text(val, field_name=field_name, message_index=None)

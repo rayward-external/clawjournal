@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from ..pricing import estimate_cost, format_cost
+from ..session_titles import resolve_session_title
 
 
 def render_session_markdown(session: dict[str, Any]) -> str:
@@ -18,10 +19,9 @@ def render_session_markdown(session: dict[str, Any]) -> str:
     parts: list[str] = []
 
     # Header
-    title = (
-        session.get("ai_display_title")
-        or session.get("display_title")
-        or session.get("session_id", "Untitled Session")
+    title = resolve_session_title(
+        session,
+        fallback=str(session.get("session_id") or "Untitled Session"),
     )
     parts.append(f"# {title}\n")
 
@@ -189,10 +189,9 @@ def render_session_summary(session: dict[str, Any]) -> str:
     """
     parts: list[str] = []
 
-    title = (
-        session.get("ai_display_title")
-        or session.get("display_title")
-        or session.get("session_id", "Untitled Session")
+    title = resolve_session_title(
+        session,
+        fallback=str(session.get("session_id") or "Untitled Session"),
     )
     parts.append(f"# {title}\n")
 
