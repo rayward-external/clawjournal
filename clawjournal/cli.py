@@ -55,6 +55,27 @@ def _argparse_path(path: Path) -> str:
     return str(path).replace("%", "%%")
 
 
+class _VersionAction(argparse.Action):
+    """Resolve checkout HEAD only when ``--version`` is actually requested."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, **kwargs):
+        kwargs.pop("nargs", None)
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            default=default,
+            **kwargs,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        from .support_diagnostics import version_string
+
+        parser._print_message(version_string() + "\n", sys.stdout)
+        parser.exit()
+
+
 REQUIRED_REVIEW_ATTESTATIONS: dict[str, str] = {
     "asked_full_name": "I asked the user for their full name and scanned for it.",
     "asked_sensitive_entities": "I asked about company/client/internal names and private URLs.",
@@ -3997,21 +4018,22 @@ def _should_auto_update(argv: list[str] | None = None) -> bool:
       - A one-shot workbench controller is about to start a `serve` child.
         The child must pin its imported backend/frontend pair before it starts
         the updater, so the parent must not race an update ahead of that pin.
-      - The user invoked help/version (`-h`, `--help`, `--version`)
-        with no real subcommand — argparse prints and exits, so a
-        background fetch is wasted work that surprises the user.
+      - The user invoked help/version (`-h`, `--help`, `--version`) —
+        argparse prints and exits, so a background fetch is wasted work that
+        surprises the user even when help belongs to a subcommand.
 
     Matching `"selfupdate"` anywhere in argv produced false positives
     like `clawjournal export --output ./selfupdate`.
     """
     tokens = (sys.argv if argv is None else argv)[1:]
+    if any(token in _AUTO_UPDATE_SKIP_FLAGS for token in tokens):
+        return False
     command = _requested_subcommand(argv)
     if command is None:
         if not tokens:
             return True
-        # All tokens were flags — no subcommand. Skip when any are help/version.
-        return not any(t in _AUTO_UPDATE_SKIP_FLAGS for t in tokens)
-    if command in {"selfupdate", "open"}:
+        return True
+    if command in {"selfupdate", "open", "doctor"}:
         return False
     # `desktop launch` has no options of its own, so its subcommand is the
     # final token. Avoid mistaking an unrelated global option value named
@@ -4046,7 +4068,7 @@ def _should_pin_frontend(
     return True
 
 
-def main() -> None:
+def _main() -> None:
     # A workbench process must remember the revision its already-imported
     # Python belongs to and pin its matching frontend before the detached
     # updater can fast-forward the checkout or rebuild dist/.
@@ -4089,11 +4111,28 @@ def main() -> None:
             pass
 
     parser = argparse.ArgumentParser(description="ClawJournal — coding agent conversation exporter")
+    parser.add_argument(
+        "--version",
+        action=_VersionAction,
+        help="Show package version and checkout revision, then exit",
+    )
     sub = parser.add_subparsers(dest="command")
 
     prep_parser = sub.add_parser("prep", help="Data prep — discover projects, output JSON")
     prep_parser.add_argument("--source", choices=SOURCE_CHOICES, default="auto")
     sub.add_parser("status", help="Show current stage and next steps (JSON)")
+    doctor = sub.add_parser(
+        "doctor",
+        help="Collect privacy-bounded, read-only support diagnostics",
+    )
+    doctor_sub = doctor.add_subparsers(dest="doctor_command", required=True)
+    doctor_index = doctor_sub.add_parser(
+        "index",
+        help="Inspect index health without creating or migrating the database",
+    )
+    doctor_index.add_argument(
+        "--json", action="store_true", help="Output structured JSON report"
+    )
     cf = sub.add_parser("confirm", help="Scan for PII, summarize export, and record review state (JSON)")
     cf.add_argument("--file", "-f", type=Path, default=None, help="Path to export JSONL file")
     cf.add_argument("--full-name", type=str, default=None,
@@ -5022,6 +5061,23 @@ def main() -> None:
     if command == "desktop":
         from .desktop import run_desktop_command
         exit_code = run_desktop_command(args)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
+
+    if command == "doctor":
+        from .support_diagnostics import (
+            collect_index_diagnostics,
+            diagnostics_exit_code,
+            render_index_diagnostics,
+        )
+
+        report = collect_index_diagnostics()
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(render_index_diagnostics(report))
+        exit_code = diagnostics_exit_code(report)
         if exit_code:
             raise SystemExit(exit_code)
         return
@@ -7405,6 +7461,22 @@ def _print_pii_guidance(output_path: Path) -> None:
     print(f"  clawjournal export -o {abs_output}")
     print()
     print(f"Found an issue? Help improve ClawJournal: {REPO_URL}/issues")
+
+
+def main() -> None:
+    """CLI boundary with a path-free error for refused shared-state writes."""
+
+    from .filesystem import UnsafeStateStorageError
+
+    try:
+        _main()
+    except UnsafeStateStorageError as exc:
+        # The dedicated exception is constructed from a path-free filesystem
+        # classification.  Still collapse control characters so stderr stays
+        # one line if a future subclass adds dynamic context.
+        message = re.sub(r"[\x00-\x1f\x7f]+", " ", str(exc)).strip()
+        print(f"error: {message[:500] or 'unsafe state storage'}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

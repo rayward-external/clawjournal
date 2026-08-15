@@ -613,9 +613,8 @@ def test_cli_should_auto_update_skips_help_and_version():
     assert _should_auto_update(["clawjournal", "-h"]) is False
     assert _should_auto_update(["clawjournal", "--help"]) is False
     assert _should_auto_update(["clawjournal", "--version"]) is False
-    # But -h paired with a real subcommand still updates — the user is
-    # asking for subcommand help and may proceed to run it.
-    assert _should_auto_update(["clawjournal", "scan", "--help"]) is True
+    # Subcommand help is just as read-only and short-lived as root help.
+    assert _should_auto_update(["clawjournal", "scan", "--help"]) is False
 
 
 @pytest.mark.parametrize("json_mode", [False, True])

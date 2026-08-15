@@ -233,6 +233,11 @@ export interface IndexHealth {
   backup_path?: string | null;
   sqlite_version?: string | null;
   journal_mode?: string | null;
+  /** Normalized filesystem kind only; never a path or mount source. */
+  filesystem_type?: string | null;
+  storage_risk?: 'network' | 'local' | 'unknown';
+  /** Recovery must wait until the complete state directory is copied locally. */
+  storage_migration_required?: boolean;
   automatic_recovery_available?: boolean;
   interrupted_recovery?: boolean;
   unreadable_state?: string[];

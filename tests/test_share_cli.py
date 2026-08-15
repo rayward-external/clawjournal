@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from clawjournal import share_cli
+from clawjournal.filesystem import UnsafeStateStorageError
 from clawjournal.scoring.backends import DEFAULT_CODEX_MODEL
 
 
@@ -17,6 +18,31 @@ def _parse(argv):
     p = argparse.ArgumentParser()
     share_cli.add_share_cli_args(p)
     return p.parse_args(argv)
+
+
+def test_clawshare_network_refusal_is_one_line_without_traceback(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        share_cli,
+        "run",
+        lambda _args: (_ for _ in ()).throw(
+            UnsafeStateStorageError(
+                "state is on nfs; set CLAWJOURNAL_HOME to local storage"
+            )
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        share_cli.main([])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("\n") == 1
+    assert "Traceback" not in captured.err
+    assert "CLAWJOURNAL_HOME" in captured.err
 
 
 def test_arg_parsing_defaults():
