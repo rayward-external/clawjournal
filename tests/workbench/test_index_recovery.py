@@ -496,6 +496,133 @@ def test_guided_rebuild_rechecks_storage_next_to_source_rw_open(
     assert index_recovery._load_marker(database)["stage"] == "preparing"
 
 
+def test_remount_after_fresh_backup_preserves_live_index(
+    recovery_install,
+    monkeypatch,
+):
+    conn = index_module.open_index()
+    conn.close()
+    database = recovery_install / "index.db"
+    original = database.read_bytes()
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "automatic_recovery_available": True,
+        "message": "test recovery",
+    })
+    remounted = False
+    real_backup = index_recovery._backup_index_files
+
+    def backup_then_remount(path):
+        nonlocal remounted
+        result = real_backup(path)
+        remounted = True
+        return result
+
+    monkeypatch.setattr(index_recovery, "_backup_index_files", backup_then_remount)
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo(
+            "nfs4" if remounted else "ext4",
+            "network" if remounted else "local",
+        ),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery.guided_rebuild(
+            lambda: pytest.fail("a remounted recovery must not start scanning")
+        )
+
+    assert database.is_file()
+    assert database.read_bytes() == original
+    assert index_recovery._load_marker(database)["stage"] == "preparing"
+    assert index_recovery.current_index_health()["code"] == (
+        "storage_migration_required"
+    )
+
+
+def test_remount_after_existing_backup_snapshot_preserves_live_index(
+    recovery_install,
+    monkeypatch,
+):
+    conn = index_module.open_index()
+    conn.close()
+    database = recovery_install / "index.db"
+    original = database.read_bytes()
+    backup_name = "index-recovery-20260816T020304Z-1234abcd"
+    backup = recovery_install / "index-backups" / backup_name
+    backup.mkdir(parents=True)
+    (backup / "index.db").write_bytes(original)
+    (backup / "recovery-manifest.json").write_text("{}", encoding="utf-8")
+    index_recovery._write_marker(
+        database,
+        {
+            "version": 2,
+            "database_path": str(database.resolve()),
+            "backup_path": str(backup.resolve()),
+            "backup_directory": backup_name,
+            "stage": "failed",
+        },
+    )
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "automatic_recovery_available": True,
+        "message": "retry recovery",
+    })
+    remounted = False
+    real_snapshot = index_recovery._snapshot_from_path
+
+    def snapshot_then_remount(path):
+        nonlocal remounted
+        result = real_snapshot(path)
+        remounted = True
+        return result
+
+    monkeypatch.setattr(index_recovery, "_snapshot_from_path", snapshot_then_remount)
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo(
+            "nfs" if remounted else "ext4",
+            "network" if remounted else "local",
+        ),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery.guided_rebuild(
+            lambda: pytest.fail("a remounted retry must not start scanning")
+        )
+
+    assert database.is_file()
+    assert database.read_bytes() == original
+    assert index_recovery._load_marker(database)["stage"] == "failed"
+    assert index_recovery.current_index_health()["code"] == (
+        "storage_migration_required"
+    )
+
+
+def test_remove_index_files_rechecks_storage_before_unlink(
+    recovery_install,
+    monkeypatch,
+):
+    database = recovery_install / "index.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"live index")
+    journal = Path(str(database) + "-journal")
+    journal.write_bytes(b"live journal")
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("nfs4", "network"),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery._remove_index_files(database)
+
+    assert database.read_bytes() == b"live index"
+    assert journal.read_bytes() == b"live journal"
+
+
 def test_initialize_new_index_uses_delete_journal(recovery_install):
     report = index_recovery.initialize_index_health()
 

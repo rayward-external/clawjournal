@@ -311,6 +311,19 @@ def _storage_migration_health(
     }
 
 
+def _require_safe_recovery_storage(
+    database: Path,
+) -> filesystem_module.FilesystemInfo:
+    """Recheck storage immediately before a recovery filesystem mutation."""
+
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        raise UnsafeIndexRecovery(
+            filesystem_module.storage_migration_message(storage)
+        )
+    return storage
+
+
 def _marker_path(database: Path) -> Path:
     return database.parent / RECOVERY_MARKER_FILENAME
 
@@ -328,6 +341,7 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _write_marker(database: Path, payload: dict[str, Any]) -> None:
+    _require_safe_recovery_storage(database)
     marker = _marker_path(database)
     temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -449,7 +463,15 @@ def begin_guided_rebuild() -> dict[str, Any]:
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "stage": "draining",
             }
-            _write_marker(database, marker)
+            try:
+                _write_marker(database, marker)
+            except UnsafeIndexRecovery:
+                storage = filesystem_module.classify_filesystem(database)
+                if storage.storage_migration_required:
+                    blocked = _storage_migration_health(database, storage)
+                    _INDEX_HEALTH.clear()
+                    _INDEX_HEALTH.update(blocked)
+                raise
         _INDEX_HEALTH.update({
             "status": "rebuilding",
             "stage": "draining",
@@ -864,13 +886,10 @@ def initialize_index_health() -> dict[str, Any]:
 
 
 def _backup_index_files(database: Path) -> tuple[Path, list[Path]]:
-    storage = filesystem_module.classify_filesystem(database)
-    if storage.storage_migration_required:
-        raise UnsafeIndexRecovery(
-            filesystem_module.storage_migration_message(storage)
-        )
+    _require_safe_recovery_storage(database)
     backup_root = database.parent / "index-backups"
     backup_root.mkdir(parents=True, exist_ok=True)
+    _require_safe_recovery_storage(database)
     state_root = database.parent.resolve()
     backup_root = backup_root.resolve()
     if backup_root.parent != state_root:
@@ -891,6 +910,7 @@ def _backup_index_files(database: Path) -> tuple[Path, list[Path]]:
     ):
         if not source.exists():
             continue
+        _require_safe_recovery_storage(database)
         destination = backup_dir / source.name
         shutil.copy2(source, destination)
         # Windows does not permit fsync on a read-only descriptor. Open the
@@ -905,6 +925,7 @@ def _backup_index_files(database: Path) -> tuple[Path, list[Path]]:
 
 
 def _remove_index_files(database: Path) -> None:
+    _require_safe_recovery_storage(database)
     for path in (
         database,
         Path(str(database) + "-wal"),
@@ -1974,6 +1995,7 @@ def _guided_rebuild_locked(
                 name: len(rows) for name, rows in snapshot.items()
             },
         }
+        _require_safe_recovery_storage(database)
         manifest_path = backup_dir / "recovery-manifest.json"
         with manifest_path.open("w", encoding="utf-8") as manifest_file:
             json.dump(manifest, manifest_file, indent=2, sort_keys=True)
@@ -2087,6 +2109,7 @@ def _guided_rebuild_locked(
         blocked = _storage_migration_health(database, final_storage)
         _set_health(blocked)
         raise UnsafeIndexRecovery(blocked["message"])
+    _require_safe_recovery_storage(database)
     _marker_path(database).unlink(missing_ok=True)
     _fsync_directory(database.parent)
     ready = {
@@ -2125,7 +2148,13 @@ def guided_rebuild(
             "started_at": datetime.now(timezone.utc).isoformat(),
             "stage": "preparing",
         }
-        _write_marker(database, marker)
+        try:
+            _write_marker(database, marker)
+        except UnsafeIndexRecovery:
+            storage = filesystem_module.classify_filesystem(database)
+            if storage.storage_migration_required:
+                _set_health(_storage_migration_health(database, storage))
+            raise
     lease = index_module._exclusive_index_recovery_lease(timeout=30.0)
     try:
         lease.__enter__()
@@ -2145,9 +2174,15 @@ def guided_rebuild(
         _set_health(failed)
         raise UnsafeIndexRecovery(failed["message"]) from exc
     try:
-        return _guided_rebuild_locked(
-            scan_callback,
-            on_source_retired=on_source_retired,
-        )
+        try:
+            return _guided_rebuild_locked(
+                scan_callback,
+                on_source_retired=on_source_retired,
+            )
+        except UnsafeIndexRecovery:
+            storage = filesystem_module.classify_filesystem(database)
+            if storage.storage_migration_required:
+                _set_health(_storage_migration_health(database, storage))
+            raise
     finally:
         lease.__exit__(None, None, None)
