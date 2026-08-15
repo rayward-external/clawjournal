@@ -34,6 +34,17 @@ export interface BlockedShareSession {
 
 export interface ReadySession {
   session_id: string;
+  /** Stable conversation identity; falls back to session_id on older daemons. */
+  logical_session_id?: string | null;
+  /** Revision of this conversation's active checkpoint membership. */
+  logical_revision?: string | null;
+  checkpoint_count?: number | null;
+  checkpoint_session_ids?: string[];
+  checkpoint_revisions?: Record<string, string>;
+  logical_incomplete?: boolean;
+  segment_index?: number | null;
+  segment_reason?: string | null;
+  segment_sealed?: boolean;
   project: string;
   model: string | null;
   source: string;
@@ -62,9 +73,19 @@ export interface ReadySession {
   updated_since_last_share?: boolean;
 }
 
+export interface LogicalReadySessionGroup {
+  logical_session_id: string;
+  logical_revision: string | null;
+  members: ReadySession[];
+  /** Aggregate used only for the Queue conversation card. */
+  display: ReadySession;
+  logical_incomplete: boolean;
+}
+
 export interface ShareReadyStats {
   count: number;
   total_approved: number;
+  logical_incomplete_excluded?: number;
   projects: string[];
   models: string[];
   recommended_session_ids: string[];

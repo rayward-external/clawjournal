@@ -33,7 +33,7 @@ from .workbench.index import (
     get_hold_history,
     open_index,
     read_blob,
-    set_hold_state,
+    set_logical_hold_state,
 )
 from .config import load_config
 
@@ -74,7 +74,7 @@ def run_hold(args) -> None:
     def body(conn: sqlite3.Connection) -> None:
         if _lookup_session(conn, args.session_id) is None:
             _fail("session not found", session_id=args.session_id)
-        set_hold_state(
+        set_logical_hold_state(
             conn, args.session_id, "pending_review",
             changed_by="user", reason=args.reason,
         )
@@ -86,7 +86,7 @@ def run_release(args) -> None:
     def body(conn: sqlite3.Connection) -> None:
         if _lookup_session(conn, args.session_id) is None:
             _fail("session not found", session_id=args.session_id)
-        set_hold_state(
+        set_logical_hold_state(
             conn, args.session_id, "released",
             changed_by="user", reason=args.reason,
         )
@@ -103,7 +103,7 @@ def run_embargo(args) -> None:
         if len(until) == 10 and until.count("-") == 2:
             until = f"{until}T00:00:00+00:00"
         try:
-            set_hold_state(
+            set_logical_hold_state(
                 conn, args.session_id, "embargoed",
                 changed_by="user", reason=args.reason, embargo_until=until,
             )

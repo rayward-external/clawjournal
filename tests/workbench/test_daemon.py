@@ -1712,6 +1712,168 @@ class TestSessionsAPI:
         assert data["session_id"] == "sess-0"
         assert "messages" in data
 
+    def test_checkpoint_family_projects_as_one_complete_session(self, server):
+        def checkpoint(index: int, content: str) -> dict:
+            session_id = "logical-long" if index == 0 else f"logical-long_seg-{index:04d}"
+            return {
+                "session_id": session_id,
+                "logical_session_id": "logical-long",
+                "project": "logical-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "raw_source_path": "C:/tmp/logical-long.jsonl",
+                "start_time": f"2025-02-01T00:0{index}:00+00:00",
+                "end_time": f"2025-02-01T00:0{index + 1}:00+00:00",
+                "segment_index": index,
+                "segment_message_range": [index * 2, index * 2 + 1],
+                "segment_reason": "bounded_checkpoint" if index == 0 else "active_tail",
+                "segment_sealed": index == 0,
+                "messages": [
+                    {"role": "user", "content": content, "tool_uses": []},
+                    {"role": "assistant", "content": f"answer {index}", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 1,
+                    "tool_uses": 0,
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                },
+            }
+
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [
+                checkpoint(0, "opening request"),
+                checkpoint(1, "unique-tail-search-needle"),
+            ])
+        finally:
+            conn.close()
+
+        status, rows = _get(server, "/api/sessions?project=logical-project")
+        assert status == 200
+        assert [(row["session_id"], row["checkpoint_count"]) for row in rows] == [
+            ("logical-long", 2)
+        ]
+
+        status, detail = _get(server, "/api/sessions/logical-long_seg-0001")
+        assert status == 200
+        assert detail["session_id"] == "logical-long"
+        assert [message["content"] for message in detail["messages"]] == [
+            "opening request",
+            "answer 0",
+            "unique-tail-search-needle",
+            "answer 1",
+        ]
+
+        status, search = _get(server, "/api/search?q=unique-tail-search-needle")
+        assert status == 200
+        assert [row["session_id"] for row in search] == ["logical-long"]
+
+        status, scoring_error = _post(
+            server, "/api/sessions/logical-long/score", {"backend": "auto"}
+        )
+        assert status == 409
+        assert scoring_error["block_reason"] == "logical_scoring_not_supported"
+
+        status, override_error = _post(
+            server,
+            "/api/sessions/logical-long",
+            {"ai_failure_value_score": 1},
+        )
+        assert status == 409
+        assert override_error["block_reason"] == "logical_scoring_not_supported"
+        for field, value in (
+            ("ai_summary", "not a conversation-level score"),
+            ("ai_effort_estimate", 0.9),
+        ):
+            status, override_error = _post(
+                server,
+                "/api/sessions/logical-long",
+                {field: value},
+            )
+            assert status == 409
+            assert (
+                override_error["block_reason"]
+                == "logical_scoring_not_supported"
+            )
+
+        status, result = _post(
+            server,
+            "/api/sessions/logical-long",
+            {"status": "shortlisted", "hold_state": "pending_review"},
+        )
+        assert status == 200
+        assert result["ok"] is True
+        conn = open_index()
+        try:
+            states = conn.execute(
+                "SELECT review_status, hold_state FROM sessions "
+                "WHERE logical_session_id = 'logical-long' ORDER BY segment_index"
+            ).fetchall()
+            assert [(row["review_status"], row["hold_state"]) for row in states] == [
+                ("shortlisted", "pending_review"),
+                ("shortlisted", "pending_review"),
+            ]
+        finally:
+            conn.close()
+
+    def test_logical_update_validates_before_changing_family(self, server):
+        def checkpoint(index: int) -> dict:
+            session_id = "validated-family" if index == 0 else "validated-family_seg-0001"
+            return {
+                "session_id": session_id,
+                "logical_session_id": "validated-family",
+                "project": "logical-project",
+                "source": "claude",
+                "raw_source_path": "C:/tmp/validated-family.jsonl",
+                "segment_index": index,
+                "segment_message_range": [index, index],
+                "segment_reason": "bounded_checkpoint" if index == 0 else "active_tail",
+                "segment_sealed": index == 0,
+                "messages": [{
+                    "role": "user" if index == 0 else "assistant",
+                    "content": f"message {index}",
+                    "tool_uses": [],
+                }],
+                "stats": {},
+            }
+
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [checkpoint(0), checkpoint(1)])
+        finally:
+            conn.close()
+
+        status, data = _post(
+            server,
+            "/api/sessions/validated-family",
+            {"status": "approved", "ai_quality_score": 99},
+        )
+        assert status == 409
+        assert data["block_reason"] == "logical_scoring_not_supported"
+
+        status, data = _post(
+            server,
+            "/api/sessions/validated-family",
+            {"status": "approved", "hold_state": "not-a-hold-state"},
+        )
+        assert status == 400
+        assert "invalid hold_state" in data["error"]
+
+        conn = open_index()
+        try:
+            states = conn.execute(
+                "SELECT review_status, hold_state FROM sessions "
+                "WHERE logical_session_id = 'validated-family' ORDER BY segment_index"
+            ).fetchall()
+            assert [(row["review_status"], row["hold_state"]) for row in states] == [
+                ("new", "auto_redacted"),
+                ("new", "auto_redacted"),
+            ]
+        finally:
+            conn.close()
+
     def test_encoded_session_id_routes(self, server, monkeypatch):
         from urllib.parse import quote
 
@@ -1748,7 +1910,7 @@ class TestSessionsAPI:
 
         monkeypatch.setattr(
             "clawjournal.scoring.scoring.score_session",
-            lambda conn, sid, model=None, backend="auto": SimpleNamespace(
+            lambda conn, sid, model=None, backend="auto", **kwargs: SimpleNamespace(
                 quality=4,
                 reason=f"scored {sid}",
                 detail_json='{"substance": 4}',
@@ -1980,7 +2142,7 @@ class TestSessionsAPI:
     def test_score_session_endpoint_updates_session(self, server, monkeypatch):
         monkeypatch.setattr(
             "clawjournal.scoring.scoring.score_session",
-            lambda conn, session_id, model=None, backend="auto": SimpleNamespace(
+            lambda conn, session_id, model=None, backend="auto", **kwargs: SimpleNamespace(
                 quality=4,
                 reason="Solid debugging session",
                 detail_json='{"substance": 4}',
@@ -2046,6 +2208,67 @@ class TestStatsAPI:
         assert data["total"] == 3
         assert "by_status" in data
         assert "by_source" in data
+
+    def test_stats_count_logical_family_once_and_match_filters(self, server):
+        def checkpoint(index: int) -> dict:
+            session_id = (
+                "stats-family"
+                if index == 0
+                else f"stats-family_seg-{index:04d}"
+            )
+            return {
+                "session_id": session_id,
+                "logical_session_id": "stats-family",
+                "project": "stats-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "start_time": f"2025-02-01T00:0{index}:00+00:00",
+                "end_time": f"2025-02-01T00:0{index + 1}:00+00:00",
+                "segment_index": index,
+                "segment_message_range": [index, index],
+                "segment_reason": (
+                    "bounded_checkpoint" if index == 0 else "active_tail"
+                ),
+                "segment_sealed": index == 0,
+                "raw_source_path": __file__,
+                "messages": [
+                    {"role": "user", "content": f"checkpoint {index}", "tool_uses": []}
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 0,
+                    "tool_uses": 0,
+                    "input_tokens": 1,
+                    "output_tokens": 0,
+                },
+            }
+
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [checkpoint(0), checkpoint(1)])
+            conn.execute(
+                "UPDATE sessions SET review_status = 'approved', "
+                "ai_task_type = 'root-only-ai-type' "
+                "WHERE session_id = 'stats-family'"
+            )
+            conn.execute(
+                "UPDATE sessions SET task_type = 'family-debugging' "
+                "WHERE logical_session_id = 'stats-family'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        status, data = _get(server, "/api/stats")
+        assert status == 200
+        assert data["total"] == 4
+        assert data["by_status"] == {"new": 4}
+        assert data["by_task_type"]["family-debugging"] == 1
+        assert "root-only-ai-type" not in data["by_task_type"]
+
+        status, rows = _get(server, "/api/sessions?task_type=family-debugging")
+        assert status == 200
+        assert [row["session_id"] for row in rows] == ["stats-family"]
 
 
 class TestScanner:
@@ -3459,6 +3682,69 @@ class TestSharesAPI:
         assert status == 409
         assert data["block_reason"] == "revision_conflict"
         assert data["blockers"][0]["session_id"] == "sess-0"
+
+    def test_create_rejects_checkpoint_added_after_queue_review(self, server):
+        def checkpoint(index: int) -> dict:
+            session_id = "share-long" if index == 0 else f"share-long_seg-{index:04d}"
+            return {
+                "session_id": session_id,
+                "logical_session_id": "share-long",
+                "project": "test-project",
+                "source": "claude",
+                "model": "claude-sonnet-4",
+                "raw_source_path": "C:/tmp/share-long.jsonl",
+                "start_time": f"2025-03-01T00:0{index}:00+00:00",
+                "end_time": f"2025-03-01T00:0{index + 1}:00+00:00",
+                "segment_index": index,
+                "segment_message_range": [index * 2, index * 2 + 1],
+                "segment_reason": "bounded_checkpoint" if index < 2 else "active_tail",
+                "segment_sealed": index < 2,
+                "messages": [
+                    {"role": "user", "content": f"question {index}", "tool_uses": []},
+                    {"role": "assistant", "content": f"answer {index}", "tool_uses": []},
+                ],
+                "stats": {
+                    "user_messages": 1,
+                    "assistant_messages": 1,
+                    "tool_uses": 0,
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                },
+            }
+
+        root = checkpoint(0)
+        tail = checkpoint(1)
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [root, tail])
+            rows = conn.execute(
+                "SELECT session_id, content_revision, logical_revision FROM sessions "
+                "WHERE logical_session_id = 'share-long' ORDER BY segment_index"
+            ).fetchall()
+            expected_revisions = {
+                row["session_id"]: row["content_revision"] for row in rows
+            }
+            reviewed_logical_revision = rows[0]["logical_revision"]
+            upsert_sessions(conn, [root, tail, checkpoint(2)])
+        finally:
+            conn.close()
+
+        status, data = _post(server, "/api/shares", {
+            "session_ids": ["share-long", "share-long_seg-0001"],
+            "expected_revisions": expected_revisions,
+            "expected_logical_revisions": {
+                "share-long": reviewed_logical_revision,
+            },
+        })
+
+        assert status == 409
+        assert data["block_reason"] == "revision_conflict"
+        assert data["blockers"][0]["logical_session_id"] == "share-long"
+        assert data["blockers"][0]["member_session_ids"] == [
+            "share-long",
+            "share-long_seg-0001",
+            "share-long_seg-0002",
+        ]
 
     def test_create_rejects_exact_revision_already_shared(self, server):
         from clawjournal.workbench.index import create_share

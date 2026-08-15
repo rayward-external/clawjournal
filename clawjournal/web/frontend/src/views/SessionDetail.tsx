@@ -289,6 +289,7 @@ export default function SessionDetail() {
     0,
   );
   const userMsgCount = session.messages.filter((m) => m.role === 'user').length;
+  const logicalScoringUnavailable = (session.checkpoint_count ?? 1) > 1;
   const firstUserMsg = session.messages.find((m) => m.role === 'user');
   const firstUserPreview = firstUserMsg
     ? truncate((firstUserMsg.content ?? '').trim(), 200)
@@ -318,11 +319,27 @@ export default function SessionDetail() {
           </button>
         </div>
 
+        {session.logical_incomplete && (
+          <div
+            role="alert"
+            style={{
+              margin: '10px 10px 2px', padding: '8px 10px', borderRadius: 6,
+              border: `1px solid ${colors.red200}`, background: colors.red100,
+              color: colors.red700, fontSize: 12, lineHeight: 1.4,
+            }}
+          >
+            This conversation has a missing or overlapping upload checkpoint. Run a successful scan before sharing it.
+          </div>
+        )}
+
         <div style={{ padding: '8px 10px 4px', fontWeight: 700, fontSize: 12, color: colors.gray400 }}>
           SUMMARY
         </div>
         <div style={{ padding: '4px 10px' }}>
           <SummaryRow label="Messages" value={String(session.messages.length)} />
+          {(session.checkpoint_count ?? 0) > 1 && (
+            <SummaryRow label="Upload checkpoints" value={String(session.checkpoint_count)} />
+          )}
           <SummaryRow label="User msgs" value={String(userMsgCount)} />
           <SummaryRow label="Tool uses" value={String(totalToolUses)} />
           <SummaryRow label="Tokens" value={formatTokens(session.input_tokens + session.output_tokens)} />
@@ -342,6 +359,9 @@ export default function SessionDetail() {
             SESSION INFO
           </div>
           <MetaRow label="ID" value={session.session_id} mono />
+          {session.logical_session_id && session.logical_session_id !== session.session_id && (
+            <MetaRow label="Conversation" value={session.logical_session_id} mono />
+          )}
           <MetaRow label="Source" value={
             <span style={{
               fontSize: 11, fontWeight: 600, padding: '1px 6px', borderRadius: 4,
@@ -396,12 +416,13 @@ export default function SessionDetail() {
             const modes = Array.isArray(session.ai_failure_modes) ? session.ai_failure_modes : [];
             const recovery = Array.isArray(session.ai_recovery_labels) ? session.ai_recovery_labels : [];
             const hasFailureBlock =
-              session.ai_failure_value_score != null
+              !logicalScoringUnavailable
+              && (session.ai_failure_value_score != null
               || modes.length > 0
               || metaLabels.length > 0
               || evidence.length > 0
               || (session.ai_failure_attribution && session.ai_failure_attribution.length > 0)
-              || (session.ai_learning_summary && session.ai_learning_summary.length > 0);
+              || (session.ai_learning_summary && session.ai_learning_summary.length > 0));
             if (!hasFailureBlock) return null;
             return (
               <>
@@ -574,7 +595,20 @@ export default function SessionDetail() {
         }}
       >
         <Section title="Failure Value">
-          {(failureValueOverride ?? session.ai_failure_value_score) != null ? (() => {
+          {logicalScoringUnavailable && (
+            <div
+              role="note"
+              style={{
+                fontSize: 12, color: colors.gray500, lineHeight: 1.45,
+                marginBottom: 10, padding: '7px 8px', borderRadius: 5,
+                background: colors.gray100,
+              }}
+            >
+              AI scoring is currently recorded per upload checkpoint, so no
+              checkpoint score is presented as a score for this full conversation.
+            </div>
+          )}
+          {!logicalScoringUnavailable && ((failureValueOverride ?? session.ai_failure_value_score) != null ? (() => {
             const displayScore = failureValueOverride ?? session.ai_failure_value_score!;
             return (
             <div>
@@ -615,10 +649,11 @@ export default function SessionDetail() {
             );
           })() : (
             <div style={{ fontSize: 12, color: colors.gray400, marginBottom: 8 }}>Failure value not scored yet</div>
-          )}
+          ))}
 
           <button
-            disabled={scoring}
+            disabled={scoring || logicalScoringUnavailable}
+            title={logicalScoringUnavailable ? 'Conversation-level scoring is not available yet.' : undefined}
             onClick={async () => {
               if (!id) return;
               setScoring(true);
@@ -642,13 +677,17 @@ export default function SessionDetail() {
               fontSize: 12,
               fontWeight: 600,
               color: colors.gray50,
-              background: scoring ? colors.gray400 : colors.gray700,
+              background: scoring || logicalScoringUnavailable ? colors.gray400 : colors.gray700,
               border: 'none',
               borderRadius: 4,
-              cursor: scoring ? 'wait' : 'pointer',
+              cursor: scoring || logicalScoringUnavailable ? 'not-allowed' : 'pointer',
             }}
           >
-            {scoring ? 'Scoring…' : (session.ai_failure_value_score ? 'Re-score with AI' : 'Score with AI')}
+            {logicalScoringUnavailable
+              ? 'Conversation scoring unavailable'
+              : scoring
+                ? 'Scoring…'
+                : (session.ai_failure_value_score ? 'Re-score with AI' : 'Score with AI')}
           </button>
 
           <div style={{ fontSize: 11, color: colors.gray400, lineHeight: 1.45, marginBottom: 10 }}>
@@ -659,6 +698,7 @@ export default function SessionDetail() {
 
           <div style={{ fontSize: 12, fontWeight: 600, color: colors.gray700, marginBottom: 4 }}>Override failure value</div>
           <textarea
+            disabled={logicalScoringUnavailable}
             value={failureValueEvidence}
             onChange={e => setFailureValueEvidence(e.target.value)}
             placeholder="Evidence for 4-5 overrides"
@@ -683,6 +723,7 @@ export default function SessionDetail() {
               return (
                 <button
                   key={n}
+                  disabled={logicalScoringUnavailable}
                   onClick={async () => {
                     const evidence = splitEvidence(failureValueEvidence);
                     if (n >= 4 && evidence.length === 0) {
@@ -713,7 +754,8 @@ export default function SessionDetail() {
                     borderRadius: 4,
                     fontSize: 12,
                     fontWeight: 700,
-                    cursor: 'pointer',
+                    cursor: logicalScoringUnavailable ? 'not-allowed' : 'pointer',
+                    opacity: logicalScoringUnavailable ? 0.5 : 1,
                     lineHeight: 1,
                   }}
                 >

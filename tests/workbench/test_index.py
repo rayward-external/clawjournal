@@ -8,9 +8,12 @@ import pytest
 
 from clawjournal.session_titles import resolve_session_title
 from clawjournal.workbench.index import (
+    LogicalProjectionError,
+    RevisionConflictError,
     _migrate_bundles_to_shares,
     add_policy,
     backfill_session_keys,
+    bulk_update_logical_review_status,
     bulk_update_review_status,
     create_share,
     effective_hold_state,
@@ -20,19 +23,25 @@ from clawjournal.workbench.index import (
     get_shares,
     get_policies,
     get_share_ready_stats,
+    get_logical_session_detail,
+    get_logical_session_members,
+    get_logical_stats,
     get_session_detail,
     get_stats,
     link_subagent_hierarchy,
     open_index,
+    query_logical_sessions,
     query_sessions,
     query_sessions_for_rescore,
     query_unscored_sessions,
     recompute_estimated_costs,
     remove_policy,
     search_fts,
+    search_logical_sessions,
     session_matches_excluded_projects,
     source_scope_blockers,
     set_hold_state,
+    set_logical_hold_state,
     update_session,
     upsert_sessions,
 )
@@ -79,6 +88,39 @@ def _make_session(session_id="sess-1", project="test-project", source="claude",
             "output_tokens": 100,
         },
     }
+
+
+def _make_checkpoint(
+    logical_id: str,
+    index: int,
+    *,
+    content: str | None = None,
+    parent_session_id: str | None = None,
+    start_message: int | None = None,
+    sealed: bool | None = None,
+):
+    session_id = logical_id if index == 0 else f"{logical_id}_seg-{index:04d}"
+    start = index * 2 if start_message is None else start_message
+    checkpoint = _make_session(
+        session_id,
+        content=content or f"checkpoint {index}",
+        start_time=f"2025-01-01T00:0{index}:00+00:00",
+        end_time=f"2025-01-01T00:0{index + 1}:00+00:00",
+    )
+    checkpoint.update({
+        "logical_session_id": logical_id,
+        "parent_session_id": parent_session_id,
+        "segment_index": index,
+        "segment_message_range": [start, start + 1],
+        "segment_reason": (
+            "bounded_checkpoint"
+            if sealed is not False and index == 0
+            else "active_tail"
+        ),
+        "segment_sealed": index == 0 if sealed is None else sealed,
+        "raw_source_path": f"/tmp/{logical_id}.jsonl",
+    })
+    return checkpoint
 
 
 class TestUpsertSessions:
@@ -546,6 +588,507 @@ class TestCostAccounting:
         assert child_row["parent_session_id"] == "parent-1"
 
 
+class TestLogicalCheckpointProjection:
+    def test_unsegmented_identity_grows_into_one_logical_trace(self, index_conn):
+        initial = _make_session("long", content="checkpoint 0")
+        initial["logical_session_id"] = "long"
+        initial["raw_source_path"] = "/tmp/long.jsonl"
+        upsert_sessions(index_conn, [initial])
+
+        before = query_logical_sessions(index_conn)
+        assert [(row["session_id"], row["checkpoint_count"]) for row in before] == [
+            ("long", 1)
+        ]
+        before_revision = before[0]["logical_revision"]
+        assert before_revision.startswith("logical-sha256:")
+
+        root = _make_checkpoint("long", 0, content="checkpoint 0")
+        tail = _make_checkpoint("long", 1, content="unique tail needle")
+        upsert_sessions(index_conn, [root, tail])
+
+        rows = query_logical_sessions(index_conn)
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "long"
+        assert rows[0]["checkpoint_count"] == 2
+        assert rows[0]["checkpoint_session_ids"] == [
+            "long", "long_seg-0001"
+        ]
+        assert rows[0]["logical_incomplete"] is False
+        assert rows[0]["logical_revision"] != before_revision
+        detail = get_logical_session_detail(index_conn, "long_seg-0001")
+        assert detail["session_id"] == "long"
+        assert detail["component_session_ids"] == ["long", "long_seg-0001"]
+        assert len(detail["messages"]) == 4
+        assert get_session_detail(index_conn, "long_seg-0001")["session_id"] == (
+            "long_seg-0001"
+        )
+
+    def test_family_growth_and_retirement_keep_physical_history(self, index_conn):
+        root = _make_checkpoint("long", 0)
+        tail = _make_checkpoint("long", 1)
+        upsert_sessions(index_conn, [root, tail])
+        first_revision = query_logical_sessions(index_conn)[0]["logical_revision"]
+
+        third = _make_checkpoint("long", 2)
+        upsert_sessions(index_conn, [root, tail, third])
+        grown_revision = query_logical_sessions(index_conn)[0]["logical_revision"]
+        assert grown_revision != first_revision
+        assert [row["session_id"] for row in get_logical_session_members(index_conn, "long")] == [
+            "long", "long_seg-0001", "long_seg-0002"
+        ]
+
+        upsert_sessions(index_conn, [root, tail])
+        active = get_logical_session_members(index_conn, "long")
+        assert [row["session_id"] for row in active] == ["long", "long_seg-0001"]
+        stale = index_conn.execute(
+            "SELECT checkpoint_active FROM sessions WHERE session_id = ?",
+            ("long_seg-0002",),
+        ).fetchone()
+        assert stale["checkpoint_active"] == 0
+        assert get_session_detail(index_conn, "long_seg-0002") is not None
+
+    def test_partial_filtered_family_preserves_prior_active_membership(self, index_conn):
+        root = _make_checkpoint("long", 0)
+        tail = _make_checkpoint("long", 1)
+        upsert_sessions(index_conn, [root, tail])
+        prior_revision = query_logical_sessions(index_conn)[0]["logical_revision"]
+
+        updated_root = _make_checkpoint("long", 0, content="updated root")
+        filtered_tail = _make_checkpoint("long", 1, content="/clear")
+        new_third = _make_checkpoint("long", 2)
+        upsert_sessions(index_conn, [updated_root, filtered_tail, new_third])
+
+        members = index_conn.execute(
+            "SELECT session_id, checkpoint_active, logical_revision "
+            "FROM sessions WHERE logical_session_id = 'long' "
+            "ORDER BY segment_index"
+        ).fetchall()
+        assert [
+            (row["session_id"], row["checkpoint_active"])
+            for row in members
+        ] == [
+            ("long", 1),
+            ("long_seg-0001", 1),
+            ("long_seg-0002", 0),
+        ]
+        projected = query_logical_sessions(index_conn)
+        assert len(projected) == 1
+        assert projected[0]["checkpoint_session_ids"] == [
+            "long", "long_seg-0001"
+        ]
+        assert projected[0]["checkpoint_count"] == 2
+        assert projected[0]["logical_revision"] != prior_revision
+        assert {row["logical_revision"] for row in members} == {
+            projected[0]["logical_revision"]
+        }
+
+    def test_logical_status_filter_and_bulk_shortlist_use_whole_family(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        update_session(index_conn, "long", status="approved")
+
+        assert query_logical_sessions(index_conn, status="approved") == []
+        assert [row["session_id"] for row in query_logical_sessions(
+            index_conn, status="new"
+        )] == ["long"]
+
+        updated, missing = bulk_update_logical_review_status(
+            index_conn, ["long_seg-0001", "missing"], "shortlisted"
+        )
+        assert updated == ["long_seg-0001"]
+        assert missing == ["missing"]
+        statuses = index_conn.execute(
+            "SELECT review_status FROM sessions WHERE logical_session_id = 'long'"
+        ).fetchall()
+        assert {row["review_status"] for row in statuses} == {"shortlisted"}
+
+    def test_list_and_detail_project_same_mixed_review_and_hold(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        update_session(index_conn, "long", status="approved")
+        set_hold_state(
+            index_conn,
+            "long_seg-0001",
+            "pending_review",
+            changed_by="user",
+        )
+
+        summary = query_logical_sessions(index_conn)[0]
+        detail = get_logical_session_detail(index_conn, "long")
+        assert summary["review_status"] == detail["review_status"] == "new"
+        assert summary["hold_state"] == detail["hold_state"] == "pending_review"
+        assert summary["embargo_until"] is detail["embargo_until"] is None
+
+    def test_multi_checkpoint_projection_does_not_reuse_root_ai_score(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        update_session(
+            index_conn,
+            "long",
+            ai_quality_score=5,
+            ai_score_reason="root-only score",
+            ai_effort_estimate=0.8,
+            ai_summary="root-only summary",
+            ai_scoring_detail='{"reason":"root"}',
+            ai_task_type="ai-only-type",
+            ai_outcome_badge="resolved",
+            ai_value_badges='["high_value"]',
+            ai_risk_badges='["low_risk"]',
+            ai_display_title="AI root title",
+            ai_failure_value_score=4,
+            ai_recovery_labels='["recovered"]',
+            ai_failure_attribution="assistant",
+            ai_failure_modes='["reasoning"]',
+            ai_learning_summary="root learning",
+            ai_scorer_backend="judge",
+            ai_scorer_model="model",
+            ai_rubric_git_sha="abc",
+            ai_scored_at="2025-01-01T01:00:00+00:00",
+        )
+        index_conn.execute(
+            "UPDATE sessions SET ai_episode_quality = 0.5, ai_quality_tier = 'high' "
+            "WHERE session_id = 'long'"
+        )
+        index_conn.commit()
+        physical = get_session_detail(index_conn, "long")
+
+        summary = query_logical_sessions(index_conn)[0]
+        detail = get_logical_session_detail(index_conn, "long")
+        ai_fields = (
+            "ai_quality_score", "ai_score_reason", "ai_scoring_detail",
+            "ai_episode_quality", "ai_quality_tier", "ai_display_title",
+            "ai_task_type", "ai_outcome_badge", "ai_value_badges",
+            "ai_risk_badges", "ai_effort_estimate", "ai_summary",
+            "ai_failure_value_score", "ai_recovery_labels",
+            "ai_failure_attribution", "ai_failure_modes",
+            "ai_learning_summary", "ai_scorer_backend", "ai_scorer_model",
+            "ai_rubric_git_sha", "ai_scored_at",
+        )
+        assert all(summary[field] is None for field in ai_fields)
+        assert all(detail[field] is None for field in ai_fields)
+        assert query_logical_sessions(index_conn, task_type="ai-only-type") == []
+        assert query_logical_sessions(index_conn, recovery_label="recovered") == []
+        assert detail["display_title"] == physical["display_title"]
+        assert detail["outcome_badge"] == physical["outcome_badge"]
+
+    def test_duration_sort_uses_whole_logical_time_range(self, index_conn):
+        short = [_make_checkpoint("short", 0), _make_checkpoint("short", 1)]
+        short[0]["start_time"] = "2025-01-02T00:00:00+00:00"
+        short[0]["end_time"] = "2025-01-02T00:02:00+00:00"
+        short[1]["start_time"] = "2025-01-02T00:02:00+00:00"
+        short[1]["end_time"] = "2025-01-02T00:10:00+00:00"
+        long = _make_session(
+            "longer",
+            start_time="2025-01-01T00:00:00+00:00",
+            end_time="2025-01-01T02:00:00+00:00",
+        )
+        long["logical_session_id"] = "longer"
+        long["raw_source_path"] = "/tmp/longer.jsonl"
+        upsert_sessions(index_conn, [*short, long])
+
+        descending = query_logical_sessions(
+            index_conn, sort="duration_seconds", order="desc"
+        )
+        ascending = query_logical_sessions(
+            index_conn, sort="duration_seconds", order="asc"
+        )
+        assert [row["session_id"] for row in descending] == ["longer", "short"]
+        assert [row["session_id"] for row in ascending] == ["short", "longer"]
+        assert {row["session_id"]: row["duration_seconds"] for row in descending} == {
+            "longer": 7200,
+            "short": 600,
+        }
+
+    def test_child_fts_hit_returns_root_once(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [
+                _make_checkpoint("long", 0, content="ordinary opening"),
+                _make_checkpoint("long", 1, content="rarechildneedle"),
+            ],
+        )
+
+        results = search_logical_sessions(index_conn, "rarechildneedle")
+        assert [row["session_id"] for row in results] == ["long"]
+        assert results[0]["checkpoint_count"] == 2
+
+    def test_grouping_happens_before_list_and_fts_pagination(self, index_conn):
+        family_a = [
+            _make_checkpoint("family-a", 0, content="sharedsearchterm root"),
+            _make_checkpoint("family-a", 1, content="sharedsearchterm tail"),
+        ]
+        family_b = _make_session(
+            "family-b",
+            content="sharedsearchterm standalone",
+            start_time="2025-01-02T00:00:00+00:00",
+            end_time="2025-01-02T00:01:00+00:00",
+        )
+        family_b["logical_session_id"] = "family-b"
+        family_b["raw_source_path"] = "/tmp/family-b.jsonl"
+        upsert_sessions(index_conn, [*family_a, family_b])
+
+        first_page = query_logical_sessions(
+            index_conn, sort="start_time", limit=1, offset=0
+        )
+        second_page = query_logical_sessions(
+            index_conn, sort="start_time", limit=1, offset=1
+        )
+        assert [row["session_id"] for row in first_page] == ["family-b"]
+        assert [row["session_id"] for row in second_page] == ["family-a"]
+
+        first_hit = search_logical_sessions(
+            index_conn, "sharedsearchterm", limit=1, offset=0
+        )
+        second_hit = search_logical_sessions(
+            index_conn, "sharedsearchterm", limit=1, offset=1
+        )
+        assert len(first_hit) == len(second_hit) == 1
+        assert {first_hit[0]["session_id"], second_hit[0]["session_id"]} == {
+            "family-a", "family-b"
+        }
+
+    def test_incomplete_family_is_visible_but_fails_closed_for_share(self, index_conn):
+        root = _make_checkpoint("long", 0)
+        gap = _make_checkpoint("long", 1, start_message=3)
+        upsert_sessions(index_conn, [root, gap])
+        bulk_update_logical_review_status(index_conn, ["long"], "approved")
+
+        projected = query_logical_sessions(index_conn)
+        assert projected[0]["logical_incomplete"] is True
+        with pytest.raises(LogicalProjectionError):
+            get_logical_session_detail(index_conn, "long")
+        stats = get_share_ready_stats(index_conn)
+        assert stats["sessions"] == []
+        assert stats["logical_incomplete_excluded"] == 1
+
+    def test_share_ready_keeps_physical_candidates_with_family_metadata(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        bulk_update_logical_review_status(index_conn, ["long"], "approved")
+
+        stats = get_share_ready_stats(index_conn)
+        assert [row["session_id"] for row in stats["sessions"]] == [
+            "long_seg-0001", "long"
+        ]
+        for row in stats["sessions"]:
+            assert row["logical_session_id"] == "long"
+            assert row["logical_revision"].startswith("logical-sha256:")
+            assert row["checkpoint_count"] == 2
+            assert row["checkpoint_session_ids"] == ["long", "long_seg-0001"]
+            assert row["logical_incomplete"] is False
+            assert row["segment_index"] in (0, 1)
+            assert row["segment_reason"] in ("bounded_checkpoint", "active_tail")
+
+    def test_share_ready_fails_closed_for_one_negative_family_member(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        bulk_update_logical_review_status(index_conn, ["long"], "approved")
+        set_hold_state(
+            index_conn,
+            "long_seg-0001",
+            "pending_review",
+            changed_by="findings",
+        )
+
+        assert get_share_ready_stats(index_conn)["sessions"] == []
+
+        set_hold_state(
+            index_conn,
+            "long_seg-0001",
+            "released",
+            changed_by="user",
+        )
+        index_conn.execute(
+            "UPDATE sessions SET review_status = 'blocked' "
+            "WHERE session_id = 'long_seg-0001'"
+        )
+        index_conn.commit()
+        assert get_share_ready_stats(index_conn)["sessions"] == []
+
+    def test_missing_checkpoint_blob_fails_share_ready_and_create(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        bulk_update_logical_review_status(index_conn, ["long"], "approved")
+        preview = query_logical_sessions(index_conn)[0]
+        root_revision = index_conn.execute(
+            "SELECT content_revision FROM sessions WHERE session_id = 'long'"
+        ).fetchone()[0]
+        tail_blob = index_conn.execute(
+            "SELECT blob_path FROM sessions WHERE session_id = 'long_seg-0001'"
+        ).fetchone()[0]
+        Path(tail_blob).unlink()
+
+        assert query_logical_sessions(index_conn)[0]["logical_incomplete"] is True
+        stats = get_share_ready_stats(index_conn)
+        assert stats["sessions"] == []
+        assert stats["logical_incomplete_excluded"] == 1
+        with pytest.raises(RevisionConflictError) as exc_info:
+            create_share(
+                index_conn,
+                ["long"],
+                expected_revisions={"long": root_revision},
+                expected_logical_revisions={
+                    "long": preview["logical_revision"]
+                },
+            )
+        assert exc_info.value.blockers[0]["reason"] == "logical_incomplete"
+
+    def test_logical_hold_updates_every_checkpoint_and_audits_each(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+
+        assert set_logical_hold_state(
+            index_conn,
+            "long_seg-0001",
+            "pending_review",
+            changed_by="user",
+            reason="logical hold",
+        )
+        rows = index_conn.execute(
+            "SELECT session_id, hold_state FROM sessions "
+            "WHERE logical_session_id = 'long' ORDER BY session_id"
+        ).fetchall()
+        assert [(row["session_id"], row["hold_state"]) for row in rows] == [
+            ("long", "pending_review"),
+            ("long_seg-0001", "pending_review"),
+        ]
+        history = index_conn.execute(
+            "SELECT session_id FROM session_hold_history "
+            "WHERE reason = 'logical hold' ORDER BY session_id"
+        ).fetchall()
+        assert [row["session_id"] for row in history] == [
+            "long", "long_seg-0001"
+        ]
+
+    @pytest.mark.parametrize(
+        ("hold_state", "embargo_until"),
+        [
+            ("pending_review", None),
+            ("embargoed", "2099-01-01T00:00:00+00:00"),
+            ("released", None),
+        ],
+    )
+    def test_new_checkpoint_inherits_logical_family_hold(
+        self, index_conn, hold_state, embargo_until
+    ):
+        root = _make_checkpoint("long", 0)
+        tail = _make_checkpoint("long", 1)
+        upsert_sessions(index_conn, [root, tail])
+        assert set_logical_hold_state(
+            index_conn,
+            "long",
+            hold_state,
+            changed_by="user",
+            embargo_until=embargo_until,
+        )
+
+        third = _make_checkpoint("long", 2)
+        upsert_sessions(index_conn, [root, tail, third])
+
+        row = index_conn.execute(
+            "SELECT hold_state, embargo_until FROM sessions WHERE session_id = ?",
+            ("long_seg-0002",),
+        ).fetchone()
+        assert row["hold_state"] == hold_state
+        assert row["embargo_until"] == embargo_until
+        history = index_conn.execute(
+            "SELECT from_state, to_state FROM session_hold_history "
+            "WHERE session_id = ? AND reason = ?",
+            (
+                "long_seg-0002",
+                "Inherited logical checkpoint family hold",
+            ),
+        ).fetchone()
+        assert tuple(history) == ("auto_redacted", hold_state)
+
+    def test_new_checkpoint_inherits_block_but_not_approval(self, index_conn):
+        blocked = [_make_checkpoint("blocked-family", 0), _make_checkpoint("blocked-family", 1)]
+        approved = [
+            _make_checkpoint("approved-family", 0),
+            _make_checkpoint("approved-family", 1),
+        ]
+        upsert_sessions(index_conn, [*blocked, *approved])
+        bulk_update_logical_review_status(
+            index_conn, ["blocked-family"], "blocked"
+        )
+        bulk_update_logical_review_status(
+            index_conn, ["approved-family"], "approved"
+        )
+
+        blocked_third = _make_checkpoint("blocked-family", 2)
+        approved_third = _make_checkpoint("approved-family", 2)
+        upsert_sessions(index_conn, [*blocked, blocked_third])
+        upsert_sessions(index_conn, [*approved, approved_third])
+
+        statuses = {
+            row["session_id"]: row["review_status"]
+            for row in index_conn.execute(
+                "SELECT session_id, review_status FROM sessions "
+                "WHERE session_id IN (?, ?)",
+                ("blocked-family_seg-0002", "approved-family_seg-0002"),
+            ).fetchall()
+        }
+        assert statuses == {
+            "blocked-family_seg-0002": "blocked",
+            "approved-family_seg-0002": "new",
+        }
+
+    def test_unsegmented_block_survives_threshold_split(self, index_conn):
+        initial = _make_session("threshold", content="full conversation before split")
+        initial["logical_session_id"] = "threshold"
+        initial["raw_source_path"] = "/tmp/threshold.jsonl"
+        upsert_sessions(index_conn, [initial])
+        bulk_update_logical_review_status(index_conn, ["threshold"], "blocked")
+
+        root = _make_checkpoint("threshold", 0, content="shorter sealed prefix")
+        tail = _make_checkpoint("threshold", 1, content="new active tail")
+        upsert_sessions(index_conn, [root, tail])
+
+        statuses = index_conn.execute(
+            "SELECT review_status FROM sessions WHERE logical_session_id = ? "
+            "ORDER BY segment_index",
+            ("threshold",),
+        ).fetchall()
+        assert [row["review_status"] for row in statuses] == ["blocked", "blocked"]
+
+    def test_hierarchy_links_only_checkpoint_representative(self, index_conn):
+        parent = _make_session("real-parent", project="test-project")
+        root = _make_checkpoint("child", 0, parent_session_id="real-parent")
+        tail = _make_checkpoint("child", 1, parent_session_id="real-parent")
+        upsert_sessions(index_conn, [parent, root, tail])
+
+        link_subagent_hierarchy(index_conn)
+
+        parent_row = index_conn.execute(
+            "SELECT review_status, subagent_session_ids FROM sessions "
+            "WHERE session_id = 'real-parent'"
+        ).fetchone()
+        assert parent_row["review_status"] != "segmented"
+        assert json.loads(parent_row["subagent_session_ids"]) == ["child"]
+        child_parents = index_conn.execute(
+            "SELECT session_id, parent_session_id FROM sessions "
+            "WHERE logical_session_id = 'child' ORDER BY segment_index"
+        ).fetchall()
+        assert [(row["session_id"], row["parent_session_id"]) for row in child_parents] == [
+            ("child", "real-parent"),
+            ("child_seg-0001", "real-parent"),
+        ]
+
+
 class TestQuerySessions:
     def test_query_all(self, index_conn):
         upsert_sessions(index_conn, [_make_session("s1"), _make_session("s2")])
@@ -622,6 +1165,17 @@ class TestGetSessionDetail:
 
 
 class TestQueryUnscoredSessions:
+    def test_skips_retired_checkpoint(self, index_conn):
+        checkpoints = [_make_checkpoint("long", index) for index in range(3)]
+        upsert_sessions(index_conn, checkpoints)
+        upsert_sessions(index_conn, checkpoints[:2])
+
+        ids = {
+            row["session_id"]
+            for row in query_unscored_sessions(index_conn, source=["claude"])
+        }
+        assert ids == {"long", "long_seg-0001"}
+
     def test_since_filters_old_unscored_sessions(self, index_conn):
         upsert_sessions(index_conn, [
             _make_session("old", start_time="2025-01-01T00:00:00+00:00"),
@@ -727,6 +1281,25 @@ class TestQueryUnscoredSessions:
 
 
 class TestQuerySessionsForRescore:
+    def test_skips_retired_checkpoint(self, index_conn):
+        from datetime import datetime, timezone
+
+        checkpoints = [_make_checkpoint("long", index) for index in range(3)]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for checkpoint in checkpoints:
+            checkpoint["start_time"] = now_iso
+            checkpoint["end_time"] = now_iso
+        upsert_sessions(index_conn, checkpoints)
+        upsert_sessions(index_conn, checkpoints[:2])
+
+        ids = {
+            row["session_id"]
+            for row in query_sessions_for_rescore(
+                index_conn, window_days=7, source=["claude"]
+            )
+        }
+        assert ids == {"long", "long_seg-0001"}
+
     def test_returns_sessions_regardless_of_existing_score(self, index_conn):
         """`clawjournal rescore --window` must overwrite, so the query
         returns scored sessions too — the difference from
@@ -987,6 +1560,39 @@ class TestStats:
         assert stats["by_source"] == {"codex": 1}
         assert stats["by_status"] == {"new": 1}
 
+    def test_logical_stats_match_family_status_and_task_type_filters(self, index_conn):
+        upsert_sessions(
+            index_conn,
+            [_make_checkpoint("long", 0), _make_checkpoint("long", 1)],
+        )
+        update_session(index_conn, "long", status="approved")
+        index_conn.execute(
+            "UPDATE sessions SET task_type = 'debugging' "
+            "WHERE logical_session_id = 'long'"
+        )
+        index_conn.execute(
+            "UPDATE sessions SET ai_task_type = 'root-only-ai-type' "
+            "WHERE session_id = 'long'"
+        )
+        index_conn.commit()
+
+        stats = get_logical_stats(index_conn)
+
+        assert stats["total"] == 1
+        assert stats["by_status"] == {"new": 1}
+        assert stats["by_source"] == {"claude": 1}
+        assert stats["by_project"] == {"test-project": 1}
+        assert stats["by_task_type"] == {"debugging": 1}
+        assert [row["session_id"] for row in query_logical_sessions(
+            index_conn, status="new"
+        )] == ["long"]
+        assert [row["session_id"] for row in query_logical_sessions(
+            index_conn, task_type="debugging"
+        )] == ["long"]
+        assert query_logical_sessions(
+            index_conn, task_type="root-only-ai-type"
+        ) == []
+
 
 class TestDashboardAnalytics:
     def test_filters_by_date_range(self, index_conn):
@@ -1106,6 +1712,61 @@ class TestDashboardAnalytics:
 
 
 class TestShares:
+    def test_create_share_binds_selected_subset_to_logical_revision(self, index_conn):
+        root = _make_checkpoint("long", 0)
+        tail = _make_checkpoint("long", 1)
+        upsert_sessions(index_conn, [root, tail])
+        preview = query_logical_sessions(index_conn)[0]
+        tail_revision = index_conn.execute(
+            "SELECT content_revision FROM sessions WHERE session_id = ?",
+            ("long_seg-0001",),
+        ).fetchone()[0]
+
+        with pytest.raises(RevisionConflictError):
+            create_share(
+                index_conn,
+                ["long_seg-0001"],
+                expected_revisions={"long_seg-0001": tail_revision},
+                expected_logical_revisions={},
+            )
+        with pytest.raises(RevisionConflictError):
+            create_share(
+                index_conn,
+                ["long_seg-0001"],
+                expected_revisions={"long_seg-0001": tail_revision},
+                expected_logical_revisions={
+                    "long": preview["logical_revision"],
+                    "unselected-family": "logical-sha256:stale",
+                },
+            )
+
+        # A physical subset is valid: a prior successful share or hold can
+        # legitimately make another active member absent from this package.
+        share_id = create_share(
+            index_conn,
+            ["long_seg-0001"],
+            expected_revisions={"long_seg-0001": tail_revision},
+            expected_logical_revisions={"long": preview["logical_revision"]},
+        )
+        assert get_share(index_conn, share_id)["session_count"] == 1
+
+        third = _make_checkpoint("long", 2)
+        upsert_sessions(index_conn, [root, tail, third])
+        with pytest.raises(RevisionConflictError) as exc_info:
+            create_share(
+                index_conn,
+                ["long_seg-0001"],
+                expected_revisions={"long_seg-0001": tail_revision},
+                expected_logical_revisions={"long": preview["logical_revision"]},
+            )
+        assert exc_info.value.blockers[0]["logical_session_id"] == "long"
+        assert exc_info.value.blockers[0]["selected_session_ids"] == [
+            "long_seg-0001"
+        ]
+        assert exc_info.value.blockers[0]["member_session_ids"] == [
+            "long", "long_seg-0001", "long_seg-0002"
+        ]
+
     def test_create_and_get(self, index_conn):
         upsert_sessions(index_conn, [_make_session("s1"), _make_session("s2")])
         share_id = create_share(index_conn, ["s1", "s2"], note="Test share")

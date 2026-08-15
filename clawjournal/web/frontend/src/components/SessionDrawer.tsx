@@ -78,6 +78,7 @@ export function SessionDrawer({ sessionId, onClose }: SessionDrawerProps) {
               <div style={{ fontSize: 11, color: colors.gray500, marginTop: 2 }}>
                 {data.project} · {data.user_messages + data.assistant_messages} msgs
                 {data.tool_uses ? ` · ${data.tool_uses} tools` : ''}
+                {(data.checkpoint_count ?? 0) > 1 ? ` · ${data.checkpoint_count} upload checkpoints` : ''}
               </div>
             )}
           </div>
@@ -112,6 +113,18 @@ export function SessionDrawer({ sessionId, onClose }: SessionDrawerProps) {
               borderRadius: 6, fontSize: 13,
             }}>
               Failed to load: {error}
+            </div>
+          )}
+          {data?.logical_incomplete && (
+            <div
+              role="alert"
+              style={{
+                color: colors.red700, background: colors.red100,
+                border: `1px solid ${colors.red200}`, padding: 12,
+                borderRadius: 6, fontSize: 13, marginBottom: 12,
+              }}
+            >
+              This conversation has a missing or overlapping upload checkpoint. Run a successful scan before sharing it.
             </div>
           )}
           {data?.messages?.map((msg, i) => (

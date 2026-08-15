@@ -8,7 +8,7 @@ import { SessionDrawer } from '../../components/SessionDrawer.tsx';
 import { TraceCard } from '../../components/TraceCard.tsx';
 import { LARGE_BUNDLE_CONFIRM_THRESHOLD, MAX_SHARE_QUEUE_SIZE } from './types.ts';
 import type { ReadySession, ShareReadyStats } from './types.ts';
-import { autoDescription, formatDate, formatTokens, outcomeBadge, outcomeTooltip, sessionTotalTokens, sourceFullLabel } from './helpers.ts';
+import { autoDescription, formatDate, formatTokens, groupReadySessions, outcomeBadge, outcomeTooltip, sessionTotalTokens, sourceFullLabel } from './helpers.ts';
 import { SHARE_SHELL_WIDTH, btnGhost, btnPrimary, btnSecondary } from './styles.tsx';
 import { CheckboxRow, HelpModal, Icon, SourceBadge, UsageDisclosure } from './shared.tsx';
 
@@ -76,6 +76,10 @@ export function QueueStep(p: QueueStepProps) {
   const [confirmLargeBundle, setConfirmLargeBundle] = useState(false);
 
   const allSessions = p.readyStats?.sessions || [];
+  const allGroups = groupReadySessions(allSessions);
+  const queuedGroups = groupReadySessions(p.queuedSessions);
+  const logicalGroupingActive = allSessions.some((session) => Boolean(session.logical_session_id))
+    || allGroups.some((group) => group.members.length > 1);
   const selectedIds = new Set(p.queueOrder);
   const selectionLimitReached = p.queueOrder.length >= MAX_SHARE_QUEUE_SIZE;
   // `total_approved` counts every approved session; `allSessions` only holds the
@@ -85,6 +89,9 @@ export function QueueStep(p: QueueStepProps) {
   const totalApproved = p.readyStats?.total_approved ?? 0;
   const totalTokens = p.queuedSessions.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
   const uniqueProjects = [...new Set(p.queuedSessions.map(s => s.project).filter(Boolean))];
+  const selectionSummary = logicalGroupingActive
+    ? `${queuedGroups.length} conversation${queuedGroups.length === 1 ? '' : 's'} / ${p.queuedSessions.length} upload checkpoint${p.queuedSessions.length === 1 ? '' : 's'}`
+    : `${p.queuedSessions.length} trace${p.queuedSessions.length === 1 ? '' : 's'}`;
 
   const onDragStart = (e: React.DragEvent, id: string) => {
     setDragId(id);
@@ -105,7 +112,7 @@ export function QueueStep(p: QueueStepProps) {
   // eslint-disable-next-line react-hooks/purity
   const dateCutoffMs = p.dateFilter ? (Date.now() - ((p.dateFilter === '7d' ? 7 : p.dateFilter === '30d' ? 30 : 90) * 86_400_000)) : null;
 
-  const filteredSessions = allSessions.filter(s => {
+  const filteredGroups = allGroups.filter((group) => group.members.some((s) => {
     if (p.searchQuery && !(s.display_title || '').toLowerCase().includes(p.searchQuery.toLowerCase())
       && !(s.project || '').toLowerCase().includes(p.searchQuery.toLowerCase())) return false;
     if (p.sourceFilter && s.source !== p.sourceFilter) return false;
@@ -113,10 +120,12 @@ export function QueueStep(p: QueueStepProps) {
     if (p.scoreFilter > 0 && (s.ai_failure_value_score == null || s.ai_failure_value_score < p.scoreFilter)) return false;
     if (dateCutoffMs && (!s.start_time || new Date(s.start_time).getTime() < dateCutoffMs)) return false;
     return true;
-  });
-  const available = filteredSessions.filter((s) => !selectedIds.has(s.session_id));
-  const visiblePickerSessions = filteredSessions.slice(0, pickerRenderLimit);
-  const visibleQueuedSessions = p.queuedSessions.slice(0, queueRenderLimit);
+  }));
+  const available = filteredGroups.filter((group) => (
+    !group.members.every((session) => selectedIds.has(session.session_id))
+  ));
+  const visiblePickerGroups = filteredGroups.slice(0, pickerRenderLimit);
+  const visibleQueuedGroups = queuedGroups.slice(0, queueRenderLimit);
 
   const historyShares = p.shares.filter(b => b.status === 'shared' || b.status === 'exported');
 
@@ -167,24 +176,41 @@ export function QueueStep(p: QueueStepProps) {
           <option value="90d">Last 90 days</option>
         </select>
       </div>
-      {filteredSessions.length > 0 && (() => {
-        const filteredIds = filteredSessions.map(s => s.session_id);
-        const selectedInFilter = filteredIds.filter(id => selectedIds.has(id)).length;
+      {filteredGroups.length > 0 && (() => {
+        const filteredIds = filteredGroups.flatMap((group) => group.members.map((s) => s.session_id));
+        const selectedInFilter = filteredGroups.filter((group) => (
+          group.members.every((session) => selectedIds.has(session.session_id))
+        )).length;
         const filterActive = !!(p.searchQuery || p.sourceFilter || p.projectFilter || p.scoreFilter > 0 || p.dateFilter);
-        const allSelected = selectedInFilter === filteredIds.length;
-        const batchDisabled = allSelected || selectionLimitReached;
+        const allSelected = selectedInFilter === filteredGroups.length;
         const remainingSlots = Math.max(0, MAX_SHARE_QUEUE_SIZE - p.queueOrder.length);
-        const unselectedInFilter = filteredIds.length - selectedInFilter;
-        const batchSelectionWouldBeCapped = unselectedInFilter > remainingSlots;
+        let batchSlots = remainingSlots;
+        const addableGroups = filteredGroups.filter((group) => {
+          if (group.logical_incomplete) return false;
+          const missing = group.members.filter((session) => !selectedIds.has(session.session_id));
+          if (missing.length === 0 || missing.length > batchSlots) return false;
+          batchSlots -= missing.length;
+          return true;
+        });
+        const batchAddIds = addableGroups.flatMap((group) => (
+          group.members
+            .map((session) => session.session_id)
+            .filter((id) => !selectedIds.has(id))
+        ));
+        const unselectedInFilter = filteredGroups.length - selectedInFilter;
+        const batchSelectionWouldBeCapped = addableGroups.length < unselectedInFilter;
+        const batchDisabled = allSelected || batchAddIds.length === 0;
         let batchLabel = filterActive
-          ? `Select ${filteredIds.length} filtered`
-          : `Select all ${filteredIds.length}`;
+          ? `Select ${filteredGroups.length} filtered`
+          : `Select all ${filteredGroups.length}`;
         if (selectionLimitReached && !allSelected) {
-          batchLabel = `${MAX_SHARE_QUEUE_SIZE} trace limit reached`;
+          batchLabel = `${MAX_SHARE_QUEUE_SIZE} ${logicalGroupingActive ? 'checkpoint' : 'trace'} limit reached`;
         } else if (batchSelectionWouldBeCapped) {
           batchLabel = filterActive
-            ? `Select ${remainingSlots} more filtered (${MAX_SHARE_QUEUE_SIZE} max)`
-            : `Select first ${remainingSlots} (${MAX_SHARE_QUEUE_SIZE} max)`;
+            ? `Select ${addableGroups.length} more filtered (${MAX_SHARE_QUEUE_SIZE} ${logicalGroupingActive ? 'checkpoints max' : 'max'})`
+            : logicalGroupingActive
+              ? `Select first ${addableGroups.length} (${MAX_SHARE_QUEUE_SIZE} checkpoints max)`
+              : `Select first ${batchAddIds.length} (${MAX_SHARE_QUEUE_SIZE} max)`;
         }
         const batchBtn = {
           ...btnGhost, fontSize: 12, padding: '5px 10px',
@@ -194,7 +220,7 @@ export function QueueStep(p: QueueStepProps) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
             <button
               type="button"
-              onClick={() => p.onAddMany(filteredIds)}
+              onClick={() => p.onAddMany(batchAddIds)}
               disabled={batchDisabled}
               style={{ ...batchBtn, opacity: batchDisabled ? 0.45 : 1, cursor: batchDisabled ? 'not-allowed' : 'pointer' }}
             >
@@ -209,37 +235,46 @@ export function QueueStep(p: QueueStepProps) {
               {filterActive ? `Deselect ${selectedInFilter} filtered` : 'Deselect all'}
             </button>
             <span style={{ fontSize: 11.5, color: colors.gray500 }}>
-              {selectedInFilter} of {filteredIds.length}{filterActive ? ' filtered' : ''} selected
-              {' · '}{MAX_SHARE_QUEUE_SIZE} trace maximum
+              {selectedInFilter} of {filteredGroups.length}{filterActive ? ' filtered' : ''}{' '}
+              {logicalGroupingActive ? 'conversations' : 'traces'} selected
+              {' · '}{MAX_SHARE_QUEUE_SIZE} {logicalGroupingActive ? 'upload checkpoint' : 'trace'} maximum
             </span>
           </div>
         );
       })()}
       <div style={{ maxHeight: '36vh', overflowY: 'auto', border: `1px solid ${colors.gray200}`, borderRadius: 6, background: colors.white }}>
-        {filteredSessions.length === 0 ? (
+        {filteredGroups.length === 0 ? (
           <div style={{ padding: 14, textAlign: 'center', color: colors.gray400, fontSize: 13 }}>
             No sessions match your filters.
           </div>
-        ) : visiblePickerSessions.map((s, i) => {
-          const selected = selectedIds.has(s.session_id);
-          const blockedByLimit = selectionLimitReached && !selected;
+        ) : visiblePickerGroups.map((group, i) => {
+          const s = group.display;
+          const checkpointIds = group.members.map((session) => session.session_id);
+          const selected = checkpointIds.every((id) => selectedIds.has(id));
+          const missingCount = checkpointIds.filter((id) => !selectedIds.has(id)).length;
+          const blockedByLimit = !selected && missingCount > (MAX_SHARE_QUEUE_SIZE - p.queueOrder.length);
+          const selectionBlocked = group.logical_incomplete || blockedByLimit;
           return (
             <label
-              key={s.session_id}
-              title={blockedByLimit ? 'Remove a selected trace before adding another.' : undefined}
+              key={group.logical_session_id}
+              title={group.logical_incomplete
+                ? 'This conversation has a missing or overlapping checkpoint. Run a successful scan before sharing it.'
+                : blockedByLimit
+                  ? 'Remove selected upload checkpoints before adding this conversation.'
+                  : undefined}
               style={{
                 display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 10,
                 alignItems: 'center', padding: '8px 12px',
-                borderBottom: i < visiblePickerSessions.length - 1 ? `1px solid ${colors.gray100}` : 'none',
-                cursor: blockedByLimit ? 'not-allowed' : 'pointer',
-                opacity: blockedByLimit ? 0.55 : 1,
+                borderBottom: i < visiblePickerGroups.length - 1 ? `1px solid ${colors.gray100}` : 'none',
+                cursor: selectionBlocked ? 'not-allowed' : 'pointer',
+                opacity: selectionBlocked ? 0.55 : 1,
               }}>
               <input
                 type="checkbox"
                 checked={selected}
-                disabled={blockedByLimit}
-                aria-label={`Include trace: ${s.display_title || 'Untitled'}`}
-                onChange={(e) => e.target.checked ? p.onAdd(s.session_id) : p.onRemove(s.session_id)}
+                disabled={selectionBlocked}
+                aria-label={`Include ${logicalGroupingActive ? 'conversation' : 'trace'}: ${s.display_title || 'Untitled'}`}
+                onChange={(e) => e.target.checked ? p.onAddMany(checkpointIds) : p.onRemoveMany(checkpointIds)}
                 style={{ width: 15, height: 15, accentColor: colors.gray900 }}
               />
               <div style={{ minWidth: 0 }}>
@@ -257,6 +292,18 @@ export function QueueStep(p: QueueStepProps) {
                   <span>{s.project}</span>
                   <span style={{ opacity: 0.5 }}>&middot;</span>
                   <span>{formatTokens(sessionTotalTokens(s))} tokens</span>
+                  {(s.checkpoint_count ?? group.members.length) > 1 && (<>
+                    <span style={{ opacity: 0.5 }}>&middot;</span>
+                    <span>
+                      {group.members.length < (s.checkpoint_count ?? group.members.length)
+                        ? `${group.members.length} eligible of ${s.checkpoint_count} upload checkpoints`
+                        : `${s.checkpoint_count ?? group.members.length} upload checkpoints`}
+                    </span>
+                  </>)}
+                  {group.members.some((session) => session.logical_incomplete) && (<>
+                    <span style={{ opacity: 0.5 }}>&middot;</span>
+                    <span style={{ color: colors.red700, fontWeight: 600 }}>Checkpoint sequence incomplete</span>
+                  </>)}
                   {s.review_status && s.review_status !== 'approved' && (<>
                     <span style={{ opacity: 0.5 }}>&middot;</span>
                     <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
@@ -266,7 +313,7 @@ export function QueueStep(p: QueueStepProps) {
             </label>
           );
         })}
-        {filteredSessions.length > visiblePickerSessions.length && (
+        {filteredGroups.length > visiblePickerGroups.length && (
           <button
             onClick={() => setPickerRenderLimit((current) => current + TRACE_RENDER_BATCH)}
             style={{
@@ -274,16 +321,16 @@ export function QueueStep(p: QueueStepProps) {
               borderTop: `1px solid ${colors.gray200}`, borderRadius: 0,
             }}
           >
-            Show {Math.min(TRACE_RENDER_BATCH, filteredSessions.length - visiblePickerSessions.length)} more
+            Show {Math.min(TRACE_RENDER_BATCH, filteredGroups.length - visiblePickerGroups.length)} more
             <span style={{ color: colors.gray400, fontWeight: 400 }}>
-              ({filteredSessions.length - visiblePickerSessions.length} remaining)
+              ({filteredGroups.length - visiblePickerGroups.length} remaining)
             </span>
           </button>
         )}
       </div>
-      {filteredSessions.length > TRACE_RENDER_BATCH && (
+      {filteredGroups.length > TRACE_RENDER_BATCH && (
         <div style={{ marginTop: 7, fontSize: 11.5, color: colors.gray500 }}>
-          Showing {visiblePickerSessions.length} of {filteredSessions.length} matching traces. Only selected traces are in this bundle ({MAX_SHARE_QUEUE_SIZE} maximum); unselected matches remain available to swap in.
+          Showing {visiblePickerGroups.length} of {filteredGroups.length} matching {logicalGroupingActive ? 'conversations' : 'traces'}. Only selected {logicalGroupingActive ? 'upload checkpoints' : 'traces'} are in this bundle ({MAX_SHARE_QUEUE_SIZE} maximum); unselected matches remain available to swap in.
         </div>
       )}
     </div>
@@ -293,6 +340,18 @@ export function QueueStep(p: QueueStepProps) {
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
+      {(p.readyStats?.logical_incomplete_excluded ?? 0) > 0 && (
+        <div
+          role="alert"
+          style={{
+            marginBottom: 14, padding: '9px 12px', borderRadius: 7,
+            border: `1px solid ${colors.red200}`, background: colors.red100,
+            color: colors.red700, fontSize: 12.5,
+          }}
+        >
+          {p.readyStats?.logical_incomplete_excluded} incomplete conversation{p.readyStats?.logical_incomplete_excluded === 1 ? '' : 's'} hidden from sharing. Run a successful scan to repair the checkpoint sequence.
+        </div>
+      )}
 
       {allSessions.length === 0 && p.candidates.length === 0 ? (
         <>
@@ -398,7 +457,7 @@ export function QueueStep(p: QueueStepProps) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               <div style={{ fontSize: 13, color: colors.gray900, fontWeight: 500 }}>draft-bundle</div>
               <div style={{ fontSize: 12, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
-                {p.queuedSessions.length} trace{p.queuedSessions.length === 1 ? '' : 's'} &middot; ~{formatTokens(totalTokens)} tokens
+                {selectionSummary} &middot; ~{formatTokens(totalTokens)} tokens
                 {uniqueProjects.length > 0 && ` · ${uniqueProjects.length} project${uniqueProjects.length !== 1 ? 's' : ''}`}
               </div>
             </div>
@@ -449,14 +508,18 @@ export function QueueStep(p: QueueStepProps) {
           {/* Trace list */}
           {!p.showAddTraces && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 18 }} onDragEnd={onDragEnd}>
-            {visibleQueuedSessions.map((s) => {
-              const isDragging = dragId === s.session_id;
+            {visibleQueuedGroups.map((group) => {
+              const s = group.display;
+              const checkpointIds = group.members.map((session) => session.session_id);
+              const canDrag = checkpointIds.length === 1;
+              const dragSessionId = checkpointIds[0];
+              const isDragging = canDrag && dragId === dragSessionId;
               return (
                 <div
-                  key={s.session_id}
-                  draggable
-                  onDragStart={(e) => onDragStart(e, s.session_id)}
-                  onDragOver={(e) => onDragOver(e, s.session_id)}
+                  key={group.logical_session_id}
+                  draggable={canDrag}
+                  onDragStart={(e) => { if (canDrag) onDragStart(e, dragSessionId); }}
+                  onDragOver={(e) => { if (canDrag) onDragOver(e, dragSessionId); }}
                   onDrop={(e) => { e.preventDefault(); setDragId(null); }}
                   style={{
                     display: 'grid', gridTemplateColumns: '20px 1fr auto', gap: 12,
@@ -469,7 +532,10 @@ export function QueueStep(p: QueueStepProps) {
                     transition: 'border-color 140ms, background 140ms, box-shadow 200ms',
                   }}
                 >
-                  <div style={{ color: colors.gray400, cursor: 'grab', display: 'grid', placeItems: 'center' }} title="Drag to reorder">
+                  <div
+                    style={{ color: colors.gray400, cursor: canDrag ? 'grab' : 'default', opacity: canDrag ? 1 : 0.35, display: 'grid', placeItems: 'center' }}
+                    title={canDrag ? 'Drag to reorder' : 'Grouped upload checkpoints stay together'}
+                  >
                     <Icon name="grip" size={14} />
                   </div>
                   <div style={{ minWidth: 0 }}>
@@ -488,6 +554,14 @@ export function QueueStep(p: QueueStepProps) {
                       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flexShrink: 1 }}>{s.project}</span>
                       <span style={{ opacity: 0.5, flexShrink: 0 }}>&middot;</span>
                       <span style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>{formatTokens(sessionTotalTokens(s))} tokens</span>
+                      {(s.checkpoint_count ?? group.members.length) > 1 && (<>
+                        <span style={{ opacity: 0.5, flexShrink: 0 }}>&middot;</span>
+                        <span style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>
+                          {group.members.length < (s.checkpoint_count ?? group.members.length)
+                            ? `${group.members.length} eligible of ${s.checkpoint_count} upload checkpoints`
+                            : `${s.checkpoint_count ?? group.members.length} upload checkpoints`}
+                        </span>
+                      </>)}
                       {s.tool_uses > 0 && (<>
                         <span style={{ opacity: 0.5, flexShrink: 0 }}>&middot;</span>
                         <span style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>{s.tool_uses} tools</span>
@@ -533,14 +607,14 @@ export function QueueStep(p: QueueStepProps) {
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                     <button
-                      onClick={() => p.setDrawerSessionId(s.session_id)}
+                      onClick={() => p.setDrawerSessionId(group.logical_session_id)}
                       style={btnGhost}
                       title="Preview"
                     >
                       Preview
                     </button>
                     <button
-                      onClick={() => p.onRemove(s.session_id)}
+                      onClick={() => p.onRemoveMany(checkpointIds)}
                       style={{ ...btnGhost, color: colors.red700 }}
                       title="Remove from bundle"
                     >
@@ -550,12 +624,12 @@ export function QueueStep(p: QueueStepProps) {
                 </div>
               );
             })}
-            {p.queuedSessions.length > visibleQueuedSessions.length && (
+            {queuedGroups.length > visibleQueuedGroups.length && (
               <button
                 onClick={() => setQueueRenderLimit((current) => current + TRACE_RENDER_BATCH)}
                 style={{ ...btnSecondary, alignSelf: 'center', marginTop: 4 }}
               >
-                Show {Math.min(TRACE_RENDER_BATCH, p.queuedSessions.length - visibleQueuedSessions.length)} more selected traces
+                Show {Math.min(TRACE_RENDER_BATCH, queuedGroups.length - visibleQueuedGroups.length)} more selected conversations
               </button>
             )}
           </div>
@@ -623,7 +697,7 @@ export function QueueStep(p: QueueStepProps) {
             }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                 <div style={{ fontSize: 13, color: colors.gray900 }}>
-                  {p.queuedSessions.length} trace{p.queuedSessions.length === 1 ? '' : 's'} selected
+                  {selectionSummary} selected
                 </div>
                 <div style={{ fontSize: 11.5, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
                   Next: we&rsquo;ll redact secrets and identifiers on your device
@@ -652,8 +726,8 @@ export function QueueStep(p: QueueStepProps) {
           <ConfirmDialog
             open={confirmLargeBundle}
             title="Review large bundle?"
-            message={`You selected ${p.queuedSessions.length} traces. Redaction and optional AI-assisted PII review will run for every selected trace. Continue only if you intend to review this full bundle.`}
-            confirmLabel={`Redact ${p.queuedSessions.length} traces`}
+            message={`You selected ${selectionSummary}. Redaction and optional AI-assisted PII review will run for every selected upload checkpoint. Continue only if you intend to review this full bundle.`}
+            confirmLabel={`Redact ${p.queuedSessions.length} upload checkpoints`}
             onConfirm={() => {
               setConfirmLargeBundle(false);
               p.onContinue();

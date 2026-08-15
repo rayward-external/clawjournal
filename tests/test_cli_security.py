@@ -90,6 +90,28 @@ class TestHoldVerbs:
         assert history[-1]["changed_by"] == "user"
         assert history[-1]["reason"] == "reviewing"
 
+    def test_hold_updates_every_active_checkpoint_in_logical_conversation(self, conn):
+        _seed(conn, "root")
+        _seed(conn, "tail")
+        conn.execute(
+            "UPDATE sessions SET logical_session_id = 'conversation', "
+            "segment_index = CASE session_id WHEN 'root' THEN 0 ELSE 1 END "
+            "WHERE session_id IN ('root', 'tail')"
+        )
+        conn.commit()
+
+        _run(cli_security.run_hold, session_id="root", reason="review family")
+
+        states = conn.execute(
+            "SELECT session_id, hold_state FROM sessions "
+            "WHERE logical_session_id = 'conversation' ORDER BY session_id"
+        ).fetchall()
+        assert [(row["session_id"], row["hold_state"]) for row in states] == [
+            ("root", "pending_review"),
+            ("tail", "pending_review"),
+        ]
+        assert get_hold_history(conn, "tail")[-1]["reason"] == "review family"
+
     def test_release(self, conn):
         _seed(conn)
         result = _run(cli_security.run_release, session_id="sess-1", reason=None)

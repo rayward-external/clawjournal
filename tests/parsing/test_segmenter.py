@@ -95,6 +95,7 @@ class TestAppendOnlySegmentation:
         )
 
         assert result == [session]
+        assert result[0]["logical_session_id"] == "growing"
 
     def test_next_user_seals_prior_turn_and_leaves_tail_unranged(self):
         messages = [
@@ -121,11 +122,57 @@ class TestAppendOnlySegmentation:
             "growing",
             "growing_seg-0001",
         ]
+        assert [item["logical_session_id"] for item in result] == [
+            "growing",
+            "growing",
+        ]
+        assert [item["segment_message_range"] for item in result] == [
+            [0, 3],
+            [4, 4],
+        ]
+        assert [item["messages"] for item in result] == [
+            messages[:4],
+            messages[4:],
+        ]
+        assert [
+            (
+                item.get("raw_source_start_offset"),
+                item.get("raw_source_end_offset"),
+            )
+            for item in result
+        ] == [(0, 50), (None, None)]
+        assert all("parent_session_id" not in item for item in result)
         assert result[0]["segment_sealed"] is True
-        assert result[0]["raw_source_end_offset"] == 50
         assert result[1]["segment_sealed"] is False
-        assert result[1]["raw_source_start_offset"] is None
-        assert result[1]["raw_source_end_offset"] is None
+
+    def test_checkpointing_preserves_a_real_subagent_parent(self):
+        messages = [
+            _user("question one"),
+            _assistant("answer one"),
+            _user("question two"),
+        ]
+        session = _session(messages, session_id="child", source="claude")
+        session["parent_session_id"] = "real-subagent-parent"
+
+        result = segment_append_only_session(
+            session,
+            [10, 20, 30],
+            message_start_offsets=[0, 10, 20],
+            raw_source_size=30,
+            max_messages=2,
+            max_user_messages=99,
+            max_text_bytes=999_999,
+            max_raw_bytes=999_999,
+        )
+
+        assert [item["session_id"] for item in result] == [
+            "child",
+            "child_seg-0001",
+        ]
+        assert all(
+            item["parent_session_id"] == "real-subagent-parent" for item in result
+        )
+        assert all(item["logical_session_id"] == "child" for item in result)
 
     def test_token_snapshots_split_into_per_segment_deltas(self):
         messages = [
@@ -689,6 +736,30 @@ class TestHelpers:
     def test_extract_segment_title(self):
         msgs = [_user("Fix the authentication bug"), _assistant("On it")]
         assert _extract_segment_title(msgs) == "Fix the authentication bug"
+
+    def test_extract_segment_title_skips_complete_internal_wrappers(self):
+        msgs = [
+            _user(
+                "<task-notification>background task completed</task-notification>"
+            ),
+            _assistant("Noted"),
+            _user("Fix the authentication bug"),
+        ]
+
+        assert _extract_segment_title(msgs) == "Fix the authentication bug"
+        assert msgs[0]["content"] == (
+            "<task-notification>background task completed</task-notification>"
+        )
+
+    def test_extract_segment_title_keeps_user_text_after_wrapper(self):
+        content = (
+            "<command-name>/review</command-name>\n"
+            "Review the authentication changes"
+        )
+
+        assert _extract_segment_title([_user(content)]) == (
+            "Review the authentication changes"
+        )
 
     def test_extract_segment_title_truncates(self):
         long_msg = "A" * 200

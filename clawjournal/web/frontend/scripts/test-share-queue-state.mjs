@@ -123,9 +123,9 @@ assert.deepEqual(queueSelectionFromSearchParams(missingLockedParams, ids, storag
 
 const queueStep = await readFile(new URL('../src/views/Share/QueueStep.tsx', import.meta.url), 'utf8');
 assert.doesNotMatch(queueStep, /queueOrder\.includes\(/);
-assert.match(queueStep, /selectedIds\.has\(s\.session_id\)/);
-assert.match(queueStep, /p\.queuedSessions\.slice\(0, queueRenderLimit\)/);
-assert.match(queueStep, /filteredSessions\.slice\(0, pickerRenderLimit\)/);
+assert.match(queueStep, /selectedIds\.has\(session\.session_id\)/);
+assert.match(queueStep, /queuedGroups\.slice\(0, queueRenderLimit\)/);
+assert.match(queueStep, /filteredGroups\.slice\(0, pickerRenderLimit\)/);
 
 const redactStep = await readFile(new URL('../src/views/Share/RedactStep.tsx', import.meta.url), 'utf8');
 assert.match(redactStep, /p\.queuedSessions\.slice\(0, visibleCount\)/);

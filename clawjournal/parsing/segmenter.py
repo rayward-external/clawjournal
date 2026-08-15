@@ -23,6 +23,30 @@ APPEND_ONLY_MAX_TEXT_BYTES = 4 * 1024 * 1024
 APPEND_ONLY_MAX_RAW_BYTES = 8 * 1024 * 1024
 
 
+_INTERNAL_TITLE_WRAPPER_RE = re.compile(
+    r"\s*<(?P<tag>task-notification|command-message|command-name|command-args|"
+    r"local-command-caveat|local-command-stdout)\b[^>]*>"
+    r".*?</(?P=tag)>\s*",
+    re.DOTALL,
+)
+
+
+def strip_high_confidence_internal_wrappers(content: Any) -> str:
+    """Strip complete known harness wrappers from the start of *content*.
+
+    Keep this deliberately narrower than the heuristics used for scoring or
+    turn analysis. Wrappers embedded in ordinary prose are left untouched;
+    only a complete prefix block is display-only noise.
+    """
+
+    if not isinstance(content, str) or not content:
+        return ""
+    position = 0
+    while match := _INTERNAL_TITLE_WRAPPER_RE.match(content, position):
+        position = match.end()
+    return content[position:].strip() if position else content
+
+
 def _message_text_bytes(message: dict[str, Any]) -> int:
     total = 0
     stack: list[Any] = [message]
@@ -64,6 +88,15 @@ def segment_append_only_session(
     Snapshots that do not line up with the messages are ignored, leaving the
     children with the zeroed token counts they had before.
     """
+
+    root_session_id = str(session.get("session_id") or "")
+    existing_logical_id = session.get("logical_session_id")
+    if root_session_id and (
+        not isinstance(existing_logical_id, str) or not existing_logical_id
+    ):
+        # Checkpoints are transport/storage units of one logical conversation.
+        # Make that identity explicit even when the session stays unsegmented.
+        session["logical_session_id"] = root_session_id
 
     messages = session.get("messages", [])
     if not isinstance(messages, list) or not messages:
@@ -138,8 +171,7 @@ def segment_append_only_session(
     if len(starts) <= 1:
         return [session]
 
-    parent_id = str(session.get("session_id") or "")
-    if not parent_id:
+    if not root_session_id:
         return [session]
     closed_boundaries = set(boundaries)
     children: list[dict[str, Any]] = []
@@ -175,9 +207,9 @@ def segment_append_only_session(
             # hosted receiver sees a normal revision chain instead of a new,
             # overlapping trace. Later checkpoints are independent children.
             "session_id": (
-                parent_id
+                root_session_id
                 if segment_index == 0
-                else f"{parent_id}_seg-{segment_index:04d}"
+                else f"{root_session_id}_seg-{segment_index:04d}"
             ),
             "segment_index": segment_index,
             "segment_title": _extract_segment_title(segment_messages),
@@ -194,10 +226,6 @@ def segment_append_only_session(
             "messages": segment_messages,
             "stats": segment_stats,
         })
-        if segment_index == 0:
-            child.pop("parent_session_id", None)
-        else:
-            child["parent_session_id"] = parent_id
         children.append(child)
     return children
 
@@ -777,7 +805,11 @@ def _extract_segment_title(messages: list[dict]) -> str:
     """Generate a title from the first user message in the segment."""
     for msg in messages:
         if msg.get("role") == "user":
-            content = msg.get("content", "")
+            content = strip_high_confidence_internal_wrappers(
+                msg.get("content", "")
+            )
+            if not content:
+                continue
             # Strip common metadata prefixes (OpenClaw wraps user messages)
             text = _strip_openclaw_metadata(content)
             if text:

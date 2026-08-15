@@ -464,6 +464,68 @@ def test_snapshot_treats_missing_critical_session_columns_as_unreadable():
     assert errors == ["session decisions and hold state"]
 
 
+def test_recovery_preserves_missing_checkpoint_projection_metadata(
+    recovery_install,
+):
+    conn = index_module.open_index()
+    try:
+        session = _session()
+        session.update({
+            "logical_session_id": "session-recovery",
+            "parent_session_id": "real-parent",
+            "segment_index": 0,
+            "segment_message_range": [0, 1],
+            "segment_reason": "bounded_checkpoint",
+            "segment_sealed": True,
+            "raw_source_start_offset": 0,
+            "raw_source_end_offset": 42,
+        })
+        index_module.upsert_sessions(conn, [session])
+        conn.execute(
+            "UPDATE sessions SET checkpoint_active = 0 WHERE session_id = ?",
+            ("session-recovery",),
+        )
+        conn.commit()
+        snapshot, errors = index_recovery._recovery_snapshot(conn)
+        assert errors == []
+        saved = snapshot["sessions"][0]
+        assert saved["logical_session_id"] == "session-recovery"
+        assert saved["checkpoint_active"] == 0
+
+        conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?", ("session-recovery",)
+        )
+        conn.commit()
+        restored, needs_review, skipped = index_recovery._restore_session_state(
+            conn, snapshot["sessions"]
+        )
+        conn.commit()
+
+        assert (restored, needs_review, skipped) == (0, 1, 0)
+        row = conn.execute(
+            "SELECT parent_session_id, segment_index, segment_start_message, "
+            "segment_end_message, segment_reason, segment_sealed, "
+            "raw_source_start_offset, raw_source_end_offset, logical_session_id, "
+            "checkpoint_active, logical_revision FROM sessions "
+            "WHERE session_id = 'session-recovery'"
+        ).fetchone()
+        assert dict(row) == {
+            "parent_session_id": "real-parent",
+            "segment_index": 0,
+            "segment_start_message": 0,
+            "segment_end_message": 1,
+            "segment_reason": "bounded_checkpoint",
+            "segment_sealed": 1,
+            "raw_source_start_offset": 0,
+            "raw_source_end_offset": 42,
+            "logical_session_id": "session-recovery",
+            "checkpoint_active": 0,
+            "logical_revision": saved["logical_revision"],
+        }
+    finally:
+        conn.close()
+
+
 def test_snapshot_treats_missing_critical_finding_columns_as_unreadable():
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

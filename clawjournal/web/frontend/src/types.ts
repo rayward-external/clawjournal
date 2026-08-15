@@ -47,6 +47,19 @@ export interface Session {
   estimated_cost_usd: number | null;
   parent_session_id: string | null;
   subagent_session_ids: string | null;
+  /** Stable identity shared by append-only upload checkpoints. */
+  logical_session_id?: string | null;
+  /** Revision of the active checkpoint membership and ordering. */
+  logical_revision?: string | null;
+  /** Number of active upload checkpoints represented by this logical row. */
+  checkpoint_count?: number | null;
+  /** Physical checkpoint ids represented by this logical row, when supplied. */
+  checkpoint_session_ids?: string[];
+  /** Physical components merged into a logical detail response. */
+  component_session_ids?: string[];
+  checkpoint_revisions?: Record<string, string>;
+  /** True when the checkpoint family could not be projected losslessly. */
+  logical_incomplete?: boolean;
   user_interrupts: number | null;
   hold_state: HoldState | null;
   embargo_until: string | null;

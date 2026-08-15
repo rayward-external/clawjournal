@@ -252,3 +252,38 @@ describe('share scanner recovery API', () => {
     });
   });
 });
+
+describe('share creation API', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('sends both physical and logical revision preconditions', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ share_id: 'share-1' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.shares.create(
+      ['trace', 'trace_seg-0001'],
+      'note',
+      undefined,
+      { trace: 'physical-0', 'trace_seg-0001': 'physical-1' },
+      { trace: 'logical-revision' },
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/shares', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_ids: ['trace', 'trace_seg-0001'],
+        note: 'note',
+        attestation: undefined,
+        expected_revisions: { trace: 'physical-0', 'trace_seg-0001': 'physical-1' },
+        expected_logical_revisions: { trace: 'logical-revision' },
+      }),
+    });
+  });
+});

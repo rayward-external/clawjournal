@@ -894,6 +894,30 @@ export function Inbox() {
                         {LABELS[s.task_type] ?? s.task_type.replace(/_/g, ' ')}
                       </span>
                     )}
+                    {(s.checkpoint_count ?? 0) > 1 && (
+                      <span
+                        style={{
+                          fontSize: 11, padding: '1px 8px', borderRadius: 9999,
+                          background: colors.gray100, color: colors.gray600,
+                          fontWeight: 600, flexShrink: 0,
+                        }}
+                        title="This conversation is stored as bounded upload checkpoints."
+                      >
+                        {s.checkpoint_count} upload checkpoints
+                      </span>
+                    )}
+                    {s.logical_incomplete && (
+                      <span
+                        style={{
+                          fontSize: 11, padding: '1px 8px', borderRadius: 9999,
+                          background: colors.red100, color: colors.red700,
+                          fontWeight: 600, flexShrink: 0,
+                        }}
+                        title="One or more checkpoints are missing or overlap; sharing is disabled until the next successful scan."
+                      >
+                        Incomplete conversation
+                      </span>
+                    )}
                   </div>
                   <div style={{ fontSize: '12px', color: colors.gray400, lineHeight: '1.3', display: 'flex', alignItems: 'center', gap: 4 }}>
                     <span style={{

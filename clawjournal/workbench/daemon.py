@@ -64,7 +64,7 @@ from .index import (
     add_policy,
     already_shared_revision_blockers,
     apply_share_redactions,
-    bulk_update_review_status,
+    bulk_update_logical_review_status,
     create_share,
     export_share_to_disk,
     FAILURE_VALUE_SOURCE_SCOPE,
@@ -73,25 +73,30 @@ from .index import (
     get_shares,
     get_dashboard_analytics,
     get_highlights,
+    get_logical_stats,
+    get_logical_session_detail,
+    get_logical_session_members,
     get_policies,
     get_session_detail,
     get_share_ready_stats,
-    get_stats,
     link_subagent_hierarchy,
+    LogicalProjectionError,
     open_index,
-    query_sessions,
+    query_logical_sessions,
     query_unscored_sessions,
     release_gate_blockers,
     RevisionConflictError,
     revision_review_blockers,
     remove_policy,
-    search_fts,
+    search_logical_sessions,
     SCORE_SETTLE_SECONDS,
     session_matches_excluded_projects,
+    set_logical_hold_state,
     share_predecessor_blockers,
     share_revision_blockers,
     source_scope_blockers,
     synchronize_share_predecessors,
+    _validate_hold_target,
     update_session,
     upsert_sessions,
 )
@@ -4241,7 +4246,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             status_filter = None
         conn = open_index()
         try:
-            result = query_sessions(
+            result = query_logical_sessions(
                 conn,
                 status=status_filter,
                 source=params.get("source", [None])[0],
@@ -4264,7 +4269,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _handle_get_session(self, session_id: str) -> None:
         conn = open_index()
         try:
-            detail = get_session_detail(conn, session_id)
+            try:
+                detail = get_logical_session_detail(conn, session_id)
+            except LogicalProjectionError as exc:
+                _json_response(self, {
+                    "error": str(exc),
+                    "block_reason": "logical_projection_incomplete",
+                }, 409)
+                return
             if detail is None:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
@@ -4277,10 +4289,77 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         body = _read_body(self)
         conn = open_index()
         try:
+            members = get_logical_session_members(conn, session_id)
+            if not members:
+                _json_response(self, {"error": "Session not found"}, 404)
+                return
+            representative_id = str(members[0]["session_id"])
+
+            scoring_fields = {
+                "ai_quality_score", "ai_score_reason", "ai_scoring_detail",
+                "ai_effort_estimate", "ai_summary", "ai_task_type",
+                "ai_outcome_badge", "ai_value_badges",
+                "ai_risk_badges", "ai_failure_value_score",
+                "ai_failure_evidence", "ai_recovery_labels",
+                "ai_failure_attribution", "ai_failure_modes",
+                "ai_learning_summary", "ai_scorer_backend",
+                "ai_scorer_model", "ai_rubric_git_sha", "ai_scored_at",
+            }
+            if len(members) > 1 and scoring_fields.intersection(body):
+                _json_response(self, {
+                    "error": (
+                        "Conversation-level scoring is not available for a "
+                        "multi-checkpoint conversation yet."
+                    ),
+                    "block_reason": "logical_scoring_not_supported",
+                }, 409)
+                return
+
+            # Validate every field that can reject the request before changing
+            # any member of the logical family.  Review status and hold state
+            # are committed by separate audited helpers below, so a late
+            # validation failure must not leave a partially updated family.
+            status = body.get("status")
+            if status is not None and status not in {
+                "new", "shortlisted", "approved", "blocked",
+            }:
+                _json_response(self, {"error": "Invalid review status"}, 400)
+                return
+            for score_field in ("ai_quality_score", "ai_failure_value_score"):
+                raw_score = body.get(score_field)
+                if raw_score is None:
+                    continue
+                try:
+                    score = int(raw_score)
+                except (TypeError, ValueError):
+                    _json_response(self, {"error": f"Invalid {score_field}"}, 400)
+                    return
+                if not 1 <= score <= 5:
+                    _json_response(self, {"error": f"Invalid {score_field}"}, 400)
+                    return
+                body[score_field] = score
+            hold_state = body.get("hold_state")
+            if hold_state is not None:
+                if not isinstance(hold_state, str):
+                    _json_response(self, {"error": "Invalid hold_state"}, 400)
+                    return
+                try:
+                    _validate_hold_target(
+                        hold_state,
+                        body.get("embargo_until"),
+                    )
+                except (TypeError, ValueError) as exc:
+                    _json_response(self, {"error": str(exc)}, 400)
+                    return
+
             if "ai_failure_value_score" in body or "ai_failure_evidence" in body:
-                detail = get_session_detail(conn, session_id)
-                if detail is None:
-                    _json_response(self, {"error": "Session not found"}, 404)
+                try:
+                    detail = get_logical_session_detail(conn, session_id)
+                except LogicalProjectionError as exc:
+                    _json_response(self, {
+                        "error": str(exc),
+                        "block_reason": "logical_projection_incomplete",
+                    }, 409)
                     return
 
                 failure_value = body.get("ai_failure_value_score")
@@ -4314,9 +4393,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         provided_evidence,
                     )
 
+            status_ok = True
+            if status is not None:
+                try:
+                    updated_ids, _ = bulk_update_logical_review_status(
+                        conn,
+                        [session_id],
+                        status,
+                    )
+                except ValueError as exc:
+                    _json_response(self, {"error": str(exc)}, 400)
+                    return
+                status_ok = bool(updated_ids)
+
             ok = update_session(
-                conn, session_id,
-                status=body.get("status"),
+                conn, representative_id,
                 notes=body.get("notes"),
                 reason=body.get("reason"),
                 ai_quality_score=body.get("ai_quality_score"),
@@ -4337,15 +4428,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 ai_scorer_model=body.get("ai_scorer_model"),
                 ai_rubric_git_sha=body.get("ai_rubric_git_sha"),
                 ai_scored_at=body.get("ai_scored_at"),
-            )
+            ) and status_ok
             # Hold-state transitions are separate from review-status updates
             # — they pass through `set_hold_state` so the audit log and
             # validation stay in one place.
             hold_state = body.get("hold_state")
             if hold_state is not None:
-                from .index import set_hold_state
                 try:
-                    ok = set_hold_state(
+                    ok = set_logical_hold_state(
                         conn, session_id, hold_state,
                         changed_by="user",
                         reason=body.get("reason"),
@@ -4399,7 +4489,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         conn = open_index()
         try:
             try:
-                updated_ids, missing_ids = bulk_update_review_status(
+                updated_ids, missing_ids = bulk_update_logical_review_status(
                     conn,
                     session_ids,
                     status,
@@ -4609,6 +4699,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         conn = open_index()
         try:
+            members = get_logical_session_members(conn, session_id)
+            if not members:
+                _json_response(self, {"error": "Session not found"}, 404)
+                return
+            if len(members) > 1:
+                _json_response(self, {
+                    "error": (
+                        "Conversation-level scoring is not available for a "
+                        "multi-checkpoint conversation yet."
+                    ),
+                    "block_reason": "logical_scoring_not_supported",
+                }, 409)
+                return
+            representative_id = str(members[0]["session_id"])
             # Manual scoring is AI egress too: scrub configured redaction
             # strings/usernames/blocked-domains before the prompt leaves the
             # machine, matching the background warmup path. Unlike warmup we do
@@ -4621,17 +4725,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             if redaction_settings is not None:
                 score_kwargs["redaction_settings"] = redaction_settings
             try:
-                result = score_session(conn, session_id, **score_kwargs)
+                result = score_session(conn, representative_id, **score_kwargs)
             except RuntimeError as e:
                 _json_response(self, {"error": str(e)}, 503)
                 return
 
-            ok = _persist_scoring_result(conn, session_id, result)
+            ok = _persist_scoring_result(conn, representative_id, result)
             if not ok:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
 
-            _maybe_create_trace_note(conn, session_id)
+            _maybe_create_trace_note(conn, representative_id)
 
             _json_response(self, {
                 "ok": True,
@@ -4803,7 +4907,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         conn = open_index()
         try:
-            results = search_fts(
+            results = search_logical_sessions(
                 conn, q,
                 limit=int(params.get("limit", ["50"])[0]),
                 offset=int(params.get("offset", ["0"])[0]),
@@ -4818,7 +4922,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         end = params.get("end", [None])[0]
         conn = open_index()
         try:
-            stats = get_stats(conn, start=start, end=end)
+            stats = get_logical_stats(conn, start=start, end=end)
             _json_response(self, stats)
         finally:
             conn.close()
@@ -4923,7 +5027,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         """Return session with secrets redacted — for pre-share review."""
         conn = open_index()
         try:
-            detail = get_session_detail(conn, session_id)
+            try:
+                detail = get_logical_session_detail(conn, session_id)
+            except LogicalProjectionError as exc:
+                _json_response(self, {
+                    "error": str(exc),
+                    "block_reason": "logical_projection_incomplete",
+                }, 409)
+                return
             if detail is None:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
@@ -5888,6 +5999,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if expected_revisions is not None and not isinstance(expected_revisions, dict):
             _json_response(self, {"error": "expected_revisions must be an object"}, 400)
             return
+        expected_logical_revisions = body.get("expected_logical_revisions")
+        if (
+            expected_logical_revisions is not None
+            and not isinstance(expected_logical_revisions, dict)
+        ):
+            _json_response(
+                self,
+                {"error": "expected_logical_revisions must be an object"},
+                400,
+            )
+            return
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
@@ -5919,6 +6041,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     note=body.get("note"),
                     source_filter=settings.get("source_filter"),
                     expected_revisions=expected_revisions,
+                    expected_logical_revisions=expected_logical_revisions,
                 )
             except RevisionConflictError as exc:
                 _json_response(self, {
