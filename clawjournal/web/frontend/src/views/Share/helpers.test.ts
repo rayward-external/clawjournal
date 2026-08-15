@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 import type { ReadySession, ShareReadyStats } from './types.ts';
 import {
   classify,
+  collectExpectedLogicalRevisions,
+  expandLogicalQueueSelection,
+  groupReadySessions,
   hasLockedQueueSelection,
   queueFromSelectionParams,
   queueFromStats,
@@ -122,5 +125,81 @@ describe('Share queue selection encoding', () => {
 
     params.delete('ids');
     expect(hasLockedQueueSelection(params)).toBe(false);
+  });
+});
+
+describe('logical conversation queue projection', () => {
+  function checkpoint(id: string, segmentIndex: number, checkpointCount = 2): ReadySession {
+    return {
+      ...readySession(id),
+      logical_session_id: 'conversation-1',
+      logical_revision: 'logical-r1',
+      checkpoint_count: checkpointCount,
+      segment_index: segmentIndex,
+      input_tokens: 10 * (segmentIndex + 1),
+      output_tokens: 5 * (segmentIndex + 1),
+    };
+  }
+
+  it('groups checkpoint rows once while retaining physical members for upload', () => {
+    const groups = groupReadySessions([
+      checkpoint('conversation-1_seg-0001', 1, 3),
+      checkpoint('conversation-1', 0, 3),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].members.map((session) => session.session_id)).toEqual([
+      'conversation-1',
+      'conversation-1_seg-0001',
+    ]);
+    expect(groups[0].display.checkpoint_count).toBe(3);
+    expect(groups[0].display.input_tokens).toBe(30);
+    expect(groups[0].display.ai_failure_value_score).toBeNull();
+    expect(groups[0].display.ai_quality_score).toBeNull();
+    expect(groups[0].logical_incomplete).toBe(false);
+  });
+
+  it('expands a selected checkpoint to all currently eligible group members', () => {
+    const sessions = [
+      checkpoint('conversation-1', 0),
+      checkpoint('conversation-1_seg-0001', 1),
+      readySession('standalone'),
+    ];
+    const stats: ShareReadyStats = { ...readyStats(0), count: 3, sessions };
+
+    expect(expandLogicalQueueSelection(stats, ['conversation-1_seg-0001'])).toEqual([
+      'conversation-1',
+      'conversation-1_seg-0001',
+    ]);
+  });
+
+  it('does not split a checkpoint family at the 50-checkpoint default cap', () => {
+    const standalone = Array.from({ length: 49 }, (_, index) => readySession(`s${index + 1}`));
+    const sessions = [
+      ...standalone,
+      checkpoint('conversation-1', 0),
+      checkpoint('conversation-1_seg-0001', 1),
+      readySession('fits-after-group'),
+    ];
+    const stats: ShareReadyStats = { ...readyStats(0), count: sessions.length, sessions };
+
+    expect(queueFromStats(stats)).toHaveLength(50);
+    expect(queueFromStats(stats)).not.toContain('conversation-1');
+    expect(queueFromStats(stats)).not.toContain('conversation-1_seg-0001');
+    expect(queueFromStats(stats)).toContain('fits-after-group');
+  });
+
+  it('rejects conflicting logical revisions before packaging', () => {
+    const first = checkpoint('conversation-1', 0);
+    const second = { ...checkpoint('conversation-1_seg-0001', 1), logical_revision: 'logical-r2' };
+
+    expect(() => collectExpectedLogicalRevisions([first, second])).toThrow(/changed while preparing/);
+  });
+
+  it('collects one logical precondition for multiple physical checkpoints', () => {
+    expect(collectExpectedLogicalRevisions([
+      checkpoint('conversation-1', 0),
+      checkpoint('conversation-1_seg-0001', 1),
+    ])).toEqual({ 'conversation-1': 'logical-r1' });
   });
 });

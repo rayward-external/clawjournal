@@ -10,15 +10,19 @@ import pytest
 
 from clawjournal.workbench.index import (
     EXACT_SCOPE_PAIRS_SCHEMA_VERSION,
+    LOGICAL_CHECKPOINT_SCHEMA_VERSION,
     PREDECESSOR_SOURCE_RECEIVER,
     RECEIVER_PREDECESSOR_SCHEMA_VERSION,
     RECURRING_PROTOCOL_V2_SCHEMA_VERSION,
+    RevisionConflictError,
     WORKBENCH_SCHEMA_VERSION,
     already_shared_revision_blockers,
+    auto_upload_review_blockers,
     create_share,
     get_auto_upload_candidate_report,
     get_auto_upload_enrollment,
     open_index,
+    release_gate_blockers,
     revision_review_blockers,
     save_auto_upload_enrollment,
     set_hold_state,
@@ -110,9 +114,10 @@ def _mark_shared(conn, session_id: str) -> str:
 
 def test_fresh_schema_has_auto_upload_foundation(index_conn):
     assert index_conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
-    assert WORKBENCH_SCHEMA_VERSION == RECEIVER_PREDECESSOR_SCHEMA_VERSION
+    assert WORKBENCH_SCHEMA_VERSION == LOGICAL_CHECKPOINT_SCHEMA_VERSION
     assert EXACT_SCOPE_PAIRS_SCHEMA_VERSION == 10
     assert RECEIVER_PREDECESSOR_SCHEMA_VERSION == 11
+    assert LOGICAL_CHECKPOINT_SCHEMA_VERSION == 12
     assert RECURRING_PROTOCOL_V2_SCHEMA_VERSION == 9
 
     session_columns = {
@@ -123,7 +128,14 @@ def test_fresh_schema_has_auto_upload_foundation(index_conn):
         "raw_source_start_offset",
         "raw_source_end_offset",
         "segment_sealed",
+        "logical_session_id",
+        "checkpoint_active",
+        "logical_revision",
     } <= session_columns
+    assert index_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_sessions_logical_checkpoint'"
+    ).fetchone()
 
     share_columns = {
         row[1] for row in index_conn.execute("PRAGMA table_info(shares)")
@@ -157,6 +169,151 @@ def test_fresh_schema_has_auto_upload_foundation(index_conn):
         row[1] for row in index_conn.execute("PRAGMA index_list(shares)")
     }
     assert "idx_shares_client_submission_id" in indexes
+
+
+@pytest.mark.parametrize(
+    ("hold_state", "embargo_until"),
+    [
+        ("pending_review", None),
+        ("embargoed", "2099-01-01T00:00:00+00:00"),
+    ],
+)
+def test_v11_migration_projects_checkpoint_family_without_losing_history(
+    tmp_path, monkeypatch, hold_state, embargo_until
+):
+    db_path = tmp_path / "index.db"
+    monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", db_path)
+    monkeypatch.setattr("clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs")
+    monkeypatch.setattr("clawjournal.workbench.index.CONFIG_DIR", tmp_path)
+    parent = _session("real-parent")
+    root = _session("child")
+    root.update({
+        "logical_session_id": "child",
+        "parent_session_id": "real-parent",
+        "segment_index": 0,
+        "segment_message_range": [0, 1],
+        "segment_reason": "bounded_checkpoint",
+        "segment_sealed": True,
+    })
+    tail = _session("child_seg-0001")
+    tail.update({
+        "logical_session_id": "child",
+        "parent_session_id": "real-parent",
+        "segment_index": 1,
+        "segment_message_range": [2, 3],
+        "segment_reason": "active_tail",
+        "segment_sealed": False,
+    })
+    conn = open_index()
+    upsert_sessions(conn, [parent, root, tail])
+    share_id = create_share(conn, ["child_seg-0001"])
+    conn.execute(
+        "UPDATE shares SET status = 'shared', shared_at = ?, "
+        "hosted_receipt_id = ?, hosted_status = ? WHERE share_id = ?",
+        (
+            "2026-07-13T00:00:00+00:00",
+            "receipt-v11",
+            "accepted",
+            share_id,
+        ),
+    )
+    tail_revision = conn.execute(
+        "SELECT content_revision FROM sessions WHERE session_id = 'child_seg-0001'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO findings (finding_id, session_id, engine, rule, "
+        "entity_hash, field, offset, length, status, decided_by, decided_at, "
+        "revision, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "finding-v11",
+            "child_seg-0001",
+            "test",
+            "rule",
+            "hash:v11",
+            "content",
+            0,
+            1,
+            "ignored",
+            "user",
+            "2026-07-12T12:00:00+00:00",
+            tail_revision,
+            "2026-07-12T11:00:00+00:00",
+        ),
+    )
+    conn.commit()
+    set_hold_state(
+        conn,
+        "child_seg-0001",
+        hold_state,
+        changed_by="user",
+        reason="migration hold",
+        embargo_until=embargo_until,
+    )
+    conn.execute(
+        "UPDATE sessions SET review_status = 'blocked' "
+        "WHERE session_id = 'child_seg-0001'"
+    )
+    conn.execute(
+        "UPDATE sessions SET subagent_session_ids = ? WHERE session_id = ?",
+        ('["child", "child_seg-0001"]', "real-parent"),
+    )
+    conn.commit()
+    conn.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("DROP INDEX idx_sessions_logical_checkpoint")
+    raw.execute("ALTER TABLE sessions DROP COLUMN logical_session_id")
+    raw.execute("ALTER TABLE sessions DROP COLUMN checkpoint_active")
+    raw.execute("ALTER TABLE sessions DROP COLUMN logical_revision")
+    raw.execute(f"PRAGMA user_version = {RECEIVER_PREDECESSOR_SCHEMA_VERSION}")
+    raw.commit()
+    raw.close()
+
+    conn = open_index()
+    try:
+        members = conn.execute(
+            "SELECT session_id, logical_session_id, checkpoint_active, "
+            "parent_session_id, logical_revision FROM sessions "
+            "WHERE logical_session_id = 'child' ORDER BY segment_index"
+        ).fetchall()
+        assert [row["session_id"] for row in members] == [
+            "child", "child_seg-0001"
+        ]
+        assert all(row["checkpoint_active"] == 1 for row in members)
+        assert all(row["parent_session_id"] == "real-parent" for row in members)
+        assert len({row["logical_revision"] for row in members}) == 1
+        controls = conn.execute(
+            "SELECT review_status, hold_state, embargo_until FROM sessions "
+            "WHERE logical_session_id = 'child' ORDER BY segment_index"
+        ).fetchall()
+        assert [row["review_status"] for row in controls] == ["blocked", "blocked"]
+        assert [row["hold_state"] for row in controls] == [hold_state, hold_state]
+        assert [row["embargo_until"] for row in controls] == [
+            embargo_until, embargo_until
+        ]
+        parent_children = conn.execute(
+            "SELECT subagent_session_ids FROM sessions "
+            "WHERE session_id = 'real-parent'"
+        ).fetchone()[0]
+        assert parent_children == '["child"]'
+        assert conn.execute(
+            "SELECT COUNT(*) FROM share_sessions WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()[0] == 1
+        receipt = conn.execute(
+            "SELECT hosted_receipt_id, hosted_status FROM shares WHERE share_id = ?",
+            (share_id,),
+        ).fetchone()
+        assert tuple(receipt) == ("receipt-v11", "accepted")
+        assert conn.execute(
+            "SELECT status FROM findings WHERE finding_id = 'finding-v11'"
+        ).fetchone()[0] == "ignored"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM session_hold_history "
+            "WHERE session_id IN ('child', 'child_seg-0001')"
+        ).fetchone()[0] == 4
+    finally:
+        conn.close()
 
 
 def test_v6_migration_backfills_stability_and_adds_share_ledger_fields(
@@ -609,6 +766,113 @@ def test_first_checkpoint_keeps_parent_identity_without_being_hidden(index_conn)
         "long-parent",
         "long-parent_seg-0001",
     ]
+
+
+def test_inactive_checkpoint_leaves_auto_candidate_pool_but_keeps_history(index_conn):
+    _enroll(index_conn)
+
+    def checkpoint(index: int) -> dict:
+        item = _session(
+            "long-parent" if index == 0 else f"long-parent_seg-{index:04d}"
+        )
+        item.update({
+            "logical_session_id": "long-parent",
+            "segment_index": index,
+            "segment_reason": "bounded_checkpoint" if index < 2 else "active_tail",
+            "segment_message_range": [index * 2, index * 2 + 1],
+            "segment_sealed": index < 2,
+        })
+        return item
+
+    first, second, stale = (checkpoint(index) for index in range(3))
+    upsert_sessions(index_conn, [first, second, stale])
+    upsert_sessions(index_conn, [first, second])
+    index_conn.execute(
+        "UPDATE sessions SET revision_stable_since = ?",
+        ("2026-07-11T00:00:00+00:00",),
+    )
+    index_conn.commit()
+
+    report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("claude",),
+        current_projects=("project-one",),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"claude": "stable_revision"},
+        now=NOW,
+    )
+
+    assert [item["session_id"] for item in report["selected"]] == [
+        "long-parent", "long-parent_seg-0001"
+    ]
+    assert index_conn.execute(
+        "SELECT checkpoint_active FROM sessions WHERE session_id = ?",
+        ("long-parent_seg-0002",),
+    ).fetchone()[0] == 0
+    assert auto_upload_review_blockers(
+        index_conn, ["long-parent_seg-0002"]
+    ) == [{
+        "session_id": "long-parent_seg-0002",
+        "review_status": "new",
+        "checkpoint_active": False,
+        "reason": "inactive_checkpoint",
+    }]
+    assert release_gate_blockers(index_conn, ["long-parent_seg-0002"]) == [{
+        "session_id": "long-parent_seg-0002",
+        "hold_state": "inactive_checkpoint",
+        "reason": "inactive_checkpoint",
+    }]
+    with pytest.raises(RevisionConflictError) as exc_info:
+        create_share(index_conn, ["long-parent_seg-0002"])
+    assert exc_info.value.blockers[0]["reason"] == "inactive_checkpoint"
+
+
+def test_one_negative_checkpoint_blocks_the_auto_upload_family(index_conn):
+    _enroll(index_conn)
+    upsert_sessions(index_conn, [_session("root"), _session("tail")])
+    index_conn.execute(
+        "UPDATE sessions SET logical_session_id = 'conversation', "
+        "segment_index = CASE session_id WHEN 'root' THEN 0 ELSE 1 END, "
+        "revision_stable_since = '2026-07-11T00:00:00+00:00' "
+        "WHERE session_id IN ('root', 'tail')"
+    )
+    index_conn.commit()
+
+    set_hold_state(index_conn, "tail", "pending_review", changed_by="findings")
+    held_report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("claude",),
+        current_projects=("project-one",),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"claude": "stable_revision"},
+        now=NOW,
+    )
+    assert held_report["selected"] == []
+    assert held_report["exclusion_counts"]["held_or_embargoed"] == 2
+
+    set_hold_state(index_conn, "tail", "released", changed_by="user")
+    index_conn.execute(
+        "UPDATE sessions SET review_status = 'blocked' WHERE session_id = 'tail'"
+    )
+    index_conn.commit()
+    blocked_report = get_auto_upload_candidate_report(
+        index_conn,
+        current_sources=("claude",),
+        current_projects=("project-one",),
+        source_confirmed=True,
+        projects_confirmed=True,
+        completion_modes={"claude": "stable_revision"},
+        now=NOW,
+    )
+    assert blocked_report["selected"] == []
+    assert blocked_report["exclusion_counts"]["blocked_review_status"] == 2
+    assert auto_upload_review_blockers(index_conn, ["root"]) == [{
+        "session_id": "root",
+        "review_status": "blocked",
+        "reason": "blocked_review_status",
+    }]
 
 
 def test_candidate_report_uses_cheap_blob_presence_not_full_parse(

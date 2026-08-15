@@ -260,8 +260,10 @@ def open_existing_index(
 # fingerprint snapshot needed to recover a sealed artifact safely, version 9
 # pins hosted recurring-protocol-v2 authorization metadata, version 10
 # stores the exact source/project pair snapshot used by recurring selection,
-# and version 11 records which share predecessors the hosted receiver dictated
-# so a retried submission can tell them apart from a locally stale claim.
+# version 11 records which share predecessors the hosted receiver dictated
+# so a retried submission can tell them apart from a locally stale claim, and
+# version 12 separates append-only upload checkpoints from the logical
+# conversation projected by the local workbench.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
@@ -272,7 +274,8 @@ AUTO_UPLOAD_SCHEMA_VERSION = 8
 RECURRING_PROTOCOL_V2_SCHEMA_VERSION = 9
 EXACT_SCOPE_PAIRS_SCHEMA_VERSION = 10
 RECEIVER_PREDECESSOR_SCHEMA_VERSION = 11
-WORKBENCH_SCHEMA_VERSION = RECEIVER_PREDECESSOR_SCHEMA_VERSION
+LOGICAL_CHECKPOINT_SCHEMA_VERSION = 12
+WORKBENCH_SCHEMA_VERSION = LOGICAL_CHECKPOINT_SCHEMA_VERSION
 
 # `share_sessions.predecessor_source` values. NULL means the predecessor is the
 # create-time local baseline; RECEIVER means the hosted lineage preflight
@@ -295,6 +298,10 @@ class RevisionConflictError(ValueError):
             str(blocker.get("session_id", "unknown")) for blocker in blockers
         )
         super().__init__(f"Trace revisions changed before share creation: {session_ids}")
+
+
+class LogicalProjectionError(ValueError):
+    """A checkpoint family cannot be losslessly projected as one transcript."""
 
 
 # Display-only normalization from the mixed AI/heuristic outcome vocabulary
@@ -376,7 +383,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     ai_scored_at           TEXT,
     segment_sealed         INTEGER DEFAULT 0,
     content_revision       TEXT,
-    revision_stable_since  TEXT
+    revision_stable_since  TEXT,
+    logical_session_id     TEXT,
+    checkpoint_active      INTEGER NOT NULL DEFAULT 1,
+    logical_revision       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shares (
@@ -662,6 +672,223 @@ def compute_content_revision(session: dict[str, Any]) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+_APPEND_ONLY_CHECKPOINT_REASONS = frozenset({"bounded_checkpoint", "active_tail"})
+
+
+def _checkpoint_logical_id(item: Mapping[str, Any]) -> str | None:
+    """Return a verified-by-shape append-only checkpoint root id.
+
+    The append-only segmenter has shipped two layouts: older builds emitted
+    ``<root>_seg-0000`` as the first child, while current builds keep ``root``
+    for segment zero and use ``<root>_seg-0001`` onward.  Do not group generic
+    segmented/subagent rows merely because they have a parent or a suffix.
+    """
+
+    if item.get("segment_reason") not in _APPEND_ONLY_CHECKPOINT_REASONS:
+        return None
+    index = item.get("segment_index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        return None
+    session_id = item.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    parent_id = item.get("parent_session_id")
+    if index == 0:
+        if (
+            isinstance(parent_id, str)
+            and parent_id
+            and session_id == f"{parent_id}_seg-0000"
+        ):
+            return parent_id
+        return session_id
+    if (
+        isinstance(parent_id, str)
+        and parent_id
+        and session_id == f"{parent_id}_seg-{index:04d}"
+    ):
+        return parent_id
+    explicit = item.get("logical_session_id")
+    if (
+        isinstance(explicit, str)
+        and explicit
+        and session_id == f"{explicit}_seg-{index:04d}"
+    ):
+        return explicit
+    # A v11 row could not persist the parser's explicit logical id.  The exact
+    # checkpoint suffix is still recoverable when the segment keeps a genuine
+    # subagent parent; migration additionally requires a real root row with
+    # matching source provenance before accepting this inferred identity.
+    suffix = f"_seg-{index:04d}"
+    if session_id.endswith(suffix) and len(session_id) > len(suffix):
+        return session_id[:-len(suffix)]
+    return None
+
+
+def _declared_logical_session_id(item: Mapping[str, Any]) -> str | None:
+    """Return parser-declared logical identity, preferring verified checkpoints."""
+
+    checkpoint_id = _checkpoint_logical_id(item)
+    if checkpoint_id is not None:
+        return checkpoint_id
+    explicit = item.get("logical_session_id")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit
+    return None
+
+
+def _same_checkpoint_provenance(
+    root: Mapping[str, Any], member: Mapping[str, Any]
+) -> bool:
+    """Require a checkpoint and its root to name the same physical source."""
+
+    if root.get("session_id") == member.get("session_id"):
+        return True
+    if root.get("source") != member.get("source"):
+        return False
+    if root.get("project") != member.get("project"):
+        return False
+    root_key = root.get("session_key")
+    member_key = member.get("session_key")
+    if root_key and member_key:
+        return root_key == member_key
+    root_path = root.get("raw_source_path")
+    member_path = member.get("raw_source_path")
+    return bool(root_path and member_path and root_path == member_path)
+
+
+def _logical_revision_for_members(members: Sequence[Mapping[str, Any]]) -> str:
+    """Hash the exact ordered physical membership of one logical trace."""
+
+    ordered = sorted(
+        members,
+        key=lambda item: (
+            item.get("segment_index") is None,
+            item.get("segment_index") if item.get("segment_index") is not None else 0,
+            str(item.get("session_id") or ""),
+        ),
+    )
+    payload = [
+        {
+            "session_id": item.get("session_id"),
+            "content_revision": item.get("content_revision"),
+            "segment_index": item.get("segment_index"),
+            "segment_start_message": item.get("segment_start_message"),
+            "segment_end_message": item.get("segment_end_message"),
+        }
+        for item in ordered
+    ]
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return f"logical-sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _logical_review_status(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Project physical review states using the list-query precedence."""
+
+    statuses = [str(row.get("review_status") or "new") for row in rows]
+    if "blocked" in statuses:
+        return "blocked"
+    if "new" in statuses:
+        return "new"
+    if "shortlisted" in statuses:
+        return "shortlisted"
+    if statuses and all(status == "approved" for status in statuses):
+        return "approved"
+    return min(statuses, default="new")
+
+
+_LOGICAL_MULTI_CHECKPOINT_AI_FIELDS = (
+    "ai_quality_score",
+    "ai_score_reason",
+    "ai_scoring_detail",
+    "ai_episode_quality",
+    "ai_quality_tier",
+    "ai_display_title",
+    "ai_task_type",
+    "ai_outcome_badge",
+    "ai_value_badges",
+    "ai_risk_badges",
+    "ai_effort_estimate",
+    "ai_summary",
+    "ai_failure_value_score",
+    "ai_recovery_labels",
+    "ai_failure_attribution",
+    "ai_failure_modes",
+    "ai_learning_summary",
+    "ai_scorer_backend",
+    "ai_scorer_model",
+    "ai_rubric_git_sha",
+    "ai_scored_at",
+)
+
+
+def _clear_multi_checkpoint_ai_projection(
+    item: dict[str, Any], checkpoint_count: int
+) -> None:
+    """Do not present one component's judge result as a family-wide score."""
+
+    if checkpoint_count <= 1:
+        return
+    for field in _LOGICAL_MULTI_CHECKPOINT_AI_FIELDS:
+        item[field] = None
+
+
+def _project_family_controls(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    changed_at: str,
+    include_shareable_state: bool,
+) -> tuple[str | None, str | None, str | None]:
+    """Fold physical review/hold controls into a conservative family state."""
+
+    review_status = _logical_review_status(rows) if rows else None
+    if not rows:
+        return review_status, None, None
+    try:
+        controls_now = datetime.fromisoformat(changed_at)
+        if controls_now.tzinfo is None:
+            controls_now = controls_now.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        controls_now = datetime.now(timezone.utc)
+    effective_states = [
+        effective_hold_state(
+            row.get("hold_state"), row.get("embargo_until"), now=controls_now
+        )
+        for row in rows
+    ]
+    if "pending_review" in effective_states:
+        return review_status, "pending_review", None
+    if "embargoed" in effective_states:
+        embargoes: list[tuple[datetime, str]] = []
+        for row, effective in zip(rows, effective_states):
+            if effective != "embargoed":
+                continue
+            raw_until = row.get("embargo_until")
+            if not isinstance(raw_until, str) or not raw_until:
+                return review_status, "pending_review", None
+            try:
+                parsed_until = datetime.fromisoformat(raw_until)
+            except ValueError:
+                return review_status, "pending_review", None
+            if parsed_until.tzinfo is None:
+                parsed_until = parsed_until.replace(tzinfo=timezone.utc)
+            embargoes.append((parsed_until, raw_until))
+        if embargoes:
+            _, embargo_until = max(embargoes, key=lambda item: item[0])
+            return review_status, "embargoed", embargo_until
+        return review_status, "pending_review", None
+    if include_shareable_state:
+        if all(state == "released" for state in effective_states):
+            return review_status, "released", None
+        return review_status, "auto_redacted", None
+    return review_status, None, None
+
+
 def _legacy_content_revision(session_id: str) -> str:
     """Return a stable opaque baseline when a migrated blob is unreadable."""
     digest = hashlib.sha256(f"legacy-session:{session_id}".encode("utf-8")).hexdigest()
@@ -923,6 +1150,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_recurring_protocol_v2(conn)
     _migrate_exact_scope_pairs(conn)
     _migrate_receiver_predecessor(conn)
+    _migrate_logical_checkpoint_projection(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -1421,6 +1649,260 @@ def _migrate_receiver_predecessor(conn: sqlite3.Connection) -> None:
         conn.execute(
             f"PRAGMA user_version = {RECEIVER_PREDECESSOR_SCHEMA_VERSION}"
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_logical_checkpoint_projection(conn: sqlite3.Connection) -> None:
+    """Advance v11 -> v12 without moving or deleting checkpoint artifacts.
+
+    The projection columns are rebuildable metadata.  Historical session rows,
+    blobs, share links, findings, hold history, and receipt lineage stay on the
+    original physical ids.  Legacy parent cleanup is deliberately limited to
+    append-only rows whose id shape and source provenance both verify.
+    """
+
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= LOGICAL_CHECKPOINT_SCHEMA_VERSION:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_logical_checkpoint "
+            "ON sessions(logical_session_id, checkpoint_active, segment_index) "
+            "WHERE logical_session_id IS NOT NULL"
+        )
+        conn.commit()
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for column, definition in (
+            ("logical_session_id", "TEXT"),
+            ("checkpoint_active", "INTEGER NOT NULL DEFAULT 1"),
+            ("logical_revision", "TEXT"),
+        ):
+            try:
+                conn.execute(
+                    f"ALTER TABLE sessions ADD COLUMN {column} {definition}"
+                )
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc):
+                    raise
+
+        session_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        optional_columns = (
+            "raw_source_path",
+            "session_key",
+            "parent_session_id",
+            "subagent_session_ids",
+            "segment_index",
+            "segment_start_message",
+            "segment_end_message",
+            "segment_reason",
+            "content_revision",
+            "reviewed_at",
+            "hold_state",
+            "embargo_until",
+        )
+        optional_select = ", ".join(
+            column if column in session_columns else f"NULL AS {column}"
+            for column in optional_columns
+        )
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT session_id, project, source, review_status, "
+                f"{optional_select} FROM sessions"
+            ).fetchall()
+        ]
+        by_id = {str(row["session_id"]): row for row in rows}
+        families: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            logical_id = _checkpoint_logical_id(row)
+            if logical_id is None:
+                continue
+            root = by_id.get(logical_id)
+            if root is None or not _same_checkpoint_provenance(root, row):
+                continue
+            families.setdefault(logical_id, []).append(row)
+
+        checkpoint_representatives: dict[str, str] = {}
+        migration_time = _now_iso()
+        for logical_id, members in families.items():
+            root = by_id[logical_id]
+            root_is_checkpoint = _checkpoint_logical_id(root) == logical_id
+            # A transition between the legacy `_seg-0000` layout and the
+            # current root-as-zero layout can leave two physical rows for the
+            # same ordinal. Prefer the current root row; retain the other as an
+            # inactive historical artifact.
+            ordered = sorted(
+                members,
+                key=lambda item: (
+                    int(item.get("segment_index") or 0),
+                    item.get("session_id") != logical_id,
+                    str(item.get("session_id")),
+                ),
+            )
+            active_by_index: dict[int, dict[str, Any]] = {}
+            for member in ordered:
+                index = int(member["segment_index"])
+                if index == 0 and root_is_checkpoint:
+                    if member["session_id"] == logical_id:
+                        active_by_index[0] = member
+                    continue
+                active_by_index.setdefault(index, member)
+            active_ids = {
+                str(member["session_id"]) for member in active_by_index.values()
+            }
+            representative = active_by_index.get(0)
+            if representative is not None:
+                representative_id = str(representative["session_id"])
+                for member in members:
+                    checkpoint_representatives[str(member["session_id"])] = (
+                        representative_id
+                    )
+            active_members = list(active_by_index.values())
+            logical_revision = _logical_revision_for_members(active_members)
+            classified_ids = {str(member["session_id"]) for member in members}
+
+            # Old physical UI actions could hold/block only one checkpoint.
+            # Project the strict negative control across every active member
+            # immediately, before any background scan or candidate poll can
+            # observe the newly grouped family.
+            control_rows = {
+                str(member["session_id"]): member for member in [root, *members]
+            }
+            projected_review, projected_hold, projected_embargo = (
+                _project_family_controls(
+                    list(control_rows.values()),
+                    changed_at=migration_time,
+                    include_shareable_state=False,
+                )
+            )
+            for member_id in active_ids:
+                current = by_id[member_id]
+                if projected_hold is not None and (
+                    current.get("hold_state") != projected_hold
+                    or current.get("embargo_until") != projected_embargo
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET hold_state = ?, embargo_until = ?, "
+                        "updated_at = ? WHERE session_id = ?",
+                        (projected_hold, projected_embargo, migration_time, member_id),
+                    )
+                    conn.execute(
+                        "INSERT INTO session_hold_history "
+                        "(history_id, session_id, from_state, to_state, embargo_until, "
+                        " changed_by, changed_at, reason) "
+                        "VALUES (?, ?, ?, ?, ?, 'migration', ?, ?)",
+                        (
+                            str(uuid.uuid4()),
+                            member_id,
+                            current.get("hold_state"),
+                            projected_hold,
+                            projected_embargo,
+                            migration_time,
+                            "Migrated logical checkpoint family hold",
+                        ),
+                    )
+                if (
+                    projected_review == "blocked"
+                    and current.get("review_status") != "blocked"
+                ):
+                    conn.execute(
+                        "UPDATE sessions SET review_status = 'blocked', "
+                        "reviewed_at = COALESCE(reviewed_at, ?), updated_at = ? "
+                        "WHERE session_id = ?",
+                        (migration_time, migration_time, member_id),
+                    )
+
+            for member in members:
+                member_id = str(member["session_id"])
+                conn.execute(
+                    "UPDATE sessions SET logical_session_id = ?, "
+                    "checkpoint_active = ?, logical_revision = ? "
+                    "WHERE session_id = ?",
+                    (
+                        logical_id,
+                        1 if member_id in active_ids else 0,
+                        logical_revision,
+                        member_id,
+                    ),
+                )
+                if member_id != logical_id:
+                    conn.execute(
+                        "UPDATE sessions SET parent_session_id = NULL "
+                        "WHERE session_id = ? AND parent_session_id = ?",
+                        (member_id, logical_id),
+                    )
+
+            if logical_id not in classified_ids:
+                # Old layouts retained the complete source row only as a
+                # hidden `segmented` parent; it is the logical address, not an
+                # upload member.
+                conn.execute(
+                    "UPDATE sessions SET logical_session_id = ?, "
+                    "checkpoint_active = 0, logical_revision = ? "
+                    "WHERE session_id = ?",
+                    (logical_id, logical_revision, logical_id),
+                )
+
+            encoded_children = root.get("subagent_session_ids")
+            if encoded_children:
+                try:
+                    child_ids = json.loads(encoded_children)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    child_ids = None
+                if isinstance(child_ids, list):
+                    cleaned = [
+                        child_id
+                        for child_id in child_ids
+                        if child_id not in classified_ids - {logical_id}
+                    ]
+                    if cleaned != child_ids:
+                        conn.execute(
+                            "UPDATE sessions SET subagent_session_ids = ? "
+                            "WHERE session_id = ?",
+                            (
+                                json.dumps(cleaned) if cleaned else None,
+                                logical_id,
+                            ),
+                        )
+
+        # A real subagent parent may already list every physical checkpoint.
+        # Keep its relationship to the segment-zero representative only. The
+        # logical root's own polluted list was cleared above and is excluded
+        # here so it never becomes its own child.
+        for row in rows:
+            parent_id = str(row["session_id"])
+            if parent_id in families or not row.get("subagent_session_ids"):
+                continue
+            try:
+                child_ids = json.loads(row["subagent_session_ids"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(child_ids, list):
+                continue
+            cleaned: list[Any] = []
+            for child_id in child_ids:
+                replacement = checkpoint_representatives.get(child_id, child_id)
+                if replacement not in cleaned:
+                    cleaned.append(replacement)
+            if cleaned != child_ids:
+                conn.execute(
+                    "UPDATE sessions SET subagent_session_ids = ? WHERE session_id = ?",
+                    (json.dumps(cleaned) if cleaned else None, parent_id),
+                )
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_logical_checkpoint "
+            "ON sessions(logical_session_id, checkpoint_active, segment_index) "
+            "WHERE logical_session_id IS NOT NULL"
+        )
+        conn.execute(f"PRAGMA user_version = {LOGICAL_CHECKPOINT_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -2670,6 +3152,224 @@ def recompute_estimated_costs(conn: sqlite3.Connection) -> int:
     return changed
 
 
+def _reconcile_emitted_checkpoint_families(
+    conn: sqlite3.Connection,
+    declared: Mapping[str, Mapping[str, int | None]],
+    indexed: Mapping[str, Mapping[str, int | None]],
+    *,
+    collapsed: set[str],
+    fresh_members: Mapping[str, set[str]],
+    prior_family_controls: Mapping[str, Sequence[Mapping[str, Any]]],
+    changed_at: str,
+) -> None:
+    """Refresh logical membership for complete families in one scan batch."""
+
+    def refresh_current_revision(logical_id: str) -> None:
+        """Hash only the membership that was already active before reconcile.
+
+        SQL upserts deliberately leave existing activity unchanged and insert
+        new logical members inactive.  If a parser row is filtered after the
+        family was declared, the complete-family checks below abort membership
+        reconciliation; this refresh still prevents updated active content
+        from retaining an obsolete logical revision.
+        """
+
+        active_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT session_id, content_revision, segment_index, "
+                "segment_start_message, segment_end_message FROM sessions "
+                "WHERE logical_session_id = ? AND checkpoint_active = 1 "
+                "ORDER BY segment_index, session_id",
+                (logical_id,),
+            ).fetchall()
+        ]
+        logical_revision = (
+            _logical_revision_for_members(active_rows) if active_rows else None
+        )
+        conn.execute(
+            "UPDATE sessions SET logical_revision = ? "
+            "WHERE logical_session_id = ?",
+            (logical_revision, logical_id),
+        )
+
+    for logical_id in sorted(indexed):
+        declared_members = dict(declared.get(logical_id, {}))
+        indexed_members = dict(indexed[logical_id])
+        if not declared_members or declared_members != indexed_members:
+            # A slash-command/invalid row was skipped. Retaining the previous
+            # projection is safer than retiring a checkpoint from a partial
+            # parse result.
+            refresh_current_revision(logical_id)
+            continue
+        if logical_id in collapsed:
+            if indexed_members != {logical_id: None}:
+                refresh_current_revision(logical_id)
+                continue
+        else:
+            indices = list(indexed_members.values())
+            if (
+                any(index is None for index in indices)
+                or len(set(indices)) != len(indices)
+                or sorted(int(index) for index in indices if index is not None)
+                != list(range(len(indices)))
+            ):
+                refresh_current_revision(logical_id)
+                continue
+
+        requested_ids = set(indexed_members)
+        lookup_ids = sorted(requested_ids | {logical_id})
+        placeholders = ",".join("?" for _ in lookup_ids)
+        current_rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT session_id, project, source, raw_source_path, session_key, "
+                "parent_session_id, segment_index, segment_start_message, "
+                "segment_end_message, segment_reason, content_revision, "
+                "logical_session_id FROM sessions "
+                f"WHERE session_id IN ({placeholders})",
+                lookup_ids,
+            ).fetchall()
+        ]
+        by_id = {str(row["session_id"]): row for row in current_rows}
+        root = by_id.get(logical_id)
+        if root is None or requested_ids - set(by_id):
+            refresh_current_revision(logical_id)
+            continue
+        if any(
+            not _same_checkpoint_provenance(root, by_id[session_id])
+            for session_id in requested_ids
+        ):
+            refresh_current_revision(logical_id)
+            continue
+
+        # Snapshot the established family's negative controls before changing
+        # membership. Newly inserted/reactivated checkpoints start with schema
+        # defaults and must not dilute a logical hold, embargo, or block.
+        fresh_ids = set(fresh_members.get(logical_id, set()))
+        prior_controls = [
+            dict(row) for row in prior_family_controls.get(logical_id, ())
+        ]
+        projected_review_status, inherited_hold_state, inherited_embargo_until = (
+            _project_family_controls(
+                prior_controls,
+                changed_at=changed_at,
+                include_shareable_state=True,
+            )
+        )
+        inherited_review_status = (
+            "blocked" if projected_review_status == "blocked" else None
+        )
+
+        emitted_ids = sorted(requested_ids)
+        conn.executemany(
+            "UPDATE sessions SET logical_session_id = ?, checkpoint_active = 1 "
+            "WHERE session_id = ?",
+            [(logical_id, session_id) for session_id in emitted_ids],
+        )
+        if logical_id not in requested_ids:
+            conn.execute(
+                "UPDATE sessions SET logical_session_id = ?, checkpoint_active = 0 "
+                "WHERE session_id = ?",
+                (logical_id, logical_id),
+            )
+
+        emitted_placeholders = ",".join("?" for _ in emitted_ids)
+        conn.execute(
+            "UPDATE sessions SET checkpoint_active = 0 "
+            "WHERE logical_session_id = ? "
+            f"AND session_id NOT IN ({emitted_placeholders})",
+            (logical_id, *emitted_ids),
+        )
+        emitted_controls = {
+            str(row["session_id"]): dict(row)
+            for row in conn.execute(
+                "SELECT session_id, review_status, reviewed_at, hold_state, "
+                "embargo_until FROM sessions "
+                f"WHERE session_id IN ({emitted_placeholders})",
+                emitted_ids,
+            ).fetchall()
+        }
+        for session_id in emitted_ids:
+            current = emitted_controls[session_id]
+            inherit_hold_for_member = (
+                inherited_hold_state in {"pending_review", "embargoed"}
+                or session_id in fresh_ids
+            )
+            if inherited_hold_state is not None and inherit_hold_for_member and (
+                current.get("hold_state") != inherited_hold_state
+                or current.get("embargo_until") != inherited_embargo_until
+            ):
+                conn.execute(
+                    "UPDATE sessions SET hold_state = ?, embargo_until = ?, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (
+                        inherited_hold_state,
+                        inherited_embargo_until,
+                        changed_at,
+                        session_id,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO session_hold_history "
+                    "(history_id, session_id, from_state, to_state, embargo_until, "
+                    " changed_by, changed_at, reason) "
+                    "VALUES (?, ?, ?, ?, ?, 'auto', ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        session_id,
+                        current.get("hold_state"),
+                        inherited_hold_state,
+                        inherited_embargo_until,
+                        changed_at,
+                        "Inherited logical checkpoint family hold",
+                    ),
+                )
+            if (
+                inherited_review_status == "blocked"
+                and current.get("review_status") != "blocked"
+            ):
+                conn.execute(
+                    "UPDATE sessions SET review_status = 'blocked', reviewed_at = ?, "
+                    "updated_at = ? WHERE session_id = ?",
+                    (changed_at, changed_at, session_id),
+                )
+        if logical_id in collapsed:
+            conn.execute(
+                "UPDATE sessions SET review_status = CASE "
+                "WHEN review_status = 'segmented' THEN 'new' ELSE review_status END "
+                "WHERE session_id = ?",
+                (logical_id,),
+            )
+
+        polluted_children = requested_ids - {logical_id}
+        if polluted_children:
+            conn.executemany(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE session_id = ? AND parent_session_id = ?",
+                [(session_id, logical_id) for session_id in sorted(polluted_children)],
+            )
+            root_children = conn.execute(
+                "SELECT subagent_session_ids FROM sessions WHERE session_id = ?",
+                (logical_id,),
+            ).fetchone()
+            if root_children is not None and root_children["subagent_session_ids"]:
+                try:
+                    decoded = json.loads(root_children["subagent_session_ids"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = None
+                if isinstance(decoded, list):
+                    cleaned = [item for item in decoded if item not in polluted_children]
+                    if cleaned != decoded:
+                        conn.execute(
+                            "UPDATE sessions SET subagent_session_ids = ? "
+                            "WHERE session_id = ?",
+                            (json.dumps(cleaned) if cleaned else None, logical_id),
+                        )
+
+        refresh_current_revision(logical_id)
+
+
 def upsert_sessions(
     conn: sqlite3.Connection,
     sessions: list[dict[str, Any]],
@@ -2694,6 +3394,44 @@ def upsert_sessions(
     if not sessions:
         return 0
 
+    declared_families: dict[str, dict[str, int | None]] = {}
+    indexed_families: dict[str, dict[str, int | None]] = {}
+    fresh_family_members: dict[str, set[str]] = {}
+    collapsed_families: set[str] = set()
+    for session in sessions:
+        logical_id = _declared_logical_session_id(session)
+        session_id = session.get("session_id")
+        if logical_id is not None and isinstance(session_id, str) and session_id:
+            index = session.get("segment_index")
+            declared_families.setdefault(logical_id, {})[session_id] = (
+                int(index)
+                if isinstance(index, int) and not isinstance(index, bool) and index >= 0
+                else None
+            )
+    collapsed_families.update(
+        logical_id
+        for logical_id, members in declared_families.items()
+        if members == {logical_id: None}
+    )
+
+    def snapshot_family_controls(logical_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT session_id, review_status, hold_state, embargo_until "
+                "FROM sessions WHERE "
+                "(logical_session_id = ? OR "
+                " (logical_session_id IS NULL AND session_id = ?)) "
+                "AND COALESCE(checkpoint_active, 1) = 1",
+                (logical_id, logical_id),
+            ).fetchall()
+        ]
+
+    prior_family_controls = {
+        logical_id: snapshot_family_controls(logical_id)
+        for logical_id in declared_families
+    }
+
     now = _now_iso()
     new_count = 0
     emitted_session_ids = {
@@ -2701,11 +3439,14 @@ def upsert_sessions(
         for session in sessions
         if session.get("session_id")
     }
+    # Older checkpoint layouts emitted a hidden logical root and pointed every
+    # segment at it as though it were a subagent parent.  Newer parsers can keep
+    # a *real* subagent parent on every checkpoint, so only the independently
+    # verified logical id may be treated as the hidden segmented parent.
     segmented_parent_ids = {
-        str(session.get("parent_session_id"))
+        logical_id
         for session in sessions
-        if session.get("parent_session_id")
-        and session.get("segment_reason") in {"bounded_checkpoint", "active_tail"}
+        if (logical_id := _checkpoint_logical_id(session)) is not None
     } - emitted_session_ids
 
     # Check FTS availability
@@ -2759,6 +3500,7 @@ def upsert_sessions(
             "ai_value_badges, ai_risk_badges, "
             "ai_effort_estimate, ai_summary, "
             "share_id, session_key, parent_session_id, subagent_session_ids, "
+            "logical_session_id, checkpoint_active, "
             "estimated_cost_usd, input_tokens, output_tokens, "
             "cache_read_tokens, cache_creation_tokens, end_time, content_revision "
             "FROM sessions WHERE session_id = ?",
@@ -2769,6 +3511,27 @@ def upsert_sessions(
             existing is not None
             and existing["content_revision"] != content_revision
         )
+        logical_id = _declared_logical_session_id(session)
+        if (
+            logical_id is None
+            and existing is not None
+            and existing["logical_session_id"] == session_id
+            and session.get("segment_reason") not in _APPEND_ONLY_CHECKPOINT_REASONS
+            and session_id not in declared_families
+        ):
+            # A current parser result collapsed a formerly segmented family
+            # back to one physical root. The old children remain historical
+            # artifacts but must leave the active projection/candidate pool.
+            logical_id = str(session_id)
+            declared_families[logical_id] = {str(session_id): None}
+            collapsed_families.add(logical_id)
+            prior_family_controls.setdefault(
+                logical_id, snapshot_family_controls(logical_id)
+            )
+        if logical_id is not None and (
+            is_new or not bool(existing["checkpoint_active"])
+        ):
+            fresh_family_members.setdefault(logical_id, set()).add(str(session_id))
 
         # Avoid rewriting the blob/FTS record for a byte-equivalent transcript.
         # Metadata fields still flow through the SQL upsert below so parser
@@ -2878,7 +3641,8 @@ def upsert_sessions(
                 fork_of, fork_source, fork_nickname,
                 estimated_cost_usd,
                 tool_counts, user_interrupts,
-                hold_state, content_revision, revision_stable_since
+                hold_state, content_revision, revision_stable_since,
+                logical_session_id, checkpoint_active, logical_revision
             ) VALUES (
                 ?, ?, ?, ?, ?,
                 ?, ?, ?,
@@ -2907,7 +3671,8 @@ def upsert_sessions(
                 ?, ?, ?,
                 ?,
                 ?, ?,
-                'auto_redacted', ?, ?
+                'auto_redacted', ?, ?,
+                ?, ?, NULL
             )
             ON CONFLICT(session_id) DO UPDATE SET
                 project = excluded.project,
@@ -3040,6 +3805,8 @@ def upsert_sessions(
                     WHEN sessions.content_revision IS NOT excluded.content_revision
                     THEN excluded.revision_stable_since
                     ELSE sessions.revision_stable_since END,
+                logical_session_id = sessions.logical_session_id,
+                checkpoint_active = sessions.checkpoint_active,
                 content_revision = excluded.content_revision
             """,
             (
@@ -3101,6 +3868,8 @@ def upsert_sessions(
                 session_stats.get("user_interrupts", 0),
                 content_revision,
                 now,
+                logical_id,
+                0 if logical_id is not None else 1,
             ),
         )
 
@@ -3141,6 +3910,29 @@ def upsert_sessions(
         else:
             counts["unchanged"] += 1
 
+        if logical_id is not None:
+            segment_index = session.get("segment_index")
+            indexed_families.setdefault(logical_id, {})[str(session_id)] = (
+                None
+                if logical_id in collapsed_families
+                else (
+                    int(segment_index)
+                    if isinstance(segment_index, int)
+                    and not isinstance(segment_index, bool)
+                    and segment_index >= 0
+                    else None
+                )
+            )
+
+    _reconcile_emitted_checkpoint_families(
+        conn,
+        declared_families,
+        indexed_families,
+        collapsed=collapsed_families,
+        fresh_members=fresh_family_members,
+        prior_family_controls=prior_family_controls,
+        changed_at=now,
+    )
     if segmented_parent_ids:
         conn.executemany(
             "UPDATE sessions SET review_status = 'segmented' WHERE session_id = ?",
@@ -3178,6 +3970,270 @@ def _build_start_time_where(
     if not clauses:
         return "", []
     return f" WHERE {' AND '.join(clauses)}", params
+
+
+def query_logical_sessions(
+    conn: sqlite3.Connection,
+    *,
+    status: str | list[str] | tuple[str, ...] | None = None,
+    source: str | list[str] | tuple[str, ...] | None = None,
+    project: str | None = None,
+    task_type: str | None = None,
+    recovery_label: str | None = None,
+    failure_attribution: str | None = None,
+    failure_mode: str | None = None,
+    search_text: str | None = None,
+    sort: str = "ai_failure_value_score",
+    order: str = "desc",
+    limit: int = 50,
+    offset: int = 0,
+    exclude_segmented_parents: bool = False,
+    logical_session_ids: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return one metadata row per active logical conversation.
+
+    Filtering identifies matching families first; aggregation and pagination
+    then operate on those families. A child-only match therefore cannot leak a
+    duplicate card or consume another pagination slot.
+    """
+
+    allowed_sort_columns = {
+        "start_time", "end_time", "indexed_at", "updated_at",
+        "project", "source", "model", "model_effort", "review_status", "task_type",
+        "user_messages", "assistant_messages", "tool_uses",
+        "input_tokens", "output_tokens", "duration_seconds",
+        "sensitivity_score", "ai_quality_score", "ai_failure_value_score",
+    }
+    if sort not in allowed_sort_columns:
+        sort = "start_time"
+    if order.lower() not in {"asc", "desc"}:
+        order = "desc"
+    direction = order.upper()
+
+    params: list[Any] = []
+    clauses: list[str] = []
+    eligible_from = "active a"
+    if search_text:
+        if _has_fts(conn):
+            eligible_from += " JOIN sessions_fts f ON f.session_id = a.session_id"
+            clauses.append("sessions_fts MATCH ?")
+            params.append(search_text)
+        else:
+            clauses.append("a.display_title LIKE ?")
+            params.append(f"%{search_text}%")
+
+    def add_multi(column: str, value: str | Sequence[str] | None) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            clauses.append(f"a.{column} = ?")
+            params.append(value)
+            return
+        values = [item for item in value if item]
+        if values:
+            clauses.append(f"a.{column} IN ({','.join('?' for _ in values)})")
+            params.extend(values)
+
+    add_multi("source", source)
+    family_size_sql = (
+        "(SELECT COUNT(*) FROM active family_member "
+        "WHERE family_member._logical_id = a._logical_id)"
+    )
+    if project is not None:
+        clauses.append("a.project = ?")
+        params.append(project)
+    if task_type is not None:
+        clauses.append(
+            "CASE WHEN " + family_size_sql + " = 1 "
+            "THEN COALESCE(a.ai_task_type, a.task_type) "
+            "ELSE a.task_type END = ?"
+        )
+        params.append(task_type)
+    if recovery_label is not None:
+        clauses.append(
+            family_size_sql + " = 1 AND "
+            "EXISTS (SELECT 1 FROM json_each(COALESCE(a.ai_recovery_labels, '[]')) "
+            "WHERE value = ?)"
+        )
+        params.append(recovery_label)
+    if failure_attribution is not None:
+        clauses.append(
+            family_size_sql + " = 1 AND a.ai_failure_attribution = ?"
+        )
+        params.append(failure_attribution)
+    if failure_mode is not None:
+        clauses.append(
+            family_size_sql + " = 1 AND "
+            "EXISTS (SELECT 1 FROM json_each(COALESCE(a.ai_failure_modes, '[]')) "
+            "WHERE value = ?)"
+        )
+        params.append(failure_mode)
+    if exclude_segmented_parents:
+        clauses.append("a.review_status != 'segmented'")
+    if logical_session_ids is not None:
+        ids = list(dict.fromkeys(item for item in logical_session_ids if item))
+        if not ids:
+            return []
+        clauses.append(f"a._logical_id IN ({','.join('?' for _ in ids)})")
+        params.extend(ids)
+    where_sql = " AND ".join(clauses) if clauses else "1=1"
+    projected_status_params: list[Any] = []
+    projected_status_sql = ""
+    if status is not None:
+        if isinstance(status, str):
+            projected_status_sql = " AND g._logical_review_status = ?"
+            projected_status_params.append(status)
+        else:
+            statuses = [item for item in status if item]
+            if statuses:
+                projected_status_sql = (
+                    " AND g._logical_review_status IN "
+                    f"({','.join('?' for _ in statuses)})"
+                )
+                projected_status_params.extend(statuses)
+
+    aggregate_sort = {
+        "start_time": "g._logical_start_time",
+        "end_time": "g._logical_end_time",
+        "user_messages": "g._logical_user_messages",
+        "assistant_messages": "g._logical_assistant_messages",
+        "tool_uses": "g._logical_tool_uses",
+        "input_tokens": "g._logical_input_tokens",
+        "output_tokens": "g._logical_output_tokens",
+        "duration_seconds": "g._logical_duration_seconds",
+        "review_status": "g._logical_review_status",
+    }
+    sort_expression = aggregate_sort.get(sort, f"r.{sort}")
+    if sort == "ai_failure_value_score":
+        order_sql = (
+            "ORDER BY (CASE WHEN g._checkpoint_count > 1 THEN NULL "
+            "ELSE r.ai_failure_value_score END IS NULL), "
+            "CASE WHEN g._checkpoint_count > 1 THEN NULL "
+            f"ELSE r.ai_failure_value_score END {direction}, "
+            "g._logical_start_time DESC"
+        )
+    elif sort == "ai_quality_score":
+        order_sql = (
+            "ORDER BY (CASE WHEN g._checkpoint_count > 1 THEN NULL "
+            "ELSE r.ai_quality_score END IS NULL), "
+            "CASE WHEN g._checkpoint_count > 1 THEN NULL "
+            f"ELSE r.ai_quality_score END {direction}, "
+            "g._logical_start_time DESC"
+        )
+    else:
+        order_sql = f"ORDER BY {sort_expression} {direction}, r.session_id"
+
+    sql = f"""
+        WITH active AS (
+            SELECT s.*, COALESCE(s.logical_session_id, s.session_id) AS _logical_id
+            FROM sessions s
+            WHERE COALESCE(s.checkpoint_active, 1) = 1
+        ), eligible AS (
+            SELECT DISTINCT a._logical_id
+            FROM {eligible_from}
+            WHERE {where_sql}
+        ), ranked AS (
+            SELECT a.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY a._logical_id
+                       ORDER BY
+                           CASE WHEN a.session_id = a._logical_id THEN 0 ELSE 1 END,
+                           CASE WHEN a.segment_index IS NULL THEN 1 ELSE 0 END,
+                           a.segment_index,
+                           a.session_id
+                   ) AS _logical_row
+            FROM active a JOIN eligible e ON e._logical_id = a._logical_id
+        ), grouped AS (
+            SELECT a._logical_id,
+                   COUNT(*) AS _checkpoint_count,
+                   MIN(a.start_time) AS _logical_start_time,
+                   MAX(a.end_time) AS _logical_end_time,
+                   CAST(ROUND((julianday(MAX(a.end_time)) -
+                               julianday(MIN(a.start_time))) * 86400.0)
+                        AS INTEGER) AS _logical_duration_seconds,
+                   SUM(COALESCE(a.user_messages, 0)) AS _logical_user_messages,
+                   SUM(COALESCE(a.assistant_messages, 0)) AS _logical_assistant_messages,
+                   SUM(COALESCE(a.tool_uses, 0)) AS _logical_tool_uses,
+                   SUM(COALESCE(a.input_tokens, 0)) AS _logical_input_tokens,
+                   SUM(COALESCE(a.output_tokens, 0)) AS _logical_output_tokens,
+                   SUM(COALESCE(a.cache_read_tokens, 0)) AS _logical_cache_read_tokens,
+                   SUM(COALESCE(a.cache_creation_tokens, 0)) AS _logical_cache_creation_tokens,
+                   SUM(COALESCE(a.estimated_cost_usd, 0)) AS _logical_estimated_cost,
+                   MIN(COALESCE(a.segment_sealed, 0)) AS _logical_segment_sealed,
+                   MAX(a.logical_revision) AS _stored_logical_revision,
+                   CASE
+                     WHEN SUM(CASE WHEN a.review_status = 'blocked' THEN 1 ELSE 0 END) > 0
+                       THEN 'blocked'
+                     WHEN SUM(CASE WHEN a.review_status = 'new' THEN 1 ELSE 0 END) > 0
+                       THEN 'new'
+                     WHEN SUM(CASE WHEN a.review_status = 'shortlisted' THEN 1 ELSE 0 END) > 0
+                       THEN 'shortlisted'
+                     WHEN SUM(CASE WHEN a.review_status = 'approved' THEN 1 ELSE 0 END) = COUNT(*)
+                       THEN 'approved'
+                     ELSE MIN(a.review_status)
+                   END AS _logical_review_status
+            FROM active a JOIN eligible e ON e._logical_id = a._logical_id
+            GROUP BY a._logical_id
+        )
+        SELECT r.*, g._checkpoint_count, g._logical_start_time,
+               g._logical_end_time, g._logical_duration_seconds,
+               g._logical_user_messages,
+               g._logical_assistant_messages, g._logical_tool_uses,
+               g._logical_input_tokens, g._logical_output_tokens,
+               g._logical_cache_read_tokens, g._logical_cache_creation_tokens,
+               g._logical_estimated_cost, g._logical_segment_sealed,
+               g._stored_logical_revision, g._logical_review_status
+        FROM ranked r JOIN grouped g ON g._logical_id = r._logical_id
+        WHERE r._logical_row = 1 {projected_status_sql}
+        {order_sql}
+        LIMIT ? OFFSET ?
+    """
+    rows = conn.execute(
+        sql, (*params, *projected_status_params, limit, offset)
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    projection_time = _now_iso()
+    for row in rows:
+        item = dict(row)
+        logical_id = str(item.pop("_logical_id"))
+        item.pop("_logical_row", None)
+        item["session_id"] = logical_id
+        item["logical_session_id"] = logical_id
+        item["checkpoint_count"] = int(item.pop("_checkpoint_count"))
+        item["start_time"] = item.pop("_logical_start_time")
+        item["end_time"] = item.pop("_logical_end_time")
+        item["duration_seconds"] = item.pop("_logical_duration_seconds")
+        item["user_messages"] = int(item.pop("_logical_user_messages") or 0)
+        item["assistant_messages"] = int(item.pop("_logical_assistant_messages") or 0)
+        item["tool_uses"] = int(item.pop("_logical_tool_uses") or 0)
+        item["input_tokens"] = int(item.pop("_logical_input_tokens") or 0)
+        item["output_tokens"] = int(item.pop("_logical_output_tokens") or 0)
+        item["cache_read_tokens"] = int(item.pop("_logical_cache_read_tokens") or 0)
+        item["cache_creation_tokens"] = int(
+            item.pop("_logical_cache_creation_tokens") or 0
+        )
+        item["estimated_cost_usd"] = item.pop("_logical_estimated_cost")
+        item["segment_sealed"] = int(item.pop("_logical_segment_sealed") or 0)
+        item["review_status"] = item.pop("_logical_review_status")
+        item["logical_revision"] = (
+            item.pop("_stored_logical_revision") or item.get("content_revision")
+        )
+        members = get_logical_session_members(conn, logical_id)
+        item["checkpoint_session_ids"] = [
+            str(member["session_id"]) for member in members
+        ]
+        item["logical_incomplete"] = not _logical_member_metadata_complete(members)
+        projected_review, projected_hold, projected_embargo = _project_family_controls(
+            members,
+            changed_at=projection_time,
+            include_shareable_state=True,
+        )
+        item["review_status"] = projected_review or "new"
+        item["hold_state"] = projected_hold or "pending_review"
+        item["embargo_until"] = projected_embargo
+        _clear_multi_checkpoint_ai_projection(item, item["checkpoint_count"])
+        result.append(item)
+    return result
 
 
 def query_sessions(
@@ -3329,6 +4385,300 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, A
             except (json.JSONDecodeError, ValueError):
                 pass
 
+    return result
+
+
+def get_logical_session_members(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    active_only: bool = True,
+) -> list[dict[str, Any]]:
+    """Resolve a logical/root/child id to its ordered physical members."""
+
+    requested = conn.execute(
+        "SELECT session_id, logical_session_id FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if requested is None:
+        return []
+    logical_id = requested["logical_session_id"] or requested["session_id"]
+    active_clause = "AND COALESCE(checkpoint_active, 1) = 1 " if active_only else ""
+    rows = conn.execute(
+        "SELECT * FROM sessions WHERE "
+        "(logical_session_id = ? OR (logical_session_id IS NULL AND session_id = ?)) "
+        + active_clause
+        + "ORDER BY CASE WHEN segment_index IS NULL THEN 1 ELSE 0 END, "
+        "segment_index, session_id",
+        (logical_id, logical_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _logical_member_ranges_complete(members: Sequence[Mapping[str, Any]]) -> bool:
+    if not members:
+        return False
+    indexes = [member.get("segment_index") for member in members]
+    if all(index is None for index in indexes):
+        return len(members) == 1
+    if (
+        any(not isinstance(index, int) or isinstance(index, bool) for index in indexes)
+        or indexes != list(range(len(indexes)))
+    ):
+        return False
+    expected_start = 0
+    for member in members:
+        start = member.get("segment_start_message")
+        end = member.get("segment_end_message")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or start != expected_start
+            or end < start
+        ):
+            return False
+        expected_start = end + 1
+    return True
+
+
+def _logical_member_payload_complete(
+    members: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Verify active membership plus the blobs needed for a lossless package."""
+
+    if not _logical_member_ranges_complete(members):
+        return False
+    checkpointed = any(member.get("segment_index") is not None for member in members)
+    for member in members:
+        session_id = str(member.get("session_id") or "")
+        blob = _read_blob_for_revision(session_id, member.get("blob_path"))
+        if blob is None or not isinstance(blob.get("messages"), list):
+            return False
+        if checkpointed:
+            start = member.get("segment_start_message")
+            end = member.get("segment_end_message")
+            if len(blob["messages"]) != int(end) - int(start) + 1:
+                return False
+    return True
+
+
+def _logical_member_metadata_complete(
+    members: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Cheap list-view completeness: structural ranges plus blob presence."""
+
+    return _logical_member_ranges_complete(members) and all(
+        _blob_present_for_revision(
+            str(member.get("session_id") or ""), member.get("blob_path")
+        )
+        for member in members
+    )
+
+
+def _current_logical_revision(members: Sequence[Mapping[str, Any]]) -> str | None:
+    if not members:
+        return None
+    if len(members) == 1 and members[0].get("logical_session_id") is None:
+        revision = members[0].get("content_revision")
+        return str(revision) if revision is not None else None
+    return _logical_revision_for_members(members)
+
+
+def expand_logical_session_ids(
+    conn: sqlite3.Connection,
+    session_ids: Sequence[str],
+    *,
+    expected_logical_revisions: Mapping[str, str] | None = None,
+    expected_component_revisions: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Expand logical ids to current active physical ids in deterministic order.
+
+    Callers that need a race-free write should begin ``IMMEDIATE`` before this
+    helper and retain that transaction through their update. Optional expected
+    maps bind both family membership and component revisions to a prior UI read.
+    """
+
+    ordered_logical_ids: list[str] = []
+    by_logical: dict[str, list[dict[str, Any]]] = {}
+    blockers: list[dict[str, Any]] = []
+    for requested_id in dict.fromkeys(session_ids):
+        members = get_logical_session_members(conn, requested_id)
+        if not members:
+            blockers.append({
+                "session_id": requested_id,
+                "logical_session_id": requested_id,
+                "expected_revision_hash": None,
+                "current_revision_hash": None,
+                "member_session_ids": [],
+            })
+            continue
+        logical_id = str(
+            members[0].get("logical_session_id") or members[0]["session_id"]
+        )
+        if logical_id not in by_logical:
+            ordered_logical_ids.append(logical_id)
+            by_logical[logical_id] = members
+
+    if expected_logical_revisions is not None:
+        expected_ids = set(expected_logical_revisions)
+        actual_ids = set(by_logical)
+        for logical_id in sorted(expected_ids | actual_ids):
+            members = by_logical.get(logical_id, [])
+            current = _current_logical_revision(members)
+            expected = expected_logical_revisions.get(logical_id)
+            if logical_id not in expected_ids or logical_id not in actual_ids or expected != current:
+                blockers.append({
+                    "session_id": logical_id,
+                    "logical_session_id": logical_id,
+                    "expected_revision_hash": expected,
+                    "current_revision_hash": current,
+                    "member_session_ids": [row["session_id"] for row in members],
+                })
+
+    expanded = [
+        str(member["session_id"])
+        for logical_id in ordered_logical_ids
+        for member in by_logical[logical_id]
+    ]
+    if expected_component_revisions is not None:
+        current_components = {
+            str(member["session_id"]): member.get("content_revision")
+            for members in by_logical.values()
+            for member in members
+        }
+        expected_ids = set(expected_component_revisions)
+        current_ids = set(current_components)
+        for component_id in sorted(expected_ids | current_ids):
+            expected = expected_component_revisions.get(component_id)
+            current = current_components.get(component_id)
+            if component_id not in expected_ids or component_id not in current_ids or expected != current:
+                blockers.append({
+                    "session_id": component_id,
+                    "logical_session_id": next(
+                        (
+                            logical_id
+                            for logical_id, members in by_logical.items()
+                            if any(row["session_id"] == component_id for row in members)
+                        ),
+                        None,
+                    ),
+                    "expected_revision_hash": expected,
+                    "current_revision_hash": current,
+                })
+    if blockers:
+        raise RevisionConflictError(blockers)
+    return expanded
+
+
+def get_logical_session_detail(
+    conn: sqlite3.Connection, session_id: str
+) -> dict[str, Any] | None:
+    """Return a lossless merged detail for one active checkpoint family."""
+
+    members = get_logical_session_members(conn, session_id)
+    if not members:
+        return None
+    logical_id = str(members[0].get("logical_session_id") or members[0]["session_id"])
+    checkpointed = any(member.get("segment_index") is not None for member in members)
+    if checkpointed:
+        indexes = [member.get("segment_index") for member in members]
+        if (
+            any(not isinstance(index, int) or isinstance(index, bool) for index in indexes)
+            or indexes != list(range(len(indexes)))
+        ):
+            raise LogicalProjectionError(
+                f"Checkpoint indexes for {logical_id} are not contiguous from zero."
+            )
+
+    details: list[dict[str, Any]] = []
+    expected_start = 0
+    for member in members:
+        detail = get_session_detail(conn, str(member["session_id"]))
+        if detail is None:
+            raise LogicalProjectionError(
+                f"Checkpoint blob metadata vanished for {member['session_id']}."
+            )
+        if checkpointed:
+            start = member.get("segment_start_message")
+            end = member.get("segment_end_message")
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+                or start != expected_start
+                or end < start
+            ):
+                raise LogicalProjectionError(
+                    f"Checkpoint message ranges for {logical_id} are not contiguous."
+                )
+            if len(detail.get("messages", [])) != end - start + 1:
+                raise LogicalProjectionError(
+                    f"Checkpoint {member['session_id']} does not match its message range."
+                )
+            expected_start = end + 1
+        details.append(detail)
+
+    result = dict(details[0])
+    result["session_id"] = logical_id
+    result["logical_session_id"] = logical_id
+    result["checkpoint_count"] = len(details)
+    result["logical_incomplete"] = False
+    result["component_session_ids"] = [
+        str(member["session_id"]) for member in members
+    ]
+    result["checkpoint_session_ids"] = list(result["component_session_ids"])
+    result["messages"] = [
+        message for detail in details for message in detail.get("messages", [])
+    ]
+    for field in (
+        "user_messages", "assistant_messages", "tool_uses", "input_tokens",
+        "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+    ):
+        result[field] = sum(int(member.get(field) or 0) for member in members)
+    result["estimated_cost_usd"] = sum(
+        float(member.get("estimated_cost_usd") or 0) for member in members
+    )
+    result["start_time"] = min(
+        (member.get("start_time") for member in members if member.get("start_time")),
+        default=None,
+    )
+    result["end_time"] = max(
+        (member.get("end_time") for member in members if member.get("end_time")),
+        default=None,
+    )
+    result["duration_seconds"] = _compute_duration(result)
+    result["logical_revision"] = _current_logical_revision(members)
+    result["content_revision"] = compute_content_revision(result)
+    result["segment_index"] = None
+    result["segment_start_message"] = None
+    result["segment_end_message"] = None
+    result["segment_reason"] = None
+    result["segment_sealed"] = int(
+        all(bool(member.get("segment_sealed")) for member in members)
+    )
+    result["raw_source_start_offset"] = None
+    result["raw_source_end_offset"] = None
+    projected_review, projected_hold, projected_embargo = _project_family_controls(
+        members,
+        changed_at=_now_iso(),
+        include_shareable_state=True,
+    )
+    result["review_status"] = projected_review or "new"
+    result["hold_state"] = projected_hold or "pending_review"
+    result["embargo_until"] = projected_embargo
+    _clear_multi_checkpoint_ai_projection(result, len(members))
+    for field in ("value_badges", "risk_badges", "files_touched", "commands_run"):
+        combined: list[Any] = []
+        for detail in details:
+            value = detail.get(field)
+            if isinstance(value, list):
+                for item in value:
+                    if item not in combined:
+                        combined.append(item)
+        result[field] = combined
     return result
 
 
@@ -3567,11 +4917,91 @@ def bulk_update_review_status(
     return updated_ids, missing_ids
 
 
+def bulk_update_logical_review_status(
+    conn: sqlite3.Connection,
+    session_ids: Sequence[str],
+    status: str,
+) -> tuple[list[str], list[str]]:
+    """Atomically apply one review status to every active family member."""
+
+    logical_statuses = frozenset({"new", "shortlisted", "approved", "blocked"})
+    if not isinstance(status, str) or status not in logical_statuses:
+        raise ValueError(
+            "status must be 'new', 'shortlisted', 'approved', or 'blocked'"
+        )
+    if (
+        isinstance(session_ids, (str, bytes))
+        or not isinstance(session_ids, Sequence)
+        or not (1 <= len(session_ids) <= REVIEW_BULK_LIMIT)
+    ):
+        raise ValueError(
+            f"session_ids must contain 1-{REVIEW_BULK_LIMIT} entries"
+        )
+    if any(not isinstance(session_id, str) or not session_id for session_id in session_ids):
+        raise ValueError("session_ids must contain non-empty strings")
+    if conn.in_transaction:
+        raise RuntimeError(
+            "bulk logical review updates require a connection without "
+            "an active transaction"
+        )
+
+    requested_ids = list(dict.fromkeys(session_ids))
+    updated_requested: list[str] = []
+    missing_requested: list[str] = []
+    member_ids: list[str] = []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for requested_id in requested_ids:
+            members = get_logical_session_members(conn, requested_id)
+            if not members:
+                missing_requested.append(requested_id)
+                continue
+            updated_requested.append(requested_id)
+            for member in members:
+                physical_id = str(member["session_id"])
+                if physical_id not in member_ids:
+                    member_ids.append(physical_id)
+        now = _now_iso()
+        conn.executemany(
+            "UPDATE sessions SET review_status = ?, "
+            "reviewed_at = CASE WHEN review_status = ? THEN reviewed_at ELSE ? END, "
+            "updated_at = ? WHERE session_id = ? AND checkpoint_active = 1",
+            [(status, status, now, now, session_id) for session_id in member_ids],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return updated_requested, missing_requested
+
+
 # ---------------------------------------------------------------------------
 # Hold-state lifecycle
 # ---------------------------------------------------------------------------
 
 HOLD_STATES = frozenset({"auto_redacted", "pending_review", "released", "embargoed"})
+
+
+def _validate_hold_target(
+    to_state: str, embargo_until: str | None
+) -> str | None:
+    """Validate a hold transition and normalize its embargo timestamp."""
+
+    if to_state not in HOLD_STATES:
+        raise ValueError(f"invalid hold_state: {to_state!r}")
+    if to_state != "embargoed":
+        return None
+    if not embargo_until:
+        raise ValueError("embargoed requires embargo_until (ISO 8601)")
+    try:
+        parsed = datetime.fromisoformat(embargo_until)
+    except ValueError as exc:
+        raise ValueError(f"embargo_until is not ISO 8601: {embargo_until!r}") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed <= datetime.now(timezone.utc):
+        raise ValueError("embargo_until must be in the future; use release instead")
+    return embargo_until
 
 
 def set_hold_state(
@@ -3593,21 +5023,7 @@ def set_hold_state(
     Returns True on success, False if the session is missing. Invalid
     state transitions raise `ValueError`.
     """
-    if to_state not in HOLD_STATES:
-        raise ValueError(f"invalid hold_state: {to_state!r}")
-    if to_state == "embargoed":
-        if not embargo_until:
-            raise ValueError("embargoed requires embargo_until (ISO 8601)")
-        try:
-            parsed = datetime.fromisoformat(embargo_until)
-        except ValueError as exc:
-            raise ValueError(f"embargo_until is not ISO 8601: {embargo_until!r}") from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        if parsed <= datetime.now(timezone.utc):
-            raise ValueError("embargo_until must be in the future; use release instead")
-    else:
-        embargo_until = None
+    embargo_until = _validate_hold_target(to_state, embargo_until)
 
     row = conn.execute(
         "SELECT hold_state, embargo_until FROM sessions WHERE session_id = ?",
@@ -3639,6 +5055,64 @@ def set_hold_state(
     return True
 
 
+def set_logical_hold_state(
+    conn: sqlite3.Connection,
+    session_id: str,
+    to_state: str,
+    *,
+    changed_by: str,
+    reason: str | None = None,
+    embargo_until: str | None = None,
+) -> bool:
+    """Atomically transition every active member of one logical conversation.
+
+    Each physical checkpoint keeps its own audit entry because share and
+    recovery records continue to address physical session ids.  ``False`` is
+    returned only when ``session_id`` cannot resolve to a current family.
+    """
+
+    embargo_until = _validate_hold_target(to_state, embargo_until)
+    if conn.in_transaction:
+        raise RuntimeError(
+            "logical hold updates require a connection without an active transaction"
+        )
+    now = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        members = get_logical_session_members(conn, session_id)
+        if not members:
+            conn.rollback()
+            return False
+        for member in members:
+            physical_id = str(member["session_id"])
+            conn.execute(
+                "UPDATE sessions SET hold_state = ?, embargo_until = ?, updated_at = ? "
+                "WHERE session_id = ? AND COALESCE(checkpoint_active, 1) = 1",
+                (to_state, embargo_until, now, physical_id),
+            )
+            conn.execute(
+                "INSERT INTO session_hold_history "
+                "(history_id, session_id, from_state, to_state, embargo_until, "
+                " changed_by, changed_at, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    physical_id,
+                    member.get("hold_state"),
+                    to_state,
+                    embargo_until,
+                    changed_by,
+                    now,
+                    reason,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return True
+
+
 def get_hold_history(
     conn: sqlite3.Connection, session_id: str,
 ) -> list[dict[str, Any]]:
@@ -3656,6 +5130,64 @@ def get_hold_history(
 SHAREABLE_HOLD_STATES = frozenset({"auto_redacted", "released"})
 
 
+def _active_family_controls_for_session_ids(
+    conn: sqlite3.Connection,
+    session_ids: Sequence[str],
+    *,
+    now: datetime | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, tuple[str | None, str | None, str | None]]]:
+    """Resolve selected rows and conservatively fold their active families.
+
+    Egress continues to address physical checkpoint ids, but a negative user
+    control belongs to the logical conversation.  Reading every active member
+    here makes the gates safe even when an older writer (or a findings worker)
+    changed only one checkpoint.
+    """
+
+    ordered_ids = list(dict.fromkeys(str(session_id) for session_id in session_ids))
+    if not ordered_ids:
+        return {}, {}
+    placeholders = ", ".join("?" for _ in ordered_ids)
+    selected_rows = conn.execute(
+        "SELECT session_id, COALESCE(logical_session_id, session_id) "
+        "AS logical_session_id, review_status, hold_state, embargo_until, "
+        "COALESCE(checkpoint_active, 1) AS checkpoint_active FROM sessions "
+        f"WHERE session_id IN ({placeholders})",
+        ordered_ids,
+    ).fetchall()
+    selected = {str(row["session_id"]): dict(row) for row in selected_rows}
+    logical_ids = list(dict.fromkeys(
+        str(row["logical_session_id"]) for row in selected.values()
+    ))
+    if not logical_ids:
+        return selected, {}
+    family_placeholders = ", ".join("?" for _ in logical_ids)
+    family_rows = conn.execute(
+        "SELECT session_id, COALESCE(logical_session_id, session_id) "
+        "AS logical_session_id, review_status, hold_state, embargo_until "
+        "FROM sessions WHERE COALESCE(checkpoint_active, 1) = 1 "
+        "AND COALESCE(logical_session_id, session_id) "
+        f"IN ({family_placeholders}) ORDER BY session_id",
+        logical_ids,
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in family_rows:
+        item = dict(row)
+        grouped.setdefault(str(item["logical_session_id"]), []).append(item)
+    controls_at = now or datetime.now(timezone.utc)
+    if controls_at.tzinfo is None:
+        controls_at = controls_at.replace(tzinfo=timezone.utc)
+    controls = {
+        logical_id: _project_family_controls(
+            members,
+            changed_at=controls_at.isoformat(),
+            include_shareable_state=True,
+        )
+        for logical_id, members in grouped.items()
+    }
+    return selected, controls
+
+
 def release_gate_blockers(
     conn: sqlite3.Connection, session_ids: list[str],
     *, now: datetime | None = None,
@@ -3669,25 +5201,37 @@ def release_gate_blockers(
     """
     if not session_ids:
         return []
-    placeholders = ",".join("?" * len(session_ids))
-    rows = conn.execute(
-        f"SELECT session_id, hold_state, embargo_until FROM sessions "
-        f"WHERE session_id IN ({placeholders})",
-        session_ids,
-    ).fetchall()
-    seen = {r["session_id"]: r for r in rows}
+    seen, family_controls = _active_family_controls_for_session_ids(
+        conn, session_ids, now=now
+    )
     blockers: list[dict[str, Any]] = []
     for sid in session_ids:
         row = seen.get(sid)
         if row is None:
             blockers.append({"session_id": sid, "hold_state": "missing"})
             continue
-        effective = effective_hold_state(row["hold_state"], row["embargo_until"], now=now)
+        if not bool(row.get("checkpoint_active")):
+            blockers.append({
+                "session_id": sid,
+                "hold_state": "inactive_checkpoint",
+                "reason": "inactive_checkpoint",
+            })
+            continue
+        _, effective, embargo_until = family_controls.get(
+            str(row["logical_session_id"]),
+            (
+                row.get("review_status"),
+                effective_hold_state(
+                    row.get("hold_state"), row.get("embargo_until"), now=now
+                ),
+                row.get("embargo_until"),
+            ),
+        )
         if effective not in SHAREABLE_HOLD_STATES:
             blockers.append({
                 "session_id": sid,
                 "hold_state": effective,
-                "embargo_until": row["embargo_until"],
+                "embargo_until": embargo_until,
             })
     return blockers
 
@@ -3849,7 +5393,8 @@ def query_unscored_sessions(
     sql = (
         "SELECT session_id, display_title, task_type, outcome_badge, project, source, "
         "end_time, ai_scored_at, ai_quality_score, ai_failure_value_score "
-        f"FROM sessions WHERE {where} AND review_status != 'segmented'"
+        f"FROM sessions WHERE {where} AND review_status != 'segmented' "
+        "AND COALESCE(checkpoint_active, 1) = 1"
     )
     if since is not None:
         sql += " AND start_time >= ?"
@@ -3919,7 +5464,8 @@ def query_sessions_for_rescore(
     params: list[Any] = [cutoff]
     sql = (
         "SELECT session_id, display_title, task_type, outcome_badge, project, source "
-        "FROM sessions WHERE start_time >= ? AND review_status != 'segmented'"
+        "FROM sessions WHERE start_time >= ? AND review_status != 'segmented' "
+        "AND COALESCE(checkpoint_active, 1) = 1"
     )
     if source is not None:
         if isinstance(source, (list, tuple)):
@@ -3966,6 +5512,58 @@ def search_fts(
         (normalized_query, limit, offset),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def search_logical_sessions(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """FTS search grouped by logical family before offset/limit are applied."""
+
+    if not _has_fts(conn):
+        return []
+    terms = re.findall(r"\w+", query, flags=re.UNICODE)
+    if not terms:
+        return []
+    normalized_query = " AND ".join(f'"{term}"' for term in terms)
+    matches = conn.execute(
+        "SELECT COALESCE(s.logical_session_id, s.session_id) AS logical_id, "
+        "bm25(sessions_fts) AS search_rank "
+        "FROM sessions_fts JOIN sessions s "
+        "ON s.session_id = sessions_fts.session_id "
+        "WHERE sessions_fts MATCH ? AND COALESCE(s.checkpoint_active, 1) = 1 "
+        "ORDER BY search_rank, s.session_id",
+        (normalized_query,),
+    ).fetchall()
+    best_rank: dict[str, float] = {}
+    ranked_ids: list[str] = []
+    for match in matches:
+        logical_id = str(match["logical_id"])
+        if logical_id in best_rank:
+            continue
+        best_rank[logical_id] = float(match["search_rank"])
+        ranked_ids.append(logical_id)
+    page_ids = ranked_ids[offset:offset + limit]
+    if not page_ids:
+        return []
+    summaries = query_logical_sessions(
+        conn,
+        logical_session_ids=page_ids,
+        sort="start_time",
+        limit=len(page_ids),
+    )
+    by_id = {str(summary["session_id"]): summary for summary in summaries}
+    result: list[dict[str, Any]] = []
+    for logical_id in page_ids:
+        summary = by_id.get(logical_id)
+        if summary is None:
+            continue
+        summary["search_rank"] = best_rank[logical_id]
+        result.append(summary)
+    return result
 
 
 def get_stats(
@@ -4015,6 +5613,108 @@ def get_stats(
         tt_params,
     ).fetchall():
         result["by_task_type"][row["tt"]] = row["cnt"]
+
+    return result
+
+
+def get_logical_stats(
+    conn: sqlite3.Connection,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, Any]:
+    """Return Inbox counts using the same active-family semantics as its list.
+
+    Dashboard analytics intentionally remain physical/history based.  This
+    projection is only for surfaces backed by :func:`query_logical_sessions`,
+    where one checkpoint family is one conversation and status/task-type
+    filters must lead to the same set of cards as their displayed counts.
+    """
+
+    date_clauses: list[str] = []
+    params: list[Any] = []
+    if start:
+        date_clauses.append("DATE(_logical_start_time) >= ?")
+        params.append(start)
+    if end:
+        date_clauses.append("DATE(_logical_start_time) <= ?")
+        params.append(end)
+    included_where = (
+        f"WHERE {' AND '.join(date_clauses)}" if date_clauses else ""
+    )
+    cte = f"""
+        WITH active AS (
+            SELECT s.*,
+                   COALESCE(s.logical_session_id, s.session_id) AS _logical_id
+            FROM sessions s
+            WHERE COALESCE(s.checkpoint_active, 1) = 1
+        ), grouped AS (
+            SELECT _logical_id,
+                   COUNT(*) AS _checkpoint_count,
+                   MIN(start_time) AS _logical_start_time,
+                   CASE
+                     WHEN SUM(CASE WHEN review_status = 'blocked' THEN 1 ELSE 0 END) > 0
+                       THEN 'blocked'
+                     WHEN SUM(CASE WHEN review_status = 'new' THEN 1 ELSE 0 END) > 0
+                       THEN 'new'
+                     WHEN SUM(CASE WHEN review_status = 'shortlisted' THEN 1 ELSE 0 END) > 0
+                       THEN 'shortlisted'
+                     WHEN SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END) = COUNT(*)
+                       THEN 'approved'
+                     ELSE MIN(review_status)
+                   END AS _logical_review_status
+            FROM active
+            GROUP BY _logical_id
+        ), included AS (
+            SELECT * FROM grouped {included_where}
+        )
+    """
+    result: dict[str, Any] = {
+        "total": 0,
+        "by_status": {},
+        "by_source": {},
+        "by_project": {},
+        "by_task_type": {},
+    }
+
+    row = conn.execute(cte + "SELECT COUNT(*) AS cnt FROM included", params).fetchone()
+    result["total"] = int(row["cnt"] if row else 0)
+
+    for row in conn.execute(
+        cte
+        + "SELECT _logical_review_status AS value, COUNT(*) AS cnt "
+          "FROM included GROUP BY _logical_review_status",
+        params,
+    ).fetchall():
+        result["by_status"][row["value"]] = row["cnt"]
+
+    for field, result_key in (("source", "by_source"), ("project", "by_project")):
+        for row in conn.execute(
+            cte
+            + f"SELECT a.{field} AS value, COUNT(DISTINCT a._logical_id) AS cnt "
+              "FROM active a JOIN included i ON i._logical_id = a._logical_id "
+            + f"GROUP BY a.{field}",
+            params,
+        ).fetchall():
+            result[result_key][row["value"]] = row["cnt"]
+
+    # This expression deliberately mirrors query_logical_sessions: a single
+    # physical trace may use its AI classification, while a multi-checkpoint
+    # conversation exposes only per-checkpoint heuristic task types.  DISTINCT
+    # keeps one family from inflating a chip when several members share a type.
+    for row in conn.execute(
+        cte
+        + "SELECT task_type, COUNT(*) AS cnt FROM ("
+          "  SELECT DISTINCT a._logical_id, "
+          "    CASE WHEN i._checkpoint_count = 1 "
+          "         THEN COALESCE(a.ai_task_type, a.task_type) "
+          "         ELSE a.task_type END AS task_type "
+          "  FROM active a JOIN included i ON i._logical_id = a._logical_id"
+          ") WHERE task_type IS NOT NULL "
+          "GROUP BY task_type ORDER BY cnt DESC",
+        params,
+    ).fetchall():
+        result["by_task_type"][row["task_type"]] = row["cnt"]
 
     return result
 
@@ -4468,29 +6168,103 @@ def link_subagent_hierarchy(conn: sqlite3.Connection) -> int:
     """
     links_created = 0
 
-    # Step 1: Link sessions that already have parent_session_id from parsing
+    # A real subagent can itself be checkpointed.  Its physical checkpoints
+    # retain the true parent_session_id as provenance, but the parent's child
+    # list must contain one logical representative rather than every upload
+    # component.  Include inactive historical members in the replacement map
+    # so old polluted child lists are cleaned as well.
+    logical_rows = conn.execute(
+        "SELECT session_id, logical_session_id, segment_index, checkpoint_active "
+        "FROM sessions WHERE logical_session_id IS NOT NULL "
+        "ORDER BY logical_session_id, "
+        "CASE WHEN segment_index IS NULL THEN 1 ELSE 0 END, segment_index, "
+        "CASE WHEN session_id = logical_session_id THEN 0 ELSE 1 END, session_id"
+    ).fetchall()
+    representatives: dict[str, str] = {}
+    for row in logical_rows:
+        logical_id = str(row["logical_session_id"])
+        if bool(row["checkpoint_active"]) and logical_id not in representatives:
+            representatives[logical_id] = str(row["session_id"])
+    checkpoint_representatives = {
+        str(row["session_id"]): representatives[str(row["logical_session_id"])]
+        for row in logical_rows
+        if str(row["logical_session_id"]) in representatives
+    }
+
+    def representative_id(session_id: str) -> str:
+        return checkpoint_representatives.get(session_id, session_id)
+
+    parent_children: dict[str, list[str]] = {}
+    assigned_parent_by_child: dict[str, str] = {}
+
+    # Seed and sanitize already-materialized parent child lists.  Mapping both
+    # sides handles the unusual but valid case where a checkpointed trace is
+    # itself a parent.
+    existing_parent_rows = conn.execute(
+        "SELECT session_id, subagent_session_ids FROM sessions "
+        "WHERE subagent_session_ids IS NOT NULL"
+    ).fetchall()
+    for row in existing_parent_rows:
+        parent_id = representative_id(str(row["session_id"]))
+        try:
+            raw_children = json.loads(row["subagent_session_ids"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw_children, list):
+            continue
+        children = parent_children.setdefault(parent_id, [])
+        for raw_child in raw_children:
+            if not isinstance(raw_child, str) or not raw_child:
+                continue
+            child_id = representative_id(raw_child)
+            if child_id != parent_id and child_id not in children:
+                children.append(child_id)
+                assigned_parent_by_child.setdefault(child_id, parent_id)
+
+    # Step 1: Link parser-provided parents, collapsing checkpoint members to
+    # their active segment-zero representative.
     rows = conn.execute(
         "SELECT session_id, parent_session_id FROM sessions "
         "WHERE parent_session_id IS NOT NULL"
     ).fetchall()
-    parent_children: dict[str, list[str]] = {}
-    assigned_parent_by_child: dict[str, str] = {}
-    for r in rows:
-        parent_id = r["parent_session_id"]
-        child_id = r["session_id"]
-        parent_children.setdefault(parent_id, []).append(child_id)
-        assigned_parent_by_child[child_id] = parent_id
+    for row in rows:
+        parent_id = representative_id(str(row["parent_session_id"]))
+        child_id = representative_id(str(row["session_id"]))
+        if child_id == parent_id:
+            continue
+        children = parent_children.setdefault(parent_id, [])
+        if child_id not in children:
+            children.append(child_id)
+        assigned_parent_by_child.setdefault(child_id, parent_id)
 
     # Step 2: Detect Agent/Task tool calls in session blobs.
     # Query all sessions for candidate matching, but only read blobs for
     # sessions that haven't been linked yet (subagent_session_ids IS NULL)
     # to avoid re-reading all blobs on every scan cycle.
-    all_sessions = conn.execute(
+    all_session_rows = conn.execute(
         "SELECT session_id, project, source, start_time, end_time, "
-        "blob_path, subagent_session_ids "
+        "blob_path, subagent_session_ids, logical_session_id, checkpoint_active "
         "FROM sessions WHERE start_time IS NOT NULL "
         "ORDER BY start_time"
     ).fetchall()
+    all_sessions: list[dict[str, Any]] = []
+    seen_representatives: set[str] = set()
+    for row in all_session_rows:
+        item = dict(row)
+        session_id = str(item["session_id"])
+        logical_id = item.get("logical_session_id")
+        if logical_id is not None:
+            representative = representatives.get(str(logical_id))
+            if (
+                not bool(item.get("checkpoint_active"))
+                or representative is None
+                or session_id != representative
+            ):
+                continue
+            if representative in seen_representatives:
+                continue
+            seen_representatives.add(representative)
+        all_sessions.append(item)
 
     # Build a lookup for quick matching
     by_project: dict[str, list[dict]] = {}
@@ -4574,7 +6348,7 @@ def link_subagent_hierarchy(conn: sqlite3.Connection) -> int:
         conn.execute(
             "UPDATE sessions SET subagent_session_ids = ?, updated_at = ? "
             "WHERE session_id = ?",
-            (json.dumps(child_ids), now, parent_id),
+            (json.dumps(child_ids) if child_ids else None, now, parent_id),
         )
         for child_id in child_ids:
             cursor = conn.execute(
@@ -4788,12 +6562,16 @@ def create_share(
     note: str | None = None,
     source_filter: str | list[str] | tuple[str, ...] | None = None,
     expected_revisions: dict[str, str] | None = None,
+    expected_logical_revisions: dict[str, str] | None = None,
 ) -> str:
     """Create a share linking the given sessions.
 
     Returns the new share_id. ``expected_revisions`` lets callers bind a UI
     selection to the exact revisions the user reviewed; a concurrent append
     raises ``ValueError`` before any share row is created.
+    ``expected_logical_revisions`` additionally binds the selected physical
+    subset to the family membership visible in the UI without requiring that
+    already-shared or otherwise unselected active checkpoints be resubmitted.
     """
     share_id = str(uuid.uuid4())
     now = _now_iso()
@@ -4804,7 +6582,21 @@ def create_share(
         # Verify all sessions exist while holding the same write transaction
         # that records their immutable share snapshots.
         found_sessions: dict[str, str | None] = {}
+        selected_rows: list[sqlite3.Row] = []
         if session_ids:
+            session_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)")
+            }
+            logical_id_sql = (
+                "logical_session_id"
+                if "logical_session_id" in session_columns
+                else "NULL AS logical_session_id"
+            )
+            checkpoint_active_sql = (
+                "checkpoint_active"
+                if "checkpoint_active" in session_columns
+                else "1 AS checkpoint_active"
+            )
             placeholders = ", ".join("?" for _ in session_ids)
             source_clause = ""
             params: list[Any] = list(session_ids)
@@ -4819,15 +6611,79 @@ def create_share(
                 else:
                     source_clause = " AND source = ?"
                     params.append(source_filter)
-            rows = conn.execute(
-                "SELECT session_id, content_revision FROM sessions "
+            selected_rows = conn.execute(
+                "SELECT session_id, content_revision, "
+                f"{logical_id_sql}, {checkpoint_active_sql} FROM sessions "
                 f"WHERE session_id IN ({placeholders}){source_clause}",
                 params,
             ).fetchall()
             found_sessions = {
                 row["session_id"]: row["content_revision"]
-                for row in rows
+                for row in selected_rows
             }
+
+        inactive_blockers = [
+            {
+                "session_id": str(row["session_id"]),
+                "logical_session_id": str(
+                    row["logical_session_id"] or row["session_id"]
+                ),
+                "reason": "inactive_checkpoint",
+            }
+            for row in selected_rows
+            if not bool(row["checkpoint_active"])
+        ]
+        if inactive_blockers:
+            raise RevisionConflictError(inactive_blockers)
+
+        if expected_logical_revisions is not None:
+            selected_logical_ids = {
+                str(row["logical_session_id"] or row["session_id"])
+                for row in selected_rows
+            }
+            expected_logical_ids = set(expected_logical_revisions)
+            logical_blockers: list[dict[str, Any]] = []
+            for logical_id in sorted(selected_logical_ids | expected_logical_ids):
+                members = get_logical_session_members(conn, logical_id)
+                current_revision = _current_logical_revision(members)
+                payload_complete = _logical_member_payload_complete(members)
+                expected_revision = expected_logical_revisions.get(logical_id)
+                selected_for_family = sorted(
+                    str(row["session_id"])
+                    for row in selected_rows
+                    if str(row["logical_session_id"] or row["session_id"])
+                    == logical_id
+                )
+                selected_inactive = any(
+                    not bool(row["checkpoint_active"])
+                    for row in selected_rows
+                    if str(row["logical_session_id"] or row["session_id"])
+                    == logical_id
+                )
+                if (
+                    logical_id not in selected_logical_ids
+                    or logical_id not in expected_logical_ids
+                    or expected_revision != current_revision
+                    or selected_inactive
+                    or not payload_complete
+                ):
+                    logical_blockers.append({
+                        "session_id": logical_id,
+                        "logical_session_id": logical_id,
+                        "expected_revision_hash": expected_revision,
+                        "current_revision_hash": current_revision,
+                        "member_session_ids": [
+                            str(member["session_id"]) for member in members
+                        ],
+                        "selected_session_ids": selected_for_family,
+                        "reason": (
+                            "logical_incomplete"
+                            if members and not payload_complete
+                            else "revision_conflict"
+                        ),
+                    })
+            if logical_blockers:
+                raise RevisionConflictError(logical_blockers)
 
         if expected_revisions is not None:
             expected_ids = set(expected_revisions)
@@ -5752,6 +7608,7 @@ def get_auto_upload_candidate_report(
         _LATEST_SUCCESSFUL_REVISIONS_CTE
         + "SELECT s.session_id, s.project, s.source, s.display_title, "
         "s.end_time, s.review_status, s.hold_state, s.embargo_until, "
+        "COALESCE(s.logical_session_id, s.session_id) AS logical_session_id, "
         "s.blob_path, s.raw_source_path, s.raw_source_start_offset, "
         "s.raw_source_end_offset, s.segment_sealed, "
         "s.content_revision AS revision_hash, "
@@ -5761,8 +7618,21 @@ def get_auto_upload_candidate_report(
         "AS already_shared_exact_revision "
         "FROM sessions s "
         "LEFT JOIN latest_shared_revisions latest ON latest.session_id = s.session_id "
+        "WHERE COALESCE(s.checkpoint_active, 1) = 1 "
         "ORDER BY s.session_id"
     ).fetchall()
+
+    grouped_controls: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped_controls.setdefault(str(row["logical_session_id"]), []).append(dict(row))
+    family_controls = {
+        logical_id: _project_family_controls(
+            members,
+            changed_at=current_time.isoformat(),
+            include_shareable_state=True,
+        )
+        for logical_id, members in grouped_controls.items()
+    }
 
     eligible: list[dict[str, Any]] = []
     exclusions: list[dict[str, str]] = []
@@ -5772,6 +7642,9 @@ def get_auto_upload_candidate_report(
         exclusions.append({"session_id": row["session_id"], "reason": reason})
 
     for row in rows:
+        family_review, family_hold, _family_embargo = family_controls[
+            str(row["logical_session_id"])
+        ]
         if row["source"] not in enrolled_sources:
             exclude(row, "source_excluded")
             continue
@@ -5825,14 +7698,14 @@ def get_auto_upload_candidate_report(
         ):
             exclude(row, "changed_revision_needing_approval")
             continue
-        if row["review_status"] not in AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES:
+        if (
+            family_review == "blocked"
+            or row["review_status"] not in AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES
+        ):
             exclude(row, "blocked_review_status")
             continue
 
-        hold_state = effective_hold_state(
-            row["hold_state"], row["embargo_until"], now=current_time
-        )
-        if hold_state not in SHAREABLE_HOLD_STATES:
+        if family_hold not in SHAREABLE_HOLD_STATES:
             exclude(row, "held_or_embargoed")
             continue
         if not _blob_present_for_revision(row["session_id"], row["blob_path"]):
@@ -5905,18 +7778,16 @@ def auto_upload_review_blockers(
 
     First-time traces may remain ``new``, ``shortlisted``, or ``approved``.
     A changed revision of a previously shared trace must remain ``approved``
-    through the final submission transition.
+    through the final submission transition. Checkpoints retired after
+    candidate selection fail closed. Receipt reconciliation for an artifact
+    already in ``submitting`` happens before this new-submission gate.
     """
     ordered_ids = list(dict.fromkeys(session_ids))
     if not ordered_ids:
         return []
-    placeholders = ", ".join("?" for _ in ordered_ids)
-    rows = conn.execute(
-        "SELECT session_id, review_status FROM sessions "
-        f"WHERE session_id IN ({placeholders})",
-        ordered_ids,
-    ).fetchall()
-    by_id = {str(row["session_id"]): row for row in rows}
+    by_id, family_controls = _active_family_controls_for_session_ids(
+        conn, ordered_ids
+    )
     blockers: list[dict[str, Any]] = []
     blocked_ids: set[str] = set()
     for session_id in ordered_ids:
@@ -5928,10 +7799,29 @@ def auto_upload_review_blockers(
                 "reason": "missing",
             })
             blocked_ids.add(session_id)
-        elif row["review_status"] not in AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES:
+        elif not bool(row["checkpoint_active"]):
             blockers.append({
                 "session_id": session_id,
-                "review_status": row["review_status"],
+                "review_status": row.get("review_status"),
+                "checkpoint_active": False,
+                "reason": "inactive_checkpoint",
+            })
+            blocked_ids.add(session_id)
+        elif (
+            family_controls.get(str(row["logical_session_id"]), (None, None, None))[0]
+            == "blocked"
+            or row.get("review_status") not in AUTO_UPLOAD_ALLOWED_REVIEW_STATUSES
+        ):
+            blockers.append({
+                "session_id": session_id,
+                "review_status": (
+                    "blocked"
+                    if family_controls.get(
+                        str(row["logical_session_id"]), (None, None, None)
+                    )[0]
+                    == "blocked"
+                    else row.get("review_status")
+                ),
                 "reason": "blocked_review_status",
             })
             blocked_ids.add(session_id)
@@ -6051,6 +7941,7 @@ def get_share_ready_stats(
     """
     where_clauses: list[str] = []
     params: list[Any] = []
+    where_clauses.append("COALESCE(s.checkpoint_active, 1) = 1")
     if include_unapproved:
         where_clauses.append(
             "s.review_status IN ('new', 'shortlisted', 'approved')"
@@ -6086,6 +7977,14 @@ def get_share_ready_stats(
         f" s.input_tokens, s.output_tokens, ({_OUTCOME_NORMALIZE_SQL}) as outcome_badge, s.client_origin,"
         " s.runtime_channel, s.start_time, s.review_status, s.hold_state, s.embargo_until,"
         " s.content_revision AS revision_hash,"
+        " COALESCE(s.logical_session_id, s.session_id) AS logical_session_id,"
+        " COALESCE(s.logical_revision, s.content_revision) AS logical_revision,"
+        " s.segment_index, s.segment_reason, s.segment_sealed,"
+        " CASE WHEN s.logical_session_id IS NULL THEN 1 ELSE ("
+        "   SELECT COUNT(*) FROM sessions checkpoint_member"
+        "   WHERE checkpoint_member.logical_session_id = s.logical_session_id"
+        "   AND COALESCE(checkpoint_member.checkpoint_active, 1) = 1"
+        " ) END AS checkpoint_count,"
         " latest.content_revision AS last_shared_revision_hash,"
         " CASE WHEN latest.content_revision IS NOT NULL "
         "      AND s.content_revision IS NOT latest.content_revision "
@@ -6103,8 +8002,10 @@ def get_share_ready_stats(
             "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
             "user_messages", "assistant_messages", "tool_uses", "input_tokens",
             "output_tokens", "outcome_badge", "client_origin", "runtime_channel",
-            "start_time", "review_status", "hold_state", "embargo_until",
-            "revision_hash", "last_shared_revision_hash",
+             "start_time", "review_status", "hold_state", "embargo_until",
+             "revision_hash", "logical_session_id", "logical_revision",
+             "segment_index", "segment_reason", "segment_sealed", "checkpoint_count",
+             "last_shared_revision_hash",
             "updated_since_last_share"]
     sessions = [dict(zip(cols, r)) for r in rows]
     for session in sessions:
@@ -6117,6 +8018,45 @@ def get_share_ready_stats(
                     session[field] = json.loads(session[field])
                 except (json.JSONDecodeError, ValueError):
                     session[field] = []
+    # Manual sharing may still package physical checkpoints, but it must never
+    # silently package a family whose active ordinal/message ranges have a gap
+    # or overlap.  Resolve completeness against *all* active members before
+    # hold/share-history filtering so every candidate from that family fails
+    # closed together.
+    logical_members: dict[
+        str,
+        tuple[list[str], bool, str | None, str | None, str | None],
+    ] = {}
+    incomplete_logical_ids: set[str] = set()
+    complete_sessions: list[dict[str, Any]] = []
+    for session in sessions:
+        logical_id = str(session["logical_session_id"])
+        cached = logical_members.get(logical_id)
+        if cached is None:
+            members = get_logical_session_members(conn, str(session["session_id"]))
+            member_ids = [str(member["session_id"]) for member in members]
+            complete = _logical_member_metadata_complete(members)
+            projected_controls = _project_family_controls(
+                members,
+                changed_at=_now_iso(),
+                include_shareable_state=True,
+            )
+            cached = (member_ids, complete, *projected_controls)
+            logical_members[logical_id] = cached
+        member_ids, complete, family_review, family_hold, _family_embargo = cached
+        session["checkpoint_session_ids"] = member_ids
+        session["checkpoint_count"] = len(member_ids)
+        session["logical_incomplete"] = not complete
+        if not complete:
+            incomplete_logical_ids.add(logical_id)
+            continue
+        if (
+            family_review == "blocked"
+            or family_hold not in SHAREABLE_HOLD_STATES
+        ):
+            continue
+        complete_sessions.append(session)
+    sessions = complete_sessions
     # Only offer sessions that are actually shareable: drop explicit holds
     # (`pending_review`, active `embargoed`) so the student cannot pick a
     # session that the submit-time release gate would later reject. Auto-expired
@@ -6173,6 +8113,7 @@ def get_share_ready_stats(
         ).fetchone()[0],
         "projects": sorted(projects),
         "models": sorted(models),
+        "logical_incomplete_excluded": len(incomplete_logical_ids),
         "recommended_session_ids": recommended_ids,
         "sessions": sessions,
     }

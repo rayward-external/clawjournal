@@ -43,9 +43,22 @@ _SESSION_STATE_COLUMNS = (
     "reviewed_at",
     "blob_path",
     "raw_source_path",
+    "raw_source_start_offset",
+    "raw_source_end_offset",
+    "session_key",
     "indexed_at",
     "updated_at",
     "share_id",
+    "parent_session_id",
+    "subagent_session_ids",
+    "segment_index",
+    "segment_start_message",
+    "segment_end_message",
+    "segment_reason",
+    "segment_sealed",
+    "logical_session_id",
+    "checkpoint_active",
+    "logical_revision",
     "hold_state",
     "embargo_until",
     "content_revision",
@@ -1308,27 +1321,60 @@ def _restore_session_state(
             and current["content_revision"] == row.get("content_revision")
         )
         if current is None:
+            checkpoint_active = row.get("checkpoint_active")
+            if checkpoint_active not in (0, 1):
+                checkpoint_active = 1
+            segment_sealed = row.get("segment_sealed")
+            if segment_sealed not in (0, 1):
+                segment_sealed = 0
             conn.execute(
                 """INSERT INTO sessions (
                     session_id, project, source, display_title, review_status,
                     selection_reason, reviewer_notes, reviewed_at, blob_path,
-                    raw_source_path, indexed_at, updated_at, share_id,
-                    hold_state, embargo_until, content_revision
-                ) VALUES (?, ?, ?, ?, 'new', NULL, NULL, NULL, ?, ?, ?, ?, ?,
-                          'pending_review', NULL, ?)""",
-                (
-                    session_id,
-                    row.get("project") or "recovered",
-                    row.get("source") or "recovered",
-                    row.get("display_title") or "Recovered trace",
-                    row.get("blob_path"),
-                    row.get("raw_source_path"),
-                    row.get("indexed_at")
+                    raw_source_path, raw_source_start_offset,
+                    raw_source_end_offset, session_key, indexed_at, updated_at,
+                    share_id, parent_session_id, subagent_session_ids,
+                    segment_index, segment_start_message, segment_end_message,
+                    segment_reason, segment_sealed, logical_session_id,
+                    checkpoint_active, logical_revision, hold_state,
+                    embargo_until, content_revision
+                ) VALUES (
+                    :session_id, :project, :source, :display_title, 'new',
+                    NULL, NULL, NULL, :blob_path, :raw_source_path,
+                    :raw_source_start_offset, :raw_source_end_offset,
+                    :session_key, :indexed_at, :updated_at, :share_id,
+                    :parent_session_id, :subagent_session_ids, :segment_index,
+                    :segment_start_message, :segment_end_message,
+                    :segment_reason, :segment_sealed, :logical_session_id,
+                    :checkpoint_active, :logical_revision, 'pending_review',
+                    NULL, :content_revision
+                )""",
+                {
+                    "session_id": session_id,
+                    "project": row.get("project") or "recovered",
+                    "source": row.get("source") or "recovered",
+                    "display_title": row.get("display_title") or "Recovered trace",
+                    "blob_path": row.get("blob_path"),
+                    "raw_source_path": row.get("raw_source_path"),
+                    "raw_source_start_offset": row.get("raw_source_start_offset"),
+                    "raw_source_end_offset": row.get("raw_source_end_offset"),
+                    "session_key": row.get("session_key"),
+                    "indexed_at": row.get("indexed_at")
                     or datetime.now(timezone.utc).isoformat(),
-                    row.get("updated_at"),
-                    share_id,
-                    row.get("content_revision"),
-                ),
+                    "updated_at": row.get("updated_at"),
+                    "share_id": share_id,
+                    "parent_session_id": row.get("parent_session_id"),
+                    "subagent_session_ids": row.get("subagent_session_ids"),
+                    "segment_index": row.get("segment_index"),
+                    "segment_start_message": row.get("segment_start_message"),
+                    "segment_end_message": row.get("segment_end_message"),
+                    "segment_reason": row.get("segment_reason"),
+                    "segment_sealed": segment_sealed,
+                    "logical_session_id": row.get("logical_session_id"),
+                    "checkpoint_active": checkpoint_active,
+                    "logical_revision": row.get("logical_revision"),
+                    "content_revision": row.get("content_revision"),
+                },
             )
             needs_review += 1
             continue

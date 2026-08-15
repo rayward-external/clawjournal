@@ -109,6 +109,93 @@ describe('Share selection defaults', () => {
     });
   });
 
+  it('shows one conversation while selecting and redacting every eligible checkpoint', async () => {
+    const root: ReadySession = {
+      ...readySession('long-trace'),
+      display_title: 'Long conversation',
+      logical_session_id: 'long-trace',
+      logical_revision: 'logical-r1',
+      checkpoint_count: 3,
+      segment_index: 0,
+      revision_hash: 'physical-r0',
+    };
+    const tail: ReadySession = {
+      ...readySession('long-trace_seg-0001'),
+      display_title: 'Long conversation',
+      logical_session_id: 'long-trace',
+      logical_revision: 'logical-r1',
+      checkpoint_count: 3,
+      segment_index: 1,
+      revision_hash: 'physical-r1',
+    };
+    mockInitialLoad({
+      ...readyStats(0),
+      count: 2,
+      total_approved: 2,
+      recommended_session_ids: ['long-trace'],
+      sessions: [root, tail],
+    });
+    const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
+      session_id: id,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'disabled',
+      redacted_session: { messages: [] },
+    }) as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('1 conversation / 2 upload checkpoints selected')).toBeInTheDocument();
+    expect(screen.getByText('2 eligible of 3 upload checkpoints')).toBeInTheDocument();
+    expect(screen.getAllByText('Long conversation')).toHaveLength(1);
+    expect(screen.getAllByRole('checkbox', { name: 'Include conversation: Long conversation' })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include conversation: Long conversation' }));
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include conversation: Long conversation' }));
+    expect(await screen.findByText('1 conversation / 2 upload checkpoints selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
+    expect(redactionSpy.mock.calls.map(([id]) => id)).toEqual([
+      'long-trace',
+      'long-trace_seg-0001',
+    ]);
+  });
+
+  it('fails closed when a conversation checkpoint sequence is incomplete', async () => {
+    const incomplete: ReadySession = {
+      ...readySession('incomplete-trace'),
+      logical_session_id: 'incomplete-trace',
+      logical_revision: 'logical-r1',
+      checkpoint_count: 2,
+      segment_index: 0,
+      logical_incomplete: true,
+    };
+    mockInitialLoad({
+      ...readyStats(0),
+      count: 1,
+      total_approved: 1,
+      recommended_session_ids: ['incomplete-trace'],
+      sessions: [incomplete],
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include conversation: Trace incomplete-trace' })).toBeDisabled();
+    expect(screen.getByText('Checkpoint sequence incomplete')).toBeInTheDocument();
+  });
+
   it('keeps a custom queue order when bulk-selecting filtered traces', async () => {
     mockInitialLoad(readyStats(3));
 

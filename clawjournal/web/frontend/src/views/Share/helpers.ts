@@ -7,6 +7,8 @@ import {
 import type {
   BlockedShareSession,
   BucketCounts,
+  LogicalReadySessionGroup,
+  ReadySession,
   RedactedSessionData,
   RedactionBucket,
   ShareReadyStats,
@@ -137,19 +139,191 @@ export function formatShareDestination(url: string): string {
   }
 }
 
+export function readySessionLogicalId(session: ReadySession): string {
+  return session.logical_session_id || session.session_id;
+}
+
+/**
+ * Project physical upload checkpoints as one conversation for Queue display.
+ * The original rows remain intact in `members`; redaction and packaging must
+ * continue to consume those physical ids and revisions.
+ */
+export function groupReadySessions(sessions: ReadySession[]): LogicalReadySessionGroup[] {
+  const groups = new Map<string, Array<{ session: ReadySession; inputIndex: number }>>();
+  sessions.forEach((session, inputIndex) => {
+    const logicalId = readySessionLogicalId(session);
+    const members = groups.get(logicalId) || [];
+    members.push({ session, inputIndex });
+    groups.set(logicalId, members);
+  });
+
+  return [...groups.entries()].map(([logicalId, indexedMembers]) => {
+    const members = [...indexedMembers]
+      .sort((a, b) => {
+        const aIndex = a.session.segment_index;
+        const bIndex = b.session.segment_index;
+        if (typeof aIndex === 'number' && typeof bIndex === 'number' && aIndex !== bIndex) {
+          return aIndex - bIndex;
+        }
+        if (typeof aIndex === 'number' && typeof bIndex !== 'number') return -1;
+        if (typeof aIndex !== 'number' && typeof bIndex === 'number') return 1;
+        return a.inputIndex - b.inputIndex;
+      })
+      .map(({ session }) => session);
+    const representative = members.find((session) => session.session_id === logicalId)
+      || members.find((session) => session.segment_index === 0)
+      || members[0];
+    const revisions = new Set(
+      members.map((session) => session.logical_revision).filter((value): value is string => Boolean(value)),
+    );
+    const logicalRevision = revisions.size === 1 ? [...revisions][0] : null;
+    const checkpointCount = Math.max(
+      members.length,
+      ...members.map((session) => (
+        typeof session.checkpoint_count === 'number' ? session.checkpoint_count : 0
+      )),
+    );
+    // A smaller eligible subset is normal after earlier checkpoints were
+    // shared. Only the backend's structural gap/overlap flag is fail-closed.
+    const logicalIncomplete = members.some((session) => Boolean(session.logical_incomplete));
+    const checkpointScoringOnly = checkpointCount > 1;
+    const display: ReadySession = {
+      ...representative,
+      session_id: logicalId,
+      logical_session_id: logicalId,
+      logical_revision: logicalRevision,
+      checkpoint_count: checkpointCount,
+      user_messages: members.reduce((sum, session) => sum + session.user_messages, 0),
+      assistant_messages: members.reduce((sum, session) => sum + session.assistant_messages, 0),
+      tool_uses: members.reduce((sum, session) => sum + session.tool_uses, 0),
+      input_tokens: members.reduce((sum, session) => sum + session.input_tokens, 0),
+      output_tokens: members.reduce((sum, session) => sum + session.output_tokens, 0),
+      updated_since_last_share: members.some((session) => session.updated_since_last_share),
+      // These scores were produced for individual transport checkpoints. Do
+      // not present a representative checkpoint's score as though the judge
+      // evaluated the complete logical conversation.
+      ai_quality_score: checkpointScoringOnly ? null : representative.ai_quality_score,
+      ai_failure_value_score: checkpointScoringOnly ? null : representative.ai_failure_value_score,
+      ai_recovery_labels: checkpointScoringOnly ? [] : representative.ai_recovery_labels,
+      ai_failure_attribution: checkpointScoringOnly ? null : representative.ai_failure_attribution,
+      ai_failure_modes: checkpointScoringOnly ? [] : representative.ai_failure_modes,
+      ai_learning_summary: checkpointScoringOnly ? null : representative.ai_learning_summary,
+    };
+    return {
+      logical_session_id: logicalId,
+      logical_revision: logicalRevision,
+      members,
+      display,
+      logical_incomplete: logicalIncomplete,
+    };
+  });
+}
+
+export function checkpointIdsForReadySession(
+  stats: ShareReadyStats,
+  sessionId: string,
+): string[] {
+  const group = groupReadySessions(stats.sessions).find((candidate) => (
+    candidate.logical_session_id === sessionId
+    || candidate.members.some((session) => session.session_id === sessionId)
+  ));
+  return group?.members.map((session) => session.session_id) || [];
+}
+
+/** Expand any selected member to its complete eligible checkpoint family. */
+export function expandLogicalQueueSelection(
+  stats: ShareReadyStats,
+  selection: string[],
+): string[] {
+  const groups = groupReadySessions(stats.sessions);
+  const byId = new Map<string, LogicalReadySessionGroup>();
+  groups.forEach((group) => {
+    byId.set(group.logical_session_id, group);
+    group.members.forEach((session) => byId.set(session.session_id, group));
+  });
+  const seenGroups = new Set<string>();
+  const expanded: string[] = [];
+  for (const id of selection) {
+    const group = byId.get(id);
+    if (!group || group.logical_incomplete || seenGroups.has(group.logical_session_id)) continue;
+    seenGroups.add(group.logical_session_id);
+    const ids = group.members.map((session) => session.session_id);
+    if (expanded.length + ids.length > MAX_SHARE_QUEUE_SIZE) continue;
+    expanded.push(...ids);
+  }
+  return expanded;
+}
+
+/**
+ * Preserve explicit exclusions: a partial group is treated as deselected, not
+ * silently broadened by restoring its omitted checkpoint.
+ */
+export function retainCompleteLogicalQueueGroups(
+  stats: ShareReadyStats,
+  selection: string[],
+): string[] {
+  const selected = new Set(selection);
+  return groupReadySessions(stats.sessions)
+    .filter((group) => (
+      !group.logical_incomplete
+      && group.members.every((session) => selected.has(session.session_id))
+    ))
+    .flatMap((group) => group.members.map((session) => session.session_id))
+    .slice(0, MAX_SHARE_QUEUE_SIZE);
+}
+
+export function collectExpectedLogicalRevisions(
+  sessions: ReadySession[],
+): Record<string, string> {
+  const expected: Record<string, string> = {};
+  for (const group of groupReadySessions(sessions)) {
+    if (group.logical_incomplete) {
+      throw new Error(
+        `Conversation ${group.logical_session_id} has an incomplete checkpoint sequence. Run a successful scan before sharing it.`,
+      );
+    }
+    const revisions = new Set(
+      group.members
+        .map((session) => session.logical_revision)
+        .filter((revision): revision is string => Boolean(revision)),
+    );
+    if (revisions.size > 1) {
+      throw new Error(
+        `Conversation ${group.logical_session_id} changed while preparing this share. Return to Queue and try again.`,
+      );
+    }
+    if (revisions.size === 1) expected[group.logical_session_id] = [...revisions][0];
+  }
+  return expected;
+}
+
 export function queueFromStats(stats: ShareReadyStats): string[] {
-  const validIds = new Set(stats.sessions.map((s) => s.session_id));
-  const recommended = (stats.recommended_session_ids || [])
-    .filter((id) => validIds.has(id));
+  const groups = groupReadySessions(stats.sessions);
+  const groupById = new Map<string, LogicalReadySessionGroup>();
+  groups.forEach((group) => {
+    groupById.set(group.logical_session_id, group);
+    group.members.forEach((session) => groupById.set(session.session_id, group));
+  });
+  const recommendedGroups = (stats.recommended_session_ids || [])
+    .map((id) => groupById.get(id))
+    .filter((group): group is LogicalReadySessionGroup => Boolean(group));
+  const orderedGroups = [...new Map([
+    ...recommendedGroups,
+    ...groups,
+  ].map((group) => [group.logical_session_id, group])).values()];
 
   // Start with the server's highest-value recommendations, then fill the
-  // bounded queue from the remaining eligible traces. The complete eligible
-  // pool stays available in the picker, but a share never starts with the
-  // user's entire local history selected.
-  return [...new Set([
-    ...recommended,
-    ...stats.sessions.map((s) => s.session_id).filter(Boolean),
-  ])].slice(0, MAX_SHARE_QUEUE_SIZE);
+  // bounded queue from the remaining eligible conversations. Never split a
+  // logical conversation at the physical-checkpoint cap.
+  const selected: string[] = [];
+  orderedGroups.forEach((group) => {
+    if (group.logical_incomplete) return;
+    const checkpointIds = group.members.map((session) => session.session_id);
+    if (selected.length + checkpointIds.length <= MAX_SHARE_QUEUE_SIZE) {
+      selected.push(...checkpointIds);
+    }
+  });
+  return selected;
 }
 
 function csvParam(params: URLSearchParams, name: string): string[] | null {
@@ -165,14 +339,18 @@ export function queueFromSelectionParams(
   // queue and must not fall back to the select-all default on reload.
   const explicitIds = csvParam(params, 'ids');
   if (explicitIds !== null) {
-    return sanitizeQueueSelection(stats, explicitIds);
+    const sanitized = sanitizeQueueSelection(stats, explicitIds);
+    return params.get('selection') === 'locked'
+      ? sanitized
+      : expandLogicalQueueSelection(stats, sanitized);
   }
 
   const excludedIds = new Set([
     ...(csvParam(params, 'exclude') || []),
     ...(csvParam(params, 'exclude_ids') || []),
   ]);
-  return queueFromStats(stats).filter((id) => !excludedIds.has(id));
+  const selected = queueFromStats(stats).filter((id) => !excludedIds.has(id));
+  return retainCompleteLogicalQueueGroups(stats, selected);
 }
 
 export function sanitizeQueueSelection(

@@ -136,6 +136,18 @@ describe('Inbox selection defaults', () => {
     expect(second).not.toBeChecked();
     expect(screen.queryByText(/selected$/)).not.toBeInTheDocument();
   });
+
+  it('labels logical conversations and warns about an incomplete projection', async () => {
+    renderInbox([{
+      ...session('logical'),
+      logical_session_id: 'logical',
+      checkpoint_count: 3,
+      logical_incomplete: true,
+    }]);
+
+    expect(await screen.findByText('3 upload checkpoints')).toBeInTheDocument();
+    expect(screen.getByText('Incomplete conversation')).toBeInTheDocument();
+  });
 });
 
 describe('Inbox bulk status updates', () => {

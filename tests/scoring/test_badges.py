@@ -243,6 +243,54 @@ class TestDisplayTitle:
         title = compute_display_title(session)
         assert title == "Refactor the auth middleware"
 
+    def test_skips_task_notification(self):
+        session = _make_session("")
+        session["messages"] = [
+            {
+                "role": "user",
+                "content": "<task-notification>background task completed</task-notification>",
+                "tool_uses": [],
+            },
+            {"role": "assistant", "content": "Noted", "tool_uses": []},
+            {
+                "role": "user",
+                "content": "Refactor the auth middleware",
+                "tool_uses": [],
+            },
+        ]
+
+        assert compute_display_title(session) == "Refactor the auth middleware"
+
+    def test_legacy_internal_segment_title_falls_back_to_real_user(self):
+        session = _make_session("")
+        session["segment_title"] = (
+            "<task-notification>background task completed</task-notification>"
+        )
+        session["messages"] = [
+            {
+                "role": "user",
+                "content": session["segment_title"],
+                "tool_uses": [],
+            },
+            {
+                "role": "user",
+                "content": "Refactor the auth middleware",
+                "tool_uses": [],
+            },
+        ]
+
+        assert compute_display_title(session) == "Refactor the auth middleware"
+
+    def test_wrapper_plus_user_text_is_not_skipped(self):
+        content = (
+            "<command-name>/review</command-name>\n"
+            "Review the authentication changes"
+        )
+
+        assert compute_display_title(_make_session(content)) == (
+            "Review the authentication changes"
+        )
+
     def test_skips_terse_single_word(self):
         session = _make_session("")
         session["messages"] = [

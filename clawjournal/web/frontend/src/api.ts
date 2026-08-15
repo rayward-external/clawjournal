@@ -470,7 +470,7 @@ export const api = {
     return request('/projects');
   },
 
-  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; ai_failure_value_score: number | null; ai_recovery_labels: string[]; ai_failure_attribution: string | null; ai_failure_modes: string[]; ai_learning_summary: string | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string; revision_hash?: string | null; last_shared_revision_hash?: string | null; updated_since_last_share?: boolean }> }> {
+  shareReady(opts?: { includeUnapproved?: boolean }): Promise<{ count: number; total_approved: number; logical_incomplete_excluded?: number; projects: string[]; models: string[]; recommended_session_ids: string[]; sessions: Array<{ session_id: string; logical_session_id?: string | null; logical_revision?: string | null; checkpoint_count?: number | null; checkpoint_session_ids?: string[]; checkpoint_revisions?: Record<string, string>; logical_incomplete?: boolean; segment_index?: number | null; segment_reason?: string | null; segment_sealed?: boolean; project: string; model: string | null; source: string; display_title: string; ai_quality_score: number | null; ai_failure_value_score: number | null; ai_recovery_labels: string[]; ai_failure_attribution: string | null; ai_failure_modes: string[]; ai_learning_summary: string | null; user_messages: number; assistant_messages: number; tool_uses: number; input_tokens: number; output_tokens: number; outcome_badge: string | null; client_origin: string | null; runtime_channel: string | null; start_time: string | null; review_status?: string; revision_hash?: string | null; last_shared_revision_hash?: string | null; updated_since_last_share?: boolean }> }> {
     const q = opts?.includeUnapproved ? '?include_unapproved=1' : '';
     return request(`/share-ready${q}`);
   },
@@ -595,6 +595,7 @@ export const api = {
       note?: string,
       attestation?: string,
       expectedRevisions?: Record<string, string>,
+      expectedLogicalRevisions?: Record<string, string>,
     ): Promise<{ share_id: string }> {
       return request('/shares', {
         method: 'POST',
@@ -604,6 +605,7 @@ export const api = {
           note,
           attestation,
           expected_revisions: expectedRevisions,
+          expected_logical_revisions: expectedLogicalRevisions,
         }),
       });
     },

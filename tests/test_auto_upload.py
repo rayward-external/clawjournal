@@ -1914,9 +1914,11 @@ def test_revoked_fresh_approval_stops_before_ai_and_submit(
 
 
 @pytest.mark.parametrize("boundary", ["seal", "submit"])
-def test_revoked_fresh_approval_stops_atomic_artifact_boundaries(
+@pytest.mark.parametrize("mutation", ["review", "inactive"])
+def test_revoked_control_stops_atomic_artifact_boundaries(
     isolated_auto_upload,
     boundary,
+    mutation,
 ):
     config = _save_scope_config()
     conn = open_index()
@@ -1944,9 +1946,14 @@ def test_revoked_fresh_approval_stops_atomic_artifact_boundaries(
             state="sealed",
         )
 
-    conn.execute(
-        "UPDATE sessions SET review_status = 'new' WHERE session_id = 'session-one'"
-    )
+    if mutation == "review":
+        conn.execute(
+            "UPDATE sessions SET review_status = 'new' WHERE session_id = 'session-one'"
+        )
+    else:
+        conn.execute(
+            "UPDATE sessions SET checkpoint_active = 0 WHERE session_id = 'session-one'"
+        )
     conn.commit()
 
     if boundary == "seal":
@@ -1974,6 +1981,89 @@ def test_revoked_fresh_approval_stops_atomic_artifact_boundaries(
         "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
     ).fetchone()[0]
     assert state == expected_state
+    conn.close()
+
+
+def test_retired_submitting_checkpoint_allows_receipt_lookup_but_not_repost(
+    isolated_auto_upload,
+    monkeypatch,
+):
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_changed_approved_revision(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    share_id, _ = _create_pending_share(
+        conn,
+        isolated_auto_upload["install"],
+        session_id="session-one",
+        enrollment_id="server-enrollment-1",
+        state="submitting",
+    )
+    conn.execute(
+        "UPDATE sessions SET checkpoint_active = 0 WHERE session_id = 'session-one'"
+    )
+    conn.commit()
+
+    pending = conn.execute(
+        "SELECT * FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()
+    with pytest.raises(auto.ControlChanged):
+        auto._validate_pending_for_submission(
+            conn,
+            share=dict(pending),
+            enrollment=enrollment,
+            expected_profile_hash=str(enrollment["egress_profile_hash"]),
+            api_origin=ORIGIN,
+            ai_backend=None,
+            check_raw_fingerprints=False,
+        )
+    assert auto._transition_submission(
+        conn,
+        share_id=share_id,
+        from_state="submitting",
+        to_state="submitting",
+        generation=int(enrollment["generation"]),
+    ) is False
+    assert conn.execute(
+        "SELECT submission_state FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone()[0] == "submitting"
+
+    submitted: list[str] = []
+    monkeypatch.setattr(auto, "fetch_capabilities", lambda **_kwargs: _capabilities())
+    monkeypatch.setattr(auto, "_server_enrollment_gate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auto, "submit_artifact", lambda *_args, **_kwargs: submitted.append("POST"))
+    share = dict(conn.execute(
+        "SELECT * FROM shares WHERE share_id = ?", (share_id,)
+    ).fetchone())
+    with pytest.raises(auto.ControlChanged):
+        auto._submit_pending_artifact(
+            conn,
+            share=share,
+            enrollment=enrollment,
+            credentials=_credentials(),
+            capabilities=_capabilities(),
+        )
+    assert submitted == []
+
+    monkeypatch.setattr(
+        auto,
+        "lookup_receipt",
+        lambda *_args, **_kwargs: {
+            "receipt_id": "receipt-retired-recovery",
+            "accepted_at": "2026-07-15T14:00:00+00:00",
+            "status": "accepted",
+        },
+    )
+    result = auto._reconcile_pending(
+        conn,
+        enrollment=enrollment,
+        credentials=_credentials(),
+        capabilities=_capabilities(),
+        allow_submit=False,
+    )
+    assert result is not None
+    assert result["code"] == "uploaded"
+    assert submitted == []
     conn.close()
 
 

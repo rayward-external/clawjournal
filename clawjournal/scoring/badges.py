@@ -3,6 +3,7 @@
 import re
 from collections.abc import Iterator
 
+from ..parsing.segmenter import strip_high_confidence_internal_wrappers
 from ..redaction.secrets import scan_text
 
 # ---------------------------------------------------------------------------
@@ -564,13 +565,7 @@ def compute_task_type(session: dict) -> str:
     return best_type
 
 
-_INTERNAL_TAG_RE = re.compile(
-    r"^\s*<(command-message|local-command-caveat|command-name|local-command-stdout)\b[^>]*>"
-    r".*?</\1>\s*$",
-    re.DOTALL,
-)
 _SKIP_PATTERNS = [
-    _INTERNAL_TAG_RE,
     re.compile(r"^\s*\[Request interrupted by user\]\s*$"),
     # Single-word terse commands (init, install, exit, help, etc.)
     re.compile(r"^\s*[a-z]{2,12}\s*$"),
@@ -580,7 +575,8 @@ _XML_TAG_RE = re.compile(r"<[^>]+>")
 
 def _is_skippable_message(text: str) -> bool:
     """Return True if *text* is an internal command or too terse to be a title."""
-    return any(p.match(text) for p in _SKIP_PATTERNS)
+    cleaned = strip_high_confidence_internal_wrappers(text)
+    return not cleaned or any(pattern.match(cleaned) for pattern in _SKIP_PATTERNS)
 
 
 def compute_display_title(session: dict) -> str:
@@ -590,9 +586,12 @@ def compute_display_title(session: dict) -> str:
     local-command wrappers, etc.) and strips XML/HTML tags from the result.
     Truncates to ~80 chars.
     """
-    # For segmented child traces, prefer the segment title (already cleaned)
-    seg_title = session.get("segment_title")
-    if seg_title:
+    # Prefer a real segment title, but tolerate blobs written by older parsers
+    # that selected an internal harness notification as the title.
+    seg_title = strip_high_confidence_internal_wrappers(
+        session.get("segment_title", "")
+    )
+    if seg_title and not _is_skippable_message(seg_title):
         if len(seg_title) > 80:
             return seg_title[:77] + "..."
         return seg_title
@@ -609,8 +608,9 @@ def compute_display_title(session: dict) -> str:
     # Find the first real user message (skip internal commands)
     text = ""
     for msg in user_msgs:
-        if not _is_skippable_message(msg):
-            text = msg.strip()
+        cleaned = strip_high_confidence_internal_wrappers(msg)
+        if not _is_skippable_message(cleaned):
+            text = cleaned.strip()
             break
 
     if not text:

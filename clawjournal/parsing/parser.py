@@ -1916,6 +1916,13 @@ def _finalize_append_only_segments(
 ) -> list[dict[str, Any]]:
     from .segmenter import segment_append_only_session
 
+    logical_session_id = str(session.get("session_id") or "")
+    existing_logical_id = session.get("logical_session_id")
+    if logical_session_id and (
+        not isinstance(existing_logical_id, str) or not existing_logical_id
+    ):
+        session["logical_session_id"] = logical_session_id
+
     full_fingerprint = session.get("_raw_source_fingerprint")
     offsets = session.pop("_raw_message_end_offsets", None)
     start_offsets = session.pop("_raw_message_start_offsets", None)

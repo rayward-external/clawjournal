@@ -23,13 +23,17 @@ import {
   blockedSessionsFromError,
   bucketOf,
   classify,
+  checkpointIdsForReadySession,
+  collectExpectedLogicalRevisions,
   completedKeysForStep,
   emptyBuckets,
+  expandLogicalQueueSelection,
   formatBytes,
   formatDate,
   hasLockedQueueSelection,
   parseStep,
   queueFromStats,
+  retainCompleteLogicalQueueGroups,
   sanitizeQueueSelection,
   sessionTotalTokens,
 } from './helpers.ts';
@@ -92,7 +96,12 @@ function restoredQueueFromParams(
 ): string[] {
   const defaultQueue = queueFromStats(stats);
   const restored = queueSelectionFromSearchParams(params, defaultQueue, storage);
-  return sanitizeQueueSelection(stats, restored ?? defaultQueue);
+  const sanitized = sanitizeQueueSelection(stats, restored ?? defaultQueue);
+  if (params.get('selection') === 'locked') return sanitized;
+  if (params.has('exclude') || params.has('exclude_ids')) {
+    return retainCompleteLogicalQueueGroups(stats, sanitized);
+  }
+  return expandLogicalQueueSelection(stats, sanitized);
 }
 
 
@@ -146,10 +155,14 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       : null
   ));
   const eligibleQueueOrder = useMemo(
-    () => readyStats
-      ? sanitizeQueueSelection(readyStats, queueOrder)
-      : [...new Set(queueOrder)].slice(0, MAX_SHARE_QUEUE_SIZE),
-    [readyStats, queueOrder],
+    () => {
+      if (!readyStats) return [...new Set(queueOrder)].slice(0, MAX_SHARE_QUEUE_SIZE);
+      const sanitized = sanitizeQueueSelection(readyStats, queueOrder);
+      return selectionLocked
+        ? sanitized
+        : expandLogicalQueueSelection(readyStats, sanitized);
+    },
+    [readyStats, queueOrder, selectionLocked],
   );
   const queueSet = useMemo(() => new Set(eligibleQueueOrder), [eligibleQueueOrder]);
 
@@ -552,7 +565,11 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   };
 
   const addToQueue = (id: string) => {
-    if (!eligibleQueueOrder.includes(id) && eligibleQueueOrder.length >= MAX_SHARE_QUEUE_SIZE) {
+    const checkpointIds = readyStats
+      ? checkpointIdsForReadySession(readyStats, id)
+      : [id];
+    const missingIds = checkpointIds.filter((checkpointId) => !eligibleQueueOrder.includes(checkpointId));
+    if (eligibleQueueOrder.length + missingIds.length > MAX_SHARE_QUEUE_SIZE) {
       toast(`A share can include at most ${MAX_SHARE_QUEUE_SIZE} traces. Remove one before adding another.`, 'error');
       return;
     }
@@ -561,18 +578,18 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       const current = readyStats
         ? sanitizeQueueSelection(readyStats, prev)
         : [...new Set(prev)].slice(0, MAX_SHARE_QUEUE_SIZE);
-      if (current.includes(id)) return current;
-      if (current.length >= MAX_SHARE_QUEUE_SIZE) return current;
+      if (missingIds.length === 0) return current;
+      if (current.length + missingIds.length > MAX_SHARE_QUEUE_SIZE) return current;
       const defaults = readyStats ? queueFromStats(readyStats) : [];
       const previousIds = new Set(current);
       const defaultOrderedSubset = defaults.filter((sessionId) => previousIds.has(sessionId));
       const followsDefaultOrder = defaultOrderedSubset.length === current.length
         && defaultOrderedSubset.every((sessionId, index) => sessionId === current[index]);
-      if (followsDefaultOrder && defaults.includes(id)) {
-        previousIds.add(id);
+      if (followsDefaultOrder && missingIds.every((checkpointId) => defaults.includes(checkpointId))) {
+        missingIds.forEach((checkpointId) => previousIds.add(checkpointId));
         return defaults.filter((sessionId) => previousIds.has(sessionId));
       }
-      return [...current, id];
+      return [...current, ...missingIds];
     });
   };
 
@@ -1078,11 +1095,13 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           .filter((s): s is ReadySession & { revision_hash: string } => Boolean(s.revision_hash))
           .map((s) => [s.session_id, s.revision_hash]),
       );
+      const expectedLogicalRevisions = collectExpectedLogicalRevisions(approvedList);
       const { share_id } = await api.shares.create(
         ids,
         note || undefined,
         undefined,
         expectedRevisions,
+        expectedLogicalRevisions,
       );
       setPackageProgress(2);
       setPackageLog('Starting local packaging...');

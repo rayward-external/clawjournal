@@ -766,6 +766,7 @@ class TestDiscoverProjects:
         assert len(sessions) == 1
         # Project is the cwd basename (consistent with codex/opencode/openclaw).
         assert sessions[0]["project"] == "claude:test-project"
+        assert sessions[0]["logical_session_id"] == "session1"
 
     def test_parse_project_sessions_uses_cwd_basename_for_hyphenated_project(
         self, tmp_path, monkeypatch, mock_anonymizer
@@ -958,6 +959,7 @@ class TestDiscoverProjects:
         assert sessions[0]["messages"][1]["role"] == "assistant"
         assert sessions[0]["messages"][1]["tool_uses"][0]["tool"] == "exec_command"
         assert sessions[0]["raw_source_path"] == str(session_file)
+        assert sessions[0]["logical_session_id"] == "session-1"
 
     def test_long_codex_session_seals_stable_append_only_segments(
         self, tmp_path, monkeypatch, mock_anonymizer
@@ -1029,8 +1031,45 @@ class TestDiscoverProjects:
         ]
         assert first[0]["segment_sealed"] is True
         assert first[1]["segment_sealed"] is False
-        assert first[0].get("parent_session_id") is None
-        assert first[1]["parent_session_id"] == "long-codex"
+        assert all(item.get("parent_session_id") is None for item in first)
+        assert [item["logical_session_id"] for item in first] == [
+            "long-codex",
+            "long-codex",
+        ]
+        assert [item["segment_message_range"] for item in first] == [
+            [0, 39],
+            [40, 41],
+        ]
+        assert [item["messages"] for item in first] == [
+            [
+                message
+                for turn in range(20)
+                for message in (
+                    {
+                        "role": "user",
+                        "content": f"question {turn}",
+                        "timestamp": f"2026-07-29T00:{turn:02d}:02Z",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": f"answer {turn}",
+                        "timestamp": f"2026-07-29T00:{turn:02d}:03Z",
+                    },
+                )
+            ],
+            [
+                {
+                    "role": "user",
+                    "content": "question 20",
+                    "timestamp": "2026-07-29T00:20:02Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": "answer 20",
+                    "timestamp": "2026-07-29T00:20:03Z",
+                },
+            ],
+        ]
         assert first[0]["raw_source_start_offset"] == 0
         assert first[1]["raw_source_start_offset"] is None
         assert first[1]["raw_source_end_offset"] is None
@@ -1057,6 +1096,16 @@ class TestDiscoverProjects:
         assert len(second) == 3
         assert second[0]["messages"] == first_messages
         assert second[0]["_raw_source_fingerprint"] == first_fingerprint
+        assert [item["session_id"] for item in second] == [
+            "long-codex",
+            "long-codex_seg-0001",
+            "long-codex_seg-0002",
+        ]
+        assert [item["segment_message_range"] for item in second] == [
+            [0, 39],
+            [40, 79],
+            [80, 81],
+        ]
         assert [item["segment_sealed"] for item in second] == [True, True, False]
 
     def test_codex_retry_keeps_sealed_segment_stable_across_appends(
@@ -3667,6 +3716,26 @@ def test_long_claude_session_checkpoint_includes_interstitial_tool_result(
     assert [session["session_id"] for session in sessions] == [
         "claude-long",
         "claude-long_seg-0001",
+    ]
+    assert [session["logical_session_id"] for session in sessions] == [
+        "claude-long",
+        "claude-long",
+    ]
+    assert all(session.get("parent_session_id") is None for session in sessions)
+    assert [session["segment_message_range"] for session in sessions] == [
+        [0, 39],
+        [40, 41],
+    ]
+    assert [
+        [(message["role"], message.get("content")) for message in session["messages"]]
+        for session in sessions
+    ] == [
+        [
+            item
+            for turn in range(20)
+            for item in (("user", f"question {turn}"), ("assistant", f"answer {turn}"))
+        ],
+        [("user", "question 20"), ("assistant", "answer 20")],
     ]
     assert [session["segment_sealed"] for session in sessions] == [True, False]
     first_raw = session_file.read_bytes()[

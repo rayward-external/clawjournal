@@ -80,6 +80,22 @@ class TestReleaseGate:
         assert len(blockers) == 1
         assert blockers[0]["hold_state"] == "pending_review"
 
+    def test_one_held_checkpoint_blocks_its_logical_family(self, conn):
+        upsert_sessions(conn, [_settled_session("root"), _settled_session("tail")])
+        conn.execute(
+            "UPDATE sessions SET logical_session_id = 'conversation', "
+            "segment_index = CASE session_id WHEN 'root' THEN 0 ELSE 1 END "
+            "WHERE session_id IN ('root', 'tail')"
+        )
+        conn.commit()
+        set_hold_state(conn, "tail", "pending_review", changed_by="findings")
+
+        blockers = release_gate_blockers(conn, ["root"])
+
+        assert len(blockers) == 1
+        assert blockers[0]["session_id"] == "root"
+        assert blockers[0]["hold_state"] == "pending_review"
+
     def test_released_passes(self, conn):
         upsert_sessions(conn, [_settled_session("a")])
         conn.commit()
