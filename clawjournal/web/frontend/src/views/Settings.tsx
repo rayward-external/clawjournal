@@ -3,6 +3,7 @@ import { api } from '../api.ts';
 import type { ProjectSummary, WorkbenchConfig } from '../types.ts';
 import { useToast } from '../components/Toast.tsx';
 import { AutoUploadPanel } from '../components/AutoUploadControls.tsx';
+import { ScoringQueueStatus } from '../components/ScoringQueueStatus.tsx';
 import { colors, selectStyle, btnPrimary } from '../theme.ts';
 
 type ConfigPatch = Partial<{
@@ -220,15 +221,7 @@ export function Settings() {
           backend (each trace is anonymized on this machine before it is sent, and the agent may
           incur usage cost). Turn it off to stop the auto-scorer and the first-run prompt.
         </p>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: colors.gray700 }}>
-          <input
-            type="checkbox"
-            checked={!cfg.scoring_warmup_declined}
-            disabled={saving}
-            onChange={e => save({ scoring_warmup_declined: !e.target.checked })}
-          />
-          Enable background AI scoring
-        </label>
+        <ScoringQueueStatus controls />
       </div>
 
       {/* Benchmark tab visibility */}

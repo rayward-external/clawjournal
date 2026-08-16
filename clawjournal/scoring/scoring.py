@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -86,6 +88,14 @@ class ScoringResult:
     scored_at: str = ""
 
 
+class ScoringAborted(RuntimeError):
+    """A local control/revision check stopped scoring before its next egress."""
+
+
+class ScoringDeadlineExceeded(RuntimeError):
+    """The bounded wall-clock budget expired before scoring could finish."""
+
+
 @dataclass(frozen=True)
 class LocatorChunk:
     """A bounded, overlapping slice of segment-formatted scoring input."""
@@ -101,6 +111,27 @@ FINAL_SCORE_MAX_CHARS = 48_000
 LOCATOR_OVERLAP_SEGMENTS = 2
 LOCATOR_MAX_WORKERS = 3
 LOCATOR_TIMEOUT_SECONDS = 90
+JUDGE_TIMEOUT_SECONDS = 120
+# Keep the default below the durable worker's ten-minute lease so a normal
+# timeout is recorded before another process can recover the same job.
+SCORING_TOTAL_TIMEOUT_SECONDS = 8 * 60
+
+
+def _remaining_provider_timeout(
+    deadline_at: float | None,
+    per_call_timeout: int,
+) -> int:
+    """Return a positive provider timeout bounded by the overall deadline."""
+
+    if deadline_at is None:
+        return per_call_timeout
+    remaining = deadline_at - time.monotonic()
+    if remaining <= 0:
+        raise ScoringDeadlineExceeded("Scoring timeout: total time budget exceeded")
+    # Provider adapters take whole seconds. Rounding up avoids turning a
+    # positive sub-second remainder into an invalid zero-second timeout; the
+    # total overrun remains bounded to less than one second plus teardown.
+    return max(1, min(per_call_timeout, math.ceil(remaining)))
 
 
 # ---------------------------------------------------------------------------
@@ -1158,6 +1189,7 @@ def call_judge(
     session_data: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
     backend: str = "auto",
+    timeout_seconds: int = JUDGE_TIMEOUT_SECONDS,
 ) -> dict:
     """Call the resolved scoring backend and return a validated judge result."""
     rubric = load_scoring_rubric()
@@ -1205,7 +1237,7 @@ def call_judge(
             system_prompt_file=_SCORER_PROMPT_FILE,
             task_prompt=task_prompt,
             model=effective_model,
-            timeout_seconds=120,
+            timeout_seconds=timeout_seconds,
             codex_sandbox="read-only",
             codex_output_schema=JUDGE_SCHEMA,
             codex_output_file="scoring.json",
@@ -1226,6 +1258,7 @@ def call_signal_locator(
     *,
     backend: str = "auto",
     model: str | None = None,
+    timeout_seconds: int = LOCATOR_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Locate high-signal segment ranges in one anonymized long-session chunk."""
     from ..benchmark.generate import run_agent_json_call
@@ -1242,7 +1275,7 @@ def call_signal_locator(
             "Return a JSON object matching the supplied schema. Segment numbers must refer "
             "to the stable segment-NNNN labels in this chunk.\n\n" + chunk.text
         ),
-        timeout_seconds=LOCATOR_TIMEOUT_SECONDS,
+        timeout_seconds=timeout_seconds,
         codex_output_schema=LOCATOR_SCHEMA,
         claude_bare=True,
         claude_safe_mode=True,
@@ -1260,6 +1293,8 @@ def prepare_prompt_for_judge(
     model: str | None = None,
     locator: Callable[[LocatorChunk], Any] | None = None,
     progress: Callable[[str], None] | None = None,
+    before_egress: Callable[[], None] | None = None,
+    deadline_at: float | None = None,
     direct_max_chars: int = DIRECT_SCORE_MAX_CHARS,
     final_max_chars: int = FINAL_SCORE_MAX_CHARS,
 ) -> str:
@@ -1271,12 +1306,31 @@ def prepare_prompt_for_judge(
     chunks = build_locator_chunks(segments, task_context)
     if progress is not None:
         progress(f"Long session: locating high-signal evidence in {len(chunks)} chunks")
-    locate = locator or (lambda chunk: call_signal_locator(chunk, backend=backend, model=model))
+
+    def guarded_locate(chunk: LocatorChunk) -> Any:
+        # Futures are deliberately guarded at execution time rather than at
+        # submission time.  If Pause/hold/scope/revision changes while three
+        # locators are running, queued chunks abort before opening a new AI
+        # request. Calls already in flight are allowed to finish.
+        if before_egress is not None:
+            before_egress()
+        timeout_seconds = _remaining_provider_timeout(
+            deadline_at, LOCATOR_TIMEOUT_SECONDS
+        )
+        if locator is not None:
+            return locator(chunk)
+        return call_signal_locator(
+            chunk,
+            backend=backend,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+
     signals: list[dict[str, Any]] = []
     failed_chunks: list[LocatorChunk] = []
     workers = max(1, min(LOCATOR_MAX_WORKERS, len(chunks)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(locate, chunk): chunk for chunk in chunks}
+        futures = {pool.submit(guarded_locate, chunk): chunk for chunk in chunks}
         completed = 0
         for future in as_completed(futures):
             chunk = futures[future]
@@ -1296,6 +1350,10 @@ def prepare_prompt_for_judge(
                         )
                         signal["end_segment"] = min(chunk_end, signal["end_segment"])
                         signals.append(signal)
+            except (ScoringAborted, ScoringDeadlineExceeded):
+                for pending in futures:
+                    pending.cancel()
+                raise
             except Exception:
                 failed_chunks.append(chunk)
             completed += 1
@@ -1693,9 +1751,22 @@ def score_session(
     backend: str = "auto",
     redaction_settings: dict[str, Any] | None = None,
     progress: Callable[[str], None] | None = None,
+    before_egress: Callable[[], None] | None = None,
+    overall_timeout_seconds: float | None = SCORING_TOTAL_TIMEOUT_SECONDS,
 ) -> ScoringResult:
     """Score a session: format → judge → store. No aggregation formulas."""
     from ..workbench.index import get_session_detail, resolve_blob_path
+
+    if overall_timeout_seconds is None:
+        deadline_at = None
+    else:
+        if (
+            isinstance(overall_timeout_seconds, bool)
+            or not isinstance(overall_timeout_seconds, (int, float))
+            or overall_timeout_seconds <= 0
+        ):
+            raise ValueError("overall_timeout_seconds must be positive or None")
+        deadline_at = time.monotonic() + float(overall_timeout_seconds)
 
     detail = get_session_detail(conn, session_id)
     if not detail:
@@ -1773,14 +1844,24 @@ def score_session(
         backend=backend,
         model=model,
         progress=progress,
+        before_egress=before_egress,
+        deadline_at=deadline_at,
     )
 
+    if progress is not None:
+        progress("Scoring final judge")
+    if before_egress is not None:
+        before_egress()
+    judge_timeout = _remaining_provider_timeout(
+        deadline_at, JUDGE_TIMEOUT_SECONDS
+    )
     result = call_judge(
         prompt,
         model,
         session_data=detail,
         metadata=metrics,
         backend=backend,
+        timeout_seconds=judge_timeout,
     )
 
     # Effort: use judge override if provided, otherwise heuristic

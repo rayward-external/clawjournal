@@ -273,6 +273,11 @@ _NON_SAFETY_RELATIONAL_TABLES = _EXECUTION_RECORDER_TABLES | frozenset({
     "benchmarks",
     "benchmark_tasks",
     "benchmark_exports",
+    # Derived scheduler state is rebuilt from the current session revisions
+    # after recovery; an orphan here must not make readable review/hold state
+    # look unsafe to restore.
+    "scoring_jobs",
+    "scoring_backend_state",
 })
 
 

@@ -341,32 +341,169 @@ def _scoring_result_fields(r) -> dict:
     )
 
 
-def score_compute(session_id: str, *, backend: str = "auto", model: str | None = None) -> dict:
-    """Run the existing failure-value scoring (the slow AI-judge step) on one
-    trace WITHOUT writing. Opens its own short-lived read connection, so it's
-    safe to call from worker threads in parallel (the DB write is the caller's
-    job — see persist_score). Returns {ok, fields, failure_value, display_title}
-    or {ok: False, error}."""
-    from .workbench.index import open_index
-    from .scoring.scoring import score_session
+def score_compute(
+    session_id: str,
+    *,
+    backend: str = "auto",
+    model: str | None = None,
+    force: bool = False,
+) -> dict:
+    """Run failure-value scoring and revision-CAS persist under the egress lock.
+
+    It opens its own short-lived connection for worker-thread safety. The
+    global lock stays held through the revision-CAS write. Returns a bounded
+    result payload or an error payload.
+    """
+    import inspect
+
+    from .scoring.egress_lock import scoring_egress_lock
+    from .workbench import scoring_queue
+    from .workbench.index import open_index, update_session
+    from .scoring.scoring import ScoringAborted, score_session
     conn = open_index()
     try:
-        r = score_session(conn, session_id, model=model, backend=backend)
+        initial_row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if initial_row is None:
+            return {"ok": False, "error": "Session not found"}
+        initial = dict(initial_row)
+
+        with scoring_egress_lock(blocking=True) as acquired:
+            if not acquired:  # pragma: no cover - blocking without a timeout
+                return {"ok": False, "error": "Scoring is busy"}
+            current_row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if current_row is None:
+                return {"ok": False, "error": "Session not found"}
+            current = dict(current_row)
+            revision = str(current.get("content_revision") or "")
+            current_has_score = (
+                current.get("ai_quality_score") is not None
+                and current.get("ai_failure_value_score") is not None
+            )
+            initial_had_score = (
+                initial.get("ai_quality_score") is not None
+                or initial.get("ai_failure_value_score") is not None
+            )
+            explicit_rescore = (
+                force
+                and initial_had_score
+                and str(initial.get("content_revision") or "") == revision
+            )
+            if current_has_score and not explicit_rescore:
+                fields = {
+                    field: current.get(field)
+                    for field in (
+                        "ai_quality_score", "ai_score_reason", "ai_scoring_detail",
+                        "ai_task_type", "ai_outcome_badge", "ai_value_badges",
+                        "ai_risk_badges", "ai_display_title", "ai_effort_estimate",
+                        "ai_summary", "ai_failure_value_score", "ai_recovery_labels",
+                        "ai_failure_attribution", "ai_failure_modes",
+                        "ai_learning_summary", "ai_scorer_backend", "ai_scorer_model",
+                        "ai_rubric_git_sha", "ai_scored_at",
+                    )
+                }
+                return {
+                    "ok": True,
+                    "cached": True,
+                    "persisted": True,
+                    "revision": revision,
+                    "fields": fields,
+                    "failure_value": fields["ai_failure_value_score"],
+                    "display_title": fields["ai_display_title"],
+                }
+
+            def before_egress() -> None:
+                check_conn = open_index()
+                try:
+                    row = check_conn.execute(
+                        "SELECT content_revision FROM sessions WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone()
+                finally:
+                    check_conn.close()
+                if row is None or str(row["content_revision"] or "") != revision:
+                    raise ScoringAborted("stale_revision")
+
+            score_kwargs = {"model": model, "backend": backend}
+            try:
+                signature = inspect.signature(score_session)
+                supports_guard = "before_egress" in signature.parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            except (TypeError, ValueError):
+                supports_guard = True
+            if supports_guard:
+                score_kwargs["before_egress"] = before_egress
+            r = score_session(conn, session_id, **score_kwargs)
+            fields = _scoring_result_fields(r)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                persisted_ok = update_session(
+                    conn,
+                    session_id,
+                    expected_content_revision=revision,
+                    commit=False,
+                    **fields,
+                )
+                if persisted_ok:
+                    scoring_queue.complete_revision_jobs(
+                        conn,
+                        session_id,
+                        revision,
+                        commit=False,
+                    )
+                    conn.commit()
+                else:
+                    conn.rollback()
+            except Exception:
+                conn.rollback()
+                raise
+            if not persisted_ok:
+                return {
+                    "ok": False,
+                    "error": "Session changed during scoring; retry the current revision.",
+                    "block_reason": "stale_revision",
+                }
+            return {
+                "ok": True,
+                "persisted": True,
+                "revision": revision,
+                "fields": fields,
+                "failure_value": fields["ai_failure_value_score"],
+                "display_title": fields["ai_display_title"],
+            }
+    except ScoringAborted:
+        return {
+            "ok": False,
+            "error": "Session changed during scoring; retry the current revision.",
+            "block_reason": "stale_revision",
+        }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
     finally:
         conn.close()
-    fields = _scoring_result_fields(r)
-    return {"ok": True, "fields": fields,
-            "failure_value": fields["ai_failure_value_score"],
-            "display_title": fields["ai_display_title"]}
 
 
-def persist_score(conn, session_id: str, fields: dict) -> None:
+def persist_score(
+    conn,
+    session_id: str,
+    fields: dict,
+    *,
+    expected_content_revision: str | None = None,
+) -> bool:
     """Persist a score_compute() result. Call serially on the main connection
     (single writer; WAL handles the concurrent reader connections)."""
     from .workbench.index import update_session
-    update_session(conn, session_id, **fields)
+    return update_session(
+        conn,
+        session_id,
+        expected_content_revision=expected_content_revision,
+        **fields,
+    )
 
 
 def build_zip(export_dir: Path) -> bytes:

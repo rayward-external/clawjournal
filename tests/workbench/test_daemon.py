@@ -14,6 +14,7 @@ from io import BytesIO
 from pathlib import Path
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -2912,9 +2913,7 @@ class TestScanner:
         assert row["ai_summary"] == "Useful fix"
 
     def test_score_unscored_once_disables_on_no_backend_error(self, tmp_path, monkeypatch):
-        """A 'no usable backend' RuntimeError must trip the circuit breaker so the
-        scan loop stops retrying. Guards against the disable sentinel drifting away
-        from resolve_backend's message."""
+        """A missing backend must trip the durable fixed-code circuit breaker."""
         from clawjournal.scoring.backends import NO_BACKEND_DETECTED_ERROR
 
         monkeypatch.setattr("clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db")
@@ -2945,8 +2944,7 @@ class TestScanner:
 
         scanner = Scanner(source_filter="claude")
         assert scanner.score_unscored_once(limit=5) == 0
-        assert scanner._auto_score_disabled_reason is not None
-        assert NO_BACKEND_DETECTED_ERROR in scanner._auto_score_disabled_reason
+        assert scanner._auto_score_disabled_reason == "backend_missing"
 
     def _settled_session(self, sid, now):
         return {
@@ -3460,6 +3458,556 @@ class TestScoringWarmupAPI:
         result = trigger_scoring_warmup(scanner)
 
         assert result["status"] == "disabled"
+
+
+class TestDurableScoringAPI:
+    def test_status_and_control_require_bearer_auth(self, server):
+        assert _get(server, "/api/scoring/status", skip_auth=True)[0] == 401
+        assert _post(
+            server,
+            "/api/scoring/control",
+            {"action": "pause"},
+            skip_auth=True,
+        )[0] == 401
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {},
+            {"action": "unknown"},
+            {"action": "pause", "extra": True},
+            {"action": ["pause"]},
+        ],
+    )
+    def test_control_rejects_every_non_contract_body(self, server, body):
+        status, response = _post(server, "/api/scoring/control", body)
+
+        assert status == 400
+        assert set(response) == {"error"}
+
+    def test_status_uses_complete_fallback_chain_and_discloses_no_session(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench import scoring_queue
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"scorer_backend": "codex"},
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.installed_fallback_chain",
+            lambda _primary: ["codex", "claude"],
+        )
+        conn = open_index()
+        try:
+            scoring_queue.enqueue_session_ids(conn, ["sess-0"])
+            job = scoring_queue.claim_next_job(conn, owner="worker")
+            scoring_queue.update_job_stage(
+                conn,
+                job["job_id"],
+                "worker",
+                "locating_evidence",
+                current=2,
+                total=7,
+            )
+            scoring_queue.record_backend_action_required(
+                conn, "codex", "backend_auth"
+            )
+        finally:
+            conn.close()
+
+        status, response = _get(server, "/api/scoring/status")
+
+        assert status == 200
+        assert response == {
+            "enabled": True,
+            "backend": "codex",
+            "worker_state": "running",
+            "counts": {
+                "pending": 0,
+                "running": 1,
+                "retry_wait": 0,
+                "succeeded": 0,
+                "failed": 0,
+            },
+            "current": {
+                "job_id": job["job_id"],
+                "stage": "locating_evidence",
+                "progress_current": 2,
+                "progress_total": 7,
+            },
+            "next_retry_at": None,
+            "action_required_code": None,
+        }
+        assert "sess-0" not in json.dumps(response)
+
+    def test_pause_and_resume_round_trip_persisted_control(
+        self, server, monkeypatch
+    ):
+        config = {"scorer_backend": "codex"}
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config", lambda: dict(config)
+        )
+
+        def save(updated):
+            config.clear()
+            config.update(updated)
+            return True
+
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", save)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.installed_fallback_chain",
+            lambda _primary: ["codex"],
+        )
+
+        status, paused = _post(
+            server, "/api/scoring/control", {"action": "pause"}
+        )
+        assert status == 200
+        assert paused["status"]["worker_state"] == "disabled"
+        assert config["scoring_warmup_declined"] is True
+
+        status, resumed = _post(
+            server, "/api/scoring/control", {"action": "resume"}
+        )
+        assert status == 200
+        assert resumed["status"]["enabled"] is True
+        assert resumed["status"]["worker_state"] == "idle"
+        assert "scoring_warmup_declined" not in config
+
+
+class TestDurableScoringWorker:
+    @staticmethod
+    def _result() -> SimpleNamespace:
+        now = datetime.now(timezone.utc).isoformat()
+        return SimpleNamespace(
+            quality=4,
+            reason="ok",
+            detail_json="{}",
+            task_type="debugging",
+            outcome_label="resolved",
+            value_labels=[],
+            risk_level=[],
+            display_title="Scored",
+            effort_estimate=0.5,
+            summary="summary",
+            failure_value_score=4,
+            recovery_labels=[],
+            failure_attribution="agent_caused",
+            failure_modes=[],
+            learning_summary="learning",
+            scorer_backend="codex",
+            scorer_model="test",
+            rubric_git_sha="sha",
+            scored_at=now,
+        )
+
+    @staticmethod
+    def _one_backend(monkeypatch) -> None:
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.resolve_backend", lambda _backend: "codex"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.installed_fallback_chain",
+            lambda _primary: ["codex"],
+        )
+
+    def test_second_worker_cannot_claim_while_first_process_lock_is_held(
+        self, index_setup, monkeypatch
+    ):
+        self._one_backend(monkeypatch)
+        entered = Event()
+        release = Event()
+        calls: list[str] = []
+
+        def fake_score(_conn, session_id, **_kwargs):
+            calls.append(session_id)
+            entered.set()
+            assert release.wait(timeout=5)
+            return self._result()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+        first = Scanner(source_filter="claude")
+        second = Scanner(source_filter="claude")
+        completed: list[int] = []
+        thread = Thread(
+            target=lambda: completed.append(first.score_unscored_once(limit=1))
+        )
+        thread.start()
+        assert entered.wait(timeout=5)
+
+        assert second.score_unscored_once(limit=1) == 0
+        conn = open_index()
+        try:
+            states = {
+                row["state"]: row["count"]
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) AS count FROM scoring_jobs GROUP BY state"
+                )
+            }
+        finally:
+            conn.close()
+        assert states == {"pending": 2, "running": 1}
+        assert len(calls) == 1
+
+        release.set()
+        thread.join(timeout=5)
+        assert completed == [1]
+
+    def test_revision_cas_discards_result_if_session_changes_during_call(
+        self, index_setup, monkeypatch
+    ):
+        self._one_backend(monkeypatch)
+
+        def fake_score(_conn, session_id, **_kwargs):
+            writer = open_index()
+            try:
+                writer.execute(
+                    "UPDATE sessions SET content_revision = 'new-revision' "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                )
+                writer.commit()
+            finally:
+                writer.close()
+            return self._result()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+
+        assert Scanner(source_filter="claude").score_unscored_once(limit=1) == 0
+        conn = open_index()
+        try:
+            session = conn.execute(
+                "SELECT content_revision, ai_quality_score FROM sessions "
+                "WHERE session_id = 'sess-0'"
+            ).fetchone()
+            job = conn.execute(
+                "SELECT state, last_error_code FROM scoring_jobs "
+                "WHERE session_id = 'sess-0'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert tuple(session) == ("new-revision", None)
+        assert tuple(job) == ("cancelled", "stale_revision")
+
+    @pytest.mark.parametrize(
+        ("mutation", "expected_code"),
+        [
+            ("pause", "ineligible"),
+            ("hold", "ineligible"),
+            ("revision", "stale_revision"),
+            ("source", "ineligible"),
+            ("exclude", "ineligible"),
+        ],
+    )
+    def test_control_change_aborts_before_next_locator_egress(
+        self, index_setup, monkeypatch, mutation, expected_code
+    ):
+        self._one_backend(monkeypatch)
+        config: dict[str, Any] = {}
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config", lambda: dict(config)
+        )
+        provider_calls: list[str] = []
+
+        def fake_score(_conn, session_id, **kwargs):
+            guard = kwargs["before_egress"]
+            guard()
+            provider_calls.append("locator-1")
+            if mutation == "pause":
+                config["scoring_warmup_declined"] = True
+            elif mutation == "source":
+                config["source"] = "codex"
+            else:
+                writer = open_index()
+                try:
+                    if mutation == "hold":
+                        set_hold_state(
+                            writer,
+                            session_id,
+                            "pending_review",
+                            changed_by="test",
+                            reason="test",
+                        )
+                    elif mutation == "exclude":
+                        add_policy(writer, "exclude_project", "test-project")
+                    else:
+                        writer.execute(
+                            "UPDATE sessions SET content_revision = 'changed-mid-score' "
+                            "WHERE session_id = ?",
+                            (session_id,),
+                        )
+                        writer.commit()
+                finally:
+                    writer.close()
+            guard()
+            provider_calls.append("locator-2")
+            return self._result()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+
+        assert Scanner(source_filter="claude").score_unscored_once(limit=1) == 0
+        assert provider_calls == ["locator-1"]
+        conn = open_index()
+        try:
+            job = conn.execute(
+                "SELECT state, last_error_code FROM scoring_jobs "
+                "WHERE session_id = 'sess-0'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert tuple(job) == ("cancelled", expected_code)
+
+    def test_http_waiting_for_background_returns_cached_same_revision(
+        self, server, monkeypatch
+    ):
+        from clawjournal.scoring import egress_lock
+
+        self._one_backend(monkeypatch)
+        entered = Event()
+        release = Event()
+        waiter_attempted = Event()
+        calls: list[str] = []
+        try_lock = egress_lock._try_lock
+        attempts = {"count": 0}
+
+        def observed_try_lock(file):
+            attempts["count"] += 1
+            if attempts["count"] >= 2:
+                waiter_attempted.set()
+            return try_lock(file)
+
+        monkeypatch.setattr(egress_lock, "_try_lock", observed_try_lock)
+
+        def fake_score(_conn, session_id, **_kwargs):
+            calls.append(session_id)
+            entered.set()
+            assert release.wait(timeout=5)
+            return self._result()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+        scanner = Scanner(source_filter="claude")
+        background = Thread(target=lambda: scanner.score_unscored_once(limit=1))
+        background.start()
+        assert entered.wait(timeout=5)
+
+        responses: list[tuple[int, dict]] = []
+        request = Thread(
+            target=lambda: responses.append(
+                _post(server, "/api/sessions/sess-0/score", {"backend": "codex"})
+            )
+        )
+        request.start()
+        assert waiter_attempted.wait(timeout=5)
+        release.set()
+        background.join(timeout=5)
+        request.join(timeout=5)
+
+        assert len(calls) == 1
+        assert responses[0][0] == 200
+        assert responses[0][1]["cached"] is True
+        assert responses[0][1]["ai_quality_score"] == 4
+
+    def test_429_cooldown_restarts_same_scanner_after_deadline(
+        self, index_setup, monkeypatch
+    ):
+        self._one_backend(monkeypatch)
+        calls = {"count": 0}
+
+        def fake_score(_conn, _session_id, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("429 Too Many Requests")
+            return self._result()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+        scanner = Scanner(source_filter="claude")
+        assert scanner.score_unscored_once(limit=1, backend="codex") == 0
+
+        # Advance durable deadlines without replacing/restarting Scanner.
+        conn = open_index()
+        try:
+            past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            conn.execute(
+                "UPDATE scoring_jobs SET next_attempt_at = ? "
+                "WHERE session_id = 'sess-0'",
+                (past,),
+            )
+            conn.execute(
+                "UPDATE scoring_backend_state SET next_attempt_at = ? "
+                "WHERE backend = 'codex'",
+                (past,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert scanner.trigger_auto_score(
+            limit=1, backend="codex"
+        )["status"] == "started"
+        scanner._score_thread.join(timeout=5)
+        assert not scanner._score_thread.is_alive()
+        assert scanner.last_scored_count == 1
+        assert calls["count"] == 2
+        conn = open_index()
+        try:
+            assert conn.execute(
+                "SELECT ai_quality_score FROM sessions WHERE session_id = 'sess-0'"
+            ).fetchone()[0] == 4
+            assert conn.execute(
+                "SELECT state FROM scoring_jobs WHERE session_id = 'sess-0'"
+            ).fetchone()[0] == "succeeded"
+        finally:
+            conn.close()
+
+    def test_http_manual_score_atomically_completes_pending_revision_job(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench import scoring_queue
+
+        self._one_backend(monkeypatch)
+        conn = open_index()
+        try:
+            conn.execute(
+                "UPDATE sessions SET ai_quality_score = 3, "
+                "ai_failure_value_score = 3 WHERE session_id != 'sess-0'"
+            )
+            conn.commit()
+            scoring_queue.enqueue_session_ids(conn, ["sess-0"])
+        finally:
+            conn.close()
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session",
+            lambda _conn, _session_id, **_kwargs: self._result(),
+        )
+
+        status, response = _post(
+            server, "/api/sessions/sess-0/score", {"backend": "codex"}
+        )
+
+        assert status == 200
+        assert response["cached"] is False
+        conn = open_index()
+        try:
+            assert tuple(conn.execute(
+                "SELECT state, lease_owner, last_error_code FROM scoring_jobs "
+                "WHERE session_id = 'sess-0'"
+            ).fetchone()) == ("succeeded", None, None)
+        finally:
+            conn.close()
+
+    def test_share_score_persists_before_unlock_and_queue_cancels_as_complete(
+        self, index_setup, monkeypatch
+    ):
+        from clawjournal import share_flow
+        from clawjournal.workbench import scoring_queue
+
+        self._one_backend(monkeypatch)
+        conn = open_index()
+        try:
+            conn.execute(
+                "UPDATE sessions SET ai_quality_score = 3, "
+                "ai_failure_value_score = 3 WHERE session_id != 'sess-0'"
+            )
+            conn.commit()
+            scoring_queue.enqueue_session_ids(conn, ["sess-0"])
+        finally:
+            conn.close()
+        calls: list[str] = []
+
+        def fake_score(_conn, session_id, **_kwargs):
+            calls.append(session_id)
+            return self._result()
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+        result = share_flow.score_compute("sess-0", backend="codex")
+        assert result["ok"] is True
+        assert result["persisted"] is True
+
+        conn = open_index()
+        try:
+            assert tuple(conn.execute(
+                "SELECT state, last_error_code FROM scoring_jobs "
+                "WHERE session_id = 'sess-0'"
+            ).fetchone()) == ("succeeded", None)
+        finally:
+            conn.close()
+
+        assert Scanner(source_filter="claude").score_unscored_once(limit=1) == 0
+        assert calls == ["sess-0"]
+        conn = open_index()
+        try:
+            job = conn.execute(
+                "SELECT state, last_error_code FROM scoring_jobs "
+                "WHERE session_id = 'sess-0'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert tuple(job) == ("succeeded", None)
+
+    def test_retry_failed_clears_all_fallback_state_and_requeues(
+        self, server, monkeypatch
+    ):
+        from clawjournal.workbench import scoring_queue
+
+        config = {"scorer_backend": "codex"}
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config", lambda: dict(config)
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.save_config",
+            lambda updated: config.clear() or config.update(updated) or True,
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.installed_fallback_chain",
+            lambda _primary: ["codex", "claude"],
+        )
+        conn = open_index()
+        try:
+            scoring_queue.enqueue_session_ids(conn, ["sess-0"])
+            conn.execute(
+                "UPDATE scoring_jobs SET state = 'failed', attempt_count = 4, "
+                "last_error_code = 'score_failed' WHERE session_id = 'sess-0'"
+            )
+            conn.commit()
+            scoring_queue.record_backend_action_required(
+                conn, "codex", "backend_auth"
+            )
+            scoring_queue.record_backend_cooldown(
+                conn, "claude", "backend_rate_limited"
+            )
+        finally:
+            conn.close()
+
+        status, response = _post(
+            server, "/api/scoring/control", {"action": "retry_failed"}
+        )
+
+        assert status == 200
+        assert response["ok"] is True
+        assert response["action"] == "retry_failed"
+        assert response["retried"] == 1
+        conn = open_index()
+        try:
+            assert scoring_queue.get_backend_state(conn, "codex")["state"] == "ready"
+            assert scoring_queue.get_backend_state(conn, "claude")["state"] == "ready"
+            assert conn.execute(
+                "SELECT state FROM scoring_jobs WHERE session_id = 'sess-0'"
+            ).fetchone()[0] == "pending"
+        finally:
+            conn.close()
 
 
 class TestProjectsAPI:

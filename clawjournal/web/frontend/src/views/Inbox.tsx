@@ -7,6 +7,7 @@ import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import { Spinner } from '../components/Spinner.tsx';
 import { LABELS } from '../components/BadgeChip.tsx';
 import { GettingStartedGuide } from '../components/GettingStartedGuide.tsx';
+import { ScoringQueueStatus } from '../components/ScoringQueueStatus.tsx';
 import { ZeroState } from '../components/ZeroState.tsx';
 import { colors, selectStyle, btnPrimary, btnDanger, btnSecondary } from '../theme.ts';
 
@@ -560,6 +561,8 @@ export function Inbox() {
           </button>
         </div>
       </div>
+
+      <ScoringQueueStatus compact />
 
       {loaded && stats.total === 0 && sessions.length === 0 && !typeFilter && (
         <ZeroState />

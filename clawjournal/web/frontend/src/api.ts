@@ -33,6 +33,8 @@ import type {
   SupportReportDeleteResponse,
   SupportReportListResponse,
   SupportReportStatus,
+  ScoringControlResponse,
+  ScoringQueueStatus,
 } from './types.ts';
 
 const BASE = '/api';
@@ -620,6 +622,18 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body ?? {}),
+    });
+  },
+
+  scoringStatus(): Promise<ScoringQueueStatus> {
+    return request('/scoring/status');
+  },
+
+  scoringControl(action: 'pause' | 'resume' | 'retry_failed'): Promise<ScoringControlResponse> {
+    return request('/scoring/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
     });
   },
 

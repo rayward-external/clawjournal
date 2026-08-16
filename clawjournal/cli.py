@@ -3032,10 +3032,17 @@ def _score_single_session(
     backend: str = "auto",
     dry_run: bool = False,
     redaction_settings: dict[str, Any] | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Score a single session using the structured pipeline. Returns result dict."""
-    from .workbench.index import get_session_detail, update_session
+    import inspect
+    import sqlite3
+
+    from .scoring.egress_lock import scoring_egress_lock
+    from .workbench import scoring_queue
+    from .workbench.index import get_session_detail, open_index, update_session
     from .scoring.scoring import (
+        ScoringAborted,
         compute_basic_metrics,
         format_session_for_judge,
         score_session,
@@ -3059,45 +3066,164 @@ def _score_single_session(
             "total_steps": metrics["total_steps"],
         }
 
-    try:
-        score_kwargs: dict[str, Any] = {"model": model, "backend": backend}
-        if redaction_settings is not None:
-            score_kwargs["redaction_settings"] = redaction_settings
-        result = score_session(conn, session_id, **score_kwargs)
-    except FileNotFoundError as e:
-        missing = getattr(e, "filename", None) or str(e)
-        return {
-            "session_id": session_id,
-            "error": f"Missing file or command during scoring: {missing}",
-        }
-    except RuntimeError as e:
-        return {
-            "session_id": session_id,
-            "error": f"Judge failed: {e}",
-        }
+    revision_aware = isinstance(conn, sqlite3.Connection)
+    initial = None
+    if revision_aware:
+        initial_row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if initial_row is None:
+            return {"session_id": session_id, "error": "Session not found"}
+        initial = dict(initial_row)
 
-    ok = update_session(
-        conn, session_id,
-        ai_quality_score=result.quality,
-        ai_score_reason=result.reason,
-        ai_scoring_detail=result.detail_json,
-        ai_task_type=result.task_type,
-        ai_outcome_badge=result.outcome_label or None,
-        ai_value_badges=json.dumps(result.value_labels),
-        ai_risk_badges=json.dumps(result.risk_level),
-        ai_display_title=result.display_title or None,
-        ai_effort_estimate=result.effort_estimate,
-        ai_summary=result.summary or None,
-        ai_failure_value_score=getattr(result, "failure_value_score", None),
-        ai_recovery_labels=json.dumps(getattr(result, "recovery_labels", [])),
-        ai_failure_attribution=getattr(result, "failure_attribution", "") or None,
-        ai_failure_modes=json.dumps(getattr(result, "failure_modes", [])),
-        ai_learning_summary=getattr(result, "learning_summary", "") or None,
-        ai_scorer_backend=getattr(result, "scorer_backend", "") or None,
-        ai_scorer_model=getattr(result, "scorer_model", "") or None,
-        ai_rubric_git_sha=getattr(result, "rubric_git_sha", "") or None,
-        ai_scored_at=getattr(result, "scored_at", "") or None,
-    )
+    with scoring_egress_lock(blocking=True) as acquired:
+        if not acquired:  # pragma: no cover - blocking without a timeout
+            return {"session_id": session_id, "error": "Scoring is busy"}
+
+        expected_revision: str | None = None
+        if revision_aware:
+            current_row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if current_row is None:
+                return {"session_id": session_id, "error": "Session not found"}
+            current = dict(current_row)
+            expected_revision = str(current.get("content_revision") or "")
+            initial_revision = str((initial or {}).get("content_revision") or "")
+            initial_had_score = bool(
+                (initial or {}).get("ai_quality_score") is not None
+                or (initial or {}).get("ai_failure_value_score") is not None
+            )
+            current_has_score = bool(
+                current.get("ai_quality_score") is not None
+                and current.get("ai_failure_value_score") is not None
+            )
+            explicit_rescore = (
+                force and initial_had_score and initial_revision == expected_revision
+            )
+            if current_has_score and not explicit_rescore:
+                def stored_list(field: str) -> list[Any]:
+                    value = current.get(field)
+                    if isinstance(value, str):
+                        try:
+                            value = json.loads(value)
+                        except (TypeError, ValueError):
+                            value = []
+                    return value if isinstance(value, list) else []
+
+                return {
+                    "session_id": session_id,
+                    "ai_quality_score": current.get("ai_quality_score"),
+                    "ai_failure_value_score": current.get("ai_failure_value_score"),
+                    "ai_recovery_labels": stored_list("ai_recovery_labels"),
+                    "ai_failure_attribution": current.get("ai_failure_attribution") or "",
+                    "ai_failure_modes": stored_list("ai_failure_modes"),
+                    "ai_learning_summary": current.get("ai_learning_summary") or "",
+                    "reason": current.get("ai_score_reason") or "",
+                    "task_type": current.get("ai_task_type") or "unknown",
+                    "resolution": current.get("ai_outcome_badge") or "",
+                    "session_tags": stored_list("ai_value_badges"),
+                    "privacy_flags": stored_list("ai_risk_badges"),
+                    "effort_estimate": current.get("ai_effort_estimate"),
+                    "summary": current.get("ai_summary") or "",
+                    "cached": True,
+                    "ok": True,
+                }
+
+        def before_egress() -> None:
+            if expected_revision is None:
+                return
+            check_conn = open_index()
+            try:
+                row = check_conn.execute(
+                    "SELECT content_revision FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                check_conn.close()
+            if row is None or str(row["content_revision"] or "") != expected_revision:
+                raise ScoringAborted("stale_revision")
+
+        try:
+            score_kwargs: dict[str, Any] = {"model": model, "backend": backend}
+            if redaction_settings is not None:
+                score_kwargs["redaction_settings"] = redaction_settings
+            try:
+                signature = inspect.signature(score_session)
+                supports_guard = "before_egress" in signature.parameters or any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            except (TypeError, ValueError):
+                supports_guard = True
+            if supports_guard:
+                score_kwargs["before_egress"] = before_egress
+            result = score_session(conn, session_id, **score_kwargs)
+        except FileNotFoundError as e:
+            missing = getattr(e, "filename", None) or str(e)
+            return {
+                "session_id": session_id,
+                "error": f"Missing file or command during scoring: {missing}",
+            }
+        except ScoringAborted:
+            return {
+                "session_id": session_id,
+                "error": "Session changed during scoring; retry the current revision.",
+                "block_reason": "stale_revision",
+            }
+        except RuntimeError as e:
+            return {
+                "session_id": session_id,
+                "error": f"Judge failed: {e}",
+            }
+
+        if revision_aware:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            ok = update_session(
+                conn, session_id,
+                ai_quality_score=result.quality,
+                ai_score_reason=result.reason,
+                ai_scoring_detail=result.detail_json,
+                ai_task_type=result.task_type,
+                ai_outcome_badge=result.outcome_label or None,
+                ai_value_badges=json.dumps(result.value_labels),
+                ai_risk_badges=json.dumps(result.risk_level),
+                ai_display_title=result.display_title or None,
+                ai_effort_estimate=result.effort_estimate,
+                ai_summary=result.summary or None,
+                ai_failure_value_score=getattr(result, "failure_value_score", None),
+                ai_recovery_labels=json.dumps(getattr(result, "recovery_labels", [])),
+                ai_failure_attribution=getattr(result, "failure_attribution", "") or None,
+                ai_failure_modes=json.dumps(getattr(result, "failure_modes", [])),
+                ai_learning_summary=getattr(result, "learning_summary", "") or None,
+                ai_scorer_backend=getattr(result, "scorer_backend", "") or None,
+                ai_scorer_model=getattr(result, "scorer_model", "") or None,
+                ai_rubric_git_sha=getattr(result, "rubric_git_sha", "") or None,
+                ai_scored_at=getattr(result, "scored_at", "") or None,
+                expected_content_revision=expected_revision,
+                commit=not revision_aware,
+            )
+            if ok and revision_aware and expected_revision is not None:
+                scoring_queue.complete_revision_jobs(
+                    conn,
+                    session_id,
+                    expected_revision,
+                    commit=False,
+                )
+                conn.commit()
+            elif revision_aware:
+                conn.rollback()
+        except Exception:
+            if revision_aware:
+                conn.rollback()
+            raise
+        if not ok:
+            return {
+                "session_id": session_id,
+                "error": "Session changed during scoring; retry the current revision.",
+                "block_reason": "stale_revision",
+            }
 
     return {
         "session_id": session_id,
@@ -3241,7 +3367,14 @@ def _run_score(args) -> None:
 
         results = []
         for sid in session_ids:
-            result = _score_single_session(conn, sid, model=model, backend=backend, dry_run=dry_run)
+            result = _score_single_session(
+                conn,
+                sid,
+                model=model,
+                backend=backend,
+                dry_run=dry_run,
+                force=True,
+            )
             results.append(result)
 
         if len(results) == 1:
@@ -3313,7 +3446,14 @@ def _run_rescore(args) -> None:
             f"[{i}/{len(sessions)}] Rescoring: {_truncate(title, 60)} ({sid[:12]}...)",
             file=sys.stderr,
         )
-        result = _score_single_session(conn, sid, model=model, backend=backend, dry_run=dry_run)
+        result = _score_single_session(
+            conn,
+            sid,
+            model=model,
+            backend=backend,
+            dry_run=dry_run,
+            force=True,
+        )
         results.append(result)
         if result.get("ai_quality_score"):
             failure = result.get("ai_failure_value_score")

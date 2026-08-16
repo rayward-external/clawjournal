@@ -637,7 +637,7 @@ def test_score_traces_keyboard_interrupt_is_graceful(monkeypatch):
     assert all(r.get("ai_failure_value_score") is None for r in rows)
 
 
-def test_score_traces_keyboard_interrupt_does_not_submit_beyond_workers(monkeypatch):
+def test_score_traces_keyboard_interrupt_stops_serialized_queue(monkeypatch):
     started = []
     release = threading.Event()
     u2_started = threading.Event()
@@ -662,7 +662,7 @@ def test_score_traces_keyboard_interrupt_does_not_submit_beyond_workers(monkeypa
         release.set()
 
     assert result == 0
-    assert set(started) == {"u1", "u2"}
+    assert started == ["u1"]
 
 
 def test_score_traces_rescores_stale_via_force_ids(monkeypatch):

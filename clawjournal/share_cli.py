@@ -378,20 +378,18 @@ def _backend_chain(backend: str) -> list[str]:
 def score_traces(conn, rows: list[dict], *, backend: str = "auto",
                  model: str | None = None, cap: int | None = None, workers: int = 6,
                  force_ids: set[str] | None = None) -> int:
-    """Score unscored rows for failure value, IN PARALLEL.
+    """Score unscored rows for failure value under the global egress lock.
 
     Scores rows with no failure value, plus any row whose session_id is in
     `force_ids` — used to re-score sessions that grew since they were last graded
     (the web's `include_stale_scored` behavior), so a stale early grade is
     overwritten with one that reflects the current content.
 
-    The slow AI-judge step runs in worker threads (each with its own read
-    connection via share_flow.score_compute), while DB writes happen serially on
-    `conn` (single writer; WAL handles the readers) — so N traces take about one
-    judge call, not N. Only `workers` judge calls are submitted at a time; on
-    Ctrl-C we stop queueing new calls, cancel any submitted calls that have not
-    started, and return what's done (in-flight calls may still finish). Mutates
-    rows in place and persists.
+    The slow AI-judge step runs in one worker with its own connection via
+    ``share_flow.score_compute``. It holds the installation-wide scoring lock
+    through its revision-CAS write. On Ctrl-C we stop queueing new calls and
+    return what's done (the one in-flight call may still finish). Mutates rows
+    in place and persists.
 
     If the chosen backend turns out unusable (no credits / not logged in / CLI
     missing), traces are automatically retried on the next installed backend
@@ -409,9 +407,12 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
     total = len(unscored)
     restale = sum(1 for r in unscored if r.get("ai_failure_value_score") is not None)
     suffix = f" ({restale} re-scored after new activity)" if restale else ""
-    n_workers = max(1, min(workers, total))
+    # All scoring entry points share one installation-wide egress lock. Keep a
+    # single submitted future so Ctrl-C can still cancel work that has not
+    # started instead of leaving several threads blocked on that lock.
+    n_workers = 1
     print(f"  {DIM}Scoring {total} trace(s) for failure value{suffix} "
-          f"({n_workers} in parallel, AI judge — Ctrl-C to skip the rest)…{RST}")
+          f"(serialized AI judge — Ctrl-C to skip the rest)…{RST}")
     done = 0
     pool = ThreadPoolExecutor(max_workers=n_workers)
     rows_iter = iter(unscored)
@@ -427,8 +428,14 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
         be = active_backend()
         if be is None:
             return False
-        futures[pool.submit(share_flow.score_compute, r["session_id"],
-                            backend=be, model=model)] = (r, be)
+        score_kwargs = {"backend": be, "model": model}
+        if r["session_id"] in force_ids:
+            score_kwargs["force"] = True
+        futures[pool.submit(
+            share_flow.score_compute,
+            r["session_id"],
+            **score_kwargs,
+        )] = (r, be)
         return True
 
     def submit_next() -> bool:
@@ -451,7 +458,6 @@ def score_traces(conn, rows: list[dict], *, backend: str = "auto",
                 sid = r["session_id"]
                 res = fut.result()
                 if res.get("ok"):
-                    share_flow.persist_score(conn, sid, res["fields"])  # serial write on main conn
                     r["ai_failure_value_score"] = res.get("failure_value")
                     if res.get("display_title"):
                         r["ai_display_title"] = res["display_title"]

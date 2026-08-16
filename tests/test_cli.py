@@ -2433,6 +2433,141 @@ class TestScore:
         assert result["session_id"] == "sess-1"
         assert "Judge failed: backend auth failed" in result["error"]
 
+    def test_score_single_session_revision_cas_never_overwrites_new_content(
+        self, tmp_path, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from clawjournal.cli import _score_single_session
+        from clawjournal.workbench.index import open_index, upsert_sessions
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.CONFIG_DIR", tmp_path / "config"
+        )
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "cas-session",
+            "project": "project",
+            "source": "codex",
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "messages": [
+                {"role": "user", "content": "old revision", "tool_uses": []},
+                {"role": "assistant", "content": "done", "tool_uses": []},
+            ],
+            "stats": {"user_messages": 1, "assistant_messages": 1},
+        }])
+
+        def fake_score(_conn, session_id, **_kwargs):
+            writer = open_index()
+            try:
+                writer.execute(
+                    "UPDATE sessions SET content_revision = 'new-revision' "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                )
+                writer.commit()
+            finally:
+                writer.close()
+            return SimpleNamespace(
+                quality=5,
+                reason="old result",
+                detail_json="{}",
+                task_type="debugging",
+                outcome_label="resolved",
+                value_labels=[],
+                risk_level=[],
+                display_title="Old",
+                effort_estimate=0.5,
+                summary="old",
+                failure_value_score=5,
+                recovery_labels=[],
+                failure_attribution="agent_caused",
+                failure_modes=[],
+                learning_summary="old",
+                scorer_backend="codex",
+                scorer_model="test",
+                rubric_git_sha="sha",
+                scored_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session", fake_score
+        )
+        result = _score_single_session(conn, "cas-session")
+
+        assert result["block_reason"] == "stale_revision"
+        row = conn.execute(
+            "SELECT content_revision, ai_quality_score FROM sessions "
+            "WHERE session_id = 'cas-session'"
+        ).fetchone()
+        assert tuple(row) == ("new-revision", None)
+        conn.close()
+
+    def test_score_single_session_atomically_completes_current_queue_job(
+        self, tmp_path, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from clawjournal.cli import _score_single_session
+        from clawjournal.workbench import scoring_queue
+        from clawjournal.workbench.index import open_index, upsert_sessions
+
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.INDEX_DB", tmp_path / "index.db"
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.BLOBS_DIR", tmp_path / "blobs"
+        )
+        conn = open_index()
+        upsert_sessions(conn, [{
+            "session_id": "queued-cli-session",
+            "project": "project",
+            "source": "codex",
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "messages": [{"role": "user", "content": "score me"}],
+            "stats": {"user_messages": 1, "assistant_messages": 0},
+        }])
+        scoring_queue.enqueue_session_ids(conn, ["queued-cli-session"])
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.score_session",
+            lambda _conn, _session_id, **_kwargs: SimpleNamespace(
+                quality=4,
+                reason="done",
+                detail_json="{}",
+                task_type="debugging",
+                outcome_label="resolved",
+                value_labels=[],
+                risk_level=[],
+                display_title="Done",
+                effort_estimate=0.5,
+                summary="done",
+                failure_value_score=4,
+                recovery_labels=[],
+                failure_attribution="agent_caused",
+                failure_modes=[],
+                learning_summary="done",
+                scorer_backend="codex",
+                scorer_model="test",
+                rubric_git_sha="sha",
+                scored_at=datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+        result = _score_single_session(conn, "queued-cli-session")
+
+        assert result["ok"] is True
+        assert tuple(conn.execute(
+            "SELECT state, lease_owner, last_error_code FROM scoring_jobs "
+            "WHERE session_id = 'queued-cli-session'"
+        ).fetchone()) == ("succeeded", None, None)
+        conn.close()
+
     def test_score_help_includes_default_limit_20(self, capsys, monkeypatch):
         monkeypatch.setattr(sys, "argv", ["clawjournal", "score", "--help"])
         with pytest.raises(SystemExit) as excinfo:

@@ -361,6 +361,53 @@ export interface WorkbenchConfig {
   scorer_backend_detected: string | null;
 }
 
+export type ScoringWorkerState =
+  | 'disabled'
+  | 'idle'
+  | 'running'
+  | 'cooldown'
+  | 'action_required';
+
+export type ScoringQueueStage =
+  | 'queued'
+  | 'preparing'
+  | 'locating_evidence'
+  | 'final_scoring'
+  | 'persisting';
+
+export type ScoringActionRequiredCode =
+  | 'backend_missing'
+  | 'backend_auth'
+  | 'backend_unavailable';
+
+export interface ScoringQueueStatus {
+  enabled: boolean;
+  backend: string | null;
+  worker_state: ScoringWorkerState;
+  counts: {
+    pending: number;
+    running: number;
+    retry_wait: number;
+    succeeded: number;
+    failed: number;
+  };
+  current: {
+    job_id: string;
+    stage: ScoringQueueStage;
+    progress_current: number | null;
+    progress_total: number | null;
+  } | null;
+  next_retry_at: string | null;
+  action_required_code: ScoringActionRequiredCode | null;
+}
+
+export interface ScoringControlResponse {
+  ok: true;
+  action: 'pause' | 'resume' | 'retry_failed';
+  retried?: number;
+  status: ScoringQueueStatus;
+}
+
 export type AutoUploadMode = 'off' | 'enabled' | 'paused';
 export type AutoUploadHealth = 'ready' | 'action_required' | 'retrying';
 export type AutoUploadOverlay = 'running' | 'revocation_pending' | 'enrollment_pending' | null;
