@@ -282,7 +282,8 @@ def open_existing_index(
 # version 11 records which share predecessors the hosted receiver dictated
 # so a retried submission can tell them apart from a locally stale claim, and
 # version 12 separates append-only upload checkpoints from the logical
-# conversation projected by the local workbench.
+# conversation projected by the local workbench, and version 13 adds the
+# durable, revision-keyed background scoring queue.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
@@ -294,7 +295,8 @@ RECURRING_PROTOCOL_V2_SCHEMA_VERSION = 9
 EXACT_SCOPE_PAIRS_SCHEMA_VERSION = 10
 RECEIVER_PREDECESSOR_SCHEMA_VERSION = 11
 LOGICAL_CHECKPOINT_SCHEMA_VERSION = 12
-WORKBENCH_SCHEMA_VERSION = LOGICAL_CHECKPOINT_SCHEMA_VERSION
+SCORING_QUEUE_SCHEMA_VERSION = 13
+WORKBENCH_SCHEMA_VERSION = SCORING_QUEUE_SCHEMA_VERSION
 
 # `share_sessions.predecessor_source` values. NULL means the predecessor is the
 # create-time local baseline; RECEIVER means the hosted lineage preflight
@@ -1174,6 +1176,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_exact_scope_pairs(conn)
     _migrate_receiver_predecessor(conn)
     _migrate_logical_checkpoint_projection(conn)
+    _migrate_scoring_queue(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Idempotent: after
@@ -1926,6 +1929,75 @@ def _migrate_logical_checkpoint_projection(conn: sqlite3.Connection) -> None:
             "WHERE logical_session_id IS NOT NULL"
         )
         conn.execute(f"PRAGMA user_version = {LOGICAL_CHECKPOINT_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _create_scoring_queue_schema(conn: sqlite3.Connection) -> None:
+    """Create the revision-keyed scoring queue and backend circuit state."""
+
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS scoring_jobs (
+            job_id            TEXT PRIMARY KEY,
+            session_id        TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+            content_revision  TEXT NOT NULL,
+            state             TEXT NOT NULL CHECK (
+                state IN ('pending', 'running', 'retry_wait', 'succeeded', 'failed', 'cancelled')
+            ),
+            priority          INTEGER NOT NULL DEFAULT 0,
+            attempt_count     INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            next_attempt_at   TEXT,
+            lease_owner       TEXT,
+            lease_expires_at  TEXT,
+            stage             TEXT NOT NULL DEFAULT 'queued',
+            stage_current     INTEGER,
+            stage_total       INTEGER,
+            last_error_code   TEXT,
+            last_error_at     TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            UNIQUE(session_id, content_revision)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scoring_jobs_due "
+        "ON scoring_jobs(state, next_attempt_at, priority DESC, created_at, job_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scoring_jobs_session_revision "
+        "ON scoring_jobs(session_id, content_revision)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS scoring_backend_state (
+            backend              TEXT PRIMARY KEY,
+            state                TEXT NOT NULL CHECK (
+                state IN ('ready', 'cooldown', 'action_required')
+            ),
+            next_attempt_at      TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0
+                CHECK (consecutive_failures >= 0),
+            last_error_code      TEXT,
+            updated_at           TEXT NOT NULL
+        )"""
+    )
+
+
+def _migrate_scoring_queue(conn: sqlite3.Connection) -> None:
+    """Advance v12 -> v13 by adding rebuildable scoring scheduler state."""
+
+    version_row = conn.execute("PRAGMA user_version").fetchone()
+    version = version_row[0] if version_row else 0
+    if version >= SCORING_QUEUE_SCHEMA_VERSION:
+        _create_scoring_queue_schema(conn)
+        conn.commit()
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _create_scoring_queue_schema(conn)
+        conn.execute(f"PRAGMA user_version = {SCORING_QUEUE_SCHEMA_VERSION}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -4731,6 +4803,8 @@ def update_session(
     ai_scorer_model: str | None = None,
     ai_rubric_git_sha: str | None = None,
     ai_scored_at: str | None = None,
+    expected_content_revision: str | None = None,
+    commit: bool = True,
 ) -> bool:
     """Update review fields on a session.
 
@@ -4747,10 +4821,15 @@ def update_session(
             return False
 
     row = conn.execute(
-        "SELECT session_id, review_status FROM sessions WHERE session_id = ?",
+        "SELECT session_id, review_status, content_revision FROM sessions WHERE session_id = ?",
         (session_id,),
     ).fetchone()
     if row is None:
+        return False
+    if (
+        expected_content_revision is not None
+        and row["content_revision"] != expected_content_revision
+    ):
         return False
 
     updates: list[str] = []
@@ -4854,13 +4933,18 @@ def update_session(
     updates.append("updated_at = ?")
     params.append(now)
     params.append(session_id)
+    where = "session_id = ?"
+    if expected_content_revision is not None:
+        where += " AND content_revision = ?"
+        params.append(expected_content_revision)
 
-    conn.execute(
-        f"UPDATE sessions SET {', '.join(updates)} WHERE session_id = ?",
+    cursor = conn.execute(
+        f"UPDATE sessions SET {', '.join(updates)} WHERE {where}",
         params,
     )
-    conn.commit()
-    return True
+    if commit:
+        conn.commit()
+    return cursor.rowcount == 1
 
 
 REVIEW_BULK_STATUSES = frozenset({"approved", "blocked"})

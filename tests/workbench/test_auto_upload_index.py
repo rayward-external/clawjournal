@@ -15,6 +15,7 @@ from clawjournal.workbench.index import (
     RECEIVER_PREDECESSOR_SCHEMA_VERSION,
     RECURRING_PROTOCOL_V2_SCHEMA_VERSION,
     RevisionConflictError,
+    SCORING_QUEUE_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
     already_shared_revision_blockers,
     auto_upload_review_blockers,
@@ -114,7 +115,8 @@ def _mark_shared(conn, session_id: str) -> str:
 
 def test_fresh_schema_has_auto_upload_foundation(index_conn):
     assert index_conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
-    assert WORKBENCH_SCHEMA_VERSION == LOGICAL_CHECKPOINT_SCHEMA_VERSION
+    assert WORKBENCH_SCHEMA_VERSION == SCORING_QUEUE_SCHEMA_VERSION
+    assert SCORING_QUEUE_SCHEMA_VERSION > LOGICAL_CHECKPOINT_SCHEMA_VERSION
     assert EXACT_SCOPE_PAIRS_SCHEMA_VERSION == 10
     assert RECEIVER_PREDECESSOR_SCHEMA_VERSION == 11
     assert LOGICAL_CHECKPOINT_SCHEMA_VERSION == 12

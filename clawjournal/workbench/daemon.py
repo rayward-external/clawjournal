@@ -1,6 +1,7 @@
 """Local daemon for the scientist workbench — scanner + HTTP API."""
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -35,11 +36,9 @@ from ..auto_upload_client import (
 from ..redaction.anonymizer import Anonymizer
 from ..scoring.badges import compute_all_badges
 from ..scoring.backends import (
-    PERMANENT_BACKEND_FAILURE_MARKERS,
     SUPPORTED_BACKENDS,
     detect_available_backend,
     installed_fallback_chain,
-    is_backend_unavailable_error,
     require_backend_command,
     resolve_backend,
 )
@@ -138,6 +137,7 @@ from .timeline import (
     render_not_found_html,
     render_timeline_html,
 )
+from . import scoring_queue
 from ..parsing.parser import (
     AIDER_SOURCE,
     CLAUDE_SOURCE,
@@ -339,6 +339,8 @@ SCAN_INTERVAL = 60  # seconds
 # than falling arbitrarily far behind.
 MAX_SCAN_BACKOFF = 900  # seconds
 AUTO_SCORE_BATCH_SIZE = 20
+SCORING_QUEUE_ENQUEUE_LIMIT = 10_000
+SCORING_EXPLICIT_LOCK_WAIT_SECONDS = 30.0
 _NO_MATCHING_WARMUP_SOURCE = "__clawjournal_no_matching_warmup_source__"
 SCORING_DISPLAY_NAMES = {
     "claude": "Claude Code",
@@ -499,7 +501,14 @@ _FRONTEND_BUILD_INPUT_FILES = (
 )
 
 
-def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: Any) -> bool:
+def _persist_scoring_result(
+    conn: sqlite3.Connection,
+    session_id: str,
+    result: Any,
+    *,
+    expected_content_revision: str | None = None,
+    commit: bool = True,
+) -> bool:
     """Persist a scoring result into the sessions table."""
     return update_session(
         conn, session_id,
@@ -522,7 +531,42 @@ def _persist_scoring_result(conn: sqlite3.Connection, session_id: str, result: A
         ai_scorer_model=getattr(result, "scorer_model", "") or None,
         ai_rubric_git_sha=getattr(result, "rubric_git_sha", "") or None,
         ai_scored_at=getattr(result, "scored_at", "") or None,
+        expected_content_revision=expected_content_revision,
+        commit=commit,
     )
+
+
+def _scoring_response_from_session(
+    session: sqlite3.Row | dict[str, Any], *, cached: bool
+) -> dict[str, Any]:
+    """Return the established manual-score response from a persisted row."""
+
+    row = dict(session)
+
+    def json_list(field: str) -> list[Any]:
+        value = row.get(field)
+        if not isinstance(value, str) or not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    return {
+        "ok": True,
+        "cached": cached,
+        "ai_quality_score": row.get("ai_quality_score"),
+        "ai_failure_value_score": row.get("ai_failure_value_score"),
+        "ai_recovery_labels": json_list("ai_recovery_labels"),
+        "ai_failure_attribution": row.get("ai_failure_attribution") or "",
+        "ai_failure_modes": json_list("ai_failure_modes"),
+        "ai_learning_summary": row.get("ai_learning_summary") or "",
+        "reason": row.get("ai_score_reason") or "",
+        "task_type": row.get("ai_task_type") or "unknown",
+        "outcome": row.get("ai_outcome_badge") or "",
+        "summary": row.get("ai_summary") or "",
+    }
 
 
 def _env_scoring_backend() -> str | None:
@@ -575,6 +619,16 @@ def _fallback_chain_has_installed_backend(backend: str) -> bool:
             continue
         return True
     return False
+
+
+def _scoring_backend_chain(backend: str) -> list[str]:
+    """Return the ordered durable-state keys for primary plus fallbacks."""
+
+    try:
+        chain = installed_fallback_chain(resolve_backend(backend))
+    except Exception:  # noqa: BLE001
+        chain = [backend]
+    return list(dict.fromkeys(str(candidate) for candidate in chain if candidate))
 
 
 def trigger_scoring_warmup(
@@ -755,6 +809,99 @@ def _next_scan_delay(elapsed_seconds: float) -> float:
     if not elapsed_seconds or elapsed_seconds <= SCAN_INTERVAL:
         return SCAN_INTERVAL
     return min(elapsed_seconds, MAX_SCAN_BACKOFF)
+
+
+def _enqueue_scoring_candidates(
+    conn: sqlite3.Connection,
+    *,
+    since: str | None,
+    effective_settings: dict[str, Any],
+) -> int:
+    """Reconcile the current eligible revisions into the durable queue."""
+
+    candidates = _query_scoreable_warmup_sessions(
+        conn,
+        limit=SCORING_QUEUE_ENQUEUE_LIMIT,
+        since=since,
+        source_filter=_warmup_source_filter(effective_settings),
+        excluded_projects=list(effective_settings.get("excluded_projects") or []),
+    )
+    return scoring_queue.enqueue_session_ids(
+        conn, [str(candidate["session_id"]) for candidate in candidates]
+    )
+
+
+def _scoring_job_preflight(
+    conn: sqlite3.Connection,
+    job: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    """Recheck every background-egress gate for a claimed revision."""
+
+    if load_config().get("scoring_warmup_declined"):
+        return None, None, "ineligible"
+    row = conn.execute(
+        "SELECT session_id, content_revision, source, project, checkpoint_active, "
+        "ai_quality_score, ai_failure_value_score FROM sessions WHERE session_id = ?",
+        (job["session_id"],),
+    ).fetchone()
+    if row is None or row["content_revision"] != job["content_revision"]:
+        return None, None, "stale_revision"
+    session = dict(row)
+    if not bool(session.get("checkpoint_active", 1)):
+        return None, None, "ineligible"
+    if (
+        session.get("ai_quality_score") is not None
+        and session.get("ai_failure_value_score") is not None
+    ):
+        return None, None, "already_scored"
+
+    settings = get_effective_share_settings(conn, load_config())
+    allowed = _warmup_source_filter(settings)
+    source = str(session.get("source") or "")
+    if isinstance(allowed, tuple):
+        source_allowed = source in allowed
+    else:
+        source_allowed = source == allowed
+    if not source_allowed or session_matches_excluded_projects(
+        session, list(settings.get("excluded_projects") or [])
+    ):
+        return None, None, "ineligible"
+    if release_gate_blockers(conn, [str(job["session_id"])]):
+        return None, None, "ineligible"
+    return session, _score_redaction_settings(settings), None
+
+
+def _scoring_progress_fields(message: str) -> tuple[str, int | None, int | None]:
+    """Project human progress callbacks onto the bounded queue status schema."""
+
+    locator_total = re.search(r"in (\d+) chunks", message)
+    if locator_total:
+        return "locating_evidence", 0, int(locator_total.group(1))
+    locator_done = re.search(r"Locator chunks completed: (\d+)/(\d+)", message)
+    if locator_done:
+        return "locating_evidence", int(locator_done.group(1)), int(locator_done.group(2))
+    if message.startswith("Scoring selected timeline") or message.startswith("Scoring final judge"):
+        return "final_scoring", None, None
+    return "preparing", None, None
+
+
+def _score_accepts_parameter(
+    score_function: Callable[..., Any], parameter_name: str
+) -> bool:
+    """Keep old monkeypatched scorer callables compatible in tests/plugins."""
+
+    try:
+        signature = inspect.signature(score_function)
+    except (TypeError, ValueError):
+        return True
+    return parameter_name in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _score_accepts_progress(score_function: Callable[..., Any]) -> bool:
+    return _score_accepts_parameter(score_function, "progress")
 
 
 class Scanner:
@@ -1202,10 +1349,8 @@ class Scanner:
         since: str | None = None,
         backend: str = "auto",
     ) -> int:
-        """Score the latest failure-corpus traces using the selected backend."""
-        if self._auto_score_disabled_reason:
-            return 0
-        if not self._score_lock.acquire(blocking=False):
+        """Drain a bounded number of jobs from the durable scoring queue."""
+        if limit <= 0 or not self._score_lock.acquire(blocking=False):
             return 0
 
         from ..scoring.scoring import score_session
@@ -1213,98 +1358,241 @@ class Scanner:
         try:
             conn = open_index()
             try:
-                effective_settings = get_effective_share_settings(conn, load_config())
-                excluded_projects = list(effective_settings.get("excluded_projects") or [])
-                redaction_settings = _score_redaction_settings(effective_settings)
-                # Warmup deliberately scores the latest `limit` unscored
-                # failure-corpus traces ordered by start_time DESC with no
-                # age cap (`since` is None for the background path). The
-                # `limit` bounds cost; callers that want a rolling window
-                # (CLI `--window`) pass `since` explicitly.
-                #
-                # `include_stale_scored` also re-selects sessions that were
-                # graded mid-flight and then grew (end_time advanced past
-                # ai_scored_at); `settle_seconds` defers sessions that are still
-                # active so we don't grade them prematurely in the first place.
-                sessions = _query_scoreable_warmup_sessions(
-                    conn,
-                    limit=limit,
-                    since=since,
-                    source_filter=_warmup_source_filter(effective_settings),
-                    excluded_projects=excluded_projects,
+                settings = get_effective_share_settings(conn, load_config())
+                _enqueue_scoring_candidates(
+                    conn, since=since, effective_settings=settings
                 )
-                if not sessions:
+                if load_config().get("scoring_warmup_declined"):
                     return 0
-
-                # Build a fallback chain so a backend that runs out mid-batch
-                # (e.g. codex out of credits / not logged in) is replaced by the
-                # next installed backend instead of failing every remaining trace.
-                # If nothing resolves up front, fall through to the per-session
-                # handling below (which arms the permanent-failure breaker).
                 try:
                     chain = installed_fallback_chain(resolve_backend(backend))
                 except Exception:  # noqa: BLE001
                     chain = [backend]
-                dead: set[str] = set()
 
+                owner = f"{os.getpid()}:{uuid.uuid4()}"
                 scored = 0
-                for s in sessions:
-                    # Honor a mid-batch opt-out: if the user turns off background
-                    # scoring (Settings / decline) while this batch is running,
-                    # stop before egressing the next trace. Re-read config each
-                    # iteration — it's the source of truth and cheap relative to a
-                    # scoring call.
-                    if load_config().get("scoring_warmup_declined"):
-                        logger.info("Automatic scoring stopped: background scoring turned off")
-                        break
-                    sid = s["session_id"]
-                    while True:
-                        active = next((b for b in chain if b not in dead), None)
-                        if active is None:
-                            self._auto_score_disabled_reason = (
-                                self._auto_score_disabled_reason
-                                or "All scoring backends are unavailable")
-                            logger.info("Automatic scoring disabled: %s",
-                                        self._auto_score_disabled_reason)
-                            break
-                        try:
-                            score_kwargs: dict[str, Any] = {"backend": active}
-                            if redaction_settings is not None:
-                                score_kwargs["redaction_settings"] = redaction_settings
-                            result = score_session(conn, sid, **score_kwargs)
-                        except RuntimeError as exc:
-                            message = str(exc)
-                            backend_dead = is_backend_unavailable_error(message) or any(
-                                m in message for m in PERMANENT_BACKEND_FAILURE_MARKERS)
-                            if backend_dead:
-                                dead.add(active)
-                                if next((b for b in chain if b not in dead), None) is not None:
-                                    logger.info("Scoring backend '%s' unavailable (%s); "
-                                                "switching to '%s'", active, message,
-                                                next(b for b in chain if b not in dead))
-                                    continue  # retry this session on the next backend
-                                self._auto_score_disabled_reason = message
-                                logger.info("Automatic scoring disabled: %s", message)
-                                break
-                            logger.warning("Automatic scoring failed for %s: %s", sid, message)
-                            break
-                        except Exception:
-                            logger.exception("Automatic scoring crashed for %s", sid)
-                            break
-                        else:
-                            if _persist_scoring_result(conn, sid, result):
-                                scored += 1
-                                _maybe_create_trace_note(conn, sid)
-                            break
-
-                    if self._auto_score_disabled_reason:
-                        break  # stop the batch — no usable backend remains
-
+                processed = 0
+                while processed < limit:
+                    outcome = self._score_next_queued_job(
+                        conn,
+                        chain=chain,
+                        owner=owner,
+                        score_session=score_session,
+                    )
+                    if outcome == "scored":
+                        scored += 1
+                        processed += 1
+                        continue
+                    if outcome == "processed":
+                        processed += 1
+                        continue
+                    break
                 return scored
             finally:
                 conn.close()
         finally:
             self._score_lock.release()
+
+    def _score_next_queued_job(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        chain: list[str],
+        owner: str,
+        score_session: Callable[..., Any],
+    ) -> str:
+        """Run at most one queue job while holding the global egress lock."""
+
+        from ..scoring.egress_lock import scoring_egress_lock
+        from ..scoring.scoring import ScoringAborted
+
+        # Claim only after taking the OS lock.  Otherwise a second daemon could
+        # wait behind a long judge call until its lease expires, recover it, and
+        # send the same revision to a judge a second time.
+        with scoring_egress_lock(blocking=False) as acquired:
+            if not acquired:
+                return "busy"
+            if load_config().get("scoring_warmup_declined"):
+                logger.info(
+                    "Automatic scoring stopped: background scoring turned off"
+                )
+                return "paused"
+
+            available: list[str] = []
+            blockers: list[dict[str, Any]] = []
+            for candidate_backend in chain:
+                blocker = scoring_queue.backend_blocker(conn, candidate_backend)
+                if blocker is None:
+                    available.append(candidate_backend)
+                else:
+                    blockers.append(blocker)
+            if not available:
+                if any(
+                    blocker.get("state") == "action_required"
+                    for blocker in blockers
+                ):
+                    self._auto_score_disabled_reason = (
+                        "backend_action_required"
+                    )
+                else:
+                    self._auto_score_disabled_reason = "backend_cooldown"
+                return "blocked"
+
+            job = scoring_queue.claim_next_job(conn, owner=owner)
+            if job is None:
+                return "idle"
+
+            for active_index, active in enumerate(available):
+                # Re-read every mutable privacy/control input immediately before
+                # *each* possible AI call, including a fallback retry.
+                _, redaction_settings, gate_error = _scoring_job_preflight(
+                    conn, job
+                )
+                if gate_error is not None:
+                    scoring_queue.cancel_job(
+                        conn, str(job["job_id"]), owner, gate_error
+                    )
+                    return "processed"
+
+                def progress(message: str) -> None:
+                    stage, current, total = _scoring_progress_fields(message)
+                    scoring_queue.update_job_stage(
+                        conn,
+                        str(job["job_id"]),
+                        owner,
+                        stage,
+                        current=current,
+                        total=total,
+                    )
+
+                def before_egress() -> None:
+                    # Locator calls run in their own threads; use a fresh
+                    # connection instead of sharing this worker's sqlite handle.
+                    check_conn = open_index()
+                    try:
+                        _session, _settings, current_gate_error = (
+                            _scoring_job_preflight(check_conn, job)
+                        )
+                    finally:
+                        check_conn.close()
+                    if current_gate_error is not None:
+                        raise ScoringAborted(current_gate_error)
+
+                try:
+                    score_kwargs: dict[str, Any] = {"backend": active}
+                    if redaction_settings is not None:
+                        score_kwargs["redaction_settings"] = redaction_settings
+                    if _score_accepts_progress(score_session):
+                        score_kwargs["progress"] = progress
+                    if _score_accepts_parameter(score_session, "before_egress"):
+                        score_kwargs["before_egress"] = before_egress
+                    result = score_session(
+                        conn, str(job["session_id"]), **score_kwargs
+                    )
+                except ScoringAborted as exc:
+                    code = str(exc)
+                    if code not in {
+                        "stale_revision",
+                        "ineligible",
+                        "already_scored",
+                    }:
+                        code = "score_timeout"
+                    if code == "score_timeout":
+                        scoring_queue.retry_job_failure(
+                            conn, str(job["job_id"]), owner, code
+                        )
+                    else:
+                        scoring_queue.cancel_job(
+                            conn, str(job["job_id"]), owner, code
+                        )
+                    return "processed"
+                except Exception as exc:  # noqa: BLE001
+                    category, code = scoring_queue.classify_scoring_error(exc)
+                    has_fallback = active_index + 1 < len(available)
+                    if category == "cooldown":
+                        retry_at = scoring_queue.record_backend_cooldown(
+                            conn, active, code
+                        )
+                        if has_fallback:
+                            logger.info(
+                                "Scoring backend '%s' is cooling down; switching backend",
+                                active,
+                            )
+                            continue
+                        scoring_queue.defer_job_for_backend(
+                            conn,
+                            str(job["job_id"]),
+                            owner,
+                            next_attempt_at=retry_at,
+                            action_required=False,
+                        )
+                        self._auto_score_disabled_reason = code
+                        return "blocked"
+                    if category == "action_required":
+                        scoring_queue.record_backend_action_required(
+                            conn, active, code
+                        )
+                        if has_fallback:
+                            logger.info(
+                                "Scoring backend '%s' requires attention; switching backend",
+                                active,
+                            )
+                            continue
+                        scoring_queue.defer_job_for_backend(
+                            conn,
+                            str(job["job_id"]),
+                            owner,
+                            next_attempt_at=None,
+                            action_required=True,
+                        )
+                        self._auto_score_disabled_reason = code
+                        return "blocked"
+                    scoring_queue.retry_job_failure(
+                        conn, str(job["job_id"]), owner, code
+                    )
+                    logger.warning(
+                        "Automatic scoring failed for one queued session (%s)",
+                        code,
+                    )
+                    return "processed"
+
+                scoring_queue.update_job_stage(
+                    conn, str(job["job_id"]), owner, "persisting"
+                )
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    persisted = _persist_scoring_result(
+                        conn,
+                        str(job["session_id"]),
+                        result,
+                        expected_content_revision=str(job["content_revision"]),
+                        commit=False,
+                    )
+                    finished = persisted and scoring_queue.complete_job(
+                        conn,
+                        str(job["job_id"]),
+                        owner,
+                        commit=False,
+                    )
+                    if not finished:
+                        conn.rollback()
+                        scoring_queue.cancel_job(
+                            conn,
+                            str(job["job_id"]),
+                            owner,
+                            "stale_revision",
+                        )
+                        return "processed"
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                scoring_queue.clear_backend_state(conn, active)
+                self._auto_score_disabled_reason = None
+                _maybe_create_trace_note(conn, str(job["session_id"]))
+                return "scored"
+
+            return "processed"
 
     def trigger_auto_score(
         self,
@@ -1313,11 +1601,46 @@ class Scanner:
         since: str | None = None,
         backend: str = "auto",
     ) -> dict[str, Any]:
-        """Start background scoring for the latest failure-corpus sessions if idle."""
-        if self._auto_score_disabled_reason:
-            return {"status": "disabled", "reason": self._auto_score_disabled_reason}
+        """Start durable background scoring if no worker is already active."""
         if self._score_thread and self._score_thread.is_alive():
             return {"status": "already_running"}
+
+        # Durable state, across the complete fallback chain, is the sole
+        # circuit-breaker authority.  A primary that needs login must not keep
+        # a recovered fallback disabled forever.
+        chain = _scoring_backend_chain(backend)
+        blockers: list[dict[str, Any]] = []
+        conn = open_index()
+        try:
+            for candidate_backend in chain:
+                blocker = scoring_queue.backend_blocker(conn, candidate_backend)
+                if blocker is None:
+                    self._auto_score_disabled_reason = None
+                    break
+                blockers.append(blocker)
+            else:
+                action_codes = [
+                    str(blocker.get("last_error_code"))
+                    for blocker in blockers
+                    if blocker.get("state") == "action_required"
+                ]
+                retry_times = [
+                    str(blocker["next_attempt_at"])
+                    for blocker in blockers
+                    if blocker.get("state") == "cooldown"
+                    and blocker.get("next_attempt_at")
+                ]
+                reason = action_codes[0] if action_codes else "backend_cooldown"
+                self._auto_score_disabled_reason = reason
+                response: dict[str, Any] = {
+                    "status": "disabled",
+                    "reason": reason,
+                }
+                if retry_times:
+                    response["next_retry_at"] = min(retry_times)
+                return response
+        finally:
+            conn.close()
 
         def _run() -> None:
             scored = self.score_unscored_once(limit=limit, since=since, backend=backend)
@@ -4245,6 +4568,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_auto_upload_preview(refresh=False)
         elif path == "/api/scoring/backend":
             self._handle_scoring_backend()
+        elif path == "/api/scoring/status":
+            self._handle_scoring_status()
         elif path == "/api/bundles":
             self._handle_list_shares()
         elif path.startswith("/api/bundles/") and path.endswith("/preview"):
@@ -4379,6 +4704,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_add_findings_allowlist()
         elif path == "/api/scoring/warmup":
             self._handle_scoring_warmup()
+        elif path == "/api/scoring/control":
+            self._handle_scoring_control()
         elif path == "/api/config":
             self._handle_update_config()
         elif path == "/api/desktop/opened":
@@ -4902,7 +5229,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         backend = body.get("backend", "auto")
         model = body.get("model")
 
-        from ..scoring.scoring import score_session
+        from ..scoring.egress_lock import scoring_egress_lock
+        from ..scoring.scoring import ScoringAborted, score_session
 
         conn = open_index()
         try:
@@ -4920,43 +5248,141 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 }, 409)
                 return
             representative_id = str(members[0]["session_id"])
-            # Manual scoring is AI egress too: scrub configured redaction
-            # strings/usernames/blocked-domains before the prompt leaves the
-            # machine, matching the background warmup path. Unlike warmup we do
-            # not gate on hold/embargo/excluded-project here — scoring a
-            # specific session is an explicit user request for that session.
-            redaction_settings = _score_redaction_settings(
-                get_effective_share_settings(conn, load_config())
-            )
-            score_kwargs: dict[str, Any] = {"model": model, "backend": backend}
-            if redaction_settings is not None:
-                score_kwargs["redaction_settings"] = redaction_settings
-            try:
-                result = score_session(conn, representative_id, **score_kwargs)
-            except RuntimeError as e:
-                _json_response(self, {"error": str(e)}, 503)
-                return
-
-            ok = _persist_scoring_result(conn, representative_id, result)
-            if not ok:
+            initial = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (representative_id,),
+            ).fetchone()
+            if initial is None:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
+            initial_revision = str(initial["content_revision"] or "")
+            initial_had_score = (
+                initial["ai_quality_score"] is not None
+                or initial["ai_failure_value_score"] is not None
+            )
 
-            _maybe_create_trace_note(conn, representative_id)
+            with scoring_egress_lock(
+                blocking=True, timeout=SCORING_EXPLICIT_LOCK_WAIT_SECONDS
+            ) as acquired:
+                if not acquired:
+                    _json_response(
+                        self,
+                        {
+                            "error": "Another scoring request is still running.",
+                            "block_reason": "scoring_busy",
+                        },
+                        409,
+                    )
+                    return
 
-            _json_response(self, {
-                "ok": True,
-                "ai_quality_score": result.quality,
-                "ai_failure_value_score": getattr(result, "failure_value_score", None),
-                "ai_recovery_labels": getattr(result, "recovery_labels", []),
-                "ai_failure_attribution": getattr(result, "failure_attribution", ""),
-                "ai_failure_modes": getattr(result, "failure_modes", []),
-                "ai_learning_summary": getattr(result, "learning_summary", ""),
-                "reason": result.reason,
-                "task_type": result.task_type,
-                "outcome": result.outcome_label,
-                "summary": result.summary,
-            })
+                current = conn.execute(
+                    "SELECT * FROM sessions WHERE session_id = ?",
+                    (representative_id,),
+                ).fetchone()
+                if current is None:
+                    _json_response(self, {"error": "Session not found"}, 404)
+                    return
+                expected_revision = str(current["content_revision"] or "")
+                current_has_score = (
+                    current["ai_quality_score"] is not None
+                    and current["ai_failure_value_score"] is not None
+                )
+                explicit_rescore = (
+                    initial_had_score and expected_revision == initial_revision
+                )
+                if current_has_score and not explicit_rescore:
+                    _json_response(
+                        self, _scoring_response_from_session(current, cached=True)
+                    )
+                    return
+
+                def before_egress() -> None:
+                    check_conn = open_index()
+                    try:
+                        row = check_conn.execute(
+                            "SELECT content_revision FROM sessions "
+                            "WHERE session_id = ?",
+                            (representative_id,),
+                        ).fetchone()
+                    finally:
+                        check_conn.close()
+                    if (
+                        row is None
+                        or str(row["content_revision"] or "") != expected_revision
+                    ):
+                        raise ScoringAborted("stale_revision")
+
+                redaction_settings = _score_redaction_settings(
+                    get_effective_share_settings(conn, load_config())
+                )
+                score_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "backend": backend,
+                }
+                if redaction_settings is not None:
+                    score_kwargs["redaction_settings"] = redaction_settings
+                if _score_accepts_parameter(score_session, "before_egress"):
+                    score_kwargs["before_egress"] = before_egress
+                try:
+                    result = score_session(
+                        conn, representative_id, **score_kwargs
+                    )
+                except ScoringAborted:
+                    _json_response(
+                        self,
+                        {
+                            "error": "Session changed while scoring; retry the current revision.",
+                            "block_reason": "stale_revision",
+                        },
+                        409,
+                    )
+                    return
+                except RuntimeError as exc:
+                    _json_response(self, {"error": str(exc)}, 503)
+                    return
+
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    persisted_ok = _persist_scoring_result(
+                        conn,
+                        representative_id,
+                        result,
+                        expected_content_revision=expected_revision,
+                        commit=False,
+                    )
+                    if persisted_ok:
+                        scoring_queue.complete_revision_jobs(
+                            conn,
+                            representative_id,
+                            expected_revision,
+                            commit=False,
+                        )
+                        conn.commit()
+                    else:
+                        conn.rollback()
+                except Exception:
+                    conn.rollback()
+                    raise
+                if not persisted_ok:
+                    _json_response(
+                        self,
+                        {
+                            "error": "Session changed while scoring; retry the current revision.",
+                            "block_reason": "stale_revision",
+                        },
+                        409,
+                    )
+                    return
+
+                _maybe_create_trace_note(conn, representative_id)
+                persisted = conn.execute(
+                    "SELECT * FROM sessions WHERE session_id = ?",
+                    (representative_id,),
+                ).fetchone()
+                _json_response(
+                    self, _scoring_response_from_session(persisted, cached=False)
+                )
+                return
         finally:
             conn.close()
 
@@ -5683,6 +6109,89 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "confirmed": backend is not None,
             "needs_confirmation": backend is None and suggested is not None,
         })
+
+    def _scoring_status_payload(self) -> dict[str, Any]:
+        backend = _confirmed_scoring_backend()
+        enabled = bool(
+            backend and not load_config().get("scoring_warmup_declined")
+        )
+        conn = open_index()
+        try:
+            return scoring_queue.queue_status(
+                conn,
+                backend=backend,
+                backends=_scoring_backend_chain(backend) if backend else [],
+                enabled=enabled,
+            )
+        finally:
+            conn.close()
+
+    def _handle_scoring_status(self) -> None:
+        """Return content-free aggregate state for the local scoring worker."""
+
+        _json_response(self, self._scoring_status_payload())
+
+    def _handle_scoring_control(self) -> None:
+        """Pause/resume scoring or explicitly retry quarantined revisions."""
+
+        body = _read_body(self)
+        if not isinstance(body, dict) or set(body) != {"action"}:
+            _json_response(
+                self,
+                {"error": "Request body must contain only action"},
+                400,
+            )
+            return
+        action = body.get("action")
+        if not isinstance(action, str) or action not in {
+            "pause", "resume", "retry_failed"
+        }:
+            _json_response(
+                self,
+                {"error": "action must be pause, resume, or retry_failed"},
+                400,
+            )
+            return
+
+        config = load_config()
+        scanner = getattr(self.server, "_scanner", None)
+        retried = 0
+        if action == "pause":
+            config["scoring_warmup_declined"] = True
+            if save_config(config) is False:
+                _json_response(self, {"error": "Could not save scoring control"}, 500)
+                return
+        else:
+            config.pop("scoring_warmup_declined", None)
+            if save_config(config) is False:
+                _json_response(self, {"error": "Could not save scoring control"}, 500)
+                return
+            backend = _confirmed_scoring_backend()
+            conn = open_index()
+            try:
+                if backend:
+                    for candidate in _scoring_backend_chain(backend):
+                        scoring_queue.clear_backend_state(conn, candidate)
+                if action == "retry_failed":
+                    retried = scoring_queue.retry_failed_jobs(conn)
+                settings = get_effective_share_settings(conn, load_config())
+                _enqueue_scoring_candidates(
+                    conn, since=None, effective_settings=settings
+                )
+            finally:
+                conn.close()
+            if scanner is not None:
+                scanner._auto_score_disabled_reason = None
+                trigger_scoring_warmup(scanner)
+
+        payload: dict[str, Any] = {
+            "ok": True,
+            "action": action,
+            "status": self._scoring_status_payload(),
+        }
+        if action == "retry_failed":
+            payload["retried"] = retried
+        _json_response(self, payload)
 
     def _handle_scoring_warmup(self) -> None:
         """Start background scoring for share-ready recommendations."""

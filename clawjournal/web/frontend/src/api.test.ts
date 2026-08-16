@@ -403,3 +403,45 @@ describe('share creation API', () => {
     });
   });
 });
+
+describe('durable scoring queue API', () => {
+  afterEach(() => {
+    delete window.__CLAWJOURNAL_API_TOKEN__;
+    vi.unstubAllGlobals();
+  });
+
+  it('reads aggregate status and sends a strict control action', async () => {
+    window.__CLAWJOURNAL_API_TOKEN__ = 'scoring-queue-token';
+    const status = {
+      enabled: true,
+      backend: 'codex',
+      worker_state: 'idle' as const,
+      counts: { pending: 4, running: 0, retry_wait: 1, succeeded: 20, failed: 2 },
+      current: null,
+      next_retry_at: '2026-08-16T12:00:00Z',
+      action_required_code: null,
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => status })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, action: 'retry_failed', retried: 2, status }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.scoringStatus()).resolves.toEqual(status);
+    await expect(api.scoringControl('retry_failed')).resolves.toMatchObject({
+      ok: true,
+      action: 'retry_failed',
+      retried: 2,
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/scoring/status', { headers: { Authorization: 'Bearer scoring-queue-token' } });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/scoring/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer scoring-queue-token' },
+      body: JSON.stringify({ action: 'retry_failed' }),
+    });
+  });
+});

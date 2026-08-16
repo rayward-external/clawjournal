@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../api.ts';
 import { ToastProvider } from '../components/Toast.tsx';
 import type { Session } from '../types.ts';
@@ -92,6 +92,18 @@ function renderInbox(sessions: Session[]) {
   );
   return { statsSpy };
 }
+
+beforeEach(() => {
+  vi.spyOn(api, 'scoringStatus').mockResolvedValue({
+    enabled: true,
+    backend: 'codex',
+    worker_state: 'idle',
+    counts: { pending: 0, running: 0, retry_wait: 0, succeeded: 0, failed: 0 },
+    current: null,
+    next_retry_at: null,
+    action_required_code: null,
+  });
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -372,4 +384,49 @@ describe('Inbox bulk status updates', () => {
     expect(screen.getByText('100 sessions approved')).toBeInTheDocument();
     expect(screen.getByText('1 session could not be updated; visible items remain selected')).toBeInTheDocument();
   }, 15_000);
+
+  it('approves 400 loaded sessions in four bounded requests', async () => {
+    const allSessions = Array.from({ length: 400 }, (_, index) => session(`s${index + 1}`));
+    vi.spyOn(api.sessions, 'list').mockImplementation(async (params = {}) => {
+      const start = params.offset ?? 0;
+      return allSessions.slice(start, start + (params.limit ?? 50));
+    });
+    vi.spyOn(api, 'stats').mockResolvedValue(stats(allSessions.length));
+    const bulkStatus = vi.spyOn(api.sessions, 'bulkStatus').mockImplementation(async ids => ({
+      updated_ids: ids,
+      missing_ids: [],
+    }));
+    localStorage.setItem('cj.gettingStartedGuideV2Dismissed', '1');
+    render(
+      <MemoryRouter>
+        <ToastProvider><Inbox /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole('checkbox', { name: 'Select session: Session s1' });
+    fireEvent.change(screen.getByRole('combobox', { name: 'Sessions per page' }), {
+      target: { value: '100' },
+    });
+    await screen.findByText('100 selected');
+
+    for (const expected of [200, 300, 400]) {
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+      await screen.findByText(`${expected} selected`);
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => expect(bulkStatus).toHaveBeenCalledTimes(4));
+    expect(bulkStatus.mock.calls.map(([ids, status]) => [ids.length, status])).toEqual([
+      [100, 'approved'],
+      [100, 'approved'],
+      [100, 'approved'],
+      [100, 'approved'],
+    ]);
+    expect(bulkStatus.mock.calls.flatMap(([ids]) => ids)).toEqual(
+      allSessions.map(item => item.session_id),
+    );
+    await screen.findByText('400 sessions approved');
+  }, 45_000);
 });

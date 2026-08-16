@@ -28,6 +28,8 @@ from clawjournal.scoring.scoring import (
     LocatorChunk,
     SCORING_BACKEND_CHOICES,
     Segment,
+    ScoringAborted,
+    ScoringDeadlineExceeded,
     ScoringResult,
     Step,
     _SCORER_PROMPT_FILE,
@@ -44,6 +46,7 @@ from clawjournal.scoring.scoring import (
     get_message_text,
     load_scoring_rubric,
     prepare_prompt_for_judge,
+    score_session,
     segment_session,
 )
 
@@ -509,6 +512,187 @@ class TestLongSessionSelection:
             final_max_chars=12_000,
         )
         assert "segment-0050" not in prompt
+
+    def test_local_abort_before_a_queued_locator_is_not_swallowed(self, monkeypatch):
+        monkeypatch.setattr("clawjournal.scoring.scoring.LOCATOR_MAX_WORKERS", 1)
+        segments = self._segments(60)
+        assert len(build_locator_chunks(segments, "large task")) > 1
+        checks = 0
+        located: list[int] = []
+
+        def before_egress():
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise ScoringAborted("background scoring was paused")
+
+        def locator(chunk):
+            located.append(chunk.chunk_index)
+            return {"signals": []}
+
+        with pytest.raises(ScoringAborted, match="paused"):
+            prepare_prompt_for_judge(
+                segments,
+                "large task",
+                {"total_steps": 60},
+                locator=locator,
+                before_egress=before_egress,
+                direct_max_chars=1,
+            )
+
+        assert located == [0]
+
+    def test_locator_provider_timeout_uses_remaining_total_budget(self, monkeypatch):
+        observed_timeouts: list[int] = []
+
+        def fake_locator(chunk, *, backend, model, timeout_seconds):
+            observed_timeouts.append(timeout_seconds)
+            return {"signals": []}
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.call_signal_locator", fake_locator
+        )
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.time.monotonic", lambda: 100.25
+        )
+
+        prepare_prompt_for_judge(
+            self._segments(2),
+            "large task",
+            {"total_steps": 2},
+            deadline_at=106.0,
+            direct_max_chars=1,
+        )
+
+        assert observed_timeouts == [6]
+
+    def test_locator_deadline_abort_is_not_treated_as_chunk_fallback(self, monkeypatch):
+        locator_called = False
+
+        def locator(_chunk):
+            nonlocal locator_called
+            locator_called = True
+            return {"signals": []}
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.time.monotonic", lambda: 101.0
+        )
+        with pytest.raises(ScoringDeadlineExceeded, match="total time budget"):
+            prepare_prompt_for_judge(
+                self._segments(2),
+                "large task",
+                {"total_steps": 2},
+                locator=locator,
+                deadline_at=100.0,
+                direct_max_chars=1,
+            )
+        assert locator_called is False
+
+
+class TestScoringEgressControls:
+    @staticmethod
+    def _patch_scorable_session(monkeypatch, tmp_path):
+        detail = {
+            "session_id": "session-1",
+            "project": "project",
+            "source": "claude",
+            "messages": [
+                _user_msg("Fix the failing command"),
+                _asst_msg(
+                    "I will inspect it",
+                    [_tool_use("Bash", "test.sh", "tests passed")],
+                ),
+                _asst_msg("The command now passes"),
+            ],
+        }
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.get_session_detail",
+            lambda _conn, _session_id: detail,
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.index.resolve_blob_path",
+            lambda _session_id, _stored: tmp_path / "unused.json",
+        )
+
+    def test_final_judge_rechecks_before_egress(self, monkeypatch, tmp_path):
+        self._patch_scorable_session(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.prepare_prompt_for_judge",
+            lambda *args, **kwargs: "bounded prompt",
+        )
+        judge_called = False
+
+        def call_judge_should_not_run(*args, **kwargs):
+            nonlocal judge_called
+            judge_called = True
+            return _VALID_JUDGE
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.call_judge", call_judge_should_not_run
+        )
+
+        def abort():
+            raise ScoringAborted("session is no longer eligible")
+
+        with pytest.raises(ScoringAborted, match="no longer eligible"):
+            score_session(object(), "session-1", before_egress=abort)
+        assert judge_called is False
+
+    def test_final_judge_timeout_uses_remaining_total_budget(self, monkeypatch, tmp_path):
+        self._patch_scorable_session(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.prepare_prompt_for_judge",
+            lambda *args, **kwargs: "bounded prompt",
+        )
+        monotonic_values = iter((100.0, 103.2))
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.time.monotonic",
+            lambda: next(monotonic_values),
+        )
+        observed: dict[str, int] = {}
+
+        def fake_judge(*args, timeout_seconds, **kwargs):
+            observed["timeout_seconds"] = timeout_seconds
+            return _VALID_JUDGE
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.call_judge", fake_judge)
+        result = score_session(
+            object(),
+            "session-1",
+            overall_timeout_seconds=5,
+        )
+
+        assert result.quality == 4
+        assert observed == {"timeout_seconds": 2}
+
+    def test_expired_total_budget_blocks_final_judge(self, monkeypatch, tmp_path):
+        self._patch_scorable_session(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.prepare_prompt_for_judge",
+            lambda *args, **kwargs: "bounded prompt",
+        )
+        monotonic_values = iter((100.0, 106.0))
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.time.monotonic",
+            lambda: next(monotonic_values),
+        )
+        judge_called = False
+
+        def call_judge_should_not_run(*args, **kwargs):
+            nonlocal judge_called
+            judge_called = True
+            return _VALID_JUDGE
+
+        monkeypatch.setattr(
+            "clawjournal.scoring.scoring.call_judge", call_judge_should_not_run
+        )
+        with pytest.raises(ScoringDeadlineExceeded, match="total time budget"):
+            score_session(
+                object(),
+                "session-1",
+                overall_timeout_seconds=5,
+            )
+        assert judge_called is False
 
 
 # ---------------------------------------------------------------------------
