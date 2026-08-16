@@ -318,7 +318,19 @@ export interface SupportReportCapability {
   terms_text: string;
   retention_text: string;
   max_report_bytes: number;
+  screenshots: SupportScreenshotCapability;
   message: string | null;
+}
+
+export interface SupportScreenshotCapability {
+  available: boolean;
+  content_type: 'image/png';
+  max_input_bytes: number;
+  max_output_bytes: number;
+  max_width: number;
+  max_height: number;
+  max_pixels: number;
+  sanitizer_version: string;
 }
 
 export type SupportReportState =
@@ -328,6 +340,20 @@ export type SupportReportState =
   | 'rejected'
   | 'ambiguous';
 
+export type SupportScreenshotState = SupportReportState;
+
+export interface SupportScreenshotStatus {
+  state: SupportScreenshotState;
+  source_sha256: string;
+  source_bytes: number;
+  width: number;
+  height: number;
+  message: string | null;
+  sanitized_sha256: string | null;
+  sanitized_bytes: number | null;
+  sanitizer_version: string | null;
+}
+
 /** Receipt/status shape returned by the local daemon; it never exposes the manage secret. */
 export interface SupportReportStatus {
   client_report_id: string;
@@ -336,6 +362,7 @@ export interface SupportReportStatus {
   message: string | null;
   created_at: string;
   expires_at: string | null;
+  screenshot: SupportScreenshotStatus | null;
 }
 
 export interface SupportReportListResponse {

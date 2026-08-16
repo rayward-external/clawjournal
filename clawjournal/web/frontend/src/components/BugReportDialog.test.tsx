@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, api } from '../api.ts';
 import { BUG_REPORT_CONTEXT_TIMEOUT_MS, BUG_REPORT_FILENAME, BUG_REPORT_URL } from '../bugReportDraft.ts';
 import { BugReportDialog } from './BugReportDialog.tsx';
+import * as supportScreenshot from '../supportScreenshot.ts';
 
 const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, 'createObjectURL');
 const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL');
@@ -38,6 +39,16 @@ const unavailableCapability = {
   terms_text: '',
   retention_text: '',
   max_report_bytes: 0,
+  screenshots: {
+    available: false,
+    content_type: 'image/png' as const,
+    max_input_bytes: 0,
+    max_output_bytes: 0,
+    max_width: 0,
+    max_height: 0,
+    max_pixels: 0,
+    sanitizer_version: '',
+  },
   message: 'Private support is unavailable.',
 };
 
@@ -49,7 +60,22 @@ const privateCapability = {
   terms_text: 'Private support maintainers may inspect this report only for product support.',
   retention_text: 'The report is retained for up to 30 days unless you delete it sooner.',
   max_report_bytes: 32_768,
+  screenshots: unavailableCapability.screenshots,
   message: null,
+};
+
+const screenshotCapability = {
+  ...privateCapability,
+  screenshots: {
+    available: true,
+    content_type: 'image/png' as const,
+    max_input_bytes: 2 * 1024 * 1024,
+    max_output_bytes: 2 * 1024 * 1024,
+    max_width: 4096,
+    max_height: 4096,
+    max_pixels: 4 * 1024 * 1024,
+    sanitizer_version: 'png-rgb-v1',
+  },
 };
 
 const clientReportId = '123e4567-e89b-42d3-a456-426614174000';
@@ -62,6 +88,7 @@ function reportStatus(state: 'queued' | 'submitting' | 'ambiguous' | 'accepted' 
     message: null,
     created_at: '2026-08-16T00:00:00Z',
     expires_at: state === 'accepted' ? '2026-09-15T00:00:00Z' : null,
+    screenshot: null,
   };
 }
 
@@ -109,7 +136,7 @@ describe('BugReportDialog', () => {
       />,
     );
 
-    expect(screen.getByText(/does not capture screenshots, logs, traces, or hidden diagnostics/i)).toBeInTheDocument();
+    expect(screen.getByText(/never captures screenshots automatically/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Summary/)).toHaveAttribute('maxlength', '120');
     expect(screen.getByLabelText(/What happened/)).toHaveAttribute('maxlength', '4000');
     expect(screen.getByLabelText(/Expected behavior/)).toHaveAttribute('maxlength', '2000');
@@ -245,16 +272,97 @@ describe('BugReportDialog', () => {
     expect(submit).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
-    expect(send).toBeEnabled();
+    await waitFor(() => expect(send).toBeEnabled());
     fireEvent.click(send);
 
-    expect(await screen.findByRole('heading', { name: 'Private report: Queued' })).toHaveFocus();
+    const queuedHeading = await screen.findByRole('heading', { name: 'Private report: Queued' });
+    await waitFor(() => expect(queuedHeading).toHaveFocus());
     expect(submit).toHaveBeenCalledWith({
       report_markdown: '# Reviewed\n\nExact private report.',
       accepted_terms_version: privateCapability.terms_version,
       accepted_retention_policy_version: privateCapability.retention_policy_version,
     });
     expect(draft).toHaveAttribute('readonly');
+  });
+
+  it('captures only on explicit action, previews remove/retake, and submits hash-bound exact PNG bytes', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability).mockResolvedValue(screenshotCapability);
+    const makeCapture = (marker: string) => ({
+      blob: new Blob([marker], { type: 'image/png' }),
+      png_base64: btoa(marker),
+      sha256: marker.repeat(64).slice(0, 64),
+      width: 1280,
+      height: 720,
+      bytes: marker.length,
+    });
+    const capture = vi.spyOn(supportScreenshot, 'captureSupportScreenshot')
+      .mockResolvedValueOnce(makeCapture('a'))
+      .mockResolvedValueOnce(makeCapture('b'))
+      .mockResolvedValueOnce(makeCapture('c'));
+    let previewIndex = 0;
+    const createObjectURL = vi.fn(() => `blob:support-preview-${++previewIndex}`);
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
+    const submit = vi.spyOn(api.support, 'submit').mockResolvedValue({
+      ...reportStatus('queued'),
+      screenshot: {
+        state: 'queued',
+        source_sha256: 'c'.repeat(64),
+        source_bytes: 1,
+        width: 1280,
+        height: 720,
+        message: 'Screenshot queued for private delivery.',
+        sanitized_sha256: null,
+        sanitized_bytes: null,
+        sanitizer_version: null,
+      },
+    });
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalled());
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    await screen.findByText(screenshotCapability.purpose);
+    expect(capture).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Capture masked app view' }));
+    expect(await screen.findByAltText('Exact masked screenshot selected for private support')).toHaveAttribute(
+      'src', 'blob:support-preview-1',
+    );
+    expect(screen.getByText('a'.repeat(64))).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open full-resolution PNG' })).toHaveAttribute(
+      'href', 'blob:support-preview-1',
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /exact PNG preview/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'Retake' }));
+    expect(screen.getByRole('button', { name: 'Send privately' })).toBeDisabled();
+    expect(await screen.findByText('b'.repeat(64))).toBeInTheDocument();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:support-preview-1');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove screenshot' }));
+    expect(screen.queryByAltText('Exact masked screenshot selected for private support')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Capture masked app view' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Capture masked app view' }));
+    await screen.findByText('c'.repeat(64));
+    fireEvent.click(screen.getByRole('checkbox', { name: /exact PNG preview/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
+
+    await screen.findByRole('heading', { name: 'Private report: Queued' });
+    expect(submit).toHaveBeenCalledWith({
+      report_markdown: expect.any(String),
+      accepted_terms_version: screenshotCapability.terms_version,
+      accepted_retention_policy_version: screenshotCapability.retention_policy_version,
+      screenshot_png_base64: btoa('c'),
+      screenshot_source_sha256: 'c'.repeat(64),
+      screenshot_width: 1280,
+      screenshot_height: 720,
+    });
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:support-preview-3');
   });
 
   it('clears consent and refreshes capability when terms change at submission', async () => {
@@ -279,6 +387,7 @@ describe('BugReportDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     await screen.findByText(privateCapability.purpose);
     fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
 
     expect(await screen.findByText('Newest private support terms.')).toBeInTheDocument();
@@ -306,7 +415,7 @@ describe('BugReportDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     await screen.findByText(privateCapability.purpose);
     fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
-    expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
 
     rerender(<BugReportDialog open={false} onClose={() => {}} surface="workbench" />);
     rerender(<BugReportDialog open onClose={() => {}} surface="workbench" />);
@@ -364,6 +473,7 @@ describe('BugReportDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     await screen.findByText(privateCapability.purpose);
     fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
     await screen.findByRole('heading', { name: 'Private report: Queued' });
 
@@ -395,6 +505,7 @@ describe('BugReportDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     await screen.findByText(privateCapability.purpose);
     fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
     await screen.findByRole('heading', { name: 'Private report: Queued' });
 
@@ -441,6 +552,7 @@ describe('BugReportDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     await screen.findByText(privateCapability.purpose);
     fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled());
     fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
 
     await screen.findByRole('heading', { name: 'Private report: Rejected' });
