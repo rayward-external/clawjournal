@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load_config
+from .filesystem import UnsafeStateStorageError
 from .session_titles import append_fork_title_suffix, resolve_session_title
 from .scoring.backends import (
     SUPPORTED_BACKENDS,
@@ -1210,6 +1211,8 @@ def run(args) -> None:
                 )
             else:
                 print(f"{DIM}Index already up to date.{RST}")
+        except UnsafeStateStorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             print(f"{YEL}Index refresh skipped: {exc}{RST}")
     config = load_config()
@@ -1229,7 +1232,7 @@ def run(args) -> None:
         conn.close()
 
 
-def main(argv: list[str] | None = None) -> None:
+def _main(argv: list[str] | None = None) -> None:
     """Console-script entry point for the thin `clawshare` alias."""
     parser = argparse.ArgumentParser(
         prog="clawshare",
@@ -1238,6 +1241,20 @@ def main(argv: list[str] | None = None) -> None:
     )
     add_share_cli_args(parser)
     run(parser.parse_args(argv))
+
+
+def main(argv: list[str] | None = None) -> None:
+    """CLI boundary with a path-free error for refused shared-state writes."""
+
+    try:
+        _main(argv)
+    except UnsafeStateStorageError as exc:
+        message = re.sub(r"[\x00-\x1f\x7f]+", " ", str(exc)).strip()
+        print(
+            f"error: {message[:500] or 'unsafe state storage'}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

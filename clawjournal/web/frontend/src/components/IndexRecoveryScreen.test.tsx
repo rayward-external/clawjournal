@@ -50,6 +50,89 @@ describe('IndexRecoveryScreen', () => {
     expect(screen.getByText(/Sharing and automatic uploads stay blocked/)).toBeInTheDocument();
   });
 
+  it.each([
+    { storage_risk: 'unknown' as const, filesystem_type: 'unknown' },
+    { storage_risk: 'local' as const, filesystem_type: 'ext4' },
+  ])('keeps recovery available for $storage_risk storage', storage => {
+    render(
+      <IndexRecoveryScreen
+        health={recoveryRequired({
+          ...storage,
+          storage_migration_required: false,
+        })}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Back up and rebuild index' })).toBeEnabled();
+  });
+
+  it('requires a complete home migration and withholds sensitive storage diagnostics', () => {
+    const rebuild = vi.spyOn(api.index, 'rebuild');
+    render(
+      <IndexRecoveryScreen
+        health={recoveryRequired({
+          storage_risk: 'network',
+          filesystem_type: 'nfs',
+          storage_migration_required: true,
+          database_path: '/network/users/alice/.clawjournal/index.db',
+          backup_path: '/network/users/alice/.clawjournal/index-backups/recovery-1',
+          detail: 'Mounted from server:/private/home.',
+        })}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveAccessibleName('Copy ClawJournal state to local storage first');
+    expect(screen.getByRole('list', { name: 'Required storage migration steps' })).toHaveTextContent(
+      'Copy the entire CLAWJOURNAL_HOME directory',
+    );
+    expect(alert).toHaveTextContent('Keep the original unchanged until recovery succeeds');
+    expect(alert).toHaveTextContent('Do not copy only the index database');
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(screen.queryByText(/network\/users\/alice|server:\/private\/home/i)).not.toBeInTheDocument();
+    expect(rebuild).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when an older backend reports network risk without the migration flag', () => {
+    render(
+      <IndexRecoveryScreen
+        health={recoveryRequired({
+          storage_risk: 'network',
+          filesystem_type: 'nfs',
+        })}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Copy ClawJournal state to local storage first' })).toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it('shows the same migration-only path for an unavailable healthy or missing index', () => {
+    render(
+      <IndexRecoveryScreen
+        health={{
+          status: 'unavailable',
+          message: 'This raw backend message must stay hidden.',
+          storage_risk: 'network',
+          filesystem_type: 'nfs4',
+          storage_migration_required: true,
+          database_path: '/private/cluster/alice/index.db',
+        }}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('will not open, create, or rebuild');
+    expect(alert).toHaveTextContent('offer repair only if it is still needed');
+    expect(alert).not.toHaveTextContent('raw backend message');
+    expect(alert).not.toHaveTextContent('/private/cluster/alice');
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
   it('submits once, disables the action, and accepts an asynchronous rebuilding response', async () => {
     let resolveRebuild!: (value: IndexRebuildResponse) => void;
     const rebuild = vi.spyOn(api.index, 'rebuild').mockImplementationOnce(() => (

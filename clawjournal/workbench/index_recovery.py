@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -20,16 +21,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import filesystem as filesystem_module
 from . import index as index_module
 
 logger = logging.getLogger(__name__)
 
 RECOVERY_MARKER_FILENAME = index_module.INDEX_RECOVERY_MARKER_FILENAME
+RECOVERY_MARKER_VERSION = 2
+_BACKUP_DIRECTORY_RE = re.compile(
+    r"index-recovery-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\Z"
+)
 
 _STATE_LOCK = threading.Lock()
 _INDEX_HEALTH: dict[str, Any] = {
     "status": "ready",
     "message": "The workbench index is ready.",
+    "filesystem_type": "unknown",
+    "storage_risk": "unknown",
+    "storage_migration_required": False,
 }
 
 _SESSION_STATE_COLUMNS = (
@@ -275,6 +284,46 @@ def _index_path() -> Path:
     return Path(str(index_module.INDEX_DB))
 
 
+def _filesystem_health_fields(database: Path) -> dict[str, str | bool]:
+    return filesystem_module.classify_filesystem(database).health_fields()
+
+
+def _storage_migration_health(
+    database: Path,
+    storage: filesystem_module.FilesystemInfo | None = None,
+) -> dict[str, Any]:
+    classification = storage or filesystem_module.classify_filesystem(database)
+    return {
+        "status": "unavailable",
+        "code": "storage_migration_required",
+        "message": filesystem_module.storage_migration_message(classification),
+        "detail": (
+            "The workbench SQLite index will not be opened, created, or rebuilt "
+            "on this filesystem."
+        ),
+        # The network classification is already conclusive.  Avoid resolve(),
+        # which can block indefinitely on a disconnected hard-NFS mount.
+        "database_path": str(Path(os.path.abspath(database))),
+        "sqlite_version": sqlite3.sqlite_version,
+        "journal_mode": index_module.INDEX_JOURNAL_MODE,
+        "automatic_recovery_available": False,
+        **classification.health_fields(),
+    }
+
+
+def _require_safe_recovery_storage(
+    database: Path,
+) -> filesystem_module.FilesystemInfo:
+    """Recheck storage immediately before a recovery filesystem mutation."""
+
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        raise UnsafeIndexRecovery(
+            filesystem_module.storage_migration_message(storage)
+        )
+    return storage
+
+
 def _marker_path(database: Path) -> Path:
     return database.parent / RECOVERY_MARKER_FILENAME
 
@@ -292,6 +341,7 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _write_marker(database: Path, payload: dict[str, Any]) -> None:
+    _require_safe_recovery_storage(database)
     marker = _marker_path(database)
     temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -329,6 +379,9 @@ def begin_index_health_check() -> dict[str, Any]:
     """Publish the fail-closed startup state before HTTP begins serving."""
 
     database = _index_path()
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        return _set_health(_storage_migration_health(database, storage))
     return _set_health({
         "status": "checking",
         "message": "Checking the local index before enabling database work...",
@@ -336,6 +389,7 @@ def begin_index_health_check() -> dict[str, Any]:
         "sqlite_version": sqlite3.sqlite_version,
         "journal_mode": index_module.INDEX_JOURNAL_MODE,
         "automatic_recovery_available": False,
+        **storage.health_fields(),
     })
 
 
@@ -355,6 +409,17 @@ def synchronize_index_health() -> dict[str, Any]:
     """
 
     health = current_index_health()
+    database = _index_path()
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        return _set_health(_storage_migration_health(database, storage))
+    if (
+        health.get("storage_migration_required") is True
+        and storage.storage_risk == "local"
+    ):
+        # A definite local remount may safely be inspected again. Unknown
+        # storage never clears a prior fail-closed network diagnosis.
+        return initialize_index_health()
     marker_exists = recovery_marker_exists()
     if (
         marker_exists
@@ -375,6 +440,13 @@ def begin_guided_rebuild() -> dict[str, Any]:
     """Reserve the worker and publish the cross-process gate before returning."""
 
     with _STATE_LOCK:
+        database = _index_path()
+        storage = filesystem_module.classify_filesystem(database)
+        if storage.storage_migration_required:
+            blocked = _storage_migration_health(database, storage)
+            _INDEX_HEALTH.clear()
+            _INDEX_HEALTH.update(blocked)
+            raise UnsafeIndexRecovery(blocked["message"])
         if _INDEX_HEALTH.get("status") == "rebuilding":
             return dict(_INDEX_HEALTH)
         if _INDEX_HEALTH.get("status") != "recovery_required":
@@ -383,16 +455,23 @@ def begin_guided_rebuild() -> dict[str, Any]:
             raise UnsafeIndexRecovery(
                 "Automatic recovery is not available for this index state."
             )
-        database = _index_path()
         marker = _load_marker(database)
         if marker is None:
             marker = {
-                "version": 1,
+                "version": RECOVERY_MARKER_VERSION,
                 "database_path": str(database.resolve()),
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "stage": "draining",
             }
-            _write_marker(database, marker)
+            try:
+                _write_marker(database, marker)
+            except UnsafeIndexRecovery:
+                storage = filesystem_module.classify_filesystem(database)
+                if storage.storage_migration_required:
+                    blocked = _storage_migration_health(database, storage)
+                    _INDEX_HEALTH.clear()
+                    _INDEX_HEALTH.update(blocked)
+                raise
         _INDEX_HEALTH.update({
             "status": "rebuilding",
             "stage": "draining",
@@ -415,6 +494,9 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
 def _exclusive_source_connection(path: Path) -> sqlite3.Connection:
     """Hold the source stable while its decisions and exact files are copied."""
 
+    # Recheck immediately next to the write-capable SQLite open.  The mount
+    # may have changed after the worker's earlier admission check.
+    index_module._assert_safe_index_storage(path)
     conn = sqlite3.connect(
         path.resolve().as_uri() + "?mode=rw",
         uri=True,
@@ -588,18 +670,31 @@ def _snapshot_from_path(
 
 def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
     database = Path(path) if path is not None else _index_path()
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        return _storage_migration_health(database, storage)
     base: dict[str, Any] = {
         "database_path": str(database.resolve()),
         "sqlite_version": sqlite3.sqlite_version,
         "journal_mode": index_module.INDEX_JOURNAL_MODE,
         "automatic_recovery_available": False,
+        **storage.health_fields(),
     }
     marker = _load_marker(database)
     if marker is not None:
         raw_backup = marker.get("backup_path")
-        if isinstance(raw_backup, str) and raw_backup:
+        raw_backup_directory = marker.get("backup_directory")
+        has_backup_reference = bool(
+            (
+                isinstance(raw_backup, str) and raw_backup
+            ) or (
+                isinstance(raw_backup_directory, str) and raw_backup_directory
+            )
+        )
+        verified_backup_dir: Path | None = None
+        if has_backup_reference:
             try:
-                _backup_from_marker(database, marker)
+                verified_backup_dir, _ = _backup_from_marker(database, marker)
             except UnsafeIndexRecovery as exc:
                 return {
                     **base,
@@ -644,7 +739,11 @@ def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
             "status": "recovery_required",
             "message": message,
             "automatic_recovery_available": True,
-            "backup_path": raw_backup if raw_backup else None,
+            "backup_path": (
+                str(verified_backup_dir)
+                if verified_backup_dir is not None
+                else None
+            ),
             "interrupted_recovery": True,
         }
     if _marker_path(database).exists():
@@ -718,6 +817,8 @@ def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
             "unreadable_state": errors,
             "recoverable_state_counts": counts,
         }
+    except index_module.UnsafeIndexStorageError as exc:
+        return _storage_migration_health(database, exc.storage)
     except (OSError, sqlite3.DatabaseError) as exc:
         if isinstance(exc, OSError) or _is_storage_or_lock_error(exc):
             return {
@@ -764,6 +865,7 @@ def initialize_index_health() -> dict[str, Any]:
             "sqlite_version": sqlite3.sqlite_version,
             "journal_mode": index_module.INDEX_JOURNAL_MODE,
             "automatic_recovery_available": False,
+            **_filesystem_health_fields(_index_path()),
         })
     if report["status"] != "ready":
         return _set_health(report)
@@ -784,8 +886,16 @@ def initialize_index_health() -> dict[str, Any]:
 
 
 def _backup_index_files(database: Path) -> tuple[Path, list[Path]]:
+    _require_safe_recovery_storage(database)
     backup_root = database.parent / "index-backups"
     backup_root.mkdir(parents=True, exist_ok=True)
+    _require_safe_recovery_storage(database)
+    state_root = database.parent.resolve()
+    backup_root = backup_root.resolve()
+    if backup_root.parent != state_root:
+        raise UnsafeIndexRecovery(
+            "The index backup directory is outside the ClawJournal state root."
+        )
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup_dir = backup_root / f"index-recovery-{timestamp}-{uuid.uuid4().hex[:8]}"
     backup_dir.mkdir(parents=False, exist_ok=False)
@@ -800,6 +910,7 @@ def _backup_index_files(database: Path) -> tuple[Path, list[Path]]:
     ):
         if not source.exists():
             continue
+        _require_safe_recovery_storage(database)
         destination = backup_dir / source.name
         shutil.copy2(source, destination)
         # Windows does not permit fsync on a read-only descriptor. Open the
@@ -814,6 +925,7 @@ def _backup_index_files(database: Path) -> tuple[Path, list[Path]]:
 
 
 def _remove_index_files(database: Path) -> None:
+    _require_safe_recovery_storage(database)
     for path in (
         database,
         Path(str(database) + "-wal"),
@@ -823,29 +935,115 @@ def _remove_index_files(database: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _backup_from_marker(database: Path, marker: dict[str, Any]) -> tuple[Path, list[Path]]:
-    raw_backup = marker.get("backup_path")
-    if not isinstance(raw_backup, str) or not raw_backup:
-        raise UnsafeIndexRecovery("The interrupted recovery backup path is missing.")
-    backup_dir = Path(raw_backup).resolve()
+def _backup_from_marker(
+    database: Path,
+    marker: dict[str, Any],
+) -> tuple[Path, list[Path]]:
+    marker_version = marker.get("version")
+    if type(marker_version) is not int or marker_version not in {1, 2}:
+        raise UnsafeIndexRecovery(
+            "The interrupted recovery marker version is unsupported."
+        )
+    state_root = database.parent.resolve()
     guarded_root = (database.parent / "index-backups").resolve()
-    if not backup_dir.is_relative_to(guarded_root) or not backup_dir.is_dir():
+    if guarded_root.parent != state_root:
+        raise UnsafeIndexRecovery(
+            "The interrupted recovery backup root is invalid."
+        )
+    backup_dir: Path | None = None
+    require_manifest = False
+
+    # v2 binds the backup to a generated directory beneath the *current* state
+    # root. This survives a cold copy of CLAWJOURNAL_HOME and cannot smuggle an
+    # absolute source-OS path into the destination.
+    backup_directory = marker.get("backup_directory")
+    if (
+        marker_version == RECOVERY_MARKER_VERSION
+        and isinstance(backup_directory, str)
+        and _BACKUP_DIRECTORY_RE.fullmatch(backup_directory)
+    ):
+        backup_dir = guarded_root / backup_directory
+        require_manifest = True
+    elif (
+        marker_version == RECOVERY_MARKER_VERSION
+        or backup_directory is not None
+    ):
+        raise UnsafeIndexRecovery(
+            "The interrupted recovery backup identity is invalid."
+        )
+    else:
+        raw_backup = marker.get("backup_path")
+        if not isinstance(raw_backup, str) or not raw_backup:
+            raise UnsafeIndexRecovery(
+                "The interrupted recovery backup path is missing."
+            )
+        raw_path = Path(raw_backup)
+        lexical_guard = Path(os.path.abspath(guarded_root))
+        lexical_raw = Path(os.path.abspath(raw_path))
+        if lexical_raw.is_relative_to(lexical_guard):
+            # Same-root v1 marker. Resolve only after the lexical containment
+            # check so a migrated marker never touches its old network path.
+            backup_dir = raw_path
+        else:
+            # Safely rebase a production v1 marker after the complete state
+            # directory was copied. The old database and backup paths must
+            # agree structurally; only the generated basename crosses roots.
+            raw_database = marker.get("database_path")
+            normalized_backup = raw_backup.replace("\\", "/").rstrip("/")
+            normalized_database = (
+                raw_database.replace("\\", "/").rstrip("/")
+                if isinstance(raw_database, str)
+                else ""
+            )
+            backup_parts = normalized_backup.split("/")
+            database_parts = normalized_database.split("/")
+            backup_name = backup_parts[-1] if backup_parts else ""
+            old_backup_parent = "/".join(backup_parts[:-2])
+            old_database_parent = "/".join(database_parts[:-1])
+            if not (
+                _BACKUP_DIRECTORY_RE.fullmatch(backup_name)
+                and len(backup_parts) >= 2
+                and backup_parts[-2] == "index-backups"
+                and old_backup_parent == old_database_parent
+            ):
+                raise UnsafeIndexRecovery(
+                    "The interrupted recovery backup path is invalid."
+                )
+            backup_dir = guarded_root / backup_name
+
+    backup_dir = backup_dir.resolve()
+    if (
+        backup_dir.parent != guarded_root
+        or not backup_dir.is_relative_to(guarded_root)
+        or not backup_dir.is_dir()
+    ):
         raise UnsafeIndexRecovery("The interrupted recovery backup path is invalid.")
-    database_backup = backup_dir / database.name
-    if not database_backup.is_file():
+    database_backup = (backup_dir / database.name).resolve()
+    if database_backup.parent != backup_dir or not database_backup.is_file():
         raise UnsafeIndexRecovery(
             "The interrupted recovery database backup is missing."
         )
+    if require_manifest:
+        manifest = (backup_dir / "recovery-manifest.json").resolve()
+        if manifest.parent != backup_dir or not manifest.is_file():
+            raise UnsafeIndexRecovery(
+                "The interrupted recovery backup manifest is missing."
+            )
     backups = [database_backup]
-    backups.extend(
-        backup_dir / name
-        for name in (
-            database.name + "-wal",
-            database.name + "-shm",
-            database.name + "-journal",
-        )
-        if (backup_dir / name).is_file()
-    )
+    for name in (
+        database.name + "-wal",
+        database.name + "-shm",
+        database.name + "-journal",
+    ):
+        candidate = backup_dir / name
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve()
+        if resolved.parent != backup_dir or not resolved.is_file():
+            raise UnsafeIndexRecovery(
+                "The interrupted recovery backup contains an invalid sidecar."
+            )
+        backups.append(resolved)
     return backup_dir, backups
 
 
@@ -1696,6 +1894,14 @@ def _guided_rebuild_locked(
     """Back up, rebuild, rescan, and restore durable state synchronously."""
 
     database = _index_path()
+    # The worker rechecks after acquiring the exclusive connection lease and
+    # before publishing a marker or creating the one authoritative backup.
+    # This closes the Queue -> worker mount-change window.
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        blocked = _storage_migration_health(database, storage)
+        _set_health(blocked)
+        raise UnsafeIndexRecovery(blocked["message"])
     marker = _load_marker(database)
     backup_dir: Path | None = None
     backup_files: list[Path] = []
@@ -1707,7 +1913,14 @@ def _guided_rebuild_locked(
     })
 
     raw_backup = marker.get("backup_path") if marker is not None else None
-    if isinstance(raw_backup, str) and raw_backup:
+    raw_backup_directory = (
+        marker.get("backup_directory") if marker is not None else None
+    )
+    if (
+        isinstance(raw_backup, str) and raw_backup
+    ) or (
+        isinstance(raw_backup_directory, str) and raw_backup_directory
+    ):
         backup_dir, backup_files = _backup_from_marker(database, marker)
         recovery_source = backup_dir / database.name
         snapshot, errors = _snapshot_from_path(recovery_source)
@@ -1721,11 +1934,12 @@ def _guided_rebuild_locked(
         marker = dict(marker or {})
         marker.setdefault("started_at", datetime.now(timezone.utc).isoformat())
         marker.update({
-            "version": 1,
+            "version": RECOVERY_MARKER_VERSION,
             "database_path": str(database.resolve()),
             "stage": "preparing",
         })
         marker.pop("backup_path", None)
+        marker.pop("backup_directory", None)
         marker.pop("error", None)
         # Publish the cross-process gate before reading or copying the source.
         # A crash in this stage leaves the original untouched; the same marker
@@ -1738,6 +1952,10 @@ def _guided_rebuild_locked(
         try:
             try:
                 source_guard = _exclusive_source_connection(database)
+            except index_module.UnsafeIndexStorageError as exc:
+                blocked = _storage_migration_health(database, exc.storage)
+                _set_health(blocked)
+                raise UnsafeIndexRecovery(blocked["message"]) from exc
             except sqlite3.DatabaseError as exc:
                 if _is_storage_or_lock_error(exc):
                     raise UnsafeIndexRecovery(
@@ -1777,6 +1995,7 @@ def _guided_rebuild_locked(
                 name: len(rows) for name, rows in snapshot.items()
             },
         }
+        _require_safe_recovery_storage(database)
         manifest_path = backup_dir / "recovery-manifest.json"
         with manifest_path.open("w", encoding="utf-8") as manifest_file:
             json.dump(manifest, manifest_file, indent=2, sort_keys=True)
@@ -1784,9 +2003,10 @@ def _guided_rebuild_locked(
             os.fsync(manifest_file.fileno())
         _fsync_directory(backup_dir)
     marker.update({
-        "version": 1,
+        "version": RECOVERY_MARKER_VERSION,
         "database_path": str(database.resolve()),
         "backup_path": str(backup_dir),
+        "backup_directory": backup_dir.name,
         "stage": "backed_up",
     })
     marker.pop("error", None)
@@ -1852,6 +2072,14 @@ def _guided_rebuild_locked(
         finally:
             rebuilt.close()
     except Exception as exc:
+        failed_storage = filesystem_module.classify_filesystem(database)
+        if failed_storage.storage_migration_required:
+            # Do not update even the recovery marker after a remount. Its last
+            # local, durable stage and v2 backup identity are sufficient for a
+            # cold-copy retry from the new state root.
+            blocked = _storage_migration_health(database, failed_storage)
+            _set_health(blocked)
+            raise UnsafeIndexRecovery(blocked["message"]) from exc
         logger.exception("Guided workbench-index recovery failed")
         marker["stage"] = "failed"
         marker["error"] = str(exc)
@@ -1869,12 +2097,19 @@ def _guided_rebuild_locked(
             "backup_path": str(backup_dir),
             "automatic_recovery_available": True,
             "interrupted_recovery": True,
+            **_filesystem_health_fields(database),
         }
         _set_health(failed)
         raise
     finally:
         index_module._set_index_recovery_access(previous_recovery_access)
 
+    final_storage = filesystem_module.classify_filesystem(database)
+    if final_storage.storage_migration_required:
+        blocked = _storage_migration_health(database, final_storage)
+        _set_health(blocked)
+        raise UnsafeIndexRecovery(blocked["message"])
+    _require_safe_recovery_storage(database)
     _marker_path(database).unlink(missing_ok=True)
     _fsync_directory(database.parent)
     ready = {
@@ -1887,6 +2122,7 @@ def _guided_rebuild_locked(
         "backup_path": str(backup_dir),
         "restored_state_counts": restored_counts,
         "warnings": warnings,
+        **final_storage.health_fields(),
     }
     return _set_health(ready)
 
@@ -1899,15 +2135,26 @@ def guided_rebuild(
     """Rebuild only after every guarded cross-process connection has closed."""
 
     database = _index_path()
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        blocked = _storage_migration_health(database, storage)
+        _set_health(blocked)
+        raise UnsafeIndexRecovery(blocked["message"])
     marker = _load_marker(database)
     if marker is None:
         marker = {
-            "version": 1,
+            "version": RECOVERY_MARKER_VERSION,
             "database_path": str(database.resolve()),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "stage": "preparing",
         }
-        _write_marker(database, marker)
+        try:
+            _write_marker(database, marker)
+        except UnsafeIndexRecovery:
+            storage = filesystem_module.classify_filesystem(database)
+            if storage.storage_migration_required:
+                _set_health(_storage_migration_health(database, storage))
+            raise
     lease = index_module._exclusive_index_recovery_lease(timeout=30.0)
     try:
         lease.__enter__()
@@ -1927,9 +2174,15 @@ def guided_rebuild(
         _set_health(failed)
         raise UnsafeIndexRecovery(failed["message"]) from exc
     try:
-        return _guided_rebuild_locked(
-            scan_callback,
-            on_source_retired=on_source_retired,
-        )
+        try:
+            return _guided_rebuild_locked(
+                scan_callback,
+                on_source_retired=on_source_retired,
+            )
+        except UnsafeIndexRecovery:
+            storage = filesystem_module.classify_filesystem(database)
+            if storage.storage_migration_required:
+                _set_health(_storage_migration_health(database, storage))
+            raise
     finally:
         lease.__exit__(None, None, None)

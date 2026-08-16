@@ -54,9 +54,11 @@ export function IndexRecoveryScreen({
 }: IndexRecoveryScreenProps) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const storageMigrationRequired = health?.storage_migration_required === true
+    || health?.storage_risk === 'network';
 
   const startRecovery = async () => {
-    if (submitting) return;
+    if (submitting || storageMigrationRequired) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -106,6 +108,34 @@ export function IndexRecoveryScreen({
         </p>
         <Spinner text={health.message || 'Backing up and rebuilding...'} />
         <DiagnosticDetails health={health} />
+      </div>
+    );
+  } else if (
+    storageMigrationRequired
+    && (health.status === 'recovery_required' || health.status === 'unavailable')
+  ) {
+    content = (
+      <div role="alert" aria-labelledby="storage-migration-heading">
+        <h1
+          id="storage-migration-heading"
+          style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
+        >
+          Copy ClawJournal state to local storage first
+        </h1>
+        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          ClawJournal detected shared or network storage. It will not open, create, or rebuild its writable index there. Move its state to persistent local storage first.
+        </p>
+        <ol
+          aria-label="Required storage migration steps"
+          style={{ margin: '0 0 14px', paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
+        >
+          <li>Stop ClawJournal completely.</li>
+          <li>Copy the entire <code>CLAWJOURNAL_HOME</code> directory to private, persistent local storage. Keep the original unchanged until recovery succeeds.</li>
+          <li>Set <code>CLAWJOURNAL_HOME</code> to the new directory, then restart ClawJournal.</li>
+        </ol>
+        <p style={{ margin: 0, color: colors.gray600, fontSize: 13.5, lineHeight: 1.55 }}>
+          Do not copy only the index database. Review decisions, recovery data, credentials, and other state must remain together. After restart, ClawJournal will recheck the new location and offer repair only if it is still needed.
+        </p>
       </div>
     );
   } else if (health.status === 'recovery_required') {

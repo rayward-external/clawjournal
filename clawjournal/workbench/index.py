@@ -15,8 +15,7 @@ from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, BinaryIO, Iterator
 
-logger = logging.getLogger(__name__)
-
+from .. import filesystem as filesystem_module
 from ..redaction.secrets import (
     FindingsScannerProfile,
     _normalize_findings_scanner_profile,
@@ -35,12 +34,28 @@ from ..paths import ensure_install_files
 from ..pricing import estimate_cost
 from ..session_titles import append_fork_title_suffix
 
+logger = logging.getLogger(__name__)
+
 INDEX_DB = CONFIG_DIR / "index.db"
 BLOBS_DIR = CONFIG_DIR / "blobs"
 INDEX_JOURNAL_MODE = "delete"
 INDEX_CONNECTION_LEASE_FILENAME = "index-connections.lock"
 _INDEX_CONNECTION_LEASE_SLOTS = 256
 _INDEX_RECOVERY_ACCESS = threading.local()
+
+
+class UnsafeIndexStorageError(filesystem_module.UnsafeStateStorageError):
+    """The writable SQLite index is on known unsafe shared storage."""
+
+    def __init__(self, storage: filesystem_module.FilesystemInfo) -> None:
+        self.storage = storage
+        super().__init__(filesystem_module.storage_migration_message(storage))
+
+
+def _assert_safe_index_storage(database: Path) -> None:
+    storage = filesystem_module.classify_filesystem(database)
+    if storage.storage_migration_required:
+        raise UnsafeIndexStorageError(storage)
 
 
 def _set_index_recovery_access(enabled: bool) -> bool:
@@ -207,6 +222,10 @@ def open_existing_index(
 
     recovery_access = bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
     path = Path(str(INDEX_DB)) if database is None else Path(database)
+    # Even a leased read-only connection creates/truncates the coordination
+    # lock file below. Refuse every normal index open on known network storage;
+    # support diagnostics use a separate, lease-free SQLite mode=ro path.
+    _assert_safe_index_storage(path)
     marker = _index_recovery_marker_path(path)
     if marker.exists() and not recovery_access:
         raise sqlite3.DatabaseError(
@@ -990,6 +1009,10 @@ def open_index() -> sqlite3.Connection:
     if they do not already exist. Returns a connection with
     row_factory set to sqlite3.Row for dict-like access.
     """
+    # Check before creating the install directory, lock file, secrets, or
+    # database.  Known network/cluster filesystems are not safe SQLite state
+    # storage, even for the recovery worker.
+    _assert_safe_index_storage(Path(str(INDEX_DB)))
     recovery_access = bool(getattr(_INDEX_RECOVERY_ACCESS, "enabled", False))
     if _index_recovery_marker_path().exists() and not recovery_access:
         raise sqlite3.DatabaseError(

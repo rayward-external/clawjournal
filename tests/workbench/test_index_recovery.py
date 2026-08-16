@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from threading import Thread
 
 import pytest
 
+from clawjournal import filesystem as filesystem_module
 from clawjournal.workbench import index as index_module
 from clawjournal.workbench import index_recovery
 
@@ -103,6 +105,522 @@ def _scan_one_session_with_finding() -> dict[str, object]:
     finally:
         conn.close()
     return {"ok": True}
+
+
+def test_linux_mountinfo_uses_most_specific_mount_without_source_details():
+    mountinfo = "\n".join((
+        "36 25 0:32 / / rw,relatime - ext4 /dev/root rw",
+        r"40 36 0:44 / /cluster\040home rw,relatime - nfs4 "
+        r"server.example:/private/export rw",
+    ))
+
+    storage = filesystem_module._classify_linux_mountinfo(
+        Path("/cluster home/user/.clawjournal/index.db"),
+        mountinfo,
+    )
+
+    assert storage.health_fields() == {
+        "filesystem_type": "nfs4",
+        "storage_risk": "network",
+        "storage_migration_required": True,
+    }
+    assert "server.example" not in repr(storage)
+    assert "cluster home" not in repr(storage)
+
+
+def test_filesystem_classifier_does_not_resolve_a_direct_network_path(
+    monkeypatch,
+):
+    mountinfo = "\n".join((
+        "36 25 0:32 / / rw,relatime - ext4 /dev/root rw",
+        "40 36 0:44 / /cluster rw,relatime - nfs4 server:/private rw",
+    ))
+    monkeypatch.setattr(filesystem_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        filesystem_module.os.path,
+        "abspath",
+        lambda _path: "/cluster/users/alice/.clawjournal/index.db",
+    )
+    monkeypatch.setattr(
+        filesystem_module,
+        "_read_linux_mountinfo",
+        lambda: mountinfo,
+    )
+    monkeypatch.setattr(
+        filesystem_module.Path,
+        "resolve",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a directly mounted network path must not be resolved"
+        ),
+    )
+
+    storage = filesystem_module.classify_filesystem(
+        Path("/cluster/users/alice/.clawjournal/index.db")
+    )
+
+    assert storage == filesystem_module.FilesystemInfo("nfs4", "network")
+
+
+def test_filesystem_classifier_refreshes_mounts_after_resolving_symlink(
+    monkeypatch,
+):
+    initial = "36 25 0:32 / / rw,relatime - ext4 /dev/root rw"
+    refreshed = "\n".join((
+        initial,
+        "40 36 0:44 / /autofs/home rw,relatime - nfs server:/home rw",
+    ))
+    snapshots = iter((initial, refreshed))
+    monkeypatch.setattr(filesystem_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        filesystem_module,
+        "_read_linux_mountinfo",
+        lambda: next(snapshots),
+    )
+    monkeypatch.setattr(
+        filesystem_module.Path,
+        "resolve",
+        lambda *_args, **_kwargs: Path("/autofs/home/alice/index.db"),
+    )
+
+    storage = filesystem_module.classify_filesystem(Path("/home/alice/index.db"))
+
+    assert storage == filesystem_module.FilesystemInfo("nfs", "network")
+
+
+def test_filesystem_classifier_degrades_on_legacy_symlink_loop_error(
+    monkeypatch,
+):
+    mountinfo = "36 25 0:32 / / rw,relatime - ext4 /dev/root rw"
+    monkeypatch.setattr(filesystem_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        filesystem_module.os.path,
+        "abspath",
+        lambda _path: "/local/index.db",
+    )
+    monkeypatch.setattr(
+        filesystem_module,
+        "_read_linux_mountinfo",
+        lambda: mountinfo,
+    )
+    monkeypatch.setattr(
+        filesystem_module.Path,
+        "resolve",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("symlink loop")
+        ),
+    )
+
+    storage = filesystem_module.classify_filesystem(Path("/local/index.db"))
+
+    assert storage == filesystem_module.FilesystemInfo("ext4", "local")
+
+
+def test_linux_mountinfo_prefers_visible_overmount_at_same_path():
+    mountinfo = "\n".join((
+        "36 25 0:32 / / rw,relatime - ext4 /dev/root rw",
+        "40 36 0:44 / /cluster rw,relatime - ext4 /dev/local rw",
+        "57 36 0:45 / /cluster rw,relatime - nfs4 server:/cluster rw",
+    ))
+
+    storage = filesystem_module._classify_linux_mountinfo(
+        Path("/cluster/users/alice/index.db"),
+        mountinfo,
+    )
+
+    assert storage == filesystem_module.FilesystemInfo("nfs4", "network")
+
+
+def test_linux_mountinfo_never_uses_mount_id_to_hide_network_candidate():
+    mountinfo = "\n".join((
+        "36 25 0:32 / / rw,relatime - ext4 /dev/root rw",
+        "100 36 0:44 / /cluster rw,relatime - ext4 /dev/local rw",
+        "40 36 0:45 / /cluster rw,relatime - nfs server:/cluster rw",
+    ))
+
+    storage = filesystem_module._classify_linux_mountinfo(
+        Path("/cluster/users/alice/index.db"),
+        mountinfo,
+    )
+
+    assert storage == filesystem_module.FilesystemInfo("nfs", "network")
+
+
+@pytest.mark.parametrize(
+    "filesystem_type",
+    ("../../private", "evil<script>", "x" * 33, "fuse.alice_private"),
+)
+def test_malformed_filesystem_type_is_redacted_to_unknown(filesystem_type):
+    storage = filesystem_module._filesystem_info(filesystem_type)
+
+    assert storage.health_fields() == {
+        "filesystem_type": "unknown",
+        "storage_risk": "unknown",
+        "storage_migration_required": False,
+    }
+    assert filesystem_type not in repr(storage)
+
+
+@pytest.mark.parametrize(
+    ("filesystem_type", "risk"),
+    (("ext4", "local"), ("overlay", "unknown")),
+)
+def test_unknown_and_local_filesystem_kinds_are_not_blocked(
+    recovery_install,
+    monkeypatch,
+    filesystem_type,
+    risk,
+):
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo(filesystem_type, risk),
+    )
+
+    conn = index_module.open_index()
+    conn.close()
+
+    assert (recovery_install / "index.db").is_file()
+
+
+def test_missing_index_on_network_storage_fails_closed_without_creating_files(
+    recovery_install,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("nfs4", "network"),
+    )
+
+    report = index_recovery.inspect_index_health()
+
+    assert report["status"] == "unavailable"
+    assert report["code"] == "storage_migration_required"
+    assert report["filesystem_type"] == "nfs4"
+    assert report["storage_risk"] == "network"
+    assert report["storage_migration_required"] is True
+    assert report["automatic_recovery_available"] is False
+    assert "CLAWJOURNAL_HOME" in report["message"]
+    assert not (recovery_install / "index.db").exists()
+    assert not (recovery_install / "index-connections.lock").exists()
+
+
+def test_startup_health_refuses_network_storage_without_resolving_it(
+    recovery_install,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("nfs4", "network"),
+    )
+    monkeypatch.setattr(
+        index_recovery.Path,
+        "resolve",
+        lambda *_args, **_kwargs: pytest.fail(
+            "startup must not resolve a known hard-NFS path"
+        ),
+    )
+
+    report = index_recovery.begin_index_health_check()
+
+    assert report["status"] == "unavailable"
+    assert report["code"] == "storage_migration_required"
+    assert report["storage_migration_required"] is True
+
+
+def test_healthy_existing_index_on_network_storage_is_not_inspected(
+    recovery_install,
+    monkeypatch,
+):
+    conn = index_module.open_index()
+    conn.close()
+    database = recovery_install / "index.db"
+    original = database.read_bytes()
+
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("cifs", "network"),
+    )
+    monkeypatch.setattr(
+        index_recovery,
+        "_health_connection",
+        lambda _path: pytest.fail("network storage must not be opened"),
+    )
+
+    report = index_recovery.inspect_index_health()
+
+    assert report["status"] == "unavailable"
+    assert report["filesystem_type"] == "cifs"
+    assert report["storage_migration_required"] is True
+    assert database.read_bytes() == original
+
+
+def test_open_index_rejects_network_storage_before_bootstrap(
+    recovery_install,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("lustre", "network"),
+    )
+
+    with pytest.raises(index_module.UnsafeIndexStorageError) as exc_info:
+        index_module.open_index()
+
+    assert "CLAWJOURNAL_HOME" in str(exc_info.value)
+    assert "lustre" in str(exc_info.value)
+    assert not (recovery_install / "index.db").exists()
+    assert not (recovery_install / "index-connections.lock").exists()
+    assert not (recovery_install / "blobs").exists()
+
+
+def test_all_leased_index_opens_are_blocked_but_lease_free_evidence_is_readable(
+    recovery_install,
+    monkeypatch,
+):
+    database = recovery_install / "index.db"
+    recovery_install.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(database)
+    conn.execute("CREATE TABLE sample (value TEXT)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("ceph", "network"),
+    )
+
+    with pytest.raises(index_module.UnsafeIndexStorageError):
+        index_module.open_existing_index(database=database, readonly=True)
+    with pytest.raises(index_module.UnsafeIndexStorageError):
+        index_module.open_existing_index(database=database)
+
+    evidence = index_recovery._read_only_connection(database)
+    evidence.close()
+    assert not (recovery_install / "index-connections.lock").exists()
+
+
+def test_begin_guided_rebuild_rechecks_storage_before_creating_marker(
+    recovery_install,
+    monkeypatch,
+):
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "message": "Test damage",
+        "automatic_recovery_available": True,
+    })
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("sshfs", "network"),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery) as exc_info:
+        index_recovery.begin_guided_rebuild()
+
+    assert "CLAWJOURNAL_HOME" in str(exc_info.value)
+    health = index_recovery.current_index_health()
+    assert health["status"] == "unavailable"
+    assert health["code"] == "storage_migration_required"
+    assert health["storage_migration_required"] is True
+    assert not (recovery_install / index_recovery.RECOVERY_MARKER_FILENAME).exists()
+
+
+def test_direct_guided_rebuild_rechecks_storage_before_backup(
+    recovery_install,
+    monkeypatch,
+):
+    callback_called = False
+
+    def scan_callback():
+        nonlocal callback_called
+        callback_called = True
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("smbfs", "network"),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery.guided_rebuild(scan_callback)
+
+    assert callback_called is False
+    assert not (recovery_install / index_recovery.RECOVERY_MARKER_FILENAME).exists()
+    assert not (recovery_install / "index-backups").exists()
+
+
+def test_guided_rebuild_rechecks_storage_next_to_source_rw_open(
+    recovery_install,
+    monkeypatch,
+):
+    database = recovery_install / "index.db"
+    recovery_install.mkdir(parents=True, exist_ok=True)
+    original = b"damaged sqlite bytes"
+    database.write_bytes(original)
+    classification_calls = 0
+
+    def changing_storage(_path):
+        nonlocal classification_calls
+        classification_calls += 1
+        if classification_calls <= 2:
+            return filesystem_module.FilesystemInfo("ext4", "local")
+        return filesystem_module.FilesystemInfo("nfs", "network")
+
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        changing_storage,
+    )
+    monkeypatch.setattr(
+        index_recovery.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail(
+            "network storage must be rejected before SQLite opens it read/write"
+        ),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery.guided_rebuild(lambda: {"ok": True})
+
+    assert classification_calls >= 3
+    assert database.read_bytes() == original
+    assert not (recovery_install / "index-backups").exists()
+    assert index_recovery.current_index_health()["code"] == (
+        "storage_migration_required"
+    )
+    assert index_recovery._load_marker(database)["stage"] == "preparing"
+
+
+def test_remount_after_fresh_backup_preserves_live_index(
+    recovery_install,
+    monkeypatch,
+):
+    conn = index_module.open_index()
+    conn.close()
+    database = recovery_install / "index.db"
+    original = database.read_bytes()
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "automatic_recovery_available": True,
+        "message": "test recovery",
+    })
+    remounted = False
+    real_backup = index_recovery._backup_index_files
+
+    def backup_then_remount(path):
+        nonlocal remounted
+        result = real_backup(path)
+        remounted = True
+        return result
+
+    monkeypatch.setattr(index_recovery, "_backup_index_files", backup_then_remount)
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo(
+            "nfs4" if remounted else "ext4",
+            "network" if remounted else "local",
+        ),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery.guided_rebuild(
+            lambda: pytest.fail("a remounted recovery must not start scanning")
+        )
+
+    assert database.is_file()
+    assert database.read_bytes() == original
+    assert index_recovery._load_marker(database)["stage"] == "preparing"
+    assert index_recovery.current_index_health()["code"] == (
+        "storage_migration_required"
+    )
+
+
+def test_remount_after_existing_backup_snapshot_preserves_live_index(
+    recovery_install,
+    monkeypatch,
+):
+    conn = index_module.open_index()
+    conn.close()
+    database = recovery_install / "index.db"
+    original = database.read_bytes()
+    backup_name = "index-recovery-20260816T020304Z-1234abcd"
+    backup = recovery_install / "index-backups" / backup_name
+    backup.mkdir(parents=True)
+    (backup / "index.db").write_bytes(original)
+    (backup / "recovery-manifest.json").write_text("{}", encoding="utf-8")
+    index_recovery._write_marker(
+        database,
+        {
+            "version": 2,
+            "database_path": str(database.resolve()),
+            "backup_path": str(backup.resolve()),
+            "backup_directory": backup_name,
+            "stage": "failed",
+        },
+    )
+    index_recovery._set_health({
+        "status": "recovery_required",
+        "automatic_recovery_available": True,
+        "message": "retry recovery",
+    })
+    remounted = False
+    real_snapshot = index_recovery._snapshot_from_path
+
+    def snapshot_then_remount(path):
+        nonlocal remounted
+        result = real_snapshot(path)
+        remounted = True
+        return result
+
+    monkeypatch.setattr(index_recovery, "_snapshot_from_path", snapshot_then_remount)
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo(
+            "nfs" if remounted else "ext4",
+            "network" if remounted else "local",
+        ),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery.guided_rebuild(
+            lambda: pytest.fail("a remounted retry must not start scanning")
+        )
+
+    assert database.is_file()
+    assert database.read_bytes() == original
+    assert index_recovery._load_marker(database)["stage"] == "failed"
+    assert index_recovery.current_index_health()["code"] == (
+        "storage_migration_required"
+    )
+
+
+def test_remove_index_files_rechecks_storage_before_unlink(
+    recovery_install,
+    monkeypatch,
+):
+    database = recovery_install / "index.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"live index")
+    journal = Path(str(database) + "-journal")
+    journal.write_bytes(b"live journal")
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("nfs4", "network"),
+    )
+
+    with pytest.raises(index_recovery.UnsafeIndexRecovery):
+        index_recovery._remove_index_files(database)
+
+    assert database.read_bytes() == b"live index"
+    assert journal.read_bytes() == b"live journal"
 
 
 def test_initialize_new_index_uses_delete_journal(recovery_install):
@@ -348,6 +866,133 @@ def test_marker_with_missing_backup_fails_closed(recovery_install):
     assert report["status"] == "unavailable"
     assert report["automatic_recovery_available"] is False
     assert report["interrupted_recovery"] is True
+
+
+@pytest.mark.parametrize("marker_version", (1, 2))
+def test_complete_state_copy_rebases_interrupted_recovery_backup(
+    recovery_install,
+    tmp_path,
+    monkeypatch,
+    marker_version,
+):
+    old_state = recovery_install
+    database = old_state / "index.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"partial rebuilt index")
+    backup_name = "index-recovery-20260816T010203Z-abcdef12"
+    backup = old_state / "index-backups" / backup_name
+    backup.mkdir(parents=True)
+    (backup / "index.db").write_bytes(b"original index bytes")
+    (backup / "recovery-manifest.json").write_text("{}", encoding="utf-8")
+    marker = {
+        "version": marker_version,
+        "database_path": str(database.resolve()),
+        "backup_path": str(backup.resolve()),
+        "stage": "failed",
+    }
+    if marker_version == 2:
+        marker["backup_directory"] = backup_name
+    index_recovery._write_marker(database, marker)
+
+    local_state = tmp_path / "local-state"
+    shutil.copytree(old_state, local_state)
+    old_state.rename(tmp_path / "disconnected-network-state")
+    monkeypatch.setattr(index_module, "CONFIG_DIR", local_state)
+    monkeypatch.setattr(index_module, "INDEX_DB", local_state / "index.db")
+    monkeypatch.setattr(index_module, "BLOBS_DIR", local_state / "blobs")
+
+    report = index_recovery.inspect_index_health()
+
+    expected_backup = local_state / "index-backups" / backup_name
+    assert report["status"] == "recovery_required"
+    assert report["automatic_recovery_available"] is True
+    assert Path(report["backup_path"]) == expected_backup.resolve()
+    assert (expected_backup / "index.db").read_bytes() == b"original index bytes"
+
+    result = index_recovery.guided_rebuild(_scan_one_session)
+
+    assert result["status"] == "ready"
+    assert Path(result["backup_path"]) == expected_backup.resolve()
+    assert not (
+        local_state / index_recovery.RECOVERY_MARKER_FILENAME
+    ).exists()
+    rebuilt = index_module.open_index()
+    try:
+        assert rebuilt.execute(
+            "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+            ("session-recovery",),
+        ).fetchone()[0] == 1
+    finally:
+        rebuilt.close()
+
+
+def test_v2_marker_rejects_non_generated_backup_identity(recovery_install):
+    database = recovery_install / "index.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"partial rebuilt index")
+    index_recovery._write_marker(
+        database,
+        {
+            "version": 2,
+            "backup_directory": "../outside",
+            "stage": "failed",
+        },
+    )
+
+    report = index_recovery.inspect_index_health()
+
+    assert report["status"] == "unavailable"
+    assert report["automatic_recovery_available"] is False
+    assert report["interrupted_recovery"] is True
+
+
+def test_unknown_recovery_marker_version_fails_closed(recovery_install):
+    database = recovery_install / "index.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"partial rebuilt index")
+    backup = recovery_install / "index-backups" / "legacy-backup"
+    backup.mkdir(parents=True)
+    (backup / "index.db").write_bytes(b"original index")
+    index_recovery._write_marker(
+        database,
+        {
+            "version": 999,
+            "backup_path": str(backup),
+            "stage": "failed",
+        },
+    )
+
+    report = index_recovery.inspect_index_health()
+
+    assert report["status"] == "unavailable"
+    assert report["automatic_recovery_available"] is False
+    assert "version is unsupported" in report["detail"]
+
+
+def test_backup_root_symlink_cannot_escape_state_directory(
+    recovery_install,
+    tmp_path,
+):
+    database = recovery_install / "index.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"damaged index")
+    outside = tmp_path / "outside-backups"
+    outside.mkdir()
+    try:
+        (recovery_install / "index-backups").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+    except OSError:
+        pytest.skip("directory symlinks are not available on this platform")
+
+    with pytest.raises(
+        index_recovery.UnsafeIndexRecovery,
+        match="outside the ClawJournal state root",
+    ):
+        index_recovery._backup_index_files(database)
+
+    assert list(outside.iterdir()) == []
 
 
 def test_marker_with_only_sidecar_backup_fails_closed(recovery_install):
@@ -651,6 +1296,62 @@ def test_marker_transition_refreshes_cached_health(recovery_install):
     (recovery_install / index_recovery.RECOVERY_MARKER_FILENAME).unlink()
     resumed = index_recovery.synchronize_index_health()
     assert resumed["status"] == "ready"
+
+
+def test_runtime_network_remount_replaces_cached_ready_health(
+    recovery_install,
+    monkeypatch,
+):
+    index_recovery._set_health({
+        "status": "ready",
+        "message": "cached local health",
+        "storage_risk": "local",
+        "storage_migration_required": False,
+    })
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("nfs4", "network"),
+    )
+    monkeypatch.setattr(
+        index_recovery,
+        "recovery_marker_exists",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a network remount must fail closed before marker inspection"
+        ),
+    )
+
+    blocked = index_recovery.synchronize_index_health()
+
+    assert blocked["status"] == "unavailable"
+    assert blocked["code"] == "storage_migration_required"
+    assert blocked["storage_risk"] == "network"
+    assert blocked["storage_migration_required"] is True
+    assert index_recovery.current_index_health() == blocked
+
+
+def test_unknown_storage_does_not_clear_cached_network_block(
+    recovery_install,
+    monkeypatch,
+):
+    blocked = index_recovery._set_health({
+        "status": "unavailable",
+        "code": "storage_migration_required",
+        "storage_risk": "network",
+        "storage_migration_required": True,
+    })
+    monkeypatch.setattr(
+        filesystem_module,
+        "classify_filesystem",
+        lambda _path: filesystem_module.FilesystemInfo("unknown", "unknown"),
+    )
+    monkeypatch.setattr(
+        index_recovery,
+        "initialize_index_health",
+        lambda: pytest.fail("unknown storage must not clear a network block"),
+    )
+
+    assert index_recovery.synchronize_index_health() == blocked
 
 
 def test_legacy_enrollment_scope_is_restored_paused():

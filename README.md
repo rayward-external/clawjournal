@@ -171,6 +171,8 @@ clawjournal skill --install-nudge        # opt in to a stale-lessons SessionStar
 clawjournal skill --uninstall-nudge      # disable that reminder and its context output
 clawjournal share --interactive --weekly --no-score # guided sharing without AI scoring
 clawjournal status                       # check your setup
+clawjournal --version                    # show the package version and checkout revision
+clawjournal doctor index --json          # collect bounded, path-free index diagnostics
 clawjournal selfupdate --check           # see whether a newer version is available
 clawjournal selfupdate --reinstall       # update and rerun the installer in one step
 clawjournal selfupdate --reinstall --with-frontend --with-sharing # also add UI + managed scanners
@@ -188,11 +190,24 @@ background process and follow the SSH tunnel instructions it prints.
 
 On a cluster or another machine whose home directory is on a shared/network
 filesystem, set `CLAWJOURNAL_HOME` to a private, persistent local-filesystem
-directory before first use. For an existing install, stop ClawJournal and move
+directory before first use. For an existing install, stop ClawJournal and copy
 the whole state directory together (index, review state, tokens, and local trace
-copies) before setting the variable; setting it alone selects a separate state
+copies), keeping the original unchanged until recovery succeeds, before setting
+the variable; setting it alone selects a separate state
 root. For example, use `export CLAWJOURNAL_HOME=/local/path/clawjournal` on
 macOS/Linux or `$env:CLAWJOURNAL_HOME='D:\local\clawjournal'` in PowerShell.
+ClawJournal refuses to create, open, or rebuild its mutable SQLite index when it
+can positively identify the state directory as a network filesystem. Unknown
+filesystem types keep the existing behavior, so cluster users should still
+confirm the target with their administrator. Do not use an ephemeral node-local
+temporary directory for state that must survive a reboot or job migration.
+
+`clawjournal doctor index --json` is read-only and does not require the external
+`sqlite3` command. Its output is deliberately bounded and omits state paths,
+mount sources, hostnames, usernames, and session content, so it can be reviewed
+before attaching it to a support report. On known network storage or while live
+SQLite sidecars are present, it reports that condition without opening the
+database. Do not attach `index.db` itself.
 
 `clawjournal skill` uses one optional AI distill call to propose up to five
 coding-agent lessons. Its preview names one human-facing weekly focus only when a
