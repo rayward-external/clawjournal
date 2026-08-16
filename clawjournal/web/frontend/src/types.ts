@@ -263,6 +263,52 @@ export interface Features {
   index_health: IndexHealth;
 }
 
+/**
+ * The privacy-bounded subset accepted by the bug-report UI. The browser
+ * constructs this value with a strict allowlist instead of trusting the raw
+ * daemon response.
+ */
+export interface SupportContext {
+  support_context_schema_version: 1;
+  kind: 'workbench';
+  package: {
+    version: string;
+    revision: string | null;
+  };
+  runtime: {
+    python_version: string;
+    sqlite_version: string;
+    os_family: 'Linux' | 'Windows' | 'macOS' | 'FreeBSD' | 'unknown';
+    os_release: string;
+    architecture: 'x86' | 'x86_64' | 'arm64' | 'ppc64le' | 'riscv64' | 's390x' | 'unknown';
+  };
+  schema: {
+    expected_user_version: number | null;
+  };
+  storage: {
+    filesystem_type: string;
+    storage_risk: 'network' | 'local' | 'unknown';
+    storage_migration_required: boolean;
+  };
+  index: {
+    status: 'ready' | 'checking' | 'recovery_required' | 'rebuilding' | 'unavailable' | 'unknown';
+    condition: 'storage_migration_required' | 'interrupted_recovery' | 'recovery_required' | 'unavailable' | null;
+  };
+  collection: {
+    status: 'complete' | 'partial';
+    unavailable_sections: Array<
+      | 'package_version'
+      | 'package_revision'
+      | 'runtime_python'
+      | 'runtime_sqlite'
+      | 'runtime_os'
+      | 'runtime_architecture'
+      | 'expected_schema'
+      | 'cached_index_health'
+    >;
+  };
+}
+
 export interface WorkbenchConfig {
   source: string | null;
   projects_confirmed: boolean;

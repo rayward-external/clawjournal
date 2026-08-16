@@ -150,6 +150,7 @@ If you are unsure at any point, stop before **Submit**. Your review and package 
 ## Privacy in plain English
 
 - **Local by default.** Scanning and reviewing create a local index and local copies of your agent sessions. Those copies can contain the original text.
+- **Problem reports start as local drafts.** **Report a problem** does not capture your screen, upload a report, or put its text in a URL. It builds an editable in-memory draft from your description and a small allowlist of path-free diagnostics, then lets you copy or download it before opening a blank GitHub issue.
 - **Index recovery is backup-first.** The workbench checks its local SQLite index at startup. If the index is damaged, database-backed work and uploads stay stopped while the UI offers one guided action that backs up the old index before rebuilding it from the original agent logs.
 - **AI features are optional.** If you enable them, ClawJournal removes home-folder paths and usernames locally first. The remaining session text is sent to the AI service you choose and may still contain identifying details.
 - **Sharing has safety checks.** Redaction and secret scans run before a package can be submitted. One scanner may contact a credential provider to check whether a suspected secret is live. A missing or failed required scan blocks sharing.

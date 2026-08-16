@@ -55,6 +55,35 @@ describe('index recovery API', () => {
   });
 });
 
+describe('support context API', () => {
+  afterEach(() => {
+    delete window.__CLAWJOURNAL_API_TOKEN__;
+    vi.unstubAllGlobals();
+  });
+
+  it('uses the authenticated DB-free endpoint and forwards its abort signal', async () => {
+    window.__CLAWJOURNAL_API_TOKEN__ = 'support-context-token';
+    const payload = {
+      support_context_schema_version: 1,
+      kind: 'workbench',
+      collection: { status: 'partial', unavailable_sections: ['cached_index_health'] },
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    await expect(api.support.context(controller.signal)).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith('/api/support-context', {
+      headers: { Authorization: 'Bearer support-context-token' },
+      signal: controller.signal,
+    });
+  });
+});
+
 describe('automatic-upload API normalization', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

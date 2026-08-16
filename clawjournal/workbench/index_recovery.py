@@ -375,6 +375,23 @@ def current_index_health() -> dict[str, Any]:
         return dict(_INDEX_HEALTH)
 
 
+def try_current_index_health() -> dict[str, Any] | None:
+    """Return the cached health without waiting for recovery I/O.
+
+    Guided recovery deliberately holds ``_STATE_LOCK`` across parts of its
+    state transition. Support-report drafting must remain responsive even if
+    that work is blocked on storage, so its read path treats a busy lock as an
+    unavailable optional section instead of waiting.
+    """
+
+    if not _STATE_LOCK.acquire(blocking=False):
+        return None
+    try:
+        return dict(_INDEX_HEALTH)
+    finally:
+        _STATE_LOCK.release()
+
+
 def begin_index_health_check() -> dict[str, Any]:
     """Publish the fail-closed startup state before HTTP begins serving."""
 

@@ -6,13 +6,19 @@ interface State {
   message: string;
 }
 
+interface ErrorBoundaryProps {
+  children: ReactNode;
+  /** Reports only that a render failure occurred; raw error data stays local. */
+  onError?: () => void;
+}
+
 /**
  * App-wide error boundary. A render-time exception anywhere in the tree would
  * otherwise white-screen the workbench; this shows a styled fallback with the
  * error message and a reload affordance instead. Must be a class component —
  * React error boundaries cannot be function components.
  */
-export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
+export class ErrorBoundary extends Component<ErrorBoundaryProps, State> {
   state: State = { hasError: false, message: '' };
 
   static getDerivedStateFromError(err: unknown): State {
@@ -21,6 +27,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
 
   componentDidCatch(err: unknown): void {
     console.error('ClawJournal UI error:', err);
+    this.props.onError?.();
   }
 
   render(): ReactNode {
