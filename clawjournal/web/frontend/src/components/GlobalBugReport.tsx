@@ -51,12 +51,12 @@ const launcherStyle: CSSProperties = {
 function BugReportLauncher({ surface }: { surface: BugReportSurface }) {
   const [open, setOpen] = useState(false);
   return (
-    <>
+    <div data-support-capture-exclude>
       <button type="button" onClick={() => setOpen(true)} style={launcherStyle}>
         Report a problem
       </button>
       <BugReportDialog open={open} onClose={() => setOpen(false)} surface={surface} />
-    </>
+    </div>
   );
 }
 

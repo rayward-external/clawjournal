@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import multiprocessing
 import stat
+import struct
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +58,59 @@ def _enqueue(capability, markdown="# Exact\n\n用户正文 🐾"):
     )
 
 
+def _png() -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", 2, 1, 8, 6, 0, 0, 0)
+    pixels = bytes((255, 0, 0, 255, 0, 0, 255, 255))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00" + pixels))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _with_screenshots(capability):
+    return support_reports.SupportCapability(
+        **{
+            **capability.__dict__,
+            "screenshots": support_reports.SupportScreenshotCapability(
+                upload_url=(
+                    "https://support.example.test/api/support/v1/reports/"
+                    "{client_report_id}/screenshot"
+                ),
+                max_input_bytes=2 * 1024 * 1024,
+                max_output_bytes=2 * 1024 * 1024,
+                max_width=4096,
+                max_height=4096,
+                max_pixels=4 * 1024 * 1024,
+                sanitizer_version="png-rgb-v1",
+            ),
+        }
+    )
+
+
+def _enqueue_screenshot(capability, png: bytes | None = None):
+    png = png or _png()
+    return support_reports.enqueue_report(
+        report_markdown="# Screenshot report",
+        accepted_terms_version=capability.terms_version,
+        accepted_retention_policy_version=capability.retention_policy_version,
+        capability=capability,
+        screenshot_png_base64=base64.b64encode(png).decode("ascii"),
+        screenshot_source_sha256=hashlib.sha256(png).hexdigest(),
+        screenshot_width=2,
+        screenshot_height=1,
+    )
+
+
 def _receipt(record):
     return {
         "schema_version": 1,
@@ -68,6 +124,331 @@ def _receipt(record):
         "delete_url": "/private",
         "idempotent_replay": False,
     }
+
+
+def _screenshot_receipt(record):
+    response = _receipt(record)
+    response["screenshot"] = {
+        "source_sha256": record["screenshot"]["source_sha256"],
+        "sanitized_sha256": "a" * 64,
+        "width": 2,
+        "height": 1,
+        "sanitized_bytes": 70,
+        "sanitizer_version": "png-rgb-v1",
+        "created_at": "2026-08-16T00:00:01Z",
+    }
+    return response
+
+
+def test_screenshot_outbox_posts_intent_then_exact_png_and_minimizes_bytes(
+    outbox, capability, monkeypatch
+):
+    capability = _with_screenshots(capability)
+    png = _png()
+    record = _enqueue_screenshot(capability, png)
+    stored_path = outbox / f"{record['client_report_id']}.png"
+    assert stored_path.read_bytes() == png
+    assert record["outbox_schema_version"] == 2
+    assert record["screenshot"]["state"] == "queued"
+    assert support_reports.public_status(record)["screenshot"]["source_sha256"] == hashlib.sha256(png).hexdigest()
+    assert base64.b64encode(png).decode("ascii") not in json.dumps(
+        support_reports.public_status(record)
+    )
+
+    post_calls = []
+    put_calls = []
+
+    def request(url, **kwargs):
+        post_calls.append((url, kwargs))
+        return 201, {**_receipt(record), "screenshot": None}
+
+    def put(current_record, screenshot, exact_png, **kwargs):
+        put_calls.append((current_record, screenshot, exact_png, kwargs))
+        return 201, _screenshot_receipt(current_record)
+
+    monkeypatch.setattr(support_reports, "_request_json", request)
+    monkeypatch.setattr(support_reports, "_request_png", put)
+    accepted = support_reports.deliver_report(record["client_report_id"])
+
+    assert accepted["state"] == "accepted"
+    assert accepted["screenshot"]["state"] == "accepted"
+    assert accepted["screenshot"]["receipt"]["source_sha256"] == hashlib.sha256(png).hexdigest()
+    assert not stored_path.exists()
+    assert post_calls[0][1]["payload"]["screenshot_source_sha256"] == hashlib.sha256(png).hexdigest()
+    assert put_calls[0][2] == png
+    assert "manage_secret" not in json.dumps(support_reports.public_status(accepted))
+
+
+def test_ambiguous_screenshot_put_recovers_by_receipt_hash_after_restart(
+    outbox, capability, monkeypatch
+):
+    capability = _with_screenshots(capability)
+    png = _png()
+    record = _enqueue_screenshot(capability, png)
+    identifier = record["client_report_id"]
+    requests = []
+
+    def request(url, **kwargs):
+        requests.append((url, kwargs))
+        if kwargs.get("method") == "POST":
+            return 201, {**_receipt(record), "screenshot": None}
+        return 200, _screenshot_receipt(support_reports.load_report(identifier))
+
+    put_count = 0
+
+    def ambiguous_put(*_args, **_kwargs):
+        nonlocal put_count
+        put_count += 1
+        raise support_reports.SupportReportError(
+            "support_service_unavailable",
+            "temporary",
+            status=502,
+            retryable=True,
+            ambiguous=True,
+        )
+
+    monkeypatch.setattr(support_reports, "_request_json", request)
+    monkeypatch.setattr(support_reports, "_request_png", ambiguous_put)
+    uncertain = support_reports.deliver_report(identifier)
+    assert uncertain["state"] == "accepted"
+    assert uncertain["screenshot"]["state"] == "ambiguous"
+    assert (outbox / f"{identifier}.png").read_bytes() == png
+    assert identifier in support_reports.list_pending_report_ids()
+
+    # Simulate the next daemon process after the scheduled retry becomes due.
+    monkeypatch.setattr(support_reports, "_screenshot_attempt_due", lambda _record: True)
+    support_reports.recover_pending_reports()
+    recovered = support_reports.load_report(identifier)
+    assert recovered["screenshot"]["state"] == "accepted"
+    assert put_count == 1
+    assert not (outbox / f"{identifier}.png").exists()
+    assert any(call[1].get("method") is None for call in requests[1:])
+
+
+def test_screenshot_requires_open_capability_and_delete_removes_exact_local_file(
+    outbox, capability
+):
+    png = _png()
+    with pytest.raises(support_reports.SupportReportError) as error:
+        _enqueue_screenshot(capability, png)
+    assert error.value.code == "support_screenshots_closed"
+    assert not outbox.exists()
+
+    capability = _with_screenshots(capability)
+    record = _enqueue_screenshot(capability, png)
+    assert (outbox / f"{record['client_report_id']}.png").exists()
+    deleted = support_reports.delete_report(record["client_report_id"])
+    assert deleted["state"] == "deleted"
+    assert not list(outbox.glob(f"{record['client_report_id']}.*"))
+
+
+@pytest.mark.parametrize(
+    ("encoded", "digest", "width", "expected_code"),
+    [
+        ("not base64", "0" * 64, 2, "invalid_screenshot"),
+        (base64.b64encode(_png()).decode("ascii"), "0" * 64, 2, "screenshot_hash_mismatch"),
+        (base64.b64encode(_png()).decode("ascii"), hashlib.sha256(_png()).hexdigest(), 3, "invalid_screenshot"),
+    ],
+)
+def test_screenshot_local_validation_fails_before_outbox(
+    outbox, capability, encoded, digest, width, expected_code
+):
+    capability = _with_screenshots(capability)
+    with pytest.raises(support_reports.SupportReportError) as error:
+        support_reports.enqueue_report(
+            report_markdown="# report",
+            accepted_terms_version=capability.terms_version,
+            accepted_retention_policy_version=capability.retention_policy_version,
+            capability=capability,
+            screenshot_png_base64=encoded,
+            screenshot_source_sha256=digest,
+            screenshot_width=width,
+            screenshot_height=1,
+        )
+    assert error.value.code == expected_code
+    assert not outbox.exists()
+
+
+def test_queued_screenshot_ttl_removes_png_and_never_attempts_egress(
+    outbox, capability, monkeypatch
+):
+    capability = _with_screenshots(capability)
+    record = _enqueue_screenshot(capability)
+    identifier = record["client_report_id"]
+    record["screenshot"]["local_expires_at"] = "2026-08-15T00:00:00Z"
+    support_reports._atomic_write_record(record)
+    monkeypatch.setattr(
+        support_reports,
+        "_request_json",
+        lambda *_args, **_kwargs: pytest.fail("expired queued bytes must not egress"),
+    )
+    monkeypatch.setattr(
+        support_reports,
+        "_request_png",
+        lambda *_args, **_kwargs: pytest.fail("expired queued bytes must not egress"),
+    )
+
+    with pytest.raises(support_reports.SupportReportError) as error:
+        support_reports.deliver_report(identifier)
+    assert error.value.code == "report_not_found"
+    assert not list(outbox.glob(f"{identifier}.*"))
+
+
+def test_accepted_parent_ambiguous_screenshot_ttl_forgets_png_then_recovers_delete(
+    outbox, capability, monkeypatch
+):
+    capability = _with_screenshots(capability)
+    record = _enqueue_screenshot(capability)
+    identifier = record["client_report_id"]
+
+    def post(url, **kwargs):
+        assert kwargs.get("method") == "POST"
+        return 201, {**_receipt(record), "screenshot": None}
+
+    monkeypatch.setattr(support_reports, "_request_json", post)
+    monkeypatch.setattr(
+        support_reports,
+        "_request_png",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            support_reports.SupportReportError(
+                "support_service_unavailable",
+                "temporary",
+                status=502,
+                retryable=True,
+                ambiguous=True,
+            )
+        ),
+    )
+    uncertain = support_reports.deliver_report(identifier)
+    assert uncertain["state"] == "accepted"
+    assert uncertain["screenshot"]["state"] == "ambiguous"
+    uncertain["screenshot"]["local_expires_at"] = "2026-08-15T00:00:00Z"
+    support_reports._atomic_write_record(uncertain)
+
+    monkeypatch.setattr(
+        support_reports,
+        "_request_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            support_reports.SupportReportError(
+                "support_service_unavailable",
+                "temporary",
+                status=502,
+                retryable=True,
+                ambiguous=False,
+            )
+        ),
+    )
+    retained = support_reports.deliver_report(identifier)
+    assert retained["state"] == "ambiguous"
+    assert retained["plaintext_expired"] is True
+    assert retained["screenshot"]["state"] == "rejected"
+    assert retained["screenshot"]["message_code"] == "local_screenshot_expired"
+    assert retained["manage_secret"] == record["manage_secret"]
+    assert not (outbox / f"{identifier}.png").exists()
+    assert support_reports.load_report(identifier)["screenshot"]["state"] == "rejected"
+
+    calls = []
+
+    def delete_remote(url, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("method") == "DELETE":
+            return 200, {
+                "schema_version": 1,
+                "client_report_id": identifier,
+                "status": "deleted",
+            }
+        return 200, _receipt(retained)
+
+    monkeypatch.setattr(support_reports, "_request_json", delete_remote)
+    with pytest.raises(support_reports.SupportReportError) as error:
+        support_reports.deliver_report(identifier)
+    assert error.value.code == "report_not_found"
+    assert [call.get("method") for call in calls] == [None, "DELETE"]
+    assert all(call["manage_secret"] == record["manage_secret"] for call in calls)
+    assert not list(outbox.glob(f"{identifier}.*"))
+
+
+def test_expiry_crash_point_record_reloads_and_restart_removes_png(
+    outbox, capability, monkeypatch
+):
+    capability = _with_screenshots(capability)
+    record = _enqueue_screenshot(capability)
+    identifier = record["client_report_id"]
+    record.update({
+        "state": "accepted",
+        "attempt_count": 1,
+        "next_attempt_at": None,
+        "report_markdown": None,
+        "receipt_id": "support_receipt_123",
+        "expires_at": "2026-09-15T00:00:00Z",
+    })
+    record["screenshot"]["state"] = "ambiguous"
+    record["screenshot"]["attempt_count"] = 1
+    record["screenshot"]["local_expires_at"] = "2026-08-15T00:00:00Z"
+    support_reports._atomic_write_record(record)
+    original_unlink = support_reports._unlink_local_screenshot
+    monkeypatch.setattr(
+        support_reports,
+        "_unlink_local_screenshot",
+        lambda _identifier: (_ for _ in ()).throw(SystemExit("crash after record fsync")),
+    )
+    with pytest.raises(SystemExit):
+        support_reports._expire_screenshot_locked(record, attempt_remote=False)
+
+    persisted = support_reports.load_report(identifier)
+    assert persisted["state"] == "ambiguous"
+    assert persisted["plaintext_expired"] is True
+    assert persisted["message_code"] == "local_pending_expired"
+    assert persisted["screenshot"]["message_code"] == "local_screenshot_expired"
+    assert (outbox / f"{identifier}.png").exists()
+
+    monkeypatch.setattr(support_reports, "_unlink_local_screenshot", original_unlink)
+    monkeypatch.setattr(
+        support_reports,
+        "_request_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            support_reports.SupportReportError(
+                "support_service_unavailable",
+                "temporary",
+                status=502,
+                retryable=True,
+            )
+        ),
+    )
+    recovered = support_reports.deliver_report(identifier)
+    assert recovered["manage_secret"] == record["manage_secret"]
+    assert not (outbox / f"{identifier}.png").exists()
+    assert support_reports.load_report(identifier)["state"] == "ambiguous"
+
+
+def test_bounded_orphan_cleanup_respects_grace_and_valid_pending_record(
+    outbox, capability
+):
+    capability = _with_screenshots(capability)
+    valid = _enqueue_screenshot(capability)
+    valid_png = outbox / f"{valid['client_report_id']}.png"
+    old_epoch = time.time() - 10_000
+    support_reports.os.utime(valid_png, (old_epoch, old_epoch))
+
+    orphan_id = "00000000-0000-4000-8000-000000000099"
+    orphan = outbox / f"{orphan_id}.png"
+    orphan.write_bytes(_png())
+    temporary = outbox / ".support-screenshot-crash.tmp"
+    temporary.write_bytes(b"private partial bytes")
+    recent = outbox / "00000000-0000-4000-8000-000000000098.png"
+    recent.write_bytes(_png())
+    for path in (orphan, temporary):
+        support_reports.os.utime(path, (old_epoch, old_epoch))
+
+    removed = support_reports.cleanup_orphaned_screenshot_files(
+        now_epoch=time.time(),
+        grace_seconds=60,
+    )
+    assert removed == 2
+    assert valid_png.exists()
+    assert recent.exists()
+    assert not orphan.exists()
+    assert not temporary.exists()
 
 
 def test_enqueue_persists_exact_markdown_and_private_secret(outbox, capability):
@@ -89,6 +470,22 @@ def test_enqueue_persists_exact_markdown_and_private_secret(outbox, capability):
         if support_reports.os.name != "nt":
             assert stat.S_IMODE(outbox.stat().st_mode) == 0o700
             assert stat.S_IMODE(next(outbox.glob("*.json")).stat().st_mode) == 0o600
+
+
+def test_v1_text_only_outbox_records_remain_recoverable(outbox, capability):
+    record = _enqueue(capability, "# legacy pending")
+    path = outbox / f"{record['client_report_id']}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["outbox_schema_version"] = 1
+    raw.pop("screenshot")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    if support_reports.os.name != "nt":
+        path.chmod(0o600)
+
+    loaded = support_reports.load_report(record["client_report_id"])
+    assert loaded["outbox_schema_version"] == 2
+    assert loaded["screenshot"] is None
+    assert loaded["report_markdown"] == "# legacy pending"
 
 
 def test_enqueue_enforces_utf8_byte_limit_not_character_count(outbox, capability):
@@ -482,8 +879,9 @@ def test_public_listing_is_newest_first_and_never_exposes_private_fields(
         "receipt_id",
         "message",
         "created_at",
-        "expires_at",
-    }
+            "expires_at",
+            "screenshot",
+        }
 
 
 def test_public_listing_skips_corrupt_and_symlink_entries(
@@ -692,6 +1090,63 @@ def test_discovery_fetches_strict_versioned_terms(monkeypatch):
     assert result.max_report_bytes == support_reports.SUPPORT_REPORT_LOCAL_MAX_BYTES
     assert result.reports_url == "https://support.example.test/api/support/v1/reports"
     assert result.terms_version == "terms-v1"
+    assert result.screenshots is None
+
+
+def test_discovery_additively_validates_open_screenshot_capability(monkeypatch):
+    discovery = {
+        "support_reports": {
+            "api_version": 1,
+            "open": True,
+            "reports_url": "/api/support/v1/reports",
+            "report_lookup_url": "/api/support/v1/reports/{client_report_id}",
+            "terms_url": "/api/support/v1/terms",
+            "max_report_bytes": 64 * 1024,
+            "screenshots": {
+                "api_version": 1,
+                "open": True,
+                "upload_url": "/api/support/v1/reports/{client_report_id}/screenshot",
+                "content_type": "image/png",
+                "max_input_bytes": 2 * 1024 * 1024,
+                "max_output_bytes": 2 * 1024 * 1024,
+                "max_width": 4096,
+                "max_height": 4096,
+                "max_pixels": 4 * 1024 * 1024,
+                "sanitizer_version": "png-rgb-v1",
+            },
+        }
+    }
+    monkeypatch.setattr(
+        support_reports,
+        "_request_json",
+        lambda *_args, **_kwargs: (
+            200,
+            {
+                "schema_version": 1,
+                "purpose": "Private troubleshooting only.",
+                "terms_version": "terms-v2",
+                "retention_policy_version": "retention-v2",
+                "terms_text": "Terms including optional screenshots.",
+                "retention_text": "Thirty days.",
+            },
+        ),
+    )
+    result = support_reports.discover_capability(
+        discovery,
+        origin="https://support.example.test",
+    )
+    assert result.screenshots is not None
+    assert result.screenshots.upload_url == (
+        "https://support.example.test/api/support/v1/reports/"
+        "{client_report_id}/screenshot"
+    )
+    assert result.as_ui_payload()["screenshots"]["available"] is True
+
+    discovery["support_reports"]["screenshots"] = {"open": False, "bad": "ignored"}
+    assert support_reports.discover_capability(
+        discovery,
+        origin="https://support.example.test",
+    ).screenshots is None
 
 
 def test_loopback_protocol_sends_exact_markdown_and_secret_header(outbox):

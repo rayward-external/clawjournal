@@ -3,6 +3,8 @@ import type {
   SupportReportListResponse,
   SupportReportState,
   SupportReportStatus,
+  SupportScreenshotCapability,
+  SupportScreenshotStatus,
 } from './types.ts';
 
 // Capability discovery may make two bounded 15-second hosted requests through
@@ -23,6 +25,50 @@ function boundedString(value: unknown, maxLength: number, allowEmpty = false): s
   return trimmed || allowEmpty ? trimmed : null;
 }
 
+const UNAVAILABLE_SCREENSHOTS: SupportScreenshotCapability = {
+  available: false,
+  content_type: 'image/png',
+  max_input_bytes: 0,
+  max_output_bytes: 0,
+  max_width: 0,
+  max_height: 0,
+  max_pixels: 0,
+  sanitizer_version: '',
+};
+
+function projectScreenshotCapability(value: unknown): SupportScreenshotCapability {
+  const raw = record(value);
+  if (!raw || raw.available !== true) return { ...UNAVAILABLE_SCREENSHOTS };
+  const sanitizerVersion = boundedString(raw.sanitizer_version, 128);
+  const numeric = [
+    raw.max_input_bytes,
+    raw.max_output_bytes,
+    raw.max_width,
+    raw.max_height,
+    raw.max_pixels,
+  ];
+  if (
+    raw.content_type !== 'image/png'
+    || !sanitizerVersion
+    || numeric.some(candidate => !Number.isInteger(candidate) || (candidate as number) <= 0)
+    || (raw.max_input_bytes as number) > 2 * 1024 * 1024
+    || (raw.max_output_bytes as number) > 2 * 1024 * 1024
+    || (raw.max_width as number) > 4096
+    || (raw.max_height as number) > 4096
+    || (raw.max_pixels as number) > 4 * 1024 * 1024
+  ) return { ...UNAVAILABLE_SCREENSHOTS };
+  return {
+    available: true,
+    content_type: 'image/png',
+    max_input_bytes: raw.max_input_bytes as number,
+    max_output_bytes: raw.max_output_bytes as number,
+    max_width: raw.max_width as number,
+    max_height: raw.max_height as number,
+    max_pixels: raw.max_pixels as number,
+    sanitizer_version: sanitizerVersion,
+  };
+}
+
 /** Treat capability data as untrusted even though it came through the local daemon. */
 export function projectSupportReportCapability(value: unknown): SupportReportCapability | null {
   const raw = record(value);
@@ -39,6 +85,7 @@ export function projectSupportReportCapability(value: unknown): SupportReportCap
       terms_text: '',
       retention_text: '',
       max_report_bytes: 0,
+      screenshots: projectScreenshotCapability(raw.screenshots),
       message,
     };
   }
@@ -63,6 +110,7 @@ export function projectSupportReportCapability(value: unknown): SupportReportCap
     terms_text: termsText,
     retention_text: retentionText,
     max_report_bytes: maxReportBytes as number,
+    screenshots: projectScreenshotCapability(raw.screenshots),
     message,
   };
 }
@@ -110,6 +158,9 @@ export function isSupportReportStatus(value: unknown): value is SupportReportSta
     typeof raw.expires_at === 'string'
     && raw.expires_at.length <= 64 && Number.isFinite(Date.parse(raw.expires_at))
   );
+  const screenshotIsSafe = raw.screenshot === undefined
+    || raw.screenshot === null
+    || projectSupportScreenshotStatus(raw.screenshot) !== null;
   return (
     typeof raw.client_report_id === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw.client_report_id)
@@ -117,7 +168,54 @@ export function isSupportReportStatus(value: unknown): value is SupportReportSta
     && messageIsSafe
     && createdAtIsSafe
     && expiresAtIsSafe
+    && screenshotIsSafe
   );
+}
+
+function projectSupportScreenshotStatus(value: unknown): SupportScreenshotStatus | null {
+  const raw = record(value);
+  if (!raw || !Object.hasOwn(SUPPORT_REPORT_STATE_PRESENTATION, String(raw.state))) return null;
+  const digest = (candidate: unknown) => typeof candidate === 'string'
+    && /^[0-9a-f]{64}$/.test(candidate);
+  const positiveInteger = (candidate: unknown, maximum: number) => Number.isInteger(candidate)
+    && (candidate as number) > 0 && (candidate as number) <= maximum;
+  const nullableDigest = raw.sanitized_sha256 === null || digest(raw.sanitized_sha256);
+  const nullableBytes = raw.sanitized_bytes === null
+    || positiveInteger(raw.sanitized_bytes, 2 * 1024 * 1024);
+  const nullableVersion = raw.sanitizer_version === null || (
+    typeof raw.sanitizer_version === 'string'
+    && raw.sanitizer_version.length > 0
+    && raw.sanitizer_version.length <= 128
+  );
+  const message = raw.message === null || (
+    typeof raw.message === 'string' && raw.message.length <= 500
+  );
+  if (
+    !Object.hasOwn(SUPPORT_REPORT_STATE_PRESENTATION, String(raw.state))
+    || !digest(raw.source_sha256)
+    || !positiveInteger(raw.source_bytes, 2 * 1024 * 1024)
+    || !positiveInteger(raw.width, 4096)
+    || !positiveInteger(raw.height, 4096)
+    || (raw.width as number) * (raw.height as number) > 4 * 1024 * 1024
+    || !message || !nullableDigest || !nullableBytes || !nullableVersion
+  ) return null;
+  const accepted = raw.state === 'accepted';
+  if (accepted !== (
+    raw.sanitized_sha256 !== null
+    && raw.sanitized_bytes !== null
+    && raw.sanitizer_version !== null
+  )) return null;
+  return {
+    state: raw.state as SupportScreenshotStatus['state'],
+    source_sha256: raw.source_sha256 as string,
+    source_bytes: raw.source_bytes as number,
+    width: raw.width as number,
+    height: raw.height as number,
+    message: raw.message as string | null,
+    sanitized_sha256: raw.sanitized_sha256 as string | null,
+    sanitized_bytes: raw.sanitized_bytes as number | null,
+    sanitizer_version: raw.sanitizer_version as string | null,
+  };
 }
 
 /** Copy only the public receipt fields from one untrusted daemon response. */
@@ -135,6 +233,9 @@ export function projectSupportReportStatus(
     message: value.message,
     created_at: value.created_at,
     expires_at: value.expires_at,
+    screenshot: value.screenshot === undefined || value.screenshot === null
+      ? null
+      : projectSupportScreenshotStatus(value.screenshot),
   };
 }
 

@@ -356,6 +356,10 @@ export const api = {
       report_markdown: string;
       accepted_terms_version: string;
       accepted_retention_policy_version: string;
+      screenshot_png_base64?: string;
+      screenshot_source_sha256?: string;
+      screenshot_width?: number;
+      screenshot_height?: number;
     }, signal?: AbortSignal): Promise<SupportReportStatus> {
       return request('/support-reports', {
         method: 'POST',

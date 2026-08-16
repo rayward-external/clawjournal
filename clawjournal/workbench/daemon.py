@@ -5809,19 +5809,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         _json_response(self, payload, cache_control="no-store")
 
     def _handle_create_support_report(self) -> None:
-        """Durably queue only the exact, user-reviewed Markdown body."""
+        """Durably queue exact reviewed Markdown and an optional exact PNG."""
 
         try:
             body = _read_bounded_json_body(
                 self,
                 maximum_bytes=SUPPORT_LOCAL_REQUEST_MAX_BYTES,
             )
-            expected = {
+            text_fields = {
                 "report_markdown",
                 "accepted_terms_version",
                 "accepted_retention_policy_version",
             }
-            if set(body) != expected:
+            screenshot_fields = {
+                "screenshot_png_base64",
+                "screenshot_source_sha256",
+                "screenshot_width",
+                "screenshot_height",
+            }
+            if frozenset(body) not in {
+                frozenset(text_fields),
+                frozenset(text_fields | screenshot_fields),
+            }:
                 raise SupportReportError(
                     "invalid_request",
                     "The support-report request has missing or unsupported fields.",
@@ -5837,6 +5846,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "accepted_retention_policy_version"
                 ],
                 capability=capability,
+                screenshot_png_base64=body.get("screenshot_png_base64"),
+                screenshot_source_sha256=body.get("screenshot_source_sha256"),
+                screenshot_width=body.get("screenshot_width"),
+                screenshot_height=body.get("screenshot_height"),
             )
             start_support_report_delivery(str(record["client_report_id"]))
         except SupportReportError as exc:

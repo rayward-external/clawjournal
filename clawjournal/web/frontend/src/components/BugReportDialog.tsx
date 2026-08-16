@@ -20,6 +20,11 @@ import {
   reportUtf8Bytes,
 } from '../supportReport.ts';
 import type { SupportContext, SupportReportCapability, SupportReportStatus } from '../types.ts';
+import {
+  captureSupportScreenshot,
+  markdownSha256,
+} from '../supportScreenshot.ts';
+import type { CapturedSupportScreenshot } from '../supportScreenshot.ts';
 import { btnPrimary, btnSecondary, colors, fontFamily, inputStyle, labelStyle } from '../theme.ts';
 
 interface BugReportDialogProps {
@@ -34,6 +39,7 @@ type CapabilityState = 'loading' | 'available' | 'unavailable';
 type DialogStage = 'compose' | 'review';
 type SupportOperation = 'idle' | 'submitting' | 'checking' | 'deleting';
 type RecentReportsState = 'loading' | 'ready' | 'unavailable';
+type ScreenshotOperation = 'idle' | 'capturing';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -56,6 +62,11 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   const [capabilityState, setCapabilityState] = useState<CapabilityState>('loading');
   const [supportCapability, setSupportCapability] = useState<SupportReportCapability | null>(null);
   const [supportConsent, setSupportConsent] = useState(false);
+  const [supportConsentBinding, setSupportConsentBinding] = useState<string | null>(null);
+  const [capturedScreenshot, setCapturedScreenshot] = useState<CapturedSupportScreenshot | null>(null);
+  const [screenshotPreviewUrl, setScreenshotPreviewUrl] = useState<string | null>(null);
+  const [screenshotOperation, setScreenshotOperation] = useState<ScreenshotOperation>('idle');
+  const [screenshotActionStatus, setScreenshotActionStatus] = useState('');
   const [supportReport, setSupportReport] = useState<SupportReportStatus | null>(null);
   const [supportOperation, setSupportOperation] = useState<SupportOperation>('idle');
   const [supportActionStatus, setSupportActionStatus] = useState('');
@@ -73,9 +84,32 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   const focusSubmittedStatusRef = useRef(false);
   const downloadUrlRef = useRef<string | null>(null);
   const downloadTimerRef = useRef<number | null>(null);
+  const screenshotPreviewUrlRef = useRef<string | null>(null);
+  const consentGenerationRef = useRef(0);
   const titleId = useId();
   const privacyId = useId();
   const diagnosticsId = useId();
+
+  const clearSupportConsent = useCallback(() => {
+    consentGenerationRef.current += 1;
+    setSupportConsent(false);
+    setSupportConsentBinding(null);
+  }, []);
+
+  const releaseScreenshotPreview = useCallback(() => {
+    if (screenshotPreviewUrlRef.current !== null) {
+      URL.revokeObjectURL(screenshotPreviewUrlRef.current);
+      screenshotPreviewUrlRef.current = null;
+    }
+    setScreenshotPreviewUrl(null);
+  }, []);
+
+  const removeCapturedScreenshot = useCallback(() => {
+    releaseScreenshotPreview();
+    setCapturedScreenshot(null);
+    setScreenshotActionStatus('Screenshot removed. Only the reviewed Markdown will be sent.');
+    clearSupportConsent();
+  }, [clearSupportConsent, releaseScreenshotPreview]);
 
   const releaseDownloadUrl = useCallback(() => {
     if (downloadTimerRef.current !== null) {
@@ -91,10 +125,17 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   useEffect(() => {
     if (!open) {
       releaseDownloadUrl();
+      releaseScreenshotPreview();
+      setCapturedScreenshot(null);
+      setScreenshotActionStatus('');
+      setScreenshotOperation('idle');
       return;
     }
-    return releaseDownloadUrl;
-  }, [open, releaseDownloadUrl]);
+    return () => {
+      releaseDownloadUrl();
+      releaseScreenshotPreview();
+    };
+  }, [open, releaseDownloadUrl, releaseScreenshotPreview]);
 
   useEffect(() => {
     if (!open) return;
@@ -153,7 +194,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
     // Consent is scoped to the exact terms fetched for this opening of the
     // dialog. Never carry a checked box across close/reopen: the service may
     // have published a new terms or retention version in between.
-    setSupportConsent(false);
+    clearSupportConsent();
     if (!open) return;
     const controller = new AbortController();
     let active = true;
@@ -183,7 +224,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
       controller.abort();
       window.clearTimeout(timeout);
     };
-  }, [open]);
+  }, [clearSupportConsent, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -331,33 +372,115 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
     return 'Private support is unavailable right now. Your draft is still here; you can copy or download it.';
   };
 
+  const consentBindingFor = async (
+    markdown: string,
+    screenshot: CapturedSupportScreenshot | null,
+    capability: SupportReportCapability,
+  ) => JSON.stringify({
+    markdown_sha256: await markdownSha256(markdown),
+    screenshot_source_sha256: screenshot?.sha256 ?? null,
+    terms_version: capability.terms_version,
+    retention_policy_version: capability.retention_policy_version,
+  });
+
+  const updateSupportConsent = async (checked: boolean) => {
+    clearSupportConsent();
+    if (!checked || !supportCapability?.available) return;
+    const generation = consentGenerationRef.current;
+    const exactDraft = draft;
+    const exactScreenshot = capturedScreenshot;
+    const exactCapability = supportCapability;
+    try {
+      const binding = await consentBindingFor(exactDraft, exactScreenshot, exactCapability);
+      if (consentGenerationRef.current !== generation) return;
+      setSupportConsentBinding(binding);
+      setSupportConsent(true);
+    } catch {
+      if (consentGenerationRef.current === generation) {
+        setSupportActionStatus('Could not bind consent to the reviewed bytes. Nothing was sent.');
+      }
+    }
+  };
+
+  const captureScreenshot = async () => {
+    const screenshotCapability = supportCapability?.screenshots;
+    if (!screenshotCapability?.available || screenshotOperation !== 'idle') return;
+    setScreenshotOperation('capturing');
+    setScreenshotActionStatus('Creating a masked screenshot locally for your review...');
+    clearSupportConsent();
+    try {
+      const captured = await captureSupportScreenshot(screenshotCapability);
+      releaseScreenshotPreview();
+      const previewUrl = URL.createObjectURL(captured.blob);
+      screenshotPreviewUrlRef.current = previewUrl;
+      setScreenshotPreviewUrl(previewUrl);
+      setCapturedScreenshot(captured);
+      setScreenshotActionStatus('Review the exact PNG below. It will not be sent until you consent and submit.');
+    } catch {
+      setScreenshotActionStatus('Could not create a safe screenshot. No screenshot was added or sent.');
+    } finally {
+      setScreenshotOperation('idle');
+    }
+  };
+
   const submitPrivately = async () => {
-    if (!supportCapability?.available || !supportConsent || supportOperation !== 'idle') return;
+    if (
+      !supportCapability?.available
+      || !supportConsent
+      || !supportConsentBinding
+      || supportOperation !== 'idle'
+    ) return;
     const exactMarkdown = draft;
+    const exactScreenshot = capturedScreenshot;
     if (!exactMarkdown.trim() || reportUtf8Bytes(exactMarkdown) > supportCapability.max_report_bytes) return;
+    if (exactScreenshot && !supportCapability.screenshots.available) return;
+    const binding = await consentBindingFor(exactMarkdown, exactScreenshot, supportCapability);
+    if (binding !== supportConsentBinding) {
+      clearSupportConsent();
+      setSupportActionStatus('The reviewed bytes changed. Review them and consent again.');
+      return;
+    }
     setSupportOperation('submitting');
-    setSupportActionStatus('Asking the local daemon to submit this exact Markdown...');
+    setSupportActionStatus(
+      exactScreenshot
+        ? 'Asking the local daemon to durably queue the exact Markdown and reviewed PNG...'
+        : 'Asking the local daemon to submit this exact Markdown...',
+    );
     setConfirmDelete(false);
     try {
       const result = await api.support.submit({
         report_markdown: exactMarkdown,
         accepted_terms_version: supportCapability.terms_version,
         accepted_retention_policy_version: supportCapability.retention_policy_version,
+        ...(exactScreenshot ? {
+          screenshot_png_base64: exactScreenshot.png_base64,
+          screenshot_source_sha256: exactScreenshot.sha256,
+          screenshot_width: exactScreenshot.width,
+          screenshot_height: exactScreenshot.height,
+        } : {}),
       });
       const projected = projectSupportReportStatus(result);
       if (!projected) throw new Error('invalid local support response');
       focusSubmittedStatusRef.current = true;
       setSupportReport(projected);
-      setSupportConsent(false);
+      clearSupportConsent();
+      releaseScreenshotPreview();
+      setCapturedScreenshot(null);
+      setScreenshotActionStatus('');
       setSupportActionStatus('');
     } catch (error) {
       if (error instanceof ApiError && error.body.code === 'terms_mismatch') {
-        setSupportConsent(false);
+        clearSupportConsent();
         setCapabilityState('loading');
         try {
           const refreshed = projectSupportReportCapability(await api.support.capability());
           setSupportCapability(refreshed);
           setCapabilityState(refreshed?.available ? 'available' : 'unavailable');
+          if (!refreshed?.screenshots.available && capturedScreenshot) {
+            releaseScreenshotPreview();
+            setCapturedScreenshot(null);
+            setScreenshotActionStatus('Screenshot intake is no longer available; the local screenshot was removed.');
+          }
         } catch {
           setSupportCapability(null);
           setCapabilityState('unavailable');
@@ -400,7 +523,10 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
         report.client_report_id !== supportReport.client_report_id
       )));
       setSupportReport(null);
-      setSupportConsent(false);
+      clearSupportConsent();
+      releaseScreenshotPreview();
+      setCapturedScreenshot(null);
+      setScreenshotActionStatus('');
       setConfirmDelete(false);
       setSupportActionStatus('The private report was deleted. The editable Markdown remains in this tab.');
     } catch (error) {
@@ -465,7 +591,10 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
     setExpectedBehavior('');
     setDraft('');
     setStage('compose');
-    setSupportConsent(false);
+    clearSupportConsent();
+    releaseScreenshotPreview();
+    setCapturedScreenshot(null);
+    setScreenshotActionStatus('');
     setConfirmDelete(false);
     setSupportActionStatus('The previous receipt remains available under Recent private reports.');
     setActionStatus('');
@@ -474,12 +603,15 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   const canReview = summary.trim().length > 0 && whatHappened.trim().length > 0;
   const draftBytes = reportUtf8Bytes(draft);
   const reportIsLocked = supportOperation !== 'idle'
+    || screenshotOperation !== 'idle'
     || (supportReport !== null && supportReport.state !== 'rejected');
   const canSendPrivately = capabilityState === 'available'
     && supportCapability?.available === true
     && supportConsent
+    && supportConsentBinding !== null
     && draft.trim().length > 0
     && draftBytes <= supportCapability.max_report_bytes
+    && screenshotOperation === 'idle'
     && supportOperation === 'idle';
 
   return (
@@ -517,7 +649,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               Report a problem
             </h2>
             <p id={privacyId} style={{ margin: 0, color: colors.gray600, fontSize: 13.5, lineHeight: 1.55 }}>
-              The draft stays in this browser tab until you explicitly send or share it. ClawJournal does not capture screenshots, logs, traces, or hidden diagnostics. Review and remove sensitive information first.
+              The draft stays in this browser tab until you explicitly send or share it. ClawJournal never captures screenshots automatically. An optional button can create a heavily masked app-view PNG for your exact review; logs, traces, hidden diagnostics, and the reporter itself are excluded.
             </p>
           </div>
           <button type="button" onClick={onClose} aria-label="Close bug report" style={{
@@ -575,6 +707,11 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
                   {report.receipt_id && (
                     <div style={{ marginTop: 4, color: colors.gray600, fontSize: 11.5, overflowWrap: 'anywhere' }}>
                       Receipt: {report.receipt_id}
+                    </div>
+                  )}
+                  {report.screenshot && (
+                    <div style={{ marginTop: 4, color: colors.gray600, fontSize: 11.5 }}>
+                      Screenshot: {SUPPORT_REPORT_STATE_PRESENTATION[report.screenshot.state].label}
                     </div>
                   )}
                   <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 7, marginTop: 7 }}>
@@ -698,7 +835,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               onChange={event => {
                 setDraft(event.target.value.slice(0, MAX_BUG_REPORT_DRAFT_LENGTH));
                 setActionStatus('');
-                setSupportConsent(false);
+                clearSupportConsent();
                 setSupportActionStatus('');
               }}
               style={{
@@ -710,7 +847,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               }}
             />
             <p style={{ margin: '8px 0 0', color: colors.gray500, fontSize: 12.5, lineHeight: 1.5 }}>
-              Copy or download only after reviewing this text. Opening GitHub sends none of it automatically. Private support receives only this exact Markdown—no screenshot or attachment.
+              Copy or download only after reviewing this text. Opening GitHub sends none of it automatically. Private support receives this exact Markdown and only an optional PNG that you capture, preview, and explicitly include below.
             </p>
 
             {capabilityState === 'loading' && !supportReport && (
@@ -757,18 +894,81 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
                   {draftBytes.toLocaleString()} / {supportCapability.max_report_bytes.toLocaleString()} UTF-8 bytes
                 </div>
 
+                {supportCapability.screenshots.available && (!supportReport || supportReport.state === 'rejected') && (
+                  <section aria-labelledby={`${titleId}-optional-screenshot`} style={{
+                    marginTop: 12,
+                    paddingTop: 11,
+                    borderTop: `1px solid ${colors.gray200}`,
+                  }}>
+                    <h4 id={`${titleId}-optional-screenshot`} style={{ margin: 0, color: colors.gray800, fontSize: 13 }}>
+                      Optional masked app screenshot
+                    </h4>
+                    <p style={{ margin: '5px 0 8px', color: colors.gray600, fontSize: 12, lineHeight: 1.5 }}>
+                      Capture is local and explicit. Dynamic text, form values, images, canvases, embedded pages, URL-bearing styles, and this reporter are masked or removed by default. Inspect the exact full-resolution PNG before including it.
+                    </p>
+                    {!capturedScreenshot ? (
+                      <button
+                        type="button"
+                        disabled={screenshotOperation !== 'idle' || supportOperation !== 'idle'}
+                        onClick={() => void captureScreenshot()}
+                        style={btnSecondary}
+                      >
+                        {screenshotOperation === 'capturing' ? 'Capturing locally…' : 'Capture masked app view'}
+                      </button>
+                    ) : (
+                      <figure style={{ margin: '8px 0 0' }}>
+                        {screenshotPreviewUrl && (
+                          <img
+                            src={screenshotPreviewUrl}
+                            alt="Exact masked screenshot selected for private support"
+                            style={{
+                              display: 'block',
+                              width: '100%',
+                              maxHeight: 360,
+                              objectFit: 'contain',
+                              background: colors.white,
+                              border: `1px solid ${colors.gray300}`,
+                              borderRadius: 6,
+                            }}
+                          />
+                        )}
+                        <figcaption style={{ marginTop: 6, color: colors.gray600, fontSize: 11.5, lineHeight: 1.45 }}>
+                          Exact PNG: {capturedScreenshot.width} × {capturedScreenshot.height}, {capturedScreenshot.bytes.toLocaleString()} bytes<br />
+                          SHA-256: <span style={{ overflowWrap: 'anywhere' }}>{capturedScreenshot.sha256}</span>
+                        </figcaption>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 7 }}>
+                          {screenshotPreviewUrl && (
+                            <a href={screenshotPreviewUrl} target="_blank" rel="noopener noreferrer" style={{ ...btnSecondary, textDecoration: 'none' }}>
+                              Open full-resolution PNG
+                            </a>
+                          )}
+                          <button type="button" disabled={screenshotOperation !== 'idle'} onClick={() => void captureScreenshot()} style={btnSecondary}>
+                            {screenshotOperation === 'capturing' ? 'Retaking…' : 'Retake'}
+                          </button>
+                          <button type="button" disabled={screenshotOperation !== 'idle'} onClick={removeCapturedScreenshot} style={btnSecondary}>
+                            Remove screenshot
+                          </button>
+                        </div>
+                      </figure>
+                    )}
+                    <div role="status" aria-live="polite" style={{ minHeight: 18, marginTop: 5, color: colors.blue700, fontSize: 11.5 }}>
+                      {screenshotActionStatus}
+                    </div>
+                  </section>
+                )}
+
                 {(!supportReport || supportReport.state === 'rejected') && (
                   <>
                     <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 10, color: colors.gray700, fontSize: 12.5, lineHeight: 1.45 }}>
                       <input
                         type="checkbox"
                         checked={supportConsent}
-                        disabled={supportOperation !== 'idle'}
-                        onChange={event => setSupportConsent(event.target.checked)}
+                        disabled={supportOperation !== 'idle' || screenshotOperation !== 'idle'}
+                        onChange={event => void updateSupportConsent(event.target.checked)}
                         style={{ marginTop: 2 }}
                       />
                       <span>
-                        I reviewed the exact Markdown above and accept support terms {supportCapability.terms_version} and retention policy {supportCapability.retention_policy_version}.
+                        I reviewed the exact Markdown above{capturedScreenshot ? ' and the exact PNG preview (including its SHA-256)' : ''} and accept support terms {supportCapability.terms_version} and retention policy {supportCapability.retention_policy_version}.
                       </span>
                     </label>
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
@@ -808,6 +1008,21 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
                   <p style={{ margin: '6px 0 0', color: colors.gray600, fontSize: 12.5 }}>
                     {supportReport.message.slice(0, 500)}
                   </p>
+                )}
+                {supportReport.screenshot && (
+                  <div style={{ marginTop: 8, padding: 8, borderRadius: 6, background: colors.white, color: colors.gray700, fontSize: 12, lineHeight: 1.5 }}>
+                    <strong>Screenshot: {SUPPORT_REPORT_STATE_PRESENTATION[supportReport.screenshot.state].label}</strong>
+                    <div>{supportReport.screenshot.message}</div>
+                    <div>
+                      {supportReport.screenshot.width} × {supportReport.screenshot.height}, {supportReport.screenshot.source_bytes.toLocaleString()} source bytes
+                    </div>
+                    <div style={{ overflowWrap: 'anywhere' }}>Source SHA-256: {supportReport.screenshot.source_sha256}</div>
+                    {supportReport.screenshot.sanitized_sha256 && (
+                      <div style={{ overflowWrap: 'anywhere' }}>
+                        Sanitized SHA-256: {supportReport.screenshot.sanitized_sha256}
+                      </div>
+                    )}
+                  </div>
                 )}
                 <dl style={{ margin: '8px 0 0', color: colors.gray600, fontSize: 12, lineHeight: 1.5 }}>
                   {supportReport.receipt_id && (
@@ -861,7 +1076,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
                   setStage('compose');
                   setActionStatus('');
                   setSupportActionStatus('');
-                  setSupportConsent(false);
+                  clearSupportConsent();
                 }}
                 style={{ ...btnSecondary, opacity: reportIsLocked ? 0.55 : 1 }}
               >

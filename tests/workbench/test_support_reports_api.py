@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import struct
+import zlib
+from dataclasses import replace
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from threading import Thread
@@ -84,6 +89,23 @@ def _request(port, token, method, path, body=None, *, headers=None):
     return response.status, response_headers, parsed
 
 
+def _png() -> bytes:
+    def chunk(kind, payload):
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
 def test_support_capability_is_authenticated_no_store_and_before_health_gate(
     support_api,
 ):
@@ -101,6 +123,16 @@ def test_support_capability_is_authenticated_no_store_and_before_health_gate(
         "terms_text": "Private support terms.",
         "retention_text": "Stored for 30 days.",
         "max_report_bytes": 32768,
+        "screenshots": {
+            "available": False,
+            "content_type": "image/png",
+            "max_input_bytes": 0,
+            "max_output_bytes": 0,
+            "max_width": 0,
+            "max_height": 0,
+            "max_pixels": 0,
+            "sanitizer_version": "",
+        },
         "message": None,
     }
 
@@ -147,6 +179,80 @@ def test_post_queues_only_exact_markdown_and_returns_no_secret(
     assert markdown not in serialized
     assert stored["manage_secret"] not in serialized
     assert stored["reports_url"] not in serialized
+
+
+def test_post_atomically_queues_bounded_png_without_exposing_bytes(
+    support_api, capability, monkeypatch
+):
+    port, token, delivery_calls = support_api
+    screenshot_capability = support_reports.SupportScreenshotCapability(
+        upload_url=(
+            "https://support.example.test/api/support/v1/reports/"
+            "{client_report_id}/screenshot"
+        ),
+        max_input_bytes=2 * 1024 * 1024,
+        max_output_bytes=2 * 1024 * 1024,
+        max_width=4096,
+        max_height=4096,
+        max_pixels=4 * 1024 * 1024,
+        sanitizer_version="png-rgb-v1",
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_resolve_support_report_capability",
+        lambda **_kwargs: replace(capability, screenshots=screenshot_capability),
+    )
+    png = _png()
+    digest = hashlib.sha256(png).hexdigest()
+    encoded = base64.b64encode(png).decode("ascii")
+    status, headers, body = _request(
+        port,
+        token,
+        "POST",
+        "/api/support-reports",
+        {
+            "report_markdown": "# Exact screenshot report",
+            "accepted_terms_version": capability.terms_version,
+            "accepted_retention_policy_version": capability.retention_policy_version,
+            "screenshot_png_base64": encoded,
+            "screenshot_source_sha256": digest,
+            "screenshot_width": 1,
+            "screenshot_height": 1,
+        },
+    )
+    assert status == 202
+    assert headers["cache-control"] == "no-store"
+    assert body["screenshot"] == {
+        "state": "queued",
+        "source_sha256": digest,
+        "source_bytes": len(png),
+        "width": 1,
+        "height": 1,
+        "message": "Screenshot queued for private delivery.",
+        "sanitized_sha256": None,
+        "sanitized_bytes": None,
+        "sanitizer_version": None,
+    }
+    assert encoded not in json.dumps(body)
+    stored = support_reports.load_report(body["client_report_id"])
+    assert support_reports._screenshot_path(body["client_report_id"]).read_bytes() == png
+    assert stored["screenshot"]["source_sha256"] == digest
+    assert delivery_calls[-1] == body["client_report_id"]
+
+    partial, _headers, rejected = _request(
+        port,
+        token,
+        "POST",
+        "/api/support-reports",
+        {
+            "report_markdown": "# partial",
+            "accepted_terms_version": capability.terms_version,
+            "accepted_retention_policy_version": capability.retention_policy_version,
+            "screenshot_source_sha256": digest,
+        },
+    )
+    assert partial == 400
+    assert rejected["code"] == "invalid_request"
 
 
 def test_post_uses_strict_schema_and_bounded_reader(support_api):
