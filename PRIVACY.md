@@ -6,9 +6,10 @@ ClawJournal is designed to be usable without uploading anything.
 
 - `clawjournal scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` run locally.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
-- **Report a problem** creates an editable draft in browser memory. Its loopback diagnostic request uses a fixed allowlist and excludes transcripts, logs, paths, raw URLs, identifiers, and raw error text. It does not take a screenshot or upload anything; copy/download and opening a blank GitHub issue leave final review and submission to you.
+- **Report a problem** starts as an editable draft in browser memory. Its loopback diagnostic request uses a fixed allowlist and excludes transcripts, logs, paths, raw URLs, identifiers, and raw error text. It never takes a screenshot. Copy/download and opening a blank GitHub issue do not upload the draft. If the separately configured private support service is available, you may review its current purpose and retention terms, explicitly accept them, and send only the exact Markdown shown in the editor.
+- A private problem report is not a research share and does not run the bundle redaction/TruffleHog pipeline. Remove credentials, confidential text, health information, and third-party content from the visible Markdown before sending it.
 - `bundle-export` writes files to disk. It does not contact a server.
-- If you never use the workbench Submit step, never explicitly enable Automatic uploads, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
+- If you never use the workbench Submit step, never choose **Send privately** for a problem report, never explicitly enable Automatic uploads, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
 - If you are explicitly enrolled in OpenRefinery Agent Failure Sharing, the optional agent hook only shows a local reminder and can open the existing Share workflow. The hook does not read transcripts, package bundles, or upload data by itself.
 - The separate recurring-upload `SessionStart` hook is inert unless you explicitly accept the current recurring authorization and the local SQLite enrollment remains enabled. It only starts a detached local runner when a cycle is due; it never sends trace content from the hook process.
 

@@ -55,6 +55,20 @@ from ..support_context import (
     collect_support_context,
     unavailable_support_context,
 )
+from ..support_reports import (
+    SUPPORT_LOCAL_REQUEST_MAX_BYTES,
+    SupportCapability,
+    SupportReportError,
+    delete_report as delete_support_report,
+    enqueue_report as enqueue_support_report,
+    fetch_capability as fetch_support_report_capability,
+    list_public_reports as list_public_support_reports,
+    public_status as support_report_public_status,
+    reconcile_report as reconcile_support_report,
+    run_recovery_loop as run_support_report_recovery_loop,
+    start_delivery as start_support_report_delivery,
+    unavailable_capability as unavailable_support_capability,
+)
 from ..config import (
     CONFIG_DIR,
     RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
@@ -378,8 +392,60 @@ _auto_upload_enrollment_lock = threading.Lock()
 _auto_upload_enrollment_thread: threading.Thread | None = None
 _index_recovery_lock = threading.Lock()
 _index_recovery_thread: threading.Thread | None = None
+_support_report_recovery_lock = threading.Lock()
+_support_report_recovery_thread: threading.Thread | None = None
+_support_report_recovery_stop: threading.Event | None = None
 _HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
 _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
+
+
+def _start_support_report_recovery_worker() -> bool:
+    """Resume the DB-free private outbox after daemon restart."""
+
+    global _support_report_recovery_stop, _support_report_recovery_thread
+    with _support_report_recovery_lock:
+        if (
+            _support_report_recovery_thread is not None
+            and _support_report_recovery_thread.is_alive()
+        ):
+            return False
+
+        stop_event = threading.Event()
+
+        def run() -> None:
+            try:
+                run_support_report_recovery_loop(stop_event)
+            except Exception:
+                # Do not include exception text: a corrupt dependency may have
+                # interpolated the report body or its management secret.
+                logger.warning("Private support outbox recovery did not complete")
+
+        _support_report_recovery_stop = stop_event
+        _support_report_recovery_thread = threading.Thread(
+            target=run,
+            daemon=True,
+            name="support-report-recovery",
+        )
+        _support_report_recovery_thread.start()
+        return True
+
+
+def _stop_support_report_recovery_worker() -> None:
+    global _support_report_recovery_stop, _support_report_recovery_thread
+
+    with _support_report_recovery_lock:
+        stop_event = _support_report_recovery_stop
+        thread = _support_report_recovery_thread
+        if stop_event is not None:
+            stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=1.0)
+    with _support_report_recovery_lock:
+        if _support_report_recovery_thread is thread and (
+            thread is None or not thread.is_alive()
+        ):
+            _support_report_recovery_thread = None
+            _support_report_recovery_stop = None
 
 
 def _start_auto_upload_enrollment_worker() -> bool:
@@ -1395,6 +1461,92 @@ def _read_body(handler: BaseHTTPRequestHandler) -> dict:
     return json.loads(raw)
 
 
+def _read_bounded_json_body(
+    handler: BaseHTTPRequestHandler,
+    *,
+    maximum_bytes: int,
+) -> dict[str, Any]:
+    """Read one strict, length-delimited JSON object within ``maximum_bytes``.
+
+    Support reporting remains reachable while the index is unhealthy and may
+    receive user-edited text.  It therefore has its own bounded reader instead
+    of the legacy, unlimited ``_read_body`` helper used by DB-backed routes.
+    """
+
+    if handler.headers.get("Transfer-Encoding"):
+        raise SupportReportError(
+            "invalid_request",
+            "Chunked support-report requests are not accepted.",
+            status=400,
+        )
+    content_type = (
+        (handler.headers.get("Content-Type") or "")
+        .split(";", 1)[0]
+        .strip()
+        .lower()
+    )
+    if content_type != "application/json":
+        raise SupportReportError(
+            "invalid_request",
+            "Support reports must use application/json.",
+            status=415,
+        )
+    raw_length = handler.headers.get("Content-Length")
+    try:
+        length = int(raw_length) if raw_length is not None else -1
+    except (TypeError, ValueError) as exc:
+        raise SupportReportError(
+            "invalid_request",
+            "Support-report Content-Length is invalid.",
+            status=400,
+        ) from exc
+    if length < 0:
+        raise SupportReportError(
+            "invalid_request",
+            "Support-report Content-Length is required.",
+            status=411,
+        )
+    if length > maximum_bytes:
+        raise SupportReportError(
+            "report_too_large",
+            "The support-report request is too large.",
+            status=413,
+        )
+    raw = handler.rfile.read(length)
+    if len(raw) != length:
+        raise SupportReportError(
+            "invalid_request",
+            "The support-report request body is incomplete.",
+            status=400,
+        )
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SupportReportError(
+            "invalid_request",
+            "The support-report request must be valid UTF-8 JSON.",
+            status=400,
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise SupportReportError(
+            "invalid_request",
+            "The support-report request must be a JSON object.",
+            status=400,
+        )
+    return parsed
+
+
 # Serializes benchmark generation: the deep pipeline is minutes-long and
 # expensive, so only one runs at a time (the row's `generating` status is the
 # durable state; this lock just rejects concurrent kicks).
@@ -1697,6 +1849,27 @@ def _fetch_hosted_share_capabilities(*, force: bool = False) -> dict[str, Any]:
         ttl = 300
     _hosted_capabilities_cache = (api_base, now + ttl, dict(capabilities))
     return capabilities
+
+
+def _resolve_support_report_capability(*, force: bool = False) -> SupportCapability:
+    """Resolve the purpose-separated support capability and current terms."""
+
+    try:
+        origin = _hosted_api_base()
+        # Support reports have their own bounded discovery client. ``force``
+        # is accepted so callers can explicitly document the egress-time
+        # refresh; this client deliberately performs a fresh fetch every time.
+        _ = force
+        return fetch_support_report_capability(origin=origin)
+    except SupportReportError:
+        raise
+    except Exception as exc:
+        raise SupportReportError(
+            "support_service_unavailable",
+            "Private support reporting is temporarily unavailable.",
+            status=503,
+            retryable=True,
+        ) from exc
 
 
 def _manual_lineage_preflight_url(
@@ -4011,6 +4184,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         # It projects only startup metadata and the in-memory health snapshot.
         elif path == "/api/support-context":
             self._handle_support_context()
+        elif path == "/api/support-reports/capability":
+            self._handle_support_report_capability()
+        elif path == "/api/support-reports":
+            self._handle_list_support_reports()
+        elif path.startswith("/api/support-reports/"):
+            client_report_id = unquote(path[len("/api/support-reports/"):])
+            self._handle_support_report_status(client_report_id)
         elif path.startswith("/api/") and self._reject_unhealthy_index():
             return
         # API routes
@@ -4129,7 +4309,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
 
-        if path == "/api/index/rebuild":
+        if path == "/api/support-reports":
+            self._handle_create_support_report()
+        elif path == "/api/index/rebuild":
             self._handle_index_rebuild()
         elif path.startswith("/api/") and self._reject_unhealthy_index():
             return
@@ -4232,6 +4414,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        if path.startswith("/api/support-reports/"):
+            client_report_id = unquote(path[len("/api/support-reports/"):])
+            self._handle_delete_support_report(client_report_id)
+            return
 
         if path.startswith("/api/") and self._reject_unhealthy_index():
             return
@@ -5162,6 +5349,98 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             # Never place exception text or a traceback in the response. The
             # local report draft remains useful with a fixed partial marker.
             payload = unavailable_support_context()
+        _json_response(self, payload, cache_control="no-store")
+
+    def _support_report_error(self, exc: SupportReportError) -> None:
+        """Return only the bounded public error, never report text or secrets."""
+
+        _json_response(
+            self,
+            {"error": exc.message, "code": exc.code},
+            status=exc.status,
+            cache_control="no-store",
+        )
+
+    def _handle_support_report_capability(self) -> None:
+        """Return current private-support terms without touching SQLite."""
+
+        try:
+            capability = _resolve_support_report_capability(force=False)
+        except SupportReportError as exc:
+            payload = unavailable_support_capability(exc.message)
+        else:
+            payload = capability.as_ui_payload()
+        _json_response(self, payload, cache_control="no-store")
+
+    def _handle_list_support_reports(self) -> None:
+        """List only bounded public receipt state from the private outbox."""
+
+        try:
+            payload = list_public_support_reports()
+        except SupportReportError as exc:
+            self._support_report_error(exc)
+            return
+        _json_response(self, payload, cache_control="no-store")
+
+    def _handle_create_support_report(self) -> None:
+        """Durably queue only the exact, user-reviewed Markdown body."""
+
+        try:
+            body = _read_bounded_json_body(
+                self,
+                maximum_bytes=SUPPORT_LOCAL_REQUEST_MAX_BYTES,
+            )
+            expected = {
+                "report_markdown",
+                "accepted_terms_version",
+                "accepted_retention_policy_version",
+            }
+            if set(body) != expected:
+                raise SupportReportError(
+                    "invalid_request",
+                    "The support-report request has missing or unsupported fields.",
+                    status=400,
+                )
+            # Force a terms refresh at the egress decision, so acceptance of a
+            # stale browser document can never authorize a newer policy.
+            capability = _resolve_support_report_capability(force=True)
+            record = enqueue_support_report(
+                report_markdown=body["report_markdown"],
+                accepted_terms_version=body["accepted_terms_version"],
+                accepted_retention_policy_version=body[
+                    "accepted_retention_policy_version"
+                ],
+                capability=capability,
+            )
+            start_support_report_delivery(str(record["client_report_id"]))
+        except SupportReportError as exc:
+            self._support_report_error(exc)
+            return
+        _json_response(
+            self,
+            support_report_public_status(record),
+            status=202,
+            cache_control="no-store",
+        )
+
+    def _handle_support_report_status(self, client_report_id: str) -> None:
+        try:
+            record = reconcile_support_report(client_report_id)
+        except SupportReportError as exc:
+            self._support_report_error(exc)
+            return
+        _json_response(
+            self,
+            support_report_public_status(record),
+            cache_control="no-store",
+        )
+
+    def _handle_delete_support_report(self, client_report_id: str) -> None:
+        try:
+            payload = delete_support_report(client_report_id)
+        except SupportReportError as exc:
+            self._support_report_error(exc)
+            return
         _json_response(self, payload, cache_control="no-store")
 
     def _handle_index_rebuild(self) -> None:
@@ -7380,6 +7659,7 @@ def run_server(
     # this process's cached health stuck at ``checking``. No serving loop or
     # background worker starts before this fail-closed state is visible.
     begin_index_health_check()
+    _start_support_report_recovery_worker()
 
     # Companion IPv6 loopback socket on the same port. Browsers resolve
     # `localhost` to ::1 (IPv6) first and don't all fall back to IPv4, so an
@@ -7563,6 +7843,7 @@ def run_server(
     finally:
         stopping.set()
         startup_done.set()
+        _stop_support_report_recovery_worker()
         scanner.stop()
         if v6_server is not None:
             v6_server.shutdown()

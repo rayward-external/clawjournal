@@ -309,6 +309,45 @@ export interface SupportContext {
   };
 }
 
+/** Public, non-secret support-intake capability exposed by the local daemon. */
+export interface SupportReportCapability {
+  available: boolean;
+  purpose: string;
+  terms_version: string;
+  retention_policy_version: string;
+  terms_text: string;
+  retention_text: string;
+  max_report_bytes: number;
+  message: string | null;
+}
+
+export type SupportReportState =
+  | 'queued'
+  | 'submitting'
+  | 'accepted'
+  | 'rejected'
+  | 'ambiguous';
+
+/** Receipt/status shape returned by the local daemon; it never exposes the manage secret. */
+export interface SupportReportStatus {
+  client_report_id: string;
+  state: SupportReportState;
+  receipt_id: string | null;
+  message: string | null;
+  created_at: string;
+  expires_at: string | null;
+}
+
+export interface SupportReportListResponse {
+  reports: SupportReportStatus[];
+  truncated: boolean;
+}
+
+export interface SupportReportDeleteResponse {
+  client_report_id: string;
+  state: 'deleted';
+}
+
 export interface WorkbenchConfig {
   source: string | null;
   projects_confirmed: boolean;

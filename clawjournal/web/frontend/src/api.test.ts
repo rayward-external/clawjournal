@@ -84,6 +84,93 @@ describe('support context API', () => {
   });
 });
 
+describe('private support report API', () => {
+  afterEach(() => {
+    delete window.__CLAWJOURNAL_API_TOKEN__;
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps capability, exact Markdown submission, receipt lookup, and deletion on authenticated daemon endpoints', async () => {
+    window.__CLAWJOURNAL_API_TOKEN__ = 'private-support-token';
+    const capability = {
+      available: true,
+      purpose: 'Product support only.',
+      terms_version: 'support-v1',
+      retention_policy_version: 'retention-v1',
+      terms_text: 'Private support terms.',
+      retention_text: 'Retained for 30 days.',
+      max_report_bytes: 32_768,
+      message: null,
+    };
+    const status = {
+      client_report_id: '123e4567-e89b-42d3-a456-426614174000',
+      state: 'accepted',
+      receipt_id: 'support-receipt-1',
+      message: null,
+      created_at: '2026-08-16T00:00:00Z',
+      expires_at: '2026-09-15T00:00:00Z',
+    };
+    const listing = { reports: [status], truncated: false };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => capability })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => listing })
+      .mockResolvedValueOnce({ ok: true, status: 201, json: async () => status })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => status })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ client_report_id: status.client_report_id, state: 'deleted' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+    const exactMarkdown = '# Exact report\n\nReviewed by the reporter.';
+
+    await expect(api.support.capability(controller.signal)).resolves.toEqual(capability);
+    await expect(api.support.list(controller.signal)).resolves.toEqual(listing);
+    await expect(api.support.submit({
+      report_markdown: exactMarkdown,
+      accepted_terms_version: 'support-v1',
+      accepted_retention_policy_version: 'retention-v1',
+    })).resolves.toEqual(status);
+    await expect(api.support.status(status.client_report_id)).resolves.toEqual(status);
+    await expect(api.support.remove(status.client_report_id)).resolves.toEqual({
+      client_report_id: status.client_report_id,
+      state: 'deleted',
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/support-reports/capability', {
+      headers: { Authorization: 'Bearer private-support-token' },
+      signal: controller.signal,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/support-reports', {
+      headers: { Authorization: 'Bearer private-support-token' },
+      signal: controller.signal,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/support-reports', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer private-support-token',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        report_markdown: exactMarkdown,
+        accepted_terms_version: 'support-v1',
+        accepted_retention_policy_version: 'retention-v1',
+      }),
+      signal: undefined,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(4, `/api/support-reports/${status.client_report_id}`, {
+      headers: { Authorization: 'Bearer private-support-token' },
+      signal: undefined,
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(5, `/api/support-reports/${status.client_report_id}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer private-support-token' },
+      signal: undefined,
+    });
+  });
+});
+
 describe('automatic-upload API normalization', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

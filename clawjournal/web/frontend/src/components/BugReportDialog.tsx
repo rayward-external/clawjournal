@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
-import { api } from '../api.ts';
+import { ApiError, api } from '../api.ts';
 import {
   BUG_REPORT_CONTEXT_TIMEOUT_MS,
   BUG_REPORT_FILENAME,
@@ -11,7 +11,15 @@ import {
   safeRouteTemplate,
 } from '../bugReportDraft.ts';
 import type { BugReportLocation, BugReportSurface } from '../bugReportDraft.ts';
-import type { SupportContext } from '../types.ts';
+import {
+  SUPPORT_REPORT_STATE_PRESENTATION,
+  SUPPORT_REPORT_CAPABILITY_TIMEOUT_MS,
+  projectSupportReportList,
+  projectSupportReportCapability,
+  projectSupportReportStatus,
+  reportUtf8Bytes,
+} from '../supportReport.ts';
+import type { SupportContext, SupportReportCapability, SupportReportStatus } from '../types.ts';
 import { btnPrimary, btnSecondary, colors, fontFamily, inputStyle, labelStyle } from '../theme.ts';
 
 interface BugReportDialogProps {
@@ -22,7 +30,10 @@ interface BugReportDialogProps {
 }
 
 type DiagnosticsState = 'loading' | 'ready' | 'unavailable';
+type CapabilityState = 'loading' | 'available' | 'unavailable';
 type DialogStage = 'compose' | 'review';
+type SupportOperation = 'idle' | 'submitting' | 'checking' | 'deleting';
+type RecentReportsState = 'loading' | 'ready' | 'unavailable';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -42,9 +53,24 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   const [supportContext, setSupportContext] = useState<SupportContext | null>(null);
   const [draft, setDraft] = useState('');
   const [actionStatus, setActionStatus] = useState('');
+  const [capabilityState, setCapabilityState] = useState<CapabilityState>('loading');
+  const [supportCapability, setSupportCapability] = useState<SupportReportCapability | null>(null);
+  const [supportConsent, setSupportConsent] = useState(false);
+  const [supportReport, setSupportReport] = useState<SupportReportStatus | null>(null);
+  const [supportOperation, setSupportOperation] = useState<SupportOperation>('idle');
+  const [supportActionStatus, setSupportActionStatus] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [recentReports, setRecentReports] = useState<SupportReportStatus[]>([]);
+  const [recentReportsState, setRecentReportsState] = useState<RecentReportsState>('loading');
+  const [recentReportsTruncated, setRecentReportsTruncated] = useState(false);
+  const [recentOperationId, setRecentOperationId] = useState<string | null>(null);
+  const [recentConfirmDeleteId, setRecentConfirmDeleteId] = useState<string | null>(null);
+  const [recentActionStatus, setRecentActionStatus] = useState('');
   const dialogRef = useRef<HTMLDivElement>(null);
   const summaryRef = useRef<HTMLInputElement>(null);
   const draftRef = useRef<HTMLTextAreaElement>(null);
+  const supportStatusHeadingRef = useRef<HTMLHeadingElement>(null);
+  const focusSubmittedStatusRef = useRef(false);
   const downloadUrlRef = useRef<string | null>(null);
   const downloadTimerRef = useRef<number | null>(null);
   const titleId = useId();
@@ -77,12 +103,57 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   }, [open]);
 
   useEffect(() => {
+    if (!open) {
+      setRecentConfirmDeleteId(null);
+      return;
+    }
+    const controller = new AbortController();
+    let active = true;
+    setRecentReportsState('loading');
+    setRecentActionStatus('');
+    const timeout = window.setTimeout(() => controller.abort(), BUG_REPORT_CONTEXT_TIMEOUT_MS);
+
+    void api.support.list(controller.signal)
+      .then(raw => {
+        if (!active) return;
+        const projected = projectSupportReportList(raw);
+        if (!projected) throw new Error('invalid local support report list');
+        setRecentReports(projected.reports);
+        setRecentReportsTruncated(projected.truncated);
+        setRecentReportsState('ready');
+      })
+      .catch(() => {
+        if (!active) return;
+        setRecentReports([]);
+        setRecentReportsTruncated(false);
+        setRecentReportsState('unavailable');
+      })
+      .finally(() => window.clearTimeout(timeout));
+
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearTimeout(timeout);
+    };
+  }, [open]);
+
+  useEffect(() => {
     if (!open) return;
     if (stage === 'review') draftRef.current?.focus();
     else summaryRef.current?.focus();
   }, [open, stage]);
 
   useEffect(() => {
+    if (!focusSubmittedStatusRef.current || !supportReport) return;
+    focusSubmittedStatusRef.current = false;
+    supportStatusHeadingRef.current?.focus();
+  }, [supportReport]);
+
+  useEffect(() => {
+    // Consent is scoped to the exact terms fetched for this opening of the
+    // dialog. Never carry a checked box across close/reopen: the service may
+    // have published a new terms or retention version in between.
+    setSupportConsent(false);
     if (!open) return;
     const controller = new AbortController();
     let active = true;
@@ -104,6 +175,38 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
         if (!active) return;
         setSupportContext(null);
         setDiagnosticsState('unavailable');
+      })
+      .finally(() => window.clearTimeout(timeout));
+
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearTimeout(timeout);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    let active = true;
+    setCapabilityState('loading');
+    setSupportCapability(null);
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      SUPPORT_REPORT_CAPABILITY_TIMEOUT_MS,
+    );
+
+    void api.support.capability(controller.signal)
+      .then(raw => {
+        if (!active) return;
+        const projected = projectSupportReportCapability(raw);
+        setSupportCapability(projected);
+        setCapabilityState(projected?.available ? 'available' : 'unavailable');
+      })
+      .catch(() => {
+        if (!active) return;
+        setSupportCapability(null);
+        setCapabilityState('unavailable');
       })
       .finally(() => window.clearTimeout(timeout));
 
@@ -182,6 +285,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   };
 
   const copyDraft = async () => {
+    setSupportActionStatus('');
     try {
       if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
       await navigator.clipboard.writeText(draft);
@@ -194,6 +298,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
   };
 
   const downloadDraft = () => {
+    setSupportActionStatus('');
     releaseDownloadUrl();
     const blob = new Blob([draft], { type: 'text/markdown;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -215,7 +320,167 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
     setActionStatus(`Downloaded ${BUG_REPORT_FILENAME}.`);
   };
 
+  const supportErrorMessage = (error: unknown): string => {
+    if (error instanceof ApiError) {
+      const code = typeof error.body.code === 'string' ? error.body.code : '';
+      if (code === 'report_too_large') return 'The report is larger than private support accepts. Shorten the Markdown, then try again.';
+      if (code === 'terms_mismatch') return 'The support terms changed. Review and accept the current terms before trying again.';
+      if (code === 'report_busy') return 'The report is busy. Wait a moment, then check its status again.';
+      if (code === 'report_not_found') return 'The local report receipt could not be found.';
+    }
+    return 'Private support is unavailable right now. Your draft is still here; you can copy or download it.';
+  };
+
+  const submitPrivately = async () => {
+    if (!supportCapability?.available || !supportConsent || supportOperation !== 'idle') return;
+    const exactMarkdown = draft;
+    if (!exactMarkdown.trim() || reportUtf8Bytes(exactMarkdown) > supportCapability.max_report_bytes) return;
+    setSupportOperation('submitting');
+    setSupportActionStatus('Asking the local daemon to submit this exact Markdown...');
+    setConfirmDelete(false);
+    try {
+      const result = await api.support.submit({
+        report_markdown: exactMarkdown,
+        accepted_terms_version: supportCapability.terms_version,
+        accepted_retention_policy_version: supportCapability.retention_policy_version,
+      });
+      const projected = projectSupportReportStatus(result);
+      if (!projected) throw new Error('invalid local support response');
+      focusSubmittedStatusRef.current = true;
+      setSupportReport(projected);
+      setSupportConsent(false);
+      setSupportActionStatus('');
+    } catch (error) {
+      if (error instanceof ApiError && error.body.code === 'terms_mismatch') {
+        setSupportConsent(false);
+        setCapabilityState('loading');
+        try {
+          const refreshed = projectSupportReportCapability(await api.support.capability());
+          setSupportCapability(refreshed);
+          setCapabilityState(refreshed?.available ? 'available' : 'unavailable');
+        } catch {
+          setSupportCapability(null);
+          setCapabilityState('unavailable');
+        }
+      }
+      setSupportActionStatus(supportErrorMessage(error));
+    } finally {
+      setSupportOperation('idle');
+    }
+  };
+
+  const checkSupportStatus = async () => {
+    if (!supportReport || supportOperation !== 'idle') return;
+    setSupportOperation('checking');
+    setSupportActionStatus('Checking the private report receipt...');
+    setConfirmDelete(false);
+    try {
+      const result = await api.support.status(supportReport.client_report_id);
+      const projected = projectSupportReportStatus(result, supportReport.client_report_id);
+      if (!projected) throw new Error('invalid local support response');
+      setSupportReport(projected);
+      setSupportActionStatus('Status checked.');
+    } catch (error) {
+      setSupportActionStatus(supportErrorMessage(error));
+    } finally {
+      setSupportOperation('idle');
+    }
+  };
+
+  const deleteSupportReport = async () => {
+    if (!supportReport || supportOperation !== 'idle') return;
+    setSupportOperation('deleting');
+    setSupportActionStatus('Deleting the private report...');
+    try {
+      const result = await api.support.remove(supportReport.client_report_id);
+      if (result.client_report_id !== supportReport.client_report_id || result.state !== 'deleted') {
+        throw new Error('invalid local delete response');
+      }
+      setRecentReports(current => current.filter(report => (
+        report.client_report_id !== supportReport.client_report_id
+      )));
+      setSupportReport(null);
+      setSupportConsent(false);
+      setConfirmDelete(false);
+      setSupportActionStatus('The private report was deleted. The editable Markdown remains in this tab.');
+    } catch (error) {
+      setSupportActionStatus(supportErrorMessage(error));
+    } finally {
+      setSupportOperation('idle');
+    }
+  };
+
+  const checkRecentSupportReport = async (clientReportId: string) => {
+    if (recentOperationId !== null) return;
+    setRecentOperationId(clientReportId);
+    setRecentConfirmDeleteId(null);
+    setRecentActionStatus('Checking the saved private report receipt...');
+    try {
+      const result = await api.support.status(clientReportId);
+      const projected = projectSupportReportStatus(result, clientReportId);
+      if (!projected) throw new Error('invalid local support response');
+      setRecentReports(current => current.map(report => (
+        report.client_report_id === clientReportId ? projected : report
+      )));
+      if (supportReport?.client_report_id === clientReportId) setSupportReport(projected);
+      setRecentActionStatus('Saved private report status checked.');
+    } catch (error) {
+      setRecentActionStatus(supportErrorMessage(error));
+    } finally {
+      setRecentOperationId(null);
+    }
+  };
+
+  const deleteRecentSupportReport = async (clientReportId: string) => {
+    if (recentOperationId !== null) return;
+    setRecentOperationId(clientReportId);
+    setRecentActionStatus('Deleting the saved private report...');
+    try {
+      const result = await api.support.remove(clientReportId);
+      if (result.client_report_id !== clientReportId || result.state !== 'deleted') {
+        throw new Error('invalid local delete response');
+      }
+      setRecentReports(current => current.filter(report => report.client_report_id !== clientReportId));
+      if (supportReport?.client_report_id === clientReportId) setSupportReport(null);
+      setRecentConfirmDeleteId(null);
+      setRecentActionStatus('The saved private report was deleted.');
+    } catch (error) {
+      setRecentActionStatus(supportErrorMessage(error));
+    } finally {
+      setRecentOperationId(null);
+    }
+  };
+
+  const startAnotherReport = () => {
+    if (supportReport) {
+      setRecentReports(current => [
+        supportReport,
+        ...current.filter(report => report.client_report_id !== supportReport.client_report_id),
+      ].slice(0, 100));
+      setRecentReportsState('ready');
+    }
+    setSupportReport(null);
+    setSummary('');
+    setWhatHappened('');
+    setExpectedBehavior('');
+    setDraft('');
+    setStage('compose');
+    setSupportConsent(false);
+    setConfirmDelete(false);
+    setSupportActionStatus('The previous receipt remains available under Recent private reports.');
+    setActionStatus('');
+  };
+
   const canReview = summary.trim().length > 0 && whatHappened.trim().length > 0;
+  const draftBytes = reportUtf8Bytes(draft);
+  const reportIsLocked = supportOperation !== 'idle'
+    || (supportReport !== null && supportReport.state !== 'rejected');
+  const canSendPrivately = capabilityState === 'available'
+    && supportCapability?.available === true
+    && supportConsent
+    && draft.trim().length > 0
+    && draftBytes <= supportCapability.max_report_bytes
+    && supportOperation === 'idle';
 
   return (
     <div style={{
@@ -252,7 +517,7 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               Report a problem
             </h2>
             <p id={privacyId} style={{ margin: 0, color: colors.gray600, fontSize: 13.5, lineHeight: 1.55 }}>
-              This draft stays in this browser tab. ClawJournal does not capture a screenshot, upload the draft, or submit an issue. Review and remove sensitive information before sharing it.
+              The draft stays in this browser tab until you explicitly send or share it. ClawJournal does not capture screenshots, logs, traces, or hidden diagnostics. Review and remove sensitive information first.
             </p>
           </div>
           <button type="button" onClick={onClose} aria-label="Close bug report" style={{
@@ -275,6 +540,92 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
           {diagnosticsState === 'loading' && 'Checking privacy-bounded local diagnostics… You can continue without waiting.'}
           {diagnosticsState === 'ready' && 'Privacy-bounded local diagnostics are ready for review.'}
           {diagnosticsState === 'unavailable' && 'Local diagnostics are unavailable. You can still create, copy, and download the report.'}
+        </div>
+
+        {recentReportsState === 'ready' && recentReports.some(report => (
+          report.client_report_id !== supportReport?.client_report_id
+        )) && (
+          <section aria-labelledby={`${titleId}-recent-support`} style={{
+            marginTop: 12,
+            padding: 12,
+            border: `1px solid ${colors.gray200}`,
+            borderRadius: 8,
+            background: colors.gray50,
+          }}>
+            <h3 id={`${titleId}-recent-support`} style={{ margin: 0, color: colors.gray900, fontSize: 14 }}>
+              Recent private reports from this device
+            </h3>
+            <p style={{ margin: '5px 0 8px', color: colors.gray600, fontSize: 12 }}>
+              These saved receipts are separate from the draft below. Opening one never changes or sends the current draft.
+            </p>
+            {recentReports.filter(report => report.client_report_id !== supportReport?.client_report_id).map(report => {
+              const busy = recentOperationId === report.client_report_id;
+              const confirmingDelete = recentConfirmDeleteId === report.client_report_id;
+              return (
+                <div key={report.client_report_id} style={{
+                  padding: '9px 0',
+                  borderTop: `1px solid ${colors.gray200}`,
+                }}>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8 }}>
+                    <span style={{ color: colors.gray800, fontSize: 12.5, fontWeight: 600 }}>
+                      {SUPPORT_REPORT_STATE_PRESENTATION[report.state].label}
+                    </span>
+                    <span style={{ color: colors.gray500, fontSize: 11.5 }}>{report.created_at}</span>
+                  </div>
+                  {report.receipt_id && (
+                    <div style={{ marginTop: 4, color: colors.gray600, fontSize: 11.5, overflowWrap: 'anywhere' }}>
+                      Receipt: {report.receipt_id}
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 7, marginTop: 7 }}>
+                    <button
+                      type="button"
+                      aria-label={`Check status for report ${report.client_report_id}`}
+                      disabled={recentOperationId !== null}
+                      onClick={() => void checkRecentSupportReport(report.client_report_id)}
+                      style={btnSecondary}
+                    >
+                      {busy && !confirmingDelete ? 'Checking…' : 'Check status'}
+                    </button>
+                    {!confirmingDelete ? (
+                      <button
+                        type="button"
+                        aria-label={`Delete report ${report.client_report_id}`}
+                        disabled={recentOperationId !== null}
+                        onClick={() => setRecentConfirmDeleteId(report.client_report_id)}
+                        style={btnSecondary}
+                      >
+                        Delete
+                      </button>
+                    ) : (
+                      <>
+                        <button type="button" disabled={recentOperationId !== null} onClick={() => setRecentConfirmDeleteId(null)} style={btnSecondary}>
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Confirm delete report ${report.client_report_id}`}
+                          disabled={recentOperationId !== null}
+                          onClick={() => void deleteRecentSupportReport(report.client_report_id)}
+                          style={{ ...btnSecondary, color: colors.red700 }}
+                        >
+                          {busy ? 'Deleting…' : 'Confirm delete'}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {recentReportsTruncated && (
+              <p style={{ margin: '8px 0 0', color: colors.gray500, fontSize: 11.5 }}>
+                Showing the 100 most recent saved reports.
+              </p>
+            )}
+          </section>
+        )}
+        <div role="status" aria-live="polite" style={{ minHeight: 18, marginTop: 4, color: colors.blue700, fontSize: 11.5 }}>
+          {recentActionStatus}
         </div>
 
         {stage === 'compose' ? (
@@ -343,9 +694,12 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               maxLength={MAX_BUG_REPORT_DRAFT_LENGTH}
               rows={18}
               value={draft}
+              readOnly={reportIsLocked}
               onChange={event => {
                 setDraft(event.target.value.slice(0, MAX_BUG_REPORT_DRAFT_LENGTH));
                 setActionStatus('');
+                setSupportConsent(false);
+                setSupportActionStatus('');
               }}
               style={{
                 ...inputStyle,
@@ -356,10 +710,142 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               }}
             />
             <p style={{ margin: '8px 0 0', color: colors.gray500, fontSize: 12.5, lineHeight: 1.5 }}>
-              Copy or download only after reviewing this text. Opening GitHub sends none of it automatically.
+              Copy or download only after reviewing this text. Opening GitHub sends none of it automatically. Private support receives only this exact Markdown—no screenshot or attachment.
             </p>
+
+            {capabilityState === 'loading' && !supportReport && (
+              <p role="status" aria-live="polite" style={{ margin: '12px 0 0', color: colors.gray500, fontSize: 12.5 }}>
+                Checking private support availability…
+              </p>
+            )}
+
+            {capabilityState === 'unavailable' && !supportReport && (
+              <p role="status" aria-live="polite" style={{
+                margin: '12px 0 0',
+                padding: '8px 10px',
+                borderRadius: 7,
+                color: colors.yellow700,
+                background: colors.yellow50,
+                fontSize: 12.5,
+              }}>
+                Private submission is unavailable right now. Copy, download, and the blank GitHub issue remain available.
+              </p>
+            )}
+
+            {supportCapability?.available && (
+              <section aria-labelledby={`${titleId}-private-support`} style={{
+                marginTop: 14,
+                padding: 12,
+                border: `1px solid ${colors.gray200}`,
+                borderRadius: 8,
+                background: colors.gray50,
+              }}>
+                <h3 id={`${titleId}-private-support`} style={{ margin: 0, color: colors.gray900, fontSize: 14 }}>
+                  Private support
+                </h3>
+                <dl style={{ margin: '8px 0 0', fontSize: 12.5, lineHeight: 1.5 }}>
+                  <dt style={{ fontWeight: 600, color: colors.gray700 }}>Purpose</dt>
+                  <dd style={{ margin: '2px 0 8px', color: colors.gray600 }}>{supportCapability.purpose}</dd>
+                  <dt style={{ fontWeight: 600, color: colors.gray700 }}>Retention</dt>
+                  <dd style={{ margin: '2px 0 8px', color: colors.gray600 }}>{supportCapability.retention_text}</dd>
+                </dl>
+                <details style={{ color: colors.gray600, fontSize: 12.5 }}>
+                  <summary style={{ cursor: 'pointer' }}>Support terms</summary>
+                  <p style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{supportCapability.terms_text}</p>
+                </details>
+                <div style={{ marginTop: 8, color: draftBytes > supportCapability.max_report_bytes ? colors.red700 : colors.gray500, fontSize: 11.5 }}>
+                  {draftBytes.toLocaleString()} / {supportCapability.max_report_bytes.toLocaleString()} UTF-8 bytes
+                </div>
+
+                {(!supportReport || supportReport.state === 'rejected') && (
+                  <>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 10, color: colors.gray700, fontSize: 12.5, lineHeight: 1.45 }}>
+                      <input
+                        type="checkbox"
+                        checked={supportConsent}
+                        disabled={supportOperation !== 'idle'}
+                        onChange={event => setSupportConsent(event.target.checked)}
+                        style={{ marginTop: 2 }}
+                      />
+                      <span>
+                        I reviewed the exact Markdown above and accept support terms {supportCapability.terms_version} and retention policy {supportCapability.retention_policy_version}.
+                      </span>
+                    </label>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+                      <button
+                        type="button"
+                        disabled={!canSendPrivately}
+                        onClick={() => void submitPrivately()}
+                        style={{
+                          ...btnPrimary,
+                          opacity: canSendPrivately ? 1 : 0.55,
+                          cursor: canSendPrivately ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        {supportOperation === 'submitting' ? 'Submitting…' : supportReport?.state === 'rejected' ? 'Retry privately' : 'Send privately'}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </section>
+            )}
+
+            {supportReport && (
+              <section aria-labelledby={`${titleId}-private-status`} style={{
+                marginTop: 12,
+                padding: 12,
+                border: `1px solid ${supportReport.state === 'rejected' ? colors.yellow200 : colors.blue100}`,
+                borderRadius: 8,
+                background: supportReport.state === 'rejected' ? colors.yellow50 : colors.blue50,
+              }}>
+                <h3 ref={supportStatusHeadingRef} tabIndex={-1} id={`${titleId}-private-status`} style={{ margin: 0, color: colors.gray900, fontSize: 14 }}>
+                  Private report: {SUPPORT_REPORT_STATE_PRESENTATION[supportReport.state].label}
+                </h3>
+                <p style={{ margin: '6px 0 0', color: colors.gray700, fontSize: 12.5, lineHeight: 1.5 }}>
+                  {SUPPORT_REPORT_STATE_PRESENTATION[supportReport.state].description}
+                </p>
+                {supportReport.message && (
+                  <p style={{ margin: '6px 0 0', color: colors.gray600, fontSize: 12.5 }}>
+                    {supportReport.message.slice(0, 500)}
+                  </p>
+                )}
+                <dl style={{ margin: '8px 0 0', color: colors.gray600, fontSize: 12, lineHeight: 1.5 }}>
+                  {supportReport.receipt_id && (
+                    <><dt style={{ fontWeight: 600 }}>Receipt</dt><dd style={{ margin: '0 0 4px', overflowWrap: 'anywhere' }}>{supportReport.receipt_id}</dd></>
+                  )}
+                  <dt style={{ fontWeight: 600 }}>Local report ID</dt>
+                  <dd style={{ margin: '0 0 4px', overflowWrap: 'anywhere' }}>{supportReport.client_report_id}</dd>
+                  {supportReport.expires_at && (
+                    <><dt style={{ fontWeight: 600 }}>Scheduled deletion</dt><dd style={{ margin: 0, overflowWrap: 'anywhere' }}>{supportReport.expires_at}</dd></>
+                  )}
+                </dl>
+                <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+                  <button type="button" disabled={supportOperation !== 'idle'} onClick={() => void checkSupportStatus()} style={btnSecondary}>
+                    {supportOperation === 'checking' ? 'Checking…' : 'Check status'}
+                  </button>
+                  {!confirmDelete ? (
+                    <button type="button" disabled={supportOperation !== 'idle'} onClick={() => setConfirmDelete(true)} style={btnSecondary}>
+                      Delete private report
+                    </button>
+                  ) : (
+                    <>
+                      <button type="button" disabled={supportOperation !== 'idle'} onClick={() => setConfirmDelete(false)} style={btnSecondary}>
+                        Cancel delete
+                      </button>
+                      <button type="button" disabled={supportOperation !== 'idle'} onClick={() => void deleteSupportReport()} style={{ ...btnSecondary, color: colors.red700 }}>
+                        {supportOperation === 'deleting' ? 'Deleting…' : 'Confirm delete'}
+                      </button>
+                    </>
+                  )}
+                  <button type="button" disabled={supportOperation !== 'idle' || confirmDelete} onClick={startAnotherReport} style={btnSecondary}>
+                    Report another problem
+                  </button>
+                </div>
+              </section>
+            )}
+
             <div role="status" aria-live="polite" style={{ minHeight: 20, marginTop: 6, color: colors.blue700, fontSize: 12.5 }}>
-              {actionStatus}
+              {supportActionStatus || actionStatus}
             </div>
             <div style={{
               display: 'flex',
@@ -368,7 +854,17 @@ export function BugReportDialog({ open, onClose, surface, location }: BugReportD
               gap: 8,
               marginTop: 10,
             }}>
-              <button type="button" onClick={() => { setStage('compose'); setActionStatus(''); }} style={btnSecondary}>
+              <button
+                type="button"
+                disabled={reportIsLocked}
+                onClick={() => {
+                  setStage('compose');
+                  setActionStatus('');
+                  setSupportActionStatus('');
+                  setSupportConsent(false);
+                }}
+                style={{ ...btnSecondary, opacity: reportIsLocked ? 0.55 : 1 }}
+              >
                 Back
               </button>
               <button type="button" onClick={() => void copyDraft()} style={btnSecondary}>
