@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api } from '../api.ts';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError, api } from '../api.ts';
 import { BUG_REPORT_CONTEXT_TIMEOUT_MS, BUG_REPORT_FILENAME, BUG_REPORT_URL } from '../bugReportDraft.ts';
 import { BugReportDialog } from './BugReportDialog.tsx';
 
@@ -30,6 +30,41 @@ const supportContext = {
   collection: { status: 'complete', unavailable_sections: [] },
 };
 
+const unavailableCapability = {
+  available: false,
+  purpose: '',
+  terms_version: '',
+  retention_policy_version: '',
+  terms_text: '',
+  retention_text: '',
+  max_report_bytes: 0,
+  message: 'Private support is unavailable.',
+};
+
+const privateCapability = {
+  available: true,
+  purpose: 'Troubleshoot and improve ClawJournal. Reports are not used for research or model training.',
+  terms_version: 'support-2026-08-16',
+  retention_policy_version: 'retention-30d-v1',
+  terms_text: 'Private support maintainers may inspect this report only for product support.',
+  retention_text: 'The report is retained for up to 30 days unless you delete it sooner.',
+  max_report_bytes: 32_768,
+  message: null,
+};
+
+const clientReportId = '123e4567-e89b-42d3-a456-426614174000';
+
+function reportStatus(state: 'queued' | 'submitting' | 'ambiguous' | 'accepted' | 'rejected') {
+  return {
+    client_report_id: clientReportId,
+    state,
+    receipt_id: state === 'accepted' ? 'support-receipt-123' : null,
+    message: null,
+    created_at: '2026-08-16T00:00:00Z',
+    expires_at: state === 'accepted' ? '2026-09-15T00:00:00Z' : null,
+  };
+}
+
 function fillRequiredFields() {
   fireEvent.change(screen.getByLabelText(/Summary/), { target: { value: 'Workbench froze' } });
   fireEvent.change(screen.getByLabelText(/What happened/), {
@@ -44,6 +79,11 @@ afterEach(() => {
   delete (navigator as unknown as { mediaDevices?: MediaDevices }).mediaDevices;
   restoreUrlMethod('createObjectURL', originalCreateObjectURL);
   restoreUrlMethod('revokeObjectURL', originalRevokeObjectURL);
+});
+
+beforeEach(() => {
+  vi.spyOn(api.support, 'capability').mockResolvedValue(unavailableCapability);
+  vi.spyOn(api.support, 'list').mockResolvedValue({ reports: [], truncated: false });
 });
 
 describe('BugReportDialog', () => {
@@ -69,7 +109,7 @@ describe('BugReportDialog', () => {
       />,
     );
 
-    expect(screen.getByText(/does not capture a screenshot, upload the draft, or submit an issue/i)).toBeInTheDocument();
+    expect(screen.getByText(/does not capture screenshots, logs, traces, or hidden diagnostics/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Summary/)).toHaveAttribute('maxlength', '120');
     expect(screen.getByLabelText(/What happened/)).toHaveAttribute('maxlength', '4000');
     expect(screen.getByLabelText(/Expected behavior/)).toHaveAttribute('maxlength', '2000');
@@ -183,6 +223,251 @@ describe('BugReportDialog', () => {
 
     rerender(<BugReportDialog open={false} onClose={() => {}} surface="workbench" />);
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:test-report');
+  });
+
+  it('shows private submission only for a validated available capability and requires separate consent', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability).mockResolvedValue(privateCapability);
+    const submit = vi.spyOn(api.support, 'submit').mockResolvedValue(reportStatus('queued'));
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalled());
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    expect(await screen.findByText(privateCapability.purpose)).toBeInTheDocument();
+    expect(screen.getByText(privateCapability.retention_text)).toBeInTheDocument();
+
+    const draft = screen.getByLabelText(/Review and edit the exact Markdown/) as HTMLTextAreaElement;
+    expect(draft).toHaveFocus();
+    fireEvent.change(draft, { target: { value: '# Reviewed\n\nExact private report.' } });
+    const send = screen.getByRole('button', { name: 'Send privately' });
+    expect(send).toBeDisabled();
+    expect(submit).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    expect(send).toBeEnabled();
+    fireEvent.click(send);
+
+    expect(await screen.findByRole('heading', { name: 'Private report: Queued' })).toHaveFocus();
+    expect(submit).toHaveBeenCalledWith({
+      report_markdown: '# Reviewed\n\nExact private report.',
+      accepted_terms_version: privateCapability.terms_version,
+      accepted_retention_policy_version: privateCapability.retention_policy_version,
+    });
+    expect(draft).toHaveAttribute('readonly');
+  });
+
+  it('clears consent and refreshes capability when terms change at submission', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    const updatedCapability = {
+      ...privateCapability,
+      terms_version: 'support-2026-08-18',
+      terms_text: 'Newest private support terms.',
+    };
+    vi.mocked(api.support.capability)
+      .mockResolvedValueOnce(privateCapability)
+      .mockResolvedValueOnce(updatedCapability);
+    vi.spyOn(api.support, 'submit').mockRejectedValue(new ApiError(
+      409,
+      'terms changed',
+      { code: 'terms_mismatch' },
+    ));
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalledTimes(1));
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    await screen.findByText(privateCapability.purpose);
+    fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
+
+    expect(await screen.findByText('Newest private support terms.')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /support-2026-08-18/i })).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Send privately' })).toBeDisabled();
+  });
+
+  it('requires fresh consent after close and a support-terms change', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability)
+      .mockResolvedValueOnce(privateCapability)
+      .mockResolvedValueOnce({
+        ...privateCapability,
+        terms_version: 'support-2026-08-17',
+        retention_policy_version: 'retention-30d-v2',
+        terms_text: 'Updated private support terms.',
+      });
+    const submit = vi.spyOn(api.support, 'submit');
+    const { rerender } = render(
+      <BugReportDialog open onClose={() => {}} surface="workbench" />,
+    );
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalledTimes(1));
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    await screen.findByText(privateCapability.purpose);
+    fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    expect(screen.getByRole('button', { name: 'Send privately' })).toBeEnabled();
+
+    rerender(<BugReportDialog open={false} onClose={() => {}} surface="workbench" />);
+    rerender(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('Updated private support terms.')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /support-2026-08-17.*retention-30d-v2/i })).not.toBeChecked();
+    expect(screen.getByRole('button', { name: 'Send privately' })).toBeDisabled();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it('restores recent private receipts after reopen and allows check and delete', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    const accepted = reportStatus('accepted');
+    const queuedId = '223e4567-e89b-42d3-a456-426614174001';
+    const queued = { ...reportStatus('queued'), client_report_id: queuedId };
+    vi.mocked(api.support.list).mockResolvedValue({ reports: [accepted, queued], truncated: false });
+    const status = vi.spyOn(api.support, 'status').mockResolvedValue({
+      ...reportStatus('accepted'),
+      client_report_id: queuedId,
+      receipt_id: 'support-receipt-queued',
+    });
+    const remove = vi.spyOn(api.support, 'remove').mockResolvedValue({
+      client_report_id: accepted.client_report_id,
+      state: 'deleted',
+    });
+
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    expect(await screen.findByRole('heading', { name: 'Recent private reports from this device' })).toBeInTheDocument();
+    expect(screen.getByText(/support-receipt-123/)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Summary/)).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: `Check status for report ${queuedId}` }));
+    expect(await screen.findByText(/support-receipt-queued/)).toBeInTheDocument();
+    expect(status).toHaveBeenCalledWith(queuedId);
+
+    fireEvent.click(screen.getByRole('button', { name: `Delete report ${accepted.client_report_id}` }));
+    fireEvent.click(screen.getByRole('button', { name: `Confirm delete report ${accepted.client_report_id}` }));
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(accepted.client_report_id));
+    expect(screen.queryByText(/support-receipt-123/)).not.toBeInTheDocument();
+    expect(await screen.findByText('The saved private report was deleted.')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Summary/)).toBeEnabled();
+  });
+
+  it('moves a submitted receipt to recent reports before composing another problem', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability).mockResolvedValue(privateCapability);
+    vi.spyOn(api.support, 'submit').mockResolvedValue(reportStatus('queued'));
+    const remove = vi.spyOn(api.support, 'remove');
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalled());
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    await screen.findByText(privateCapability.purpose);
+    fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
+    await screen.findByRole('heading', { name: 'Private report: Queued' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Report another problem' }));
+
+    expect(screen.queryByRole('heading', { name: /Private report:/ })).not.toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Recent private reports from this device' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: `Check status for report ${clientReportId}` })).toBeEnabled();
+    expect(screen.getByLabelText(/Summary/)).toHaveValue('');
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('renders real queue, send, confirmation, receipt, and deletion states through the daemon', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability).mockResolvedValue(privateCapability);
+    vi.spyOn(api.support, 'submit').mockResolvedValue(reportStatus('queued'));
+    const status = vi.spyOn(api.support, 'status')
+      .mockResolvedValueOnce(reportStatus('submitting'))
+      .mockResolvedValueOnce(reportStatus('ambiguous'))
+      .mockResolvedValueOnce(reportStatus('accepted'));
+    const remove = vi.spyOn(api.support, 'remove').mockResolvedValue({
+      client_report_id: clientReportId,
+      state: 'deleted',
+    });
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalled());
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    await screen.findByText(privateCapability.purpose);
+    fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
+    await screen.findByRole('heading', { name: 'Private report: Queued' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check status' }));
+    await screen.findByRole('heading', { name: 'Private report: Sending' });
+    fireEvent.click(screen.getByRole('button', { name: 'Check status' }));
+    await screen.findByRole('heading', { name: 'Private report: Confirming' });
+    fireEvent.click(screen.getByRole('button', { name: 'Check status' }));
+    await screen.findByRole('heading', { name: 'Private report: Received' });
+    expect(screen.getByText('support-receipt-123')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy draft' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Download .md' })).toBeEnabled();
+    expect(screen.getByRole('link', { name: 'Open blank GitHub issue' })).toHaveAttribute('href', BUG_REPORT_URL);
+    expect(status).toHaveBeenCalledTimes(3);
+    expect(status).toHaveBeenLastCalledWith(clientReportId);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete private report' }));
+    expect(screen.getByRole('button', { name: 'Confirm delete' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }));
+    expect(await screen.findByText(/private report was deleted/i)).toBeInTheDocument();
+    expect(remove).toHaveBeenCalledWith(clientReportId);
+    expect(screen.queryByRole('heading', { name: /Private report:/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Send privately' })).toBeDisabled();
+  });
+
+  it('shows rejection without leaking an error and leaves every local fallback usable', async () => {
+    const getDisplayMedia = vi.fn();
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getDisplayMedia },
+    });
+    const localSet = vi.spyOn(window.localStorage, 'setItem');
+    const sessionSet = vi.spyOn(window.sessionStorage, 'setItem');
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability).mockResolvedValue(privateCapability);
+    vi.spyOn(api.support, 'submit').mockResolvedValue({
+      ...reportStatus('rejected'),
+      message: 'The report was not accepted.',
+    });
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    await waitFor(() => expect(api.support.capability).toHaveBeenCalled());
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    await screen.findByText(privateCapability.purpose);
+    fireEvent.click(screen.getByRole('checkbox', { name: /I reviewed the exact Markdown above/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send privately' }));
+
+    await screen.findByRole('heading', { name: 'Private report: Rejected' });
+    expect(screen.getByRole('button', { name: 'Retry privately' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Copy draft' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Download .md' })).toBeEnabled();
+    expect(screen.getByRole('link', { name: 'Open blank GitHub issue' })).toHaveAttribute('href', BUG_REPORT_URL);
+    expect(getDisplayMedia).not.toHaveBeenCalled();
+    expect(localSet).not.toHaveBeenCalled();
+    expect(sessionSet).not.toHaveBeenCalled();
+  });
+
+  it('never shows Send privately when capability lookup is unavailable', async () => {
+    vi.spyOn(api.support, 'context').mockResolvedValue(supportContext);
+    vi.mocked(api.support.capability).mockRejectedValue(new TypeError('offline private detail'));
+    const submit = vi.spyOn(api.support, 'submit');
+    render(<BugReportDialog open onClose={() => {}} surface="workbench" />);
+
+    fillRequiredFields();
+    fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
+    expect(await screen.findByText(/Private submission is unavailable right now/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Send privately' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy draft' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Download .md' })).toBeEnabled();
+    expect(screen.getByRole('link', { name: 'Open blank GitHub issue' })).toBeInTheDocument();
+    expect(submit).not.toHaveBeenCalled();
+    expect(screen.queryByText(/offline private detail/)).not.toBeInTheDocument();
   });
 
   it('traps focus, restores it on Escape, and preserves textarea Enter', async () => {

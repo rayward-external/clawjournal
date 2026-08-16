@@ -29,6 +29,10 @@ import type {
   AutoUploadEnableProgress,
   AutoUploadHookDiagnostic,
   AutoUploadStatus,
+  SupportReportCapability,
+  SupportReportDeleteResponse,
+  SupportReportListResponse,
+  SupportReportStatus,
 } from './types.ts';
 
 const BASE = '/api';
@@ -336,6 +340,38 @@ export const api = {
   support: {
     context(signal?: AbortSignal): Promise<unknown> {
       return request('/support-context', { signal });
+    },
+
+    capability(signal?: AbortSignal): Promise<SupportReportCapability> {
+      return request('/support-reports/capability', { signal });
+    },
+
+    list(signal?: AbortSignal): Promise<SupportReportListResponse> {
+      return request('/support-reports', { signal });
+    },
+
+    submit(body: {
+      report_markdown: string;
+      accepted_terms_version: string;
+      accepted_retention_policy_version: string;
+    }, signal?: AbortSignal): Promise<SupportReportStatus> {
+      return request('/support-reports', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+      });
+    },
+
+    status(clientReportId: string, signal?: AbortSignal): Promise<SupportReportStatus> {
+      return request(`/support-reports/${encodeURIComponent(clientReportId)}`, { signal });
+    },
+
+    remove(clientReportId: string, signal?: AbortSignal): Promise<SupportReportDeleteResponse> {
+      return request(`/support-reports/${encodeURIComponent(clientReportId)}`, {
+        method: 'DELETE',
+        signal,
+      });
     },
   },
 
