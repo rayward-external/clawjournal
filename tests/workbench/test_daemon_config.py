@@ -272,8 +272,10 @@ class TestScoringBatchCancel:
         monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
 
         scored = dmod.Scanner().score_unscored_once()
-        # Only the first trace was scored; the loop broke before egressing more.
-        assert calls == ["s0"]
+        # Only one trace was scored; the durable queue deliberately chooses
+        # the oldest due revision first, then the loop stops before another
+        # egress after the user disables background scoring.
+        assert calls == ["s2"]
         assert scored == 1
 
 
