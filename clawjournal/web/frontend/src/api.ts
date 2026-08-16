@@ -333,6 +333,12 @@ export const api = {
     return request('/features');
   },
 
+  support: {
+    context(signal?: AbortSignal): Promise<unknown> {
+      return request('/support-context', { signal });
+    },
+  },
+
   index: {
     rebuild(): Promise<IndexRebuildResponse> {
       return request('/index/rebuild', { method: 'POST' });

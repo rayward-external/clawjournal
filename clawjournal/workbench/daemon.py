@@ -49,6 +49,12 @@ from ..scoring.overrides import (
     normalize_failure_evidence,
     requires_failure_evidence,
 )
+from ..support_context import (
+    SupportEnvironment,
+    capture_support_environment,
+    collect_support_context,
+    unavailable_support_context,
+)
 from ..config import (
     CONFIG_DIR,
     RECURRING_ENROLLMENT_GRANT_CONFIG_KEYS,
@@ -99,6 +105,7 @@ from .index import (
     _validate_hold_target,
     update_session,
     upsert_sessions,
+    WORKBENCH_SCHEMA_VERSION,
 )
 from .index_recovery import (
     UnsafeIndexRecovery,
@@ -109,6 +116,7 @@ from .index_recovery import (
     initialize_index_health,
     inspect_index_health,
     synchronize_index_health,
+    try_current_index_health,
 )
 from .timeline import (
     canonical_session_path,
@@ -1357,12 +1365,20 @@ def _api_token_cookie_header(token: str) -> str:
     )
 
 
-def _json_response(handler: BaseHTTPRequestHandler, data: Any, status: int = 200) -> None:
+def _json_response(
+    handler: BaseHTTPRequestHandler,
+    data: Any,
+    status: int = 200,
+    *,
+    cache_control: str | None = None,
+) -> None:
     """Send a JSON response."""
     body = json.dumps(data, default=str).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    if cache_control is not None:
+        handler.send_header("Cache-Control", cache_control)
     origin = _cors_origin(handler)
     if origin:
         handler.send_header("Access-Control-Allow-Origin", origin)
@@ -3991,6 +4007,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         # can render recovery guidance without touching the damaged index.
         elif path == "/api/features":
             self._handle_features()
+        # Support drafting must remain available when the index is unhealthy.
+        # It projects only startup metadata and the in-memory health snapshot.
+        elif path == "/api/support-context":
+            self._handle_support_context()
         elif path.startswith("/api/") and self._reject_unhealthy_index():
             return
         # API routes
@@ -5128,6 +5148,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "scoring_warmup_declined": bool(config.get("scoring_warmup_declined", False)),
             "index_health": synchronize_index_health(),
         })
+
+    def _handle_support_context(self) -> None:
+        """Return a DB-free, strictly allowlisted support-report snapshot."""
+
+        try:
+            environment = getattr(self.server, "_support_environment", None)
+            payload = collect_support_context(
+                environment,
+                try_current_index_health(),
+            )
+        except Exception:
+            # Never place exception text or a traceback in the response. The
+            # local report draft remains useful with a fixed partial marker.
+            payload = unavailable_support_context()
+        _json_response(self, payload, cache_control="no-store")
 
     def _handle_index_rebuild(self) -> None:
         """Start the one-click, backup-first index rebuild in the background."""
@@ -7254,6 +7289,7 @@ def _try_serve_ipv6_loopback(
     port: int,
     scanner: "Scanner",
     frontend_snapshot: FrontendSnapshot | None = None,
+    support_environment: SupportEnvironment | None = None,
 ) -> ThreadingHTTPServer | None:
     """Start a companion IPv6 (``::1``) loopback server on ``port``, serving in a
     daemon thread with the same handler/scanner as the primary IPv4 server.
@@ -7277,6 +7313,7 @@ def _try_serve_ipv6_loopback(
         return None
     v6._scanner = scanner  # type: ignore[attr-defined]
     v6._frontend_snapshot = frontend_snapshot  # type: ignore[attr-defined]
+    v6._support_environment = support_environment  # type: ignore[attr-defined]
     threading.Thread(target=v6.serve_forever, daemon=True).start()
     return v6
 
@@ -7309,6 +7346,21 @@ def run_server(
     scanner = Scanner(source_filter=source_filter)
     _open_request_admission()
 
+    support_revision = startup_head
+    if support_revision is None and frontend_snapshot is not None:
+        support_revision = frontend_snapshot.revision
+    try:
+        support_environment = capture_support_environment(
+            revision=support_revision,
+            expected_user_version=WORKBENCH_SCHEMA_VERSION,
+            # Reading this module constant does not open an SQLite database.
+            sqlite_version=sqlite3.sqlite_version,
+        )
+    except Exception:
+        # Collection is best-effort and must never prevent the workbench from
+        # starting. The endpoint will render this as a fixed partial payload.
+        support_environment = None
+
     # Start HTTP server first so it's responsive immediately. The primary socket
     # is IPv4 127.0.0.1 — what the CLI health probe, curl, and SSH `-L` tunnels
     # expect.
@@ -7321,6 +7373,7 @@ def run_server(
         port = server.server_address[1]
     server._scanner = scanner  # type: ignore[attr-defined]
     server._frontend_snapshot = frontend_snapshot  # type: ignore[attr-defined]
+    server._support_environment = support_environment  # type: ignore[attr-defined]
 
     # Publish a non-ready state only after the primary socket binds. A rejected
     # launch (for example, the desktop port is already occupied) must not leave
@@ -7333,7 +7386,12 @@ def run_server(
     # IPv4-only daemon leaves the workbench unreachable via localhost on
     # IPv6-preferring systems. Each family is its own ::1 / 127.0.0.1 loopback
     # socket — nothing is exposed beyond the local host.
-    v6_server = _try_serve_ipv6_loopback(port, scanner, frontend_snapshot)
+    v6_server = _try_serve_ipv6_loopback(
+        port,
+        scanner,
+        frontend_snapshot,
+        support_environment,
+    )
 
     url = f"http://localhost:{port}/"
     logger.info("Workbench running at %s", url)

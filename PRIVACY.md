@@ -6,6 +6,7 @@ ClawJournal is designed to be usable without uploading anything.
 
 - `clawjournal scan`, `serve`, `inbox`, `search`, `score`, `export`, and `bundle-export` run locally.
 - The browser workbench is local. If you install from source, `clawjournal serve` opens your own machine at `localhost:8384`.
+- **Report a problem** creates an editable draft in browser memory. Its loopback diagnostic request uses a fixed allowlist and excludes transcripts, logs, paths, raw URLs, identifiers, and raw error text. It does not take a screenshot or upload anything; copy/download and opening a blank GitHub issue leave final review and submission to you.
 - `bundle-export` writes files to disk. It does not contact a server.
 - If you never use the workbench Submit step, never explicitly enable Automatic uploads, and never configure `CLAWJOURNAL_INGEST_URL` or run `bundle-share`, nothing is uploaded.
 - If you are explicitly enrolled in OpenRefinery Agent Failure Sharing, the optional agent hook only shows a local reminder and can open the existing Share workflow. The hook does not read transcripts, package bundles, or upload data by itself.
