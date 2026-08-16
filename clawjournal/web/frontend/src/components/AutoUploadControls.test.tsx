@@ -347,7 +347,7 @@ describe('AutoUploadPanel authorization', () => {
     expect(screen.getByText(/automatically upload up to 5 eligible/i)).toBeInTheDocument();
     expect(screen.queryByText('Claude Code - matches exact upload scope')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'View scope and terms' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'View scope and terms' }));
     expect(screen.getByText('Claude Code - matches exact upload scope')).toBeInTheDocument();
     expect(screen.getByText('I authorize capped recurring uploads of eligible future traces.')).toBeInTheDocument();
     expect(screen.getByText('Hosted retention terms for recurring uploads.')).toBeInTheDocument();
