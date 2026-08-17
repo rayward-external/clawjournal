@@ -591,6 +591,7 @@ function AuthorizationDialog({
             <li>ClawJournal anonymizes and redacts locally, then runs the existing findings and secret-scan gates.</li>
             <li>Run now is an extra capped cycle and resets the next scheduled date.</li>
             <li>You can preview, pause, review the exact scope, or turn this off in Settings.</li>
+            <li>To keep a single trace out without excluding its project, hold, embargo, or block that session in the workbench; it is then counted under exclusions here.</li>
             <li>Turning it off does not delete prior uploads. A request already being submitted may finish.</li>
           </ul>
         </div>
