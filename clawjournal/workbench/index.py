@@ -3575,8 +3575,15 @@ def upsert_sessions(
         files = badges["files_touched"]
         commands = badges["commands_run"]
 
-        # Skip sessions that are just slash commands (not real traces)
-        if display_title.startswith("/") and " " not in display_title.strip():
+        # Skip sessions that are just slash commands (not real traces).
+        # The title is derived from the *first* user message, so gate on
+        # message count too: a long session opened with a bare `/model`
+        # is still a real trace (#196).
+        if (
+            display_title.startswith("/")
+            and " " not in display_title.strip()
+            and len(session.get("messages", [])) <= 2
+        ):
             continue
 
         # A fork rollout replays its parent's opening message, so its derived
