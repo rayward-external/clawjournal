@@ -109,6 +109,43 @@ describe('Share selection defaults', () => {
     });
   });
 
+  it('preselects only approved traces and counts them, keeping unapproved ones pickable', async () => {
+    // Regression test for issue #201: the widened pool returns unapproved
+    // (new/shortlisted) traces for the picker, but they must not appear as
+    // "will be shared" nor inflate the selection counter.
+    mockInitialLoad({
+      ...readyStats(0),
+      count: 4,
+      total_approved: 2,
+      recommended_session_ids: [],
+      sessions: [
+        readySession('s1'),
+        { ...readySession('s2'), review_status: 'new' },
+        readySession('s3'),
+        { ...readySession('s4'), review_status: 'shortlisted' },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/share']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('2 traces selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s3' })).toBeChecked();
+    const unapproved = screen.getByRole('checkbox', { name: 'Include trace: Trace s2' });
+    expect(unapproved).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s4' })).not.toBeChecked();
+    expect(screen.getByText('not approved (new)')).toBeInTheDocument();
+    expect(screen.getByText('not approved (shortlisted)')).toBeInTheDocument();
+
+    // Explicitly opting an unapproved trace in still works from the picker.
+    fireEvent.click(unapproved);
+    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
+  });
+
   it('shows one conversation while selecting and redacting every eligible checkpoint', async () => {
     const root: ReadySession = {
       ...readySession('long-trace'),

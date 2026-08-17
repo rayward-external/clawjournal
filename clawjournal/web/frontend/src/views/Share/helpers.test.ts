@@ -73,6 +73,36 @@ describe('Share queue selection encoding', () => {
     expect(queueFromSelectionParams(stats, new URLSearchParams())).toEqual(expected);
   });
 
+  it('preselects only approved traces from the widened pool', () => {
+    const sessions = [
+      readySession('s1'),
+      { ...readySession('s2'), review_status: 'new' },
+      readySession('s3'),
+      { ...readySession('s4'), review_status: 'shortlisted' },
+    ];
+    const stats: ShareReadyStats = { ...readyStats(0), count: sessions.length, sessions };
+
+    expect(queueFromStats(stats)).toEqual(['s1', 's3']);
+    expect(queueFromSelectionParams(stats, new URLSearchParams())).toEqual(['s1', 's3']);
+    // Unapproved traces stay individually selectable from the picker.
+    expect(expandLogicalQueueSelection(stats, ['s2'])).toEqual(['s2']);
+  });
+
+  it('does not let a recommendation preselect an unapproved trace', () => {
+    const sessions = [
+      { ...readySession('s1'), review_status: 'new' },
+      readySession('s2'),
+    ];
+    const stats: ShareReadyStats = {
+      ...readyStats(0),
+      count: sessions.length,
+      recommended_session_ids: ['s1'],
+      sessions,
+    };
+
+    expect(queueFromStats(stats)).toEqual(['s2']);
+  });
+
   it('keeps default and exclusion URLs compact while preserving explicit empty and ordered subsets', () => {
     const stats = readyStats();
     const defaults = queueFromStats(stats);
@@ -187,6 +217,17 @@ describe('logical conversation queue projection', () => {
     expect(queueFromStats(stats)).not.toContain('conversation-1');
     expect(queueFromStats(stats)).not.toContain('conversation-1_seg-0001');
     expect(queueFromStats(stats)).toContain('fits-after-group');
+  });
+
+  it('does not preselect a checkpoint family with an unapproved member', () => {
+    const sessions = [
+      checkpoint('conversation-1', 0),
+      { ...checkpoint('conversation-1_seg-0001', 1), review_status: 'new' },
+      readySession('standalone'),
+    ];
+    const stats: ShareReadyStats = { ...readyStats(0), count: sessions.length, sessions };
+
+    expect(queueFromStats(stats)).toEqual(['standalone']);
   });
 
   it('rejects conflicting logical revisions before packaging', () => {
