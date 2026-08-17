@@ -297,6 +297,14 @@ export function collectExpectedLogicalRevisions(
   return expected;
 }
 
+// The widened share-ready pool (`include_unapproved=1`) deliberately contains
+// review_status new/shortlisted traces so the picker can offer them for
+// explicit selection — but only user-approved traces may be *preselected* as
+// "will be shared" (issue #201). Fail closed on a missing status.
+function groupApproved(group: LogicalReadySessionGroup): boolean {
+  return group.members.every((session) => session.review_status === 'approved');
+}
+
 export function queueFromStats(stats: ShareReadyStats): string[] {
   const groups = groupReadySessions(stats.sessions);
   const groupById = new Map<string, LogicalReadySessionGroup>();
@@ -317,7 +325,7 @@ export function queueFromStats(stats: ShareReadyStats): string[] {
   // logical conversation at the physical-checkpoint cap.
   const selected: string[] = [];
   orderedGroups.forEach((group) => {
-    if (group.logical_incomplete) return;
+    if (group.logical_incomplete || !groupApproved(group)) return;
     const checkpointIds = group.members.map((session) => session.session_id);
     if (selected.length + checkpointIds.length <= MAX_SHARE_QUEUE_SIZE) {
       selected.push(...checkpointIds);

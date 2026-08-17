@@ -306,7 +306,12 @@ export function QueueStep(p: QueueStepProps) {
                   </>)}
                   {s.review_status && s.review_status !== 'approved' && (<>
                     <span style={{ opacity: 0.5 }}>&middot;</span>
-                    <span style={{ color: colors.gray400, fontStyle: 'italic' }}>{s.review_status}</span>
+                    <span
+                      style={{ color: colors.yellow700, fontStyle: 'italic' }}
+                      title="This trace has not been approved in review, so it is not preselected. Selecting it here includes it after you redact and review it."
+                    >
+                      not approved ({s.review_status})
+                    </span>
                   </>)}
                 </div>
               </div>
