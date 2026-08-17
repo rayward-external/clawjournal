@@ -363,7 +363,7 @@ describe('AutoUploadPanel authorization', () => {
     const checkboxes = screen.getAllByRole('checkbox');
     expect(checkboxes).toHaveLength(1);
     expect(screen.getByRole('button', { name: 'Enable automatic upload' })).toBeDisabled();
-    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
+    fireEvent.click(await screen.findByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     await waitFor(() => expect(enableSpy).toHaveBeenCalledTimes(2));
@@ -430,7 +430,7 @@ describe('AutoUploadPanel authorization', () => {
     await openPanelDetails();
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
     await screen.findByRole('heading', { name: 'Enable automatic uploads?' });
-    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
+    fireEvent.click(await screen.findByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     expect(screen.getByText(
@@ -492,7 +492,7 @@ describe('AutoUploadPanel authorization', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Review scope and terms' }));
     await screen.findByRole('heading', { name: 'Enable automatic uploads?' });
 
-    fireEvent.click(screen.getByLabelText('Certify bundle ownership'));
+    fireEvent.click(await screen.findByLabelText('Certify bundle ownership'));
     fireEvent.click(screen.getByRole('button', { name: 'Enable automatic upload' }));
 
     expect(await screen.findByText(/single-use email verification/i)).toBeInTheDocument();
