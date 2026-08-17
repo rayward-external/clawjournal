@@ -108,6 +108,12 @@ class TestAnonymizeText:
         assert "alice" not in result
         assert _USERNAME_PLACEHOLDER in result
 
+    def test_bare_username_adjacent_cjk_replaced(self):
+        # `\b` never fires between CJK and ASCII word chars (#195)
+        result = anonymize_text("请把alice的文件发我", "alice")
+        assert "alice" not in result
+        assert _USERNAME_PLACEHOLDER in result
+
     def test_short_username_not_replaced_bare(self):
         # Usernames < 4 chars should NOT be replaced as bare words
         result = anonymize_text(

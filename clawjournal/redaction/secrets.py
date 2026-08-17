@@ -636,7 +636,13 @@ def redact_custom_strings(text: str, strings: list[str]) -> tuple[str, int]:
         if not target or len(target) < 3:
             continue
         escaped = re.escape(target)
-        pattern = rf"\b{escaped}\b" if len(target) >= 4 else escaped
+        # ASCII-only boundaries: `\b` treats CJK as word characters, so a
+        # target adjacent to CJK text (e.g. `用myuser这`) would never match.
+        pattern = (
+            rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])"
+            if len(target) >= 4
+            else escaped
+        )
         text, replacements = re.subn(pattern, "[REDACTED_CUSTOM]", text)
         count += replacements
 
@@ -802,10 +808,15 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
     # Sort by length descending so longer matches replace first
     for secret in sorted(secret_map, key=len, reverse=True):
         replacement = secret_map[secret]
-        # Short alphanumeric strings need word boundaries to avoid matching
+        # Short alphanumeric strings need boundaries to avoid matching
         # inside unrelated words (e.g. custom redact_strings like "Kai").
+        # ASCII-only lookarounds rather than `\b`, which treats CJK
+        # neighbours as word characters and silently skips the match.
         if len(secret) < 20 and secret.isalnum():
-            pattern = re.compile(rf"\b{re.escape(secret)}\b", re.IGNORECASE)
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])",
+                re.IGNORECASE,
+            )
             text, n = pattern.subn(replacement, text)
             count += n
         elif secret in text:

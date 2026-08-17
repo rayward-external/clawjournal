@@ -64,7 +64,13 @@ def anonymize_text(text: str, username: str) -> str:
     # Final pass: replace bare username in remaining contexts (ls output, prose, etc.)
     # Only if username is >= 4 chars to avoid false positives
     if len(username) >= 4:
-        text = re.sub(rf"\b{escaped}\b", _USERNAME_PLACEHOLDER, text)
+        # ASCII-only boundaries: `\b` treats CJK as word characters, so a
+        # username adjacent to CJK prose would never match.
+        text = re.sub(
+            rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])",
+            _USERNAME_PLACEHOLDER,
+            text,
+        )
 
     return text
 
