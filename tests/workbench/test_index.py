@@ -137,6 +137,25 @@ class TestUpsertSessions:
         new_count = upsert_sessions(index_conn, sessions)
         assert new_count == 2
 
+    def test_bare_slash_command_only_session_skipped(self, index_conn):
+        # A session that is just `/model` (no real work) stays out of the index
+        new_count = upsert_sessions(index_conn, [_make_session(content="/model")])
+        assert new_count == 0
+
+    def test_bare_slash_command_opening_real_session_indexed(self, index_conn):
+        # A real trace whose *first* message is a bare slash command must not
+        # be dropped (#196)
+        session = _make_session(content="/model")
+        session["messages"].extend(
+            [
+                {"role": "user", "content": "Now fix the login bug", "tool_uses": []},
+                {"role": "assistant", "content": "Done.", "tool_uses": []},
+            ]
+        )
+        new_count = upsert_sessions(index_conn, [session])
+        assert new_count == 1
+        assert get_session_detail(index_conn, "sess-1") is not None
+
     @pytest.mark.parametrize(
         "session_id",
         ("claude-science:org-1:frame-1", "../outside-the-blob-directory"),
