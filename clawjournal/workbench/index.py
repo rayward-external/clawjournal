@@ -2507,9 +2507,14 @@ def _compile_blocked_domain_pattern(domain: str) -> re.Pattern[str] | None:
         suffix = normalized[2:].strip(".")
         if not suffix:
             return None
-        pattern = rf"\b(?:[a-z0-9-]+\.)+{re.escape(suffix)}\b"
+        # ASCII-only boundaries: `\b` treats CJK neighbours as word
+        # characters, silently skipping domains embedded in CJK prose.
+        pattern = (
+            rf"(?<![A-Za-z0-9_])(?:[a-z0-9-]+\.)+"
+            rf"{re.escape(suffix)}(?![A-Za-z0-9_])"
+        )
     else:
-        pattern = rf"\b{re.escape(normalized)}\b"
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(normalized)}(?![A-Za-z0-9_])"
     return re.compile(pattern, re.IGNORECASE)
 
 

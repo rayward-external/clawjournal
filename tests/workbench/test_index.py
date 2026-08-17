@@ -10,6 +10,7 @@ from clawjournal.session_titles import resolve_session_title
 from clawjournal.workbench.index import (
     LogicalProjectionError,
     RevisionConflictError,
+    _compile_blocked_domain_pattern,
     _migrate_bundles_to_shares,
     add_policy,
     backfill_session_keys,
@@ -2398,3 +2399,21 @@ class TestMigration:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
 
         conn.close()
+
+
+# --- _compile_blocked_domain_pattern ---
+
+
+class TestBlockedDomainPatternBoundaries:
+    def test_wildcard_matches_adjacent_cjk(self):
+        # `\b` never fires between CJK and ASCII word chars (#195)
+        pattern = _compile_blocked_domain_pattern("*.internal")
+        assert pattern.search("访问api.internal的接口")
+
+    def test_exact_matches_adjacent_cjk(self):
+        pattern = _compile_blocked_domain_pattern("api.internal")
+        assert pattern.search("在api.internal上部署")
+
+    def test_ascii_embedded_domain_still_untouched(self):
+        pattern = _compile_blocked_domain_pattern("api.internal")
+        assert not pattern.search("xapi.internally")

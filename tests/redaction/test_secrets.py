@@ -7,6 +7,7 @@ from clawjournal.redaction.secrets import (
     REDACTED,
     SECRET_PLACEHOLDER,
     SECRET_PATTERNS,
+    _apply_redaction_set,
     _check_user_allowlist,
     _has_mixed_char_types,
     _shannon_entropy,
@@ -361,6 +362,41 @@ class TestRedactCustomStrings:
         result, count = redact_custom_strings("fooabc bar abc", ["abc"])
         # With no word boundary for 3-char, should match in "fooabc" as escaped substring
         assert count >= 1
+
+    def test_cjk_adjacent_target_redacted(self):
+        # `\b` never fires between CJK and ASCII word chars (#195)
+        result, count = redact_custom_strings("只用myuser这个目录", ["myuser"])
+        assert result == "只用[REDACTED_CUSTOM]这个目录"
+        assert count == 1
+
+    def test_cjk_after_path_target_redacted(self):
+        result, count = redact_custom_strings("帮我看看/data/myuser里面", ["myuser"])
+        assert result == "帮我看看/data/[REDACTED_CUSTOM]里面"
+        assert count == 1
+
+    def test_ascii_embedded_target_still_untouched(self):
+        result, count = redact_custom_strings(
+            "run mymyuser and myuser2024 now", ["myuser"]
+        )
+        assert result == "run mymyuser and myuser2024 now"
+        assert count == 0
+
+
+# --- _apply_redaction_set ---
+
+
+class TestApplyRedactionSetBoundaries:
+    def test_cjk_adjacent_short_secret_replaced(self):
+        # Short alnum secrets go through the boundary-matched branch; `\b`
+        # would skip them next to CJK text (#195)
+        text, count = _apply_redaction_set("在tok3nvalue后面", {"tok3nvalue": "[X]"})
+        assert text == "在[X]后面"
+        assert count == 1
+
+    def test_ascii_embedded_short_secret_still_untouched(self):
+        text, count = _apply_redaction_set("xtok3nvaluey", {"tok3nvalue": "[X]"})
+        assert text == "xtok3nvaluey"
+        assert count == 0
 
 
 # --- redact_session ---
