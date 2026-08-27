@@ -4369,3 +4369,291 @@ class TestScanLocalAgentEdgeCases:
         size = _estimate_la_session_size(descriptor)
         assert size == audit_file.stat().st_size
         assert size > 0
+
+
+class TestCodexResponseItemMessages:
+    """Rollouts from newer Codex CLI versions store conversation messages as
+    `response_item` records instead of (or alongside) `event_msg` records."""
+
+    @staticmethod
+    def _write_rollout(tmp_path, records):
+        session_file = tmp_path / "rollout-response-items.jsonl"
+        lines = [
+            {
+                "timestamp": "2026-08-25T10:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": "session-ri", "cwd": "/repo"},
+            },
+            *records,
+        ]
+        session_file.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+        return session_file
+
+    @staticmethod
+    def _ri_message(role, blocks, timestamp="2026-08-25T10:00:01.000Z"):
+        return {
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": blocks},
+        }
+
+    @staticmethod
+    def _em(event_type, timestamp="2026-08-25T10:00:01.500Z", **payload):
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": event_type, **payload},
+        }
+
+    def _parse(self, session_file, mock_anonymizer):
+        return _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+    def test_new_format_messages_discovered(self, tmp_path, mock_anonymizer):
+        """A rollout with only response_item message records parses."""
+        session_file = self._write_rollout(tmp_path, [
+            # Synthetic context bundle: ignored.
+            self._ri_message("user", [
+                {"type": "input_text", "text": "<recommended_plugins>\nHere is a list of plugins.\n</recommended_plugins>"},
+                {"type": "input_text", "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>"},
+                {"type": "input_text", "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"},
+            ]),
+            # Developer instructions: ignored.
+            self._ri_message("developer", [
+                {"type": "input_text", "text": "<skills_instructions>\n## Skills\n</skills_instructions>"},
+            ]),
+            self._ri_message("user", [
+                {"type": "input_text", "text": "hello"},
+            ], timestamp="2026-08-25T10:00:02.000Z"),
+            {
+                "timestamp": "2026-08-25T10:00:03.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call-1",
+                    "arguments": json.dumps({"cmd": "ls"}),
+                },
+            },
+            self._ri_message("assistant", [
+                {"type": "output_text", "text": "hi there"},
+            ], timestamp="2026-08-25T10:00:04.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert result is not None
+        assert result["stats"]["user_messages"] == 1
+        assert result["stats"]["assistant_messages"] == 1
+        assert result["messages"][0] == {
+            "role": "user",
+            "content": "hello",
+            "timestamp": "2026-08-25T10:00:02.000Z",
+        }
+        assert result["messages"][1]["content"] == "hi there"
+        assert result["messages"][1]["tool_uses"][0]["tool"] == "exec_command"
+
+    def test_dual_format_messages_deduplicated(self, tmp_path, mock_anonymizer):
+        """When a rollout carries both formats, each message parses once.
+
+        Real rollouts persist the response_item copy of a user message just
+        before its event_msg copy, and the response_item copy of the final
+        assistant message just after its event_msg copy; intermediate
+        agent messages may exist only as event_msg records."""
+        session_file = self._write_rollout(tmp_path, [
+            self._ri_message("user", [{"type": "input_text", "text": "hello"}],
+                             timestamp="2026-08-25T10:00:01.000Z"),
+            self._em("user_message", message="hello",
+                     timestamp="2026-08-25T10:00:01.100Z"),
+            self._em("agent_message", message="working on it",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+            self._em("agent_message", message="all done",
+                     timestamp="2026-08-25T10:00:03.000Z"),
+            self._ri_message("assistant", [{"type": "output_text", "text": "all done"}],
+                             timestamp="2026-08-25T10:00:03.100Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "hello"),
+            ("assistant", "working on it"),
+            ("assistant", "all done"),
+        ]
+        assert result["stats"]["user_messages"] == 1
+        assert result["stats"]["assistant_messages"] == 2
+
+    def test_same_format_identical_resend_is_kept(self, tmp_path, mock_anonymizer):
+        """Cross-format dedup must not swallow a genuine identical resend."""
+        session_file = self._write_rollout(tmp_path, [
+            self._ri_message("user", [{"type": "input_text", "text": "continue"}],
+                             timestamp="2026-08-25T10:00:01.000Z"),
+            self._ri_message("user", [{"type": "input_text", "text": "continue"}],
+                             timestamp="2026-08-25T10:00:02.000Z"),
+            self._ri_message("assistant", [{"type": "output_text", "text": "done"}],
+                             timestamp="2026-08-25T10:00:03.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert result["stats"]["user_messages"] == 2
+
+    def test_request_marker_wrapper_preserved(self, tmp_path, mock_anonymizer):
+        """IDE-context wrappers keep the request after the request marker."""
+        wrapped = (
+            "# Context from my IDE setup:\n\n## Active file: src/lib.rs\n\n"
+            "## My request for Codex:\nfix the failing test"
+        )
+        contextual_wrapped = (
+            "<user_instructions>\nsome instructions\n\n"
+            "## My request for Codex:\nalso review the docs\n</user_instructions>"
+        )
+        session_file = self._write_rollout(tmp_path, [
+            self._ri_message("user", [{"type": "input_text", "text": wrapped}],
+                             timestamp="2026-08-25T10:00:01.000Z"),
+            self._ri_message("assistant", [{"type": "output_text", "text": "on it"}],
+                             timestamp="2026-08-25T10:00:02.000Z"),
+            self._ri_message("user", [{"type": "input_text", "text": contextual_wrapped}],
+                             timestamp="2026-08-25T10:00:03.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        users = [m for m in result["messages"] if m["role"] == "user"]
+        assert len(users) == 2
+        # Non-contextual wrapper text is kept whole (matches event_msg behavior).
+        assert users[0]["content"].endswith("fix the failing test")
+        # A fully-contextual wrapper still surfaces the embedded request.
+        assert users[1]["content"] == "also review the docs"
+
+    def test_input_image_metadata_distinguishes_retried_prompts(
+        self, tmp_path, mock_anonymizer
+    ):
+        """A resend with a different attached image is a new message, not a
+        retry replacement; a resend with the same image replaces in place."""
+        def user_with_image(url, timestamp):
+            return self._ri_message("user", [
+                {"type": "input_text", "text": "look at this"},
+                {"type": "input_image", "image_url": url},
+            ], timestamp=timestamp)
+
+        # Different image: not a confirmed retry -> both messages kept.
+        session_file = self._write_rollout(tmp_path, [
+            user_with_image("data:image/png;base64,AAAA", "2026-08-25T10:00:01.000Z"),
+            self._em("turn_aborted", reason="interrupted",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+            user_with_image("data:image/png;base64,BBBB", "2026-08-25T10:00:03.000Z"),
+            self._ri_message("assistant", [{"type": "output_text", "text": "ok"}],
+                             timestamp="2026-08-25T10:00:04.000Z"),
+        ])
+        result = self._parse(session_file, mock_anonymizer)
+        assert result["stats"]["user_messages"] == 2
+
+        # Same image: confirmed retry -> replaced in place.
+        session_file = self._write_rollout(tmp_path, [
+            user_with_image("data:image/png;base64,AAAA", "2026-08-25T10:00:01.000Z"),
+            self._em("turn_aborted", reason="interrupted",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+            user_with_image("data:image/png;base64,AAAA", "2026-08-25T10:00:03.000Z"),
+            self._ri_message("assistant", [{"type": "output_text", "text": "ok"}],
+                             timestamp="2026-08-25T10:00:04.000Z"),
+        ])
+        result = self._parse(session_file, mock_anonymizer)
+        assert result["stats"]["user_messages"] == 1
+        assert result["messages"][0]["timestamp"] == "2026-08-25T10:00:03.000Z"
+
+    def test_cross_format_retry_hash_comparable_for_text_only(
+        self, tmp_path, mock_anonymizer
+    ):
+        """A text-only prompt hashes identically from either format, so a
+        confirmed retry replaces in place even when the candidate came from
+        one format and the resend from the other."""
+        session_file = self._write_rollout(tmp_path, [
+            self._ri_message("user", [{"type": "input_text", "text": "go"}],
+                             timestamp="2026-08-25T10:00:01.000Z"),
+            self._em("user_message", message="go",
+                     timestamp="2026-08-25T10:00:01.100Z"),
+            self._em("turn_aborted", reason="interrupted",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+            # Resend arrives only as event_msg: its hash must compare equal
+            # to the response_item-derived candidate hash.
+            self._em("user_message", message="go",
+                     timestamp="2026-08-25T10:00:03.000Z"),
+            self._em("agent_message", message="done",
+                     timestamp="2026-08-25T10:00:04.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert result["stats"]["user_messages"] == 1
+        assert result["messages"][0]["timestamp"] == "2026-08-25T10:00:03.000Z"
+
+    def test_input_audio_metadata_distinguishes_retried_prompts(
+        self, tmp_path, mock_anonymizer
+    ):
+        """A resend with a different audio attachment is a new message."""
+        def user_with_audio(url, timestamp):
+            return self._ri_message("user", [
+                {"type": "input_text", "text": "listen to this"},
+                {"type": "input_audio", "audio_url": url},
+            ], timestamp=timestamp)
+
+        session_file = self._write_rollout(tmp_path, [
+            user_with_audio("data:audio/wav;base64,AAAA", "2026-08-25T10:00:01.000Z"),
+            self._em("turn_aborted", reason="interrupted",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+            user_with_audio("data:audio/wav;base64,BBBB", "2026-08-25T10:00:03.000Z"),
+            self._ri_message("assistant", [{"type": "output_text", "text": "ok"}],
+                             timestamp="2026-08-25T10:00:04.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert result["stats"]["user_messages"] == 2
+
+    def test_assistant_dedup_ignores_request_marker(self, tmp_path, mock_anonymizer):
+        """The wrapper strip is a user-message construct; two assistant
+        messages that only share the text after the marker are distinct."""
+        session_file = self._write_rollout(tmp_path, [
+            self._ri_message("user", [{"type": "input_text", "text": "hi"}],
+                             timestamp="2026-08-25T10:00:01.000Z"),
+            self._em("agent_message",
+                     message="First answer.\n## My request for Codex:\nfix it",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+            self._ri_message("assistant", [
+                {"type": "output_text",
+                 "text": "Second answer.\n## My request for Codex:\nfix it"},
+            ], timestamp="2026-08-25T10:00:03.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert result["stats"]["assistant_messages"] == 2
+
+    def test_wrapped_and_bare_request_deduplicate(self, tmp_path, mock_anonymizer):
+        """A response_item stored as the bare extracted request dedups against
+        an event_msg twin persisting the full wrapped text."""
+        wrapped = (
+            "<user_instructions>\ncontext\n\n"
+            "## My request for Codex:\nship it\n</user_instructions>"
+        )
+        session_file = self._write_rollout(tmp_path, [
+            self._ri_message("user", [{"type": "input_text", "text": wrapped}],
+                             timestamp="2026-08-25T10:00:01.000Z"),
+            self._em("user_message", message=wrapped,
+                     timestamp="2026-08-25T10:00:01.100Z"),
+            self._em("agent_message", message="shipped",
+                     timestamp="2026-08-25T10:00:02.000Z"),
+        ])
+
+        result = self._parse(session_file, mock_anonymizer)
+
+        assert result["stats"]["user_messages"] == 1
+        assert result["messages"][0]["content"] == "ship it"
