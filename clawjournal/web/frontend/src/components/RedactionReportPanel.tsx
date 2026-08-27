@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { RedactionLogEntry } from '../types.ts';
-import { api } from '../api.ts';
+import { api, AUTO_UPLOAD_PAUSED_NOTICE } from '../api.ts';
 import { useToast } from './Toast.tsx';
 import { Spinner } from './Spinner.tsx';
 import { colors } from '../theme.ts';
@@ -63,12 +63,13 @@ export function RedactionReportPanel({ sessionId, onScrollToMessage }: Redaction
 
   const handleAllowCategory = async (entry: RedactionLogEntry) => {
     try {
-      await api.allowlist.add({
+      const result = await api.allowlist.add({
         type: 'category',
         match_type: entry.type,
         reason: `Skipped all ${TYPE_LABELS[entry.type] ?? entry.type} detections`,
       });
       toast(`All "${TYPE_LABELS[entry.type] ?? entry.type}" findings will be skipped`, 'success');
+      if (result.auto_upload_paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
       load(); // Refresh to reflect allowlist
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Failed to add allowlist entry', 'error');
@@ -78,12 +79,13 @@ export function RedactionReportPanel({ sessionId, onScrollToMessage }: Redaction
   const handleAllowExact = async () => {
     if (!allowText.trim()) return;
     try {
-      await api.allowlist.add({
+      const result = await api.allowlist.add({
         type: 'exact',
         text: allowText.trim(),
         reason: allowReason.trim() || undefined,
       });
       toast('Added to allowlist', 'success');
+      if (result.auto_upload_paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
       setShowAllowForm(null);
       setAllowText('');
       setAllowReason('');

@@ -37,7 +37,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
 
-from .config import mark_auto_upload_profile_changed
 from .paths import ensure_hash_salt
 
 ENGINE_VERSION = 3  # Include fork_nickname in every session-level findings
@@ -712,7 +711,11 @@ def allowlist_add_by_hash(
         entity_hash=entity_hash,
         reason=reason,
     )
-    mark_auto_upload_profile_changed(conn)
+    # Deliberately no auto-upload pause here: the findings allowlist is not
+    # part of the recurring egress profile hash, so pausing guarded nothing —
+    # resume()'s profile check passed unchanged and the runner re-derives
+    # every per-finding tier decision from this table at package time. The
+    # allowlist decision itself is the explicit, audited user review.
     entry = AllowlistEntry(
         allowlist_id=allowlist_id,
         entity_type=entity_type,
@@ -777,7 +780,9 @@ def allowlist_remove(
         "DELETE FROM findings_allowlist WHERE allowlist_id = ?",
         (allowlist_id,),
     )
-    mark_auto_upload_profile_changed(conn)
+    # No auto-upload pause: removing an entry only reverts findings toward
+    # the stricter open/redact states, and the findings allowlist is not an
+    # egress-profile-hash input (see allowlist_add_by_hash).
 
     now = _now_iso()
     reverted = 0

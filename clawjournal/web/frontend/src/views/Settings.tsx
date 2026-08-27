@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api } from '../api.ts';
+import { api, AUTO_UPLOAD_PAUSED_NOTICE } from '../api.ts';
 import type { ProjectSummary, WorkbenchConfig } from '../types.ts';
 import { useToast } from '../components/Toast.tsx';
 import { AutoUploadPanel } from '../components/AutoUploadControls.tsx';
@@ -61,6 +61,7 @@ export function Settings() {
       const next = await api.config.update(patch);
       setCfg(next);
       toast('Settings saved', 'success');
+      if (next.auto_upload_paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Save failed', 'error');
     } finally {

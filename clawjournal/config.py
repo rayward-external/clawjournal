@@ -346,13 +346,25 @@ def save_config(config: ClawJournalConfig) -> bool:
                         conn = open_existing_index(timeout=5)
                         try:
                             conn.execute("BEGIN IMMEDIATE")
-                            mark_auto_upload_profile_changed(conn)
+                            paused = mark_auto_upload_profile_changed(conn)
                             conn.commit()
                         except Exception:
                             conn.rollback()
                             raise
                         finally:
                             conn.close()
+                        if paused:
+                            # The pause itself is deliberate and durable, but it
+                            # must never be silent: the user has to know why
+                            # recurring uploads stopped and how to bring them
+                            # back.
+                            print(
+                                "Note: automatic uploads are paused until you "
+                                "review this redaction-profile change "
+                                "(workbench Settings -> Automatic uploads, or "
+                                "`clawjournal auto-upload enable`).",
+                                file=sys.stderr,
+                            )
                     except (OSError, sqlite3.Error) as e:
                         print(
                             "Warning: could not pause automatic upload after a "

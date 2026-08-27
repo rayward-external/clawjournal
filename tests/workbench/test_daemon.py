@@ -4399,6 +4399,8 @@ class TestPoliciesAPI:
             "reason": "API key",
         })
         assert status == 201
+        # No enabled enrollment exists, so nothing was paused.
+        assert data["auto_upload_paused"] is False
 
         status, policies = _get(server, "/api/policies")
         assert status == 200
@@ -4407,6 +4409,39 @@ class TestPoliciesAPI:
     def test_add_missing_fields(self, server):
         status, data = _post(server, "/api/policies", {"policy_type": "redact_string"})
         assert status == 400
+
+    def test_add_reports_auto_upload_pause(self, server):
+        from clawjournal.workbench.index import save_auto_upload_enrollment
+
+        conn = open_index()
+        save_auto_upload_enrollment(
+            conn,
+            mode="enabled",
+            health="ready",
+            generation=1,
+            enrolled_at="2026-08-01T00:00:00+00:00",
+            client_enrollment_id="client-1",
+            enrolled_sources=["claude"],
+            enrolled_projects=["project-one"],
+        )
+        conn.close()
+
+        status, data = _post(server, "/api/policies", {
+            "policy_type": "redact_string",
+            "value": "my-secret",
+        })
+        assert status == 201
+        # A redaction-profile change pauses recurring uploads; the response
+        # must say so, so the UI can surface it at the action site.
+        assert data["auto_upload_paused"] is True
+
+        status, removal = _delete(
+            server, f"/api/policies/{data['policy_id']}"
+        )
+        assert status == 200
+        # Already paused: the removal changes the profile again but does not
+        # newly pause an enabled enrollment.
+        assert removal["auto_upload_paused"] is False
 
 
 class TestFrontendStaleWarning:

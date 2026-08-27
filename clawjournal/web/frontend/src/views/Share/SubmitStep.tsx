@@ -584,6 +584,12 @@ export function SubmitStep(p: SubmitStepProps) {
                               automaticUploadCadence
                             } day${automaticUploadCadence === 1 ? '' : 's'} for this exact scope.`}
                       </label>{' '}
+                      {automaticUploadsAlreadyConfigured
+                        && autoUploadStatus?.mode === 'paused' && (
+                        <span style={{ color: colors.yellow700 }}>
+                          Nothing uploads while paused — resume in Settings → Automatic uploads.{' '}
+                        </span>
+                      )}
                       {automaticUploadOptionLoading ? (
                         <span style={{ color: colors.gray500 }}>Loading details…</span>
                       ) : (

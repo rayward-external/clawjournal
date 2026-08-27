@@ -480,6 +480,45 @@ def _start_auto_upload_enrollment_worker() -> bool:
         _auto_upload_enrollment_thread.start()
         return True
 
+
+def _auto_upload_enrollment_mode(conn: sqlite3.Connection) -> str | None:
+    """Best-effort enrollment mode read for pause-transition reporting."""
+
+    from .index import get_auto_upload_enrollment
+
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+    except (sqlite3.Error, ValueError):
+        return None
+    return enrollment.get("mode") if enrollment else None
+
+
+def _auto_upload_pause_transition(
+    conn: sqlite3.Connection, before_mode: str | None
+) -> bool:
+    """Whether this request's mutation just paused an enabled enrollment.
+
+    Redaction-profile mutations pause recurring uploads by design; the UI
+    uses this flag to say so at the action site instead of leaving the user
+    to discover a silent pause later.
+    """
+
+    return before_mode == "enabled" and _auto_upload_enrollment_mode(conn) == "paused"
+
+
+def _auto_upload_mode_snapshot() -> str | None:
+    """Read the enrollment mode on a short-lived connection of its own."""
+
+    try:
+        conn = open_index()
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        return _auto_upload_enrollment_mode(conn)
+    finally:
+        conn.close()
+
+
 # Sources supported in the workbench (scientist-facing subset)
 WORKBENCH_SOURCES = {
     CLAUDE_SOURCE, CLAUDE_SCIENCE_SOURCE, CODEX_SOURCE, OPENCLAW_SOURCE,
@@ -5968,11 +6007,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             status=202,
         )
 
-    def _handle_get_config(self) -> None:
+    def _handle_get_config(self, extra: dict[str, Any] | None = None) -> None:
         """Return the UI-editable config subset plus the valid option lists.
 
         Only non-sensitive knobs are exposed — never tokens, attestations, or
-        verification state.
+        verification state. ``extra`` lets the config-update handler annotate
+        its echo (e.g. that the change just paused automatic uploads).
         """
         from ..config import load_config
         from ..cli import EXPLICIT_SOURCE_CHOICES
@@ -5998,6 +6038,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "source_choices": source_choices,
             "scorer_backend_choices": [b for b in SUPPORTED_SCORING_BACKENDS if b != "auto"],
             "scorer_backend_detected": _suggest_scoring_backend(),
+            **(extra or {}),
         })
 
     def _handle_update_config(self) -> None:
@@ -6032,12 +6073,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if not kwargs:
             _json_response(self, {"error": "No recognized config fields"}, 400)
             return
+        before_mode = _auto_upload_mode_snapshot()
         try:
             configure(quiet=True, **kwargs)
         except Exception as exc:
             _json_response(self, {"error": str(exc)}, 500)
             return
-        self._handle_get_config()  # echo back the new state
+        # Echo back the new state, annotated when this change paused an
+        # enabled recurring enrollment (a redaction-profile change).
+        self._handle_get_config(extra={
+            "auto_upload_paused": (
+                before_mode == "enabled"
+                and _auto_upload_mode_snapshot() == "paused"
+            ),
+        })
 
     def _handle_list_allowlist(self) -> None:
         """Return current allowlist entries from config."""
@@ -6081,6 +6130,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if body.get("reason"):
             entry["reason"] = body["reason"]
 
+        before_mode = _auto_upload_mode_snapshot()
         config = load_config()
         entries = config.get("allowlist_entries", [])
         entries.append(entry)
@@ -6092,11 +6142,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 500,
             )
             return
-        _json_response(self, {"ok": True, "entry": entry})
+        _json_response(self, {
+            "ok": True,
+            "entry": entry,
+            "auto_upload_paused": (
+                before_mode == "enabled"
+                and _auto_upload_mode_snapshot() == "paused"
+            ),
+        })
 
     def _handle_remove_allowlist(self, entry_id: str) -> None:
         """Remove an allowlist entry by ID."""
         from ..config import load_config, save_config
+        before_mode = _auto_upload_mode_snapshot()
         config = load_config()
         entries = config.get("allowlist_entries", [])
         new_entries = [e for e in entries if e.get("id") != entry_id]
@@ -6111,7 +6169,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 500,
             )
             return
-        _json_response(self, {"ok": True})
+        _json_response(self, {
+            "ok": True,
+            "auto_upload_paused": (
+                before_mode == "enabled"
+                and _auto_upload_mode_snapshot() == "paused"
+            ),
+        })
 
     def _handle_scoring_backend(self) -> None:
         """Return the default AI scoring backend detected for this daemon."""
@@ -7402,17 +7466,25 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         conn = open_index()
         try:
+            before_mode = _auto_upload_enrollment_mode(conn)
             policy_id = add_policy(conn, policy_type, value, reason=body.get("reason"))
-            _json_response(self, {"policy_id": policy_id}, 201)
+            _json_response(self, {
+                "policy_id": policy_id,
+                "auto_upload_paused": _auto_upload_pause_transition(conn, before_mode),
+            }, 201)
         finally:
             conn.close()
 
     def _handle_remove_policy(self, policy_id: str) -> None:
         conn = open_index()
         try:
+            before_mode = _auto_upload_enrollment_mode(conn)
             ok = remove_policy(conn, policy_id)
             if ok:
-                _json_response(self, {"ok": True})
+                _json_response(self, {
+                    "ok": True,
+                    "auto_upload_paused": _auto_upload_pause_transition(conn, before_mode),
+                })
             else:
                 _json_response(self, {"error": "Policy not found"}, 404)
         finally:

@@ -6566,7 +6566,7 @@ def test_config_profile_mutation_before_final_transition_stops_post(
     conn.close()
 
 
-def test_policy_and_allowlist_mutations_pause_and_advance_generation(
+def test_policy_mutations_pause_and_advance_generation(
     isolated_auto_upload,
 ):
     config = _save_scope_config()
@@ -6587,6 +6587,21 @@ def test_policy_and_allowlist_mutations_pause_and_advance_generation(
     after_remove = get_auto_upload_enrollment(conn)
     assert after_remove["mode"] == "paused"
     assert after_remove["generation"] == expected_generation
+    assert after_remove["last_result_code"] == "profile_changed"
+    conn.close()
+
+
+def test_findings_allowlist_mutations_do_not_pause(
+    isolated_auto_upload,
+):
+    """The findings allowlist is not an egress-profile-hash input: pausing on
+    its mutations guarded nothing (resume()'s hash check passed unchanged) and
+    silently killed recurring uploads for anyone triaging a false positive."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(conn, config)
+    expected_generation = enrollment["generation"]
 
     entry, _, _ = allowlist_add_by_hash(
         conn,
@@ -6597,20 +6612,18 @@ def test_policy_and_allowlist_mutations_pause_and_advance_generation(
         added_by="test",
     )
     conn.commit()
-    expected_generation += 1
     after_allowlist_add = get_auto_upload_enrollment(conn)
-    assert after_allowlist_add["mode"] == "paused"
+    assert after_allowlist_add["mode"] == "enabled"
+    assert after_allowlist_add["health"] == "ready"
     assert after_allowlist_add["generation"] == expected_generation
 
     removed, _, _ = allowlist_remove(conn, entry["allowlist_id"])
     conn.commit()
     assert removed is True
-    expected_generation += 1
     after_allowlist_remove = get_auto_upload_enrollment(conn)
-    assert after_allowlist_remove["mode"] == "paused"
-    assert after_allowlist_remove["health"] == "action_required"
+    assert after_allowlist_remove["mode"] == "enabled"
+    assert after_allowlist_remove["health"] == "ready"
     assert after_allowlist_remove["generation"] == expected_generation
-    assert after_allowlist_remove["last_result_code"] == "profile_changed"
     conn.close()
 
 
