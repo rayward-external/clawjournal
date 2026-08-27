@@ -3040,6 +3040,11 @@ class _CodexParseState:
     retry_candidate_replaced: bool = False
     last_user_input_hash: str | None = None
     retry_candidate_input_hash: str | None = None
+    # Which record format produced messages[-1] ("event_msg" or
+    # "response_item"). Rollouts that carry both formats duplicate each
+    # message once per format; the duplicate arrives from the *other*
+    # format, so a same-format repeat is a genuine resend and is kept.
+    last_message_origin: str | None = None
 
 
 def _coalesce_codex_output(raw: Any) -> str:
@@ -3195,6 +3200,7 @@ def _parse_codex_session_file(
         ):
             before_messages = len(state.messages)
             replaced_retry_user = False
+            user_message_record = False
             timestamp = _normalize_timestamp(entry.get("timestamp"))
             entry_type = entry.get("type")
 
@@ -3209,7 +3215,13 @@ def _parse_codex_session_file(
                     response_type == "reasoning" and include_thinking
                 ):
                     _clear_codex_retry_candidate(state)
-                _handle_codex_response_item(state, entry, anonymizer, include_thinking)
+                user_message_record = (
+                    response_type == "message"
+                    and response_payload.get("role") == "user"
+                )
+                replaced_retry_user = _handle_codex_response_item(
+                    state, entry, anonymizer, include_thinking, timestamp
+                )
             elif entry_type == "event_msg":
                 payload = entry.get("payload", {})
                 event_type = payload.get("type")
@@ -3224,17 +3236,19 @@ def _parse_codex_session_file(
                             state._pending_thinking_seen.add(cleaned)
                             state.pending_thinking.append(cleaned)
                 elif event_type == "user_message":
-                    replaced_retry_user = _replace_codex_retry_user_message(
-                        state, payload, timestamp, anonymizer
-                    )
-                    if not replaced_retry_user:
-                        _handle_codex_user_message(
-                            state, payload, timestamp, anonymizer
+                    user_message_record = True
+                    message_parts = _codex_user_message_parts(payload, anonymizer)
+                    if message_parts is not None:
+                        replaced_retry_user = _ingest_codex_user_message(
+                            state, message_parts, timestamp, "event_msg"
                         )
+                    else:
+                        _flush_codex_pending(state, timestamp)
                 elif event_type == "agent_message":
                     _clear_codex_retry_candidate(state)
                     _handle_codex_agent_message(
-                        state, payload, timestamp, anonymizer, include_thinking
+                        state, payload.get("message"), timestamp, anonymizer,
+                        include_thinking, "event_msg",
                     )
                 elif event_type in ("turn_aborted", "task_complete"):
                     # Do not delete the prompt at the terminal event: the log
@@ -3262,11 +3276,7 @@ def _parse_codex_session_file(
                 raw_message_start_offsets.extend(
                     [int(parse_snapshot["record_start"])] * added_messages
                 )
-                if (
-                    entry_type == "event_msg"
-                    and payload.get("type") == "user_message"
-                    and added_messages == 2
-                ):
+                if user_message_record and added_messages == 2:
                     raw_message_end_offsets.extend([
                         int(parse_snapshot["record_start"]),
                         int(parse_snapshot["record_end"]),
@@ -3397,12 +3407,236 @@ def _handle_codex_turn_context(
         state.metadata["model_effort"] = _extract_model_effort(payload)
 
 
+# Synthetic context fragments Codex injects into model input as user-role
+# `response_item` messages (mirrors codex-rs `is_contextual_user_fragment`):
+# a text block is contextual when its trimmed text starts with the open
+# marker and ends with the close marker, ASCII case-insensitive. Entries
+# with a None close marker match on the prefix alone.
+_CODEX_CONTEXTUAL_USER_MARKERS: tuple[tuple[str, str | None], ...] = (
+    ("<user_instructions>", "</user_instructions>"),
+    ("# agents.md instructions", "</instructions>"),
+    ("<environment_context>", "</environment_context>"),
+    ("<external_", ">"),
+    ("<skill>", "</skill>"),
+    ("<user_shell_command>", "</user_shell_command>"),
+    ("<turn_aborted>", "</turn_aborted>"),
+    ("<subagent_notification>", "</subagent_notification>"),
+    ("<codex_internal_context", "</codex_internal_context>"),
+    ("<goal_context>", "</goal_context>"),
+    ("<recommended_plugins>", "</recommended_plugins>"),
+    ("<hook_prompt", "</hook_prompt>"),
+    ("warning: apply_patch was requested via ", None),
+    ("warning: your account was flagged for potentially high-risk cyber activity", None),
+    ("warning: the maximum number of unified exec processes you can keep open is", None),
+)
+
+# Prefix Codex prepends to a prompt when IDE context / attachments are
+# serialized into the raw user message; the real request follows the marker.
+_CODEX_USER_REQUEST_MARKER = "## My request for Codex:"
+
+
+# Longest open/close marker lengths, so the contextual check only has to
+# lowercase a bounded head and tail instead of copying the whole block.
+_CODEX_MARKER_HEAD_LEN = max(
+    len(open_marker) for open_marker, _ in _CODEX_CONTEXTUAL_USER_MARKERS
+)
+_CODEX_MARKER_TAIL_LEN = max(
+    len(close_marker)
+    for _, close_marker in _CODEX_CONTEXTUAL_USER_MARKERS
+    if close_marker
+)
+
+
+def _is_codex_contextual_user_text(text: str) -> bool:
+    start, end = 0, len(text)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    head = text[start:start + _CODEX_MARKER_HEAD_LEN].lower()
+    tail = text[max(start, end - _CODEX_MARKER_TAIL_LEN):end].lower()
+    for open_marker, close_marker in _CODEX_CONTEXTUAL_USER_MARKERS:
+        if not head.startswith(open_marker):
+            continue
+        if close_marker is None or tail.endswith(close_marker):
+            return True
+    return False
+
+
+def _strip_codex_contextual_close_tag(text: str) -> str:
+    lowered = text.lower()
+    for _, close_marker in _CODEX_CONTEXTUAL_USER_MARKERS:
+        if (
+            close_marker
+            and close_marker.startswith("</")
+            and lowered.endswith(close_marker)
+        ):
+            return text[: -len(close_marker)].strip()
+    return text
+
+
+def _codex_request_dedup_key(role: str, content: str) -> str:
+    """Identity used to match a message across the two rollout formats.
+
+    For user messages, strips any attachment/IDE-context wrapper (and a
+    trailing contextual close tag, mirroring the response_item extractor)
+    so the two formats compare equal even if one side persists the wrapped
+    text and the other the bare request. Assistant text is compared as-is:
+    the wrapper marker is a user-input construct there."""
+    if role != "user":
+        return content.strip()
+    idx = content.rfind(_CODEX_USER_REQUEST_MARKER)
+    if idx != -1:
+        content = content[idx + len(_CODEX_USER_REQUEST_MARKER):]
+    return _strip_codex_contextual_close_tag(content.strip())
+
+
+def _is_codex_cross_format_duplicate(
+    state: _CodexParseState, role: str, content: str, origin: str,
+) -> bool:
+    if state.last_message_origin is None or state.last_message_origin == origin:
+        return False
+    if not state.messages:
+        return False
+    last = state.messages[-1]
+    if last.get("role") != role:
+        return False
+    previous = last.get("content")
+    if not isinstance(previous, str):
+        return False
+    return _codex_request_dedup_key(role, previous) == _codex_request_dedup_key(
+        role, content
+    )
+
+
+def _codex_user_identity_hash(message: str, media: list[tuple[str, Any]]) -> str:
+    """Hash identifying a user submission for retry detection.
+
+    ``media`` holds (kind, value) pairs; empty values are dropped so a
+    text-only message hashes identically from either rollout format."""
+    entries = [[kind, value] for kind, value in media if value]
+    raw_identity = json.dumps(
+        {"message": message, "media": entries},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
+
+
+def _is_codex_media_label_text(text: str) -> bool:
+    if text in ("<image>", "</image>", "<audio>", "</audio>"):
+        return True
+    return (
+        (text.startswith("<image name=") or text.startswith("<audio name="))
+        and text.endswith(">")
+    )
+
+
+def _codex_response_user_message_parts(
+    payload: dict[str, Any], anonymizer: Anonymizer,
+) -> tuple[str, str] | None:
+    """Extract (anonymized text, identity hash) from a user `response_item`.
+
+    Returns None for synthetic context records (AGENTS.md instructions,
+    environment context, hook prompts, ...) and for messages with no text.
+    A wrapper that embeds the real request after ``## My request for
+    Codex:`` is preserved rather than dropped."""
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return None
+    texts: list[str] = []
+    contextual_texts: list[str] = []
+    images: list[dict[str, Any]] = []
+    audios: list[dict[str, Any]] = []
+    has_media = any(
+        isinstance(block, dict) and block.get("type") in ("input_image", "input_audio")
+        for block in blocks
+    )
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "input_text":
+            text = block.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if has_media and _is_codex_media_label_text(text.strip()):
+                continue
+            if _is_codex_contextual_user_text(text):
+                contextual_texts.append(text)
+            else:
+                texts.append(text)
+        elif block_type == "input_image":
+            images.append(
+                {
+                    "image_url": block.get("image_url"),
+                    "detail": block.get("detail"),
+                }
+            )
+        elif block_type == "input_audio":
+            audios.append({"audio_url": block.get("audio_url")})
+    raw_content = "\n\n".join(part.strip() for part in texts).strip()
+    if not raw_content:
+        # A fully-contextual bundle may still embed the user's request
+        # after the wrapper marker — keep the request, drop the context.
+        for text in contextual_texts:
+            idx = text.rfind(_CODEX_USER_REQUEST_MARKER)
+            if idx == -1:
+                continue
+            raw_content = _strip_codex_contextual_close_tag(
+                text[idx + len(_CODEX_USER_REQUEST_MARKER):].strip()
+            )
+            break
+    if not raw_content:
+        return None
+    input_hash = _codex_user_identity_hash(
+        raw_content,
+        [("input_images", images), ("input_audio", audios)],
+    )
+    return anonymizer.text(raw_content), input_hash
+
+
+def _codex_response_agent_message_text(payload: dict[str, Any]) -> str | None:
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return None
+    texts = [
+        block.get("text")
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("type") in ("output_text", "input_text")
+        and isinstance(block.get("text"), str)
+    ]
+    joined = "\n\n".join(part.strip() for part in texts if part.strip()).strip()
+    return joined or None
+
+
 def _handle_codex_response_item(
     state: _CodexParseState, entry: dict[str, Any], anonymizer: Anonymizer,
-    include_thinking: bool,
-) -> None:
+    include_thinking: bool, timestamp: str | None,
+) -> bool:
+    """Handle one `response_item` record. Returns True when the record
+    replaced a retry-candidate user message in place."""
     payload = entry.get("payload", {})
     item_type = payload.get("type")
+    if item_type == "message":
+        role = payload.get("role")
+        if role == "user":
+            message_parts = _codex_response_user_message_parts(payload, anonymizer)
+            if message_parts is None:
+                return False
+            return _ingest_codex_user_message(
+                state, message_parts, timestamp, "response_item"
+            )
+        elif role == "assistant":
+            _clear_codex_retry_candidate(state)
+            _handle_codex_agent_message(
+                state, _codex_response_agent_message_text(payload), timestamp,
+                anonymizer, include_thinking, "response_item",
+            )
+        # developer / system records are instructions, not conversation.
+        return False
     if item_type == "function_call":
         tool_name = payload.get("name")
         args_data = _parse_codex_tool_arguments(payload.get("arguments"))
@@ -3434,6 +3668,7 @@ def _handle_codex_response_item(
                 if cleaned not in state._pending_thinking_seen:
                     state._pending_thinking_seen.add(cleaned)
                     state.pending_thinking.append(cleaned)
+    return False
 
 
 def _handle_codex_token_count(state: _CodexParseState, payload: dict[str, Any]) -> None:
@@ -3459,18 +3694,14 @@ def _codex_user_message_parts(
     if not isinstance(content, str) or not content.strip():
         return None
     raw_content = content.strip()
-    raw_identity = json.dumps(
-        {
-            "message": raw_content,
-            "images": payload.get("images") or [],
-            "local_images": payload.get("local_images") or [],
-            "text_elements": payload.get("text_elements") or [],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    input_hash = _codex_user_identity_hash(
+        raw_content,
+        [
+            ("images", payload.get("images") or []),
+            ("local_images", payload.get("local_images") or []),
+            ("text_elements", payload.get("text_elements") or []),
+        ],
     )
-    input_hash = hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
     return anonymizer.text(raw_content), input_hash
 
 
@@ -3508,16 +3739,13 @@ def _mark_codex_retry_candidate(
 
 def _replace_codex_retry_user_message(
     state: _CodexParseState,
-    payload: dict[str, Any],
+    replacement_parts: tuple[str, str],
     timestamp: str | None,
-    anonymizer: Anonymizer,
+    origin: str,
 ) -> bool:
     """Replace a confirmed retry in place, preserving its raw start boundary."""
     candidate_index = state.retry_candidate_index
     if candidate_index is None:
-        return False
-    replacement_parts = _codex_user_message_parts(payload, anonymizer)
-    if replacement_parts is None:
         return False
     replacement, replacement_hash = replacement_parts
     if (
@@ -3550,28 +3778,54 @@ def _replace_codex_retry_user_message(
             ]
             state.metadata["start_time"] = min(timestamps, default=timestamp)
     state.last_user_input_hash = replacement_hash
+    state.last_message_origin = origin
     _update_time_bounds(state.metadata, timestamp)
     return True
 
 
+def _ingest_codex_user_message(
+    state: _CodexParseState, message_parts: tuple[str, str],
+    timestamp: str | None, origin: str,
+) -> bool:
+    """Route one user message (either rollout format) into the transcript.
+
+    Returns True when it replaced a retry-candidate message in place. The
+    cross-format duplicate check runs first and leaves any armed retry
+    candidate untouched: the twin record must not clear the candidate
+    before the other format's copy gets its chance to replace it."""
+    content, _ = message_parts
+    if (
+        not state.pending_tool_uses
+        and not state.pending_thinking
+        and _is_codex_cross_format_duplicate(state, "user", content, origin)
+    ):
+        # The same message already arrived via the other rollout format;
+        # consume the pair so a genuine identical resend is kept.
+        state.last_message_origin = None
+        return False
+    if _replace_codex_retry_user_message(state, message_parts, timestamp, origin):
+        return True
+    _handle_codex_user_message(state, message_parts, timestamp, origin)
+    return False
+
+
 def _handle_codex_user_message(
-    state: _CodexParseState, payload: dict[str, Any],
-    timestamp: str | None, anonymizer: Anonymizer,
+    state: _CodexParseState, message_parts: tuple[str, str],
+    timestamp: str | None, origin: str,
 ) -> None:
+    content, input_hash = message_parts
     _flush_codex_pending(state, timestamp)
-    message_parts = _codex_user_message_parts(payload, anonymizer)
-    if message_parts is not None:
-        content, input_hash = message_parts
-        state.messages.append(
-            {
-                "role": "user",
-                "content": content,
-                "timestamp": timestamp,
-            }
-        )
-        state.last_user_input_hash = input_hash
-        state.stats["user_messages"] += 1
-        _update_time_bounds(state.metadata, timestamp)
+    state.messages.append(
+        {
+            "role": "user",
+            "content": content,
+            "timestamp": timestamp,
+        }
+    )
+    state.last_user_input_hash = input_hash
+    state.last_message_origin = origin
+    state.stats["user_messages"] += 1
+    _update_time_bounds(state.metadata, timestamp)
 
 
 def _resolve_codex_tool_uses(state: _CodexParseState) -> list[dict]:
@@ -3588,13 +3842,21 @@ def _resolve_codex_tool_uses(state: _CodexParseState) -> list[dict]:
 
 
 def _handle_codex_agent_message(
-    state: _CodexParseState, payload: dict[str, Any],
+    state: _CodexParseState, content: Any,
     timestamp: str | None, anonymizer: Anonymizer, include_thinking: bool,
+    origin: str,
 ) -> None:
-    content = payload.get("message")
     msg: dict[str, Any] = {"role": "assistant"}
     if isinstance(content, str) and content.strip():
-        msg["content"] = anonymizer.text(content.strip())
+        cleaned = anonymizer.text(content.strip())
+        if (
+            not state.pending_tool_uses
+            and not state.pending_thinking
+            and _is_codex_cross_format_duplicate(state, "assistant", cleaned, origin)
+        ):
+            state.last_message_origin = None
+            return
+        msg["content"] = cleaned
     if state.pending_thinking and include_thinking:
         msg["thinking"] = "\n\n".join(state.pending_thinking)
     if state.pending_tool_uses:
@@ -3603,6 +3865,7 @@ def _handle_codex_agent_message(
     if len(msg) > 1:
         msg["timestamp"] = timestamp
         state.messages.append(msg)
+        state.last_message_origin = origin
         state.stats["assistant_messages"] += 1
         state.stats["tool_uses"] += len(msg.get("tool_uses", []))
         _update_time_bounds(state.metadata, timestamp)
@@ -3623,6 +3886,7 @@ def _flush_codex_pending(state: _CodexParseState, timestamp: str | None) -> None
         msg["tool_uses"] = _resolve_codex_tool_uses(state)
 
     state.messages.append(msg)
+    state.last_message_origin = None
     state.stats["assistant_messages"] += 1
     state.stats["tool_uses"] += len(msg.get("tool_uses", []))
     _update_time_bounds(state.metadata, timestamp)
