@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { Policy } from '../types.ts';
-import { api } from '../api.ts';
+import { api, AUTO_UPLOAD_PAUSED_NOTICE } from '../api.ts';
 import { useToast } from '../components/Toast.tsx';
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx';
 import { Spinner } from '../components/Spinner.tsx';
@@ -55,11 +55,12 @@ export function Policies() {
   async function handleAdd() {
     if (!newValue.trim()) return;
     try {
-      await api.policies.add(newType, newValue.trim(), newReason.trim() || undefined);
+      const result = await api.policies.add(newType, newValue.trim(), newReason.trim() || undefined);
       setNewValue('');
       setNewReason('');
       await loadPolicies();
       toast('Policy added', 'success');
+      if (result.auto_upload_paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : 'Failed to add policy', 'error');
     }
@@ -67,9 +68,10 @@ export function Policies() {
 
   async function handleDelete(policy: Policy) {
     try {
-      await api.policies.remove(policy.policy_id);
+      const result = await api.policies.remove(policy.policy_id);
       await loadPolicies();
       toast('Policy deleted', 'success');
+      if (result.auto_upload_paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
     } catch (e: unknown) {
       toast(e instanceof Error ? e.message : 'Failed to delete policy', 'error');
     }
@@ -205,11 +207,14 @@ export function Policies() {
             <button
               onClick={async () => {
                 try {
+                  let paused = false;
                   for (const preset of availablePresets) {
-                    await api.policies.add(preset.type, preset.value, preset.reason);
+                    const result = await api.policies.add(preset.type, preset.value, preset.reason);
+                    paused = paused || Boolean(result.auto_upload_paused);
                   }
                   await loadPolicies();
                   toast(`Added ${availablePresets.length} preset rules`, 'success');
+                  if (paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
                 } catch (e: unknown) {
                   toast(e instanceof Error ? e.message : 'Failed to add presets', 'error');
                 }
@@ -255,9 +260,10 @@ export function Policies() {
                 <button
                   onClick={async () => {
                     try {
-                      await api.policies.add(preset.type, preset.value, preset.reason);
+                      const result = await api.policies.add(preset.type, preset.value, preset.reason);
                       await loadPolicies();
                       toast(`Added: ${preset.label}`, 'success');
+                      if (result.auto_upload_paused) toast(AUTO_UPLOAD_PAUSED_NOTICE, 'info');
                     } catch (e: unknown) {
                       toast(e instanceof Error ? e.message : 'Failed to add preset', 'error');
                     }

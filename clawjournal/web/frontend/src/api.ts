@@ -56,6 +56,13 @@ export class ApiError extends Error {
 export const REDACTION_REPORT_TIMEOUT_MS = 200_000;
 export const AUTO_UPLOAD_STATUS_TIMEOUT_MS = 15_000;
 
+// Shown whenever a redaction-profile mutation reports `auto_upload_paused`:
+// the pause is deliberate (controls win before submitting), but it must be
+// surfaced at the action site rather than discovered later.
+export const AUTO_UPLOAD_PAUSED_NOTICE =
+  'Automatic uploads are paused until you review this redaction change: '
+  + 'Settings → Automatic uploads → Review scope and terms.';
+
 declare global {
   interface Window {
     __CLAWJOURNAL_API_TOKEN__?: string;
@@ -398,7 +405,7 @@ export const api = {
       ai_pii_review_enabled: boolean;
       benchmark_tab_enabled: boolean;
       scoring_warmup_declined: boolean;
-    }>): Promise<WorkbenchConfig> {
+    }>): Promise<WorkbenchConfig & { auto_upload_paused?: boolean }> {
       return request('/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -799,7 +806,7 @@ export const api = {
       return request('/policies');
     },
 
-    add(policyType: string, value: string, reason?: string): Promise<{ policy_id: string }> {
+    add(policyType: string, value: string, reason?: string): Promise<{ policy_id: string; auto_upload_paused?: boolean }> {
       return request('/policies', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -807,7 +814,7 @@ export const api = {
       });
     },
 
-    remove(id: string): Promise<{ ok: boolean }> {
+    remove(id: string): Promise<{ ok: boolean; auto_upload_paused?: boolean }> {
       return request(`/policies/${encodeURIComponent(id)}`, { method: 'DELETE' });
     },
   },
@@ -817,7 +824,7 @@ export const api = {
       return request('/allowlist');
     },
 
-    add(entry: { type: string; text?: string; regex?: string; match_type?: string; reason?: string }): Promise<{ ok: boolean; entry: AllowlistEntry }> {
+    add(entry: { type: string; text?: string; regex?: string; match_type?: string; reason?: string }): Promise<{ ok: boolean; entry: AllowlistEntry; auto_upload_paused?: boolean }> {
       return request('/allowlist', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -825,7 +832,7 @@ export const api = {
       });
     },
 
-    remove(id: string): Promise<{ ok: boolean }> {
+    remove(id: string): Promise<{ ok: boolean; auto_upload_paused?: boolean }> {
       return request(`/allowlist/${encodeURIComponent(id)}`, { method: 'DELETE' });
     },
   },
