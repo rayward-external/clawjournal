@@ -1928,6 +1928,11 @@ def _finalize_append_only_segments(
     start_offsets = session.pop("_raw_message_start_offsets", None)
     raw_source_size = session.pop("_raw_source_size", None)
     token_snapshots = session.pop("_raw_message_token_snapshots", None)
+    # Multi-fragment Codex rollouts: per-message raw file, per-file sizes and
+    # whole-file fingerprints (absent for single-file sessions).
+    message_raw_paths = session.pop("_raw_message_paths", None)
+    sizes_by_path = session.pop("_raw_source_sizes_by_path", None)
+    fingerprints_by_path = session.pop("_raw_source_fingerprints_by_path", None)
     if not isinstance(offsets, list):
         return [session]
     segments = segment_append_only_session(
@@ -1936,6 +1941,8 @@ def _finalize_append_only_segments(
         message_start_offsets=start_offsets,
         raw_source_size=raw_source_size,
         message_token_snapshots=token_snapshots,
+        message_raw_paths=message_raw_paths,
+        raw_source_sizes=sizes_by_path if isinstance(sizes_by_path, dict) else None,
     )
     if len(segments) <= 1:
         return [session]
@@ -1943,14 +1950,26 @@ def _finalize_append_only_segments(
         from ..raw_sources import fingerprint_raw_source_range
 
         for segment in segments:
+            segment_path = Path(segment.get("raw_source_path") or raw_path)
             if segment.get("segment_sealed"):
                 segment["_raw_source_fingerprint"] = fingerprint_raw_source_range(
-                    raw_path,
+                    segment_path,
                     int(segment["raw_source_start_offset"]),
                     int(segment["raw_source_end_offset"]),
                 )
-            elif isinstance(full_fingerprint, tuple) and len(full_fingerprint) == 5:
-                segment["_raw_source_fingerprint"] = full_fingerprint
+            else:
+                fragment_fingerprint = (
+                    fingerprints_by_path.get(str(segment_path))
+                    if isinstance(fingerprints_by_path, dict)
+                    else None
+                )
+                if (
+                    isinstance(fragment_fingerprint, tuple)
+                    and len(fragment_fingerprint) == 5
+                ):
+                    segment["_raw_source_fingerprint"] = fragment_fingerprint
+                elif isinstance(full_fingerprint, tuple) and len(full_fingerprint) == 5:
+                    segment["_raw_source_fingerprint"] = full_fingerprint
     return segments
 
 
@@ -2048,9 +2067,9 @@ def parse_project_sessions(
         index = _get_codex_project_index()
         session_files = index.get(project_dir_name, [])
         sessions = []
-        for session_file in session_files:
-            parsed = _parse_codex_session_file(
-                session_file,
+        for fragment_group in _group_codex_rollout_fragments(session_files):
+            parsed = _parse_codex_session_fragments(
+                fragment_group,
                 anonymizer=anonymizer,
                 include_thinking=include_thinking,
                 target_cwd=project_dir_name,
@@ -2060,7 +2079,9 @@ def parse_project_sessions(
             if parsed and parsed["messages"]:
                 parsed["project"] = _build_codex_project_name(project_dir_name)
                 parsed["source"] = CODEX_SOURCE
-                parsed["raw_source_path"] = str(session_file)
+                # The newest fragment holds the active tail; sealed
+                # checkpoints override this per segment in finalize.
+                parsed["raw_source_path"] = str(fragment_group[-1])
                 # Derive client_origin from originator field
                 originator = parsed.pop("originator", None) or ""
                 parsed.pop("codex_source", None)
@@ -2070,7 +2091,7 @@ def parse_project_sessions(
                     parsed["client_origin"] = "cli"
                 sessions.extend(
                     _finalize_append_only_segments(
-                        parsed, session_file, strict_jsonl=strict_jsonl
+                        parsed, fragment_group[-1], strict_jsonl=strict_jsonl
                     )
                 )
         return sessions
@@ -3155,9 +3176,37 @@ def _parse_codex_session_file(
     strict_jsonl: bool = False,
     capture_raw_offsets: bool = False,
 ) -> dict | None:
+    return _parse_codex_session_fragments(
+        [filepath],
+        anonymizer=anonymizer,
+        include_thinking=include_thinking,
+        target_cwd=target_cwd,
+        strict_jsonl=strict_jsonl,
+        capture_raw_offsets=capture_raw_offsets,
+    )
+
+
+def _parse_codex_session_fragments(
+    filepaths: list[Path],
+    *,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+    target_cwd: str,
+    strict_jsonl: bool = False,
+    capture_raw_offsets: bool = False,
+) -> dict | None:
+    """Parse one Codex conversation stored across ordered rollout fragments.
+
+    Codex Desktop's cancel+edit flow continues the same conversation in a
+    new rollout file that repeats the original ``session_meta.payload.id``
+    (issue #214). All fragments flow through one ``_CodexParseState`` so the
+    retry-candidate and cross-format-duplicate logic survive the file
+    boundary; per-message raw paths keep byte ranges bound to the file they
+    actually came from.
+    """
     state = _CodexParseState(
         metadata={
-            "session_id": filepath.stem,
+            "session_id": filepaths[0].stem,
             "cwd": None,
             "git_branch": None,
             "model": None,
@@ -3173,31 +3222,83 @@ def _parse_codex_session_file(
         },
     )
 
-    tool_snapshot: dict[str, Any] = {}
-    try:
-        state.tool_result_map = _build_codex_tool_result_map(
-            _iter_jsonl(
-                filepath,
-                strict=strict_jsonl,
-                snapshot_out=tool_snapshot,
-            ),
-            anonymizer,
-        )
-    except OSError:
-        if strict_jsonl:
-            raise
-        return None
+    # Tool outputs may land in a later fragment than their call (a turn cut
+    # by the continuation); merge every fragment's call_id map up front.
+    tool_snapshots: dict[str, dict[str, Any]] = {}
+    for filepath in filepaths:
+        tool_snapshot: dict[str, Any] = {}
+        try:
+            state.tool_result_map.update(
+                _build_codex_tool_result_map(
+                    _iter_jsonl(
+                        filepath,
+                        strict=strict_jsonl,
+                        snapshot_out=tool_snapshot,
+                    ),
+                    anonymizer,
+                )
+            )
+        except OSError:
+            if strict_jsonl:
+                raise
+            return None
+        tool_snapshots[str(filepath)] = tool_snapshot
 
     parse_snapshot: dict[str, Any] = {}
     raw_message_start_offsets: list[int] = []
     raw_message_end_offsets: list[int] = []
     raw_message_token_snapshots: list[tuple[int, int, int, int]] = []
+    raw_message_paths: list[str] = []
+    fragment_sizes: dict[str, int] = {}
+    fragment_fingerprints: dict[str, Any] = {}
+
+    def _iter_fragment_entries() -> Iterable[tuple[Path, dict[str, Any]]]:
+        """Yield (fragment_path, entry) across fragments, in order.
+
+        Runs each fragment's end-of-file bookkeeping (two-pass fingerprint
+        check, size/fingerprint capture) before moving on, and leaves
+        ``parse_snapshot`` pointing at the fragment currently being read.
+        """
+        nonlocal parse_snapshot
+        for fragment_path in filepaths:
+            fragment_snapshot: dict[str, Any] = {}
+            parse_snapshot = fragment_snapshot
+            for entry in _iter_jsonl(
+                fragment_path,
+                strict=strict_jsonl,
+                snapshot_out=fragment_snapshot,
+            ):
+                yield fragment_path, entry
+            fragment_key = str(fragment_path)
+            if strict_jsonl and (
+                tool_snapshots.get(fragment_key, {}).get("fingerprint")
+                != fragment_snapshot.get("fingerprint")
+            ):
+                from ..raw_sources import RawSourceChanged
+
+                raise RawSourceChanged("raw source changed between parser passes")
+            size = fragment_snapshot.get("file_size")
+            if isinstance(size, int):
+                fragment_sizes[fragment_key] = size
+            fragment_fingerprints[fragment_key] = fragment_snapshot.get("fingerprint")
+
+    current_fragment: str | None = None
     try:
-        for entry in _iter_jsonl(
-            filepath,
-            strict=strict_jsonl,
-            snapshot_out=parse_snapshot,
-        ):
+        for filepath, entry in _iter_fragment_entries():
+            path_str = str(filepath)
+            if path_str != current_fragment:
+                if (
+                    current_fragment is not None
+                    and state.retry_candidate_index is not None
+                ):
+                    # Codex Desktop creates a same-id continuation rollout
+                    # specifically for cancel+edit, so the new fragment is
+                    # itself the edit-and-resend signal: its first real user
+                    # message replaces the output-free canceled prompt that
+                    # ended the previous fragment, even with edited text
+                    # (mirrors the in-file `thread_rolled_back` rule).
+                    state.retry_candidate_replaced = True
+                current_fragment = path_str
             before_messages = len(state.messages)
             replaced_retry_user = False
             user_message_record = False
@@ -3270,12 +3371,24 @@ def _parse_codex_session_file(
                 and replaced_retry_user
                 and raw_message_end_offsets
             ):
-                raw_message_end_offsets[-1] = int(parse_snapshot["record_end"])
+                if not raw_message_paths or raw_message_paths[-1] == path_str:
+                    raw_message_end_offsets[-1] = int(parse_snapshot["record_end"])
+                else:
+                    # The edited resend arrived in a later rollout fragment;
+                    # the abandoned prompt's range cannot reach into another
+                    # file, so bind it through the end of its own fragment
+                    # (covering the aborted-turn record) instead.
+                    prior_size = fragment_sizes.get(raw_message_paths[-1])
+                    if isinstance(prior_size, int):
+                        raw_message_end_offsets[-1] = max(
+                            raw_message_end_offsets[-1], prior_size
+                        )
             if capture_raw_offsets and len(state.messages) > before_messages:
                 added_messages = len(state.messages) - before_messages
                 raw_message_start_offsets.extend(
                     [int(parse_snapshot["record_start"])] * added_messages
                 )
+                raw_message_paths.extend([path_str] * added_messages)
                 if user_message_record and added_messages == 2:
                     raw_message_end_offsets.extend([
                         int(parse_snapshot["record_start"]),
@@ -3297,14 +3410,11 @@ def _parse_codex_session_file(
                 elif raw_message_token_snapshots:
                     raw_message_token_snapshots[-1] = token_snapshot
     except OSError:
+        # RawSourceChanged (an OSError) from the per-fragment two-pass
+        # fingerprint check re-raises here under strict parsing.
         if strict_jsonl:
             raise
         return None
-
-    if strict_jsonl and tool_snapshot.get("fingerprint") != parse_snapshot.get("fingerprint"):
-        from ..raw_sources import RawSourceChanged
-
-        raise RawSourceChanged("raw source changed between parser passes")
 
     state.stats["input_tokens"] = state.max_input_tokens
     state.stats["output_tokens"] = state.max_output_tokens
@@ -3327,6 +3437,9 @@ def _parse_codex_session_file(
         raw_message_token_snapshots.extend(
             [_codex_token_snapshot(state)] * (len(state.messages) - before_flush)
         )
+        raw_message_paths.extend(
+            [str(filepaths[-1])] * (len(state.messages) - before_flush)
+        )
 
     if state.metadata["model"] is None:
         model_provider = state.metadata.get("model_provider")
@@ -3337,12 +3450,19 @@ def _parse_codex_session_file(
 
     result = _make_session_result(state.metadata, state.messages, state.stats)
     if result is not None and strict_jsonl:
+        # Session-level snapshot stays the active tail's whole-file
+        # fingerprint (matches the session-level raw_source_path); sealed
+        # segments get exact per-file range fingerprints in finalize.
         result["_raw_source_fingerprint"] = parse_snapshot.get("fingerprint")
     if result is not None and capture_raw_offsets:
         result["_raw_message_start_offsets"] = raw_message_start_offsets
         result["_raw_message_end_offsets"] = raw_message_end_offsets
         result["_raw_message_token_snapshots"] = raw_message_token_snapshots
         result["_raw_source_size"] = parse_snapshot.get("file_size")
+        if len(filepaths) > 1:
+            result["_raw_message_paths"] = raw_message_paths
+            result["_raw_source_sizes_by_path"] = fragment_sizes
+            result["_raw_source_fingerprints_by_path"] = fragment_fingerprints
     return result
 
 
@@ -4050,6 +4170,52 @@ def _extract_codex_cwd(session_file: Path) -> str | None:
     except OSError:
         return None
     return None
+
+
+def _extract_codex_session_meta_id(session_file: Path) -> str | None:
+    """Return the first embedded ``session_meta.payload.id``, or None.
+
+    First-wins mirrors ``_handle_codex_session_meta``: a fork rollout's own
+    meta precedes any replayed parent records, so its own id is returned.
+    Bounded to the leading records — session_meta is normally the first.
+    """
+    try:
+        for index, entry in enumerate(_iter_jsonl(session_file)):
+            if entry.get("type") == "session_meta":
+                meta_id = entry.get("payload", {}).get("id")
+                if isinstance(meta_id, str) and meta_id.strip():
+                    return meta_id.strip()
+            if index >= 24:
+                break
+    except OSError:
+        return None
+    return None
+
+
+def _group_codex_rollout_fragments(session_files: list[Path]) -> list[list[Path]]:
+    """Group rollout files that carry the same embedded session id.
+
+    Codex Desktop's cancel+edit flow can continue one conversation in a new
+    ``<stem>_<continuation>.jsonl`` rollout that repeats the original
+    ``session_meta.payload.id`` (issue #214). Fragments must parse through
+    one shared state, so they are grouped here, ordered by filename (the
+    name embeds the creation timestamp, and a same-timestamp continuation
+    suffix sorts after its base). A fork rollout declares its own id plus
+    ``forked_from_id``, so it naturally stays a separate group; a file
+    without a readable meta id stays alone.
+    """
+    groups: dict[str, list[Path]] = {}
+    ordered_keys: list[str] = []
+    for session_file in session_files:
+        meta_id = _extract_codex_session_meta_id(session_file)
+        key = meta_id if meta_id else f"__no_meta__:{session_file}"
+        if key not in groups:
+            groups[key] = []
+            ordered_keys.append(key)
+        groups[key].append(session_file)
+    return [
+        sorted(groups[key], key=lambda path: path.name) for key in ordered_keys
+    ]
 
 
 def _first_cwd_in_session_file(session_file: Path) -> str | None:
