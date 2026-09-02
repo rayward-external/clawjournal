@@ -29,6 +29,8 @@ from clawjournal.parsing.parser import (
     discover_projects,
     parse_project_sessions,
     _parse_codex_session_file,
+    _parse_codex_session_fragments,
+    _group_codex_rollout_fragments,
     _parse_openclaw_session_file,
 )
 
@@ -4657,3 +4659,243 @@ class TestCodexResponseItemMessages:
 
         assert result["stats"]["user_messages"] == 1
         assert result["messages"][0]["content"] == "ship it"
+
+
+# --- Codex multi-fragment rollouts (issue #214) ---
+
+
+class TestCodexRolloutFragments:
+    """Cancel+edit continuations share one session_meta id across files."""
+
+    CWD = "/Users/testuser/Documents/myrepo"
+
+    def _meta(self, session_id, timestamp="2026-08-25T10:00:00.000Z", **extra):
+        return {
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": self.CWD,
+                "model_provider": "openai",
+                "originator": "Codex Desktop",
+                **extra,
+            },
+        }
+
+    @staticmethod
+    def _em(event_type, timestamp, **payload):
+        return {
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {"type": event_type, **payload},
+        }
+
+    def _write(self, path, lines):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(json.dumps(line) for line in lines) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _fragments(self, tmp_path):
+        """The issue's shape: abort at the end of file 1, edit in file 2."""
+        day_dir = tmp_path / "codex-sessions" / "2026" / "08" / "25"
+        first = self._write(
+            day_dir / "rollout-2026-08-25T10-00-00-sess-split.jsonl",
+            [
+                self._meta("sess-split"),
+                self._em("user_message", "2026-08-25T10:00:01.000Z",
+                         message="add a login page"),
+                self._em("agent_message", "2026-08-25T10:00:02.000Z",
+                         message="Login page added."),
+                self._em("user_message", "2026-08-25T10:00:03.000Z",
+                         message="now add logout"),
+                self._em("turn_aborted", "2026-08-25T10:00:04.000Z",
+                         reason="interrupted"),
+            ],
+        )
+        second = self._write(
+            day_dir / "rollout-2026-08-25T10-00-05-sess-split_cont-1.jsonl",
+            [
+                self._meta("sess-split", timestamp="2026-08-25T10:00:05.000Z"),
+                self._em("user_message", "2026-08-25T10:00:06.000Z",
+                         message="now add logout with confirmation"),
+                self._em("agent_message", "2026-08-25T10:00:07.000Z",
+                         message="Logout with confirmation added."),
+            ],
+        )
+        return first, second
+
+    def test_grouping_by_embedded_meta_id(self, tmp_path):
+        first, second = self._fragments(tmp_path)
+        other = self._write(
+            tmp_path / "codex-sessions" / "2026" / "08" / "25"
+            / "rollout-2026-08-25T11-00-00-sess-other.jsonl",
+            [self._meta("sess-other", timestamp="2026-08-25T11:00:00.000Z")],
+        )
+        groups = _group_codex_rollout_fragments([second, other, first])
+        assert [first, second] in groups
+        assert [other] in groups
+        assert len(groups) == 2
+
+    def test_fork_rollout_stays_its_own_group(self, tmp_path):
+        first, second = self._fragments(tmp_path)
+        fork = self._write(
+            tmp_path / "codex-sessions" / "2026" / "08" / "25"
+            / "rollout-2026-08-25T12-00-00-sess-fork.jsonl",
+            [
+                self._meta(
+                    "sess-fork",
+                    timestamp="2026-08-25T12:00:00.000Z",
+                    forked_from_id="sess-split",
+                ),
+            ],
+        )
+        groups = _group_codex_rollout_fragments([first, second, fork])
+        assert [first, second] in groups
+        assert [fork] in groups
+
+    def test_file_without_meta_groups_alone(self, tmp_path):
+        bare = self._write(
+            tmp_path / "codex-sessions" / "2026" / "08" / "25"
+            / "rollout-2026-08-25T13-00-00-no-meta.jsonl",
+            [self._em("user_message", "2026-08-25T13:00:01.000Z", message="hi")],
+        )
+        assert _group_codex_rollout_fragments([bare]) == [[bare]]
+
+    def test_fragments_merge_into_one_conversation(
+        self, tmp_path, mock_anonymizer
+    ):
+        first, second = self._fragments(tmp_path)
+        result = _parse_codex_session_fragments(
+            [first, second],
+            anonymizer=mock_anonymizer,
+            include_thinking=True,
+            target_cwd=self.CWD,
+            capture_raw_offsets=True,
+        )
+        assert result is not None
+        assert result["session_id"] == "sess-split"
+        # The edited resend replaced the output-free canceled prompt: it
+        # appears exactly once, with the continuation's text.
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "add a login page"),
+            ("assistant", "Login page added."),
+            ("user", "now add logout with confirmation"),
+            ("assistant", "Logout with confirmation added."),
+        ]
+        assert result["stats"]["user_messages"] == 2
+        assert result["start_time"] == "2026-08-25T10:00:01.000Z"
+        assert result["end_time"] == "2026-08-25T10:00:07.000Z"
+        # Per-message raw paths: the replaced prompt keeps its file-1 slot,
+        # the final answer lives in file 2.
+        assert result["_raw_message_paths"] == [
+            str(first), str(first), str(first), str(second),
+        ]
+        # The replaced prompt's range extends through its own file (covering
+        # the aborted-turn record), never into the continuation file.
+        first_size = first.stat().st_size
+        assert result["_raw_message_end_offsets"][2] == first_size
+        assert all(
+            end <= first_size
+            for end in result["_raw_message_end_offsets"][:3]
+        )
+
+    def test_project_parse_yields_single_logical_session(
+        self, tmp_path, monkeypatch, mock_anonymizer
+    ):
+        first, second = self._fragments(tmp_path)
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.PROJECTS_DIR",
+            tmp_path / "projects" / "nonexistent",
+        )
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.CODEX_SESSIONS_DIR",
+            tmp_path / "codex-sessions",
+        )
+        monkeypatch.setattr(
+            "clawjournal.parsing.parser.CODEX_ARCHIVED_DIR",
+            tmp_path / "codex-archived",
+        )
+        monkeypatch.setattr("clawjournal.parsing.parser._CODEX_PROJECT_INDEX", {})
+
+        sessions = parse_project_sessions(
+            self.CWD, mock_anonymizer, source="codex"
+        )
+
+        # One logical conversation; the fragment transition forces a sealed
+        # checkpoint so no row's byte range spans two files.
+        assert [s["session_id"] for s in sessions] == [
+            "sess-split", "sess-split_seg-0001",
+        ]
+        assert {s.get("logical_session_id") for s in sessions} == {"sess-split"}
+        root, tail = sessions
+        assert root["segment_sealed"] is True
+        assert root["raw_source_path"] == str(first)
+        assert root["raw_source_start_offset"] == 0
+        assert root["raw_source_end_offset"] == first.stat().st_size
+        assert tail["segment_sealed"] is False
+        assert tail["raw_source_path"] == str(second)
+        assert [m["content"] for m in root["messages"]] == [
+            "add a login page",
+            "Login page added.",
+            "now add logout with confirmation",
+        ]
+        assert [m["content"] for m in tail["messages"]] == [
+            "Logout with confirmation added.",
+        ]
+        assert root["client_origin"] == "desktop"
+        assert tail["client_origin"] == "desktop"
+
+    def test_same_text_resend_across_fragments_not_duplicated(
+        self, tmp_path, mock_anonymizer
+    ):
+        day_dir = tmp_path / "codex-sessions" / "2026" / "08" / "25"
+        first = self._write(
+            day_dir / "rollout-2026-08-25T14-00-00-sess-same.jsonl",
+            [
+                self._meta("sess-same", timestamp="2026-08-25T14:00:00.000Z"),
+                self._em("user_message", "2026-08-25T14:00:01.000Z",
+                         message="run the tests"),
+                self._em("turn_aborted", "2026-08-25T14:00:02.000Z",
+                         reason="interrupted"),
+            ],
+        )
+        second = self._write(
+            day_dir / "rollout-2026-08-25T14-00-03-sess-same_cont-1.jsonl",
+            [
+                self._meta("sess-same", timestamp="2026-08-25T14:00:03.000Z"),
+                self._em("user_message", "2026-08-25T14:00:04.000Z",
+                         message="run the tests"),
+                self._em("agent_message", "2026-08-25T14:00:05.000Z",
+                         message="All green."),
+            ],
+        )
+        result = _parse_codex_session_fragments(
+            [first, second],
+            anonymizer=mock_anonymizer,
+            include_thinking=True,
+            target_cwd=self.CWD,
+            capture_raw_offsets=True,
+        )
+        assert result is not None
+        assert result["stats"]["user_messages"] == 1
+        assert [(m["role"], m.get("content")) for m in result["messages"]] == [
+            ("user", "run the tests"),
+            ("assistant", "All green."),
+        ]
+
+    def test_single_file_behavior_unchanged(self, tmp_path, mock_anonymizer):
+        first, _ = self._fragments(tmp_path)
+        result = _parse_codex_session_file(
+            first,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd=self.CWD,
+            capture_raw_offsets=True,
+        )
+        assert result is not None
+        assert result["session_id"] == "sess-split"
+        assert "_raw_message_paths" not in result
+        assert result["stats"]["user_messages"] == 2

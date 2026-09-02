@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,6 +68,8 @@ def segment_append_only_session(
     message_start_offsets: list[int] | None = None,
     raw_source_size: int | None = None,
     message_token_snapshots: list[Sequence[int]] | None = None,
+    message_raw_paths: list[str] | None = None,
+    raw_source_sizes: Mapping[str, int] | None = None,
     max_messages: int = APPEND_ONLY_MAX_MESSAGES,
     max_user_messages: int = APPEND_ONLY_MAX_USER_MESSAGES,
     max_text_bytes: int = APPEND_ONLY_MAX_TEXT_BYTES,
@@ -87,6 +89,14 @@ def segment_append_only_session(
     file-level totals partition across segments instead of being dropped.
     Snapshots that do not line up with the messages are ignored, leaving the
     children with the zeroed token counts they had before.
+
+    ``message_raw_paths`` supports one logical conversation stored across
+    several rollout files (Codex Desktop cancel+edit continuations): offsets
+    are file-relative, so a file transition forces a closed boundary — a
+    segment never spans files — and each child carries the
+    ``raw_source_path`` its byte range refers to. ``raw_source_sizes`` maps
+    each path to its file size so a segment ending at a transition can bind
+    its file's trailing bytes (e.g. the aborted-turn record).
     """
 
     root_session_id = str(session.get("session_id") or "")
@@ -103,18 +113,34 @@ def segment_append_only_session(
         return [session]
     if len(message_end_offsets) != len(messages):
         return [session]
+    if message_raw_paths is not None and (
+        len(message_raw_paths) != len(messages)
+        or any(not isinstance(path, str) or not path for path in message_raw_paths)
+    ):
+        return [session]
+
+    def _continues_run(index: int) -> bool:
+        """True when message *index* lives in the same raw file as index-1."""
+        return (
+            message_raw_paths is None
+            or message_raw_paths[index] == message_raw_paths[index - 1]
+        )
+
     if message_start_offsets is None:
         message_start_offsets = [
-            0 if index == 0 else message_end_offsets[index - 1]
+            0 if index == 0 or not _continues_run(index)
+            else message_end_offsets[index - 1]
             for index in range(len(messages))
         ]
     if len(message_start_offsets) != len(messages):
         return [session]
+    # Offsets are file-relative, so monotonicity is only meaningful within
+    # one raw file; a fragment transition legitimately restarts near zero.
     if any(
         not isinstance(offset, int)
         or isinstance(offset, bool)
         or offset <= 0
-        or (index and offset < message_end_offsets[index - 1])
+        or (index and _continues_run(index) and offset < message_end_offsets[index - 1])
         for index, offset in enumerate(message_end_offsets)
     ):
         return [session]
@@ -157,7 +183,15 @@ def segment_append_only_session(
             message.get("role") == "assistant"
             and next_role == "user"
         )
-        if over_limit and complete_turn:
+        # A rollout-fragment transition is a hard closed boundary: the
+        # finished file cannot host the next message's byte range, so the
+        # segment must close here regardless of the turn shape.
+        fragment_break = (
+            message_raw_paths is not None
+            and index + 1 < len(messages)
+            and not _continues_run(index + 1)
+        )
+        if fragment_break or (over_limit and complete_turn):
             boundary = index + 1
             boundaries.append(boundary)
             segment_start = boundary
@@ -180,12 +214,26 @@ def segment_append_only_session(
         segment_stats = _compute_stats(segment_messages)
         if token_snapshots is not None:
             segment_stats.update(_segment_token_deltas(token_snapshots, start, end))
-        raw_segment_start = 0 if start == 0 else message_start_offsets[start]
-        raw_segment_end = (
-            message_start_offsets[end]
-            if end < len(messages)
-            else int(raw_source_size or message_end_offsets[end - 1])
+        segment_path = (
+            message_raw_paths[start] if message_raw_paths is not None else None
         )
+        # A segment that opens its raw file binds the file's preamble
+        # (session_meta, replayed context) too, exactly like offset 0 does
+        # for a single-file session.
+        opens_file = start == 0 or not _continues_run(start)
+        raw_segment_start = 0 if opens_file else message_start_offsets[start]
+        if end < len(messages) and _continues_run(end):
+            raw_segment_end = message_start_offsets[end]
+        else:
+            # Session tail, or a segment closed by a fragment transition:
+            # bind through its own file's size so trailing records (e.g. the
+            # aborted-turn event) sit inside the sealed range.
+            segment_file_size = None
+            if segment_path is not None and raw_source_sizes is not None:
+                segment_file_size = raw_source_sizes.get(segment_path)
+            elif segment_path is None:
+                segment_file_size = raw_source_size
+            raw_segment_end = int(segment_file_size or message_end_offsets[end - 1])
         sealed = end in closed_boundaries
         child = {
             key: value
@@ -226,6 +274,11 @@ def segment_append_only_session(
             "messages": segment_messages,
             "stats": segment_stats,
         })
+        if segment_path is not None:
+            # Offsets are relative to the fragment the messages came from;
+            # the session-level raw_source_path (the active tail's file)
+            # would misbind earlier fragments' ranges.
+            child["raw_source_path"] = segment_path
         children.append(child)
     return children
 
