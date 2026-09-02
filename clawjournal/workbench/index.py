@@ -1179,16 +1179,28 @@ def open_index() -> sqlite3.Connection:
     _migrate_scoring_queue(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
-    # resolution validator rejected invalid labels. Idempotent: after
-    # the first cleanup this UPDATE matches zero rows. Keeps the
-    # normalized outcome chart free of silent "unknown" buckets.
-    conn.execute(
-        "UPDATE sessions SET ai_outcome_badge = NULL "
-        "WHERE ai_outcome_badge IS NOT NULL "
+    # resolution validator rejected invalid labels. Keeps the normalized
+    # outcome chart free of silent "unknown" buckets. Gated behind a read:
+    # a zero-row UPDATE still takes SQLite's write lock, and open_index()
+    # runs on every daemon API request — an unconditional UPDATE here made
+    # every request queue (up to the 30s busy timeout) behind whatever
+    # write transaction the background scanner held at the time, which
+    # surfaced as every workbench view hanging in "Loading" (#215). The
+    # steady-state open path must stay read-only.
+    invalid_badge = conn.execute(
+        "SELECT 1 FROM sessions WHERE ai_outcome_badge IS NOT NULL "
         "AND ai_outcome_badge NOT IN "
-        "('resolved', 'partial', 'failed', 'abandoned', 'exploratory', 'trivial')"
-    )
-    conn.commit()
+        "('resolved', 'partial', 'failed', 'abandoned', 'exploratory', 'trivial') "
+        "LIMIT 1"
+    ).fetchone()
+    if invalid_badge is not None:
+        conn.execute(
+            "UPDATE sessions SET ai_outcome_badge = NULL "
+            "WHERE ai_outcome_badge IS NOT NULL "
+            "AND ai_outcome_badge NOT IN "
+            "('resolved', 'partial', 'failed', 'abandoned', 'exploratory', 'trivial')"
+        )
+        conn.commit()
 
     return conn
 
@@ -3287,11 +3299,20 @@ def _reconcile_emitted_checkpoint_families(
         logical_revision = (
             _logical_revision_for_members(active_rows) if active_rows else None
         )
-        conn.execute(
-            "UPDATE sessions SET logical_revision = ? "
-            "WHERE logical_session_id = ?",
-            (logical_revision, logical_id),
-        )
+        # Read-gated: this refresh runs for every family on every scan pass,
+        # and a value-identical UPDATE still takes the write lock and dirties
+        # the rows (#215). Only write when some member actually disagrees.
+        stale = conn.execute(
+            "SELECT 1 FROM sessions WHERE logical_session_id = ? "
+            "AND logical_revision IS NOT ? LIMIT 1",
+            (logical_id, logical_revision),
+        ).fetchone()
+        if stale is not None:
+            conn.execute(
+                "UPDATE sessions SET logical_revision = ? "
+                "WHERE logical_session_id = ?",
+                (logical_revision, logical_id),
+            )
 
     for logical_id in sorted(indexed):
         declared_members = dict(declared.get(logical_id, {}))
@@ -3326,7 +3347,7 @@ def _reconcile_emitted_checkpoint_families(
                 "SELECT session_id, project, source, raw_source_path, session_key, "
                 "parent_session_id, segment_index, segment_start_message, "
                 "segment_end_message, segment_reason, content_revision, "
-                "logical_session_id FROM sessions "
+                "logical_session_id, checkpoint_active FROM sessions "
                 f"WHERE session_id IN ({placeholders})",
                 lookup_ids,
             ).fetchall()
@@ -3361,13 +3382,28 @@ def _reconcile_emitted_checkpoint_families(
             "blocked" if projected_review_status == "blocked" else None
         )
 
+        # Membership writes below are all read-gated for the same reason as
+        # refresh_current_revision: in steady state every family re-runs this
+        # reconcile on every scan pass with nothing to change, and value-
+        # identical UPDATEs would still take the write lock and dirty the
+        # same pages each tick (#215).
         emitted_ids = sorted(requested_ids)
-        conn.executemany(
-            "UPDATE sessions SET logical_session_id = ?, checkpoint_active = 1 "
-            "WHERE session_id = ?",
-            [(logical_id, session_id) for session_id in emitted_ids],
-        )
-        if logical_id not in requested_ids:
+        misprojected_ids = [
+            session_id
+            for session_id in emitted_ids
+            if by_id[session_id]["logical_session_id"] != logical_id
+            or by_id[session_id]["checkpoint_active"] != 1
+        ]
+        if misprojected_ids:
+            conn.executemany(
+                "UPDATE sessions SET logical_session_id = ?, checkpoint_active = 1 "
+                "WHERE session_id = ?",
+                [(logical_id, session_id) for session_id in misprojected_ids],
+            )
+        if logical_id not in requested_ids and (
+            root["logical_session_id"] != logical_id
+            or root["checkpoint_active"] != 0
+        ):
             conn.execute(
                 "UPDATE sessions SET logical_session_id = ?, checkpoint_active = 0 "
                 "WHERE session_id = ?",
@@ -3375,12 +3411,19 @@ def _reconcile_emitted_checkpoint_families(
             )
 
         emitted_placeholders = ",".join("?" for _ in emitted_ids)
-        conn.execute(
-            "UPDATE sessions SET checkpoint_active = 0 "
-            "WHERE logical_session_id = ? "
-            f"AND session_id NOT IN ({emitted_placeholders})",
+        active_stragglers = conn.execute(
+            "SELECT 1 FROM sessions "
+            "WHERE logical_session_id = ? AND COALESCE(checkpoint_active, 1) != 0 "
+            f"AND session_id NOT IN ({emitted_placeholders}) LIMIT 1",
             (logical_id, *emitted_ids),
-        )
+        ).fetchone()
+        if active_stragglers is not None:
+            conn.execute(
+                "UPDATE sessions SET checkpoint_active = 0 "
+                "WHERE logical_session_id = ? "
+                f"AND session_id NOT IN ({emitted_placeholders})",
+                (logical_id, *emitted_ids),
+            )
         emitted_controls = {
             str(row["session_id"]): dict(row)
             for row in conn.execute(
@@ -3434,21 +3477,30 @@ def _reconcile_emitted_checkpoint_families(
                     "updated_at = ? WHERE session_id = ?",
                     (changed_at, changed_at, session_id),
                 )
-        if logical_id in collapsed:
+        if (
+            logical_id in collapsed
+            and emitted_controls.get(logical_id, {}).get("review_status")
+            == "segmented"
+        ):
             conn.execute(
-                "UPDATE sessions SET review_status = CASE "
-                "WHEN review_status = 'segmented' THEN 'new' ELSE review_status END "
-                "WHERE session_id = ?",
+                "UPDATE sessions SET review_status = 'new' "
+                "WHERE session_id = ? AND review_status = 'segmented'",
                 (logical_id,),
             )
 
-        polluted_children = requested_ids - {logical_id}
+        family_children = requested_ids - {logical_id}
+        polluted_children = [
+            session_id
+            for session_id in sorted(family_children)
+            if by_id[session_id]["parent_session_id"] == logical_id
+        ]
         if polluted_children:
             conn.executemany(
                 "UPDATE sessions SET parent_session_id = NULL "
                 "WHERE session_id = ? AND parent_session_id = ?",
-                [(session_id, logical_id) for session_id in sorted(polluted_children)],
+                [(session_id, logical_id) for session_id in polluted_children],
             )
+        if family_children:
             root_children = conn.execute(
                 "SELECT subagent_session_ids FROM sessions WHERE session_id = ?",
                 (logical_id,),
@@ -3459,7 +3511,7 @@ def _reconcile_emitted_checkpoint_families(
                 except (TypeError, ValueError, json.JSONDecodeError):
                     decoded = None
                 if isinstance(decoded, list):
-                    cleaned = [item for item in decoded if item not in polluted_children]
+                    cleaned = [item for item in decoded if item not in family_children]
                     if cleaned != decoded:
                         conn.execute(
                             "UPDATE sessions SET subagent_session_ids = ? "
@@ -3598,19 +3650,11 @@ def upsert_sessions(
         # that happens to contain `ghp_...` doesn't leak into the DB.
         display_title, _, _ = redact_text(display_title)
 
-        # Check if session already exists and capture fields we need to preserve
+        # Check if session already exists and capture fields we need to
+        # preserve. All columns: the steady-state no-op check below compares
+        # the would-be replacement values against the stored row.
         existing = conn.execute(
-            "SELECT session_id, review_status, reviewed_at, "
-            "selection_reason, reviewer_notes, indexed_at, "
-            "ai_quality_score, ai_score_reason, ai_scoring_detail, "
-            "ai_display_title, ai_task_type, ai_outcome_badge, "
-            "ai_value_badges, ai_risk_badges, "
-            "ai_effort_estimate, ai_summary, "
-            "share_id, session_key, parent_session_id, subagent_session_ids, "
-            "logical_session_id, checkpoint_active, "
-            "estimated_cost_usd, input_tokens, output_tokens, "
-            "cache_read_tokens, cache_creation_tokens, end_time, content_revision "
-            "FROM sessions WHERE session_id = ?",
+            "SELECT * FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         is_new = existing is None
@@ -3710,6 +3754,73 @@ def upsert_sessions(
             cache_creation_tokens=cache_create,
         )
 
+        # Steady-state no-op check: when the parsed session is byte-identical
+        # to the stored blob, the ON CONFLICT DO UPDATE below would rewrite
+        # the row with the values it already holds. SQLite still dirties the
+        # page and holds the write lock for such an update, so on a large
+        # corpus every background scan pass rewrote every row and starved
+        # interactive readers for the whole pass (#215). Skip the SQL write
+        # when every value the SET clause would apply already matches the
+        # stored row; any mismatch (including one produced by a code change
+        # to badges, costs, or redaction) falls through to the write path.
+        row_write_needed = True
+        if not is_new and not content_updated and not metadata_updated:
+            segment_range = session.get("segment_message_range") or None
+            replacement_values: dict[str, Any] = {
+                "project": project,
+                "source": source,
+                "model": session.get("model"),
+                "model_effort": session.get("model_effort"),
+                "start_time": session.get("start_time"),
+                "end_time": session.get("end_time"),
+                "duration_seconds": duration,
+                "git_branch": session.get("git_branch"),
+                "user_messages": session_stats.get("user_messages", 0),
+                "assistant_messages": session_stats.get("assistant_messages", 0),
+                "tool_uses": session_stats.get("tool_uses", 0),
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cache_read_tokens": cache_read,
+                "cache_creation_tokens": cache_create,
+                "display_title": display_title,
+                "outcome_badge": badges["outcome_badge"],
+                "value_badges": json.dumps(badges["value_badges"]),
+                "risk_badges": json.dumps(badges["risk_badges"]),
+                "sensitivity_score": badges["sensitivity_score"],
+                "task_type": badges["task_type"],
+                "files_touched": json.dumps(files),
+                "commands_run": json.dumps(commands),
+                "blob_path": str(blob_path),
+                "raw_source_path": session.get("raw_source_path"),
+                "raw_source_start_offset": session.get("raw_source_start_offset"),
+                "raw_source_end_offset": session.get("raw_source_end_offset"),
+                # COALESCE semantics of the SET clause: an absent new value
+                # keeps the stored one.
+                "session_key": session_key or preserved_session_key,
+                "parent_session_id": (
+                    session.get("parent_session_id") or preserved_parent_session_id
+                ),
+                "segment_index": session.get("segment_index"),
+                "segment_start_message": segment_range[0] if segment_range else None,
+                "segment_end_message": segment_range[1] if segment_range else None,
+                "segment_reason": session.get("segment_reason"),
+                "segment_sealed": 1 if session.get("segment_sealed") else 0,
+                "client_origin": session.get("client_origin"),
+                "runtime_channel": session.get("runtime_channel"),
+                "outer_session_id": session.get("outer_session_id"),
+                "fork_of": session.get("fork_of"),
+                "fork_source": session.get("fork_source"),
+                "fork_nickname": session.get("fork_nickname"),
+                "estimated_cost_usd": cost,
+                "tool_counts": json.dumps(badges.get("tool_counts", {})) or None,
+                "user_interrupts": session_stats.get("user_interrupts", 0),
+                "content_revision": content_revision,
+            }
+            row_write_needed = any(
+                existing[column] != value
+                for column, value in replacement_values.items()
+            )
+
         # Non-destructive upsert. INSERT OR REPLACE would delete the
         # existing row first, which cascades through findings and
         # session_hold_history via ON DELETE CASCADE. ON CONFLICT DO
@@ -3718,7 +3829,8 @@ def upsert_sessions(
         # intact. Fields we want preserved on update (review state,
         # AI metadata, linkage, hold state, findings_revision, etc.)
         # are simply absent from the SET clause.
-        conn.execute(
+        if row_write_needed:
+            conn.execute(
             """INSERT INTO sessions (
                 session_id, project, source, model, model_effort,
                 start_time, end_time, duration_seconds,
@@ -4041,10 +4153,26 @@ def upsert_sessions(
         changed_at=now,
     )
     if segmented_parent_ids:
-        conn.executemany(
-            "UPDATE sessions SET review_status = 'segmented' WHERE session_id = ?",
-            [(session_id,) for session_id in sorted(segmented_parent_ids)],
-        )
+        # Pre-filter with a read: even a no-op UPDATE takes the write lock,
+        # and these hidden segmented parents are re-derived on every scan
+        # pass, so an unconditional write here would dirty the same rows
+        # each tick (#215).
+        ordered_parent_ids = sorted(segmented_parent_ids)
+        placeholders = ",".join("?" for _ in ordered_parent_ids)
+        unmarked_parent_ids = [
+            row["session_id"]
+            for row in conn.execute(
+                "SELECT session_id FROM sessions "
+                f"WHERE session_id IN ({placeholders}) "
+                "AND review_status IS NOT 'segmented'",
+                ordered_parent_ids,
+            ).fetchall()
+        ]
+        if unmarked_parent_ids:
+            conn.executemany(
+                "UPDATE sessions SET review_status = 'segmented' WHERE session_id = ?",
+                [(session_id,) for session_id in unmarked_parent_ids],
+            )
     conn.commit()
     if stats is not None:
         stats.update(counts)
@@ -6323,6 +6451,10 @@ def link_subagent_hierarchy(conn: sqlite3.Connection) -> int:
         "SELECT session_id, subagent_session_ids FROM sessions "
         "WHERE subagent_session_ids IS NOT NULL"
     ).fetchall()
+    stored_children_json = {
+        str(row["session_id"]): row["subagent_session_ids"]
+        for row in existing_parent_rows
+    }
     for row in existing_parent_rows:
         parent_id = representative_id(str(row["session_id"]))
         try:
@@ -6346,6 +6478,7 @@ def link_subagent_hierarchy(conn: sqlite3.Connection) -> int:
         "SELECT session_id, parent_session_id FROM sessions "
         "WHERE parent_session_id IS NOT NULL"
     ).fetchall()
+    has_stored_parent = {str(row["session_id"]) for row in rows}
     for row in rows:
         parent_id = representative_id(str(row["parent_session_id"]))
         child_id = representative_id(str(row["session_id"]))
@@ -6461,15 +6594,24 @@ def link_subagent_hierarchy(conn: sqlite3.Connection) -> int:
                 new_children = sorted(set(existing_children + child_ids))
                 parent_children[sess["session_id"]] = new_children
 
-    # Step 3: Write all links to the database
+    # Step 3: Write all links to the database. Both writes are gated behind
+    # the already-fetched stored state: this pass reruns on every scan tick,
+    # and unconditionally rewriting every parent row (with a fresh
+    # updated_at) plus issuing a zero-row UPDATE per child kept the scanner
+    # holding SQLite's write lock and dirtying the same pages each tick,
+    # starving interactive workbench reads (#215).
     now = _now_iso()
     for parent_id, child_ids in parent_children.items():
-        conn.execute(
-            "UPDATE sessions SET subagent_session_ids = ?, updated_at = ? "
-            "WHERE session_id = ?",
-            (json.dumps(child_ids) if child_ids else None, now, parent_id),
-        )
+        new_children_json = json.dumps(child_ids) if child_ids else None
+        if stored_children_json.get(parent_id) != new_children_json:
+            conn.execute(
+                "UPDATE sessions SET subagent_session_ids = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (new_children_json, now, parent_id),
+            )
         for child_id in child_ids:
+            if child_id in has_stored_parent:
+                continue
             cursor = conn.execute(
                 "UPDATE sessions SET parent_session_id = ?, updated_at = ? "
                 "WHERE session_id = ? AND parent_session_id IS NULL",
