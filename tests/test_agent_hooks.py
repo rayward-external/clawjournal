@@ -449,3 +449,68 @@ def test_detached_process_options_do_not_inherit_stdio():
     windows = hooks.detached_process_kwargs(platform="nt")
     assert windows["creationflags"] == 0x00000200 | 0x00000008
     assert "start_new_session" not in windows
+
+
+def test_session_start_accepts_due_decision_from_a_reimported_module():
+    """Regression: the installed hook runs ``python -m clawjournal.agent_hooks``,
+    which executes this module as ``__main__`` while the auto-upload adapter
+    imports it again under its canonical name. The adapter's DueDecision is
+    then a *different class* from the one ``run_session_start`` sees. A class
+    identity check rejected every real decision, fail-open swallowed it as
+    ``due-check-error``, and no scheduled runner was ever spawned."""
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class ForeignDueDecision:  # structurally identical, different class object
+        due: bool
+        reason: str
+
+    spawned: list[str] = []
+    result = hooks.run_session_start(
+        client="claude",
+        due_check=lambda client, at: ForeignDueDecision(True, "due"),
+        spawn_runner=lambda client: spawned.append(client) or True,
+    )
+    assert result.reason == "runner-spawned"
+    assert result.due is True and result.spawned is True
+    assert spawned == ["claude"]
+
+    not_due = hooks.run_session_start(
+        client="codex",
+        due_check=lambda client, at: ForeignDueDecision(False, "not-due"),
+        spawn_runner=lambda client: spawned.append(client) or True,
+    )
+    assert not_due.reason == "not-due"
+    assert spawned == ["claude"]
+
+
+def test_module_executed_as_main_spawns_the_runner(monkeypatch, tmp_path):
+    """Run the module exactly as the installed hook command does
+    (``python -m clawjournal.agent_hooks run --client claude``) and assert the
+    default adapters reach the real spawn seam."""
+    import runpy
+    import sys
+
+    from clawjournal import auto_upload
+
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        auto_upload,
+        "hook_session_start_check",
+        lambda client, now: hooks.DueDecision(True, "due"),
+    )
+    monkeypatch.setattr(
+        auto_upload,
+        "spawn_scheduled_runner",
+        lambda client: spawned.append(client) or True,
+    )
+    monkeypatch.setattr(
+        "clawjournal.skill.due.emit_session_start_nudge", lambda client: False
+    )
+    monkeypatch.setattr(sys, "argv", ["agent_hooks", "run", "--client", "claude"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_module("clawjournal.agent_hooks", run_name="__main__", alter_sys=True)
+
+    assert exit_info.value.code == 0
+    assert spawned == ["claude"]

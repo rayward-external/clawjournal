@@ -401,8 +401,48 @@ def hook_diagnostics(
     return result
 
 
+_HOOK_FAILURE_REASONS = frozenset(
+    {"due-check-error", "runner-spawn-error", "runner-not-spawned"}
+)
+
+
+def _record_hook_failure(client: AgentName, reason: str) -> None:
+    try:
+        from .auto_upload import _write_telemetry
+
+        _write_telemetry(
+            "hook_failure",
+            code=reason.replace("-", "_"),
+            scheduled_client=client,
+        )
+    except Exception:
+        # Diagnostics must never make an agent session fail to start.
+        pass
+
+
 def _runner_not_configured(_client: AgentName, _now: datetime) -> DueDecision:
     return DueDecision(False, "runner-not-configured")
+
+
+def _coerce_due_decision(decision: object) -> DueDecision:
+    """Validate a due-check result structurally, never by class identity.
+
+    The installed hook command is ``python -m clawjournal.agent_hooks``, which
+    executes this file as ``__main__`` while the auto-upload adapter imports
+    it again under its canonical name. Those are two module objects with two
+    distinct ``DueDecision`` classes, so an ``isinstance`` check against the
+    local class rejected every real decision and the fail-open path silently
+    reported ``due-check-error`` — no scheduled runner was ever spawned by a
+    real SessionStart hook. Accept any object carrying the two fields.
+    """
+
+    if isinstance(decision, DueDecision):
+        return decision
+    due = getattr(decision, "due", None)
+    reason = getattr(decision, "reason", None)
+    if isinstance(due, bool) and isinstance(reason, str):
+        return DueDecision(due, reason)
+    raise TypeError("due check must return DueDecision")
 
 
 def detached_process_kwargs(*, platform: str | None = None) -> dict[str, Any]:
@@ -449,9 +489,7 @@ def run_session_start(
 
     check = due_check or _runner_not_configured
     try:
-        decision = check(client, observed_at)
-        if not isinstance(decision, DueDecision):
-            raise TypeError("due check must return DueDecision")
+        decision = _coerce_due_decision(check(client, observed_at))
     except Exception:
         return SessionStartResult(
             observed_at,
@@ -528,12 +566,17 @@ def main(
                     # The nudge is optional garnish; a broken import must never
                     # break the auto-upload check or the agent session.
                     nudge_emitter = None
-        run_session_start(
+        result = run_session_start(
             client=args.client,
             due_check=due_check,
             spawn_runner=spawn_runner,
             record_observed=record_observed,
         )
+        if result.reason in _HOOK_FAILURE_REASONS:
+            # Still silent toward the agent session, but leave a bounded
+            # record in the private auto-upload telemetry: a scheduler that
+            # fails open must at least be diagnosable from the machine.
+            _record_hook_failure(args.client, result.reason)
         # The auto-upload scheduler stays silent (its state must never reach a
         # trace). The lessons-refresh nudge is the ONE deliberate exception: at
         # most one printed line, bounded + fail-open + cooldown-limited, and it
@@ -548,4 +591,9 @@ def main(
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through main()
-    raise SystemExit(main())
+    # ``python -m clawjournal.agent_hooks`` executes this file as ``__main__``.
+    # Delegate to the canonical module so the hook runs the same objects the
+    # auto-upload adapters were built against (see _coerce_due_decision).
+    from clawjournal.agent_hooks import main as _canonical_main
+
+    raise SystemExit(_canonical_main())
