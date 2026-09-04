@@ -844,7 +844,10 @@ def test_writer_lock_makes_real_hook_path_return_quickly_without_runner(
         locker.close()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.5
+    # Three bounded waits (observe, due-check, session-start) against a held
+    # writer lock: each may wait HOOK_DB_BUSY_TIMEOUT_MS, none may hang.
+    assert 0 < auto.HOOK_DB_BUSY_TIMEOUT_MS <= 2000
+    assert elapsed < 3 * auto.HOOK_DB_BUSY_TIMEOUT_MS / 1000 + 1.0
     assert result == agent_hooks.SessionStartResult(
         observed_at=now,
         reason="index-busy",
@@ -6657,3 +6660,73 @@ def test_control_changed_during_cycle_records_backoff(isolated_auto_upload, monk
         assert enrollment["next_retry_at"] is not None
     finally:
         conn.close()
+
+
+def test_transient_cycle_failure_backs_off_instead_of_locking(isolated_auto_upload):
+    """An environment-shaped failure (here: no readable credential file) must
+    schedule a retry, not park the enrollment in a durable, silent
+    ``action_required`` that blocks every later scheduled cycle."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    conn.close()
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] == "credential_store_failed"
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "enabled"
+        assert enrollment["health"] == "retrying"
+        assert enrollment["next_retry_at"] is not None
+        assert enrollment["consecutive_failures"] == 1
+    finally:
+        conn.close()
+
+
+def test_cycle_self_heals_profile_changed_once_profile_matches(
+    isolated_auto_upload, monkeypatch
+):
+    """A cycle-recorded ``profile_changed`` clears itself when the accepted
+    profile is back (the same check resume() performs); a real mismatch keeps
+    the durable gate."""
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    enrollment = _save_enabled_enrollment(
+        conn, config, enrolled_at="2026-07-10T00:00:00+00:00", health="action_required"
+    )
+    assert update_auto_upload_enrollment(
+        conn,
+        expected_generation=int(enrollment["generation"]),
+        last_result_code="profile_changed",
+    )
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    result = auto.run_cycle(force=True)
+
+    assert result["code"] != "action_required"
+    conn = open_index()
+    try:
+        healed = get_auto_upload_enrollment(conn)
+        assert healed["health"] != "action_required"
+        assert healed["last_result_code"] != "profile_changed"
+        # A genuine mismatch stays gated.
+        assert update_auto_upload_enrollment(
+            conn,
+            expected_generation=int(healed["generation"]),
+            health="action_required",
+            last_result_code="profile_changed",
+            egress_profile_hash="0" * 64,
+        )
+    finally:
+        conn.close()
+
+    gated = auto.run_cycle(force=True)
+
+    assert gated["code"] == "action_required"

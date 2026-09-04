@@ -585,7 +585,10 @@ describe('AutoUploadPanel status and controls', () => {
     const first = renderControl(<AutoUploadPanel />);
     const firstSwitch = await screen.findByRole('switch', { name: 'Automatic uploads' });
     expect(firstSwitch).toHaveAttribute('aria-checked', 'true');
-    expect(firstSwitch).toHaveTextContent('On');
+    // A durable action_required must be visible without opening details: the
+    // switch stops claiming "On" and the panel says uploads are stopped.
+    expect(firstSwitch).toHaveTextContent('Needs review');
+    expect(screen.getByText(/Automatic uploads are stopped/)).toBeInTheDocument();
     await openPanelDetails();
     expect(screen.getByText('Action required')).toBeInTheDocument();
     expect(screen.getByText('Running')).toBeInTheDocument();

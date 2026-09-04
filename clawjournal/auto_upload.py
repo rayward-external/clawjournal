@@ -108,7 +108,11 @@ SEALED_ZIP_FILENAME = "auto-upload.sealed.zip"
 TELEMETRY_MAX_BYTES = 512 * 1024
 TELEMETRY_BACKUPS = 2
 SUPPORTED_HOOK_TARGETS = ("claude", "codex")
-HOOK_DB_BUSY_TIMEOUT_MS = 0
+# Bounded wait for the SessionStart hook's index read. The daemon scans every
+# SCAN_INTERVAL seconds and commits a pass in one write transaction, so a
+# zero timeout turned a due hook into a silent "index-busy" no-op whenever
+# it landed inside that window. Well under the agents' 5-second hook timeout.
+HOOK_DB_BUSY_TIMEOUT_MS = 750
 _CONTROL_THREAD_LOCK = threading.Lock()
 
 # V1 supports only sources with both a SessionStart trigger and an audited,
@@ -4274,6 +4278,62 @@ def _server_enrollment_gate(
         )
 
 
+# Environment-shaped cycle failures: nothing about the user's authorization or
+# profile changed, the machine just could not do the work right now (a
+# credential file the runner could not read, an AI backend missing from the
+# hook-spawned process's PATH). These back off like any other transient error
+# instead of parking the enrollment in a durable, silent ``action_required``.
+_TRANSIENT_CYCLE_CODES = frozenset({"credential_store_failed", "ai_backend_unavailable"})
+
+
+def _clear_restored_profile(
+    conn: sqlite3.Connection, enrollment: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Self-heal a cycle-recorded ``profile_changed`` once the accepted
+    profile is back, exactly as ``resume()`` would verify it.
+
+    Only the cycle-detected case qualifies (mode still ``enabled``); a pause
+    stamped by a redaction-profile mutation stays a pause. Returns the
+    refreshed enrollment when the gate was cleared, else None.
+    """
+
+    if (
+        enrollment.get("mode") != "enabled"
+        or enrollment.get("health") != "action_required"
+        or enrollment.get("last_result_code") != "profile_changed"
+    ):
+        return None
+    try:
+        credentials = load_credentials(required=False)
+        if not credentials:
+            return None
+        config = load_config()
+        profile = egress_profile_hash(
+            conn,
+            enrollment_scope={
+                "sources": enrollment["enrolled_sources"],
+                "projects": enrollment["enrolled_projects"],
+            },
+            api_origin=str(credentials["api_origin"]),
+            ai_backend=_resolved_ai_backend(config),
+            config=config,
+        )
+    except Exception:
+        return None
+    if profile != enrollment.get("egress_profile_hash"):
+        return None
+    if not update_auto_upload_enrollment(
+        conn,
+        expected_generation=int(enrollment["generation"]),
+        health="ready",
+        last_result_code="profile_restored",
+        next_retry_at=None,
+        consecutive_failures=0,
+    ):
+        return None
+    return get_auto_upload_enrollment(conn)
+
+
 def _run_cycle_impl(
     *,
     force: bool = False,
@@ -4424,6 +4484,9 @@ def _run_cycle_impl(
             # explicit Run now. In either case, the sole scheduled exception
             # is receipt lookup for a request already durably marked
             # ``submitting``; it may have crossed the egress boundary earlier.
+            restored = _clear_restored_profile(conn, enrollment)
+            if restored is not None:
+                enrollment = restored
             durable_action_required = enrollment.get("health") == "action_required"
             if durable_action_required or scheduled_hook_missing:
                 if receipt_probe is not None:
@@ -5075,13 +5138,14 @@ def _run_cycle_impl(
                     if isinstance(exc, AutoUploadError)
                     else AutoUploadError("credential_store_failed", str(exc))
                 )
+                retryable = error.retryable or error.code in _TRANSIENT_CYCLE_CODES
                 _record_cycle_result(
                     conn,
                     generation=generation,
                     code=error.code,
-                    retryable=error.retryable,
+                    retryable=retryable,
                     retry_after=error.retry_after,
-                    action_required=not error.retryable,
+                    action_required=not retryable,
                 )
                 return error.as_result()
         finally:

@@ -590,6 +590,13 @@ export function SubmitStep(p: SubmitStepProps) {
                           Nothing uploads while paused — resume in Settings → Automatic uploads.{' '}
                         </span>
                       )}
+                      {automaticUploadsAlreadyConfigured
+                        && autoUploadStatus?.mode === 'enabled'
+                        && autoUploadStatus?.health === 'action_required' && (
+                        <span style={{ color: colors.red700 }}>
+                          Automatic uploads are stopped and need review — Settings → Automatic uploads → Review scope and terms.{' '}
+                        </span>
+                      )}
                       {automaticUploadOptionLoading ? (
                         <span style={{ color: colors.gray500 }}>Loading details…</span>
                       ) : (
