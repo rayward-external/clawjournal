@@ -1144,7 +1144,7 @@ export function AutoUploadPanel() {
               boxShadow: '0 1px 2px rgba(0, 0, 0, 0.16)',
             }}
           />
-          {setupPending ? 'Setting up' : status.mode === 'paused' ? 'Paused' : toggleOn ? 'On' : 'Off'}
+          {setupPending ? 'Setting up' : status.mode === 'paused' ? 'Paused' : status.mode === 'enabled' && status.health === 'action_required' ? 'Needs review' : toggleOn ? 'On' : 'Off'}
         </button>
       </div>
 
@@ -1156,6 +1156,13 @@ export function AutoUploadPanel() {
       {status.overlay === 'revocation_pending' && (
         <div role="alert" style={{ marginTop: 10, fontSize: 12.5, color: colors.red700 }}>
           Turn-off needs attention. Open details to retry hosted revocation.
+        </div>
+      )}
+      {status.mode === 'enabled' && status.health === 'action_required' && (
+        <div role="alert" style={{ marginTop: 10, fontSize: 12.5, color: colors.red700 }}>
+          Automatic uploads are stopped
+          {status.last_result?.code ? ` (${status.last_result.code.replaceAll('_', ' ')})` : ''}
+          : nothing uploads until you review. Open details and use Review scope and terms.
         </div>
       )}
       {status.mode === 'off' && !status.offer_available && !status.overlay && (
