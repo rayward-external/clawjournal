@@ -72,6 +72,48 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('Reviewed share versions', () => {
+  it.each([true, false])('requires the saved preview and uses its revision (available=%s)', async (available) => {
+    const stats = readyStats(1);
+    stats.sessions[0].revision_hash = 'older-queue-revision';
+    mockInitialLoad(stats);
+    vi.spyOn(api.sessions, 'redactionReport').mockResolvedValue({
+      session_id: 's1',
+      review_snapshot_id: available ? 'saved-preview' : undefined,
+      reviewed_revision: available ? 'actually-reviewed-revision' : undefined,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'full',
+      redacted_session: { messages: [{ role: 'user', content: 'Reviewed content' }] },
+    } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+    const create = vi.spyOn(api.shares, 'create').mockResolvedValue({ share_id: 'snapshot-share' });
+    vi.spyOn(api.shares, 'seal').mockResolvedValue({ ok: true } as Awaited<ReturnType<typeof api.shares.seal>>);
+    vi.spyOn(api.shares, 'packageStatus').mockResolvedValue({ progress: 100, message: 'Ready' } as Awaited<ReturnType<typeof api.shares.packageStatus>>);
+    render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByText(/Later changes stay local for a future share/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Package 1 trace' }));
+    if (available) {
+      await waitFor(() => expect(create).toHaveBeenCalledWith(
+        ['s1'], undefined, undefined,
+        { s1: 'actually-reviewed-revision' }, expect.any(Object),
+        { s1: 'saved-preview' },
+      ));
+    } else {
+      expect((await screen.findAllByText(/A saved review is missing/)).length).toBeGreaterThan(0);
+      expect(create).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe('Share selection defaults', () => {
   it('opens the picker with every available trace selected and lets the user deselect', async () => {
     mockInitialLoad(readyStats());
@@ -174,6 +216,8 @@ describe('Share selection defaults', () => {
     });
     const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -452,6 +496,8 @@ describe('Share selection defaults', () => {
     mockInitialLoad(readyStats(2));
     const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -722,6 +768,8 @@ describe('Redaction completion', () => {
     mockInitialLoad(readyStats(2));
     const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -754,6 +802,8 @@ describe('One-click review defaults', () => {
     mockInitialLoad(readyStats(2));
     vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -790,6 +840,8 @@ describe('One-click review defaults', () => {
     mockInitialLoad(readyStats(2));
     vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],

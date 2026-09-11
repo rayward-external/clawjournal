@@ -77,7 +77,8 @@ def test_summary_titles_use_resolved_backend_default(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: "codex")
-    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": []})
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": [], "content_revision": "reviewed"})
+    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail: "preview")
     monkeypatch.setattr(share_cli, "_load_title_cache", lambda: {})
     monkeypatch.setattr(share_cli, "_save_title_cache", lambda cache: None)
 
@@ -199,7 +200,7 @@ def test_blocked_recovery_removes_and_retries(monkeypatch):
     calls = []
 
     def _package(
-        conn, session_ids, settings, *, ai_pii, note=None, expected_revisions=None
+        conn, session_ids, settings, *, ai_pii, note=None, expected_revisions=None, review_snapshot_ids=None
     ):
         calls.append(list(session_ids))
         if "bad" in session_ids:  # first attempt: block "bad"
@@ -221,7 +222,7 @@ def test_blocked_all_blocked_aborts(monkeypatch):
     monkeypatch.setattr(share_cli, "gate_blockers", lambda conn, ids: [])
 
     def _package(
-        conn, session_ids, settings, *, ai_pii, note=None, expected_revisions=None
+        conn, session_ids, settings, *, ai_pii, note=None, expected_revisions=None, review_snapshot_ids=None
     ):
         return {"ok": False, "blocked_sessions": list(session_ids), "error": "blocked"}
     monkeypatch.setattr(share_cli.share_flow, "package", _package)
@@ -444,7 +445,8 @@ def _fake_rec(coverage, status="review"):
 
 
 def test_step_redact_degrades_to_rules_only_when_ai_unavailable(monkeypatch):
-    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": []})
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": [], "content_revision": "reviewed"})
+    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail: "preview")
     seen = []
 
     def fake_build(conn, detail, settings, use_ai, **k):
@@ -461,7 +463,8 @@ def test_step_redact_degrades_to_rules_only_when_ai_unavailable(monkeypatch):
 
 
 def test_step_redact_keeps_ai_when_uniformly_full(monkeypatch):
-    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": []})
+    monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": [], "content_revision": "reviewed"})
+    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail: "preview")
     monkeypatch.setattr(share_cli, "build_redaction_record",
                         lambda conn, detail, settings, use_ai, **k: _fake_rec("full", "clear"))
     chosen = [{"session_id": "a", "display_title": "A"}]

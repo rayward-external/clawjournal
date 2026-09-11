@@ -834,6 +834,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           ...prev,
           [s.session_id]: {
             messages: msgs, loading: false,
+            reviewSnapshotId: report.review_snapshot_id,
+            reviewedRevision: report.reviewed_revision,
             redactionCount: report.redaction_count,
             aiPiiFindings: report.ai_pii_findings || [],
             aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
@@ -978,6 +980,13 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   const retryAiReview = async (id: string) => {
     const run = beginRedactionRetry(redactionRetryRef.current, id);
     if (!run) return;
+    // A refreshed preview may contain new messages. Inclusion of the previous
+    // preview must not silently approve the new version.
+    setApprovedIds((previous) => {
+      const next = new Set(previous);
+      next.delete(id);
+      return next;
+    });
     const isActive = () => isRedactionRetryActive(redactionRetryRef.current, id, run);
 
     try {
@@ -1028,6 +1037,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         ...prev,
         [id]: {
           messages: msgs, loading: false,
+          reviewSnapshotId: report.review_snapshot_id,
+          reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,
           aiPiiFindings: report.ai_pii_findings || [],
           aiCoverage: report.ai_coverage || 'rules_only',
@@ -1090,10 +1101,15 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
     try {
       const ids = approvedList.map((s) => s.session_id);
+      const reviewSnapshotIds = Object.fromEntries(ids.map((id) => {
+        const preview = redactedSessions[id];
+        if (!preview?.reviewSnapshotId || !preview.reviewedRevision || preview.loading) {
+          throw new Error('A saved review is missing. Return to Redact and refresh the affected trace.');
+        }
+        return [id, preview.reviewSnapshotId];
+      }));
       const expectedRevisions = Object.fromEntries(
-        approvedList
-          .filter((s): s is ReadySession & { revision_hash: string } => Boolean(s.revision_hash))
-          .map((s) => [s.session_id, s.revision_hash]),
+        ids.map((id) => [id, redactedSessions[id].reviewedRevision!]),
       );
       const expectedLogicalRevisions = collectExpectedLogicalRevisions(approvedList);
       const { share_id } = await api.shares.create(
@@ -1102,6 +1118,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         undefined,
         expectedRevisions,
         expectedLogicalRevisions,
+        reviewSnapshotIds,
       );
       setPackageProgress(2);
       setPackageLog('Starting local packaging...');
@@ -1161,7 +1178,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       stopProgressPolling();
       packagingStartedRef.current = false;
     }
-  }, [approvedSessions, note, toast, aiPiiEnabled]);
+  }, [approvedSessions, redactedSessions, note, toast, aiPiiEnabled]);
 
   const installScannersAndRetry = useCallback(async () => {
     if (installingScanners) return;
@@ -1403,6 +1420,15 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         onRetryAi={retryAiReview}
         onBack={() => {
           cancelAiRetries();
+          const missing = new Set(Object.entries(redactedSessions)
+            .filter(([, preview]) => !preview.reviewSnapshotId)
+            .map(([id]) => id));
+          if (missing.size > 0) {
+            setRedactedSessions((previous) => Object.fromEntries(
+              Object.entries(previous).filter(([id]) => !missing.has(id)),
+            ));
+            setApprovedIds((previous) => new Set([...previous].filter((id) => !missing.has(id))));
+          }
           setActiveStep('redact');
         }}
         onPackage={handleStartPackage}

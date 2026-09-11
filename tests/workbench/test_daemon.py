@@ -8377,3 +8377,44 @@ class TestShareAPI:
             sessions_content = archive.read("sessions.jsonl").decode("utf-8")
 
         assert "MySecretName" not in sessions_content
+
+
+def test_share_api_packages_the_previewed_revision_after_a_later_update(server, monkeypatch):
+    """The browser's explicit inclusion is bound to its server-saved preview."""
+    from clawjournal.workbench import index
+
+    monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+    original = {
+        "session_id": "review-snapshot-api", "project": "test-project", "source": "codex",
+        "messages": [{"role": "user", "content": "Already uploaded original"}],
+        "stats": {"user_messages": 1},
+    }
+    conn = open_index()
+    try:
+        upsert_sessions(conn, [original])
+        first = index.create_share(conn, [original["session_id"]])
+        conn.execute("UPDATE shares SET shared_at = '2026-09-01', status = 'shared' WHERE share_id = ?", (first,))
+        conn.commit()
+        reviewed = {**original, "messages": [{"role": "user", "content": "The reviewed update"}]}
+        upsert_sessions(conn, [reviewed])
+        status, report = _get(server, "/api/sessions/review-snapshot-api/redaction-report")
+        assert status == 200
+        assert report["review_snapshot_id"]
+        assert report["reviewed_revision"] == index.compute_content_revision(reviewed)
+        upsert_sessions(conn, [{**original, "messages": [{"role": "user", "content": "New content stays local"}]}])
+        # Requests without the saved preview retain the existing revision gate.
+        assert _post(server, "/api/shares", {"session_ids": [original["session_id"]]})[0] == 409
+        status, share = _post(server, "/api/shares", {
+            "session_ids": [original["session_id"]],
+            "expected_revisions": {original["session_id"]: report["reviewed_revision"]},
+            "review_snapshot_ids": {original["session_id"]: report["review_snapshot_id"]},
+        })
+        assert status == 201, share
+        output, manifest = index.export_share_to_disk(conn, share["share_id"], index.get_share(conn, share["share_id"]))
+        assert not manifest.get("blocked")
+        content = (output / "sessions.jsonl").read_text()
+        assert "The reviewed update" in content
+        assert "New content stays local" not in content
+        assert not index.share_revision_blockers(conn, share["share_id"])
+    finally:
+        conn.close()

@@ -663,6 +663,7 @@ export const api = {
       attestation?: string,
       expectedRevisions?: Record<string, string>,
       expectedLogicalRevisions?: Record<string, string>,
+      reviewSnapshotIds?: Record<string, string>,
     ): Promise<{ share_id: string }> {
       return request('/shares', {
         method: 'POST',
@@ -673,6 +674,7 @@ export const api = {
           attestation,
           expected_revisions: expectedRevisions,
           expected_logical_revisions: expectedLogicalRevisions,
+          review_snapshot_ids: reviewSnapshotIds,
         }),
       });
     },

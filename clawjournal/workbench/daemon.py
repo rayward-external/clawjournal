@@ -5735,6 +5735,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             if detail is None:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
+            from .review_snapshots import ReviewSnapshotError, save_review_snapshot
+
+            try:
+                review_snapshot_id = save_review_snapshot(conn, detail)
+            except ReviewSnapshotError as exc:
+                _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
+                return
+            reviewed_revision = detail["content_revision"]
             settings = get_effective_share_settings(conn, load_config())
             detail, redaction_count, redaction_log = apply_share_redactions(
                 conn,
@@ -5781,6 +5789,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
             _json_response(self, {
                 "session_id": session_id,
+                "review_snapshot_id": review_snapshot_id,
+                "reviewed_revision": reviewed_revision,
                 "redaction_count": redaction_count + ai_pii_count,
                 "redaction_log": redaction_log,
                 "ai_pii_findings": ai_pii_findings,
@@ -6910,6 +6920,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        review_snapshot_ids = body.get("review_snapshot_ids")
+        if review_snapshot_ids is not None and (
+            not isinstance(review_snapshot_ids, dict)
+            or any(not isinstance(value, str) for value in review_snapshot_ids.values())
+        ):
+            _json_response(self, {"error": "review_snapshot_ids must map session IDs to saved previews"}, 400)
+            return
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
@@ -6921,14 +6938,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 }, 409)
                 return
             review_blockers = revision_review_blockers(conn, session_ids)
-            if review_blockers:
+            if review_blockers and review_snapshot_ids is None:
                 _json_response(self, {
                     "error": "Updated traces require fresh approval before re-upload.",
                     "blockers": review_blockers,
                 }, 409)
                 return
             duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
-            if duplicate_blockers:
+            if duplicate_blockers and review_snapshot_ids is None:
                 _json_response(self, {
                     "error": "One or more selected trace revisions were already shared.",
                     "blockers": duplicate_blockers,
@@ -6942,6 +6959,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     source_filter=settings.get("source_filter"),
                     expected_revisions=expected_revisions,
                     expected_logical_revisions=expected_logical_revisions,
+                    review_snapshot_ids=review_snapshot_ids,
                 )
             except RevisionConflictError as exc:
                 _json_response(self, {

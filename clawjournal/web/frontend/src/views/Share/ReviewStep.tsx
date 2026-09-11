@@ -58,7 +58,8 @@ export function ReviewStep(p: ReviewStepProps) {
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
         Safe traces are included automatically. Anything uncertain stays out unless you
-        choose to review and include it.
+        choose to review and include it. This share uses the versions shown here.
+        Later changes stay local for a future share.
       </p>
 
       <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />

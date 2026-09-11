@@ -108,6 +108,16 @@ Depending on how you export, bundle content can include user messages, assistant
 
 Uploading is a separate path from local export.
 
+Manual Share saves the input used for each redaction preview in the local index.
+When you include that preview, packaging uses its saved content version even if
+the conversation later grows. Later content stays local for a future share; it
+does not inherit this inclusion. Saved reviews have no time-based expiry. A new
+preview replaces the version shown in that review, and must be included again.
+Current holds, blocked status, source/project scope, exclusions, redaction rules,
+consent, duplicate checks, and both secret-scan gates still apply. Missing or
+damaged saved content requires a fresh preview. This manual review mechanism
+does not grant or change recurring upload authority.
+
 - Hosted research submission uses the local workbench Submit step by default. The browser talks to the local daemon, the daemon sends the finalized zip to Rayward's hosted API, and the hosted service returns a receipt ID. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables hosted submission.
 - Advanced self-hosted ingest upload is disabled unless `CLAWJOURNAL_INGEST_URL` is configured.
 - The ingest and hosted-share URLs must use `https://`, except for `localhost` and `127.0.0.1` during local development.

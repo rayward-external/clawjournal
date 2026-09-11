@@ -617,6 +617,41 @@ _GITHUB_URL_PUBLIC_ORGS = frozenset({
 })
 
 
+_EMAIL_PATTERN = re.compile(r"([A-Za-z0-9_.+-]{3,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+_TRUNCATED_EMAIL_PATTERN = re.compile(r"([A-Za-z0-9_.+-]{3,})@(?=\s|$)")
+_EMAIL_LOCAL_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.+-"
+)
+
+
+def _content_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    """Keep the email rules, but attempt them only at actual @ candidates.
+
+    Unanchored local-part repetition retries every suffix of a long run when
+    no email follows it. Locating @ first avoids that quadratic search. Runs
+    to the left of different @ signs are disjoint, and a domain stops at @,
+    so candidate discovery and validation scan only a bounded amount per
+    character. Do not cap, truncate, or change the accepted email syntax.
+    """
+    if pattern.pattern not in {_EMAIL_PATTERN.pattern, _TRUNCATED_EMAIL_PATTERN.pattern}:
+        yield from pattern.finditer(text)
+        return
+    search_from = 0
+    match_end = 0
+    while (at := text.find("@", search_from)) != -1:
+        start = at
+        while start > match_end and text[start - 1] in _EMAIL_LOCAL_CHARS:
+            start -= 1
+        if at - start >= 3:
+            match = pattern.match(text, start)
+            if match is not None:
+                yield match
+                # Preserve finditer's non-overlapping matches, including
+                # adjacent addresses such as aaa@bbb.ccc@ddd.example.
+                match_end = match.end()
+        search_from = max(at + 1, match_end)
+
+
 def _content_findings_for_text(session_id: str, message_index: int, field: str, text: str) -> list[PIIFinding]:
     """Scan free-form text for PII patterns beyond JSON metadata."""
     findings: list[PIIFinding] = []
@@ -625,9 +660,9 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
         (r"github\.com/([A-Za-z0-9_.-]{2,})", "username", "GitHub username/org in URL", 0.85, 1),
         (r"raw\.githubusercontent\.com/([A-Za-z0-9_.-]{2,})", "username", "GitHub username/org in raw URL", 0.85, 1),
         # Email-like identifiers (require user@domain.tld format)
-        (r"([A-Za-z0-9_.+-]{3,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", "email", "Email address", 0.90, 1),
+        (_EMAIL_PATTERN.pattern, "email", "Email address", 0.90, 1),
         # Partial email / identifier with @ (e.g., "jane.doe@" in tabular output)
-        (r"([A-Za-z0-9_.+-]{3,})@(?=\s|$)", "email", "Email-like identifier (truncated)", 0.75, 1),
+        (_TRUNCATED_EMAIL_PATTERN.pattern, "email", "Email-like identifier (truncated)", 0.75, 1),
         # Telegram bot tokens: numeric_id:alphanumeric_token
         (r"(\d{8,}:[A-Za-z0-9_-]{30,})", "custom_sensitive", "Likely Telegram bot token", 0.95, 1),
         # Hostnames with personal identifiers (e.g., kais-macbook-pro, alice-desktop)
@@ -640,7 +675,7 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
         (r"\b(192\.168\.\d{1,3}\.\d{1,3})\b", "custom_sensitive", "Private IP address (192.168.x)", 0.70, 1),
     ]
     for pattern, entity_type, reason, confidence, group in patterns:
-        for match in re.finditer(pattern, text):
+        for match in _content_matches(re.compile(pattern), text):
             entity_text = match.group(group).strip()
             if not entity_text or len(entity_text) < 3:
                 continue
@@ -761,8 +796,8 @@ PII_ENGINE_ID = "regex_pii"
 _PII_CONTENT_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float, int, str]] = [
     ("github_url_username", re.compile(r"github\.com/([A-Za-z0-9_.-]{2,})"), "username", 0.85, 1, "github"),
     ("github_raw_url_username", re.compile(r"raw\.githubusercontent\.com/([A-Za-z0-9_.-]{2,})"), "username", 0.85, 1, "github"),
-    ("email", re.compile(r"([A-Za-z0-9_.+-]{3,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"), "email", 0.90, 1, "plain"),
-    ("email_truncated", re.compile(r"([A-Za-z0-9_.+-]{3,})@(?=\s|$)"), "email", 0.75, 1, "plain"),
+    ("email", _EMAIL_PATTERN, "email", 0.90, 1, "plain"),
+    ("email_truncated", _TRUNCATED_EMAIL_PATTERN, "email", 0.75, 1, "plain"),
     ("telegram_bot_token", re.compile(r"(\d{8,}:[A-Za-z0-9_-]{30,})"), "custom_sensitive", 0.95, 1, "plain"),
     ("personal_hostname", re.compile(r"\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b"), "device_id", 0.80, 1, "plain"),
     ("home_dir_path", re.compile(r"(/(?:Users|home)/[A-Za-z0-9._-]{2,}/[^\s\"'`,;)}\]]{3,})"), "path", 0.85, 1, "plain"),
@@ -893,7 +928,7 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
 
     matches: list[dict] = []
     for rule_name, pattern, entity_type, confidence, group, kind in _PII_CONTENT_PATTERNS_COMPILED:
-        for m in pattern.finditer(text):
+        for m in _content_matches(pattern, text):
             try:
                 entity_text = m.group(group)
             except IndexError:

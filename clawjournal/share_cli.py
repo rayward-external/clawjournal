@@ -700,13 +700,17 @@ def render_transcript(redacted_session: dict, max_msgs: int | None = None,
 
 
 def _build_records(conn, settings, chosen, ai_pii):
+    from .workbench.review_snapshots import save_review_snapshot
+
     recs = []
     for r in chosen:
         detail = get_session_detail(conn, r["session_id"])
         if detail is None:
             die(f"Session {r['session_id']} not found.")
+        snapshot_id = save_review_snapshot(conn, detail)
         rec = build_redaction_record(conn, detail, settings, ai_pii)
-        rec["row"] = r
+        rec["row"] = {**r, "revision_hash": detail["content_revision"]}
+        rec["review_snapshot_id"] = snapshot_id
         recs.append(rec)
     return recs
 
@@ -877,6 +881,10 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
             for s in recs
             if s["row"].get("revision_hash")
         }
+        snapshots = {
+            s["row"]["session_id"]: s["review_snapshot_id"]
+            for s in recs if s.get("review_snapshot_id")
+        }
         res = share_flow.package(
             conn,
             session_ids,
@@ -884,6 +892,7 @@ def step_package(conn, settings, included: list[dict], package_ai: bool, args):
             ai_pii=package_ai,
             note=args.note,
             expected_revisions=expected_revisions or None,
+            review_snapshot_ids=snapshots or None,
         )
         if res["ok"]:
             export_dir, manifest, share_id = res["export_dir"], res["manifest"], res["share_id"]
