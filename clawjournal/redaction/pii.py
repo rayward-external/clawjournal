@@ -19,6 +19,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
+from .replacements import ReplacementMap
 
 from ..findings import (
     ALLOWED_ENTITY_TYPES,
@@ -704,6 +705,8 @@ def _content_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[s
 
 def _content_findings_for_text(session_id: str, message_index: int, field: str, text: str) -> list[PIIFinding]:
     """Scan free-form text for PII patterns beyond JSON metadata."""
+    from .code_context import code_context
+    context = code_context(text)
     findings: list[PIIFinding] = []
     patterns: list[tuple[str, str, str, float, int]] = [
         # GitHub user/org in URLs — group 1 is the username/org
@@ -738,6 +741,8 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
             # skip noreply / no-reply email addresses
             if entity_type == "email" and entity_text.lower().startswith(("noreply@", "no-reply@")):
                 continue
+            if entity_type == "email" and context.protects(match.start(group), match.end(group)):
+                continue
             findings.append(normalize_finding({
                 "session_id": session_id,
                 "message_index": message_index,
@@ -753,6 +758,8 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
 
     existing = {(f["entity_type"], f["entity_text"]) for f in findings}
     for match in iter_format_candidates(text):
+        if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
+            continue
         if _pii_should_skip(match["match"], match["type"], "plain"):
             continue
         if (match["type"], match["match"]) in existing:
@@ -988,6 +995,8 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
     Python codepoint indices into `text` (matches `derive_preview`)."""
     if not text:
         return []
+    from .code_context import code_context
+    context = code_context(text)
 
     matches: list[dict] = []
     for rule_name, pattern, entity_type, confidence, group, kind in _PII_CONTENT_PATTERNS_COMPILED:
@@ -997,6 +1006,8 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
             except IndexError:
                 continue
             if entity_text is None:
+                continue
+            if rule_name in {"email", "internal_tld_host"} and context.protects(m.start(group), m.end(group)):
                 continue
             if _pii_should_skip(entity_text, entity_type, kind):
                 continue
@@ -1036,6 +1047,8 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
 
     existing = {(m["type"], m["start"], m["end"]) for m in matches}
     for match in iter_format_candidates(text):
+        if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
+            continue
         if (match["type"], match["start"], match["end"]) in existing:
             continue
         if not _pii_should_skip(match["match"], match["type"], "plain") and not _pii_user_allowlist_skip(
@@ -1098,17 +1111,22 @@ def pii_secret_map_from_text_decisions(
     text: str,
     decisions: dict[str, str],
     user_allowlist: list[dict] | None,
-) -> dict[str, str]:
-    """Return a `plaintext -> placeholder` map for one text value, dropping
-    matches whose hashed entity is `ignored` in `decisions`. Used by
-    `apply_findings_to_blob` to merge engines into a single replace pass."""
-    out: dict[str, str] = {}
+) -> ReplacementMap:
+    """Return full-entity replacements and occurrence-scoped fragments.
+
+    Drop ignored hashes. The caller must merge with ReplacementMap.update
+    so partial-address scopes survive; a plain dict would lose that metadata.
+    """
+    out = ReplacementMap()
     for match in _dedupe_overlapping_pii(scan_text_for_pii(text, user_allowlist=user_allowlist)):
         matched = match["match"]
         from .boundaries import ensure_safe_replacement
 
         ensure_safe_replacement(matched, match["rule"])
         if decisions.get(hash_entity(matched)) == "ignored":
+            continue
+        if match["rule"] == "email_truncated":
+            out.email_fragments.setdefault(matched, replacement_for_type(match["type"]))
             continue
         out.setdefault(matched, replacement_for_type(match["type"]))
     return out

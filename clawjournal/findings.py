@@ -927,6 +927,15 @@ def write_findings(path: Path, findings: list[PIIFinding], meta: dict[str, Any] 
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _is_partial_email_finding(finding: PIIFinding) -> bool:
+    # Use rule provenance, not absence of '@': an AI finding can describe
+    # an obfuscated address (alice [at] host [dot] test) that still needs
+    # its original full-entity replacement.
+    return finding.get("entity_type") == "email" and finding.get("reason") in {
+        "Email-like identifier (truncated)", "email_truncated",
+    }
+
+
 def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> list[PIIFinding]:
     filtered = [f for f in findings if f.get("entity_text") and float(f.get("confidence", 0.0)) >= min_confidence]
     grouped: dict[tuple[str, int, str], list[PIIFinding]] = {}
@@ -943,7 +952,9 @@ def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> l
             text_lower = text.lower()
             if any(text_lower == existing.get("entity_text", "").lower() for existing in chosen):
                 continue
-            if any(text_lower in existing.get("entity_text", "").lower() for existing in chosen):
+            # Distinct emails can occur separately even when one is a suffix
+            # of another. Keep both, including occurrence-scoped fragments.
+            if item.get("entity_type") != "email" and any(text_lower in existing.get("entity_text", "").lower() for existing in chosen):
                 continue
             chosen.append(item)
         merged.extend(chosen)
@@ -969,6 +980,11 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
         replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))
         if len(target) < 3:
             continue
+        if _is_partial_email_finding(finding):
+            from .redaction.replacements import replace_email_fragments
+            result, n = replace_email_fragments(result, {target: replacement}, ignore_case=True)
+            count += n
+            continue
         escaped = re.escape(target)
         # Email/token values already have a detected span. Unicode word
         # boundaries would skip them next to ordinary Chinese prose.
@@ -976,7 +992,11 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
             pattern = re.compile(escaped, re.IGNORECASE)
         else:
             pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
-        result, n = pattern.subn(replacement, result)
+        if finding.get("source") == "rule" and finding.get("entity_type") in {"email", "private_url"}:
+            from .redaction.code_context import replace_outside_code
+            result, n = replace_outside_code(result, pattern, replacement)
+        else:
+            result, n = pattern.subn(replacement, result)
         count += n
     return result, count
 

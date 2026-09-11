@@ -494,6 +494,8 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     # Fast-reject: skip the expensive assignment-style patterns when the
     # text has no separator character.
     has_assignment_sep = "=" in text or ":" in text
+    from .code_context import code_context
+    context = code_context(text)
 
     findings = []
     for name, pattern in SECRET_PATTERNS:
@@ -502,6 +504,8 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
 
         for match in _secret_matches(pattern, text):
             matched_text = match.group(0)
+            if name == "email" and context.protects(match.start(), match.end()):
+                continue
 
             if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
                 continue
@@ -525,13 +529,22 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
             if name == "ip_address" and _ip_looks_like_version(text, match):
                 continue
 
-            findings.append({
+            finding = {
                 "type": name,
                 "start": match.start(),
                 "end": match.end(),
                 "match": matched_text,
                 "confidence": CONFIDENCE.get(name, 0.5),
-            })
+            }
+            if name in {"env_secret", "generic_secret"}:
+                # Keep the full match/hash for existing review decisions.
+                # Like Gitleaks' secretGroup, replace only the value.
+                finding["replacement_start"] = match.start(1)
+                finding["replacement_end"] = match.end(1)
+            elif name == "high_entropy":
+                finding["replacement_start"] = match.start() + 1
+                finding["replacement_end"] = match.end() - 1
+            findings.append(finding)
 
     return findings
 
@@ -553,11 +566,9 @@ def redact_text(
     # Sort by position (descending start) to replace without shifting indices
     findings.sort(key=lambda f: f["start"], reverse=True)
 
-    # Deduplicate overlapping findings (keep the later-starting match on overlap)
-    deduped = []
-    for f in findings:
-        if not deduped or f["end"] <= deduped[-1]["start"]:
-            deduped.append(f)
+    # Match the session/decision path's longest-span precedence. A quoted
+    # entropy match inside an assignment must not consume its quote marks.
+    deduped = sorted(_dedupe_overlapping_matches(findings), key=lambda f: f["start"], reverse=True)
 
     # Build redaction log (no secret text — only metadata)
     log: list[dict] = []
@@ -596,7 +607,9 @@ def redact_text(
     result = text
     for f in deduped:
         placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-        result = result[:f["start"]] + placeholder + result[f["end"]:]
+        start = f.get("replacement_start", f["start"])
+        end = f.get("replacement_end", f["end"])
+        result = result[:start] + placeholder + result[end:]
 
     return result, len(deduped), log
 
@@ -797,10 +810,13 @@ def _build_redaction_set(
     for text, field, msg_idx, _tool_field in texts:
         ensure_text_boundaries(text)
         findings = scan_text(text, user_allowlist=user_allowlist)
-        for f in findings:
+        for f in _dedupe_overlapping_matches(findings):
             matched = f["match"]
             placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-            secret_map.setdefault(matched, placeholder)
+            if "replacement_start" in f:
+                secret_map.setdefault(text[f["replacement_start"]:f["replacement_end"]], placeholder)
+            else:
+                secret_map.setdefault(matched, placeholder)
 
             # For patterns with capture groups (env_secret, generic_secret,
             # cli_token_flag, aws_secret, url_token), also add the group
@@ -850,10 +866,24 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
     if not text or not secret_map:
         return text, 0
 
+    from .replacements import ReplacementMap, replace_email_fragments
+    from .code_context import replace_outside_code
+
     count = 0
     # Sort by length descending so longer matches replace first
     for secret in sorted(secret_map, key=len, reverse=True):
         replacement = secret_map[secret]
+        if replacement in {"[REDACTED_ENV_SECRET]", "[REDACTED_SECRET]"}:
+            from .replacements import replace_secret_value
+            text, n = replace_secret_value(text, secret, replacement)
+            count += n
+            continue
+        if replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
+            if secret not in text:
+                continue
+            text, n = replace_outside_code(text, re.compile(re.escape(secret)), replacement)
+            count += n
+            continue
         # Short alphanumeric strings need boundaries to avoid matching
         # inside unrelated words (e.g. custom redact_strings like "Kai").
         # ASCII-only lookarounds rather than `\b`, which treats CJK
@@ -870,6 +900,11 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
             text = text.replace(secret, replacement)
             count += n
 
+    # Full secrets take precedence. Replacing a fragment inside a private-key
+    # body first would invalidate the whole-key map before it can be applied.
+    if isinstance(secret_map, ReplacementMap) and secret_map.email_fragments:
+        text, n = replace_email_fragments(text, secret_map.email_fragments)
+        count += n
     return text, count
 
 
@@ -1142,10 +1177,9 @@ def _secret_map_from_text_decisions(
     """Build a replace-map for one text value, skipping ignored hashes.
 
     `decisions` maps `entity_hash → status`; `scan_text` findings whose
-    hash lands in `ignored` are dropped. Capture-group-style patterns
-    (env_secret, etc.) keep their inner-group expansion so byte-
-    equivalent output to `_build_redaction_set` is preserved when all
-    statuses are open/accepted.
+    hash lands in `ignored` are dropped. Assignments and quoted entropy
+    findings map only their values; the full match still owns the review
+    hash. Other capture-group rules keep their existing inner expansion.
     """
     secret_map: dict[str, str] = {}
     raw_matches = scan_text(text, user_allowlist=user_allowlist)
@@ -1159,7 +1193,10 @@ def _secret_map_from_text_decisions(
         if status == "ignored":
             continue
         placeholder = SECRET_PLACEHOLDER.get(finding["type"], REDACTED)
-        secret_map.setdefault(matched, placeholder)
+        if "replacement_start" in finding:
+            secret_map.setdefault(text[finding["replacement_start"]:finding["replacement_end"]], placeholder)
+        else:
+            secret_map.setdefault(matched, placeholder)
         for _name, pattern in SECRET_PATTERNS:
             if _name == finding["type"]:
                 inner = pattern.search(text[finding["start"]:finding["end"]])
@@ -1211,6 +1248,7 @@ def apply_findings_to_blob(
     # Lazy import to avoid pii.py → secrets.py import cycle.
     from .betterleaks import betterleaks_secret_map_from_blob
     from .pii import pii_secret_map_from_text_decisions
+    from .replacements import ReplacementMap
 
     # Betterleaks is the broad local detector. The Share path deliberately
     # defers live credential verification to the mandatory merged-artifact
@@ -1227,7 +1265,7 @@ def apply_findings_to_blob(
     total = 0
     for pass_num in range(max_passes):
         # Build a global replace map from every text location's current state.
-        secret_map: dict[str, str] = {}
+        secret_map = ReplacementMap()
         for text, _f, _m, _tf, _wk, _wkey in _iter_text_locations(blob):
             secret_map.update(
                 _secret_map_from_text_decisions(text, decisions, user_allowlist)

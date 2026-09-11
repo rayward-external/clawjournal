@@ -65,6 +65,16 @@ def ensure_text_boundaries(text: str) -> None:
     """
     from .candidate_formats import iter_format_candidates
     from .pii import _PII_CONTENT_PATTERNS_COMPILED, _content_matches
+    from .code_context import code_context
+
+    context = code_context(text)
+
+    def check(value: str, rule: str, start: int, end: int) -> None:
+        if context.protects(start, end) and rule in {"email", "email_extended", "internal_tld_host"}:
+            return
+        if rule.startswith("email") and context.is_ambiguous(start, end):
+            raise RedactionBoundaryError("email_or_code")
+        ensure_safe_replacement(value, rule)
 
     # Inspect raw matches before allowlists/no-reply filters. A later engine
     # can still redact one of those matches; an allowlist cannot make an
@@ -73,6 +83,6 @@ def ensure_text_boundaries(text: str) -> None:
     for rule, pattern, _kind, _confidence, group, _skip_kind in _PII_CONTENT_PATTERNS_COMPILED:
         if rule in guarded:
             for match in _content_matches(pattern, text):
-                ensure_safe_replacement(match.group(group), rule)
+                check(match.group(group), rule, match.start(group), match.end(group))
     for candidate in iter_format_candidates(text):
-        ensure_safe_replacement(candidate["match"], candidate["rule"])
+        check(candidate["match"], candidate["rule"], candidate["start"], candidate["end"])

@@ -1877,7 +1877,10 @@ def test_all_candidates_vanished_backs_off_instead_of_action_required(
         conn.close()
 
 
-def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolated_auto_upload, monkeypatch):
+@pytest.mark.parametrize("ambiguous_text", [
+    "A" * 1000 + "alice@audit.test", "result = numpy.array@torch.tensor",
+], ids=["oversized-email", "matrix-or-email"])
+def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolated_auto_upload, monkeypatch, ambiguous_text):
     import copy
 
     conn = open_index()
@@ -1891,7 +1894,7 @@ def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolate
         value = copy.deepcopy(original)
         value["session_id"] = session_id
         value["messages"][0]["content"] = (
-            "A" * 1000 + "alice@audit.test" if session_id.startswith("bad")
+            ambiguous_text if session_id.startswith("bad")
             else "Ordinary text <alice@audit.test> preserved."
         )
         return value

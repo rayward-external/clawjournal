@@ -53,6 +53,21 @@ Common encoded separators are checked against their original text offsets.
 Named Telegram assignments and database/SSH host contexts add coverage when
 the usual colon or private domain suffix is absent.
 
+Partial emails such as `abc@` only hide the local part at that occurrence;
+the ordinary word `abc` elsewhere is retained. Secret assignments retain the
+variable name, separator and quotes while hiding the value, including copies
+of that value in other fields. Existing review decisions still use the original
+finding hash.
+
+Bounded Python syntax checks can distinguish a method call such as
+`obj.local()` from a hostname. Only the method's name is protected; strings,
+comments and arguments still scan. An email-shaped matrix expression is
+protected only with preceding NumPy/PyTorch imports. A bare assignment such as
+`result = numpy.array@torch.tensor` is ambiguous and stops sharing instead of
+being deleted or silently treated as safe. This is a narrow syntax check, not
+a general code classifier; other languages and incomplete snippets can still
+produce false positives. External secret-scan gates remain mandatory.
+
 These rules cannot infer every boundary: an unlabelled token fragment, an
 ordinary-looking private hostname, or code that has the same spelling as an
 email can remain ambiguous. A short word attached to an address may be

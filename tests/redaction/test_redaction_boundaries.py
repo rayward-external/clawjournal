@@ -1,8 +1,7 @@
 """Check retained text as well as removed text in the built-in apply path.
 
 Compatibility with the old regexes does not establish correct redaction.
-The strict xfails below record observed, pre-existing coverage/output defects;
-they are not fixes and must not be counted as passing security checks.
+Check both preservation and fail-closed handling of ambiguous input.
 External detectors are isolated here, so these are not upload-gate tests.
 """
 import hashlib
@@ -13,7 +12,7 @@ import sys
 
 import pytest
 
-from clawjournal.findings import apply_findings_to_text
+from clawjournal.findings import apply_findings_to_text, apply_findings_to_session
 from clawjournal.redaction import pii, secrets
 
 
@@ -24,7 +23,7 @@ KEY = "-----BEGIN PRIVATE KEY-----\nSYNTHETIC_BODY\n-----END PRIVATE KEY-----"
 
 
 @pytest.fixture
-def render_builtin(monkeypatch):
+def builtin_conn(monkeypatch):
     # Test the production replacement function, including its merged maps
     # and repeated passes. No external scanners, live validation or uploads.
     monkeypatch.setattr(
@@ -38,16 +37,21 @@ def render_builtin(monkeypatch):
     for module in (pii, secrets):
         monkeypatch.setattr(module, "hash_entity", lambda text: hashlib.sha256(text.encode()).hexdigest())
     conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE findings (session_id TEXT, entity_hash TEXT, status TEXT)")
+    yield conn
+    conn.close()
 
+
+@pytest.fixture
+def render_builtin(builtin_conn):
     def render(text):
         blob, _ = secrets.apply_findings_to_blob(
-            {"messages": [{"content": text}]}, conn, "synthetic-boundary-audit",
+            {"messages": [{"content": text}]}, builtin_conn, "synthetic-boundary-audit",
         )
         return blob["messages"][0]["content"]
 
-    yield render
-    conn.close()
+    return render
 
 
 @pytest.mark.parametrize("before,after", [
@@ -149,19 +153,24 @@ def test_markerless_private_key_keeps_previous_behavior(render_builtin):
 
 
 @pytest.mark.parametrize("text", [
-    "result = numpy.array@torch.tensor", "value = obj.local()",
+    "import numpy\nimport torch\nresult = numpy.array@torch.tensor", "value = obj.local()",
 ])
-@pytest.mark.xfail(strict=True, reason="Existing email/hostname heuristics also match ordinary code")
 def test_ordinary_code_is_not_redacted(render_builtin, text):
     assert render_builtin(text) == text
 
 
-@pytest.mark.xfail(strict=True, reason="Existing entity-wide replacement also deletes an ordinary repeated word")
+def test_bare_matrix_expression_is_ambiguous_and_remains_local(render_builtin):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+    # The original xfail used this bare snippet. It is ALSO valid email
+    # text, so preserving it silently would trade a false positive for a leak.
+    with pytest.raises(RedactionBoundaryError, match="email_or_code"):
+        render_builtin("result = numpy.array@torch.tensor")
+
+
 def test_truncated_email_does_not_delete_other_ordinary_text(render_builtin):
     assert render_builtin("abc@  abc abcdef") == "[REDACTED_EMAIL]@  abc abcdef"
 
 
-@pytest.mark.xfail(strict=True, reason="Existing assignment regex removes part of the variable name")
 def test_named_telegram_fragment_preserves_its_field_label(render_builtin):
     assert render_builtin("TELEGRAM_BOT_TOKEN=" + TOKEN_BODY) == "TELEGRAM_BOT_TOKEN=[REDACTED_ENV_SECRET]"
 
@@ -344,5 +353,256 @@ for text in ["A" * 200_000 + "alice@audit.test", "12345678:" + "A" * 200_000, "a
         pass
     else:
         raise AssertionError("An ambiguous candidate was allowed")
+'''
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=10, capture_output=True, text=True)
+
+
+# Occurrence-aware regressions: syntax evidence (Semgrep/detect-secrets),
+# source-span replacement (Presidio), and value-only captures (Gitleaks).
+@pytest.mark.parametrize("text", [
+    "value = obj.local()", "value = obj.internal()", "obj.corp()",
+    "value = obj.local().internal()", "值 = obj.local()",
+    'value = obj.local("ordinary argument")',
+    "```python\nvalue = obj.local()\n```",
+    "import numpy as np\nimport torch as th\nresult = np.array@th.tensor",
+    "```python\nimport numpy\nimport torch\nresult = numpy.array@torch.tensor\n```",
+])
+def test_code_occurrences_survive_builtins_and_review(render_builtin, text):
+    assert render_builtin(text) == text
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    assert apply_findings_to_text(text, findings)[0] == text
+    assert not [f for f in pii.scan_text_for_pii(text) if f["type"] in {"email", "private_url"}]
+    assert not [f for f in secrets.scan_text(text) if f["type"] == "email"]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ('value = obj.local("obj.local")', 'value = obj.local("[REDACTED_URL]")'),
+    ('值 = obj.local("db01.local")', '值 = obj.local("[REDACTED_URL]")'),
+    ('value = obj.local("alice@audit.test")', 'value = obj.local("[REDACTED_EMAIL]")'),
+    ('obj.local()  # db01.local', 'obj.local()  # [REDACTED_URL]'),
+    ('obj.local()  # alice@audit.test', 'obj.local()  # [REDACTED_EMAIL]'),
+    ('value = obj["db01.local"].local()', 'value = obj["[REDACTED_URL]"].local()'),
+    ('value = factory("db01.local").local()', 'value = factory("[REDACTED_URL]").local()'),
+    ('value = f"{obj.local()} db01.local"', 'value = f"{obj.local()} [REDACTED_URL]"'),
+    ('contact = "alice.smith@audit.test"', 'contact = "[REDACTED_EMAIL]"'),
+    ('contact = alice@audit.test', 'contact = [REDACTED_EMAIL]'),
+    ('DB_HOST=db01.local()', 'DB_HOST=[REDACTED_URL]()'),
+    ('host = db01.local()', 'host = [REDACTED_URL]()'),
+    ('before<one.two@sub.audit.test>after', 'before<[REDACTED_EMAIL]>after'),
+])
+def test_code_context_never_exempts_secrets_in_strings_comments_or_arguments(render_builtin, text, expected):
+    assert render_builtin(text) == expected
+
+
+def test_same_email_in_code_and_literal_is_replaced_only_in_literal(render_builtin):
+    text = 'import numpy\nimport torch\nresult = numpy.array@torch.tensor\ncontact = "numpy.array@torch.tensor"'
+    expected = text.replace('"numpy.array@torch.tensor"', '"[REDACTED_EMAIL]"')
+    assert render_builtin(text) == expected
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    assert apply_findings_to_text(text, findings)[0] == expected
+
+
+def test_fenced_code_inside_a_string_is_still_sensitive_text(render_builtin):
+    text = 'payload = """\n```python\nimport numpy\nimport torch\nresult = numpy.array@torch.tensor\nobj.local()\n```\n"""'
+    expected = text.replace("numpy.array@torch.tensor", "[REDACTED_EMAIL]").replace("obj.local", "[REDACTED_URL]")
+    assert render_builtin(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "result = numpy.array@torch.tensor",
+    "contact = alice.smith@example.com",
+    "import numpy\nresult = numpy.array@torch.tensor",
+    "result = numpy.array@torch.tensor\nimport numpy\nimport torch",
+])
+def test_ambiguous_matrix_or_email_stops_before_mutation_or_external_scan(monkeypatch, text):
+    import copy
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("External scanning must not start before boundary preflight")
+
+    monkeypatch.setattr("clawjournal.redaction.betterleaks.betterleaks_secret_map_from_blob", forbidden)
+    blob = {"display_title": "safe title", "messages": [{"content": text}]}
+    original = copy.deepcopy(blob)
+    with pytest.raises(RedactionBoundaryError, match="email_or_code"):
+        secrets.apply_findings_to_blob(blob, None, "synthetic")
+    assert blob == original
+
+
+def test_multiline_matrix_comments_still_scan(render_builtin):
+    text = "import numpy\nimport torch\nresult = (numpy.array@\n# alice@audit.test\ntorch.tensor)"
+    output = render_builtin(text)
+    assert "alice@audit.test" not in output
+    assert "# [REDACTED_EMAIL]" in output
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("abc@  abc abcdef", "[REDACTED_EMAIL]@  abc abcdef"),
+    ("前🙂abc@\nabc", "前🙂[REDACTED_EMAIL]@\nabc"),
+    ("abc@\tABC@\nabc ABC", "[REDACTED_EMAIL]@\t[REDACTED_EMAIL]@\nabc ABC"),
+    ("abc@ abcdef@ abcdef abc", "[REDACTED_EMAIL]@ [REDACTED_EMAIL]@ abcdef abc"),
+    ("abc@ abc@audit.test abc", "[REDACTED_EMAIL]@ [REDACTED_EMAIL] abc"),
+])
+def test_partial_email_replacements_keep_original_occurrence_boundaries(render_builtin, text, expected):
+    assert render_builtin(text) == expected
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    assert apply_findings_to_text(text, findings)[0] == expected
+    assert render_builtin(expected) == expected
+
+
+def test_partial_email_does_not_spread_to_other_fields(builtin_conn):
+    import json
+    blob = {
+        "display_title": "abc", "ai_learning_summary": "abc",
+        "ai_scoring_detail": json.dumps({"reasoning": "abc", "summary": "abc@ abc"}),
+        "messages": [{"content": "abc@ abc", "thinking": "abc", "author": "abc",
+                      "tool_uses": [{"input": {"text": "abc@ abc"}, "output": ["abc"]}],
+                      "extra": {"text": "abc@ abc"}}],
+    }
+    output, count = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
+    assert count == 4
+    assert output["display_title"] == output["ai_learning_summary"] == "abc"
+    assert json.loads(output["ai_scoring_detail"]) == {"reasoning": "abc", "summary": "[REDACTED_EMAIL]@ abc"}
+    assert output["messages"][0] == {
+        "content": "[REDACTED_EMAIL]@ abc", "thinking": "abc", "author": "abc",
+        "tool_uses": [{"input": {"text": "[REDACTED_EMAIL]@ abc"}, "output": ["abc"]}],
+        "extra": {"text": "[REDACTED_EMAIL]@ abc"},
+    }
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("abc@ abc", "abc@ abc"),
+    ("abc@ ABC@ abc ABC", "abc@ [REDACTED_EMAIL]@ abc ABC"),
+])
+def test_ignored_partial_email_uses_existing_entity_hash(builtin_conn, render_builtin, text, expected):
+    builtin_conn.execute("INSERT INTO findings VALUES (?, ?, ?)",
+                         ("synthetic-boundary-audit", pii.hash_entity("abc"), "ignored"))
+    assert render_builtin(text) == expected
+
+
+@pytest.mark.parametrize("prefix,quote", [
+    ("TELEGRAM_BOT_TOKEN=", ""), ("TELEGRAM_BOT_TOKEN = ", '"'),
+    ("export TELEGRAM_BOT_TOKEN=", "'"), ("APP_PASSWORD=", '"'),
+    ("MY_SECRET=", ""), ("secret_key: ", '"'),
+])
+@pytest.mark.parametrize("value", [TOKEN_BODY, TOKEN_BODY * 2])
+def test_assignment_redactors_keep_label_separator_and_quotes(render_builtin, prefix, quote, value):
+    text = prefix + quote + value + quote
+    expected_prefix = prefix + quote
+    for result in (
+        render_builtin(text), secrets.redact_text(text)[0],
+        secrets.redact_session({"messages": [{"content": text}]})[0]["messages"][0]["content"],
+    ):
+        assert result.startswith(expected_prefix)
+        assert not quote or result.endswith(quote)
+        assert value not in result
+        assert "[REDACTED" in result
+
+
+def test_captured_secret_still_redacts_unlabelled_copies_in_other_fields(builtin_conn):
+    blob = {"display_title": TOKEN_BODY, "ai_learning_summary": TOKEN_BODY,
+            "messages": [{"content": 'MY_SECRET="' + TOKEN_BODY + '"',
+                          "tool_uses": [{"input": {"token": TOKEN_BODY}}]}]}
+    output, _ = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
+    assert output["display_title"] == output["ai_learning_summary"] == "[REDACTED_ENV_SECRET]"
+    assert output["messages"][0]["content"] == 'MY_SECRET="[REDACTED_ENV_SECRET]"'
+    assert output["messages"][0]["tool_uses"][0]["input"]["token"] == "[REDACTED_ENV_SECRET]"
+
+
+def test_assignment_ignore_keeps_legacy_full_match_hash(builtin_conn, render_builtin):
+    text = "MY_SECRET=" + TOKEN_BODY
+    match = next(f for f in secrets.scan_text(text) if f["type"] == "env_secret")
+    assert match["match"] == "SECRET=" + TOKEN_BODY
+    builtin_conn.execute("INSERT INTO findings VALUES (?, ?, ?)",
+                         ("synthetic-boundary-audit", secrets.hash_entity(match["match"]), "ignored"))
+    assert render_builtin(text + " " + TOKEN_BODY) == text + " " + TOKEN_BODY
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028", "\u2029", "\x85", "\v", "\f"])
+def test_unicode_line_separators_do_not_shift_syntax_protection(render_builtin, separator):
+    prefix = '"前' + separator + '后"; ' if separator not in {"\n", "\r\n"} else '# 前' + separator
+    text = prefix + 'value = obj.local("obj.local")'
+    assert render_builtin(text) == prefix + 'value = obj.local("[REDACTED_URL]")'
+
+
+def test_review_merging_keeps_distinct_partial_email_occurrences():
+    text = "abc@audit.test abc@ ABC@ abc ABC"
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    session = {"session_id": "synthetic", "messages": [{"content": text}]}
+    result, _ = apply_findings_to_session(session, findings)
+    assert result["messages"][0]["content"] == "[REDACTED_EMAIL] [REDACTED_EMAIL]@ [REDACTED_EMAIL]@ abc ABC"
+
+
+@pytest.mark.parametrize("target", ["alice [at] audit [dot] test", "alice AT audit DOT test", "alice"])
+def test_ai_email_finding_without_at_keeps_explicit_redaction(target):
+    findings = [{"entity_text": target, "entity_type": "email", "source": "ai", "reason": "Explicit AI finding"}]
+    assert apply_findings_to_text("before<" + target + ">after", findings)[0] == "before<[REDACTED_EMAIL]>after"
+
+
+def test_explicit_ai_finding_takes_precedence_over_code_heuristic():
+    target = "numpy.array@torch.tensor"
+    text = "import numpy\nimport torch\nresult = " + target
+    findings = [{"entity_text": target, "entity_type": "email", "source": "ai", "reason": "Explicit AI finding"}]
+    assert apply_findings_to_text(text, findings)[0] == text.replace(target, "[REDACTED_EMAIL]")
+
+
+def test_review_merging_does_not_drop_a_distinct_shorter_address():
+    text = "bob@audit.test abob@audit.test"
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    session = {"session_id": "synthetic", "messages": [{"content": text}]}
+    result, _ = apply_findings_to_session(session, findings)
+    assert result["messages"][0]["content"] == "[REDACTED_EMAIL] [REDACTED_EMAIL]"
+
+
+def test_whole_private_key_wins_over_fragments_even_in_one_pass(builtin_conn):
+    key = "-----BEGIN PRIVATE KEY-----\nabc@ \nSYNTHETIC\n-----END PRIVATE KEY-----"
+    result, _ = secrets.apply_findings_to_blob(
+        {"messages": [{"content": key + " abc@ abc"}]}, builtin_conn,
+        "synthetic-boundary-audit", max_passes=1,
+    )
+    assert result["messages"][0]["content"] == "[REDACTED_PRIVATE_KEY] [REDACTED_EMAIL]@ abc"
+
+
+def test_captured_value_equal_to_variable_name_keeps_label(render_builtin):
+    text = "PASSWORD=PASSWORD PASSWORD"
+    expected = "PASSWORD=[REDACTED_ENV_SECRET] [REDACTED_ENV_SECRET]"
+    assert render_builtin(text) == expected
+    assert secrets.redact_session({"messages": [{"content": text}]})[0]["messages"][0]["content"] == expected
+
+
+def test_entropy_finding_elsewhere_cannot_remove_assignment_quotes(render_builtin):
+    value = TOKEN_BODY * 2
+    text = 'PASSWORD="' + value + '"\n"' + value + '"'
+    output = render_builtin(text)
+    assert output == 'PASSWORD="[REDACTED_ENV_SECRET]"\n"[REDACTED_ENV_SECRET]"'
+
+
+def test_seeded_occurrence_cases_preserve_complete_ordinary_text(render_builtin):
+    for seed in (225, 224, 911):
+        rng = random.Random(seed)
+        for _ in range(50):
+            word = "word" + str(rng.randrange(10_000))
+            method = rng.choice(["local", "internal", "corp", "lan", "intranet", "localnet"])
+            text = f'value = obj.{method}("{word}@ {word} {word}@audit.test obj.{method}")'
+            expected = f'value = obj.{method}("[REDACTED_EMAIL]@ {word} [REDACTED_EMAIL] [REDACTED_URL]")'
+            assert render_builtin(text) == expected
+
+
+def test_repeated_code_and_assignment_contexts_have_a_deadline():
+    code = r'''
+from clawjournal.redaction.secrets import redact_session
+from clawjournal.redaction.pii import scan_text_for_pii
+from clawjournal.redaction.replacements import replace_email_fragments
+source = 'value = obj.local("db01.local")\n' * 1_000
+matches = scan_text_for_pii(source)
+assert len(matches) == 1_000
+assert all(source[m["start"] - 1] == '"' for m in matches)
+source = "PASSWORD=PASSWORD\n" * 3_000
+result = redact_session({"messages": [{"content": source}]})[0]["messages"][0]["content"]
+assert result == "PASSWORD=[REDACTED_ENV_SECRET]\n" * 3_000
+source = "abc@ abc " * 100_000
+result, count = replace_email_fragments(source, {"abc": "[REDACTED_EMAIL]"})
+assert count == 100_000
+assert result == "[REDACTED_EMAIL]@ abc " * 100_000
 '''
     subprocess.run([sys.executable, "-c", code], check=True, timeout=10, capture_output=True, text=True)
