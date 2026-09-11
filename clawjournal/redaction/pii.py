@@ -622,34 +622,84 @@ _TRUNCATED_EMAIL_PATTERN = re.compile(r"([A-Za-z0-9_.+-]{3,})@(?=\s|$)")
 _EMAIL_LOCAL_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.+-"
 )
+_TELEGRAM_PATTERN = re.compile(r"(\d{8,}:[A-Za-z0-9_-]{30,})")
+_INTERNAL_HOST_PATTERN = re.compile(
+    r"\b([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*"
+    r"\.(?:local|internal|corp|lan|intranet|localnet))\b", re.IGNORECASE,
+)
+_INTERNAL_HOST_SUFFIX = re.compile(
+    r"\.(?:local|internal|corp|lan|intranet|localnet)\b", re.IGNORECASE,
+)
+_INTERNAL_HOST_CHAIN = re.compile(
+    r"[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*", re.IGNORECASE,
+)
 
 
-def _content_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
-    """Keep the email rules, but attempt them only at actual @ candidates.
+def _separator_matches(
+    pattern: re.Pattern[str], text: str, separator: str,
+    left_char_matches: Callable[[str], bool], minimum_left: int,
+) -> Iterable[re.Match[str]]:
+    """Try each separator once; never reuse a preceding match's characters.
 
-    Unanchored local-part repetition retries every suffix of a long run when
-    no email follows it. Locating @ first avoids that quadratic search. Runs
-    to the left of different @ signs are disjoint, and a domain stops at @,
-    so candidate discovery and validation scan only a bounded amount per
-    character. Do not cap, truncate, or change the accepted email syntax.
+    Left-hand runs at different separators are disjoint. A shorter suffix of
+    a failed run cannot change validation on the right of that separator.
     """
-    if pattern.pattern not in {_EMAIL_PATTERN.pattern, _TRUNCATED_EMAIL_PATTERN.pattern}:
-        yield from pattern.finditer(text)
-        return
     search_from = 0
     match_end = 0
-    while (at := text.find("@", search_from)) != -1:
+    while (at := text.find(separator, search_from)) != -1:
         start = at
-        while start > match_end and text[start - 1] in _EMAIL_LOCAL_CHARS:
+        while start > match_end and left_char_matches(text[start - 1]):
             start -= 1
-        if at - start >= 3:
+        if at - start >= minimum_left:
             match = pattern.match(text, start)
             if match is not None:
                 yield match
-                # Preserve finditer's non-overlapping matches, including
-                # adjacent addresses such as aaa@bbb.ccc@ddd.example.
                 match_end = match.end()
         search_from = max(at + 1, match_end)
+
+
+def _internal_host_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    """Validate only label chains that contain an accepted suffix.
+
+    Each chain is disjoint and already has valid label syntax. If its first
+    label fails the Unicode word boundary, the next eligible start either
+    reaches the known suffix or has no labels left. The original rule keeps
+    its greedy last-suffix choice, Unicode case handling and exact spans.
+    """
+    suffixes = iter(_INTERNAL_HOST_SUFFIX.finditer(text))
+    suffix = next(suffixes, None)
+    if suffix is None:
+        return
+    for chain in _INTERNAL_HOST_CHAIN.finditer(text):
+        if suffix is None:
+            return
+        while suffix is not None and suffix.start() < chain.start():
+            suffix = next(suffixes, None)
+        last_end = None
+        while suffix is not None and suffix.start() < chain.end():
+            if suffix.end() <= chain.end():
+                last_end = suffix.end()
+            suffix = next(suffixes, None)
+        if last_end is not None:
+            # The suffix boundary was checked against the full original text;
+            # limiting endpos here must not manufacture a boundary at `_`/CJK.
+            match = pattern.search(text, chain.start(), last_end)
+            if match is not None:
+                yield match
+
+
+def _content_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    """Preserve the rules while avoiding repeated scans of long prefixes."""
+    if pattern in (_EMAIL_PATTERN, _TRUNCATED_EMAIL_PATTERN):
+        yield from _separator_matches(pattern, text, "@", _EMAIL_LOCAL_CHARS.__contains__, 3)
+    elif pattern == _TELEGRAM_PATTERN:
+        # Python's Unicode \d matches decimal digits, not all isdigit() chars
+        # (for example, superscript ² must still end a digit run).
+        yield from _separator_matches(pattern, text, ":", str.isdecimal, 8)
+    elif pattern == _INTERNAL_HOST_PATTERN:
+        yield from _internal_host_matches(pattern, text)
+    else:
+        yield from pattern.finditer(text)
 
 
 def _content_findings_for_text(session_id: str, message_index: int, field: str, text: str) -> list[PIIFinding]:
@@ -664,7 +714,7 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
         # Partial email / identifier with @ (e.g., "jane.doe@" in tabular output)
         (_TRUNCATED_EMAIL_PATTERN.pattern, "email", "Email-like identifier (truncated)", 0.75, 1),
         # Telegram bot tokens: numeric_id:alphanumeric_token
-        (r"(\d{8,}:[A-Za-z0-9_-]{30,})", "custom_sensitive", "Likely Telegram bot token", 0.95, 1),
+        (_TELEGRAM_PATTERN.pattern, "custom_sensitive", "Likely Telegram bot token", 0.95, 1),
         # Hostnames with personal identifiers (e.g., kais-macbook-pro, alice-desktop)
         (r"\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b", "device_id", "Likely personal hostname", 0.80, 1),
         # Absolute home-directory paths (leaks username and directory structure)
@@ -699,6 +749,19 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
                 "replacement": replacement_for_type(entity_type),
                 "source": "rule",
             }))
+    from .candidate_formats import iter_format_candidates
+
+    existing = {(f["entity_type"], f["entity_text"]) for f in findings}
+    for match in iter_format_candidates(text):
+        if _pii_should_skip(match["match"], match["type"], "plain"):
+            continue
+        if (match["type"], match["match"]) in existing:
+            continue
+        findings.append(normalize_finding({
+            "session_id": session_id, "message_index": message_index, "field": field,
+            "entity_text": match["match"], "entity_type": match["type"],
+            "confidence": match["confidence"], "reason": match["rule"], "source": "rule",
+        }))
     return findings
 
 
@@ -798,7 +861,7 @@ _PII_CONTENT_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float, i
     ("github_raw_url_username", re.compile(r"raw\.githubusercontent\.com/([A-Za-z0-9_.-]{2,})"), "username", 0.85, 1, "github"),
     ("email", _EMAIL_PATTERN, "email", 0.90, 1, "plain"),
     ("email_truncated", _TRUNCATED_EMAIL_PATTERN, "email", 0.75, 1, "plain"),
-    ("telegram_bot_token", re.compile(r"(\d{8,}:[A-Za-z0-9_-]{30,})"), "custom_sensitive", 0.95, 1, "plain"),
+    ("telegram_bot_token", _TELEGRAM_PATTERN, "custom_sensitive", 0.95, 1, "plain"),
     ("personal_hostname", re.compile(r"\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b"), "device_id", 0.80, 1, "plain"),
     ("home_dir_path", re.compile(r"(/(?:Users|home)/[A-Za-z0-9._-]{2,}/[^\s\"'`,;)}\]]{3,})"), "path", 0.85, 1, "plain"),
     ("private_ip_10", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
@@ -827,7 +890,7 @@ _PII_CONTENT_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float, i
     # Hostnames ending in common private TLDs: `.local`, `.internal`,
     # `.corp`, `.lan`, `.intranet`, `.localnet`. Covers intranet hosts
     # that escape the private-IP rules.
-    ("internal_tld_host", re.compile(r"\b([a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\.(?:local|internal|corp|lan|intranet|localnet))\b", re.IGNORECASE), "private_url", 0.80, 1, "plain"),
+    ("internal_tld_host", _INTERNAL_HOST_PATTERN, "private_url", 0.80, 1, "plain"),
 
     # URLs pointing at RFC1918 addresses (full URL, preserves path /
     # query so the user sees the whole private endpoint redacted).
@@ -969,6 +1032,16 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
                 "confidence": confidence,
             })
 
+    from .candidate_formats import iter_format_candidates
+
+    existing = {(m["type"], m["start"], m["end"]) for m in matches}
+    for match in iter_format_candidates(text):
+        if (match["type"], match["start"], match["end"]) in existing:
+            continue
+        if not _pii_should_skip(match["match"], match["type"], "plain") and not _pii_user_allowlist_skip(
+            match["match"], match["type"], user_allowlist
+        ):
+            matches.append(match)
     return matches
 
 
@@ -1032,6 +1105,9 @@ def pii_secret_map_from_text_decisions(
     out: dict[str, str] = {}
     for match in _dedupe_overlapping_pii(scan_text_for_pii(text, user_allowlist=user_allowlist)):
         matched = match["match"]
+        from .boundaries import ensure_safe_replacement
+
+        ensure_safe_replacement(matched, match["rule"])
         if decisions.get(hash_entity(matched)) == "ignored":
             continue
         out.setdefault(matched, replacement_for_type(match["type"]))

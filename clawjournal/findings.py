@@ -953,6 +953,11 @@ def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> l
 def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, int]:
     if not text or not findings:
         return text, 0
+    from .redaction.boundaries import ensure_safe_replacement, ensure_text_boundaries
+
+    ensure_text_boundaries(text)
+    for finding in findings:
+        ensure_safe_replacement(str(finding.get("entity_text") or ""), str(finding.get("entity_type") or ""))
     ordered = sorted(
         [f for f in findings if f.get("entity_text")],
         key=lambda f: (-len(f.get("entity_text", "")), -float(f.get("confidence", 0.0))),
@@ -965,7 +970,12 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
         if len(target) < 3:
             continue
         escaped = re.escape(target)
-        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+        # Email/token values already have a detected span. Unicode word
+        # boundaries would skip them next to ordinary Chinese prose.
+        if finding.get("entity_type") == "email" or str(finding.get("reason", "")).startswith("telegram") or finding.get("reason") == "Likely Telegram bot token":
+            pattern = re.compile(escaped, re.IGNORECASE)
+        else:
+            pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
         result, n = pattern.subn(replacement, result)
         count += n
     return result, count

@@ -3191,9 +3191,6 @@ def finalize_share_export_for_upload(
     sessions_file = export_dir / "sessions.jsonl"
     manifest_file = export_dir / "manifest.json"
 
-    if not sessions_file.exists():
-        return {"error": "Export failed — no sessions file.", "status": 500}, manifest
-
     if manifest.get("blocked"):
         return {
             "error": manifest.get("block_message") or "Share blocked by the secret scan",
@@ -3203,6 +3200,9 @@ def finalize_share_export_for_upload(
             "secret_scan_summary": manifest.get("redaction_summary", {}).get("secret_scan"),
             "status": 422,
         }, manifest
+
+    if not sessions_file.exists():
+        return {"error": "Export failed — no sessions file.", "status": 500}, manifest
 
     _emit_packaging_stage(progress, "pii_review")
     pii_started = time.perf_counter()

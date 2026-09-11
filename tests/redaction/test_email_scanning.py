@@ -49,6 +49,14 @@ def test_email_corner_cases_keep_matches_and_redaction_offsets(text, full, trunc
             (match.group(0), match.span(0), match.group(1), match.span(1)) for match in old
         ]
     expected_emails = set(full + truncated)
+    # The old adapters stay equivalent. Additional format coverage now also
+    # detects short local parts and preserves the prefix before an apostrophe.
+    if text == "@example.com ab@example.com":
+        expected_emails.add("ab@example.com")
+    if text == "o'connor@example.com":
+        expected_emails.add("o'connor@example.com")
+    if text == "中文éAlice+tag@sub.example.COM，":
+        expected_emails.add("中文éAlice+tag@sub.example.COM")
     indexed = [match for match in scan_text_for_pii(text) if match["type"] == "email"]
     assert {match["match"] for match in indexed} == expected_emails
     assert all(text[match["start"]:match["end"]] == match["match"] for match in indexed)

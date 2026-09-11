@@ -48,6 +48,13 @@ def _normalize_findings_scanner_profile(
         ) from exc
 
 
+_PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
+_PRIVATE_KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
+_PRIVATE_KEY_PATTERN = re.compile(
+    _PRIVATE_KEY_BEGIN.pattern + r"[\s\S]*?" + _PRIVATE_KEY_END.pattern
+)
+
+
 # Ordered from most specific to least specific
 SECRET_PATTERNS = [
     # JWT tokens — full 3-segment form
@@ -121,11 +128,7 @@ SECRET_PATTERNS = [
     )),
 
     # Private keys
-    ("private_key", re.compile(
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-        r"[\s\S]*?"
-        r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-    )),
+    ("private_key", _PRIVATE_KEY_PATTERN),
 
     # CLI flags that pass tokens/secrets: --token VALUE, --access-token VALUE, etc.
     ("cli_token_flag", re.compile(
@@ -447,6 +450,43 @@ def _ip_looks_like_version(text: str, match: "re.Match[str]") -> bool:
     return False
 
 
+def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    if pattern.pattern == r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b" and pattern.flags == re.UNICODE:
+        chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-")
+        cursor = consumed = 0
+        boundary = re.compile(r"\b")
+        while (at := text.find("@", cursor)) != -1:
+            start = at
+            while start > consumed and text[start - 1] in chars:
+                start -= 1
+            # Unlike PII's email rule this expression starts at a word
+            # boundary, which can occur inside the maximal local-part run.
+            while start < at and boundary.match(text, start) is None:
+                start += 1
+            match = pattern.match(text, start) if at - start >= 2 else None
+            if match is not None:
+                yield match
+                consumed = match.end()
+            cursor = max(at + 1, consumed)
+        return
+    if pattern != _PRIVATE_KEY_PATTERN:
+        yield from pattern.finditer(text)
+        return
+    cursor = 0
+    while begin := _PRIVATE_KEY_BEGIN.search(text, cursor):
+        end = _PRIVATE_KEY_END.search(text, begin.end())
+        if end is None:
+            # No later BEGIN can succeed either. Do not retry the whole tail.
+            return
+        # Preserve the old rule: earliest BEGIN through the first eligible END.
+        # Nested BEGINs do not reset the start; header/footer types need not
+        # agree. Tightening either condition would lose previously redacted text.
+        match = pattern.match(text, begin.start(), end.end())
+        if match is not None:
+            yield match
+        cursor = end.end()
+
+
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
     if not text or len(text) < _MIN_SCAN_LENGTH:
         return []
@@ -460,7 +500,7 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
         if not has_assignment_sep and name in _ASSIGNMENT_PATTERNS:
             continue
 
-        for match in pattern.finditer(text):
+        for match in _secret_matches(pattern, text):
             matched_text = match.group(0)
 
             if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
@@ -503,6 +543,9 @@ def redact_text(
     if not text:
         return text, 0, []
 
+    from .boundaries import ensure_text_boundaries
+
+    ensure_text_boundaries(text)
     findings = scan_text(text, user_allowlist=user_allowlist)
     if not findings:
         return text, 0, []
@@ -749,7 +792,10 @@ def _build_redaction_set(
     secret_map: dict[str, str] = {}
     all_log: list[dict] = []
 
+    from .boundaries import ensure_text_boundaries
+
     for text, field, msg_idx, _tool_field in texts:
+        ensure_text_boundaries(text)
         findings = scan_text(text, user_allowlist=user_allowlist)
         for f in findings:
             matched = f["match"]
@@ -1144,6 +1190,14 @@ def apply_findings_to_blob(
     when only secrets are present and every decision is open/accepted.
     """
     scanner_profile = _normalize_findings_scanner_profile(scanner_profile)
+
+    from .boundaries import ensure_text_boundaries
+
+    # Check all exportable string values before any mutation or external scan.
+    for text, *_location in _collect_all_text(blob):
+        ensure_text_boundaries(text)
+    for text in _iter_ai_text_strings(blob):
+        ensure_text_boundaries(text)
 
     # Decisions are engine-agnostic at the apply step — same hash, same
     # answer. The pipeline guarantees that hashes are unique per

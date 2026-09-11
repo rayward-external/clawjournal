@@ -36,6 +36,29 @@ At those boundaries, ClawJournal redacts several classes of sensitive data:
 
 You can also add custom strings and extra usernames to redact through `clawjournal config`.
 
+An email, Telegram token, or internal hostname can touch ordinary text without
+a space. The scanner uses delimiters and format clues to find candidates, then
+checks their replacement length. It does not discard an oversized candidate as
+safe. If the boundary is unclear, sharing stops for that trace before replacing
+the text. The original content stays local. Add a separator or an explicit
+custom redaction, then preview again. During automatic candidate selection,
+such traces are deferred so other eligible traces can fill the five slots;
+if all candidates are deferred, the runner backs off and retries.
+
+The email checks use a 64-byte local-part and 254-byte mailbox budget. Hostnames
+use 63 bytes per label and 253 bytes overall. These are conservative UTF-8
+replacement budgets, not complete address validators. The Telegram budget is
+128 characters; it is not a claim about the maximum possible token length.
+Common encoded separators are checked against their original text offsets.
+Named Telegram assignments and database/SSH host contexts add coverage when
+the usual colon or private domain suffix is absent.
+
+These rules cannot infer every boundary: an unlabelled token fragment, an
+ordinary-looking private hostname, or code that has the same spelling as an
+email can remain ambiguous. A short word attached to an address may be
+redacted with it. Private-key detection keeps its previous coverage; this
+change does not add support for arbitrary keys without BEGIN/END markers.
+
 ## AI-assisted PII review
 
 Automatic secret redaction is useful, but it is not perfect. For higher confidence, run:

@@ -2578,6 +2578,9 @@ def _redact_blocked_domains_in_value(
             matches: list[str] = []
 
             def _replace(match: re.Match[str]) -> str:
+                from ..redaction.boundaries import ensure_safe_replacement
+
+                ensure_safe_replacement(match.group(0), "internal_host_context")
                 matches.append(match.group(0))
                 return "[REDACTED_DOMAIN]"
 
@@ -8615,6 +8618,8 @@ def export_share_to_disk(
     if preflight_blockers:
         return block_revision_conflicts(preflight_blockers)
 
+    from ..redaction.boundaries import RedactionBoundaryError
+
     try:
         with open(tmp_sessions_file, "w") as f:
             for selected, detail, revision_hash, replaces_revision_hash in prepared:
@@ -8655,6 +8660,13 @@ def export_share_to_disk(
                     ),
                 })
         os.replace(tmp_sessions_file, sessions_file)
+    except RedactionBoundaryError as exc:
+        tmp_sessions_file.unlink(missing_ok=True)
+        manifest["blocked"] = True
+        manifest["block_reason"] = "redaction_boundary"
+        manifest["block_message"] = str(exc)
+        manifest["blocked_sessions"] = [{"session_id": selected["session_id"], "reason": "redaction_boundary"}]
+        return export_dir, manifest
     except BaseException:
         tmp_sessions_file.unlink(missing_ok=True)
         raise

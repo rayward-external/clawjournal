@@ -3153,11 +3153,13 @@ def _ranked_size_prefix(
     *,
     settings: Mapping[str, Any],
     maximum_bundle_size: int,
+    boundary_blocked: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Choose the largest conservative ranked prefix before any AI call.
+    """Choose up to five ranked, safely redacted candidates before any AI call.
 
     Returns ``(selected, deferred_by_size, missing)`` — ``missing`` counts
-    candidates whose session row vanished before the size ``break``.
+    candidates whose session row vanished before the size ``break``. Boundary
+    deferrals are returned through ``boundary_blocked`` and do not use a slot.
     """
 
     # ZIP can fail to compress. Apply the exact deterministic share redaction
@@ -3169,7 +3171,12 @@ def _ranked_size_prefix(
     used = fixed_overhead
     selected: list[dict[str, Any]] = []
     missing = 0
-    for candidate in candidates:
+    deferred_by_size = 0
+    from .redaction.boundaries import RedactionBoundaryError
+
+    for position, candidate in enumerate(candidates):
+        if len(selected) >= MAX_SESSIONS:
+            break
         detail = get_session_detail(conn, str(candidate.get("session_id") or ""))
         if detail is None:
             # The session row vanished between the candidate report and this
@@ -3178,23 +3185,30 @@ def _ranked_size_prefix(
             # ship, and let the caller tell "vanished" apart from "oversized".
             missing += 1
             continue
-        redacted, _count, _log = apply_share_redactions(
-            conn,
-            detail,
-            custom_strings=list(settings.get("custom_strings") or []),
-            user_allowlist=list(settings.get("allowlist_entries") or []),
-            extra_usernames=list(settings.get("extra_usernames") or []),
-            blocked_domains=list(settings.get("blocked_domains") or []),
-        )
+        try:
+            redacted, _count, _log = apply_share_redactions(
+                conn,
+                detail,
+                custom_strings=list(settings.get("custom_strings") or []),
+                user_allowlist=list(settings.get("allowlist_entries") or []),
+                extra_usernames=list(settings.get("extra_usernames") or []),
+                blocked_domains=list(settings.get("blocked_domains") or []),
+            )
+        except RedactionBoundaryError:
+            # Defer this trace before AI/egress. Other ranked candidates can
+            # proceed; an unclear boundary must not disable recurring sharing.
+            if boundary_blocked is not None:
+                boundary_blocked.append(str(candidate.get("session_id") or ""))
+            continue
         serialized_size = len(
             json.dumps(redacted, default=str, separators=(",", ":")).encode("utf-8")
         )
         projected = used + serialized_size + per_trace_overhead
         if projected > maximum_bundle_size:
+            deferred_by_size = len(candidates) - position
             break
         selected.append(dict(candidate))
         used = projected
-    deferred_by_size = max(0, len(candidates) - len(selected) - missing)
     return selected, deferred_by_size, missing
 
 
@@ -4807,15 +4821,32 @@ def _run_cycle_impl(
                     return {"ok": True, "code": "nothing_new", "count": 0}
                 settings = get_effective_share_settings(conn, config)
                 settings["source_filter"] = list(enrollment["enrolled_sources"])
+                boundary_blocked: list[str] = []
                 selected, deferred_by_size, missing_candidates = _ranked_size_prefix(
                     conn,
-                    report["selected"],
+                    report["eligible"],
                     settings=settings,
                     maximum_bundle_size=int(capabilities["maximum_bundle_size"]),
+                    boundary_blocked=boundary_blocked,
+                )
+                report["exclusion_counts"]["redaction_boundary"] = len(boundary_blocked)
+                report["deferred_by_cap"] = max(
+                    0, len(report["eligible"]) - len(selected) - len(boundary_blocked)
+                    - missing_candidates - deferred_by_size,
                 )
                 report["deferred_by_size"] = deferred_by_size
                 report["exclusion_counts"]["deferred_by_size"] = deferred_by_size
                 if not selected:
+                    if boundary_blocked and not deferred_by_size:
+                        _record_cycle_result(
+                            conn, generation=generation, code="redaction_boundary",
+                            count=0, retryable=True,
+                        )
+                        return {
+                            "ok": False, "code": "redaction_boundary", "count": 0,
+                            "message": "Selected traces remain local because a sensitive value has an unclear boundary.",
+                            "retryable": True, "deferred_by_redaction": len(boundary_blocked),
+                        }
                     if deferred_by_size:
                         # Candidates existed but none fit the hosted size budget
                         # — a genuine oversize condition worth surfacing to the
@@ -5107,6 +5138,7 @@ def _run_cycle_impl(
                     "client_submission_id": client_submission_id,
                     "artifact_sha256": artifact_hash,
                     "deferred_by_size": deferred_by_size,
+                    "deferred_by_redaction": len(boundary_blocked),
                 }
             except ControlChanged as exc:
                 # A control change voids this cycle. Most causes (pause,

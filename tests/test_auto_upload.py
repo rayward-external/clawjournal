@@ -1877,6 +1877,108 @@ def test_all_candidates_vanished_backs_off_instead_of_action_required(
         conn.close()
 
 
+def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolated_auto_upload, monkeypatch):
+    import copy
+
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    original = auto.get_session_detail(conn, "session-one")
+    candidates = [{"session_id": f"bad-{i}"} for i in range(5)] + [
+        {"session_id": f"good-{i}"} for i in range(7)
+    ]
+
+    def detail(_conn, session_id):
+        value = copy.deepcopy(original)
+        value["session_id"] = session_id
+        value["messages"][0]["content"] = (
+            "A" * 1000 + "alice@audit.test" if session_id.startswith("bad")
+            else "Ordinary text <alice@audit.test> preserved."
+        )
+        return value
+
+    monkeypatch.setattr(auto, "get_session_detail", detail)
+    blocked = []
+    selected, by_size, missing = auto._ranked_size_prefix(
+        conn, candidates, settings={}, maximum_bundle_size=5_000_000,
+        boundary_blocked=blocked,
+    )
+    assert blocked == [f"bad-{i}" for i in range(5)]
+    assert [item["session_id"] for item in selected] == [f"good-{i}" for i in range(5)]
+    assert by_size == missing == 0
+    conn.close()
+
+
+def test_all_ambiguous_candidates_back_off_before_ai_or_upload(isolated_auto_upload, monkeypatch):
+    import copy
+
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    original = auto.get_session_detail(conn, "session-one")
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    def detail(*_args, **_kwargs):
+        value = copy.deepcopy(original)
+        value["messages"][0]["content"] = "A" * 1000 + "alice@audit.test"
+        return value
+
+    monkeypatch.setattr(auto, "get_session_detail", detail)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Ambiguous content must not reach AI packaging or submission")
+
+    monkeypatch.setattr(auto, "package", forbidden)
+    monkeypatch.setattr(auto, "submit_artifact", forbidden)
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "redaction_boundary"
+    assert result["retryable"] is True
+    assert result["deferred_by_redaction"] == 1
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "enabled"
+        assert enrollment["health"] == "retrying"
+        assert enrollment["next_retry_at"] is not None
+        assert conn.execute("SELECT COUNT(*) FROM shares").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_cycle_can_select_healthy_trace_after_five_boundary_deferrals(isolated_auto_upload, monkeypatch):
+    config = _save_scope_config()
+    conn = open_index()
+    for session_id in [f"bad-{i}" for i in range(5)] + ["healthy"]:
+        session, _raw = _session(isolated_auto_upload["root"], session_id)
+        if session_id.startswith("bad"):
+            session["messages"][1]["content"] = "A" * 1000 + "alice@audit.test"
+        assert upsert_sessions(conn, [session]) == 1
+        conn.execute("UPDATE sessions SET revision_stable_since = ? WHERE session_id = ?",
+                     ("2026-07-12T09:00:00+00:00", session_id))
+        conn.commit()
+        set_hold_state(conn, session_id, "released", changed_by="test", reason="fixture")
+    enrollment = _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    report = auto._candidate_report(conn, enrollment)
+    assert [row["session_id"] for row in report["selected"]] == [f"bad-{i}" for i in range(5)]
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+    packaged = []
+
+    def stop_before_external_work(_conn, session_ids, _settings, **_kwargs):
+        packaged.extend(session_ids)
+        raise auto.ControlChanged("Test stops after checking the chosen packaging input")
+
+    monkeypatch.setattr(auto, "package", stop_before_external_work)
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "control_changed"
+    assert packaged == ["healthy"]
+
+
 @pytest.mark.parametrize("review_status", ["new", "blocked"])
 def test_revoked_fresh_approval_stops_before_ai_and_submit(
     isolated_auto_upload,

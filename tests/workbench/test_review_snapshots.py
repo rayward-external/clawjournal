@@ -41,6 +41,43 @@ def create(conn, snapshot):
     )
 
 
+def test_ambiguous_boundary_blocks_manual_share_without_changing_reviewed_data(conn):
+    from clawjournal.workbench.daemon import finalize_share_export_for_upload
+
+    content = "Intro <" + "A" * 1000 + "alice@audit.test> ordinary tail"
+    original = trace(content)
+    index.upsert_sessions(conn, [original])
+    snapshot = preview(conn)
+    share_id = create(conn, snapshot)
+    output, manifest = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id))
+    assert manifest["blocked"] is True
+    assert manifest["block_reason"] == "redaction_boundary"
+    assert not (output / "sessions.jsonl").exists()
+    assert not list(output.glob("*.tmp"))
+    assert index.get_session_detail(conn, "test-trace")["messages"][0]["content"] == content
+    assert load_review_snapshot(conn, snapshot, "test-trace")["messages"][0]["content"] == content
+    assert index.get_share(conn, share_id)["status"] == "draft"
+    error, _ = finalize_share_export_for_upload(output, manifest, conn=conn)
+    assert error["status"] == 422
+    assert error["block_reason"] == "redaction_boundary"
+    assert content not in str(error)
+
+
+def test_configured_domain_boundary_keeps_long_candidate_local(conn):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    detail = trace("a" * 1000 + ".example.test")
+    with pytest.raises(RedactionBoundaryError):
+        index.apply_share_redactions(conn, detail, blocked_domains=["*.example.test"])
+
+
+def test_explicit_custom_redaction_can_resolve_an_ambiguous_boundary(conn):
+    value = "A" * 1000 + "alice@audit.test"
+    detail = trace("before<" + value + ">after")
+    redacted, _count, _log = index.apply_share_redactions(conn, detail, custom_strings=[value])
+    assert redacted["messages"][0]["content"] == "before<[REDACTED_CUSTOM]>after"
+
+
 def test_preview_survives_restart_and_append_before_and_after_packaging(conn):
     original = trace()
     index.upsert_sessions(conn, [original])
