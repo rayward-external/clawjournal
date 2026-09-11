@@ -1,4 +1,5 @@
 """Email coverage and long-input regression for issue #224."""
+import itertools
 import random
 import re
 import subprocess
@@ -18,6 +19,54 @@ EMAIL_RULES = (
     r"([A-Za-z0-9_.+-]{3,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})",
     r"([A-Za-z0-9_.+-]{3,})@(?=\s|$)",
 )
+
+
+@pytest.mark.parametrize(("text", "full", "truncated"), [
+    ("@example.com ab@example.com", [], []),
+    ("<+.-@example.com>", ["+.-@example.com"], []),
+    ("中文éAlice+tag@sub.example.COM，", ["Alice+tag@sub.example.COM"], []),
+    ("o'connor@example.com", ["connor@example.com"], []),
+    ("abc@\r\n", [], ["abc"]),
+    ("abc@\u00a0def@\u2003", [], ["abc", "def"]),
+    ("@@abc@", [], ["abc"]),
+    ("bad@invalid def@example.com", ["def@example.com"], []),
+    ("abc@host.123 def@example.com", ["def@example.com"], []),
+    ("abc@foo.bar+baz@example.com", ["abc@foo.bar", "+baz@example.com"], []),
+    ("aaa@bbb.ccc_xyz@ddd.example", ["aaa@bbb.ccc", "_xyz@ddd.example"], []),
+    # A second candidate cannot reuse characters consumed by a prior match.
+    ("aaa@bbb.ccc@ddd.example", ["aaa@bbb.ccc"], []),
+    # Separate full/truncated rules retain their independent overlap behavior.
+    ("aaa@bbb.ccc@ ", ["aaa@bbb.ccc"], ["bbb.ccc"]),
+    ("abc@x.ab1def@next.example", ["abc@x.ab", "1def@next.example"], []),
+])
+def test_email_corner_cases_keep_matches_and_redaction_offsets(text, full, truncated):
+    for rule, expected in zip(EMAIL_RULES, [full, truncated]):
+        pattern = re.compile(rule)
+        old = list(pattern.finditer(text))
+        new = list(_content_matches(pattern, text))
+        assert [match.group(1) for match in old] == expected
+        assert [(match.group(0), match.span(0), match.group(1), match.span(1)) for match in new] == [
+            (match.group(0), match.span(0), match.group(1), match.span(1)) for match in old
+        ]
+    expected_emails = set(full + truncated)
+    indexed = [match for match in scan_text_for_pii(text) if match["type"] == "email"]
+    assert {match["match"] for match in indexed} == expected_emails
+    assert all(text[match["start"]:match["end"]] == match["match"] for match in indexed)
+    reviewed = _content_findings_for_text("synthetic", 0, "content", text)
+    assert {match["entity_text"] for match in reviewed if match["entity_type"] == "email"} == expected_emails
+
+
+def test_exhaustive_short_email_strings_match_previous_rules():
+    # Exhaust all 349,525 strings of length 0..9 over a small alphabet. This
+    # includes minimum-size full addresses, truncated ones and failed prefixes.
+    patterns = [re.compile(rule) for rule in EMAIL_RULES]
+    for size in range(10):
+        for chars in itertools.product("a.@ ", repeat=size):
+            text = "".join(chars)
+            for pattern in patterns:
+                old = [(match.group(0), match.span(0), match.span(1)) for match in pattern.finditer(text)]
+                new = [(match.group(0), match.span(0), match.span(1)) for match in _content_matches(pattern, text)]
+                assert new == old, repr(text)
 
 
 @pytest.mark.parametrize("rule", EMAIL_RULES)
