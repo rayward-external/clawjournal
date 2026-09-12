@@ -41,7 +41,7 @@ def share(conn, text):
     ('这是普通正文' * 1000, '这是普通结尾' * 1000),
     ('이메일주소는', '입니다'),
     ('กรุณาติดต่อ', 'ขอบคุณ'),
-])
+], ids=['chinese', 'chinese-long', 'japanese', 'japanese-mail', 'long-prose', 'korean', 'thai'])
 @pytest.mark.parametrize('address', ['alice@example.com', 'a@example.com', 'alice%40example.com', r'alice\u0040example.com'])
 def test_prose_script_transitions_preserve_both_sides(conn, before, after, address):
     text = before + address + after
