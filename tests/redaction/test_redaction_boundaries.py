@@ -677,10 +677,14 @@ def test_encoded_partial_email_uses_scoped_replacement(render_builtin, separator
     'DB_HOST=config%2Edatabase_host',
     'telegramBotToken=settings%2Etelegram_token',
 ])
-def test_unparsed_reference_candidates_defer_instead_of_redacting_a_prefix(render_builtin, text):
-    from clawjournal.redaction.boundaries import RedactionBoundaryError
-    with pytest.raises(RedactionBoundaryError, match="_or_code"):
-        render_builtin(text)
+def test_reference_prefixes_do_not_abort_or_get_redacted(render_builtin, text):
+    # Decoding data must not invent a code exemption for a complete secret
+    # assignment already detected by the legacy env rule.
+    expected = ("telegramBotToken=[REDACTED_ENV_SECRET]"
+                if text == "telegramBotToken=settings%2Etelegram_token" else text)
+    assert render_builtin(text) == expected
+    tail = " <alice@audit.test>"
+    assert render_builtin(text + tail) == expected + " <[REDACTED_EMAIL]>"
 
 
 def test_long_parsed_reference_keeps_the_same_protection_as_short_source(render_builtin):

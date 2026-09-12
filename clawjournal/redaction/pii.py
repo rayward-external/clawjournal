@@ -773,7 +773,7 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
     from .candidate_formats import iter_format_candidates
 
     existing = {(f["entity_type"], f["entity_text"]) for f in findings}
-    for match in iter_format_candidates(text):
+    for match in iter_format_candidates(text, context=context):
         if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
             continue
         if _pii_should_skip(match["match"], match["type"], "plain"):
@@ -1062,7 +1062,7 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
     from .candidate_formats import iter_format_candidates
 
     existing = {(m["type"], m["start"], m["end"]) for m in matches}
-    for match in iter_format_candidates(text):
+    for match in iter_format_candidates(text, context=context):
         if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
             continue
         if (match["type"], match["start"], match["end"]) in existing:

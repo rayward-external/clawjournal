@@ -72,22 +72,28 @@ must finish before upload starts; chunking does not speed up network transfer.
 Code evidence is collected from the original field and its offsets move with
 known replacements. It is not reparsed for each email or hostname, and edits
 cannot create new code exemptions. Host-boundary evidence is rechecked when
-other replacements can expose a new hostname. Code protection is no longer
-disabled at 65,536 characters. Apparent code fences inside string data do
-not grant code exemptions after a parse error. If lexical analysis stops
-before it can establish those boundaries, the trace remains local.
-Parsing retains explicit size and complexity
-budgets; exceeding one stops that trace before sharing instead of silently
-turning off protection. Literals, comments and credential evidence retain the
-same rules as short fields.
+other replacements can expose a new hostname. Hints are reused within each
+PII scan. Code analysis is optional and has size and complexity limits. A
+parse error, NUL byte or exhausted hint budget cancels the affected code
+exemptions; it never aborts secret detection, badge computation or indexing.
+The detector still scans the original text. NUL bytes are not removed or
+shifted in the source. Quoted data cannot authorize embedded Markdown fences.
+Prose outside a fence is not tokenized as Python, so ordinary apostrophes do
+not change behavior across Python versions. Parser warnings do not print
+source text. Plain word lists are rejected before costly parser recovery.
 
-Local indexing and display do not apply the sharing preflight. An unclear
-replacement or unavailable code proof preserves the local text instead of
-aborting its project. This is not a clean scan result: export paths repeat
-the strict preflight. Local findings that cannot establish safe boundaries
-put only the affected trace into pending review; the rest of the project
-remains indexable. Plain word lists are rejected as Python syntax before
-the parser's error recovery can overflow its stack.
+Local indexing and display do not apply the sharing preflight. They redact
+recognized secrets even when code evidence is unavailable. Email candidates
+up to 512 characters retain the original local replacement behavior. For
+larger uninterrupted candidates, the local view masks up to 64 characters
+before @ and 253 after it, retains distant surrounding text, and records a
+boundary-limited replacement. This display treatment is not a clean export
+verdict: sharing checks the original input with the strict boundary policy.
+Pure detection returns its findings without applying replacement limits, so
+findings can be saved and unchanged sessions need not be scanned every tick.
+A blocked review request returns a structured error instead of closing the
+connection; an explicit custom redaction can resolve the candidate before
+retrying the preview.
 
 Automatic sharing persists content-boundary deferrals in that review queue,
 so later status reports exclude them and normal traces can proceed. A
@@ -117,15 +123,17 @@ precedence over automatic email/hostname code exemptions in other fields.
 Bounded Python syntax checks can distinguish a method call such as
 `obj.local()` from a hostname. Only the method's name is protected; strings,
 comments and arguments still scan. An email-shaped matrix expression is
-protected only with preceding NumPy/PyTorch imports. A bare assignment such as
+protected only with preceding NumPy/PyTorch imports, standard aliases and
+recognized array member names. Arbitrary imported aliases do not exempt addresses. A bare assignment such as
 `result = numpy.array@torch.tensor` is ambiguous and stops sharing instead of
 being deleted or silently treated as safe. This is a narrow syntax check, not
 a general code classifier; other languages and incomplete snippets can still
 produce false positives. External secret-scan gates remain mandatory.
 Configuration lookups such as `DB_HOST=config["db_host"]` and named Telegram
 property references retain their code identifiers; quoted values and call
-arguments still scan. When the narrow syntax check cannot resolve a detected
-reference-like value, sharing stops before replacing just its prefix.
+arguments still scan. A candidate ending inside a lookup or call is not
+treated as a complete host/token value. Independent credential and hostname
+rules still scan the expression and its arguments.
 
 These rules cannot infer every boundary: an unlabelled token fragment, an
 ordinary-looking private hostname, or code that has the same spelling as an

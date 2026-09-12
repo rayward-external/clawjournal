@@ -37,10 +37,11 @@ def test_local_deferral_does_not_drop_a_separate_known_secret():
     key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
     text = "prefix " + "A" * 1000 + "@audit.test> " + key + " ordinary tail"
     result, count, _log = secrets.redact_text(text)
-    assert result == text.replace(key, "[REDACTED_ANTHROPIC_KEY]")
-    assert count == 1
+    assert result == "prefix " + "A" * 936 + "[REDACTED_EMAIL]> [REDACTED_ANTHROPIC_KEY] ordinary tail"
+    assert count == 2
+    assert any(entry.get("boundary_limited") for entry in _log)
     with pytest.raises(RedactionBoundaryError):
-        secrets.redact_text(result, strict=True)
+        secrets.redact_text(text, strict=True)
 
 
 @pytest.mark.parametrize("text", [
@@ -69,16 +70,16 @@ def test_keyword_sequences_are_still_valid_code(source):
     assert code_context._parse(source) is not None
 
 
-def test_local_parse_failure_is_preserved_but_export_fails(monkeypatch):
+def test_parser_failure_does_not_return_raw_local_text(monkeypatch):
     def fail(_source):
         raise MemoryError("synthetic parser overflow")
-    monkeypatch.setattr(code_context.ast, "parse", fail)
+    monkeypatch.setattr(code_context, "_ast_parse", fail)
     text = 'obj.local(); contact = "alice@audit.test"'
-    result, count, log = secrets.redact_text(text)
-    assert (result, count) == (text, 0)
-    assert log == [{"type": "redaction_deferred", "rule": "code_context_budget"}]
-    with pytest.raises(RedactionBoundaryError):
-        secrets.redact_text(text, strict=True)
+    expected = text.replace("alice@audit.test", "[REDACTED_EMAIL]")
+    for strict in (False, True):
+        result, count, log = secrets.redact_text(text, strict=strict)
+        assert (result, count) == (expected, 1)
+        assert log[0]["type"] == "email"
 
 
 def test_unrelated_provider_finding_does_not_block_ordinary_text():
@@ -89,7 +90,7 @@ def test_unrelated_provider_finding_does_not_block_ordinary_text():
         apply_findings_to_text(finding["entity_text"], [finding])
 
 
-def test_strict_scan_indexes_whole_project_and_parks_only_unclear_trace(tmp_path, monkeypatch):
+def test_strict_scan_indexes_whole_project_with_reference_prose(tmp_path, monkeypatch):
     projects = tmp_path / "projects"
     project = projects / "synthetic-project"
     project.mkdir(parents=True)
@@ -102,8 +103,8 @@ def test_strict_scan_indexes_whole_project_and_parks_only_unclear_trace(tmp_path
         {"source": "claude", "dir_name": project.name, "locator": None},
     ])
     for sid, command in [("bad", AMBIGUOUS[1]), ("good", "echo ordinary text")]:
-        # An unparsed code reference raises during PII findings on bad. It
-        # must park that session without marking the whole strict scan failed.
+        # A reference in prose is not a host value and must not interrupt
+        # findings for this session or later sessions in the project.
         content = "Notes:\nDB_HOST=cfg['db_host']" if sid == "bad" else "Ordinary result"
         entries = [
             {"type": "user", "timestamp": 1706000000000,
@@ -122,7 +123,7 @@ def test_strict_scan_indexes_whole_project_and_parks_only_unclear_trace(tmp_path
         rows = conn.execute("SELECT session_id, hold_state FROM sessions").fetchall()
         assert len(rows) == 2
         by_id = {row["session_id"]: row["hold_state"] for row in rows}
-        assert by_id["bad"] == "pending_review"
+        assert by_id["bad"] != "pending_review"
         assert by_id["good"] != "pending_review"
     finally:
         conn.close()
@@ -150,3 +151,12 @@ def test_final_pii_boundary_failure_keeps_session_identity_and_file_bytes(tmp_pa
     assert manifest["blocked"]
     assert path.read_text() == original
     assert text not in json.dumps(error)
+
+
+def test_limited_local_email_span_cannot_evict_an_overlapping_credential():
+    key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+    text = key + "A" * 1000 + "@audit.test"
+    result, count, _ = secrets.redact_text(text)
+    assert key not in result
+    assert result == "[REDACTED_ANTHROPIC_KEY]@audit.test"
+    assert count == 1

@@ -574,39 +574,38 @@ def redact_text(
     """Redact local display text without rejecting a project during ingest.
 
     Export callers must request ``strict=True`` or run the complete share
-    preflight. A local deferral is not evidence that the text is safe to send.
+    preflight. A local display replacement is not a clean export verdict.
     Returns (redacted_text, count, redaction_log).
     """
-    from .boundaries import RedactionBoundaryError
-
-    try:
-        return _redact_text(text, user_allowlist=user_allowlist, strict=strict)
-    except RedactionBoundaryError as exc:
-        if strict:
-            raise
-        return text, 0, [{"type": "redaction_deferred", "rule": exc.rule}]
+    return _redact_text(text, user_allowlist=user_allowlist, strict=strict)
 
 
 def _redact_text(text: str, *, user_allowlist: list[dict] | None, strict: bool):
     if not text:
         return text, 0, []
 
-    from .boundaries import RedactionBoundaryError, ensure_safe_replacement, ensure_text_boundaries
+    from .boundaries import ensure_text_boundaries
 
     if strict:
         ensure_text_boundaries(text)
     findings = scan_text(text, user_allowlist=user_allowlist)
     if not strict:
-        # Do not destroy a long local field merely because a secret rule
-        # includes adjacent prose. Sharing rechecks the preserved source.
-        safe_findings = []
+        # Keep local redaction at least as strong for ordinary candidates as
+        # the original detector. Never discard a finding or return raw input
+        # because optional code hints could not be computed. On exceptionally
+        # long runs mask the address around @, preserving distant prose. The
+        # original source still requires the strict share preflight.
         for finding in findings:
-            try:
-                ensure_safe_replacement(finding["match"], finding["type"])
-            except RedactionBoundaryError:
+            if finding["type"] != "email" or len(finding["match"]) <= 512:
                 continue
-            safe_findings.append(finding)
-        findings = safe_findings
+            at = text.rfind("@", finding["start"], finding["end"])
+            start = max(finding["start"], at - 64)
+            end = min(finding["end"], at + 1 + 253)
+            # Overlap precedence must use the span we really replace. The
+            # retained prefix must not evict an independently detected key.
+            finding.update(start=start, end=end, match=text[start:end],
+                           replacement_start=start, replacement_end=end,
+                           boundary_limited=True)
     if not findings:
         return text, 0, []
 
@@ -625,6 +624,8 @@ def _redact_text(text: str, *, user_allowlist: list[dict] | None, strict: bool):
             "confidence": f["confidence"],
             "original_length": len(f["match"]),
         }
+        if f.get("boundary_limited"):
+            entry["boundary_limited"] = True
         # Capture surrounding context for medium/low confidence findings
         if f["confidence"] < 0.90:
             start, end = f["start"], f["end"]

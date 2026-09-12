@@ -126,15 +126,16 @@ def iter_partial_email_candidates(text: str) -> Iterator[dict]:
                "start": start, "end": end, "confidence": 0.75}
 
 
-def iter_format_candidates(text: str) -> Iterator[dict]:
+def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
     from .code_context import code_context
 
     view, offsets, shifts = _scanning_view(text)
     # Decoding helps detection, but must not turn encoded data into proof
     # that it is source code. Syntax evidence uses the original text/offsets.
-    context = code_context(text)
+    if context is None:
+        context = code_context(text)
 
-    def reference_or_ambiguous(match: re.Match, rule: str) -> bool:
+    def is_reference_prefix(match: re.Match, rule: str) -> bool:
         start, end = match.span(1)
         original_start = start + shifts[bisect.bisect_right(offsets, start) - 1]
         original_end = end + shifts[bisect.bisect_right(offsets, end) - 1]
@@ -151,8 +152,11 @@ def iter_format_candidates(text: str) -> Iterator[dict]:
         # The existing internal-TLD rule supplies separate evidence for
         # db01.local(), and the complete numeric Telegram shape still wins.
         if expression and not _HOST_SUFFIX.search(value) and ":" not in value:
-            from .boundaries import RedactionBoundaryError
-            raise RedactionBoundaryError(rule + "_or_code")
+            # This match ends inside a lookup/call, not at the end of a
+            # host or token value. Other complete credential/host rules still
+            # scan the expression and its arguments. A rejected optional
+            # candidate must not abort detection of the rest of the field.
+            return True
         return False
 
     def candidate(start: int, end: int, rule: str, kind: str) -> dict:
@@ -187,7 +191,7 @@ def iter_format_candidates(text: str) -> Iterator[dict]:
                 cursor = tail.end()
 
     for match in _NAMED_TOKEN.finditer(view):
-        if not reference_or_ambiguous(match, "telegram"):
+        if not is_reference_prefix(match, "telegram"):
             yield candidate(*match.span(1), "telegram_named", "custom_sensitive")
     for match in _PERSONAL_HOST.finditer(view):
         yield candidate(*match.span(1), "personal_hostname", "device_id")
@@ -209,5 +213,5 @@ def iter_format_candidates(text: str) -> Iterator[dict]:
     for pattern in (_HOST_FIELD, _SSH_HOST):
         for match in pattern.finditer(view):
             if (match.group(1).lower() not in {"localhost", "127.0.0.1"}
-                    and not (pattern is _HOST_FIELD and reference_or_ambiguous(match, "host"))):
+                    and not (pattern is _HOST_FIELD and is_reference_prefix(match, "host"))):
                 yield candidate(*match.span(1), "internal_host_context", "private_url")

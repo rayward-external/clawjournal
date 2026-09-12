@@ -5724,6 +5724,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_session_redacted(self, session_id: str) -> None:
         """Return session with secrets redacted — for pre-share review."""
+        from ..redaction.boundaries import RedactionBoundaryError
+
         conn = open_index()
         try:
             try:
@@ -5747,6 +5749,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 blocked_domains=settings["blocked_domains"],
             )
             _json_response(self, detail)
+        except RedactionBoundaryError as exc:
+            _json_response(self, {
+                "error": str(exc), "block_reason": "redaction_boundary",
+                "rule": exc.rule,
+            }, 422, cache_control="no-store")
         finally:
             conn.close()
 
@@ -5756,6 +5763,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         When *ai_pii* is True, also runs agent-based PII detection and
         applies the findings on top of the deterministic share redaction.
         """
+        from ..redaction.boundaries import RedactionBoundaryError
+
         conn = open_index()
         try:
             detail = get_session_detail(conn, session_id)
@@ -5824,6 +5833,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "ai_coverage": ai_coverage,
                 "redacted_session": detail,
             })
+        except RedactionBoundaryError as exc:
+            _json_response(self, {
+                "error": str(exc), "block_reason": "redaction_boundary",
+                "rule": exc.rule,
+            }, 422, cache_control="no-store")
         finally:
             conn.close()
 

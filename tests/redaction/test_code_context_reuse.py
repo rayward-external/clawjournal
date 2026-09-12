@@ -1,12 +1,9 @@
 """Retain original code evidence without reparsing every redaction result."""
-import copy
-import sqlite3
 
 import pytest
 
 from clawjournal import findings
 from clawjournal.redaction import code_context as cc, secrets
-from clawjournal.redaction.boundaries import RedactionBoundaryError, ensure_text_boundaries
 from clawjournal.redaction.replacements import replace_spans
 
 
@@ -133,47 +130,29 @@ def test_long_source_keeps_preceding_imports_and_unicode_offsets():
     assert context.protects(start, start + len('numpy.array@torch.tensor'))
 
 
-def test_parse_budget_defers_instead_of_disabling_protection(monkeypatch):
+def test_parse_budget_disables_hints_but_keeps_scanning(monkeypatch):
     monkeypatch.setattr(cc, "_MAX_PARSE_CHARS", 100)
-    text = "obj.local()\n" + "#" * 101
-    with pytest.raises(RedactionBoundaryError) as raised:
-        ensure_text_boundaries(text)
-    assert raised.value.rule == "code_context_budget"
-    assert "obj.local" not in str(raised.value)
+    text = 'contact = "alice@audit.test"\n' + "#" * 101
+    assert cc.code_context(text).protected == []
+    assert secrets.redact_text(text, strict=True)[0] == text.replace("alice@audit.test", "[REDACTED_EMAIL]")
 
 
 @pytest.mark.parametrize("limit", ["_MAX_PARSE_TOKENS", "_MAX_STATEMENT_TOKENS"])
-def test_complexity_budget_is_explicit(limit, monkeypatch):
+def test_complexity_budget_does_not_abort_detection(limit, monkeypatch):
     monkeypatch.setattr(cc, limit, 5)
-    text = "obj.local()\n" + "#" * 66000 + "\nx = a + b + c + d\n"
-    with pytest.raises(RedactionBoundaryError) as raised:
-        cc.code_context(text)
-    assert raised.value.rule == "code_context_budget"
+    text = 'contact = "alice@audit.test"\n' + "#" * 66000 + "\nx = a + b + c + d\n"
+    assert cc.code_context(text).protected == []
+    assert any(f["match"] == "alice@audit.test" for f in secrets.scan_text(text))
 
 
-@pytest.mark.parametrize("error", [MemoryError, RecursionError])
-def test_parser_resource_failure_never_returns_empty_protection(error, monkeypatch):
+@pytest.mark.parametrize("error", [MemoryError, RecursionError, SystemError])
+def test_parser_resource_failure_keeps_secret_scanning(error, monkeypatch):
     def fail(*args):
         raise error("SYNTHETIC_PRIVATE_SOURCE")
-    monkeypatch.setattr(cc.ast, "parse", fail)
-    with pytest.raises(RedactionBoundaryError) as raised:
-        cc.code_context("obj.local()")
-    assert raised.value.rule == "code_context_budget"
-    assert "SYNTHETIC_PRIVATE_SOURCE" not in str(raised.value)
-
-
-def test_parse_budget_blocks_blob_before_mutation_or_external_scans(monkeypatch):
-    monkeypatch.setattr(cc, "_MAX_PARSE_CHARS", 100)
-    for scanner in ("betterleaks", "trufflehog"):
-        monkeypatch.setattr(f"clawjournal.redaction.{scanner}.{scanner}_secret_map_from_blob",
-                            lambda *a, **kw: pytest.fail("No external scan after failed preflight"))
-    blob = {"messages": [{"content": "obj.local()\n" + "#" * 101}]}
-    original = copy.deepcopy(blob)
-    with sqlite3.connect(":memory:") as conn:
-        with pytest.raises(RedactionBoundaryError) as raised:
-            secrets.apply_findings_to_blob(blob, conn, "synthetic-context-budget")
-    assert raised.value.rule == "code_context_budget"
-    assert blob == original
+    monkeypatch.setattr(cc, "_ast_parse", fail)
+    text = 'obj.local(); contact = "alice@audit.test"'
+    assert cc.code_context(text).protected == []
+    assert secrets.redact_text(text, strict=True)[0] == text.replace("alice@audit.test", "[REDACTED_EMAIL]")
 
 
 @pytest.mark.parametrize("padding", [0, 70000])
@@ -188,29 +167,28 @@ def test_fences_inside_strings_do_not_gain_exemptions_after_a_parse_error(paddin
     assert result == (expected, 2)
 
 
-def test_incomplete_lexical_analysis_cannot_whitelist_a_fence():
-    text = '  x = 1\n y = 2\n```python\nobj.local()\n```'
-    with pytest.raises(RedactionBoundaryError) as raised:
-        cc.code_context(text)
-    assert raised.value.rule == "code_context_syntax"
-
-
-def test_early_token_error_cannot_whitelist_later_fences(monkeypatch):
-    def interrupted_tokens(_readline):
-        raise cc.tokenize.TokenError("unterminated string literal", (1, 4))
-    monkeypatch.setattr(cc.tokenize, "generate_tokens", interrupted_tokens)
-    with pytest.raises(RedactionBoundaryError) as raised:
-        list(cc._fenced_sources('x = "\n```python\nobj.local()\n```'))
-    assert raised.value.rule == "code_context_syntax"
+def test_prose_indentation_cannot_abort_a_fenced_code_scan():
+    text = '  x = 1\n y = 2\n```python\nobj.local()\n```\ncontact alice@audit.test'
+    output, n, _ = secrets.redact_text(text, strict=True)
+    assert output == text.replace("alice@audit.test", "[REDACTED_EMAIL]")
+    assert n == 1
 
 
 def test_malformed_single_quote_before_string_data_never_exempts_its_fence():
     text = 'broken = "\npayload = """\n```python\nobj.local()\n```\n"""\n'
-    try:
-        result = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
-    except RedactionBoundaryError as exc:
-        # Python versions differ in whether tokenization continues after the
-        # first malformed string. Stopping safely must keep the trace local.
-        assert exc.rule == "code_context_syntax"
-    else:
-        assert result == (text.replace("obj.local", "[REDACTED_URL]"), 1)
+    result = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
+    assert result == (text.replace("obj.local", "[REDACTED_URL]"), 1)
+
+
+def test_shortening_a_protected_call_cannot_exempt_a_later_literal():
+    prefix = "A" * 40
+    text = prefix + '.local()\nhost = "db.local"\n'
+    result, n = secrets._apply_redaction_set(text, {prefix: "[REDACTED_SECRET]", "db.local": "[REDACTED_URL]"})
+    assert (result, n) == ('[REDACTED_SECRET].local()\nhost = "[REDACTED_URL]"\n', 2)
+
+
+def test_nested_formatted_string_quotes_cannot_exempt_literal_fences():
+    quote = '"' * 3
+    text = "payload = f" + quote + "{'" + quote + "'}\n```python\nobj.local()\n```\n" + quote + "\nnot python here\n"
+    result = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
+    assert result == (text.replace("obj.local", "[REDACTED_URL]"), 1)

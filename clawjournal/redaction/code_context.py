@@ -11,15 +11,19 @@ import io
 import keyword
 import re
 import tokenize
+import warnings
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from .replacements import contains_span, merge_spans, replace_spans
 
-_FENCE = re.compile(r"^```(?:python|py)\s*\n(.*?)^```", re.M | re.S)
+_QUOTE = re.compile(r"[\"'#]")
+_FENCE = re.compile(r"^```(?:python|py)[ \t]*\r?\n(.*?)^```[ \t]*\r?$", re.M | re.S)
 _HOST_ATTRS = {"local", "internal", "corp", "lan", "intranet", "localnet"}
 _HOST_NAMES = {"host", "hostname", "db_host", "database_host", "redis_host", "pghost", "mysql_host", "internal_host", "internal_hostname"}
 _ARRAY_MODULES = {"numpy", "torch"}
+_ARRAY_MEMBERS = {"array", "ndarray", "tensor", "eye", "ones", "zeros", "empty", "arange", "asarray", "linspace"}
 _TOKEN_NAMES = {"telegram_bot_token", "telegram_api_token", "telegram_token", "telegrambottoken"}
+_ast_parse = ast.parse  # Module-local seam; tests must not patch stdlib ast.
 _MAX_PARSE_CHARS = 8 * 1024 * 1024
 _MAX_PARSE_TOKENS = 100_000
 _MAX_STATEMENT_TOKENS = 2048
@@ -79,11 +83,11 @@ class CodeContext:
 
 
 def _parse(source: str) -> ast.Module | None:
-    from .boundaries import RedactionBoundaryError
-
     try:
-        if len(source) > _MAX_PARSE_CHARS:
-            raise RedactionBoundaryError("code_context_budget")
+        # Hints are optional. Preserve original offsets and never feed NULs
+        # to CPython's tokenizer (some versions raise SystemError).
+        if "\x00" in source or len(source) > _MAX_PARSE_CHARS:
+            return None
         previous = None
         tokens = statement_tokens = 0
         for item in tokenize.generate_tokens(io.StringIO(source).readline):
@@ -110,61 +114,66 @@ def _parse(source: str) -> ast.Module | None:
             tokens += 1
             statement_tokens += 1
             if tokens > _MAX_PARSE_TOKENS or statement_tokens > _MAX_STATEMENT_TOKENS:
-                raise RedactionBoundaryError("code_context_budget")
-        return ast.parse(source)
-    except RedactionBoundaryError:
-        raise
-    except (RecursionError, MemoryError):
-        raise RedactionBoundaryError("code_context_budget") from None
-    except (SyntaxError, ValueError, tokenize.TokenError):
+                return None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return _ast_parse(source)
+    except (SyntaxError, ValueError, tokenize.TokenError, SystemError,
+            RecursionError, MemoryError):
         return None
 
 
 def _fenced_sources(text: str):
-    """A failed whole-file parse must not turn string data into code.
+    """Find Markdown code outside quoted data without parsing ordinary prose.
 
-    Token locations remain useful when the surrounding Markdown/Python does
-    not parse. In particular, an unterminated triple-quoted string owns the
-    rest of the source, including any apparent Markdown fence inside it.
+    A single quote in prose owns at most its line. Triple quoted strings
+    (including raw/byte/formatted forms) own their complete body, even when
+    unfinished. This is only an exemption guard, never a secret detector.
     """
-    from .boundaries import RedactionBoundaryError
-
+    if "\x00" in text:
+        return
     fences = list(_FENCE.finditer(text))
     if not fences:
         return
-    offsets = [0]
-    for line in text.split("\n"):
-        offsets.append(offsets[-1] + len(line) + 1)
-
-    def position(point):
-        line, column = point
-        return offsets[line - 1] + column
-
     strings = []
-    interpolated = []
-    starts = {getattr(tokenize, name, None) for name in ("FSTRING_START", "TSTRING_START")} - {None}
-    ends = {getattr(tokenize, name, None) for name in ("FSTRING_END", "TSTRING_END")} - {None}
-    try:
-        for item in tokenize.generate_tokens(io.StringIO(text).readline):
-            if item.type == tokenize.STRING:
-                strings.append((position(item.start), position(item.end)))
-            elif item.type in starts:
-                interpolated.append(position(item.start))
-            elif item.type in ends and interpolated:
-                strings.append((interpolated.pop(), position(item.end)))
-    except tokenize.TokenError as exc:
-        if exc.args[0] == "EOF in multi-line string":
-            strings.append((position(exc.args[1]), len(text)))
-        elif exc.args[0] != "EOF in multi-line statement" and not interpolated:
-            # Other errors can stop before later string tokens are emitted.
-            raise RedactionBoundaryError("code_context_syntax") from None
-    except (SyntaxError, ValueError):
-        # An incomplete lexical pass cannot establish where later strings
-        # begin. Preserve the input rather than inventing code exemptions.
-        raise RedactionBoundaryError("code_context_syntax") from None
-    # Python 3.12+ can stop with an unterminated f-string error after emitting
-    # its opening token. The still-open string cannot authorize later fences.
-    strings.extend((start, len(text)) for start in interpolated)
+    cursor = 0
+    while cursor < len(text):
+        opening = _QUOTE.search(text, cursor)
+        if opening is None:
+            break
+        start = opening.start()
+        quote = text[start]
+        if quote == "#":
+            newline = text.find("\n", start)
+            cursor = len(text) if newline < 0 else newline + 1
+            continue
+        triple = text.startswith(quote * 3, start)
+        delimiter = quote * (3 if triple else 1)
+        pos = start + len(delimiter)
+        # An unfinished formatted string can continue through an expression
+        # on newer Python versions. Do not authorize fences in its tail.
+        prefix = re.search(r"(?<![\w])([rRuUbBfFtT]{1,2})$", text[max(0, start - 3):start])
+        formatted = prefix is not None and any(c in prefix.group(1).lower() for c in "ft")
+        if formatted:
+            # Nested f-string expressions have version-specific quote rules.
+            # After a failed whole-source parse, later fences cannot prove
+            # that this formatted string has ended. Keep scanning its data,
+            # but grant no later fence exemptions from that uncertain tail.
+            strings.append((start, len(text)))
+            break
+        while pos < len(text):
+            if text[pos] == "\\":
+                pos += 2
+            elif text.startswith(delimiter, pos):
+                pos += len(delimiter)
+                break
+            elif not triple and text[pos] == "\n":
+                break
+            else:
+                pos += 1
+        strings.append((start, min(pos, len(text))))
+        cursor = max(pos, start + 1)
     strings = merge_spans(strings)
     for match in fences:
         if not contains_span(strings, match.start(), match.start() + 1):
@@ -172,10 +181,23 @@ def _fenced_sources(text: str):
 
 
 def code_context(text: str) -> CodeContext:
+    """Return optional, bounded evidence; failed hints never abort a scan."""
+    try:
+        return _code_context(text)
+    except (SyntaxError, ValueError, tokenize.TokenError, SystemError,
+            RecursionError, MemoryError, IndexError):
+        # No partial exemptions survive a failed analysis. Detection still
+        # examines the original source, including every quoted secret.
+        return CodeContext()
+
+
+def _code_context(text: str) -> CodeContext:
     context = CodeContext()
     # Every supported exemption needs a call, an assignment/dict/keyword, or
     # matrix operators with preceding imports. Bare emails/domain strings
     # cannot establish code evidence and need no Python parser at all.
+    if "\x00" in text or len(text) > _MAX_PARSE_CHARS:
+        return context
     if not ("(" in text or "=" in text or ":" in text or ("@" in text and "import" in text)):
         return context
     # Parse the whole source first: a Markdown fence inside a Python string
@@ -247,7 +269,9 @@ def code_context(text: str) -> CodeContext:
         imported: set[str] = set()
         for statement in tree.body:
             if isinstance(statement, ast.Import):
-                imported.update(a.asname or a.name for a in statement.names if a.name in _ARRAY_MODULES)
+                imported.update(a.asname or a.name for a in statement.names
+                                if a.name in _ARRAY_MODULES
+                                and (a.asname is None or a.asname == {"numpy": "np", "torch": "th"}[a.name]))
             host_assignment = isinstance(statement, (ast.Assign, ast.AnnAssign)) and any(
                 isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id.lower() in _HOST_NAMES
                 for n in ast.walk(statement)
@@ -262,7 +286,8 @@ def code_context(text: str) -> CodeContext:
                     if isinstance(node.left, ast.Attribute) and isinstance(node.right, ast.Attribute):
                         left, right = node.left, node.right
                         if (isinstance(left.value, ast.Name) and left.value.id in imported
-                                and isinstance(right.value, ast.Name) and right.value.id in imported):
+                                and isinstance(right.value, ast.Name) and right.value.id in imported
+                                and left.attr in _ARRAY_MEMBERS and right.attr in _ARRAY_MEMBERS):
                             start, end = span(node)
                             # Do not cover comments, literals or arguments
                             # embedded in a multiline expression.

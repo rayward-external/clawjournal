@@ -39,7 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 3  # Include fork_nickname in every session-level findings
+ENGINE_VERSION = 4  # Rebuild findings for bounded matching and code-context rules.
                     # scanner/apply path. Version 2 caches could not contain
                     # findings from that metadata field, so force one rebuild
                     # even when the transcript content itself is unchanged.

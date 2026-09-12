@@ -8418,3 +8418,31 @@ def test_share_api_packages_the_previewed_revision_after_a_later_update(server, 
         assert not index.share_revision_blockers(conn, share["share_id"])
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize('endpoint', ['redacted', 'redaction-report'])
+def test_boundary_review_returns_actionable_error_and_custom_redaction_can_resolve_it(server, endpoint):
+    value = 'a' * 70 + '@audit.test'
+    with open_index() as conn:
+        upsert_sessions(conn, [{
+            'session_id': 'boundary-review', 'source': 'claude', 'project': 'synthetic',
+            'messages': [{'role': 'user', 'content': 'Review this trace', 'tool_uses': []},
+                         {'role': 'assistant', 'content': 'Contact ' + value, 'tool_uses': []}],
+        }])
+        set_hold_state(conn, 'boundary-review', 'pending_review', changed_by='test', reason='Synthetic boundary')
+    path = f'/api/sessions/boundary-review/{endpoint}'
+    status, body = _get(server, path)
+    assert status == 422
+    assert body['block_reason'] == 'redaction_boundary'
+    assert body['rule'] == 'email'
+    assert value not in json.dumps(body)
+    assert 'review_snapshot_id' not in body
+    # Existing custom redaction is an actual recovery path, not Release and
+    # repeat the same failing scan. No production upload occurs in this test.
+    status, _ = _post(server, '/api/policies', {'policy_type': 'redact_string', 'value': value})
+    assert status == 201
+    status, body = _get(server, path)
+    assert status == 200
+    result = body['redacted_session'] if endpoint == 'redaction-report' else body
+    assert value not in json.dumps(result)
+    assert '[REDACTED' in json.dumps(result)

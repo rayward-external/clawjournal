@@ -13,20 +13,6 @@ class RedactionBoundaryError(ValueError):
 
     def __init__(self, rule: str):
         self.rule = rule
-        if rule == "code_context_budget":
-            super().__init__(
-                "This trace is too large or complex to check its code safely. "
-                "It remains local. Reduce the input or add explicit redactions, "
-                "then retry."
-            )
-            return
-        if rule == "code_context_syntax":
-            super().__init__(
-                "The boundaries between code and string content could not be "
-                "checked safely. This trace remains local. Clarify the code "
-                "block or add explicit redactions, then retry."
-            )
-            return
         # Never include the candidate, its surrounding text or a secret hash.
         super().__init__(
             f"A {rule} candidate has an unclear or unusually long boundary. "
@@ -98,5 +84,5 @@ def ensure_text_boundaries(text: str) -> None:
         if rule in guarded:
             for match in _content_matches(pattern, text):
                 check(match.group(group), rule, match.start(group), match.end(group))
-    for candidate in iter_format_candidates(text):
+    for candidate in iter_format_candidates(text, context=context):
         check(candidate["match"], candidate["rule"], candidate["start"], candidate["end"])
