@@ -1,6 +1,7 @@
 """Boundary, retained-text, worker and global-context contracts for PR #225."""
 import hashlib
 import json
+import random
 import re
 import sqlite3
 import subprocess
@@ -193,3 +194,93 @@ def test_multiline_private_key_spans_many_chunks(small_windows, builtin_conn):
     key = "-----BEGIN RSA PRIVATE KEY-----\n" + "SYNTHETIC_BODY\n" * 80 + "-----END EC PRIVATE KEY-----"
     blob, _ = secrets.apply_findings_to_blob({"messages": [{"content": "before<" + key + ">after"}]}, builtin_conn, "chunk-key")
     assert blob["messages"][0]["content"] == "before<[REDACTED_PRIVATE_KEY]>after"
+
+
+def test_worker_uses_current_install_when_cwd_contains_another_checkout(tmp_path, monkeypatch):
+    # A CLI entry point or embedding caller can import the installed package
+    # before visiting a directory with an older/different checkout.
+    shadow = tmp_path / "clawjournal"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("raise RuntimeError('WRONG_CHECKOUT')")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    text = "<alice@example.com> " + "ordinary words " * 800 + "<bob@example.com>"
+    assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
+
+
+@pytest.mark.parametrize("length", [1023, 1024, 1025, 8191, 8192, 8193])
+def test_marker_free_fields_never_enter_regex_search(length):
+    class ForbiddenPattern:
+        pattern = pii._EMAIL_PATTERN.pattern
+        flags = pii._EMAIL_PATTERN.flags
+
+        def finditer(self, text):
+            pytest.fail("A required marker is absent")
+    assert list(chunked.finditer(ForbiddenPattern(), "A" * length,
+                continuation=lambda *args: pytest.fail("No candidate to continue"),
+                has_anchor=lambda text: "@" in text)) == []
+
+
+@pytest.mark.parametrize("length", [1025, 4096, 8191])
+def test_below_process_threshold_still_bounds_search_windows(length, monkeypatch):
+    monkeypatch.setattr(chunked, "_run_worker", lambda *args: pytest.fail("Keep this scan local"))
+    searches = []
+    class RecordingPattern:
+        def finditer(self, text):
+            searches.append(len(text))
+            return pii._EMAIL_PATTERN.finditer(text)
+        def match(self, text, start):
+            return pii._EMAIL_PATTERN.match(text, start)
+    suffix = " <alice@example.com> "
+    text = "A" * (length - len(suffix)) + suffix
+    assert len(text) == length
+    actual = chunked.finditer(RecordingPattern(), text,
+                             continuation=lambda *args: pytest.fail("No oversized candidate"),
+                             has_anchor=lambda text: "@" in text)
+    assert signature(actual) == signature(pii._EMAIL_PATTERN.finditer(text))
+    assert searches and max(searches) <= chunked.CHUNK_SIZE + 2 * chunked.OVERLAP
+
+
+@pytest.mark.parametrize("length", [511, 512, 513])
+@pytest.mark.parametrize("kind", ["email", "partial", "telegram", "host"])
+def test_production_overlap_limit_and_both_window_edges(length, kind, monkeypatch):
+    monkeypatch.setattr(chunked, "_run_worker", local_worker)
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    suffix = {"email": "@host.test", "partial": "@", "telegram": ":" + "A" * 30, "host": ".internal"}[kind]
+    value = ("1" if kind == "telegram" else "a") * (length - len(suffix)) + suffix
+    for start in [0, 511, 512, 513, 1023, 1024, 1025, 1535, 1536, 1537, 8191]:
+        text = " " * start + value + " ordinary words " * 600
+        for pattern in [pii._EMAIL_PATTERN, pii._TRUNCATED_EMAIL_PATTERN, pii._TELEGRAM_PATTERN,
+                        pii._INTERNAL_HOST_PATTERN, secrets._SECRET_EMAIL_PATTERN]:
+            fn = secrets._secret_matches if pattern == secrets._SECRET_EMAIL_PATTERN else pii._content_matches
+            assert signature(fn(pattern, text)) == signature(pattern.finditer(text)), (kind, length, start)
+
+
+def test_generated_unicode_and_adjacent_candidates_keep_original_spans(small_windows, monkeypatch):
+    monkeypatch.setattr(chunked, "OVERLAP", 24)
+    rng = random.Random(225)
+    alphabet = list("ab19.-_+%@:\n\r\t ") + ["\u00a0", "\u2003", "中", "İ", "ſ", "K", "١", "²", "\x00"]
+    values = ["aaa@bbb.ccc@ddd.example", "aa@host.test", "abc@", "db.local", "host.internal.local",
+              "１２３４５６７８:" + "A" * 30, "éabc@example.com中", "abc@x.ab1def@next.example"]
+    for _ in range(200):
+        text = "".join(rng.choices(alphabet, k=rng.randrange(150)))
+        for _ in range(rng.randrange(1, 4)):
+            at = rng.randrange(len(text) + 1)
+            text = text[:at] + rng.choice(values) + text[at:]
+        for pattern in [pii._EMAIL_PATTERN, pii._TRUNCATED_EMAIL_PATTERN, pii._TELEGRAM_PATTERN,
+                        pii._INTERNAL_HOST_PATTERN, secrets._SECRET_EMAIL_PATTERN]:
+            fn = secrets._secret_matches if pattern == secrets._SECRET_EMAIL_PATTERN else pii._content_matches
+            assert signature(fn(pattern, text)) == signature(pattern.finditer(text))
+
+
+def test_real_worker_handles_unicode_offsets_and_non_utf8_codepoints(monkeypatch):
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    text = "中文😀\ud800" + " ordinary words " * 800 + "<alice@example.com>\r\n"
+    assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
+
+
+def test_more_matches_than_cache_budget_keep_all_results(monkeypatch):
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    text = "<alice@example.com> " * (chunked._CACHE_MAX_OFFSETS + 1)
+    assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
+    assert not chunked._CACHE

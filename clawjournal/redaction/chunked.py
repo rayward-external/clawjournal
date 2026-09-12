@@ -22,6 +22,7 @@ from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 CHUNK_SIZE = 1024
 OVERLAP = 512
@@ -59,7 +60,7 @@ def _run_worker(pattern: str, flags: int, chunks: list[tuple]) -> list[int]:
     try:
         with _WORKER_SLOTS:
             result = subprocess.run(
-                [sys.executable, "-m", "clawjournal.redaction.chunked_worker"],
+                [sys.executable, str(Path(__file__).with_name("chunked_worker.py"))],
                 input=payload, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, encoding="utf-8", timeout=WORKER_TIMEOUT, check=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -125,14 +126,26 @@ def finditer(
     exceeds the overlap, retain complete-text handling. This also preserves
     greedy and successive-match behavior for chains of adjoining candidates.
     """
-    if len(text) < PARALLEL_THRESHOLD:
-        yield from pattern.finditer(text)
+    # Reject impossible fields before the size threshold too. Otherwise a
+    # marker-free run just below that threshold still takes quadratic time.
+    if not has_anchor(text):
         return
     if any(has_anchor(run.group()) for run in re.finditer(r"\S{%d,}" % (OVERLAP + 1), text)):
         yield from continuation(pattern, text)
         return
+    if len(text) <= CHUNK_SIZE:
+        yield from pattern.finditer(text)
+        return
+    if len(text) < PARALLEL_THRESHOLD:
+        from .chunked_worker import match_starts
+
+        # Bound searches below the process threshold as well. Keep small
+        # fields local to avoid worker startup overhead.
+        starts = match_starts(pattern, (window for window in _windows(text) if has_anchor(window[0])))
+    else:
+        starts = _parallel_starts(pattern, text, has_anchor)
     consumed = 0
-    for start in _parallel_starts(pattern, text, has_anchor):
+    for start in starts:
         if start < consumed:
             continue
         # Recheck against original neighbors, never synthetic window edges.

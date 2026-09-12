@@ -61,6 +61,11 @@ can exceed the overlap uses the complete-candidate adapter, so fixed window
 sizes cannot silently truncate it or turn it into a clean result. A failed
 worker stops the scan. Workers run locally and exit after each batch; source
 content is passed through memory pipes, not written to worker files.
+Workers use the current installation's file, so another checkout in the
+working directory cannot select a different scanner. Medium fields use
+bounded windows locally; required-marker checks also apply to short fields.
+Only eligible regex searches run in parallel. Packaging and all scan gates
+must finish before upload starts; chunking does not speed up network transfer.
 
 The window design borrows ideas from TruffleHog and Gitleaks. It does not
 install Gitleaks or replace the existing Betterleaks and TruffleHog gates.
