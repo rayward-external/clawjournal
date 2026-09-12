@@ -78,7 +78,8 @@ parse error, NUL byte or exhausted hint budget cancels the affected code
 exemptions; it never aborts secret detection, badge computation or indexing.
 The detector still scans the original text. NUL bytes are not removed or
 shifted in the source. Quoted data cannot authorize embedded Markdown fences.
-Prose outside a fence is not tokenized as Python, so ordinary apostrophes do
+Fence lines are paired in one pass, including unfinished blocks. Prose
+outside a fence is not tokenized as Python, so ordinary apostrophes do
 not change behavior across Python versions. Parser warnings do not print
 source text. Plain word lists are rejected before costly parser recovery.
 

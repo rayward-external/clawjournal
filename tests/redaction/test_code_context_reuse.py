@@ -192,3 +192,23 @@ def test_nested_formatted_string_quotes_cannot_exempt_literal_fences():
     text = "payload = f" + quote + "{'" + quote + "'}\n```python\nobj.local()\n```\n" + quote + "\nnot python here\n"
     result = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
     assert result == (text.replace("obj.local", "[REDACTED_URL]"), 1)
+
+
+def test_unclosed_fence_run_is_bounded_and_still_redacts_sensitive_tail():
+    import subprocess
+    import sys
+    code = """
+from clawjournal.redaction.secrets import redact_text
+prefix = '```python\\nx = 1\\n' * 20000
+text = prefix + 'Contact alice@audit.test'
+result, count, _ = redact_text(text, strict=True)
+assert result == prefix + 'Contact [REDACTED_EMAIL]'
+assert count == 1
+"""
+    subprocess.run([sys.executable, '-c', code], check=True, timeout=10, capture_output=True)
+
+
+@pytest.mark.parametrize("opening,closing", [("```text", "```"), ("````text", "````"), ("~~~text", "~~~"), ("```", "```")])
+def test_python_fence_inside_other_fenced_data_cannot_grant_exemption(opening, closing):
+    text = opening + '\n```python\nobj.local()\n```\n' + closing + '\n'
+    assert cc.code_context(text).protected == []

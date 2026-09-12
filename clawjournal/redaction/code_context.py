@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from .replacements import contains_span, merge_spans, replace_spans
 
 _QUOTE = re.compile(r"[\"'#]")
-_FENCE = re.compile(r"^```(?:python|py)[ \t]*\r?\n(.*?)^```[ \t]*\r?$", re.M | re.S)
+_FENCE_LINE = re.compile(r"^(?P<ticks>`{3,}|~{3,})(?P<language>[^\r\n]*)\r?$", re.M)
 _HOST_ATTRS = {"local", "internal", "corp", "lan", "intranet", "localnet"}
 _HOST_NAMES = {"host", "hostname", "db_host", "database_host", "redis_host", "pghost", "mysql_host", "internal_host", "internal_hostname"}
 _ARRAY_MODULES = {"numpy", "torch"}
@@ -133,7 +133,19 @@ def _fenced_sources(text: str):
     """
     if "\x00" in text:
         return
-    fences = list(_FENCE.finditer(text))
+    # Pair fence lines once. Searching a lazy .*? body from every opening
+    # becomes quadratic when a long log contains many unclosed fences.
+    fences = []
+    opened = None
+    for marker in _FENCE_LINE.finditer(text):
+        language = marker.group("language").strip()
+        ticks = marker.group("ticks")
+        if opened is None:
+            opened = (language, ticks, marker.start(), marker.end() + 1)
+        elif not language and ticks[0] == opened[1][0] and len(ticks) >= len(opened[1]):
+            if opened[0] in {"python", "py"}:
+                fences.append((opened[2], opened[3], marker.start()))
+            opened = None
     if not fences:
         return
     strings = []
@@ -175,9 +187,9 @@ def _fenced_sources(text: str):
         strings.append((start, min(pos, len(text))))
         cursor = max(pos, start + 1)
     strings = merge_spans(strings)
-    for match in fences:
-        if not contains_span(strings, match.start(), match.start() + 1):
-            yield match.group(1), match.start(1)
+    for opening, start, end in fences:
+        if not contains_span(strings, opening, opening + 1):
+            yield text[start:end], start
 
 
 def code_context(text: str) -> CodeContext:
