@@ -142,13 +142,15 @@ def _fenced_sources(text: str):
     except tokenize.TokenError as exc:
         if exc.args[0] == "EOF in multi-line string":
             strings.append((position(exc.args[1]), len(text)))
-        elif exc.args[0] != "EOF in multi-line statement":
+        elif exc.args[0] != "EOF in multi-line statement" and not interpolated:
             # Other errors can stop before later string tokens are emitted.
             raise RedactionBoundaryError("code_context_syntax") from None
     except (SyntaxError, ValueError):
         # An incomplete lexical pass cannot establish where later strings
         # begin. Preserve the input rather than inventing code exemptions.
         raise RedactionBoundaryError("code_context_syntax") from None
+    # Python 3.12+ can stop with an unterminated f-string error after emitting
+    # its opening token. The still-open string cannot authorize later fences.
     strings.extend((start, len(text)) for start in interpolated)
     strings = merge_spans(strings)
     for match in fences:
