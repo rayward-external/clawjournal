@@ -49,6 +49,22 @@ The email checks use a 64-byte local-part and 254-byte mailbox budget. Hostnames
 use 63 bytes per label and 253 bytes overall. These are conservative UTF-8
 replacement budgets, not complete address validators. The Telegram budget is
 128 characters; it is not a claim about the maximum possible token length.
+Long fields use overlapping, parallel windows for the existing email,
+Telegram-token and internal-domain regex searches. Nearby blank lines can
+adjust a cut, but a cut is never treated as a trusted content boundary.
+Matches are checked against the original text and returned with their
+original offsets; chunks are not independently rewritten and concatenated.
+Code context, finding decisions and known-credential propagation remain
+global to their existing field/session scope. Private keys and other rules
+which need longer context retain complete-text handling. A candidate which
+can exceed the overlap uses the complete-candidate adapter, so fixed window
+sizes cannot silently truncate it or turn it into a clean result. A failed
+worker stops the scan. Workers run locally and exit after each batch; source
+content is passed through memory pipes, not written to worker files.
+
+The window design borrows ideas from TruffleHog and Gitleaks. It does not
+install Gitleaks or replace the existing Betterleaks and TruffleHog gates.
+
 Common encoded separators are checked against their original text offsets.
 Named Telegram assignments and database/SSH host contexts add coverage when
 the usual colon or private domain suffix is absent.

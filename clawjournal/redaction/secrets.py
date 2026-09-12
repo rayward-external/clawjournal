@@ -53,6 +53,7 @@ _PRIVATE_KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-
 _PRIVATE_KEY_PATTERN = re.compile(
     _PRIVATE_KEY_BEGIN.pattern + r"[\s\S]*?" + _PRIVATE_KEY_END.pattern
 )
+_SECRET_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 
 
 # Ordered from most specific to least specific
@@ -198,7 +199,7 @@ SECRET_PATTERNS = [
     )),
 
     # Email addresses (for PII removal) — require at least 2-char local part
-    ("email", re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    ("email", _SECRET_EMAIL_PATTERN),
 
     # Long base64-like strings in quotes (checked for entropy — see scan_text)
     ("high_entropy", re.compile(r"""['"][A-Za-z0-9_/+=.-]{40,}['"]""")),
@@ -454,7 +455,7 @@ def _ip_looks_like_version(text: str, match: "re.Match[str]") -> bool:
     return False
 
 
-def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+def _secret_continuation_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
     if pattern.pattern == r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b" and pattern.flags == re.UNICODE:
         chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-")
         cursor = consumed = 0
@@ -489,6 +490,17 @@ def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[st
         if match is not None:
             yield match
         cursor = end.end()
+
+
+def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    if pattern == _SECRET_EMAIL_PATTERN:
+        from .chunked import finditer
+        yield from finditer(pattern, text, continuation=_secret_continuation_matches,
+                            has_anchor=lambda run: "@" in run)
+    else:
+        # Private keys retain complete-text BEGIN/END handling. A chunk-size
+        # limit must never truncate or change the existing private-key rule.
+        yield from _secret_continuation_matches(pattern, text)
 
 
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
