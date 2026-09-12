@@ -253,6 +253,10 @@ SECRET_PLACEHOLDER: dict[str, str] = {
     "email": "[REDACTED_EMAIL]",
     "high_entropy": "[REDACTED_SECRET]",
 }
+_CREDENTIAL_PLACEHOLDERS = frozenset(
+    placeholder for kind, placeholder in SECRET_PLACEHOLDER.items()
+    if kind not in {"email", "ip_address"}
+)
 
 TOOL_SERVER_ID_PLACEHOLDER = "[REDACTED_TOOL_SERVER_ID]"
 
@@ -505,6 +509,8 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
         for match in _secret_matches(pattern, text):
             matched_text = match.group(0)
             if name == "email" and context.protects(match.start(), match.end()):
+                continue
+            if name in {"env_secret", "generic_secret"} and context.is_reference(match.start(1), match.start(1) + 1):
                 continue
 
             if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
@@ -802,7 +808,9 @@ def _build_redaction_set(
     Returns (secret_map, redaction_log) where secret_map maps each secret
     string to its typed replacement (e.g. ``"sk-ant-xxx" -> "[REDACTED_ANTHROPIC_KEY]"``).
     """
-    secret_map: dict[str, str] = {}
+    from .replacements import ReplacementMap
+
+    secret_map = ReplacementMap()
     all_log: list[dict] = []
 
     from .boundaries import ensure_text_boundaries
@@ -814,9 +822,9 @@ def _build_redaction_set(
             matched = f["match"]
             placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
             if "replacement_start" in f:
-                secret_map.setdefault(text[f["replacement_start"]:f["replacement_end"]], placeholder)
+                secret_map.add(text[f["replacement_start"]:f["replacement_end"]], placeholder)
             else:
-                secret_map.setdefault(matched, placeholder)
+                secret_map.add(matched, placeholder)
 
             # For patterns with capture groups (env_secret, generic_secret,
             # cli_token_flag, aws_secret, url_token), also add the group
@@ -824,7 +832,7 @@ def _build_redaction_set(
                 if _name == f["type"]:
                     m = pattern.search(text[f["start"]:f["end"]])
                     if m and m.lastindex:
-                        secret_map.setdefault(m.group(m.lastindex), placeholder)
+                        secret_map.add(m.group(m.lastindex), placeholder)
                     break
 
             # Build log entry
@@ -879,9 +887,12 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
             count += n
             continue
         if replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
-            if secret not in text:
+            # DNS names are case-insensitive. Do not extend that rule to
+            # complete URLs, whose paths may contain case-sensitive values.
+            host_case = replacement == "[REDACTED_URL]" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", secret)
+            if not host_case and secret not in text:
                 continue
-            text, n = replace_outside_code(text, re.compile(re.escape(secret)), replacement)
+            text, n = replace_outside_code(text, re.compile(re.escape(secret), re.I if host_case else 0), replacement)
             count += n
             continue
         # Short alphanumeric strings need boundaries to avoid matching
@@ -1181,7 +1192,9 @@ def _secret_map_from_text_decisions(
     findings map only their values; the full match still owns the review
     hash. Other capture-group rules keep their existing inner expansion.
     """
-    secret_map: dict[str, str] = {}
+    from .replacements import ReplacementMap
+
+    secret_map = ReplacementMap()
     raw_matches = scan_text(text, user_allowlist=user_allowlist)
     # Same dedupe the scan path uses — keeps entity-level decisions
     # coherent: if a user ignored the longer match, the overlapping
@@ -1194,14 +1207,14 @@ def _secret_map_from_text_decisions(
             continue
         placeholder = SECRET_PLACEHOLDER.get(finding["type"], REDACTED)
         if "replacement_start" in finding:
-            secret_map.setdefault(text[finding["replacement_start"]:finding["replacement_end"]], placeholder)
+            secret_map.add(text[finding["replacement_start"]:finding["replacement_end"]], placeholder)
         else:
-            secret_map.setdefault(matched, placeholder)
+            secret_map.add(matched, placeholder)
         for _name, pattern in SECRET_PATTERNS:
             if _name == finding["type"]:
                 inner = pattern.search(text[finding["start"]:finding["end"]])
                 if inner and inner.lastindex:
-                    secret_map.setdefault(inner.group(inner.lastindex), placeholder)
+                    secret_map.add(inner.group(inner.lastindex), placeholder)
                 break
     return secret_map
 

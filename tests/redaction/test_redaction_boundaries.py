@@ -5,6 +5,7 @@ Check both preservation and fail-closed handling of ambiguous input.
 External detectors are isolated here, so these are not upload-gate tests.
 """
 import hashlib
+import itertools
 import random
 import sqlite3
 import subprocess
@@ -606,3 +607,149 @@ assert count == 100_000
 assert result == "[REDACTED_EMAIL]@ abc " * 100_000
 '''
     subprocess.run([sys.executable, "-c", code], check=True, timeout=10, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("value,code", [
+    ("obj.local", "value = obj.local()"),
+    ("numpy.array@torch.tensor", "import numpy\nimport torch\nvalue = numpy.array@torch.tensor"),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_known_password_overrides_code_exemptions_across_fields(builtin_conn, value, code, reverse):
+    messages = [{"content": 'PASSWORD="' + value + '"'}, {"content": code}]
+    if reverse:
+        messages.reverse()
+    blob = {"messages": messages, "ai_learning_summary": code}
+    output, _ = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
+    assert all(value not in m["content"] for m in output["messages"])
+    assert value not in output["ai_learning_summary"]
+    assert any(m["content"] == 'PASSWORD="[REDACTED_ENV_SECRET]"' for m in output["messages"])
+
+
+@pytest.mark.parametrize("text", [
+    'import os\nDB_HOST=os.getenv("DATABASE_HOST")\nprint(os.name)',
+    'DB_HOST=config["db_host"]\nconfiguration = config.copy()',
+    '{"DB_HOST": config.database_host, "description": "configuration is ready"}',
+    '{"telegramBotToken": settings.telegram_token, "description": "settings is ready"}',
+    'telegram_bot_token = get_token()',
+    'DB_HOST = process.env.DB_HOST',
+])
+def test_contextual_rules_preserve_configuration_expressions(render_builtin, text):
+    assert render_builtin(text) == text
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    assert apply_findings_to_text(text, findings)[0] == text
+
+
+@pytest.mark.parametrize("field,value", [("DB_HOST", "config"), ("telegramBotToken", "settings")])
+def test_quoted_values_are_still_sensitive_even_when_they_look_like_variables(render_builtin, field, value):
+    text = '{"' + field + '": "' + value + '"}'
+    assert value not in render_builtin(text)
+
+
+def test_config_expression_protection_does_not_cover_arguments(render_builtin):
+    text = 'DB_HOST = os.getenv("DATABASE_HOST", "db01.local")'
+    assert render_builtin(text) == 'DB_HOST = os.getenv("DATABASE_HOST", "[REDACTED_URL]")'
+
+
+@pytest.mark.parametrize("ordinary", ["db.locality", "mydb.locality", "mydb.local", "db.local_extra"])
+def test_host_replacement_does_not_delete_unrelated_substrings(builtin_conn, ordinary):
+    # mydb.local is a distinct sensitive hostname and must be removed as a
+    # whole candidate. The other samples are ordinary non-host matches.
+    blob = {"messages": [{"content": "server=db.local"}, {"content": ordinary}]}
+    output, _ = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
+    expected = "[REDACTED_URL]" if ordinary == "mydb.local" else ordinary
+    assert output["messages"][1]["content"] == expected
+
+
+@pytest.mark.parametrize("separator", ["%40", r"\u0040", "&#64;", "&#x40;"])
+def test_encoded_partial_email_uses_scoped_replacement(render_builtin, separator):
+    text = "before<alice" + separator + " \nalice remains ordinary"
+    expected = "before<[REDACTED_EMAIL]" + separator + " \nalice remains ordinary"
+    assert render_builtin(text) == expected
+    findings = pii._content_findings_for_text("synthetic", 0, "content", text)
+    assert apply_findings_to_text(text, findings)[0] == expected
+    assert render_builtin(expected) == expected
+
+
+@pytest.mark.parametrize("text", [
+    'const DB_HOST=process.env.DB_HOST;',
+    'Configuration example:\n{"telegramBotToken": settings.telegram_token}',
+    'DB_HOST=config["db_host"]\n' + '# ordinary\n' * 7_000,
+    'DB_HOST=config%2Edatabase_host',
+    'telegramBotToken=settings%2Etelegram_token',
+])
+def test_unparsed_reference_candidates_defer_instead_of_redacting_a_prefix(render_builtin, text):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+    with pytest.raises(RedactionBoundaryError, match="_or_code"):
+        render_builtin(text)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ('DB_HOST="database_backend"', 'DB_HOST="[REDACTED_URL]"'),
+    ('DB_HOST=database_backend', 'DB_HOST=[REDACTED_URL]'),
+    ('DB_HOST="config.database_host"', 'DB_HOST="[REDACTED_URL]"'),
+    ('https://db.local.example.com/status', 'https://[REDACTED_URL].example.com/status'),
+])
+def test_host_boundaries_never_discard_an_explicitly_detected_value(render_builtin, text, expected):
+    assert render_builtin(text) == expected
+
+
+def test_encoded_partial_email_still_obeys_length_budget(render_builtin):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+    with pytest.raises(RedactionBoundaryError):
+        render_builtin('a' * 65 + '%40 ')
+
+
+def test_ignored_encoded_partial_email_keeps_entity_decision(builtin_conn, render_builtin):
+    builtin_conn.execute('INSERT INTO findings VALUES (?, ?, ?)',
+                         ('synthetic-boundary-audit', pii.hash_entity('alice'), 'ignored'))
+    assert render_builtin('alice%40 alice') == 'alice%40 alice'
+
+
+@pytest.mark.parametrize("order", list(itertools.permutations(range(3))))
+@pytest.mark.parametrize("one_field", [False, True])
+def test_credential_priority_is_independent_of_match_and_field_order(builtin_conn, order, one_field):
+    import copy
+    value = "numpy.array@torch.tensor"
+    pieces = ['contact = "' + value + '"', 'PASSWORD="' + value + '"',
+              'import numpy\nimport torch\nvalue = ' + value]
+    texts = [pieces[n] for n in order]
+    if one_field:
+        texts = ['\n'.join(texts)]
+    blob = {"messages": [{"content": text} for text in texts]}
+    for output in (
+        secrets.redact_session(copy.deepcopy(blob))[0],
+        secrets.apply_findings_to_blob(copy.deepcopy(blob), builtin_conn, "synthetic-boundary-audit")[0],
+    ):
+        assert all(value not in message["content"] for message in output["messages"])
+
+
+def test_known_hostname_copies_ignore_case_but_preserve_longer_words(builtin_conn):
+    blob = {"messages": [{"content": "DB_HOST=database17"},
+                         {"content": "Connect to DATABASE17. Preserve mydatabase17 and DATABASE17_backup."}]}
+    output, _ = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
+    assert output["messages"][1]["content"] == "Connect to [REDACTED_URL]. Preserve mydatabase17 and DATABASE17_backup."
+
+
+@pytest.mark.parametrize("source,value", [
+    ('client --password obj.local', 'obj.local'),
+    ('Authorization: Bearer longvalueforaudit.local', 'longvalueforaudit.local'),
+    ('https://audit.test/?token=longvalueforaudit.local', 'longvalueforaudit.local'),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_other_credential_sources_also_override_code_heuristics(builtin_conn, source, value, reverse):
+    import copy
+    messages = [{"content": source}, {"content": 'value = ' + value + '()'}]
+    if reverse:
+        messages.reverse()
+    for output in (
+        secrets.redact_session({"messages": copy.deepcopy(messages)})[0],
+        secrets.apply_findings_to_blob({"messages": copy.deepcopy(messages)}, builtin_conn, "synthetic-boundary-audit")[0],
+    ):
+        assert all(value not in message["content"] for message in output["messages"])
+
+
+@pytest.mark.parametrize("field", ['PASSWORD', 'MY_SECRET', 'API_KEY', 'AUTH_KEY', 'ACCESS_TOKEN', 'DB_PASSWORD'])
+def test_generic_secret_values_cannot_gain_configuration_reference_exemptions(render_builtin, field):
+    # Parentheses can be literal password characters in configuration data.
+    # A Python parse alone must not exempt arbitrary credential assignments.
+    assert render_builtin(field + '=SecretPass123()') == field + '=[REDACTED_ENV_SECRET]'

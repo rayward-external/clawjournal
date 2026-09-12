@@ -20,7 +20,7 @@ _NAMED_TOKEN = re.compile(
 )
 _HOST_FIELD = re.compile(
     r"(?<![A-Za-z0-9_])(?:DB_HOST|DATABASE_HOST|REDIS_HOST|PGHOST|MYSQL_HOST|INTERNAL_HOST|INTERNAL_HOSTNAME)"
-    r"[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9][A-Za-z0-9.-]*)", re.I,
+    r"[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._-]*)", re.I,
 )
 _SSH_HOST = re.compile(r"(?<![\w-])ssh[ \t]+(?:[A-Za-z0-9_.-]+@)?([A-Za-z0-9][A-Za-z0-9.-]*)")
 _HOST_CHAIN = re.compile(r"[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*", re.I)
@@ -113,8 +113,47 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
             yield start, end_of_match
 
 
-def iter_format_candidates(text: str) -> Iterator[dict]:
+def iter_partial_email_candidates(text: str) -> Iterator[dict]:
+    """Keep legacy partial-address spans, also for escaped separators."""
+    from .pii import _TRUNCATED_EMAIL_PATTERN, _content_matches
+
     view, offsets, shifts = _scanning_view(text)
+    for match in _content_matches(_TRUNCATED_EMAIL_PATTERN, view):
+        start, end = match.span(1)
+        start += shifts[bisect.bisect_right(offsets, start) - 1]
+        end += shifts[bisect.bisect_right(offsets, end) - 1]
+        yield {"type": "email", "rule": "email_truncated", "match": text[start:end],
+               "start": start, "end": end, "confidence": 0.75}
+
+
+def iter_format_candidates(text: str) -> Iterator[dict]:
+    from .code_context import code_context
+
+    view, offsets, shifts = _scanning_view(text)
+    # Decoding helps detection, but must not turn encoded data into proof
+    # that it is source code. Syntax evidence uses the original text/offsets.
+    context = code_context(text)
+
+    def reference_or_ambiguous(match: re.Match, rule: str) -> bool:
+        start, end = match.span(1)
+        original_start = start + shifts[bisect.bisect_right(offsets, start) - 1]
+        original_end = end + shifts[bisect.bisect_right(offsets, end) - 1]
+        if context.is_reference(original_start, original_end):
+            return True
+        if start and view[start - 1] in "\"'":
+            return False  # A quoted value is data, even if it looks like code.
+        value = match.group(1)
+        continuation = view[end:end + 1]
+        expression = continuation in {"(", "["} or (
+            continuation == "." and view[end + 1:end + 2].isidentifier()
+        )
+        expression |= rule == "host" and "." in value and "_" in value.rsplit(".", 1)[-1]
+        # The existing internal-TLD rule supplies separate evidence for
+        # db01.local(), and the complete numeric Telegram shape still wins.
+        if expression and not _HOST_SUFFIX.search(value) and ":" not in value:
+            from .boundaries import RedactionBoundaryError
+            raise RedactionBoundaryError(rule + "_or_code")
+        return False
 
     def candidate(start: int, end: int, rule: str, kind: str) -> dict:
         start += shifts[bisect.bisect_right(offsets, start) - 1]
@@ -124,6 +163,8 @@ def iter_format_candidates(text: str) -> Iterator[dict]:
 
     for start, end in _email_spans(view):
         yield candidate(start, end, "email_extended", "email")
+    if view != text:
+        yield from iter_partial_email_candidates(text)
 
     cursor = 0
     while (colon := view.find(":", cursor)) != -1:
@@ -146,7 +187,8 @@ def iter_format_candidates(text: str) -> Iterator[dict]:
                 cursor = tail.end()
 
     for match in _NAMED_TOKEN.finditer(view):
-        yield candidate(*match.span(1), "telegram_named", "custom_sensitive")
+        if not reference_or_ambiguous(match, "telegram"):
+            yield candidate(*match.span(1), "telegram_named", "custom_sensitive")
     for match in _PERSONAL_HOST.finditer(view):
         yield candidate(*match.span(1), "personal_hostname", "device_id")
     suffixes = iter(_HOST_SUFFIX.finditer(view))
@@ -166,5 +208,6 @@ def iter_format_candidates(text: str) -> Iterator[dict]:
                 yield candidate(chain.start(), end, "internal_tld_host", "private_url")
     for pattern in (_HOST_FIELD, _SSH_HOST):
         for match in pattern.finditer(view):
-            if match.group(1).lower() not in {"localhost", "127.0.0.1"}:
+            if (match.group(1).lower() not in {"localhost", "127.0.0.1"}
+                    and not (pattern is _HOST_FIELD and reference_or_ambiguous(match, "host"))):
                 yield candidate(*match.span(1), "internal_host_context", "private_url")

@@ -54,10 +54,14 @@ Named Telegram assignments and database/SSH host contexts add coverage when
 the usual colon or private domain suffix is absent.
 
 Partial emails such as `abc@` only hide the local part at that occurrence;
-the ordinary word `abc` elsewhere is retained. Secret assignments retain the
+this also applies when `@` uses a supported separator escape. The ordinary
+word `abc` elsewhere is retained. A known hostname does not remove the same
+letters inside an unrelated longer word. Secret assignments retain the
 variable name, separator and quotes while hiding the value, including copies
 of that value in other fields. Existing review decisions still use the original
 finding hash.
+If a value was identified as a password or secret, that evidence takes
+precedence over automatic email/hostname code exemptions in other fields.
 
 Bounded Python syntax checks can distinguish a method call such as
 `obj.local()` from a hostname. Only the method's name is protected; strings,
@@ -67,6 +71,10 @@ protected only with preceding NumPy/PyTorch imports. A bare assignment such as
 being deleted or silently treated as safe. This is a narrow syntax check, not
 a general code classifier; other languages and incomplete snippets can still
 produce false positives. External secret-scan gates remain mandatory.
+Configuration lookups such as `DB_HOST=config["db_host"]` and named Telegram
+property references retain their code identifiers; quoted values and call
+arguments still scan. When the narrow syntax check cannot resolve a detected
+reference-like value, sharing stops before replacing just its prefix.
 
 These rules cannot infer every boundary: an unlabelled token fragment, an
 ordinary-looking private hostname, or code that has the same spelling as an

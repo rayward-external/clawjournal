@@ -45,23 +45,41 @@ class ReplacementMap(dict[str, str]):
     def __bool__(self) -> bool:
         return bool(len(self) or self.email_fragments)
 
+    def add(self, value: str, replacement: str) -> None:
+        """Keep the first finding, except that credential evidence wins."""
+        from .secrets import _CREDENTIAL_PLACEHOLDERS
+
+        if value not in self or (
+            self[value] in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}
+            and replacement in _CREDENTIAL_PLACEHOLDERS
+        ):
+            self[value] = replacement
+
     def update(self, other: dict[str, str]) -> None:
-        super().update(other)
+        from .secrets import _CREDENTIAL_PLACEHOLDERS
+
+        # A password can also look like an email/host. Do not let a later
+        # weak finding erase the evidence that every copy is a credential.
+        for value, replacement in other.items():
+            if (self.get(value) in _CREDENTIAL_PLACEHOLDERS
+                    and replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}):
+                continue
+            self[value] = replacement
         if isinstance(other, ReplacementMap):
             self.email_fragments.update(other.email_fragments)
 
 
 def replace_email_fragments(text: str, fragments: dict[str, str], *, ignore_case: bool = False) -> tuple[str, int]:
-    from .pii import _TRUNCATED_EMAIL_PATTERN, _content_matches
+    from .candidate_formats import iter_partial_email_candidates
 
     if ignore_case:
         fragments = {key.casefold(): value for key, value in fragments.items()}
     def key(value: str) -> str:
         return value.casefold() if ignore_case else value
     spans = [
-        (match.start(1), match.end(1), fragments[key(match.group(1))])
-        for match in _content_matches(_TRUNCATED_EMAIL_PATTERN, text)
-        if key(match.group(1)) in fragments
+        (match["start"], match["end"], fragments[key(match["match"])])
+        for match in iter_partial_email_candidates(text)
+        if key(match["match"]) in fragments
     ]
     return replace_spans(text, spans)
 
