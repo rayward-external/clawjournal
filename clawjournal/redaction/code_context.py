@@ -107,6 +107,55 @@ def _parse(source: str) -> ast.Module | None:
         return None
 
 
+def _fenced_sources(text: str):
+    """A failed whole-file parse must not turn string data into code.
+
+    Token locations remain useful when the surrounding Markdown/Python does
+    not parse. In particular, an unterminated triple-quoted string owns the
+    rest of the source, including any apparent Markdown fence inside it.
+    """
+    from .boundaries import RedactionBoundaryError
+
+    fences = list(_FENCE.finditer(text))
+    if not fences:
+        return
+    offsets = [0]
+    for line in text.split("\n"):
+        offsets.append(offsets[-1] + len(line) + 1)
+
+    def position(point):
+        line, column = point
+        return offsets[line - 1] + column
+
+    strings = []
+    interpolated = []
+    starts = {getattr(tokenize, name, None) for name in ("FSTRING_START", "TSTRING_START")} - {None}
+    ends = {getattr(tokenize, name, None) for name in ("FSTRING_END", "TSTRING_END")} - {None}
+    try:
+        for item in tokenize.generate_tokens(io.StringIO(text).readline):
+            if item.type == tokenize.STRING:
+                strings.append((position(item.start), position(item.end)))
+            elif item.type in starts:
+                interpolated.append(position(item.start))
+            elif item.type in ends and interpolated:
+                strings.append((interpolated.pop(), position(item.end)))
+    except tokenize.TokenError as exc:
+        if exc.args[0] == "EOF in multi-line string":
+            strings.append((position(exc.args[1]), len(text)))
+        elif exc.args[0] != "EOF in multi-line statement":
+            # Other errors can stop before later string tokens are emitted.
+            raise RedactionBoundaryError("code_context_syntax") from None
+    except (SyntaxError, ValueError):
+        # An incomplete lexical pass cannot establish where later strings
+        # begin. Preserve the input rather than inventing code exemptions.
+        raise RedactionBoundaryError("code_context_syntax") from None
+    strings.extend((start, len(text)) for start in interpolated)
+    strings = merge_spans(strings)
+    for match in fences:
+        if not contains_span(strings, match.start(), match.start() + 1):
+            yield match.group(1), match.start(1)
+
+
 def code_context(text: str) -> CodeContext:
     context = CodeContext()
     # Every supported exemption needs a call, an assignment/dict/keyword, or
@@ -118,7 +167,7 @@ def code_context(text: str) -> CodeContext:
     # must never turn that string's contents into executable-code evidence.
     tree = _parse(text)
     blocks = [(text, 0, tree)] if tree is not None else [
-        (m.group(1), m.start(1), _parse(m.group(1))) for m in _FENCE.finditer(text)
+        (source, start, _parse(source)) for source, start in _fenced_sources(text)
     ]
     for source, base, tree in blocks:
         if "\r" in source.replace("\r\n", ""):

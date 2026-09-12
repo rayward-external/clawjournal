@@ -73,7 +73,10 @@ Code evidence is collected from the original field and its offsets move with
 known replacements. It is not reparsed for each email or hostname, and edits
 cannot create new code exemptions. Host-boundary evidence is rechecked when
 other replacements can expose a new hostname. Code protection is no longer
-disabled at 65,536 characters. Parsing retains explicit size and complexity
+disabled at 65,536 characters. Apparent code fences inside string data do
+not grant code exemptions after a parse error. If lexical analysis stops
+before it can establish those boundaries, the trace remains local.
+Parsing retains explicit size and complexity
 budgets; exceeding one stops that trace before sharing instead of silently
 turning off protection. Literals, comments and credential evidence retain the
 same rules as short fields.

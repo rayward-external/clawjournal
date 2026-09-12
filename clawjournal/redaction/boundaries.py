@@ -20,6 +20,13 @@ class RedactionBoundaryError(ValueError):
                 "then retry."
             )
             return
+        if rule == "code_context_syntax":
+            super().__init__(
+                "The boundaries between code and string content could not be "
+                "checked safely. This trace remains local. Clarify the code "
+                "block or add explicit redactions, then retry."
+            )
+            return
         # Never include the candidate, its surrounding text or a secret hash.
         super().__init__(
             f"A {rule} candidate has an unclear or unusually long boundary. "

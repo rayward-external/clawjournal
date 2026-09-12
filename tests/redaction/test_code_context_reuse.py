@@ -174,3 +174,43 @@ def test_parse_budget_blocks_blob_before_mutation_or_external_scans(monkeypatch)
             secrets.apply_findings_to_blob(blob, conn, "synthetic-context-budget")
     assert raised.value.rule == "code_context_budget"
     assert blob == original
+
+
+@pytest.mark.parametrize("padding", [0, 70000])
+@pytest.mark.parametrize("closed", [False, True])
+@pytest.mark.parametrize("prefix", ["", "r", "f", "rf", "b"])
+def test_fences_inside_strings_do_not_gain_exemptions_after_a_parse_error(padding, closed, prefix):
+    text = '变量 = ' + prefix + '"""\n```python\nimport numpy\nimport torch\nvalue = numpy.array@torch.tensor\nobj.local()\n```\n'
+    text += '"""\nnot python here\n' if closed else ''
+    text += '#' * padding
+    expected = text.replace("numpy.array@torch.tensor", "[REDACTED_EMAIL]").replace("obj.local", "[REDACTED_URL]")
+    result = findings.apply_findings_to_text(text, [finding("numpy.array@torch.tensor"), finding("obj.local", "private_url")])
+    assert result == (expected, 2)
+
+
+def test_incomplete_lexical_analysis_cannot_whitelist_a_fence():
+    text = '  x = 1\n y = 2\n```python\nobj.local()\n```'
+    with pytest.raises(RedactionBoundaryError) as raised:
+        cc.code_context(text)
+    assert raised.value.rule == "code_context_syntax"
+
+
+def test_early_token_error_cannot_whitelist_later_fences(monkeypatch):
+    def interrupted_tokens(_readline):
+        raise cc.tokenize.TokenError("unterminated string literal", (1, 4))
+    monkeypatch.setattr(cc.tokenize, "generate_tokens", interrupted_tokens)
+    with pytest.raises(RedactionBoundaryError) as raised:
+        list(cc._fenced_sources('x = "\n```python\nobj.local()\n```'))
+    assert raised.value.rule == "code_context_syntax"
+
+
+def test_malformed_single_quote_before_string_data_never_exempts_its_fence():
+    text = 'broken = "\npayload = """\n```python\nobj.local()\n```\n"""\n'
+    try:
+        result = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
+    except RedactionBoundaryError as exc:
+        # Python versions differ in whether tokenization continues after the
+        # first malformed string. Stopping safely must keep the trace local.
+        assert exc.rule == "code_context_syntax"
+    else:
+        assert result == (text.replace("obj.local", "[REDACTED_URL]"), 1)
