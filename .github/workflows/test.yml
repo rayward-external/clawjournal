@@ -60,7 +60,7 @@ jobs:
           tests/redaction/test_trufflehog_install.py
           -v
       - name: Chunked redaction (native Windows)
-        run: python -m pytest tests/redaction/test_chunked_scanning.py tests/redaction/test_code_context_reuse.py -v
+        run: python -m pytest tests/redaction/test_chunked_scanning.py tests/redaction/test_code_context_reuse.py tests/redaction/test_ingest_boundary_policy.py -v
 
   smoke:
     runs-on: ubuntu-latest

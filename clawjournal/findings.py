@@ -964,6 +964,12 @@ def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> l
 def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, int]:
     if not text or not findings:
         return text, 0
+    # A session-level finding may belong to another field, or an AI response
+    # may name text that is absent. It cannot replace or block this field.
+    findings = [f for f in findings if len(str(f.get("entity_text") or "")) >= 3
+                and re.search(re.escape(str(f["entity_text"])), text, re.IGNORECASE)]
+    if not findings:
+        return text, 0
     from .redaction.boundaries import ensure_safe_replacement, ensure_text_boundaries
     from .redaction.code_context import code_context
     from .redaction.replacements import replace_spans

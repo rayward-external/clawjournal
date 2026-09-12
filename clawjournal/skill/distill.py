@@ -169,7 +169,7 @@ def _scrub(value: Any, anon: Anonymizer, settings: dict[str, Any] | None = None)
         blocked_domains = list(settings.get("blocked_domains", []) or [])
         text, _count = redact_custom_strings(text, custom_strings)
         text = _redact_blocked_domains(text, blocked_domains)
-    redacted, _, _ = redact_text(text)
+    redacted, _, _ = redact_text(text, strict=True)
     return redacted
 
 

@@ -273,9 +273,10 @@ def test_oversized_candidates_are_deferred_without_mutation(render_builtin, valu
     with pytest.raises(RedactionBoundaryError) as caught:
         render_builtin(value)
     assert value not in str(caught.value)
-    # The direct redactor must follow the same rule as findings-backed export.
+    # Export rejects ambiguous input. Local ingest preserves it for review.
     with pytest.raises(RedactionBoundaryError):
-        secrets.redact_text(value)
+        secrets.redact_text(value, strict=True)
+    secrets.redact_text(value)
 
 
 def test_blob_preflight_finishes_before_any_field_is_mutated(render_builtin, monkeypatch):

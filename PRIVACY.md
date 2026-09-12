@@ -81,6 +81,22 @@ budgets; exceeding one stops that trace before sharing instead of silently
 turning off protection. Literals, comments and credential evidence retain the
 same rules as short fields.
 
+Local indexing and display do not apply the sharing preflight. An unclear
+replacement or unavailable code proof preserves the local text instead of
+aborting its project. This is not a clean scan result: export paths repeat
+the strict preflight. Local findings that cannot establish safe boundaries
+put only the affected trace into pending review; the rest of the project
+remains indexable. Plain word lists are rejected as Python syntax before
+the parser's error recovery can overflow its stack.
+
+Automatic sharing persists content-boundary deferrals in that review queue,
+so later status reports exclude them and normal traces can proceed. A
+boundary failure during final PII application keeps its trace identity and
+does not rewrite the bundle; the automatic runner can park that trace and
+retry the remainder. An absent provider finding cannot block unrelated text.
+Worker infrastructure failures remain retryable and do not change content
+holds.
+
 The window design borrows ideas from TruffleHog and Gitleaks. It does not
 install Gitleaks or replace the existing Betterleaks and TruffleHog gates.
 

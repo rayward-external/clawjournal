@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import io
+import keyword
 import re
 import tokenize
 from bisect import bisect_right
@@ -83,21 +84,33 @@ def _parse(source: str) -> ast.Module | None:
     try:
         if len(source) > _MAX_PARSE_CHARS:
             raise RedactionBoundaryError("code_context_budget")
-        if len(source) > 65_536:
+        previous = None
+        tokens = statement_tokens = 0
+        for item in tokenize.generate_tokens(io.StringIO(source).readline):
+            # Adjacent ordinary identifiers cannot be Python syntax. Reject
+            # prose/word lists before PEG's invalid-syntax recovery can
+            # overflow its stack. Keywords and soft keywords remain parser
+            # input (e.g. "yield from", "match subject", "type Alias").
+            if (item.type == tokenize.NAME and previous is not None
+                    and previous.type == tokenize.NAME
+                    and not any(keyword.iskeyword(name) or keyword.issoftkeyword(name)
+                                for name in (previous.string, item.string))):
+                return None
+            previous = item
+            if len(source) <= 65_536:
+                continue
             # Python warns that large/complex AST input can exhaust stack or
             # memory. Bound complexity before parsing; long comments/strings
             # count as individual tokens and do not disable code protection.
-            tokens = statement_tokens = 0
-            for item in tokenize.generate_tokens(io.StringIO(source).readline):
-                if item.type == tokenize.NEWLINE:
-                    statement_tokens = 0
-                if item.type in {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
-                                 tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}:
-                    continue
-                tokens += 1
-                statement_tokens += 1
-                if tokens > _MAX_PARSE_TOKENS or statement_tokens > _MAX_STATEMENT_TOKENS:
-                    raise RedactionBoundaryError("code_context_budget")
+            if item.type == tokenize.NEWLINE:
+                statement_tokens = 0
+            if item.type in {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+                             tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}:
+                continue
+            tokens += 1
+            statement_tokens += 1
+            if tokens > _MAX_PARSE_TOKENS or statement_tokens > _MAX_STATEMENT_TOKENS:
+                raise RedactionBoundaryError("code_context_budget")
         return ast.parse(source)
     except RedactionBoundaryError:
         raise

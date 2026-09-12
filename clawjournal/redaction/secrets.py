@@ -569,15 +569,44 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
 
 def redact_text(
     text: str, user_allowlist: list[dict] | None = None,
+    *, strict: bool = False,
 ) -> tuple[str, int, list[dict]]:
-    """Redact secrets from text. Returns (redacted_text, count, redaction_log)."""
+    """Redact local display text without rejecting a project during ingest.
+
+    Export callers must request ``strict=True`` or run the complete share
+    preflight. A local deferral is not evidence that the text is safe to send.
+    Returns (redacted_text, count, redaction_log).
+    """
+    from .boundaries import RedactionBoundaryError
+
+    try:
+        return _redact_text(text, user_allowlist=user_allowlist, strict=strict)
+    except RedactionBoundaryError as exc:
+        if strict:
+            raise
+        return text, 0, [{"type": "redaction_deferred", "rule": exc.rule}]
+
+
+def _redact_text(text: str, *, user_allowlist: list[dict] | None, strict: bool):
     if not text:
         return text, 0, []
 
-    from .boundaries import ensure_text_boundaries
+    from .boundaries import RedactionBoundaryError, ensure_safe_replacement, ensure_text_boundaries
 
-    ensure_text_boundaries(text)
+    if strict:
+        ensure_text_boundaries(text)
     findings = scan_text(text, user_allowlist=user_allowlist)
+    if not strict:
+        # Do not destroy a long local field merely because a secret rule
+        # includes adjacent prose. Sharing rechecks the preserved source.
+        safe_findings = []
+        for finding in findings:
+            try:
+                ensure_safe_replacement(finding["match"], finding["type"])
+            except RedactionBoundaryError:
+                continue
+            safe_findings.append(finding)
+        findings = safe_findings
     if not findings:
         return text, 0, []
 
@@ -729,7 +758,7 @@ def _redact_value(
 ) -> tuple[Any, int, list[dict]]:
     """Recursively redact secrets from a string, list, or dict value."""
     if isinstance(value, str):
-        result, count, log = redact_text(value, user_allowlist=user_allowlist)
+        result, count, log = redact_text(value, user_allowlist=user_allowlist, strict=True)
         if custom_strings:
             result, n = redact_custom_strings(result, custom_strings)
             count += n

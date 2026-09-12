@@ -3109,6 +3109,18 @@ def _apply_upload_pii_redactions(
         }
 
     def redact_one(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
+        from ..redaction.boundaries import RedactionBoundaryError
+
+        try:
+            return redact_session(index, session)
+        except RedactionBoundaryError as exc:
+            # Keep the source identity when a provider finding cannot be
+            # applied. The automatic runner can park only this trace and
+            # retry the clean remainder. No file is rewritten on failure.
+            exc.session_id = str(session.get("session_id") or "")
+            raise
+
+    def redact_session(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
         if ai_pii:
             findings, cov = review_session_pii_hybrid(
                 session,
@@ -3227,6 +3239,7 @@ def finalize_share_export_for_upload(
     except Exception as exc:
         from ..auto_upload import ControlChanged
         from ..redaction.pii import _AgentCallGateError
+        from ..redaction.boundaries import RedactionBoundaryError
 
         # A before_ai_call control gate (pause/disable/profile/revision/
         # generation change) fired during AI-PII review. review_session_pii_hybrid
@@ -3240,6 +3253,20 @@ def finalize_share_export_for_upload(
         if isinstance(exc, ControlChanged):
             raise
         _record_elapsed_ms(timings_ms, "pii_review", pii_started)
+        if isinstance(exc, RedactionBoundaryError):
+            worker_failed = exc.rule == "chunk_scan_failed"
+            reason = "scanner-error" if worker_failed else "redaction-boundary"
+            blocked = [] if worker_failed else [{
+                "session_id": getattr(exc, "session_id", ""),
+                "reason": str(exc),
+            }]
+            message = "The local redaction worker is unavailable." if worker_failed else str(exc)
+            manifest.update(blocked=True, block_reason=reason,
+                            block_message=message, blocked_sessions=blocked)
+            manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            return {"error": message, "block_reason": reason,
+                    "blocked_sessions": blocked,
+                    "status": 503 if worker_failed else 422}, manifest
         logger.warning("PII redaction pass failed: %s", exc)
         return {
             "error": "PII redaction failed — upload aborted. Try again or report this issue.",

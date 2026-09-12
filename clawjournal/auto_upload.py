@@ -3194,7 +3194,12 @@ def _ranked_size_prefix(
                 extra_usernames=list(settings.get("extra_usernames") or []),
                 blocked_domains=list(settings.get("blocked_domains") or []),
             )
-        except RedactionBoundaryError:
+        except RedactionBoundaryError as exc:
+            if exc.rule == "chunk_scan_failed":
+                raise AutoUploadError(
+                    "scanner_unavailable", "The local redaction worker is unavailable.",
+                    retryable=True,
+                ) from None
             # Defer this trace before AI/egress. Other ranked candidates can
             # proceed; an unclear boundary must not disable recurring sharing.
             if boundary_blocked is not None:
@@ -4829,7 +4834,14 @@ def _run_cycle_impl(
                     maximum_bundle_size=int(capabilities["maximum_bundle_size"]),
                     boundary_blocked=boundary_blocked,
                 )
-                report["exclusion_counts"]["redaction_boundary"] = len(boundary_blocked)
+                # Persist content deferrals in the existing review queue.
+                # Fresh status/preview reports then exclude these sessions;
+                # a discarded local counter cannot stop endless reselection.
+                for session_id in boundary_blocked:
+                    set_hold_state(
+                        conn, session_id, "pending_review", changed_by="auto_upload",
+                        reason="Automatic share redaction boundary requires review",
+                    )
                 report["deferred_by_cap"] = max(
                     0, len(report["eligible"]) - len(selected) - len(boundary_blocked)
                     - missing_candidates - deferred_by_size,
@@ -4839,13 +4851,13 @@ def _run_cycle_impl(
                 if not selected:
                     if boundary_blocked and not deferred_by_size:
                         _record_cycle_result(
-                            conn, generation=generation, code="redaction_boundary",
-                            count=0, retryable=True,
+                            conn, generation=generation, code="review_attention",
+                            count=len(boundary_blocked), success=True,
                         )
                         return {
-                            "ok": False, "code": "redaction_boundary", "count": 0,
-                            "message": "Selected traces remain local because a sensitive value has an unclear boundary.",
-                            "retryable": True, "deferred_by_redaction": len(boundary_blocked),
+                            "ok": False, "code": "review_attention", "count": len(boundary_blocked),
+                            "message": "Selected traces were moved to pending review because a redaction boundary is unclear.",
+                            "retryable": False, "deferred_by_redaction": len(boundary_blocked),
                         }
                     if deferred_by_size:
                         # Candidates existed but none fit the hosted size budget

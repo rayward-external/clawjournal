@@ -1911,7 +1911,7 @@ def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolate
     conn.close()
 
 
-def test_all_ambiguous_candidates_back_off_before_ai_or_upload(isolated_auto_upload, monkeypatch):
+def test_all_ambiguous_candidates_park_before_ai_or_upload(isolated_auto_upload, monkeypatch):
     import copy
 
     config = _save_scope_config()
@@ -1937,16 +1937,52 @@ def test_all_ambiguous_candidates_back_off_before_ai_or_upload(isolated_auto_upl
     monkeypatch.setattr(auto, "package", forbidden)
     monkeypatch.setattr(auto, "submit_artifact", forbidden)
     result = auto.run_cycle(force=True)
-    assert result["code"] == "redaction_boundary"
-    assert result["retryable"] is True
+    assert result["code"] == "review_attention"
+    assert result["retryable"] is False
     assert result["deferred_by_redaction"] == 1
     conn = open_index()
     try:
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["mode"] == "enabled"
-        assert enrollment["health"] == "retrying"
-        assert enrollment["next_retry_at"] is not None
+        assert enrollment["health"] == "ready"
+        assert enrollment["next_retry_at"] is None
+        assert conn.execute("SELECT hold_state FROM sessions WHERE session_id = 'session-one'").fetchone()[0] == "pending_review"
+        fresh = auto._candidate_report(conn, enrollment)
+        assert fresh["selected"] == []
+        assert fresh["exclusion_counts"]["held_or_embargoed"] == 1
         assert conn.execute("SELECT COUNT(*) FROM shares").fetchone()[0] == 0
+    finally:
+        conn.close()
+    # A second cycle cannot reselect the deterministic failure indefinitely.
+    second = auto.run_cycle(force=True)
+    assert second["code"] == "nothing_new"
+
+
+def test_sizing_worker_failure_retries_without_parking_content(isolated_auto_upload, monkeypatch):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise RedactionBoundaryError("chunk_scan_failed")
+    monkeypatch.setattr(auto, "apply_share_redactions", unavailable)
+    monkeypatch.setattr(auto, "package", lambda *a, **kw: pytest.fail("No package after a scan error"))
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "scanner_unavailable"
+    assert result["retryable"] is True
+    conn = open_index()
+    try:
+        assert conn.execute("SELECT hold_state FROM sessions WHERE session_id = 'session-one'").fetchone()[0] == "released"
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] == "retrying"
+        assert auto._candidate_report(conn, enrollment)["selected"]
     finally:
         conn.close()
 
@@ -5822,9 +5858,11 @@ def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
         conn.close()
 
 
+@pytest.mark.parametrize("block_reason", ["secret-scan-findings", "redaction-boundary"])
 def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
     isolated_auto_upload,
     monkeypatch,
+    block_reason,
 ):
     # Two candidates; the first packaging attempt maps a blocking
     # finding to session-one only. The runner parks that one trace and
@@ -5858,7 +5896,7 @@ def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
             "ok": False,
             "share_id": share_id,
             "error": "A blocking finding mapped to one trace.",
-            "block_reason": "secret-scan-findings",
+            "block_reason": block_reason,
             "blocked_sessions": [{"session_id": blocked_id}],
         }
 

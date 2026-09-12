@@ -124,10 +124,26 @@ def run_findings_pipeline(
     # and the share-time apply path can keep them separate.
     enabled = set(get_enabled_engines(config))
     raw: list = []
-    if SECRETS_ENGINE_ID in enabled:
-        raw.extend(scan_session_for_findings(session_blob, user_allowlist=user_allowlist))
-    if PII_ENGINE_ID in enabled:
-        raw.extend(scan_session_for_pii_findings(session_blob, user_allowlist=user_allowlist))
+    from ..redaction.boundaries import RedactionBoundaryError
+
+    try:
+        if SECRETS_ENGINE_ID in enabled:
+            raw.extend(scan_session_for_findings(session_blob, user_allowlist=user_allowlist))
+        if PII_ENGINE_ID in enabled:
+            raw.extend(scan_session_for_pii_findings(session_blob, user_allowlist=user_allowlist))
+    except RedactionBoundaryError as exc:
+        if exc.rule == "chunk_scan_failed":
+            raise  # Infrastructure failure must not change a content hold.
+        from .index import set_hold_state
+
+        hold = conn.execute("SELECT hold_state FROM sessions WHERE session_id = ?",
+                            (session_id,)).fetchone()
+        if hold is not None and hold["hold_state"] in {"auto_redacted", "released"}:
+            set_hold_state(conn, session_id, "pending_review", changed_by="findings",
+                           reason="Local redaction boundary requires review")
+        # The index row and prior findings remain available. Do not stamp a
+        # successful findings revision when the scan did not complete.
+        return {"status": "redaction_review", "rule": exc.rule}
     if TRUFFLEHOG_ENGINE_ID in enabled:
         try:
             raw.extend(scan_session_for_trufflehog_findings(session_blob, user_allowlist=user_allowlist))
