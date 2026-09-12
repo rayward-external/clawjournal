@@ -75,6 +75,9 @@ def test_unbound_host_call_is_detected_at_all_field_sizes(conn, padding, fence):
     'def f(obj):\n    return obj.local()\n',
     'def f(*, obj):\n    return obj.local()\n',
     'obj = Client()\nx = obj.local("obj.local")\n',
+    'import threading\nx = threading.local()\n',
+    'import threading as obj\nx = obj.local("obj.local")\n',
+    'from project import client as obj\nx = obj.local("obj.local")\n',
 ])
 def test_bound_receiver_preserves_calls_but_never_literals(conn, source):
     assert share(conn, source) == source.replace('"obj.local"', '"[REDACTED_URL]"')
@@ -84,10 +87,17 @@ def test_bound_receiver_preserves_calls_but_never_literals(conn, source):
     '', 'obj = "a hostname"\n', 'obj = Client()\nobj = "a hostname"\n',
     'if flag:\n    obj = Client()\n', 'def f(obj):\n    pass\n',
     'obj = Client()\ndel obj\n', 'obj = Client()\nif flag:\n    obj = unknown\n',
+    'obj = Client()\n(obj := "hostname")\n',
+    'from project import *\n',
 ])
 def test_unbound_rebound_and_other_scope_receivers_do_not_hide_hosts(conn, prefix):
     text = prefix + 'result = obj.internal()\n'
     assert share(conn, text).endswith('result = [REDACTED_URL]()\n')
+
+
+def test_assignment_expression_cannot_reuse_stale_receiver_evidence(conn):
+    text = 'obj = Client()\nresult = ((obj := "hostname"), obj.internal())\n'
+    assert share(conn, text) == text.replace('obj.internal', '[REDACTED_URL]')
 
 
 @pytest.mark.parametrize('newline', ['\n', '\r\n'])

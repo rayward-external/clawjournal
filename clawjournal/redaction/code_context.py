@@ -214,7 +214,7 @@ def code_context(text: str) -> CodeContext:
 def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
     """Require a receiver binding; a dotted call alone can be a real host.
 
-    Infer only straight-line local bindings and function parameters. Branches
+    Infer only explicit imports, straight-line local bindings and parameters. Branches
     and nested scopes do not establish bindings in their enclosing scope.
     This is syntax evidence, never execution or type inference.
     """
@@ -223,6 +223,10 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
     def statements(body, bound):
         bound = set(bound)
         for statement in body:
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                bound.update(alias.asname or alias.name.split(".")[0]
+                             for alias in statement.names if alias.name != "*")
+                continue
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = statement.args
                 names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
@@ -235,6 +239,10 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 bound.difference_update(n.id for n in ast.walk(statement)
                                         if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
                 continue
+            # Assignment expressions can rebind a receiver before a later
+            # call in the same expression. Do not use stale object evidence.
+            bound.difference_update(n.target.id for n in ast.walk(statement)
+                                    if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name))
             host_assignment = any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
                                   and n.id.lower() in _HOST_NAMES for n in ast.walk(statement))
             for node in ast.walk(statement):

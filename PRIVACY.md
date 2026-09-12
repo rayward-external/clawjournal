@@ -98,8 +98,8 @@ content holds. Betterleaks and TruffleHog remain the existing share gates;
 Gitleaks is not installed.
 
 A dotted call alone, such as `api01.internal()`, is not proof of ordinary
-code. A method exemption requires a preceding local object binding or a
-function parameter. Literals, comments and arguments still scan. Code hints
+code. A method exemption requires an explicit import, a preceding local
+object binding or a function parameter. Literals, comments and arguments still scan. Code hints
 cannot bypass replacement budgets: an oversized candidate remains a review
 case whether parsing succeeds or fails. A large JSON value without such an
 ambiguous candidate is still shareable.
