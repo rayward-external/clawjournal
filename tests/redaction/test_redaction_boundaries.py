@@ -673,7 +673,6 @@ def test_encoded_partial_email_uses_scoped_replacement(render_builtin, separator
 @pytest.mark.parametrize("text", [
     'const DB_HOST=process.env.DB_HOST;',
     'Configuration example:\n{"telegramBotToken": settings.telegram_token}',
-    'DB_HOST=config["db_host"]\n' + '# ordinary\n' * 7_000,
     'DB_HOST=config%2Edatabase_host',
     'telegramBotToken=settings%2Etelegram_token',
 ])
@@ -681,6 +680,11 @@ def test_unparsed_reference_candidates_defer_instead_of_redacting_a_prefix(rende
     from clawjournal.redaction.boundaries import RedactionBoundaryError
     with pytest.raises(RedactionBoundaryError, match="_or_code"):
         render_builtin(text)
+
+
+def test_long_parsed_reference_keeps_the_same_protection_as_short_source(render_builtin):
+    text = 'DB_HOST=config["db_host"]\n' + '# ordinary\n' * 7_000
+    assert render_builtin(text) == text
 
 
 @pytest.mark.parametrize("text,expected", [

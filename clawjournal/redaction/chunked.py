@@ -27,6 +27,9 @@ from pathlib import Path
 CHUNK_SIZE = 1024
 OVERLAP = 512
 PARALLEL_THRESHOLD = 8192
+# Count selected window characters, including overlap. Starting processes for
+# a few cheap windows costs more than the actual search (e.g. 300 tokens).
+MIN_PARALLEL_WORK = 128 * 1024
 MAX_WORKERS = 2
 WORKER_TIMEOUT = 30
 _BLANK_LINE = re.compile(r"\n[ \t\r]*\n")
@@ -100,12 +103,18 @@ def _parallel_starts(pattern: re.Pattern[str], text: str, has_anchor: Callable[[
         if has_anchor(window[0]):
             shards[selected % MAX_WORKERS].append(window)
             selected += 1
-    # Threads only coordinate independent Python processes; the regex work
-    # therefore runs on separate CPU cores despite Python re holding the GIL.
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = [pool.submit(_run_worker, pattern.pattern, pattern.flags, shard)
-                   for shard in shards if shard]
-        starts = tuple(sorted({value for future in futures for value in future.result()}))
+    work = sum(len(window[0]) for shard in shards for window in shard)
+    if work < MIN_PARALLEL_WORK:
+        from .chunked_worker import match_starts
+
+        starts = tuple(sorted({value for shard in shards for value in match_starts(pattern, shard)}))
+    else:
+        # Threads coordinate independent processes; expensive searches can
+        # use separate CPU cores despite Python re holding the GIL.
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = [pool.submit(_run_worker, pattern.pattern, pattern.flags, shard)
+                       for shard in shards if shard]
+            starts = tuple(sorted({value for future in futures for value in future.result()}))
     if len(starts) <= _CACHE_MAX_OFFSETS:
         with _CACHE_LOCK:
             _CACHE[key] = starts

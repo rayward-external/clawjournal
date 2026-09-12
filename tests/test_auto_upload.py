@@ -5405,9 +5405,11 @@ def test_nothing_new_advances_successful_daily_cadence(
         conn.close()
 
 
+@pytest.mark.parametrize("long_trace", [False, True])
 def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     isolated_auto_upload,
     monkeypatch,
+    long_trace,
 ):
     """Exercise the real scan, candidate, package, ledger, and cadence path."""
 
@@ -5449,6 +5451,9 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
         / "session-happy.jsonl"
     )
     raw_path.parent.mkdir(parents=True)
+    trace_text = ("SYNTHETIC AUTO START\n".ljust(1020) + "<bob@auto-audit.test>\n"
+                  + "ordinary words <alice@auto-audit.test>\n" * 2000
+                  + "SYNTHETIC AUTO END") if long_trace else "report complete"
     raw_path.write_text(
         json.dumps(
             {
@@ -5465,7 +5470,7 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
                 "timestamp": "2026-07-12T09:00:00Z",
                 "message": {
                     "model": "claude-test",
-                    "content": [{"type": "text", "text": "report complete"}],
+                    "content": [{"type": "text", "text": trace_text}],
                     "usage": {"input_tokens": 5, "output_tokens": 2},
                 },
             }
@@ -5595,6 +5600,15 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
 
     monkeypatch.setattr(auto, "submit_artifact", submit)
 
+    from clawjournal.redaction import chunked
+    chunked._CACHE.clear()
+    worker_calls = []
+    original_worker = chunked._run_worker
+    def record_worker(*args):
+        worker_calls.append(len(args[2]))
+        return original_worker(*args)
+    monkeypatch.setattr(chunked, "_run_worker", record_worker)
+
     before = datetime.now(timezone.utc)
     result = auto.run_cycle(force=True)
     after = datetime.now(timezone.utc)
@@ -5605,6 +5619,10 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     assert result["receipt_reference"] == "receipt-happy-path"
     assert len(submissions) == 1
     submitted = submissions[0]
+    expected_text = trace_text.replace("alice@auto-audit.test", "[REDACTED_EMAIL]").replace("bob@auto-audit.test", "[REDACTED_EMAIL]")
+    assert submitted["transported_sessions"][0]["messages"][1]["content"] == expected_text
+    if long_trace:
+        assert len(worker_calls) >= 2
     assert submitted["client_submission_id"] == result["client_submission_id"]
     assert submitted["authorization_revision"] == 1
     assert submitted["trace_revision_keys"] == [

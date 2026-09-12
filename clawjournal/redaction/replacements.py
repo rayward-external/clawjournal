@@ -1,6 +1,10 @@
 """Keep weak, partial identifiers out of the global secret dictionary."""
 from __future__ import annotations
 from bisect import bisect_right
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .code_context import CodeContext
 
 
 def contains_span(spans: list[tuple[int, int]], start: int, end: int) -> bool:
@@ -19,7 +23,8 @@ def merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def replace_spans(text: str, spans: list[tuple[int, int, str]]) -> tuple[str, int]:
+def replace_spans(text: str, spans: list[tuple[int, int, str]], *,
+                  context: CodeContext | None = None) -> tuple[str, int]:
     """Use original, disjoint offsets and copy retained text only once."""
     if not spans:
         return text, 0
@@ -29,6 +34,8 @@ def replace_spans(text: str, spans: list[tuple[int, int, str]]) -> tuple[str, in
         parts.extend((text[cursor:start], replacement))
         cursor = end
     parts.append(text[cursor:])
+    if context is not None:
+        context.apply_edits(spans)
     return "".join(parts), len(spans)
 
 
@@ -69,7 +76,8 @@ class ReplacementMap(dict[str, str]):
             self.email_fragments.update(other.email_fragments)
 
 
-def replace_email_fragments(text: str, fragments: dict[str, str], *, ignore_case: bool = False) -> tuple[str, int]:
+def replace_email_fragments(text: str, fragments: dict[str, str], *, ignore_case: bool = False,
+                            context: CodeContext | None = None) -> tuple[str, int]:
     from .candidate_formats import iter_partial_email_candidates
 
     if ignore_case:
@@ -81,10 +89,11 @@ def replace_email_fragments(text: str, fragments: dict[str, str], *, ignore_case
         for match in iter_partial_email_candidates(text)
         if key(match["match"]) in fragments
     ]
-    return replace_spans(text, spans)
+    return replace_spans(text, spans, context=context)
 
 
-def replace_secret_value(text: str, secret: str, replacement: str) -> tuple[str, int]:
+def replace_secret_value(text: str, secret: str, replacement: str, *,
+                          context: CodeContext | None = None) -> tuple[str, int]:
     """Propagate a captured value without replacing assignment field names."""
     import re
     from .secrets import SECRET_PATTERNS, _secret_matches
@@ -108,4 +117,4 @@ def replace_secret_value(text: str, secret: str, replacement: str) -> tuple[str,
             labels.append((start, match.start(1)))
     labels = merge_spans(labels)
     spans = [(m.start(), m.end(), replacement) for m in matches if not contains_span(labels, m.start(), m.end())]
-    return replace_spans(text, spans)
+    return replace_spans(text, spans, context=context)

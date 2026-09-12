@@ -13,6 +13,13 @@ class RedactionBoundaryError(ValueError):
 
     def __init__(self, rule: str):
         self.rule = rule
+        if rule == "code_context_budget":
+            super().__init__(
+                "This trace is too large or complex to check its code safely. "
+                "It remains local. Reduce the input or add explicit redactions, "
+                "then retry."
+            )
+            return
         # Never include the candidate, its surrounding text or a secret hash.
         super().__init__(
             f"A {rule} candidate has an unclear or unusually long boundary. "

@@ -7,7 +7,10 @@ particular, a successful MatMult parse is NOT evidence against an email.
 from __future__ import annotations
 
 import ast
+import io
 import re
+import tokenize
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from .replacements import contains_span, merge_spans, replace_spans
 
@@ -16,6 +19,9 @@ _HOST_ATTRS = {"local", "internal", "corp", "lan", "intranet", "localnet"}
 _HOST_NAMES = {"host", "hostname", "db_host", "database_host", "redis_host", "pghost", "mysql_host", "internal_host", "internal_hostname"}
 _ARRAY_MODULES = {"numpy", "torch"}
 _TOKEN_NAMES = {"telegram_bot_token", "telegram_api_token", "telegram_token", "telegrambottoken"}
+_MAX_PARSE_CHARS = 8 * 1024 * 1024
+_MAX_PARSE_TOKENS = 100_000
+_MAX_STATEMENT_TOKENS = 2048
 
 
 @dataclass
@@ -23,6 +29,7 @@ class CodeContext:
     protected: list[tuple[int, int]] = field(default_factory=list)
     ambiguous_emails: list[tuple[int, int]] = field(default_factory=list)
     references: list[tuple[int, int]] = field(default_factory=list)
+    detected_hosts: set[tuple[int, int]] | None = None
 
     def protects(self, start: int, end: int) -> bool:
         return contains_span(self.protected, start, end)
@@ -33,18 +40,79 @@ class CodeContext:
     def is_reference(self, start: int, end: int) -> bool:
         return contains_span(self.references, start, end)
 
+    def apply_edits(self, edits: list[tuple[int, int, str]]) -> None:
+        """Move unchanged source evidence after known, disjoint redactions.
+
+        An edit inside an interval invalidates that interval. Never infer new
+        code from placeholders or reparse text changed by an earlier finding.
+        """
+        if not edits:
+            return
+        ends = [end for _start, end, _replacement in edits]
+        shifts = [0]
+        for start, end, replacement in edits:
+            shifts.append(shifts[-1] + len(replacement) - (end - start))
+
+        def move(spans):
+            moved = []
+            for start, end in spans:
+                i = bisect_right(ends, start)
+                if i < len(edits) and edits[i][0] < end:
+                    continue
+                moved.append((start + shifts[i], end + shifts[i]))
+            return moved
+
+        self.protected = move(self.protected)
+        self.ambiguous_emails = move(self.ambiguous_emails)
+        self.references = move(self.references)
+        if self.detected_hosts is not None:
+            # Complete host replacements cannot introduce another hostname.
+            # Other edits can expose a formerly embedded suffix (e.g. remove
+            # a credential prefix from prefixdb.local.example.com). Rescan
+            # that changed text instead of reusing an incomplete host set.
+            if all((start, end) in self.detected_hosts and replacement == "[REDACTED_URL]"
+                   for start, end, replacement in edits):
+                self.detected_hosts = set(move(self.detected_hosts))
+            else:
+                self.detected_hosts = None
+
 
 def _parse(source: str) -> ast.Module | None:
+    from .boundaries import RedactionBoundaryError
+
     try:
+        if len(source) > _MAX_PARSE_CHARS:
+            raise RedactionBoundaryError("code_context_budget")
+        if len(source) > 65_536:
+            # Python warns that large/complex AST input can exhaust stack or
+            # memory. Bound complexity before parsing; long comments/strings
+            # count as individual tokens and do not disable code protection.
+            tokens = statement_tokens = 0
+            for item in tokenize.generate_tokens(io.StringIO(source).readline):
+                if item.type == tokenize.NEWLINE:
+                    statement_tokens = 0
+                if item.type in {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+                                 tokenize.INDENT, tokenize.DEDENT, tokenize.ENDMARKER}:
+                    continue
+                tokens += 1
+                statement_tokens += 1
+                if tokens > _MAX_PARSE_TOKENS or statement_tokens > _MAX_STATEMENT_TOKENS:
+                    raise RedactionBoundaryError("code_context_budget")
         return ast.parse(source)
-    except (SyntaxError, ValueError, RecursionError):
+    except RedactionBoundaryError:
+        raise
+    except (RecursionError, MemoryError):
+        raise RedactionBoundaryError("code_context_budget") from None
+    except (SyntaxError, ValueError, tokenize.TokenError):
         return None
 
 
 def code_context(text: str) -> CodeContext:
     context = CodeContext()
-    if len(text) > 65_536 or ("@" not in text and "=" not in text and ":" not in text
-                            and not any("." + s in text for s in _HOST_ATTRS)):
+    # Every supported exemption needs a call, an assignment/dict/keyword, or
+    # matrix operators with preceding imports. Bare emails/domain strings
+    # cannot establish code evidence and need no Python parser at all.
+    if not ("(" in text or "=" in text or ":" in text or ("@" in text and "import" in text)):
         return context
     # Parse the whole source first: a Markdown fence inside a Python string
     # must never turn that string's contents into executable-code evidence.
@@ -144,9 +212,11 @@ def code_context(text: str) -> CodeContext:
     return context
 
 
-def replace_outside_code(text: str, pattern: re.Pattern, replacement: str) -> tuple[str, int]:
+def replace_outside_code(text: str, pattern: re.Pattern, replacement: str, *,
+                         context: CodeContext | None = None) -> tuple[str, int]:
     """Apply a known email/hostname entity without deleting syntax elsewhere."""
-    context = code_context(text)
+    if context is None:
+        context = code_context(text)
     def host_boundary(start: int, end: int) -> bool:
         # A known db.local must not eat db.locality, nor a contextual db01
         # eat mydb01. Allow a sentence's final dot, but not another DNS label.
@@ -160,7 +230,6 @@ def replace_outside_code(text: str, pattern: re.Pattern, replacement: str) -> tu
         return True
 
     spans = []
-    detected_hosts = None
     for match in pattern.finditer(text):
         start, end = match.span()
         if context.protects(start, end):
@@ -169,11 +238,11 @@ def replace_outside_code(text: str, pattern: re.Pattern, replacement: str) -> tu
             # Keep an explicitly detected occurrence (including legacy
             # subdomain spans). The guard restricts propagation to unrelated
             # text; it must never silently drop the source finding itself.
-            if detected_hosts is None:
+            if context.detected_hosts is None:
                 from .pii import scan_text_for_pii
-                detected_hosts = {(m["start"], m["end"]) for m in scan_text_for_pii(text)
-                                  if m["type"] == "private_url"}
-            if (start, end) not in detected_hosts:
+                context.detected_hosts = {(m["start"], m["end"]) for m in scan_text_for_pii(text)
+                                          if m["type"] == "private_url"}
+            if (start, end) not in context.detected_hosts:
                 continue
         spans.append((start, end, replacement))
-    return replace_spans(text, spans)
+    return replace_spans(text, spans, context=context)

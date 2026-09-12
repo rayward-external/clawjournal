@@ -64,8 +64,19 @@ content is passed through memory pipes, not written to worker files.
 Workers use the current installation's file, so another checkout in the
 working directory cannot select a different scanner. Medium fields use
 bounded windows locally; required-marker checks also apply to short fields.
+Small amounts of selected window work remain in the parent process. Larger
+amounts can use two workers. Manual and automatic sharing use this same path.
 Only eligible regex searches run in parallel. Packaging and all scan gates
 must finish before upload starts; chunking does not speed up network transfer.
+
+Code evidence is collected from the original field and its offsets move with
+known replacements. It is not reparsed for each email or hostname, and edits
+cannot create new code exemptions. Host-boundary evidence is rechecked when
+other replacements can expose a new hostname. Code protection is no longer
+disabled at 65,536 characters. Parsing retains explicit size and complexity
+budgets; exceeding one stops that trace before sharing instead of silently
+turning off protection. Literals, comments and credential evidence retain the
+same rules as short fields.
 
 The window design borrows ideas from TruffleHog and Gitleaks. It does not
 install Gitleaks or replace the existing Betterleaks and TruffleHog gates.

@@ -31,6 +31,7 @@ def small_windows(monkeypatch):
     monkeypatch.setattr(chunked, "CHUNK_SIZE", 64)
     monkeypatch.setattr(chunked, "OVERLAP", 128)
     monkeypatch.setattr(chunked, "PARALLEL_THRESHOLD", 0)
+    monkeypatch.setattr(chunked, "MIN_PARALLEL_WORK", 0)
     monkeypatch.setattr(chunked, "_run_worker", local_worker)
     monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
 
@@ -86,6 +87,7 @@ def test_blank_line_cut_moves_within_bound_and_ownership_covers_once(small_windo
 
 
 def test_real_workers_run_in_two_processes_and_exit(monkeypatch):
+    monkeypatch.setattr(chunked, "MIN_PARALLEL_WORK", 0)
     monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
     processes = []
     original = subprocess.Popen
@@ -204,6 +206,7 @@ def test_worker_uses_current_install_when_cwd_contains_another_checkout(tmp_path
     (shadow / "__init__.py").write_text("raise RuntimeError('WRONG_CHECKOUT')")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    monkeypatch.setattr(chunked, "MIN_PARALLEL_WORK", 0)
     text = "<alice@example.com> " + "ordinary words " * 800 + "<bob@example.com>"
     assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
 
@@ -275,6 +278,7 @@ def test_generated_unicode_and_adjacent_candidates_keep_original_spans(small_win
 
 def test_real_worker_handles_unicode_offsets_and_non_utf8_codepoints(monkeypatch):
     monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    monkeypatch.setattr(chunked, "MIN_PARALLEL_WORK", 0)
     text = "中文😀\ud800" + " ordinary words " * 800 + "<alice@example.com>\r\n"
     assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
 
@@ -284,3 +288,55 @@ def test_more_matches_than_cache_budget_keep_all_results(monkeypatch):
     text = "<alice@example.com> " * (chunked._CACHE_MAX_OFFSETS + 1)
     assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
     assert not chunked._CACHE
+
+
+@pytest.mark.parametrize("pattern", [pii._EMAIL_PATTERN, pii._TRUNCATED_EMAIL_PATTERN,
+                                    pii._TELEGRAM_PATTERN, pii._INTERNAL_HOST_PATTERN])
+def test_dispatch_survives_regex_cache_eviction(pattern, monkeypatch):
+    re.purge()
+    fresh = re.compile(pattern.pattern, pattern.flags)
+    assert fresh is not pattern
+    assert fresh == pattern
+    calls = []
+    original = chunked.finditer
+    def record(*args, **kwargs):
+        calls.append(args[0])
+        yield from original(*args, **kwargs)
+    monkeypatch.setattr(chunked, "finditer", record)
+    text = "alice@example.com abc@ " + "123456789:" + "A" * 32 + " db.local"
+    assert signature(pii._content_matches(fresh, text)) == signature(pattern.finditer(text))
+    assert calls == [fresh]
+
+
+def test_ordinary_token_windows_do_not_start_processes(monkeypatch):
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    monkeypatch.setattr(chunked, "_run_worker", lambda *args: pytest.fail("Cheap windows must remain local"))
+    text = ("123456789:" + "AbCdEf0123456789_-" * 2 + "\n") * 300
+    assert len(text) > chunked.PARALLEL_THRESHOLD
+    assert signature(pii._content_matches(pii._TELEGRAM_PATTERN, text)) == signature(pii._TELEGRAM_PATTERN.finditer(text))
+
+
+@pytest.mark.parametrize("address", ["a@b.com", "alice@example.com"])
+def test_separated_long_run_uses_windows_not_candidate_continuation(address, monkeypatch):
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    monkeypatch.setattr(pii, "_content_continuation_matches", lambda *a: pytest.fail("Candidates fit in overlap"))
+    text = "A" * 200000 + " " + address
+    matches = list(pii._content_matches(pii._EMAIL_PATTERN, text))
+    expected = [] if address == "a@b.com" else [(address, (200001, len(text)))]
+    assert [(m.group(), m.span()) for m in matches] == expected
+    # The legacy regex has a three-character local minimum. Supplemental
+    # rules must still find the short email in the reviewer's exact example.
+    assert {m["match"] for m in pii.scan_text_for_pii(text) if m["type"] == "email"} == {address}
+
+
+def test_large_selected_work_still_starts_two_workers(monkeypatch):
+    monkeypatch.setattr(chunked, "_CACHE", chunked.OrderedDict())
+    batches = []
+    original = chunked._run_worker
+    def record(*args):
+        batches.append(args[2])
+        return original(*args)
+    monkeypatch.setattr(chunked, "_run_worker", record)
+    text = "<alice@example.com> ordinary words " * 5000
+    assert signature(pii._content_matches(pii._EMAIL_PATTERN, text)) == signature(pii._EMAIL_PATTERN.finditer(text))
+    assert len(batches) == 2

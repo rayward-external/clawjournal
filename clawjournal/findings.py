@@ -965,6 +965,8 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
     if not text or not findings:
         return text, 0
     from .redaction.boundaries import ensure_safe_replacement, ensure_text_boundaries
+    from .redaction.code_context import code_context
+    from .redaction.replacements import replace_spans
 
     ensure_text_boundaries(text)
     for finding in findings:
@@ -975,6 +977,10 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
     )
     count = 0
     result = text
+    context = code_context(text) if any(
+        f.get("source") == "rule" and f.get("entity_type") in {"email", "private_url"}
+        for f in ordered
+    ) else None
     for finding in ordered:
         target = finding.get("entity_text", "")
         replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))
@@ -982,7 +988,7 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
             continue
         if _is_partial_email_finding(finding):
             from .redaction.replacements import replace_email_fragments
-            result, n = replace_email_fragments(result, {target: replacement}, ignore_case=True)
+            result, n = replace_email_fragments(result, {target: replacement}, ignore_case=True, context=context)
             count += n
             continue
         escaped = re.escape(target)
@@ -994,9 +1000,10 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
             pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
         if finding.get("source") == "rule" and finding.get("entity_type") in {"email", "private_url"}:
             from .redaction.code_context import replace_outside_code
-            result, n = replace_outside_code(result, pattern, replacement)
+            result, n = replace_outside_code(result, pattern, replacement, context=context)
         else:
-            result, n = pattern.subn(replacement, result)
+            spans = [(m.start(), m.end(), m.expand(replacement)) for m in pattern.finditer(result)]
+            result, n = replace_spans(result, spans, context=context)
         count += n
     return result, count
 

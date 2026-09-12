@@ -886,8 +886,12 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
     if not text or not secret_map:
         return text, 0
 
-    from .replacements import ReplacementMap, replace_email_fragments
-    from .code_context import replace_outside_code
+    from .replacements import ReplacementMap, replace_email_fragments, replace_spans
+    from .code_context import code_context, replace_outside_code
+
+    context = code_context(text) if any(
+        value in {"[REDACTED_EMAIL]", "[REDACTED_URL]"} for value in secret_map.values()
+    ) else None
 
     count = 0
     # Sort by length descending so longer matches replace first
@@ -895,7 +899,7 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
         replacement = secret_map[secret]
         if replacement in {"[REDACTED_ENV_SECRET]", "[REDACTED_SECRET]"}:
             from .replacements import replace_secret_value
-            text, n = replace_secret_value(text, secret, replacement)
+            text, n = replace_secret_value(text, secret, replacement, context=context)
             count += n
             continue
         if replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
@@ -904,7 +908,7 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
             host_case = replacement == "[REDACTED_URL]" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", secret)
             if not host_case and secret not in text:
                 continue
-            text, n = replace_outside_code(text, re.compile(re.escape(secret), re.I if host_case else 0), replacement)
+            text, n = replace_outside_code(text, re.compile(re.escape(secret), re.I if host_case else 0), replacement, context=context)
             count += n
             continue
         # Short alphanumeric strings need boundaries to avoid matching
@@ -916,17 +920,18 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
                 rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])",
                 re.IGNORECASE,
             )
-            text, n = pattern.subn(replacement, text)
+            spans = [(m.start(), m.end(), m.expand(replacement)) for m in pattern.finditer(text)]
+            text, n = replace_spans(text, spans, context=context)
             count += n
         elif secret in text:
-            n = text.count(secret)
-            text = text.replace(secret, replacement)
+            spans = [(m.start(), m.end(), replacement) for m in re.finditer(re.escape(secret), text)]
+            text, n = replace_spans(text, spans, context=context)
             count += n
 
     # Full secrets take precedence. Replacing a fragment inside a private-key
     # body first would invalidate the whole-key map before it can be applied.
     if isinstance(secret_map, ReplacementMap) and secret_map.email_fragments:
-        text, n = replace_email_fragments(text, secret_map.email_fragments)
+        text, n = replace_email_fragments(text, secret_map.email_fragments, context=context)
         count += n
     return text, count
 
