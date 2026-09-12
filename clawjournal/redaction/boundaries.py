@@ -57,7 +57,7 @@ def ensure_safe_replacement(value: str, rule: str) -> None:
         raise RedactionBoundaryError(rule)
 
 
-def ensure_text_boundaries(text: str) -> None:
+def ensure_text_boundaries(text: str, *, context=None) -> None:
     """Preflight built-in candidates before any redactor mutates this text.
 
     Lazy imports avoid the findings/pii/secrets import cycle. This does not
@@ -67,14 +67,18 @@ def ensure_text_boundaries(text: str) -> None:
     from .pii import _PII_CONTENT_PATTERNS_COMPILED, _content_matches
     from .code_context import code_context
 
-    context = code_context(text)
+    if context is None:
+        context = code_context(text)
 
     def check(value: str, rule: str, start: int, end: int) -> None:
+        # A hint can spare a supported code occurrence from replacement, but
+        # must not authorize an otherwise unsafe boundary. Budget outcomes
+        # therefore do not depend on whether optional parsing succeeded.
+        ensure_safe_replacement(value, rule)
         if context.protects(start, end) and rule in {"email", "email_extended", "internal_tld_host"}:
             return
         if rule.startswith("email") and context.is_ambiguous(start, end):
             raise RedactionBoundaryError("email_or_code")
-        ensure_safe_replacement(value, rule)
 
     # Inspect raw matches before allowlists/no-reply filters. A later engine
     # can still redact one of those matches; an allowlist cannot make an

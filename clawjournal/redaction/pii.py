@@ -690,7 +690,7 @@ def _internal_host_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.M
 
 
 def _content_continuation_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
-    """Resolve complete candidates which cannot fit in a chunk overlap."""
+    """Scan disjoint complete candidates without retrying their suffixes."""
     if pattern in (_EMAIL_PATTERN, _TRUNCATED_EMAIL_PATTERN):
         yield from _separator_matches(pattern, text, "@", _EMAIL_LOCAL_CHARS.__contains__, 3)
     elif pattern == _TELEGRAM_PATTERN:
@@ -704,19 +704,8 @@ def _content_continuation_matches(pattern: re.Pattern[str], text: str) -> Iterab
 
 
 def _content_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
-    """Run the existing rules on overlapping, parallel windows for long text."""
-    from .chunked import finditer
-
-    if pattern in (_EMAIL_PATTERN, _TRUNCATED_EMAIL_PATTERN):
-        anchor = lambda run: "@" in run
-    elif pattern == _TELEGRAM_PATTERN:
-        anchor = lambda run: ":" in run
-    elif pattern == _INTERNAL_HOST_PATTERN:
-        anchor = lambda run: _INTERNAL_HOST_SUFFIX.search(run) is not None
-    else:
-        yield from pattern.finditer(text)
-        return
-    yield from finditer(pattern, text, continuation=_content_continuation_matches, has_anchor=anchor)
+    """Keep original regex spans without window copies or worker processes."""
+    yield from _content_continuation_matches(pattern, text)
 
 
 def _content_findings_for_text(session_id: str, message_index: int, field: str, text: str) -> list[PIIFinding]:

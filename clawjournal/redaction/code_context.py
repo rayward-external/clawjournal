@@ -10,6 +10,7 @@ import ast
 import io
 import keyword
 import re
+import threading
 import tokenize
 import warnings
 from bisect import bisect_right
@@ -27,6 +28,7 @@ _ast_parse = ast.parse  # Module-local seam; tests must not patch stdlib ast.
 _MAX_PARSE_CHARS = 8 * 1024 * 1024
 _MAX_PARSE_TOKENS = 100_000
 _MAX_STATEMENT_TOKENS = 2048
+_PARSE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -83,6 +85,15 @@ class CodeContext:
 
 
 def _parse(source: str) -> ast.Module | None:
+    # Python 3.10-3.13 warning filters are process-global. Serialize our
+    # suppression scopes, including the tokenizer (which also emits warnings).
+    with _PARSE_LOCK, warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return _parse_source(source)
+
+
+def _parse_source(source: str) -> ast.Module | None:
     try:
         # Hints are optional. Preserve original offsets and never feed NULs
         # to CPython's tokenizer (some versions raise SystemError).
@@ -115,10 +126,7 @@ def _parse(source: str) -> ast.Module | None:
             statement_tokens += 1
             if tokens > _MAX_PARSE_TOKENS or statement_tokens > _MAX_STATEMENT_TOKENS:
                 return None
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", SyntaxWarning)
-            warnings.simplefilter("ignore", DeprecationWarning)
-            return _ast_parse(source)
+        return _ast_parse(source)
     except (SyntaxError, ValueError, tokenize.TokenError, SystemError,
             RecursionError, MemoryError):
         return None
@@ -176,7 +184,7 @@ def _fenced_sources(text: str):
             break
         while pos < len(text):
             if text[pos] == "\\":
-                pos += 2
+                pos += 3 if text.startswith("\\\r\n", pos) else 2
             elif text.startswith(delimiter, pos):
                 pos += len(delimiter)
                 break
@@ -201,6 +209,56 @@ def code_context(text: str) -> CodeContext:
         # No partial exemptions survive a failed analysis. Detection still
         # examines the original source, including every quoted secret.
         return CodeContext()
+
+
+def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
+    """Require a receiver binding; a dotted call alone can be a real host.
+
+    Infer only straight-line local bindings and function parameters. Branches
+    and nested scopes do not establish bindings in their enclosing scope.
+    This is syntax evidence, never execution or type inference.
+    """
+    found: set[ast.Call] = set()
+
+    def statements(body, bound):
+        bound = set(bound)
+        for statement in body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = statement.args
+                names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+                names.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
+                statements(statement.body, names)
+                bound.discard(statement.name)
+                continue
+            # Be conservative about control flow, classes, closures and rebinding.
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
+                bound.difference_update(n.id for n in ast.walk(statement)
+                                        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
+                continue
+            host_assignment = any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                                  and n.id.lower() in _HOST_NAMES for n in ast.walk(statement))
+            for node in ast.walk(statement):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                    continue
+                receiver = node.func.value
+                while isinstance(receiver, ast.Attribute):
+                    receiver = receiver.value
+                if (node.func.attr in _HOST_ATTRS and not host_assignment
+                        and isinstance(receiver, ast.Name) and receiver.id in bound):
+                    found.add(node)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                # Only an explicit object-producing expression establishes evidence.
+                creates_object = isinstance(statement.value, (ast.Call, ast.Dict, ast.List, ast.Set, ast.Tuple))
+                for target in targets:
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name):
+                            bound.discard(name.id)
+                    if creates_object and isinstance(target, ast.Name):
+                        bound.add(target.id)
+
+    statements(tree.body, set())
+    return found
 
 
 def _code_context(text: str) -> CodeContext:
@@ -279,6 +337,7 @@ def _code_context(text: str) -> CodeContext:
 
         # Only preceding top-level imports establish array module names.
         imported: set[str] = set()
+        bound_calls = _bound_host_calls(tree)
         for statement in tree.body:
             if isinstance(statement, ast.Import):
                 imported.update(a.asname or a.name for a in statement.names
@@ -290,7 +349,7 @@ def _code_context(text: str) -> CodeContext:
             )
             for node in ast.walk(statement):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                    if node.func.attr in _HOST_ATTRS and not host_assignment:
+                    if node in bound_calls and not host_assignment:
                         start, end = span(node.func)
                         if all(part.isidentifier() for part in text[start:end].split(".")):
                             context.protected.append((start, end))

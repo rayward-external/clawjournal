@@ -5489,7 +5489,7 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     raw_path.parent.mkdir(parents=True)
     trace_text = ("SYNTHETIC AUTO START\n".ljust(1020) + "<bob@auto-audit.test>\n"
                   + "ordinary words <alice@auto-audit.test>\n" * 2000
-                  + "SYNTHETIC AUTO END") if long_trace else "report complete"
+                  + "这是普通正文" * 100 + "alice@auto-audit.test谢谢\nSYNTHETIC AUTO END") if long_trace else "report complete"
     raw_path.write_text(
         json.dumps(
             {
@@ -5636,14 +5636,13 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
 
     monkeypatch.setattr(auto, "submit_artifact", submit)
 
-    from clawjournal.redaction import chunked
-    chunked._CACHE.clear()
-    worker_calls = []
-    original_worker = chunked._run_worker
-    def record_worker(*args):
-        worker_calls.append(len(args[2]))
-        return original_worker(*args)
-    monkeypatch.setattr(chunked, "_run_worker", record_worker)
+    from clawjournal.redaction import pii
+    scan_calls = []
+    original_scan = pii._content_continuation_matches
+    def record_scan(pattern, text):
+        scan_calls.append(len(text))
+        yield from original_scan(pattern, text)
+    monkeypatch.setattr(pii, "_content_continuation_matches", record_scan)
 
     before = datetime.now(timezone.utc)
     result = auto.run_cycle(force=True)
@@ -5658,7 +5657,7 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     expected_text = trace_text.replace("alice@auto-audit.test", "[REDACTED_EMAIL]").replace("bob@auto-audit.test", "[REDACTED_EMAIL]")
     assert submitted["transported_sessions"][0]["messages"][1]["content"] == expected_text
     if long_trace:
-        assert len(worker_calls) >= 2
+        assert any(length >= len(trace_text) for length in scan_calls)
     assert submitted["client_submission_id"] == result["client_submission_id"]
     assert submitted["authorization_revision"] == 1
     assert submitted["trace_revision_keys"] == [

@@ -39,10 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 4  # Rebuild findings for bounded matching and code-context rules.
-                    # scanner/apply path. Version 2 caches could not contain
-                    # findings from that metadata field, so force one rebuild
-                    # even when the transcript content itself is unchanged.
+ENGINE_VERSION = 5  # Rebuild findings for script boundaries and narrower code hints.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 
@@ -974,7 +971,8 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
     from .redaction.code_context import code_context
     from .redaction.replacements import replace_spans
 
-    ensure_text_boundaries(text)
+    context = code_context(text)
+    ensure_text_boundaries(text, context=context)
     for finding in findings:
         ensure_safe_replacement(str(finding.get("entity_text") or ""), str(finding.get("entity_type") or ""))
     ordered = sorted(
@@ -983,10 +981,6 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
     )
     count = 0
     result = text
-    context = code_context(text) if any(
-        f.get("source") == "rule" and f.get("entity_type") in {"email", "private_url"}
-        for f in ordered
-    ) else None
     for finding in ordered:
         target = finding.get("entity_text", "")
         replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))

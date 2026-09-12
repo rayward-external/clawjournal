@@ -49,25 +49,15 @@ The email checks use a 64-byte local-part and 254-byte mailbox budget. Hostnames
 use 63 bytes per label and 253 bytes overall. These are conservative UTF-8
 replacement budgets, not complete address validators. The Telegram budget is
 128 characters; it is not a claim about the maximum possible token length.
-Long fields use overlapping, parallel windows for the existing email,
-Telegram-token and internal-domain regex searches. Nearby blank lines can
-adjust a cut, but a cut is never treated as a trusted content boundary.
-Matches are checked against the original text and returned with their
-original offsets; chunks are not independently rewritten and concatenated.
-Code context, finding decisions and known-credential propagation remain
-global to their existing field/session scope. Private keys and other rules
-which need longer context retain complete-text handling. A candidate which
-can exceed the overlap uses the complete-candidate adapter, so fixed window
-sizes cannot silently truncate it or turn it into a clean result. A failed
-worker stops the scan. Workers run locally and exit after each batch; source
-content is passed through memory pipes, not written to worker files.
-Workers use the current installation's file, so another checkout in the
-working directory cannot select a different scanner. Medium fields use
-bounded windows locally; required-marker checks also apply to short fields.
-Small amounts of selected window work remain in the parent process. Larger
-amounts can use two workers. Manual and automatic sharing use this same path.
-Only eligible regex searches run in parallel. Packaging and all scan gates
-must finish before upload starts; chunking does not speed up network transfer.
+Email, Telegram-token and internal-domain regex searches use complete-candidate
+adapters. Required markers locate possible matches; the unchanged regexes
+validate them against the original field. They do not repeatedly retry each
+suffix of the same long run. No window copies, worker processes or interpreter
+launches are needed for these deterministic searches. Private keys retain
+complete-text handling. Code context, finding decisions and known-credential
+propagation keep their existing field/session scope. Manual and automatic
+sharing use this same scanning path. Packaging and all scan gates finish
+before upload starts; faster scanning does not change network transfer time.
 
 Code evidence is collected from the original field and its offsets move with
 known replacements. It is not reparsed for each email or hostname, and edits
@@ -80,8 +70,10 @@ The detector still scans the original text. NUL bytes are not removed or
 shifted in the source. Quoted data cannot authorize embedded Markdown fences.
 Fence lines are paired in one pass, including unfinished blocks. Prose
 outside a fence is not tokenized as Python, so ordinary apostrophes do
-not change behavior across Python versions. Parser warnings do not print
-source text. Plain word lists are rejected before costly parser recovery.
+not change behavior across Python versions. Parser and tokenizer warning
+scopes are serialized across redaction threads and do not print source text.
+Escaped CRLF line continuations cannot expose a fence inside quoted data.
+Plain word lists are rejected before costly parser recovery.
 
 Local indexing and display do not apply the sharing preflight. They redact
 recognized secrets even when code evidence is unavailable. Email candidates
@@ -101,11 +93,29 @@ so later status reports exclude them and normal traces can proceed. A
 boundary failure during final PII application keeps its trace identity and
 does not rewrite the bundle; the automatic runner can park that trace and
 retry the remainder. An absent provider finding cannot block unrelated text.
-Worker infrastructure failures remain retryable and do not change content
-holds.
+External scanner infrastructure failures remain retryable and do not change
+content holds. Betterleaks and TruffleHog remain the existing share gates;
+Gitleaks is not installed.
 
-The window design borrows ideas from TruffleHog and Gitleaks. It does not
-install Gitleaks or replace the existing Betterleaks and TruffleHog gates.
+A dotted call alone, such as `api01.internal()`, is not proof of ordinary
+code. A method exemption requires a preceding local object binding or a
+function parameter. Literals, comments and arguments still scan. Code hints
+cannot bypass replacement budgets: an oversized candidate remains a review
+case whether parsing succeeds or fails. A large JSON value without such an
+ambiguous candidate is still shareable.
+
+An ASCII email next to unspaced Chinese, Japanese, Korean or similar prose
+uses the script transition as a boundary. The surrounding prose stays intact.
+Accented local parts, Unicode domains, quoted mailboxes and explicitly
+angle-delimited mixed-script mailboxes remain supported. An unquoted
+mixed-script local part joined directly to prose is inherently ambiguous;
+use an explicit mailbox delimiter to retain its full intended span. These
+heuristics do not claim perfect word separation in every script.
+
+Fine-grained `github_pat_` credentials are recognized independently of email
+syntax, including overlong token-like values. Their complete detected value
+is masked locally rather than retaining a token prefix before the email
+replacement window. Strict sharing still checks the original input.
 
 Common encoded separators are checked against their original text offsets.
 Named Telegram assignments and database/SSH host contexts add coverage when

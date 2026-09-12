@@ -32,6 +32,15 @@ _PERSONAL_HOST = re.compile(
 _ESCAPED_SEPARATOR = re.compile(r"%([234][0aAeE])|\\u00(2[eE]|3[aA]|40)|&#(?:0*(46|58|64)|[xX]0*(2[eE]|3[aA]|40));")
 
 
+def _unspaced_script(char: str) -> bool:
+    """Scripts whose prose commonly abuts an ASCII mailbox without spaces."""
+    if char.isascii():
+        return False
+    name = unicodedata.name(char, "")
+    return name.startswith(("CJK ", "IDEOGRAPHIC ", "HIRAGANA ", "KATAKANA",
+                            "HANGUL ", "THAI ", "LAO ", "KHMER ", "MYANMAR "))
+
+
 def _scanning_view(text: str) -> tuple[str, list[int], list[int]]:
     parts: list[str] = []
     offsets, shifts = [0], [0]
@@ -87,14 +96,24 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                 or unicodedata.category(text[start - 1])[0] in "LMN"
             ):
                 start -= 1
+        # In prose, a script transition is a boundary around an ASCII address.
+        # Explicit mailbox delimiters retain internationalized mixed-script
+        # local parts; punctuation joins (e.g. ツ-test) also remain part of it.
+        delimited = text[start:start + 1] == '"' or (start > 0 and text[start - 1] in '<"')
+        if text[start:start + 1] != '"' and not delimited:
+            ascii_start = at
+            while ascii_start > start and text[ascii_start - 1].isascii():
+                ascii_start -= 1
+            if (start < ascii_start < at and text[ascii_start].isalnum()
+                    and all(_unspaced_script(char) for char in text[start:ascii_start])):
+                start = ascii_start
         if start == at:
             continue
         domain = _DOMAIN.match(text, at + 1)
         domain_end = domain.end() if domain else at + 1
-        # Unicode local parts and international domain labels are real email
-        # syntax. Do not normalize them in the exported text: offsets and the
-        # original bytes must still match. Short adjacent prose can be included;
-        # oversized runs are deferred by the replacement boundary check.
+        # Unicode local parts and international domain labels remain supported.
+        # Do not extend an already complete ASCII domain into unspaced prose.
+        # Delimited international mailboxes keep their complete original span.
         cursor_right = at + 1
         while cursor_right < len(text) and (
             text[cursor_right] in ".-"
@@ -106,7 +125,11 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
         if len(labels) >= 2 and len(labels[-1]) >= 2 and all(
             unicodedata.category(char)[0] in "LM" for char in labels[-1]
         ):
-            domain_end = max(domain_end, at + 1 + len(raw_domain))
+            prose_tail = (domain is not None and not delimited
+                          and domain_end < cursor_right
+                          and _unspaced_script(text[domain_end]))
+            if not prose_tail:
+                domain_end = max(domain_end, at + 1 + len(raw_domain))
         if domain_end > at + 1:
             end_of_match = domain_end
             cursor = end_of_match

@@ -65,7 +65,7 @@ def test_non_host_replacement_rechecks_newly_exposed_host_boundaries(route):
 @pytest.mark.parametrize("route", ["findings", "map"])
 def test_previous_replacements_move_but_do_not_reparse_code(route, monkeypatch):
     email = "numpy.array@torch.tensor"
-    text = 'label = "verylongperson@example.com"\nimport numpy\nimport torch\nvalue = '+email+'\nobj.local()\ncontact = "'+email+'"\n'
+    text = 'obj = object()\nlabel = "verylongperson@example.com"\nimport numpy\nimport torch\nvalue = '+email+'\nobj.local()\ncontact = "'+email+'"\n'
     expected = text.replace("verylongperson@example.com", "[REDACTED_EMAIL]").replace('"'+email+'"', '"[REDACTED_EMAIL]"')
     if route == "findings":
         actual, count = findings.apply_findings_to_text(text, [finding("verylongperson@example.com"), finding(email), finding("obj.local", "private_url")])
@@ -86,18 +86,19 @@ def test_previous_replacements_move_but_do_not_reparse_code(route, monkeypatch):
 def test_original_code_evidence_survives_an_earlier_edit_that_breaks_syntax(source):
     # Removing the end of a string must not make an unrelated genuine method
     # call disappear merely because the mutated text no longer parses.
-    text = 'x = "long-marker"\nobj.local()\ncontact = "obj.local"\n'
+    text = 'obj = object()\nx = "long-marker"\nobj.local()\ncontact = "obj.local"\n'
     items = [finding('long-marker"', "custom_sensitive", source=source), finding("obj.local", "private_url")]
     expected = text.replace('long-marker"', "[REDACTED]").replace('"obj.local"', '"[REDACTED_URL]"')
     assert findings.apply_findings_to_text(text, items) == (expected, 2)
 
 
 def test_credential_edit_inside_a_protected_interval_invalidates_it():
-    text = "obj.local(); other.local()"
+    text = "obj = object(); other = object()\nobj.local(); other.local()"
     context = cc.code_context(text)
-    result, count = replace_spans(text, [(0, 3, "[REDACTED]")], context=context)
+    start = text.index("obj.local")
+    result, count = replace_spans(text, [(start, start + 3, "[REDACTED]")], context=context)
     assert count == 1
-    assert not context.protects(0, len("[REDACTED].local"))
+    assert not context.protects(start, start + len("[REDACTED].local"))
     start = result.index("other.local")
     assert context.protects(start, start + len("other.local"))
 
@@ -105,7 +106,7 @@ def test_credential_edit_inside_a_protected_interval_invalidates_it():
 @pytest.mark.parametrize("length", [65535, 65536, 65537, 200000])
 @pytest.mark.parametrize("wrapper", ["source", "fenced", "string"])
 def test_code_evidence_does_not_silently_disappear_at_64k(length, wrapper):
-    code = "import numpy\nimport torch\nvalue = numpy.array@torch.tensor\nobj.local()\n"
+    code = "obj = object()\nimport numpy\nimport torch\nvalue = numpy.array@torch.tensor\nobj.local()\n"
     body = code + "#" * (length - len(code)) + "\n"
     text = body if wrapper == "source" else ("```python\n" + body + "```" if wrapper == "fenced" else 'data = """\n```python\n' + body + '```\n"""')
     context = cc.code_context(text)
@@ -116,7 +117,7 @@ def test_code_evidence_does_not_silently_disappear_at_64k(length, wrapper):
 
 @pytest.mark.parametrize("length", [65535, 65536, 65537, 200000])
 def test_long_code_output_preserves_calls_and_redacts_literal_copies(length):
-    prefix = 'obj.local()\ncontact = "obj.local"\n'
+    prefix = 'obj = object()\nobj.local()\ncontact = "obj.local"\n'
     text = prefix + "#" * (length - len(prefix))
     result, count = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
     assert result == text.replace('"obj.local"', '"[REDACTED_URL]"')
@@ -131,16 +132,25 @@ def test_long_source_keeps_preceding_imports_and_unicode_offsets():
 
 
 def test_parse_budget_disables_hints_but_keeps_scanning(monkeypatch):
+    text = 'obj = object()\nobj.local()\ncontact = "alice@audit.test"\n' + "#" * 101
+    assert cc.code_context(text).protected
     monkeypatch.setattr(cc, "_MAX_PARSE_CHARS", 100)
-    text = 'contact = "alice@audit.test"\n' + "#" * 101
+    original = cc._ast_parse
+    def bounded(source):
+        assert len(source) <= 100, "Over-budget source reached AST"
+        return original(source)
+    monkeypatch.setattr(cc, "_ast_parse", bounded)
+    assert cc._parse(text) is None
     assert cc.code_context(text).protected == []
     assert secrets.redact_text(text, strict=True)[0] == text.replace("alice@audit.test", "[REDACTED_EMAIL]")
 
 
 @pytest.mark.parametrize("limit", ["_MAX_PARSE_TOKENS", "_MAX_STATEMENT_TOKENS"])
 def test_complexity_budget_does_not_abort_detection(limit, monkeypatch):
+    text = 'obj = object()\nobj.local()\ncontact = "alice@audit.test"\n' + "#" * 66000 + "\nx = a + b + c + d\n"
+    assert cc.code_context(text).protected
     monkeypatch.setattr(cc, limit, 5)
-    text = 'contact = "alice@audit.test"\n' + "#" * 66000 + "\nx = a + b + c + d\n"
+    monkeypatch.setattr(cc, "_ast_parse", lambda *_: pytest.fail("Over-budget tokens reached AST"))
     assert cc.code_context(text).protected == []
     assert any(f["match"] == "alice@audit.test" for f in secrets.scan_text(text))
 
@@ -182,9 +192,10 @@ def test_malformed_single_quote_before_string_data_never_exempts_its_fence():
 
 def test_shortening_a_protected_call_cannot_exempt_a_later_literal():
     prefix = "A" * 40
-    text = prefix + '.local()\nhost = "db.local"\n'
+    text = prefix + ' = object()\n' + prefix + '.local()\nhost = "db.local"\n'
+    assert cc.code_context(text).protected
     result, n = secrets._apply_redaction_set(text, {prefix: "[REDACTED_SECRET]", "db.local": "[REDACTED_URL]"})
-    assert (result, n) == ('[REDACTED_SECRET].local()\nhost = "[REDACTED_URL]"\n', 2)
+    assert (result, n) == ('[REDACTED_SECRET] = object()\n[REDACTED_SECRET].local()\nhost = "[REDACTED_URL]"\n', 3)
 
 
 def test_nested_formatted_string_quotes_cannot_exempt_literal_fences():

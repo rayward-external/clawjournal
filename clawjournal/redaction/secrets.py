@@ -78,6 +78,9 @@ SECRET_PATTERNS = [
 
     # GitHub tokens
     ("github_token", re.compile(r"(?:ghp|gho|ghs|ghr)_[A-Za-z0-9]{30,}")),
+    # Fine-grained PATs have a separate prefix. Never retain the head of an
+    # oversized credential just because it also resembles an email local part.
+    ("github_token", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
 
     # PyPI tokens
     ("pypi_token", re.compile(r"pypi-[A-Za-z0-9_-]{50,}")),
@@ -493,14 +496,9 @@ def _secret_continuation_matches(pattern: re.Pattern[str], text: str) -> Iterabl
 
 
 def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
-    if pattern == _SECRET_EMAIL_PATTERN:
-        from .chunked import finditer
-        yield from finditer(pattern, text, continuation=_secret_continuation_matches,
-                            has_anchor=lambda run: "@" in run)
-    else:
-        # Private keys retain complete-text BEGIN/END handling. A chunk-size
-        # limit must never truncate or change the existing private-key rule.
-        yield from _secret_continuation_matches(pattern, text)
+    # Email and private-key adapters retain complete original-text matches.
+    # No child interpreter is required by deterministic scanning.
+    yield from _secret_continuation_matches(pattern, text)
 
 
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:

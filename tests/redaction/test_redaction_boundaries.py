@@ -127,7 +127,7 @@ def test_legacy_review_removes_email_adjacent_to_chinese():
 
 @pytest.mark.parametrize("text,expected", [
     pytest.param("x@redaction-audit.test", "[REDACTED_EMAIL]", id="one-character-local-part"),
-    pytest.param("请联系ab@redaction-audit.test谢谢", "[REDACTED_EMAIL]", id="two-characters-next-to-chinese"),
+    pytest.param("请联系ab@redaction-audit.test谢谢", "请联系[REDACTED_EMAIL]谢谢", id="two-characters-next-to-chinese"),
     pytest.param("o'connor@redaction-audit.test", "[REDACTED_EMAIL]", id="apostrophe-leaves-name-fragment"),
 ])
 def test_email_coverage_gaps_remove_the_whole_address(render_builtin, text, expected):
@@ -157,6 +157,7 @@ def test_markerless_private_key_keeps_previous_behavior(render_builtin):
     "import numpy\nimport torch\nresult = numpy.array@torch.tensor", "value = obj.local()",
 ])
 def test_ordinary_code_is_not_redacted(render_builtin, text):
+    text = "obj = object()\n" + text
     assert render_builtin(text) == text
 
 
@@ -370,6 +371,7 @@ for text in ["A" * 200_000 + "alice@audit.test", "12345678:" + "A" * 200_000, "a
     "```python\nimport numpy\nimport torch\nresult = numpy.array@torch.tensor\n```",
 ])
 def test_code_occurrences_survive_builtins_and_review(render_builtin, text):
+    text = text.replace("```python\n", "```python\nobj = object()\n") if text.startswith("```") else "obj = object()\n" + text
     assert render_builtin(text) == text
     findings = pii._content_findings_for_text("synthetic", 0, "content", text)
     assert apply_findings_to_text(text, findings)[0] == text
@@ -393,6 +395,7 @@ def test_code_occurrences_survive_builtins_and_review(render_builtin, text):
     ('before<one.two@sub.audit.test>after', 'before<[REDACTED_EMAIL]>after'),
 ])
 def test_code_context_never_exempts_secrets_in_strings_comments_or_arguments(render_builtin, text, expected):
+    text, expected = "obj = object()\n" + text, "obj = object()\n" + expected
     assert render_builtin(text) == expected
 
 
@@ -523,6 +526,7 @@ def test_assignment_ignore_keeps_legacy_full_match_hash(builtin_conn, render_bui
 @pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028", "\u2029", "\x85", "\v", "\f"])
 def test_unicode_line_separators_do_not_shift_syntax_protection(render_builtin, separator):
     prefix = '"前' + separator + '后"; ' if separator not in {"\n", "\r\n"} else '# 前' + separator
+    prefix = 'obj = object()\n' + prefix
     text = prefix + 'value = obj.local("obj.local")'
     assert render_builtin(text) == prefix + 'value = obj.local("[REDACTED_URL]")'
 
@@ -585,8 +589,8 @@ def test_seeded_occurrence_cases_preserve_complete_ordinary_text(render_builtin)
         for _ in range(50):
             word = "word" + str(rng.randrange(10_000))
             method = rng.choice(["local", "internal", "corp", "lan", "intranet", "localnet"])
-            text = f'value = obj.{method}("{word}@ {word} {word}@audit.test obj.{method}")'
-            expected = f'value = obj.{method}("[REDACTED_EMAIL]@ {word} [REDACTED_EMAIL] [REDACTED_URL]")'
+            text = f'obj = object()\nvalue = obj.{method}("{word}@ {word} {word}@audit.test obj.{method}")'
+            expected = f'obj = object()\nvalue = obj.{method}("[REDACTED_EMAIL]@ {word} [REDACTED_EMAIL] [REDACTED_URL]")'
             assert render_builtin(text) == expected
 
 
@@ -595,7 +599,7 @@ def test_repeated_code_and_assignment_contexts_have_a_deadline():
 from clawjournal.redaction.secrets import redact_session
 from clawjournal.redaction.pii import scan_text_for_pii
 from clawjournal.redaction.replacements import replace_email_fragments
-source = 'value = obj.local("db01.local")\n' * 1_000
+source = 'obj = object()\n' + 'value = obj.local("db01.local")\n' * 1_000
 matches = scan_text_for_pii(source)
 assert len(matches) == 1_000
 assert all(source[m["start"] - 1] == '"' for m in matches)
