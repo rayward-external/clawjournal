@@ -59,6 +59,14 @@ propagation keep their existing field/session scope. Manual and automatic
 sharing use this same scanning path. Packaging and all scan gates finish
 before upload starts; faster scanning does not change network transfer time.
 
+A local Aho-Corasick prefilter (`pyahocorasick`) checks required literal markers
+before the built-in secret and PII regex passes. Common punctuation uses
+presence checks to avoid processing every repeated dot or quote. Only exact
+reviewed regexes can be skipped; new or changed rules still run. Small fields
+and an unavailable or failed accelerator use the original rules. The prefilter
+does not change matching, Unicode boundaries, review policy or external gates,
+and does not retain field text between calls. RE2 is not used.
+
 Code evidence is collected from the original field and its offsets move with
 known replacements. It is not reparsed for each email or hostname, and edits
 cannot create new code exemptions. Host-boundary evidence is rechecked when

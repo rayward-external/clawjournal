@@ -23,6 +23,7 @@ from collections.abc import Iterable
 from enum import Enum
 from typing import Any
 
+from .prefilter import filter_rules
 from ..findings import RawFinding, hash_entity
 from ..parsing.widened import iter_widened_text_locations
 
@@ -512,7 +513,7 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     context = code_context(text)
 
     findings = []
-    for name, pattern in SECRET_PATTERNS:
+    for name, pattern in filter_rules(text, SECRET_PATTERNS):
         if not has_assignment_sep and name in _ASSIGNMENT_PATTERNS:
             continue
 

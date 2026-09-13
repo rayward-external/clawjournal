@@ -19,6 +19,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
+from .prefilter import filter_rules
 from .replacements import ReplacementMap
 
 from ..findings import (
@@ -1004,7 +1005,7 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
     context = code_context(text)
 
     matches: list[dict] = []
-    for rule_name, pattern, entity_type, confidence, group, kind in _PII_CONTENT_PATTERNS_COMPILED:
+    for rule_name, pattern, entity_type, confidence, group, kind in filter_rules(text, _PII_CONTENT_PATTERNS_COMPILED):
         for m in _content_matches(pattern, text):
             try:
                 entity_text = m.group(group)
