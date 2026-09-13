@@ -3135,7 +3135,7 @@ def _apply_upload_pii_redactions(
             cov = "rules_only"
         replacement_count = 0
         if findings:
-            session, replacement_count = apply_findings_to_session(session, findings)
+            session, replacement_count = apply_findings_to_session(session, findings, strict=True)
         coverage_bucket = cov if cov in coverage else "rules_only"
         return index, session, len(findings), replacement_count, coverage_bucket
 
@@ -4749,6 +4749,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_upload_share(share_id)
         elif path == "/api/shares":
             self._handle_create_share()
+        elif path == "/api/share-review-cache/clear":
+            self._handle_clear_share_review_cache()
         elif path.startswith("/api/shares/") and path.endswith("/export"):
             share_id = path[len("/api/shares/"):-len("/export")]
             self._handle_export_share(share_id)
@@ -5804,7 +5806,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     )
                     ai_coverage = "full"
                     if findings:
-                        detail, ai_pii_count = apply_findings_to_session(detail, findings)
+                        detail, ai_pii_count = apply_findings_to_session(detail, findings, strict=True)
                         ai_pii_findings = [
                             {
                                 "entity_type": f.get("entity_type", ""),
@@ -6885,6 +6887,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception("Quick share failed")
             _json_response(self, {"error": str(exc)}, 500)
+        finally:
+            conn.close()
+
+    def _handle_clear_share_review_cache(self) -> None:
+        body = _read_body(self)
+        if not isinstance(body, dict) or body.get('confirm_invalidate_pending_reviews') is not True:
+            _json_response(self, {'error': 'Confirm that unsubmitted packages will need new reviews.'}, 400)
+            return
+        from .review_snapshots import clear_review_cache
+        conn = open_index()
+        try:
+            clear_review_cache(conn, include_linked=True)
+            _json_response(self, {'ok': True})
         finally:
             conn.close()
 

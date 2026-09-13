@@ -149,7 +149,7 @@ def build_redaction_record(conn, session_detail: dict, settings: dict,
             findings = review_session_pii_with_agent(red, ignore_errors=False, backend=backend)
             ai_coverage = "full"
             if findings:
-                red, ai_count = apply_findings_to_session(red, findings)
+                red, ai_count = apply_findings_to_session(red, findings, strict=True)
                 count += ai_count
                 ai_findings = findings
         except RedactionBoundaryError:

@@ -13,6 +13,7 @@ from collections.abc import Iterator
 
 _LOCAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+/=?^_`{|}~-_")
 _DOMAIN = re.compile(r"(?:\[(?:IPv6:)?[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+\.(?:xn--[A-Za-z0-9-]+|[A-Za-z]{2,}))", re.I)
+_EMAIL_FIELD = re.compile(r"(?<![\w])(?:to|from|email|e[-_]?mail|recipient|sender|cc|bcc)[\"']?\s*[:=]\s*[\"']$", re.I)
 _TOKEN_TAIL = re.compile(r"[A-Za-z0-9_-]{30,}")
 _NAMED_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])(?:telegram_bot_token|telegram_api_token|telegram_token|telegramBotToken)"
@@ -30,15 +31,21 @@ _PERSONAL_HOST = re.compile(
     re.I,
 )
 _ESCAPED_SEPARATOR = re.compile(r"%([234][0aAeE])|\\u00(2[eE]|3[aA]|40)|&#(?:0*(46|58|64)|[xX]0*(2[eE]|3[aA]|40));")
-_URL_AUTHORITY = re.compile(r"(?:https?|ssh|git|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?)://([^\s/?#\"'`<>]+)", re.I)
+_URL_AUTHORITY = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://([^\s/?#\"'`<>|]+)")
 
 
 def credentialed_urls(text: str):
     """Return explicit URL userinfo, independently of email length budgets."""
     for match in _URL_AUTHORITY.finditer(text):
         authority = match.group(1)
-        at = authority.rfind('@')
+        at = authority.find('@')
         if at > 0 and at < len(authority) - 1:
+            # A hostname followed by a list separator and an address is not
+            # proof that the preceding URL contains that address as userinfo.
+            # Keep punctuation in explicit user:password credentials intact.
+            prefix = authority[:at]
+            if ':' not in prefix and re.match(r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}[,;]", prefix):
+                continue
             yield match.start(1), match.start(1) + at, match.end(1)
 
 
@@ -121,6 +128,13 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
         # quote is not a mailbox delimiter; it may enclose a whole sentence.
         # Punctuation joins (e.g. ツ-test) remain part of the local part.
         delimited = text[start:start + 1] == '"' or (start > 0 and text[start - 1] == '<')
+        # A complete value in an address field is an explicit SMTPUTF8
+        # mailbox. Merely quoting prose cannot make its prefix a mailbox.
+        if (start and text[start - 1] in "\"'"
+                and _EMAIL_FIELD.search(text[max(0, start - 96):start])):
+            quoted_domain = _DOMAIN.match(text, at + 1)
+            if quoted_domain and text[quoted_domain.end():quoted_domain.end() + 1] == text[start - 1]:
+                delimited = True
         if text[start:start + 1] != '"' and not delimited:
             ascii_start = at
             while ascii_start > start and text[ascii_start - 1].isascii():
@@ -129,11 +143,18 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                     and _unspaced_script(text[ascii_start - 1])):
                 start = ascii_start
         if not delimited:
-            # Query syntax delimits parameter values. Do not absorb a previous
-            # IP/host/token into an email and evict its independent evidence.
             prefix = text[start:at]
-            if ('?' in prefix or '&' in prefix) and '=' in prefix:
+            # RFC atext includes / & ? =. Split only with external evidence
+            # of a rooted path, URL query, or an explicit assignment label.
+            rooted = prefix.startswith(('/', './', '../', '~/'))
+            if rooted and ('?' in prefix or '&' in prefix) and '=' in prefix:
                 start += prefix.rfind('=') + 1
+            elif rooted:
+                start += prefix.rfind('/') + 1
+            else:
+                assignment = re.match(r'(?:[A-Z][A-Z0-9_]*|email|mail|recipient|owner)=', prefix)
+                if assignment:
+                    start += assignment.end()
         if start == at:
             continue
         domain = _DOMAIN.match(text, at + 1)
@@ -201,7 +222,8 @@ def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
         expression |= rule == "host" and "." in value and "_" in value.rsplit(".", 1)[-1]
         # The existing internal-TLD rule supplies separate evidence for
         # db01.local(), and the complete numeric Telegram shape still wins.
-        if expression and not _HOST_SUFFIX.search(value) and ":" not in value:
+        if expression and ":" not in value and (
+                not _HOST_SUFFIX.search(value) or rule == "host"):
             # This match ends inside a lookup/call, not at the end of a
             # host or token value. Other complete credential/host rules still
             # scan the expression and its arguments. A rejected optional
@@ -270,7 +292,11 @@ def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
                 value = match.group(1)
                 if value.lower() in {'into', 'the', 'keys', 'with', 'to', 'from', 'and', 'is', 'on', 'using'}:
                     continue
-                if before not in {'', '$', '>', '`', '```'} and '@' not in match.group() and '.' not in value:
+                command_prefix = re.search(
+                    r'(?:^|[;&|`$>])\s*(?:(?:sudo|time|command|exec|env|coder)\s+)*$', before + ' ',
+                ) or re.fullmatch(r'(?:[-*+]|\d+[.)]|Step\s+\d+:)', before, re.I)
+                host_shape = '@' in match.group() or '.' in value or any(c.isdigit() for c in value)
+                if not command_prefix and not host_shape:
                     continue
             if (match.group(1).lower() not in {"localhost", "127.0.0.1"}
                     and not (pattern is _HOST_FIELD and is_reference_prefix(match, "host"))):

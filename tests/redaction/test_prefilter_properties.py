@@ -44,7 +44,19 @@ def generate(tree, rng, flags):
                     )
                 parts.append(rng.choice([c for c in alphabet if accepts(c)]))
             else:
-                parts.append(generate([rng.choice(arg)], rng, flags))
+                # Sample characters, not parser branches. Choosing a RANGE
+                # and a singleton with equal probability makes incidental
+                # '=' in a 40-byte AWS value almost certain, hiding a deleted
+                # ':' alternative in the marker prefilter.
+                alphabet = []
+                for item, value in arg:
+                    if str(item) == 'RANGE':
+                        alphabet.extend(chr(c) for c in range(value[0], value[1] + 1))
+                    elif str(item) == 'LITERAL':
+                        alphabet.append(chr(value))
+                    else:
+                        alphabet.extend(generate([(item, value)], rng, flags))
+                parts.append(rng.choice(alphabet))
         elif name == 'RANGE':
             parts.append(chr(rng.randint(*arg)))
         elif name == 'CATEGORY':
@@ -109,6 +121,19 @@ LONG_MARKERS = [(pattern, word) for pattern in HINTED for word in prefilter._PAT
 @pytest.mark.parametrize('pattern,word', LONG_MARKERS, ids=[f'marker-{i}' for i in range(len(LONG_MARKERS))])
 def test_narrowing_any_multicharacter_marker_is_caught(monkeypatch, pattern, word):
     changed = tuple(marker + 'A' if marker == word else marker for marker in prefilter._PATTERN_LITERALS[pattern])
+    monkeypatch.setitem(prefilter._PATTERN_LITERALS, pattern, changed)
+    with pytest.raises(AssertionError):
+        test_generated_positives_cannot_be_rejected(pattern)
+
+
+ALTERNATIVES = [(pattern, word) for pattern in HINTED
+                if len(prefilter._PATTERN_LITERALS[pattern]) > 1
+                for word in prefilter._PATTERN_LITERALS[pattern]]
+
+
+@pytest.mark.parametrize('pattern,word', ALTERNATIVES, ids=[f'alternative-{i}' for i in range(len(ALTERNATIVES))])
+def test_deleting_any_marker_alternative_is_caught(monkeypatch, pattern, word):
+    changed = tuple(marker for marker in prefilter._PATTERN_LITERALS[pattern] if marker != word)
     monkeypatch.setitem(prefilter._PATTERN_LITERALS, pattern, changed)
     with pytest.raises(AssertionError):
         test_generated_positives_cannot_be_rejected(pattern)

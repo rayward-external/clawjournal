@@ -90,7 +90,8 @@ def test_unrelated_provider_finding_does_not_block_ordinary_text():
                "source": "ai", "confidence": 0.9}
     assert apply_findings_to_text("ordinary content", [finding]) == ("ordinary content", 0)
     with pytest.raises(RedactionBoundaryError):
-        apply_findings_to_text(finding["entity_text"], [finding])
+        apply_findings_to_text(finding["entity_text"], [finding], strict=True)
+    assert apply_findings_to_text(finding['entity_text'], [finding])[0] == '[REDACTED_EMAIL]'
 
 
 def test_strict_scan_indexes_whole_project_with_reference_prose(tmp_path, monkeypatch):
@@ -161,5 +162,5 @@ def test_limited_local_email_span_cannot_evict_an_overlapping_credential():
     text = key + "A" * 1000 + "@audit.test"
     result, count, _ = secrets.redact_text(text)
     assert key not in result
-    assert result == "[REDACTED_EMAIL]"
+    assert result == "[REDACTED_ANTHROPIC_KEY]"
     assert count == 1

@@ -39,7 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 6  # Rebuild findings after quoted-fence and mixed-prose fixes.
+ENGINE_VERSION = 7  # Rebuild URL, mailbox-boundary and imported-host findings.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 
@@ -958,7 +958,7 @@ def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> l
     return sorted(merged, key=lambda f: (f.get("session_id", ""), int(f.get("message_index", 0)), f.get("field", "content"), -len(f.get("entity_text", ""))))
 
 
-def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, int]:
+def apply_findings_to_text(text: str, findings: list[PIIFinding], *, strict: bool = False) -> tuple[str, int]:
     if not text or not findings:
         return text, 0
     # A session-level finding may belong to another field, or an AI response
@@ -972,9 +972,10 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
     from .redaction.replacements import replace_spans
 
     context = code_context(text)
-    ensure_text_boundaries(text, context=context)
-    for finding in findings:
-        ensure_safe_replacement(str(finding.get("entity_text") or ""), str(finding.get("entity_type") or ""))
+    if strict:
+        ensure_text_boundaries(text, context=context)
+        for finding in findings:
+            ensure_safe_replacement(str(finding.get("entity_text") or ""), str(finding.get("entity_type") or ""))
     ordered = sorted(
         [f for f in findings if f.get("entity_text")],
         key=lambda f: (-len(f.get("entity_text", "")), -float(f.get("confidence", 0.0))),
@@ -1016,6 +1017,7 @@ def apply_findings_to_session(
     session: dict[str, Any],
     findings: list[PIIFinding],
     min_confidence: float = 0.0,
+    *, strict: bool = False,
 ) -> tuple[dict[str, Any], int]:
     total = 0
     session_id = str(session.get("session_id") or "")
@@ -1034,7 +1036,7 @@ def apply_findings_to_session(
     ):
         value = session.get(meta_field)
         if isinstance(value, str):
-            new_value, n = apply_findings_to_text(value, session_findings)
+            new_value, n = apply_findings_to_text(value, session_findings, strict=strict)
             session[meta_field] = new_value
             total += n
 
@@ -1043,11 +1045,11 @@ def apply_findings_to_session(
         try:
             detail = json.loads(raw_detail)
         except json.JSONDecodeError:
-            new_value, n = apply_findings_to_text(raw_detail, session_findings)
+            new_value, n = apply_findings_to_text(raw_detail, session_findings, strict=strict)
             session["ai_scoring_detail"] = new_value
             total += n
         else:
-            redacted_detail, n = _apply_findings_to_value(detail, session_findings)
+            redacted_detail, n = _apply_findings_to_value(detail, session_findings, strict=strict)
             session["ai_scoring_detail"] = json.dumps(redacted_detail)
             total += n
 
@@ -1061,7 +1063,7 @@ def apply_findings_to_session(
         for field in ("content", "thinking"):
             value = msg.get(field)
             if isinstance(value, str):
-                new_value, n = apply_findings_to_text(value, session_findings)
+                new_value, n = apply_findings_to_text(value, session_findings, strict=strict)
                 msg[field] = new_value
                 total += n
         for tool_use in msg.get("tool_uses", []):
@@ -1072,11 +1074,11 @@ def apply_findings_to_session(
                 if isinstance(value, dict):
                     for key in list(value.keys()):
                         if isinstance(value[key], str):
-                            new_value, n = apply_findings_to_text(value[key], session_findings)
+                            new_value, n = apply_findings_to_text(value[key], session_findings, strict=strict)
                             value[key] = new_value
                             total += n
                 elif isinstance(value, str):
-                    new_value, n = apply_findings_to_text(value, session_findings)
+                    new_value, n = apply_findings_to_text(value, session_findings, strict=strict)
                     tool_use[branch] = new_value
                     total += n
     return session, total
@@ -1085,14 +1087,15 @@ def apply_findings_to_session(
 def _apply_findings_to_value(
     value: Any,
     findings: list[PIIFinding],
+    *, strict: bool = False,
 ) -> tuple[Any, int]:
     if isinstance(value, str):
-        return apply_findings_to_text(value, findings)
+        return apply_findings_to_text(value, findings, strict=strict)
     if isinstance(value, list):
         total = 0
         out: list[Any] = []
         for item in value:
-            redacted, n = _apply_findings_to_value(item, findings)
+            redacted, n = _apply_findings_to_value(item, findings, strict=strict)
             out.append(redacted)
             total += n
         return out, total
@@ -1100,7 +1103,7 @@ def _apply_findings_to_value(
         total = 0
         out: dict[str, Any] = {}
         for key, item in value.items():
-            redacted, n = _apply_findings_to_value(item, findings)
+            redacted, n = _apply_findings_to_value(item, findings, strict=strict)
             out[key] = redacted
             total += n
         return out, total

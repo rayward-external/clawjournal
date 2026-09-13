@@ -18,6 +18,7 @@ from clawjournal.workbench.index import (
     SCORING_QUEUE_SCHEMA_VERSION,
     SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION,
     REDACTION_CACHE_SCHEMA_VERSION,
+    REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION,
     WORKBENCH_SCHEMA_VERSION,
     already_shared_revision_blockers,
     auto_upload_review_blockers,
@@ -117,7 +118,7 @@ def _mark_shared(conn, session_id: str) -> str:
 
 def test_fresh_schema_has_auto_upload_foundation(index_conn):
     assert index_conn.execute("PRAGMA user_version").fetchone()[0] == WORKBENCH_SCHEMA_VERSION
-    assert WORKBENCH_SCHEMA_VERSION == REDACTION_CACHE_SCHEMA_VERSION
+    assert WORKBENCH_SCHEMA_VERSION == REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION
     assert REDACTION_CACHE_SCHEMA_VERSION > SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION
     assert SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION > SCORING_QUEUE_SCHEMA_VERSION
     assert SCORING_QUEUE_SCHEMA_VERSION > LOGICAL_CHECKPOINT_SCHEMA_VERSION

@@ -314,3 +314,77 @@ def test_open_index_does_not_take_a_write_lock_for_an_unchanged_cache(conn):
     other = index.open_index()
     other.close()
     conn.rollback()
+
+
+def test_completed_share_reexports_unchanged_source_without_restoring_raw_cache(conn, tmp_path):
+    index.upsert_sessions(conn, [trace()])
+    snapshot = preview(conn)
+    share_id = create(conn, snapshot)
+    first_dir, first = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id))
+    first_bytes = (first_dir / 'sessions.jsonl').read_bytes()
+    conn.execute("UPDATE shares SET status = 'shared', shared_at = '2026-09-13' WHERE share_id = ?", (share_id,))
+    conn.commit()
+    assert conn.execute('SELECT payload FROM share_review_snapshots WHERE snapshot_id = ?', (snapshot,)).fetchone()[0] == ''
+    second_dir, second = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id), output_path=str(tmp_path / 'reexport'))
+    assert not first.get('blocked') and not second.get('blocked')
+    assert json.loads((second_dir / 'sessions.jsonl').read_bytes()) == json.loads(first_bytes)
+    assert conn.execute('SELECT payload FROM share_review_snapshots WHERE snapshot_id = ?', (snapshot,)).fetchone()[0] == ''
+
+
+@pytest.mark.parametrize('change', ['append', 'scope', 'metadata', 'inactive', 'blocked', 'pending-cleared', 'legacy-identity'])
+def test_cleared_snapshot_recovery_never_authorizes_different_inputs(conn, change):
+    from clawjournal.workbench.review_snapshots import clear_review_cache
+    index.upsert_sessions(conn, [trace()])
+    snapshot = preview(conn)
+    share_id = create(conn, snapshot)
+    if change == 'pending-cleared':
+        clear_review_cache(conn, include_linked=True)
+    else:
+        conn.execute("UPDATE shares SET shared_at = '2026-09-13' WHERE share_id = ?", (share_id,))
+    if change == 'append':
+        index.upsert_sessions(conn, [trace('Later unreviewed content')])
+    elif change == 'scope':
+        conn.execute("UPDATE sessions SET source = 'claude'")
+    elif change == 'metadata':
+        conn.execute("UPDATE sessions SET display_title = 'New unreviewed title'")
+    elif change == 'inactive':
+        conn.execute('UPDATE sessions SET checkpoint_active = 0')
+    elif change == 'blocked':
+        conn.execute("UPDATE sessions SET review_status = 'blocked'")
+    elif change == 'legacy-identity':
+        conn.execute('UPDATE share_review_snapshots SET identity = NULL')
+    conn.commit()
+    assert index.share_revision_blockers(conn, share_id)
+
+
+def test_active_cli_selection_cannot_evict_its_own_earlier_previews(conn, monkeypatch):
+    from clawjournal import share_cli
+    from clawjournal.workbench import review_snapshots as cache
+    monkeypatch.setattr(cache, 'MAX_UNLINKED_SNAPSHOTS', 100)
+    for engine in ('betterleaks', 'trufflehog'):
+        monkeypatch.setattr(f'clawjournal.redaction.{engine}.{engine}_secret_map_from_blob', lambda *a, **kw: {})
+    rows = [trace('A synthetic trace', f'selection-{i}') for i in range(101)]
+    index.upsert_sessions(conn, rows)
+    settings = dict(custom_strings=[], allowlist_entries=[], extra_usernames=[], blocked_domains=[])
+    records = share_cli._build_records(conn, settings, rows, False)
+    share_id = index.create_share(conn, [r['session_id'] for r in rows],
+        review_snapshot_ids={r['row']['session_id']: r['review_snapshot_id'] for r in records})
+    assert len(index.get_share(conn, share_id)['sessions']) == 101
+    # A different preview still cannot evict the now-linked selection.
+    index.upsert_sessions(conn, [trace('Next trace', 'next')])
+    preview(conn, 'next')
+    assert not index.share_revision_blockers(conn, share_id)
+
+
+def test_review_identity_migration_retains_scope_and_runs_once(conn):
+    index.upsert_sessions(conn, [trace()])
+    snapshot = preview(conn)
+    conn.execute('ALTER TABLE share_review_snapshots DROP COLUMN identity')
+    conn.execute('PRAGMA user_version = 15')
+    conn.commit()
+    index._migrate_review_snapshot_identity(conn)
+    identity = conn.execute('SELECT identity FROM share_review_snapshots WHERE snapshot_id = ?', (snapshot,)).fetchone()[0]
+    from clawjournal.workbench.review_snapshots import review_identity
+    assert identity == review_identity(index.get_session_detail(conn, 'test-trace'))
+    assert len(identity) == 64 and 'synthetic-project' not in identity
+    index._migrate_review_snapshot_identity(conn)

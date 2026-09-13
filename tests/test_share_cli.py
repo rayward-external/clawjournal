@@ -78,7 +78,7 @@ def test_summary_titles_use_resolved_backend_default(monkeypatch):
 
     monkeypatch.setattr(share_cli, "resolve_backend", lambda backend: "codex")
     monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": [], "content_revision": "reviewed"})
-    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail: "preview")
+    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail, **kw: "preview")
     monkeypatch.setattr(share_cli, "_load_title_cache", lambda: {})
     monkeypatch.setattr(share_cli, "_save_title_cache", lambda cache: None)
 
@@ -446,7 +446,7 @@ def _fake_rec(coverage, status="review"):
 
 def test_step_redact_degrades_to_rules_only_when_ai_unavailable(monkeypatch):
     monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": [], "content_revision": "reviewed"})
-    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail: "preview")
+    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail, **kw: "preview")
     seen = []
 
     def fake_build(conn, detail, settings, use_ai, **k):
@@ -464,7 +464,7 @@ def test_step_redact_degrades_to_rules_only_when_ai_unavailable(monkeypatch):
 
 def test_step_redact_keeps_ai_when_uniformly_full(monkeypatch):
     monkeypatch.setattr(share_cli, "get_session_detail", lambda conn, sid: {"messages": [], "content_revision": "reviewed"})
-    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail: "preview")
+    monkeypatch.setattr("clawjournal.workbench.review_snapshots.save_review_snapshot", lambda conn, detail, **kw: "preview")
     monkeypatch.setattr(share_cli, "build_redaction_record",
                         lambda conn, detail, settings, use_ai, **k: _fake_rec("full", "clear"))
     chosen = [{"session_id": "a", "display_title": "A"}]
@@ -837,7 +837,7 @@ def test_cli_preview_failures_are_clean_and_do_not_save_raw_failed_previews(monk
     detail = {'session_id': 'synthetic', 'content_revision': 'revision'}
     monkeypatch.setattr(share_cli, 'get_session_detail', lambda *a: detail)
     saved = []
-    def save(*a):
+    def save(*a, **kw):
         saved.append(True)
         raise review_snapshots.ReviewSnapshotError('Refresh this synthetic preview.')
     monkeypatch.setattr(review_snapshots, 'save_review_snapshot', save)

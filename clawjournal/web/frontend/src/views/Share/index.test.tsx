@@ -73,6 +73,18 @@ afterEach(() => {
 });
 
 describe('Reviewed share versions', () => {
+  it('clears saved reviews only after confirmation and reports the result', async () => {
+    mockInitialLoad(readyStats(1));
+    const clear = vi.spyOn(api.shares, 'clearReviews').mockResolvedValue({ ok: true });
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear saved reviews' }));
+    expect(screen.getByText(/Unsubmitted packages will need new reviews/)).toBeInTheDocument();
+    expect(clear).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear reviews' }));
+    await waitFor(() => expect(clear).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/Saved reviews cleared/)).toBeInTheDocument();
+  });
+
   it.each([true, false])('requires the saved preview and uses its revision (available=%s)', async (available) => {
     const stats = readyStats(1);
     stats.sessions[0].revision_hash = 'older-queue-revision';

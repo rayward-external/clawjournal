@@ -60,7 +60,7 @@ jobs:
           tests/redaction/test_trufflehog_install.py
           -v
       - name: Deterministic redaction (native Windows)
-        run: python -m pytest tests/redaction/test_prefilter.py tests/redaction/test_prefilter_properties.py tests/redaction/test_consolidated_regressions.py tests/workbench/test_review_snapshots.py tests/redaction/test_linear_scanning.py tests/redaction/test_code_context_reuse.py tests/redaction/test_ingest_boundary_policy.py tests/redaction/test_scan_entrypoints.py tests/redaction/test_review_regressions.py -v
+        run: python -m pytest tests/redaction/test_prefilter.py tests/redaction/test_prefilter_properties.py tests/redaction/test_consolidated_regressions.py tests/redaction/test_review_72317b7.py tests/workbench/test_review_snapshots.py tests/redaction/test_linear_scanning.py tests/redaction/test_code_context_reuse.py tests/redaction/test_ingest_boundary_policy.py tests/redaction/test_scan_entrypoints.py tests/redaction/test_review_regressions.py -v
 
   smoke:
     runs-on: ubuntu-latest

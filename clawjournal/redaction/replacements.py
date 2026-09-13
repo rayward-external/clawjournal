@@ -41,10 +41,13 @@ def replace_spans(text: str, spans: list[tuple[int, int, str]], *,
 
 def coalesce_replacements(spans: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
     """Cover the union of sensitive spans; never lose a partial overlap."""
+    from .secrets import _CREDENTIAL_PLACEHOLDERS
     merged: list[tuple[int, int, str]] = []
     for start, end, replacement in sorted(spans, key=lambda row: (row[0], -row[1])):
         if merged and start < merged[-1][1]:
             left, right, placeholder = merged[-1]
+            if placeholder in {'[REDACTED_EMAIL]', '[REDACTED_URL]'} and replacement in _CREDENTIAL_PLACEHOLDERS:
+                placeholder = replacement
             merged[-1] = left, max(right, end), placeholder
         else:
             merged.append((start, end, replacement))
@@ -60,9 +63,10 @@ class ReplacementMap(dict[str, str]):
     def __init__(self) -> None:
         super().__init__()
         self.email_fragments: dict[str, str] = {}
+        self.url_userinfo: dict[str, str] = {}
 
     def __bool__(self) -> bool:
-        return bool(len(self) or self.email_fragments)
+        return bool(len(self) or self.email_fragments or self.url_userinfo)
 
     def add(self, value: str, replacement: str) -> None:
         """Keep the first finding, except that credential evidence wins."""
@@ -86,6 +90,7 @@ class ReplacementMap(dict[str, str]):
             self[value] = replacement
         if isinstance(other, ReplacementMap):
             self.email_fragments.update(other.email_fragments)
+            self.url_userinfo.update(other.url_userinfo)
 
 
 def replace_email_fragments(text: str, fragments: dict[str, str], *, ignore_case: bool = False,

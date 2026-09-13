@@ -1375,6 +1375,13 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         onRemove={removeFromQueue}
         onAdd={addToQueue}
         onClearAll={clearQueue}
+        onReviewsCleared={() => {
+          cancelRedaction();
+          cancelAiRetries();
+          setRedactedSessions({});
+          setApprovedIds(new Set());
+          setPackagedShareId(null);
+        }}
         onAddMany={addManyToQueue}
         onRemoveMany={removeManyFromQueue}
         onReorder={reorderQueue}

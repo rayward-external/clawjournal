@@ -514,11 +514,19 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     from .code_context import code_context
     context = code_context(text)
 
-    from .candidate_formats import credentialed_urls, email_in_url_userinfo
+    from .candidate_formats import credentialed_urls
     url_spans = list(credentialed_urls(text))
     findings = []
     for start, end, _authority_end in url_spans:
         value = text[start:end]
+        # Username-only URLs retain the existing email allowlist policy.
+        # An email exception must never authorize an explicit password.
+        address = text[start:_authority_end].split('/', 1)[0].split(':', 1)[0]
+        if ':' not in value and (_check_user_allowlist(address, 'email', user_allowlist)
+                                 or any(pattern.search(address) for pattern in ALLOWLIST)):
+            continue
+        if ':' not in value and re.fullmatch(r'[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', address):
+            continue  # The complete legacy email below also covers the host.
         if value not in _CREDENTIAL_PLACEHOLDERS and not _check_user_allowlist(value, "url_userinfo", user_allowlist):
             findings.append({"type": "url_userinfo", "start": start, "end": end,
                              "match": value, "confidence": 0.94})
@@ -530,8 +538,7 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
             matched_text = match.group(0)
             if name in {"env_secret", "generic_secret"} and match.group(1) in set(SECRET_PLACEHOLDER.values()) | {REDACTED}:
                 continue
-            if name == "email" and (context.protects(match.start(), match.end())
-                    or email_in_url_userinfo(match.start(), match.end(), url_spans)):
+            if name == "email" and context.protects(match.start(), match.end()):
                 continue
             if name in {"env_secret", "generic_secret"} and context.is_reference(match.start(1), match.start(1) + 1):
                 continue
@@ -857,7 +864,9 @@ def _build_redaction_set(
         for f in _dedupe_overlapping_matches(findings):
             matched = f["match"]
             placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-            if "replacement_start" in f:
+            if f['type'] == 'url_userinfo':
+                secret_map.url_userinfo[matched] = placeholder
+            elif "replacement_start" in f:
                 secret_map.add(text[f["replacement_start"]:f["replacement_end"]], placeholder)
             else:
                 secret_map.add(matched, placeholder)
@@ -908,9 +917,10 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
     from .replacements import (ReplacementMap, coalesce_replacements, email_pattern,
                                replace_spans, secret_value_spans)
     from .code_context import code_context, outside_code_spans
-    from .candidate_formats import iter_partial_email_candidates
+    from .candidate_formats import iter_partial_email_candidates, credentialed_urls, email_in_url_userinfo
 
     context = None
+    urls = None
     lowered = text.lower()
     spans = []
     host_patterns = []
@@ -928,6 +938,15 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
                 context = code_context(text)
             pattern = email_pattern(secret) if replacement == "[REDACTED_EMAIL]" else re.compile(re.escape(secret), re.I if host_case else 0)
             spans.extend(outside_code_spans(text, pattern, replacement, context=context))
+            if replacement == "[REDACTED_EMAIL]" and '%' in text:
+                # A legacy finding can start inside a percent escape in URL
+                # userinfo. Preserve that detected occurrence without allowing
+                # a short email to match inside an unrelated percent mailbox.
+                if urls is None:
+                    urls = list(credentialed_urls(text))
+                for match in re.finditer(re.escape(secret), text):
+                    if email_in_url_userinfo(match.start(), match.end(), urls):
+                        spans.append((match.start(), match.end(), replacement))
             if replacement == "[REDACTED_URL]":
                 host_patterns.append(pattern)
         else:
@@ -940,6 +959,11 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
         fragments = secret_map.email_fragments
         spans.extend((m['start'], m['end'], fragments[m['match']])
                      for m in iter_partial_email_candidates(text) if m['match'] in fragments)
+    if isinstance(secret_map, ReplacementMap) and secret_map.url_userinfo:
+        if urls is None:
+            urls = list(credentialed_urls(text))
+        spans.extend((start, end, secret_map.url_userinfo[text[start:end]])
+                     for start, end, _ in urls if text[start:end] in secret_map.url_userinfo)
     edits = coalesce_replacements(spans)
     result, count = replace_spans(text, edits, context=context)
     # A removed credential/custom prefix can expose a known hostname that
@@ -1176,6 +1200,7 @@ def _dedupe_overlapping_matches(matches: list[dict]) -> list[dict]:
         overlaps = any(
             existing.get("replacement_start", existing["start"]) <= candidate.get("replacement_start", candidate["start"])
             and existing.get("replacement_end", existing["end"]) >= candidate.get("replacement_end", candidate["end"])
+            and not (existing['type'] == 'email' and candidate['type'] != 'email')
             for existing in kept
         )
         if not overlaps:
@@ -1243,7 +1268,9 @@ def _secret_map_from_text_decisions(
         if status == "ignored":
             continue
         placeholder = SECRET_PLACEHOLDER.get(finding["type"], REDACTED)
-        if "replacement_start" in finding:
+        if finding['type'] == 'url_userinfo':
+            secret_map.url_userinfo[matched] = placeholder
+        elif "replacement_start" in finding:
             secret_map.add(text[finding["replacement_start"]:finding["replacement_end"]], placeholder)
         else:
             secret_map.add(matched, placeholder)

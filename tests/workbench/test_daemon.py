@@ -8420,6 +8420,24 @@ def test_share_api_packages_the_previewed_revision_after_a_later_update(server, 
         conn.close()
 
 
+def test_review_cache_can_be_cleared_from_share_ui_with_explicit_confirmation(server):
+    from clawjournal.workbench import index
+    from clawjournal.workbench.review_snapshots import save_review_snapshot
+    with open_index() as conn:
+        upsert_sessions(conn, [{'session_id':'cache-ui', 'source':'codex', 'project':'synthetic',
+                               'messages':[{'role':'user', 'content':'Synthetic original trace'}]}])
+        snapshot = save_review_snapshot(conn, index.get_session_detail(conn, 'cache-ui'))
+        share_id = index.create_share(conn, ['cache-ui'], review_snapshot_ids={'cache-ui':snapshot})
+    assert _post(server, '/api/share-review-cache/clear', {})[0] == 400
+    with open_index() as conn:
+        assert not index.share_revision_blockers(conn, share_id)
+    assert _post(server, '/api/share-review-cache/clear', {'confirm_invalidate_pending_reviews':True})[0] == 200
+    with open_index() as conn:
+        assert index.share_revision_blockers(conn, share_id)
+        assert conn.execute("SELECT SUM(length(payload)) FROM share_review_snapshots").fetchone()[0] == 0
+        assert index.get_session_detail(conn, 'cache-ui')['messages'][0]['content'] == 'Synthetic original trace'
+
+
 @pytest.mark.parametrize('endpoint', ['redacted', 'redaction-report'])
 def test_boundary_review_returns_actionable_error_and_custom_redaction_can_resolve_it(server, endpoint):
     value = 'a' * 70 + '@audit.test'

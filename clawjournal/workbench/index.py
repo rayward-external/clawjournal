@@ -299,7 +299,8 @@ LOGICAL_CHECKPOINT_SCHEMA_VERSION = 12
 SCORING_QUEUE_SCHEMA_VERSION = 13
 SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION = 14
 REDACTION_CACHE_SCHEMA_VERSION = 15
-WORKBENCH_SCHEMA_VERSION = REDACTION_CACHE_SCHEMA_VERSION
+REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION = 16
+WORKBENCH_SCHEMA_VERSION = REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION
 
 # `share_sessions.predecessor_source` values. NULL means the predecessor is the
 # create-time local baseline; RECEIVER means the hosted lineage preflight
@@ -1182,6 +1183,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_scoring_queue(conn)
     _migrate_share_review_snapshots(conn)
     _migrate_redaction_cache_state(conn)
+    _migrate_review_snapshot_identity(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Keeps the normalized
@@ -2063,6 +2065,35 @@ def _migrate_redaction_cache_state(conn: sqlite3.Connection) -> None:
         if row is None or row[0] != ENGINE_VERSION:
             conn.execute("UPDATE sessions SET findings_backfill_needed = 1 WHERE findings_revision IS NOT NULL")
             conn.execute("INSERT OR REPLACE INTO findings_engine_state VALUES (1, ?)", (ENGINE_VERSION,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_review_snapshot_identity(conn: sqlite3.Connection) -> None:
+    """Retain only scope identity after completed raw previews are cleared."""
+    from .review_snapshots import review_identity
+    if conn.execute('PRAGMA user_version').fetchone()[0] >= REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION:
+        return
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        # Another opener may finish this migration while we wait for its
+        # transaction. Recovery can also retain a column with an older marker.
+        if conn.execute('PRAGMA user_version').fetchone()[0] >= REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION:
+            conn.commit()
+            return
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(share_review_snapshots)')}
+        if 'identity' not in columns:
+            conn.execute('ALTER TABLE share_review_snapshots ADD COLUMN identity TEXT')
+        for row in conn.execute("SELECT snapshot_id, payload FROM share_review_snapshots WHERE payload != ''").fetchall():
+            try:
+                detail = json.loads(row['payload'])
+                identity = review_identity(detail)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            conn.execute('UPDATE share_review_snapshots SET identity = ? WHERE snapshot_id = ?', (identity, row['snapshot_id']))
+        conn.execute(f'PRAGMA user_version = {REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION}')
         conn.commit()
     except Exception:
         conn.rollback()

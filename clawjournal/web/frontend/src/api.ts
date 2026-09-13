@@ -649,6 +649,13 @@ export const api = {
   },
 
   shares: {
+    clearReviews(): Promise<{ ok: boolean }> {
+      return request('/share-review-cache/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm_invalidate_pending_reviews: true }),
+      });
+    },
     list(): Promise<Share[]> {
       return request('/shares');
     },

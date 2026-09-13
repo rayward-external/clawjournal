@@ -29,6 +29,7 @@ export interface QueueStepProps {
   onRemove: (id: string) => void;
   onAdd: (id: string) => void;
   onClearAll: () => void;
+  onReviewsCleared: () => void;
   onAddMany: (ids: string[]) => void;
   onRemoveMany: (ids: string[]) => void;
   onReorder: (fromId: string, overId: string) => void;
@@ -74,6 +75,8 @@ export function QueueStep(p: QueueStepProps) {
   const [pickerRenderLimit, setPickerRenderLimit] = useState(TRACE_RENDER_BATCH);
   const [queueRenderLimit, setQueueRenderLimit] = useState(TRACE_RENDER_BATCH);
   const [confirmLargeBundle, setConfirmLargeBundle] = useState(false);
+  const [confirmClearReviews, setConfirmClearReviews] = useState(false);
+  const [clearingReviews, setClearingReviews] = useState(false);
 
   const allSessions = p.readyStats?.sessions || [];
   const allGroups = groupReadySessions(allSessions);
@@ -345,6 +348,31 @@ export function QueueStep(p: QueueStepProps) {
     <div style={{ padding: '32px 24px 48px', maxWidth: SHARE_SHELL_WIDTH, margin: '0 auto' }}>
       {p.globalStyles}
       {p.stepperHeader}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+        <button style={btnGhost} disabled={clearingReviews} onClick={() => setConfirmClearReviews(true)}>
+          {clearingReviews ? 'Clearing saved reviews…' : 'Clear saved reviews'}
+        </button>
+      </div>
+      <ConfirmDialog
+        open={confirmClearReviews}
+        title="Clear saved reviews?"
+        message="This frees local review storage. Unsubmitted packages will need new reviews. Original traces and downloaded ZIP files stay available."
+        confirmLabel="Clear reviews"
+        onCancel={() => setConfirmClearReviews(false)}
+        onConfirm={async () => {
+          setConfirmClearReviews(false);
+          setClearingReviews(true);
+          try {
+            await api.shares.clearReviews();
+            p.onReviewsCleared();
+            p.toast('Saved reviews cleared. Review selected traces again before packaging.', 'success');
+          } catch (error) {
+            p.toast(error instanceof Error ? error.message : 'Could not clear reviews', 'error');
+          } finally {
+            setClearingReviews(false);
+          }
+        }}
+      />
       {(p.readyStats?.logical_incomplete_excluded ?? 0) > 0 && (
         <div
           role="alert"

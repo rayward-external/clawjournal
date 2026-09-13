@@ -14,7 +14,18 @@ MAX_UNLINKED_SNAPSHOTS = 100
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 
 
-def prune_review_snapshots(conn: sqlite3.Connection, *, reserve_bytes: int = 0) -> None:
+def review_identity(detail: dict[str, Any]) -> str:
+    """Scope plus a digest of reviewed export metadata; never another raw copy."""
+    from .index import EXPORT_FIELDS
+    metadata = {key: detail[key] for key in EXPORT_FIELDS if key != 'messages' and key in detail}
+    encoded = json.dumps(metadata, ensure_ascii=True, sort_keys=True, default=str).encode('utf-8')
+    identity = json.dumps({**{key: detail.get(key) for key in ('source', 'project', 'logical_session_id')},
+                           'metadata_sha256': hashlib.sha256(encoded).hexdigest()}, sort_keys=True)
+    return hashlib.sha256(identity.encode('utf-8')).hexdigest()
+
+
+def prune_review_snapshots(conn: sqlite3.Connection, *, reserve_bytes: int = 0,
+                           keep_snapshot_ids: set[str] | None = None) -> None:
     """Bound raw preview storage without changing in-flight share inputs.
 
     Keep links as tombstones after success: an old share must never silently
@@ -37,6 +48,8 @@ def prune_review_snapshots(conn: sqlite3.Connection, *, reserve_bytes: int = 0) 
     for row in rows:
         if remaining <= MAX_UNLINKED_SNAPSHOTS and total + reserve_bytes <= MAX_SNAPSHOT_BYTES:
             break
+        if row['snapshot_id'] in (keep_snapshot_ids or ()):
+            continue
         conn.execute("DELETE FROM share_review_snapshots WHERE snapshot_id = ?", (row['snapshot_id'],))
         total -= row['size']
         remaining -= 1
@@ -86,7 +99,8 @@ def install_cleanup_trigger(conn: sqlite3.Connection) -> None:
         END""")
 
 
-def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any]) -> str:
+def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
+                         keep_snapshot_ids: set[str] | None = None) -> str:
     """Persist a successful preview within a bounded local cache."""
     from .index import _latest_successful_revision, _now_iso, compute_content_revision
 
@@ -106,7 +120,8 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any]) -> st
             SELECT 1 FROM share_snapshot_links l WHERE l.snapshot_id = share_review_snapshots.snapshot_id
         )""", (detail['session_id'], snapshot_id))
     exists = conn.execute("SELECT 1 FROM share_review_snapshots WHERE snapshot_id = ? AND payload != ''", (snapshot_id,)).fetchone()
-    prune_review_snapshots(conn, reserve_bytes=0 if exists else size)
+    keep = (keep_snapshot_ids or set()) | {snapshot_id}
+    prune_review_snapshots(conn, reserve_bytes=0 if exists else size, keep_snapshot_ids=keep_snapshot_ids)
     # Pruning can remove an existing unused copy after a cache-limit change.
     # Recheck before reserving space; never return an immediately evicted ID.
     exists = conn.execute("SELECT 1 FROM share_review_snapshots WHERE snapshot_id = ? AND payload != ''", (snapshot_id,)).fetchone()
@@ -115,14 +130,16 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any]) -> st
         conn.commit()
         raise ReviewSnapshotError("The review cache is full. Finish pending shares or run clawjournal review-cache --clear --all, then refresh previews.")
     conn.execute(
-        "INSERT OR IGNORE INTO share_review_snapshots VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO share_review_snapshots (snapshot_id, session_id, content_revision, payload, created_at) VALUES (?, ?, ?, ?, ?)",
         (snapshot_id, detail["session_id"], revision, payload, _now_iso()),
     )
     # A cleared tombstone may be explicitly reviewed again; normal revision
     # duplicate checks still reject content already shared.
     conn.execute("UPDATE share_review_snapshots SET payload = ? WHERE snapshot_id = ? AND payload = ''", (payload, snapshot_id))
     conn.execute("UPDATE share_review_snapshots SET created_at = ? WHERE snapshot_id = ?", (_now_iso(), snapshot_id))
-    prune_review_snapshots(conn)
+    identity = review_identity(detail)
+    conn.execute("UPDATE share_review_snapshots SET identity = ? WHERE snapshot_id = ?", (identity, snapshot_id))
+    prune_review_snapshots(conn, keep_snapshot_ids=keep)
     if conn.execute("SELECT 1 FROM share_review_snapshots WHERE snapshot_id = ? AND payload != ''", (snapshot_id,)).fetchone() is None:
         conn.commit()
         raise ReviewSnapshotError("The saved review is no longer available. Refresh the trace preview.")
@@ -171,4 +188,23 @@ def load_share_snapshot(
     ).fetchone()
     if row is None:
         return None
+    # A completed share no longer needs a second raw transcript copy. A local
+    # re-export may reload the original source ONLY when both content and scope
+    # still match. This cannot recover an appended revision or a cleared pending
+    # review, and it does not grant any upload authority.
+    saved = conn.execute("""SELECT r.payload, r.content_revision, r.identity, s.shared_at,
+        ss.replaces_revision FROM share_review_snapshots r
+        JOIN share_snapshot_links l ON l.snapshot_id = r.snapshot_id
+        JOIN shares s ON s.share_id = l.share_id
+        JOIN share_sessions ss ON ss.share_id = l.share_id AND ss.session_id = l.session_id
+        WHERE l.share_id = ? AND l.session_id = ?""", (share_id, session_id)).fetchone()
+    if saved is not None and saved['payload'] == '' and saved['shared_at'] and saved['identity']:
+        from .index import compute_content_revision, get_session_detail
+        detail = get_session_detail(conn, session_id)
+        if (detail is not None and detail.get('checkpoint_active') and detail.get('review_status') != 'blocked'
+                and detail.get('content_revision') == saved['content_revision']
+                and compute_content_revision(detail) == saved['content_revision']
+                and review_identity(detail) == saved['identity']):
+            detail['_review_predecessor'] = saved['replaces_revision']
+            return detail
     return load_review_snapshot(conn, row["snapshot_id"], session_id)

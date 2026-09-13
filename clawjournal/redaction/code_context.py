@@ -211,7 +211,7 @@ def code_context(text: str) -> CodeContext:
 def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
     """Require a receiver binding; a dotted call alone can be a real host.
 
-    Infer only explicit imports, straight-line local bindings and parameters. Branches
+    Infer only known library imports, straight-line local bindings and parameters. Branches
     and nested scopes do not establish bindings in their enclosing scope.
     This is syntax evidence, never execution or type inference.
     """
@@ -219,10 +219,19 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
 
     def statements(body, bound):
         bound = set(bound)
+        libraries = set()
         for statement in body:
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
-                bound.update(alias.asname or alias.name.split(".")[0]
-                             for alias in statement.names if alias.name != "*")
+                # An arbitrary import is not evidence that api.internal()
+                # names a method. Only the standard threading.local API has
+                # a known meaning here. Reimports also invalidate old hints.
+                names = {alias.asname or alias.name.split('.')[0]
+                         for alias in statement.names if alias.name != '*'}
+                bound.difference_update(names)
+                libraries.difference_update(names)
+                if isinstance(statement, ast.Import):
+                    libraries.update(alias.asname or alias.name for alias in statement.names
+                                     if alias.name == 'threading')
                 continue
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = statement.args
@@ -230,6 +239,7 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 names.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
                 statements(statement.body, names)
                 bound.discard(statement.name)
+                libraries.discard(statement.name)
                 continue
             # Be conservative about control flow, classes, closures and rebinding.
             if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
@@ -237,11 +247,14 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                                         if isinstance(n, ast.ExceptHandler) and n.name)
                 bound.difference_update(n.id for n in ast.walk(statement)
                                         if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
+                libraries.intersection_update(bound)
                 continue
             # Assignment expressions can rebind a receiver before a later
             # call in the same expression. Do not use stale object evidence.
             bound.difference_update(n.target.id for n in ast.walk(statement)
                                     if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name))
+            libraries.difference_update(n.target.id for n in ast.walk(statement)
+                                        if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name))
             host_assignment = any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
                                   and n.id.lower() in _HOST_NAMES for n in ast.walk(statement))
             for node in ast.walk(statement):
@@ -251,7 +264,9 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 while isinstance(receiver, ast.Attribute):
                     receiver = receiver.value
                 if (node.func.attr in _HOST_ATTRS and not host_assignment
-                        and isinstance(receiver, ast.Name) and receiver.id in bound):
+                        and isinstance(receiver, ast.Name) and (receiver.id in bound or (
+                            receiver.id in libraries and node.func.attr == 'local'
+                            and node.func.value is receiver))):
                     found.add(node)
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -261,6 +276,7 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                     for name in ast.walk(target):
                         if isinstance(name, ast.Name):
                             bound.discard(name.id)
+                            libraries.discard(name.id)
                     if creates_object and isinstance(target, ast.Name):
                         bound.add(target.id)
 
