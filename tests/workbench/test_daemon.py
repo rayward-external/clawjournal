@@ -8437,6 +8437,8 @@ def test_boundary_review_returns_actionable_error_and_custom_redaction_can_resol
     assert body['rule'] == 'email'
     assert value not in json.dumps(body)
     assert 'review_snapshot_id' not in body
+    with open_index() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM share_review_snapshots WHERE session_id = 'boundary-review'").fetchone()[0] == 0
     # Existing custom redaction is an actual recovery path, not Release and
     # repeat the same failing scan. No production upload occurs in this test.
     status, _ = _post(server, '/api/policies', {'policy_type': 'redact_string', 'value': value})

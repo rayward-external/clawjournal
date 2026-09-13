@@ -3194,12 +3194,7 @@ def _ranked_size_prefix(
                 extra_usernames=list(settings.get("extra_usernames") or []),
                 blocked_domains=list(settings.get("blocked_domains") or []),
             )
-        except RedactionBoundaryError as exc:
-            if exc.rule == "chunk_scan_failed":
-                raise AutoUploadError(
-                    "scanner_unavailable", "The local redaction worker is unavailable.",
-                    retryable=True,
-                ) from None
+        except RedactionBoundaryError:
             # Defer this trace before AI/egress. Other ranked candidates can
             # proceed; an unclear boundary must not disable recurring sharing.
             if boundary_blocked is not None:

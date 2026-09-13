@@ -39,7 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 5  # Rebuild findings for script boundaries and narrower code hints.
+ENGINE_VERSION = 6  # Rebuild findings after quoted-fence and mixed-prose fixes.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 
@@ -986,7 +986,7 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
         replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))
         if len(target) < 3:
             continue
-        if _is_partial_email_finding(finding):
+        if _is_partial_email_finding(finding) and finding.get("status") != "accepted":
             from .redaction.replacements import replace_email_fragments
             result, n = replace_email_fragments(result, {target: replacement}, ignore_case=True, context=context)
             count += n
@@ -995,7 +995,11 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
         # Email/token values already have a detected span. Unicode word
         # boundaries would skip them next to ordinary Chinese prose.
         if finding.get("entity_type") == "email" or str(finding.get("reason", "")).startswith("telegram") or finding.get("reason") == "Likely Telegram bot token":
-            pattern = re.compile(escaped, re.IGNORECASE)
+            if finding.get("entity_type") == "email" and ("@" in target or "%40" in target.lower()):
+                from .redaction.replacements import email_pattern
+                pattern = email_pattern(target, re.IGNORECASE)
+            else:
+                pattern = re.compile(escaped, re.IGNORECASE)
         else:
             pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
         if finding.get("source") == "rule" and finding.get("entity_type") in {"email", "private_url"}:

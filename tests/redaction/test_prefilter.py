@@ -2,8 +2,6 @@
 import concurrent.futures
 import random
 import re
-import subprocess
-import sys
 
 import pytest
 
@@ -75,14 +73,14 @@ def scan_both(text):
 
 def baseline(monkeypatch, function, text):
     with monkeypatch.context() as patch:
-        patch.setattr(prefilter, '_AUTOMATON', None)
+        patch.setattr(secrets, 'filter_rules', lambda text, rules: rules)
+        patch.setattr(pii, 'filter_rules', lambda text, rules: rules)
         return function(text)
 
 
 @pytest.mark.parametrize('case,value', CASES, ids=[name for name, _ in CASES])
 def test_complete_findings_and_local_replacements_match_without_prefilter(case, value, monkeypatch):
     text = 'ordinary words\n' * 24 + value + '\nordinary end'
-    assert prefilter._AUTOMATON is not None, 'CI must exercise the installed native extension'
     assert scan_both(text) == baseline(monkeypatch, scan_both, text)
     assert secrets.redact_text(text) == baseline(monkeypatch, secrets.redact_text, text)
 
@@ -119,36 +117,16 @@ def test_absent_marker_skips_regex_execution(monkeypatch):
         return original(pattern, text)
     monkeypatch.setattr(secrets, '_secret_matches', track)
     secrets.scan_text('ordinary words ' * 100)
-    assert all(p not in prefilter._PATTERN_MASKS for p in calls)
+    assert all(p not in prefilter._PATTERN_LITERALS for p in calls)
     assert calls  # Rules without a proven marker still execute.
 
 
-@pytest.mark.parametrize('error', [RuntimeError, MemoryError, ValueError, OSError])
-def test_failure_after_partial_marker_scan_runs_every_rule(error, monkeypatch):
-    text = ' ' * 300 + 'hf_' + ALNUM + ' alice@example.com'
-    expected = baseline(monkeypatch, scan_both, text)
-    class Broken:
-        def iter(self, text):
-            yield 0, 1
-            raise error('synthetic accelerator failure')
-    monkeypatch.setattr(prefilter, '_AUTOMATON', Broken())
-    assert scan_both(text) == expected
-
-
-def test_extension_import_failure_preserves_scanning():
-    code = '''
-import builtins
-original = builtins.__import__
-def load(name, *args, **kwargs):
-    if name == "ahocorasick":
-        raise ImportError("synthetic missing extension")
-    return original(name, *args, **kwargs)
-builtins.__import__ = load
-from clawjournal.redaction import prefilter, secrets
-assert prefilter._AUTOMATON is None
-assert any(f["type"] == "github_token" for f in secrets.scan_text(" " * 300 + "github_pat_" + "Ab12" * 10))
-'''
-    subprocess.run([sys.executable, '-c', code], check=True, capture_output=True, text=True)
+def test_exact_prefilter_threshold():
+    pattern = next(p for n, p in secrets.SECRET_PATTERNS if n == 'hf_token')
+    rules = [('hf', pattern)]
+    assert prefilter._MIN_PREFILTER_CHARS == 256
+    for length in (255, 256, 257):
+        assert prefilter.filter_rules(' ' * length, rules) == (rules if length < 256 else [])
 
 
 def test_generated_unicode_and_adjacent_candidates_match(monkeypatch):

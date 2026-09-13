@@ -700,15 +700,19 @@ def render_transcript(redacted_session: dict, max_msgs: int | None = None,
 
 
 def _build_records(conn, settings, chosen, ai_pii):
-    from .workbench.review_snapshots import save_review_snapshot
+    from .workbench.review_snapshots import ReviewSnapshotError, save_review_snapshot
+    from .redaction.boundaries import RedactionBoundaryError
 
     recs = []
     for r in chosen:
         detail = get_session_detail(conn, r["session_id"])
         if detail is None:
             die(f"Session {r['session_id']} not found.")
-        snapshot_id = save_review_snapshot(conn, detail)
-        rec = build_redaction_record(conn, detail, settings, ai_pii)
+        try:
+            rec = build_redaction_record(conn, detail, settings, ai_pii)
+            snapshot_id = save_review_snapshot(conn, detail)
+        except (ReviewSnapshotError, RedactionBoundaryError) as exc:
+            die(str(exc))
         rec["row"] = {**r, "revision_hash": detail["content_revision"]}
         rec["review_snapshot_id"] = snapshot_id
         recs.append(rec)

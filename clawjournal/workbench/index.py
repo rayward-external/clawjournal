@@ -298,7 +298,8 @@ RECEIVER_PREDECESSOR_SCHEMA_VERSION = 11
 LOGICAL_CHECKPOINT_SCHEMA_VERSION = 12
 SCORING_QUEUE_SCHEMA_VERSION = 13
 SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION = 14
-WORKBENCH_SCHEMA_VERSION = SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION
+REDACTION_CACHE_SCHEMA_VERSION = 15
+WORKBENCH_SCHEMA_VERSION = REDACTION_CACHE_SCHEMA_VERSION
 
 # `share_sessions.predecessor_source` values. NULL means the predecessor is the
 # create-time local baseline; RECEIVER means the hosted lineage preflight
@@ -1180,6 +1181,7 @@ def open_index() -> sqlite3.Connection:
     _migrate_logical_checkpoint_projection(conn)
     _migrate_scoring_queue(conn)
     _migrate_share_review_snapshots(conn)
+    _migrate_redaction_cache_state(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Keeps the normalized
@@ -2036,6 +2038,37 @@ def _migrate_share_review_snapshots(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_redaction_cache_state(conn: sqlite3.Connection) -> None:
+    """Schedule one rebuild per engine version, including source-less blobs."""
+    from ..findings import ENGINE_VERSION
+    from .review_snapshots import install_cleanup_trigger, prune_review_snapshots
+
+    if conn.execute("PRAGMA user_version").fetchone()[0] < REDACTION_CACHE_SCHEMA_VERSION:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS findings_engine_state (id INTEGER PRIMARY KEY CHECK (id = 1), engine_version INTEGER NOT NULL)")
+            install_cleanup_trigger(conn)
+            prune_review_snapshots(conn)
+            conn.execute(f"PRAGMA user_version = {REDACTION_CACHE_SCHEMA_VERSION}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    row = conn.execute("SELECT engine_version FROM findings_engine_state WHERE id = 1").fetchone()
+    if row is not None and row[0] == ENGINE_VERSION:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT engine_version FROM findings_engine_state WHERE id = 1").fetchone()
+        if row is None or row[0] != ENGINE_VERSION:
+            conn.execute("UPDATE sessions SET findings_backfill_needed = 1 WHERE findings_revision IS NOT NULL")
+            conn.execute("INSERT OR REPLACE INTO findings_engine_state VALUES (1, ?)", (ENGINE_VERSION,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def _migrate_bundles_to_shares(conn: sqlite3.Connection) -> None:
     """One-time rename of bundles→shares, bundle_sessions→share_sessions, bundle_id→share_id.
 
@@ -2578,9 +2611,6 @@ def _redact_blocked_domains_in_value(
             matches: list[str] = []
 
             def _replace(match: re.Match[str]) -> str:
-                from ..redaction.boundaries import ensure_safe_replacement
-
-                ensure_safe_replacement(match.group(0), "internal_host_context")
                 matches.append(match.group(0))
                 return "[REDACTED_DOMAIN]"
 
@@ -6940,10 +6970,15 @@ def create_share(
                     raise RevisionConflictError([{"session_id": sid, "reason": str(exc)}]) from exc
                 found_sessions[sid] = reviewed[sid]["content_revision"]
                 latest = _latest_successful_revision(conn, sid)
-                if latest == found_sessions[sid] or latest != reviewed[sid]["_review_predecessor"]:
+                already_sent = conn.execute(
+                    "SELECT 1 FROM share_sessions ss JOIN shares sh ON sh.share_id = ss.share_id "
+                    "WHERE ss.session_id = ? AND ss.content_revision = ? AND sh.shared_at IS NOT NULL LIMIT 1",
+                    (sid, found_sessions[sid]),
+                ).fetchone() is not None
+                if already_sent or latest != reviewed[sid]["_review_predecessor"]:
                     raise RevisionConflictError([{
                         "session_id": sid,
-                        "reason": "already_shared_revision" if latest == found_sessions[sid] else "stale_predecessor",
+                        "reason": "already_shared_revision" if already_sent else "stale_predecessor",
                     }])
             # The snapshots contain the physical records actually previewed.
             # New members of a growing conversation belong to a future share.

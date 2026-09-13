@@ -766,7 +766,8 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
     for match in iter_format_candidates(text, context=context):
         if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
             continue
-        if _pii_should_skip(match["match"], match["type"], "plain"):
+        from .candidate_formats import _scanning_view
+        if _pii_should_skip(_scanning_view(match["match"])[0], match["type"], "plain"):
             continue
         if (match["type"], match["match"]) in existing:
             continue
@@ -1004,6 +1005,11 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
     from .code_context import code_context
     context = code_context(text)
 
+    from .candidate_formats import credentialed_urls, email_in_url_userinfo
+    url_spans = list(credentialed_urls(text))
+    def in_userinfo(start, end):
+        return email_in_url_userinfo(start, end, url_spans)
+
     matches: list[dict] = []
     for rule_name, pattern, entity_type, confidence, group, kind in filter_rules(text, _PII_CONTENT_PATTERNS_COMPILED):
         for m in _content_matches(pattern, text):
@@ -1012,6 +1018,8 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
             except IndexError:
                 continue
             if entity_text is None:
+                continue
+            if entity_type == "email" and in_userinfo(m.start(group), m.end(group)):
                 continue
             if rule_name in {"email", "internal_tld_host"} and context.protects(m.start(group), m.end(group)):
                 continue
@@ -1053,13 +1061,17 @@ def scan_text_for_pii(text: str, user_allowlist: list[dict] | None = None) -> li
 
     existing = {(m["type"], m["start"], m["end"]) for m in matches}
     for match in iter_format_candidates(text, context=context):
+        if match["type"] == "email" and in_userinfo(match["start"], match["end"]):
+            continue
         if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
             continue
         if (match["type"], match["start"], match["end"]) in existing:
             continue
-        if not _pii_should_skip(match["match"], match["type"], "plain") and not _pii_user_allowlist_skip(
-            match["match"], match["type"], user_allowlist
-        ):
+        from .candidate_formats import _scanning_view
+        canonical = _scanning_view(match["match"])[0]
+        if (not _pii_should_skip(canonical, match["type"], "plain")
+                and not _pii_user_allowlist_skip(match["match"], match["type"], user_allowlist)
+                and not _pii_user_allowlist_skip(canonical, match["type"], user_allowlist)):
             matches.append(match)
     return matches
 
@@ -1076,7 +1088,7 @@ def _dedupe_overlapping_pii(matches: list[dict]) -> list[dict]:
     )
     kept: list[dict] = []
     for cand in ordered:
-        if any(cand["start"] < ex["end"] and cand["end"] > ex["start"] for ex in kept):
+        if any(ex["start"] <= cand["start"] and ex["end"] >= cand["end"] for ex in kept):
             continue
         kept.append(cand)
     kept.sort(key=lambda m: m["start"])
@@ -1131,7 +1143,7 @@ def pii_secret_map_from_text_decisions(
         ensure_safe_replacement(matched, match["rule"])
         if decisions.get(hash_entity(matched)) == "ignored":
             continue
-        if match["rule"] == "email_truncated":
+        if match["rule"] == "email_truncated" and decisions.get(hash_entity(matched)) != "accepted":
             out.email_fragments.setdefault(matched, replacement_for_type(match["type"]))
             continue
         out.setdefault(matched, replacement_for_type(match["type"]))

@@ -828,3 +828,26 @@ def test_view_transcript_is_wired_into_share_cli():
     # And no longer dump the full transcript inline.
     assert "render_transcript(scrubbed[n - 1]" not in redact_src
     assert "render_transcript(s[\"redacted\"])" not in review_src
+
+
+@pytest.mark.parametrize('failure', ['boundary', 'snapshot'])
+def test_cli_preview_failures_are_clean_and_do_not_save_raw_failed_previews(monkeypatch, capsys, failure):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+    from clawjournal.workbench import review_snapshots
+    detail = {'session_id': 'synthetic', 'content_revision': 'revision'}
+    monkeypatch.setattr(share_cli, 'get_session_detail', lambda *a: detail)
+    saved = []
+    def save(*a):
+        saved.append(True)
+        raise review_snapshots.ReviewSnapshotError('Refresh this synthetic preview.')
+    monkeypatch.setattr(review_snapshots, 'save_review_snapshot', save)
+    def build(*a):
+        if failure == 'boundary':
+            raise RedactionBoundaryError('email')
+        return {}
+    monkeypatch.setattr(share_cli, 'build_redaction_record', build)
+    with pytest.raises(SystemExit) as error:
+        share_cli._build_records(None, {}, [{'session_id': 'synthetic'}], False)
+    assert error.value.code == 1
+    assert saved == ([] if failure == 'boundary' else [True])
+    assert 'Traceback' not in capsys.readouterr().err

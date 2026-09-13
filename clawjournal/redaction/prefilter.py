@@ -1,6 +1,6 @@
 """Conservative literal prefilter for the built-in regex passes.
 
-Aho-Corasick finds necessary markers in one pass. A missing marker can skip
+Literal presence checks reject impossible rules. A missing marker can skip
 only the exact reviewed pattern (including flags); it never grants an
 exemption or changes a candidate's boundaries. Unknown rules always run.
 No field text or candidate positions are cached across calls.
@@ -8,12 +8,6 @@ No field text or candidate positions are cached across calls.
 from __future__ import annotations
 
 import re
-
-try:
-    import ahocorasick
-except (ImportError, OSError):  # native extension unavailable: keep all detection
-    ahocorasick = None
-
 
 # Each tuple is an OR: every possible match contains at least one literal.
 # Keys intentionally repeat the complete regex and flags. Editing a detector
@@ -72,49 +66,23 @@ _PATTERN_LITERALS = {
 }
 
 
-def _build_index():
-    if ahocorasick is None:
-        return None, {}, ()
-    markers = sorted({word for words in _PATTERN_LITERALS.values() for word in words})
-    bits = {word: 1 << index for index, word in enumerate(markers)}
-    automaton = ahocorasick.Automaton()
-    for word, bit in bits.items():
-        if len(word) > 1:
-            automaton.add_word(word, bit)
-    automaton.make_automaton()
-    return automaton, {
-        pattern: sum(bits[word] for word in words)
-        for pattern, words in _PATTERN_LITERALS.items()
-    }, tuple((word, bit) for word, bit in bits.items() if len(word) == 1)
-
-
-try:
-    _AUTOMATON, _PATTERN_MASKS, _SINGLE_LITERALS = _build_index()
-except Exception:
-    # This is an optional accelerator, even when installed as a dependency.
-    # Failure to build it must not abort ingestion or suppress a detector.
-    _AUTOMATON, _PATTERN_MASKS, _SINGLE_LITERALS = None, {}, ()
-
-# Small fields cost more to dispatch through the accelerator than to scan.
+# Keep short fields on their original path: dispatch costs exceed the saving.
 _MIN_PREFILTER_CHARS = 256
 
 
 def filter_rules(text: str, rules):
-    """Keep original ordered rule tuples whose required marker may exist.
+    """Reject only exact known rules with no necessary literal present.
 
-    The regex remains responsible for validation, case, Unicode semantics and
-    offsets. Materialize marker presence before filtering; an iterator error
-    therefore falls back to all rules without partial results or duplicates.
+    Pure Python keeps installation portable. Cache presence within this call,
+    since multiple rules share punctuation; never retain input between calls.
     """
-    if len(text) < _MIN_PREFILTER_CHARS or _AUTOMATON is None:
+    if len(text) < _MIN_PREFILTER_CHARS:
         return rules
-    # Presence of common punctuation is cheaper than emitting a Python
-    # callback tuple for every dot, quote and colon in a large JSON field.
-    found = sum(mask for word, mask in _SINGLE_LITERALS if word in text)
-    try:
-        for _, mask in _AUTOMATON.iter(text):
-            found |= mask
-    except Exception:
-        return rules
+    present = {}
+    def contains(word):
+        if word not in present:
+            present[word] = word in text
+        return present[word]
     return [row for row in rules
-            if (required := _PATTERN_MASKS.get(row[1])) is None or required & found]
+            if (words := _PATTERN_LITERALS.get(row[1])) is None
+            or any(contains(word) for word in words)]

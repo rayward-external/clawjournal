@@ -1905,8 +1905,9 @@ def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolate
         conn, candidates, settings={}, maximum_bundle_size=5_000_000,
         boundary_blocked=blocked,
     )
-    assert blocked == [f"bad-{i}" for i in range(5)]
-    assert [item["session_id"] for item in selected] == [f"good-{i}" for i in range(5)]
+    deferred = ambiguous_text.startswith("A" * 1000)
+    assert blocked == ([f"bad-{i}" for i in range(5)] if deferred else [])
+    assert [item["session_id"] for item in selected] == [f"{'good' if deferred else 'bad'}-{i}" for i in range(5)]
     assert by_size == missing == 0
     conn.close()
 
@@ -1958,7 +1959,7 @@ def test_all_ambiguous_candidates_park_before_ai_or_upload(isolated_auto_upload,
     assert second["code"] == "nothing_new"
 
 
-def test_sizing_worker_failure_retries_without_parking_content(isolated_auto_upload, monkeypatch):
+def test_sizing_infrastructure_failure_retries_without_parking_content(isolated_auto_upload, monkeypatch):
     from clawjournal.redaction.boundaries import RedactionBoundaryError
 
     config = _save_scope_config()
@@ -1971,7 +1972,7 @@ def test_sizing_worker_failure_retries_without_parking_content(isolated_auto_upl
     _patch_strict_scanner(monkeypatch)
 
     def unavailable(*args, **kwargs):
-        raise RedactionBoundaryError("chunk_scan_failed")
+        raise auto.AutoUploadError("scanner_unavailable", "Synthetic scanner error", retryable=True)
     monkeypatch.setattr(auto, "apply_share_redactions", unavailable)
     monkeypatch.setattr(auto, "package", lambda *a, **kw: pytest.fail("No package after a scan error"))
     result = auto.run_cycle(force=True)

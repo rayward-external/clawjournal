@@ -41,13 +41,13 @@ def ensure_safe_replacement(value: str, rule: str) -> None:
         if not separator:  # legacy truncated-address finding excludes '@'
             local, domain = value, ""
         oversized = (
-            len(value.encode("utf-8")) > 254
-            or len(local.encode("utf-8")) > 64
-            or any(len(label.encode("utf-8")) > 63 for label in domain.split("."))
+            len(value.encode("utf-8", errors="surrogatepass")) > 254
+            or len(local.encode("utf-8", errors="surrogatepass")) > 64
+            or any(len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in domain.split("."))
         )
     elif rule in {"internal_tld_host", "internal_host_context", "personal_hostname", "device_id"}:
-        oversized = len(value.encode("utf-8")) > 253 or any(
-            len(label.encode("utf-8")) > 63 for label in value.rstrip(".").split(".")
+        oversized = len(value.encode("utf-8", errors="surrogatepass")) > 253 or any(
+            len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in value.rstrip(".").split(".")
         )
     elif rule.startswith("telegram"):
         oversized = len(value) > 128
@@ -70,15 +70,18 @@ def ensure_text_boundaries(text: str, *, context=None) -> None:
     if context is None:
         context = code_context(text)
 
+    from .candidate_formats import credentialed_urls, email_in_url_userinfo
+    url_spans = list(credentialed_urls(text))
+
     def check(value: str, rule: str, start: int, end: int) -> None:
+        if rule.startswith("email") and email_in_url_userinfo(start, end, url_spans):
+            return  # Explicit URL userinfo is fully masked by the secret pass.
         # A hint can spare a supported code occurrence from replacement, but
         # must not authorize an otherwise unsafe boundary. Budget outcomes
         # therefore do not depend on whether optional parsing succeeded.
         ensure_safe_replacement(value, rule)
         if context.protects(start, end) and rule in {"email", "email_extended", "internal_tld_host"}:
             return
-        if rule.startswith("email") and context.is_ambiguous(start, end):
-            raise RedactionBoundaryError("email_or_code")
 
     # Inspect raw matches before allowlists/no-reply filters. A later engine
     # can still redact one of those matches; an allowlist cannot make an

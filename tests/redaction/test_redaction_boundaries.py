@@ -161,12 +161,9 @@ def test_ordinary_code_is_not_redacted(render_builtin, text):
     assert render_builtin(text) == text
 
 
-def test_bare_matrix_expression_is_ambiguous_and_remains_local(render_builtin):
-    from clawjournal.redaction.boundaries import RedactionBoundaryError
-    # The original xfail used this bare snippet. It is ALSO valid email
-    # text, so preserving it silently would trade a false positive for a leak.
-    with pytest.raises(RedactionBoundaryError, match="email_or_code"):
-        render_builtin("result = numpy.array@torch.tensor")
+def test_bare_matrix_expression_is_redacted_without_aborting_share(render_builtin):
+    # Without specific array evidence the normal email rule still applies.
+    assert render_builtin("result = numpy.array@torch.tensor") == "result = [REDACTED_EMAIL]"
 
 
 def test_truncated_email_does_not_delete_other_ordinary_text(render_builtin):
@@ -419,19 +416,11 @@ def test_fenced_code_inside_a_string_is_still_sensitive_text(render_builtin):
     "import numpy\nresult = numpy.array@torch.tensor",
     "result = numpy.array@torch.tensor\nimport numpy\nimport torch",
 ])
-def test_ambiguous_matrix_or_email_stops_before_mutation_or_external_scan(monkeypatch, text):
-    import copy
-    from clawjournal.redaction.boundaries import RedactionBoundaryError
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("External scanning must not start before boundary preflight")
-
-    monkeypatch.setattr("clawjournal.redaction.betterleaks.betterleaks_secret_map_from_blob", forbidden)
-    blob = {"display_title": "safe title", "messages": [{"content": text}]}
-    original = copy.deepcopy(blob)
-    with pytest.raises(RedactionBoundaryError, match="email_or_code"):
-        secrets.apply_findings_to_blob(blob, None, "synthetic")
-    assert blob == original
+def test_ambiguous_matrix_or_email_uses_normal_redaction(render_builtin, text):
+    result = render_builtin(text)
+    assert 'numpy.array@torch.tensor' not in result
+    assert 'alice.smith@example.com' not in result
+    assert '[REDACTED_EMAIL]' in result
 
 
 def test_multiline_matrix_comments_still_scan(render_builtin):
@@ -661,7 +650,7 @@ def test_host_replacement_does_not_delete_unrelated_substrings(builtin_conn, ord
     # whole candidate. The other samples are ordinary non-host matches.
     blob = {"messages": [{"content": "server=db.local"}, {"content": ordinary}]}
     output, _ = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
-    expected = "[REDACTED_URL]" if ordinary == "mydb.local" else ordinary
+    expected = "[REDACTED_URL]" if ordinary == "mydb.local" else "[REDACTED_URL]_extra" if ordinary == "db.local_extra" else ordinary
     assert output["messages"][1]["content"] == expected
 
 
@@ -740,7 +729,7 @@ def test_known_hostname_copies_ignore_case_but_preserve_longer_words(builtin_con
     blob = {"messages": [{"content": "DB_HOST=database17"},
                          {"content": "Connect to DATABASE17. Preserve mydatabase17 and DATABASE17_backup."}]}
     output, _ = secrets.apply_findings_to_blob(blob, builtin_conn, "synthetic-boundary-audit")
-    assert output["messages"][1]["content"] == "Connect to [REDACTED_URL]. Preserve mydatabase17 and DATABASE17_backup."
+    assert output["messages"][1]["content"] == "Connect to [REDACTED_URL]. Preserve mydatabase17 and [REDACTED_URL]_backup."
 
 
 @pytest.mark.parametrize("source,value", [

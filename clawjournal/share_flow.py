@@ -138,6 +138,8 @@ def build_redaction_record(conn, session_detail: dict, settings: dict,
     )
     buckets, th_hits = redaction_buckets(log)
 
+    from .redaction.boundaries import RedactionBoundaryError
+
     ai_findings: list[dict] = []
     ai_coverage = "disabled"
     if ai_pii:
@@ -150,6 +152,8 @@ def build_redaction_record(conn, session_detail: dict, settings: dict,
                 red, ai_count = apply_findings_to_session(red, findings)
                 count += ai_count
                 ai_findings = findings
+        except RedactionBoundaryError:
+            raise
         except Exception:  # noqa: BLE001
             ai_coverage = "rules_only"
 

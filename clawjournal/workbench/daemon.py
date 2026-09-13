@@ -3254,19 +3254,18 @@ def finalize_share_export_for_upload(
             raise
         _record_elapsed_ms(timings_ms, "pii_review", pii_started)
         if isinstance(exc, RedactionBoundaryError):
-            worker_failed = exc.rule == "chunk_scan_failed"
-            reason = "scanner-error" if worker_failed else "redaction-boundary"
-            blocked = [] if worker_failed else [{
+            reason = "redaction-boundary"
+            blocked = [{
                 "session_id": getattr(exc, "session_id", ""),
                 "reason": str(exc),
             }]
-            message = "The local redaction worker is unavailable." if worker_failed else str(exc)
+            message = str(exc)
             manifest.update(blocked=True, block_reason=reason,
                             block_message=message, blocked_sessions=blocked)
             manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             return {"error": message, "block_reason": reason,
                     "blocked_sessions": blocked,
-                    "status": 503 if worker_failed else 422}, manifest
+                    "status": 422}, manifest
         logger.warning("PII redaction pass failed: %s", exc)
         return {
             "error": "PII redaction failed — upload aborted. Try again or report this issue.",
@@ -5773,11 +5772,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 return
             from .review_snapshots import ReviewSnapshotError, save_review_snapshot
 
-            try:
-                review_snapshot_id = save_review_snapshot(conn, detail)
-            except ReviewSnapshotError as exc:
-                _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
-                return
+            import copy
+            reviewed_input = copy.deepcopy(detail)
             reviewed_revision = detail["content_revision"]
             settings = get_effective_share_settings(conn, load_config())
             detail, redaction_count, redaction_log = apply_share_redactions(
@@ -5819,10 +5815,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                             }
                             for f in findings
                         ]
+                except RedactionBoundaryError:
+                    raise
                 except Exception as exc:
                     logger.warning("AI PII detection failed for %s: %s", session_id, exc)
                     ai_coverage = "rules_only"
 
+            try:
+                review_snapshot_id = save_review_snapshot(conn, reviewed_input)
+            except ReviewSnapshotError as exc:
+                _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
+                return
             _json_response(self, {
                 "session_id": session_id,
                 "review_snapshot_id": review_snapshot_id,

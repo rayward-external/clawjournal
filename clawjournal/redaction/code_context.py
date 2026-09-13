@@ -10,14 +10,11 @@ import ast
 import io
 import keyword
 import re
-import threading
 import tokenize
-import warnings
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from .replacements import contains_span, merge_spans, replace_spans
 
-_QUOTE = re.compile(r"[\"'#]")
 _FENCE_LINE = re.compile(r"^(?P<ticks>`{3,}|~{3,})(?P<language>[^\r\n]*)\r?$", re.M)
 _HOST_ATTRS = {"local", "internal", "corp", "lan", "intranet", "localnet"}
 _HOST_NAMES = {"host", "hostname", "db_host", "database_host", "redis_host", "pghost", "mysql_host", "internal_host", "internal_hostname"}
@@ -25,10 +22,13 @@ _ARRAY_MODULES = {"numpy", "torch"}
 _ARRAY_MEMBERS = {"array", "ndarray", "tensor", "eye", "ones", "zeros", "empty", "arange", "asarray", "linspace"}
 _TOKEN_NAMES = {"telegram_bot_token", "telegram_api_token", "telegram_token", "telegrambottoken"}
 _ast_parse = ast.parse  # Module-local seam; tests must not patch stdlib ast.
-_MAX_PARSE_CHARS = 8 * 1024 * 1024
+_MAX_PARSE_CHARS = 65_536
 _MAX_PARSE_TOKENS = 100_000
 _MAX_STATEMENT_TOKENS = 2048
-_PARSE_LOCK = threading.RLock()
+# Reject suspicious escapes before tokenization. On Python 3.12 even the
+# tokenizer can warn about f-string escapes. Hints are optional; changing
+# process-global warning filters from scanner threads is not safe.
+_WARNING_ESCAPE = re.compile(r"\\(?:[4-7][0-7]{2}|[^\\\"'abfnrtv0-7xuUN\n\r])")
 
 
 @dataclass
@@ -85,12 +85,9 @@ class CodeContext:
 
 
 def _parse(source: str) -> ast.Module | None:
-    # Python 3.10-3.13 warning filters are process-global. Serialize our
-    # suppression scopes, including the tokenizer (which also emits warnings).
-    with _PARSE_LOCK, warnings.catch_warnings():
-        warnings.simplefilter("ignore", SyntaxWarning)
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return _parse_source(source)
+    if _WARNING_ESCAPE.search(source):
+        return None
+    return _parse_source(source)
 
 
 def _parse_source(source: str) -> ast.Module | None:
@@ -111,9 +108,10 @@ def _parse_source(source: str) -> ast.Module | None:
                     and not any(keyword.iskeyword(name) or keyword.issoftkeyword(name)
                                 for name in (previous.string, item.string))):
                 return None
+            if (previous is not None and previous.type == tokenize.NUMBER
+                    and item.type == tokenize.NAME and previous.end == item.start):
+                return None  # Invalid decimal literals can emit source warnings.
             previous = item
-            if len(source) <= 65_536:
-                continue
             # Python warns that large/complex AST input can exhaust stack or
             # memory. Bound complexity before parsing; long comments/strings
             # count as individual tokens and do not disable code protection.
@@ -128,16 +126,16 @@ def _parse_source(source: str) -> ast.Module | None:
                 return None
         return _ast_parse(source)
     except (SyntaxError, ValueError, tokenize.TokenError, SystemError,
-            RecursionError, MemoryError):
+            RecursionError, MemoryError, Warning):
         return None
 
 
 def _fenced_sources(text: str):
-    """Find Markdown code outside quoted data without parsing ordinary prose.
+    """Find Markdown code only after an unambiguous lexical pass.
 
-    A single quote in prose owns at most its line. Triple quoted strings
-    (including raw/byte/formatted forms) own their complete body, even when
-    unfinished. This is only an exemption guard, never a secret detector.
+    Unknown/multiline outer string state, malformed tokens and exhausted
+    budgets remove all fence evidence. Detection still sees the whole field.
+    This is only an exemption guard, never a secret detector.
     """
     if "\x00" in text:
         return
@@ -156,48 +154,47 @@ def _fenced_sources(text: str):
             opened = None
     if not fences:
         return
+    # The tokenizer, rather than a guessed quote cursor, owns string spans.
+    # An ambiguous outer string can hide a later opening quote; in that case
+    # no fence in this field is sufficient evidence for an exemption.
+    body_starts = [start for _opening, start, _end in fences]
+    offsets = [0]
+    for line in text.split("\n"):
+        offsets.append(offsets[-1] + len(line) + 1)
+
+    def position(point):
+        return offsets[point[0] - 1] + point[1]
+
+    def inside_body(at):
+        i = bisect_right(body_starts, at) - 1
+        return i >= 0 and at < fences[i][2]
+
     strings = []
-    cursor = 0
-    while cursor < len(text):
-        opening = _QUOTE.search(text, cursor)
-        if opening is None:
-            break
-        start = opening.start()
-        quote = text[start]
-        if quote == "#":
-            newline = text.find("\n", start)
-            cursor = len(text) if newline < 0 else newline + 1
-            continue
-        triple = text.startswith(quote * 3, start)
-        delimiter = quote * (3 if triple else 1)
-        pos = start + len(delimiter)
-        # An unfinished formatted string can continue through an expression
-        # on newer Python versions. Do not authorize fences in its tail.
-        prefix = re.search(r"(?<![\w])([rRuUbBfFtT]{1,2})$", text[max(0, start - 3):start])
-        formatted = prefix is not None and any(c in prefix.group(1).lower() for c in "ft")
-        if formatted:
-            # Nested f-string expressions have version-specific quote rules.
-            # After a failed whole-source parse, later fences cannot prove
-            # that this formatted string has ended. Keep scanning its data,
-            # but grant no later fence exemptions from that uncertain tail.
-            strings.append((start, len(text)))
-            break
-        while pos < len(text):
-            if text[pos] == "\\":
-                pos += 3 if text.startswith("\\\r\n", pos) else 2
-            elif text.startswith(delimiter, pos):
-                pos += len(delimiter)
-                break
-            elif not triple and text[pos] == "\n":
-                break
-            else:
-                pos += 1
-        strings.append((start, min(pos, len(text))))
-        cursor = max(pos, start + 1)
+    try:
+        for count, item in enumerate(tokenize.generate_tokens(io.StringIO(text).readline), 1):
+            if count > _MAX_PARSE_TOKENS:
+                return
+            if item.type == tokenize.ERRORTOKEN and not (
+                item.string.isspace() or item.string == "`"
+            ):
+                return
+            start, end = position(item.start), position(item.end)
+            if tokenize.tok_name.get(item.type) in {"FSTRING_START", "TSTRING_START"}:
+                if not inside_body(start):
+                    return
+            if item.type == tokenize.STRING:
+                if item.start[0] != item.end[0] and not inside_body(start):
+                    return
+                strings.append((start, end))
+    except (SyntaxError, ValueError, tokenize.TokenError, SystemError,
+            RecursionError, MemoryError, IndexError, Warning):
+        return
     strings = merge_spans(strings)
+    # Do not yield partial evidence before the complete lexical check passes.
     for opening, start, end in fences:
         if not contains_span(strings, opening, opening + 1):
             yield text[start:end], start
+
 
 
 def code_context(text: str) -> CodeContext:
@@ -205,7 +202,7 @@ def code_context(text: str) -> CodeContext:
     try:
         return _code_context(text)
     except (SyntaxError, ValueError, tokenize.TokenError, SystemError,
-            RecursionError, MemoryError, IndexError):
+            RecursionError, MemoryError, IndexError, Warning):
         # No partial exemptions survive a failed analysis. Detection still
         # examines the original source, including every quoted secret.
         return CodeContext()
@@ -236,6 +233,8 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 continue
             # Be conservative about control flow, classes, closures and rebinding.
             if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
+                bound.difference_update(n.name for n in ast.walk(statement)
+                                        if isinstance(n, ast.ExceptHandler) and n.name)
                 bound.difference_update(n.id for n in ast.walk(statement)
                                         if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
                 continue
@@ -281,9 +280,9 @@ def _code_context(text: str) -> CodeContext:
     # Parse the whole source first: a Markdown fence inside a Python string
     # must never turn that string's contents into executable-code evidence.
     tree = _parse(text)
-    blocks = [(text, 0, tree)] if tree is not None else [
+    blocks = [(text, 0, tree)] if tree is not None else (
         (source, start, _parse(source)) for source, start in _fenced_sources(text)
-    ]
+    )
     for source, base, tree in blocks:
         if "\r" in source.replace("\r\n", ""):
             continue  # Do not infer positions for bare-CR source lines.
@@ -380,15 +379,15 @@ def _code_context(text: str) -> CodeContext:
     return context
 
 
-def replace_outside_code(text: str, pattern: re.Pattern, replacement: str, *,
-                         context: CodeContext | None = None) -> tuple[str, int]:
+def outside_code_spans(text: str, pattern: re.Pattern, replacement: str, *,
+                       context: CodeContext | None = None):
     """Apply a known email/hostname entity without deleting syntax elsewhere."""
     if context is None:
         context = code_context(text)
     def host_boundary(start: int, end: int) -> bool:
         # A known db.local must not eat db.locality, nor a contextual db01
         # eat mydb01. Allow a sentence's final dot, but not another DNS label.
-        chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-."
+        chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-."
         if start and text[start - 1] in chars:
             if text[start - 1] != "." or (start > 1 and text[start - 2] in chars):
                 return False
@@ -413,4 +412,11 @@ def replace_outside_code(text: str, pattern: re.Pattern, replacement: str, *,
             if (start, end) not in context.detected_hosts:
                 continue
         spans.append((start, end, replacement))
-    return replace_spans(text, spans, context=context)
+    return spans
+
+
+def replace_outside_code(text: str, pattern: re.Pattern, replacement: str, *,
+                         context: CodeContext | None = None) -> tuple[str, int]:
+    if context is None:
+        context = code_context(text)
+    return replace_spans(text, outside_code_spans(text, pattern, replacement, context=context), context=context)

@@ -128,3 +128,18 @@ def test_hosted_destination_open(monkeypatch):
     info = sf.hosted_destination()
     assert info["can_submit"] is True
     assert info["maximum_bundle_size"] == 100
+
+
+def test_unsafe_ai_finding_is_a_boundary_failure_not_unavailable_ai(monkeypatch):
+    import pytest
+    from clawjournal.redaction import pii
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+    detail = {'session_id': 'synthetic', 'messages': [{'content': 'device ' + 'a' * 70}]}
+    monkeypatch.setattr(sf, 'apply_share_redactions', lambda *a, **k: (detail, 0, []))
+    monkeypatch.setattr(pii, 'review_session_pii_with_agent', lambda *a, **k: [{
+        'session_id': 'synthetic', 'entity_text': 'a' * 70, 'entity_type': 'device_id',
+        'field': 'content', 'message_index': 0, 'confidence': .99, 'source': 'ai',
+    }])
+    settings = {'custom_strings': [], 'allowlist_entries': [], 'extra_usernames': [], 'blocked_domains': []}
+    with pytest.raises(RedactionBoundaryError, match='device_id'):
+        sf.build_redaction_record(None, detail, settings, True)

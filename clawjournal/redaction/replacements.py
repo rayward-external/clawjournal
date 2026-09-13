@@ -39,6 +39,18 @@ def replace_spans(text: str, spans: list[tuple[int, int, str]], *,
     return "".join(parts), len(spans)
 
 
+def coalesce_replacements(spans: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
+    """Cover the union of sensitive spans; never lose a partial overlap."""
+    merged: list[tuple[int, int, str]] = []
+    for start, end, replacement in sorted(spans, key=lambda row: (row[0], -row[1])):
+        if merged and start < merged[-1][1]:
+            left, right, placeholder = merged[-1]
+            merged[-1] = left, max(right, end), placeholder
+        else:
+            merged.append((start, end, replacement))
+    return merged
+
+
 class ReplacementMap(dict[str, str]):
     """Global full entities plus fragments restricted to actual scanner spans.
 
@@ -69,7 +81,7 @@ class ReplacementMap(dict[str, str]):
         # weak finding erase the evidence that every copy is a credential.
         for value, replacement in other.items():
             if (self.get(value) in _CREDENTIAL_PLACEHOLDERS
-                    and replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}):
+                    and replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]", "[REDACTED]"}):
                 continue
             self[value] = replacement
         if isinstance(other, ReplacementMap):
@@ -92,8 +104,7 @@ def replace_email_fragments(text: str, fragments: dict[str, str], *, ignore_case
     return replace_spans(text, spans, context=context)
 
 
-def replace_secret_value(text: str, secret: str, replacement: str, *,
-                          context: CodeContext | None = None) -> tuple[str, int]:
+def secret_value_spans(text: str, secret: str, replacement: str):
     """Propagate a captured value without replacing assignment field names."""
     import re
     from .secrets import SECRET_PATTERNS, _secret_matches
@@ -105,16 +116,32 @@ def replace_secret_value(text: str, secret: str, replacement: str, *,
     )
     matches = list(pattern.finditer(text))
     if not matches:
-        return text, 0
+        return []
     labels = []
     for name, assignment in SECRET_PATTERNS:
         if name not in {"env_secret", "generic_secret"}:
             continue
         for match in _secret_matches(assignment, text):
             start = match.start()
-            while start > 0 and (text[start - 1].isalnum() or text[start - 1] in "_.-"):
-                start -= 1
+            label_start = start
+            while label_start > 0 and (text[label_start - 1].isalnum() or text[label_start - 1] == '_'):
+                label_start -= 1
+            # Preserve a prefix such as TELEGRAM_BOT_ in a field name. A
+            # separately known value glued to that name is still sensitive.
+            if secret.casefold() not in text[label_start:start].casefold():
+                start = label_start
             labels.append((start, match.start(1)))
     labels = merge_spans(labels)
-    spans = [(m.start(), m.end(), replacement) for m in matches if not contains_span(labels, m.start(), m.end())]
-    return replace_spans(text, spans, context=context)
+    return [(m.start(), m.end(), replacement) for m in matches if not contains_span(labels, m.start(), m.end())]
+
+
+def replace_secret_value(text: str, secret: str, replacement: str, *,
+                         context: CodeContext | None = None) -> tuple[str, int]:
+    return replace_spans(text, secret_value_spans(text, secret, replacement), context=context)
+
+
+def email_pattern(value: str, flags: int = 0):
+    """Keep Chinese adjacency without matching inside a different address."""
+    import re
+    return re.compile(r"(?<![A-Za-z0-9._%+-])" + re.escape(value)
+                      + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])", flags)

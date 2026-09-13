@@ -5157,6 +5157,10 @@ def _main() -> None:
     ins.add_argument("--detail", action="store_true", help="Show detailed recommendations")
 
     # Refresh pricing
+    review_cache = sub.add_parser("review-cache", help="Clear local saved preview payloads")
+    review_cache.add_argument("--clear", action="store_true", required=True)
+    review_cache.add_argument("--all", action="store_true", help="Also invalidate saved inputs for pending shares; previews must be refreshed")
+
     sub.add_parser("refresh-pricing", help="Refresh model pricing cache from OpenRouter")
 
     # Search command
@@ -5416,6 +5420,17 @@ def _main() -> None:
 
     if command == "insights":
         _run_insights(args)
+        return
+
+    if command == "review-cache":
+        from .workbench.index import open_index
+        from .workbench.review_snapshots import clear_review_cache
+        conn = open_index()
+        try:
+            clear_review_cache(conn, include_linked=args.all)
+        finally:
+            conn.close()
+        print("Review cache cleared. Refresh previews before sharing." if args.all else "Unused review previews cleared.")
         return
 
     if command == "refresh-pricing":

@@ -30,6 +30,22 @@ _PERSONAL_HOST = re.compile(
     re.I,
 )
 _ESCAPED_SEPARATOR = re.compile(r"%([234][0aAeE])|\\u00(2[eE]|3[aA]|40)|&#(?:0*(46|58|64)|[xX]0*(2[eE]|3[aA]|40));")
+_URL_AUTHORITY = re.compile(r"(?:https?|ssh|git|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?)://([^\s/?#\"'`<>]+)", re.I)
+
+
+def credentialed_urls(text: str):
+    """Return explicit URL userinfo, independently of email length budgets."""
+    for match in _URL_AUTHORITY.finditer(text):
+        authority = match.group(1)
+        at = authority.rfind('@')
+        if at > 0 and at < len(authority) - 1:
+            yield match.start(1), match.start(1) + at, match.end(1)
+
+
+def email_in_url_userinfo(start: int, end: int, urls: list[tuple[int, int, int]]) -> bool:
+    """Look up an email-shaped URL credential without rescanning every URL."""
+    i = bisect.bisect_right(urls, start, key=lambda span: span[0]) - 1
+    return i >= 0 and start < urls[i][1] and end <= urls[i][2]
 
 
 def _unspaced_script(char: str) -> bool:
@@ -38,7 +54,9 @@ def _unspaced_script(char: str) -> bool:
         return False
     name = unicodedata.name(char, "")
     return name.startswith(("CJK ", "IDEOGRAPHIC ", "HIRAGANA ", "KATAKANA",
-                            "HANGUL ", "THAI ", "LAO ", "KHMER ", "MYANMAR "))
+                            "HANGUL ", "THAI ", "LAO ", "KHMER ", "MYANMAR ",
+                            "HALFWIDTH KATAKANA", "HALFWIDTH HANGUL",
+                            "FULLWIDTH LATIN", "FULLWIDTH DIGIT"))
 
 
 def _scanning_view(text: str) -> tuple[str, list[int], list[int]]:
@@ -97,16 +115,25 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
             ):
                 start -= 1
         # In prose, a script transition is a boundary around an ASCII address.
-        # Explicit mailbox delimiters retain internationalized mixed-script
-        # local parts; punctuation joins (e.g. ツ-test) also remain part of it.
-        delimited = text[start:start + 1] == '"' or (start > 0 and text[start - 1] in '<"')
+        # Only the script immediately next to the ASCII run matters: earlier
+        # prose may contain API names, dates or other ASCII text. RFC mailbox
+        # delimiters retain mixed-script local parts. A JSON/string-opening
+        # quote is not a mailbox delimiter; it may enclose a whole sentence.
+        # Punctuation joins (e.g. ツ-test) remain part of the local part.
+        delimited = text[start:start + 1] == '"' or (start > 0 and text[start - 1] == '<')
         if text[start:start + 1] != '"' and not delimited:
             ascii_start = at
             while ascii_start > start and text[ascii_start - 1].isascii():
                 ascii_start -= 1
             if (start < ascii_start < at and text[ascii_start].isalnum()
-                    and all(_unspaced_script(char) for char in text[start:ascii_start])):
+                    and _unspaced_script(text[ascii_start - 1])):
                 start = ascii_start
+        if not delimited:
+            # Query syntax delimits parameter values. Do not absorb a previous
+            # IP/host/token into an email and evict its independent evidence.
+            prefix = text[start:at]
+            if ('?' in prefix or '&' in prefix) and '=' in prefix:
+                start += prefix.rfind('=') + 1
         if start == at:
             continue
         domain = _DOMAIN.match(text, at + 1)
@@ -235,6 +262,16 @@ def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
                 yield candidate(chain.start(), end, "internal_tld_host", "private_url")
     for pattern in (_HOST_FIELD, _SSH_HOST):
         for match in pattern.finditer(view):
+            if pattern is _SSH_HOST:
+                # A bare English word after prose "ssh" is not host evidence.
+                # Keep command-position destinations and explicit user@host /
+                # dotted destinations; fields such as DB_HOST cover bare hosts.
+                before = view[view.rfind('\n', 0, match.start()) + 1:match.start()].strip()
+                value = match.group(1)
+                if value.lower() in {'into', 'the', 'keys', 'with', 'to', 'from', 'and', 'is', 'on', 'using'}:
+                    continue
+                if before not in {'', '$', '>', '`', '```'} and '@' not in match.group() and '.' not in value:
+                    continue
             if (match.group(1).lower() not in {"localhost", "127.0.0.1"}
                     and not (pattern is _HOST_FIELD and is_reference_prefix(match, "host"))):
                 yield candidate(*match.span(1), "internal_host_context", "private_url")

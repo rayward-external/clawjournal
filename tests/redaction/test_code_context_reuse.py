@@ -105,14 +105,14 @@ def test_credential_edit_inside_a_protected_interval_invalidates_it():
 
 @pytest.mark.parametrize("length", [65535, 65536, 65537, 200000])
 @pytest.mark.parametrize("wrapper", ["source", "fenced", "string"])
-def test_code_evidence_does_not_silently_disappear_at_64k(length, wrapper):
+def test_code_evidence_obeys_explicit_character_budget(length, wrapper):
     code = "obj = object()\nimport numpy\nimport torch\nvalue = numpy.array@torch.tensor\nobj.local()\n"
     body = code + "#" * (length - len(code)) + "\n"
     text = body if wrapper == "source" else ("```python\n" + body + "```" if wrapper == "fenced" else 'data = """\n```python\n' + body + '```\n"""')
     context = cc.code_context(text)
     for value in ("numpy.array@torch.tensor", "obj.local"):
         start = text.index(value)
-        assert context.protects(start, start + len(value)) == (wrapper != "string")
+        assert context.protects(start, start + len(value)) == (wrapper != "string" and len(text) <= cc._MAX_PARSE_CHARS)
 
 
 @pytest.mark.parametrize("length", [65535, 65536, 65537, 200000])
@@ -120,12 +120,13 @@ def test_long_code_output_preserves_calls_and_redacts_literal_copies(length):
     prefix = 'obj = object()\nobj.local()\ncontact = "obj.local"\n'
     text = prefix + "#" * (length - len(prefix))
     result, count = findings.apply_findings_to_text(text, [finding("obj.local", "private_url")])
-    assert result == text.replace('"obj.local"', '"[REDACTED_URL]"')
-    assert count == 1
+    expected = text.replace('"obj.local"', '"[REDACTED_URL]"') if length <= cc._MAX_PARSE_CHARS else text.replace('obj.local', '[REDACTED_URL]')
+    assert result == expected
+    assert count == (1 if length <= cc._MAX_PARSE_CHARS else 2)
 
 
 def test_long_source_keeps_preceding_imports_and_unicode_offsets():
-    text = '标签 = "😀"\r\nimport numpy\r\nimport torch\r\n' + '# ordinary\r\n' * 7000 + 'value = numpy.array@torch.tensor\r\n'
+    text = '标签 = "😀"\r\nimport numpy\r\nimport torch\r\n' + '# ordinary\r\n' * 1000 + 'value = numpy.array@torch.tensor\r\n'
     context = cc.code_context(text)
     start = text.index('numpy.array@torch.tensor')
     assert context.protects(start, start + len('numpy.array@torch.tensor'))
@@ -147,7 +148,7 @@ def test_parse_budget_disables_hints_but_keeps_scanning(monkeypatch):
 
 @pytest.mark.parametrize("limit", ["_MAX_PARSE_TOKENS", "_MAX_STATEMENT_TOKENS"])
 def test_complexity_budget_does_not_abort_detection(limit, monkeypatch):
-    text = 'obj = object()\nobj.local()\ncontact = "alice@audit.test"\n' + "#" * 66000 + "\nx = a + b + c + d\n"
+    text = 'obj = object()\nobj.local()\ncontact = "alice@audit.test"\n' + "#" * 6000 + "\nx = a + b + c + d\n"
     assert cc.code_context(text).protected
     monkeypatch.setattr(cc, limit, 5)
     monkeypatch.setattr(cc, "_ast_parse", lambda *_: pytest.fail("Over-budget tokens reached AST"))

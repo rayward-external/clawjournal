@@ -214,6 +214,7 @@ SECRET_PATTERNS = [
 # Medium (0.70-0.89): structural patterns, worth reviewing.
 # Low (<0.70): heuristic/PII, may be false positives.
 CONFIDENCE: dict[str, float] = {
+    "url_userinfo": 0.94,
     "jwt": 0.98, "private_key": 0.98,
     "anthropic_key": 0.98, "openai_key": 0.98,
     "github_token": 0.98, "hf_token": 0.98,
@@ -232,6 +233,7 @@ CONFIDENCE: dict[str, float] = {
 # Typed placeholders per secret type — preserves what kind of secret was
 # removed so model-training data retains task structure.
 SECRET_PLACEHOLDER: dict[str, str] = {
+    "url_userinfo": "[REDACTED_CREDENTIAL]",
     "jwt": "[REDACTED_JWT]",
     "jwt_partial": "[REDACTED_JWT]",
     "db_url": "[REDACTED_DB_URL]",
@@ -512,14 +514,24 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     from .code_context import code_context
     context = code_context(text)
 
+    from .candidate_formats import credentialed_urls, email_in_url_userinfo
+    url_spans = list(credentialed_urls(text))
     findings = []
+    for start, end, _authority_end in url_spans:
+        value = text[start:end]
+        if value not in _CREDENTIAL_PLACEHOLDERS and not _check_user_allowlist(value, "url_userinfo", user_allowlist):
+            findings.append({"type": "url_userinfo", "start": start, "end": end,
+                             "match": value, "confidence": 0.94})
     for name, pattern in filter_rules(text, SECRET_PATTERNS):
         if not has_assignment_sep and name in _ASSIGNMENT_PATTERNS:
             continue
 
         for match in _secret_matches(pattern, text):
             matched_text = match.group(0)
-            if name == "email" and context.protects(match.start(), match.end()):
+            if name in {"env_secret", "generic_secret"} and match.group(1) in set(SECRET_PLACEHOLDER.values()) | {REDACTED}:
+                continue
+            if name == "email" and (context.protects(match.start(), match.end())
+                    or email_in_url_userinfo(match.start(), match.end(), url_spans)):
                 continue
             if name in {"env_secret", "generic_secret"} and context.is_reference(match.start(1), match.start(1) + 1):
                 continue
@@ -588,23 +600,6 @@ def _redact_text(text: str, *, user_allowlist: list[dict] | None, strict: bool):
     if strict:
         ensure_text_boundaries(text)
     findings = scan_text(text, user_allowlist=user_allowlist)
-    if not strict:
-        # Keep local redaction at least as strong for ordinary candidates as
-        # the original detector. Never discard a finding or return raw input
-        # because optional code hints could not be computed. On exceptionally
-        # long runs mask the address around @, preserving distant prose. The
-        # original source still requires the strict share preflight.
-        for finding in findings:
-            if finding["type"] != "email" or len(finding["match"]) <= 512:
-                continue
-            at = text.rfind("@", finding["start"], finding["end"])
-            start = max(finding["start"], at - 64)
-            end = min(finding["end"], at + 1 + 253)
-            # Overlap precedence must use the span we really replace. The
-            # retained prefix must not evict an independently detected key.
-            finding.update(start=start, end=end, match=text[start:end],
-                           replacement_start=start, replacement_end=end,
-                           boundary_limited=True)
     if not findings:
         return text, 0, []
 
@@ -650,15 +645,13 @@ def _redact_text(text: str, *, user_allowlist: list[dict] | None, strict: bool):
             entry["context_after"] = safe_after
         log.append(entry)
 
-    # Replace from end-to-start (deduped is already in descending start order)
-    result = text
-    for f in deduped:
-        placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-        start = f.get("replacement_start", f["start"])
-        end = f.get("replacement_end", f["end"])
-        result = result[:start] + placeholder + result[end:]
-
-    return result, len(deduped), log
+    from .replacements import replace_spans, coalesce_replacements
+    spans = coalesce_replacements([
+        (f.get("replacement_start", f["start"]), f.get("replacement_end", f["end"]),
+         SECRET_PLACEHOLDER.get(f["type"], REDACTED)) for f in deduped
+    ])
+    result, count = replace_spans(text, spans)
+    return result, count, log
 
 
 def _blank_high_conf_overlaps(
@@ -843,6 +836,7 @@ def _build_redaction_set(
     texts: list[tuple[str, str, int | None, str | None]],
     user_allowlist: list[dict] | None = None,
     custom_strings: list[str] | None = None,
+    *, strict: bool = False,
 ) -> tuple[dict[str, str], list[dict]]:
     """Scan all text at once to build a global map of secret strings to typed placeholders.
 
@@ -857,7 +851,8 @@ def _build_redaction_set(
     from .boundaries import ensure_text_boundaries
 
     for text, field, msg_idx, _tool_field in texts:
-        ensure_text_boundaries(text)
+        if strict:
+            ensure_text_boundaries(text)
         findings = scan_text(text, user_allowlist=user_allowlist)
         for f in _dedupe_overlapping_matches(findings):
             matched = f["match"]
@@ -903,66 +898,60 @@ def _build_redaction_set(
 
 
 def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, int]:
-    """Replace all known secrets in text using typed placeholders.
+    """Plan all replacements in original coordinates, then mask their union.
 
-    Returns (redacted_text, replacement_count).
-
-    Short secrets (< 20 chars) that look like plain words use word-boundary
-    matching to avoid false positives (e.g. "Kai" matching inside "Kaizen").
-    Long secrets and those containing special characters use plain str.replace
-    since they are unique enough to match safely.
+    A longer partial overlap must not destroy the evidence needed to replace
+    a neighbouring credential. Code evidence is computed once per field.
     """
     if not text or not secret_map:
         return text, 0
+    from .replacements import (ReplacementMap, coalesce_replacements, email_pattern,
+                               replace_spans, secret_value_spans)
+    from .code_context import code_context, outside_code_spans
+    from .candidate_formats import iter_partial_email_candidates
 
-    from .replacements import ReplacementMap, replace_email_fragments, replace_spans
-    from .code_context import code_context, replace_outside_code
-
-    context = code_context(text) if any(
-        value in {"[REDACTED_EMAIL]", "[REDACTED_URL]"} for value in secret_map.values()
-    ) else None
-
-    count = 0
-    # Sort by length descending so longer matches replace first
+    context = None
+    lowered = text.lower()
+    spans = []
+    host_patterns = []
     for secret in sorted(secret_map, key=len, reverse=True):
         replacement = secret_map[secret]
+        host_case = replacement == "[REDACTED_URL]" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", secret)
+        short_word = len(secret) < 20 and secret.isalnum()
+        insensitive = bool(host_case or short_word)
+        if (secret.lower() not in lowered) if insensitive else (secret not in text):
+            continue
         if replacement in {"[REDACTED_ENV_SECRET]", "[REDACTED_SECRET]"}:
-            from .replacements import replace_secret_value
-            text, n = replace_secret_value(text, secret, replacement, context=context)
-            count += n
-            continue
-        if replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
-            # DNS names are case-insensitive. Do not extend that rule to
-            # complete URLs, whose paths may contain case-sensitive values.
-            host_case = replacement == "[REDACTED_URL]" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", secret)
-            if not host_case and secret not in text:
-                continue
-            text, n = replace_outside_code(text, re.compile(re.escape(secret), re.I if host_case else 0), replacement, context=context)
-            count += n
-            continue
-        # Short alphanumeric strings need boundaries to avoid matching
-        # inside unrelated words (e.g. custom redact_strings like "Kai").
-        # ASCII-only lookarounds rather than `\b`, which treats CJK
-        # neighbours as word characters and silently skips the match.
-        if len(secret) < 20 and secret.isalnum():
+            spans.extend(secret_value_spans(text, secret, replacement))
+        elif replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
+            if context is None:
+                context = code_context(text)
+            pattern = email_pattern(secret) if replacement == "[REDACTED_EMAIL]" else re.compile(re.escape(secret), re.I if host_case else 0)
+            spans.extend(outside_code_spans(text, pattern, replacement, context=context))
+            if replacement == "[REDACTED_URL]":
+                host_patterns.append(pattern)
+        else:
             pattern = re.compile(
-                rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])",
-                re.IGNORECASE,
+                rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])" if short_word else re.escape(secret),
+                re.I if short_word else 0,
             )
-            spans = [(m.start(), m.end(), m.expand(replacement)) for m in pattern.finditer(text)]
-            text, n = replace_spans(text, spans, context=context)
-            count += n
-        elif secret in text:
-            spans = [(m.start(), m.end(), replacement) for m in re.finditer(re.escape(secret), text)]
-            text, n = replace_spans(text, spans, context=context)
-            count += n
-
-    # Full secrets take precedence. Replacing a fragment inside a private-key
-    # body first would invalidate the whole-key map before it can be applied.
+            spans.extend((m.start(), m.end(), replacement) for m in pattern.finditer(text))
     if isinstance(secret_map, ReplacementMap) and secret_map.email_fragments:
-        text, n = replace_email_fragments(text, secret_map.email_fragments, context=context)
-        count += n
-    return text, count
+        fragments = secret_map.email_fragments
+        spans.extend((m['start'], m['end'], fragments[m['match']])
+                     for m in iter_partial_email_candidates(text) if m['match'] in fragments)
+    edits = coalesce_replacements(spans)
+    result, count = replace_spans(text, edits, context=context)
+    # A removed credential/custom prefix can expose a known hostname that
+    # was not independently detectable in the original field. Recheck only
+    # those known hosts, using rebased evidence, after the atomic first pass.
+    if any(replacement != "[REDACTED_URL]" for _start, _end, replacement in edits):
+        exposed = []
+        for pattern in host_patterns:
+            exposed.extend(outside_code_spans(result, pattern, "[REDACTED_URL]", context=context))
+        result, extra = replace_spans(result, coalesce_replacements(exposed), context=context)
+        count += extra
+    return result, count
 
 
 def _apply_to_value(value: Any, secret_map: dict[str, str]) -> tuple[Any, int]:
@@ -1030,6 +1019,7 @@ def redact_session(
     session: dict, custom_strings: list[str] | None = None,
     user_allowlist: list[dict] | None = None,
     max_passes: int = 3,
+    *, strict: bool = False,
 ) -> tuple[dict, int, list[dict]]:
     """Redact all secrets in a session dict using scan-mark-replace strategy.
 
@@ -1052,7 +1042,7 @@ def redact_session(
 
         # Step 2: Scan to build global redaction map (secret -> typed placeholder)
         secret_map, log = _build_redaction_set(
-            texts, user_allowlist=user_allowlist,
+            texts, user_allowlist=user_allowlist, strict=strict,
             custom_strings=custom_strings if pass_num == 0 else None,  # custom strings only on first pass
         )
         secret_map.update(_collect_infrastructure_secret_map(session))
@@ -1184,7 +1174,8 @@ def _dedupe_overlapping_matches(matches: list[dict]) -> list[dict]:
     kept: list[dict] = []
     for candidate in ordered:
         overlaps = any(
-            candidate["start"] < existing["end"] and candidate["end"] > existing["start"]
+            existing.get("replacement_start", existing["start"]) <= candidate.get("replacement_start", candidate["start"])
+            and existing.get("replacement_end", existing["end"]) >= candidate.get("replacement_end", candidate["end"])
             for existing in kept
         )
         if not overlaps:

@@ -105,6 +105,8 @@ _DURABLE_TABLES = (
     "findings_allowlist",
     "shares",
     "share_sessions",
+    "share_review_snapshots",
+    "share_snapshot_links",
     "session_hold_history",
     "auto_upload_enrollment",
     "auto_upload_enrollment_job",
@@ -1851,6 +1853,16 @@ def _restore_snapshot(
             warnings.append(
                 f"{skipped_share_sessions} orphaned share link(s) remain in the backup."
             )
+        for table, references in (
+            ("share_review_snapshots", (("session_id", "sessions", "session_id"),)),
+            ("share_snapshot_links", (("share_id", "shares", "share_id"),
+                                      ("session_id", "sessions", "session_id"),
+                                      ("snapshot_id", "share_review_snapshots", "snapshot_id"))),
+        ):
+            rows, skipped = _filter_rows_with_references(conn, snapshot.get(table, []), references)
+            counts[table] = _insert_rows(conn, table, rows)
+            if skipped:
+                warnings.append(f"{skipped} review-cache row(s) remain in the backup; refresh affected previews.")
         finding_count, skipped_findings = _restore_finding_decisions(
             conn, snapshot.get("finding_decisions", [])
         )

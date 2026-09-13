@@ -55,17 +55,19 @@ validate them against the original field. They do not repeatedly retry each
 suffix of the same long run. No window copies, worker processes or interpreter
 launches are needed for these deterministic searches. Private keys retain
 complete-text handling. Code context, finding decisions and known-credential
-propagation keep their existing field/session scope. Manual and automatic
+propagation use field/session scope. Overlapping replacements cover the union
+of detected sensitive spans. Weak truncated email fragments stay local to their
+occurrence unless their finding is explicitly accepted; accepted findings
+propagate to matching bare identifiers. Manual and automatic
 sharing use this same scanning path. Packaging and all scan gates finish
 before upload starts; faster scanning does not change network transfer time.
 
-A local Aho-Corasick prefilter (`pyahocorasick`) checks required literal markers
-before the built-in secret and PII regex passes. Common punctuation uses
-presence checks to avoid processing every repeated dot or quote. Only exact
-reviewed regexes can be skipped; new or changed rules still run. Small fields
-and an unavailable or failed accelerator use the original rules. The prefilter
-does not change matching, Unicode boundaries, review policy or external gates,
-and does not retain field text between calls. RE2 is not used.
+A pure-Python literal prefilter checks required markers before the built-in
+secret and PII regex passes. Only exact reviewed regexes can be skipped; new
+or changed rules still run. Small fields use the original rules. Tests generate
+positive inputs from the live regexes to check that a necessary marker cannot
+reject a valid match. The prefilter retains no input between calls and requires
+no native extension. Neither pyahocorasick nor RE2 is required.
 
 Code evidence is collected from the original field and its offsets move with
 known replacements. It is not reparsed for each email or hostname, and edits
@@ -76,20 +78,25 @@ parse error, NUL byte or exhausted hint budget cancels the affected code
 exemptions; it never aborts secret detection, badge computation or indexing.
 The detector still scans the original text. NUL bytes are not removed or
 shifted in the source. Quoted data cannot authorize embedded Markdown fences.
-Fence lines are paired in one pass, including unfinished blocks. Prose
-outside a fence is not tokenized as Python, so ordinary apostrophes do
-not change behavior across Python versions. Parser and tokenizer warning
-scopes are serialized across redaction threads and do not print source text.
-Escaped CRLF line continuations cannot expose a fence inside quoted data.
-Plain word lists are rejected before costly parser recovery.
+Fence lines are paired in one pass, then checked by Python's tokenizer. An
+ambiguous outer string disables fenced-code exemptions for that field. Code
+hints have a 65,536-character ceiling plus token budgets. Larger fields still
+receive full secret detection, but do not receive Python-code exemptions;
+code-shaped text can therefore be redacted as it was before these exemptions
+were added. Scanner threads do not change the process's warning filters or
+hold a parser mutex. Suspicious string escapes disable optional hints before
+tokenization. No trace text is executed.
 
-Local indexing and display do not apply the sharing preflight. They redact
-recognized secrets even when code evidence is unavailable. Email candidates
-up to 512 characters retain the original local replacement behavior. For
-larger uninterrupted candidates, the local view masks up to 64 characters
-before @ and 253 after it, retains distant surrounding text, and records a
-boundary-limited replacement. This display treatment is not a clean export
-verdict: sharing checks the original input with the strict boundary policy.
+Local indexing, card rendering and local session export do not apply the sharing
+preflight. They retain full masking of recognized candidates, including long
+URL credentials; no leading credential bytes are kept just to limit a local
+email replacement. Sharing checks the original input with the strict boundary
+policy. Explicit URL userinfo is a credential with a complete URL boundary, so
+it is masked without imposing the email local-part limit. An explicit blocked
+domain or custom redaction can likewise remove an oversized value. Ambiguous
+email-like code without specific array evidence uses normal email redaction,
+rather than stopping the whole share.
+
 Pure detection returns its findings without applying replacement limits, so
 findings can be saved and unchanged sessions need not be scanned every tick.
 A blocked review request returns a structured error instead of closing the
@@ -235,8 +242,24 @@ Uploading is a separate path from local export.
 Manual Share saves the input used for each redaction preview in the local index.
 When you include that preview, packaging uses its saved content version even if
 the conversation later grows. Later content stays local for a future share; it
-does not inherit this inclusion. Saved reviews have no time-based expiry. A new
-preview replaces the version shown in that review, and must be included again.
+does not inherit this inclusion. Only successful previews are saved. There is
+no time-based approval expiry. Unlinked previews are limited to the latest
+revision per trace, 100 rows overall, and a total payload budget of 128 MiB
+including linked previews. Old unused previews can be evicted; affected tabs
+must refresh. Inputs linked to pending shares are preserved. If those inputs
+fill the cache, new previews stop with a clear cache-full message.
+
+After every share referencing an input receives a receipt, its raw snapshot
+payload is cleared. Minimal links remain, so an old share cannot fall back to a
+newer live trace. Index recovery preserves pending snapshot data and links.
+`clawjournal review-cache --clear` removes unused previews;
+`clawjournal review-cache --clear --all` also clears linked payloads and requires
+fresh previews for pending shares. These operations remove database payloads;
+they are not a guarantee of forensic removal from backups or filesystem copies.
+A refreshed preview must be included again. Failed or timed-out previews remain
+excluded while healthy traces can proceed. A boundary failure during optional
+AI review is reported as a blocked trace, not as successful rules-only coverage.
+
 Current holds, blocked status, source/project scope, exclusions, redaction rules,
 consent, duplicate checks, and both secret-scan gates still apply. Missing or
 damaged saved content requires a fresh preview. This manual review mechanism

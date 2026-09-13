@@ -63,12 +63,10 @@ def test_ambiguous_boundary_blocks_manual_share_without_changing_reviewed_data(c
     assert content not in str(error)
 
 
-def test_configured_domain_boundary_keeps_long_candidate_local(conn):
-    from clawjournal.redaction.boundaries import RedactionBoundaryError
-
+def test_explicit_blocked_domain_removes_even_oversized_labels(conn):
     detail = trace("a" * 1000 + ".example.test")
-    with pytest.raises(RedactionBoundaryError):
-        index.apply_share_redactions(conn, detail, blocked_domains=["*.example.test"])
+    result, _, _ = index.apply_share_redactions(conn, detail, blocked_domains=["*.example.test"])
+    assert result['messages'][0]['content'] == '[REDACTED_DOMAIN]'
 
 
 def test_explicit_custom_redaction_can_resolve_an_ambiguous_boundary(conn):
@@ -190,7 +188,7 @@ def test_snapshot_cannot_repeat_an_uploaded_version_or_replace_a_newer_share(con
     conn.execute("UPDATE shares SET shared_at = '2026-09-01', status = 'shared' WHERE share_id = ?", (first,))
     conn.commit()
     with pytest.raises(index.RevisionConflictError):
-        create(conn, snapshot)
+        index.create_share(conn, ["test-trace"], review_snapshot_ids={"test-trace": snapshot})
     index.upsert_sessions(conn, [trace("Reviewed next version")])
     snapshot = preview(conn)
     index.upsert_sessions(conn, [trace("Newer version uploaded in another window")])
@@ -198,7 +196,7 @@ def test_snapshot_cannot_repeat_an_uploaded_version_or_replace_a_newer_share(con
     conn.execute("UPDATE shares SET shared_at = '2026-09-02', status = 'shared' WHERE share_id = ?", (second,))
     conn.commit()
     with pytest.raises(index.RevisionConflictError):
-        create(conn, snapshot)
+        index.create_share(conn, ["test-trace"], review_snapshot_ids={"test-trace": snapshot})
 
 
 def test_capture_rejects_blob_that_does_not_match_the_index_revision(conn):
@@ -222,3 +220,97 @@ def test_upgrade_from_v13_preserves_existing_rows(conn):
         assert load_review_snapshot(reopened, snapshot, "test-trace")["messages"] == trace()["messages"]
     finally:
         reopened.close()
+
+
+def test_abandoned_revisions_are_replaced_but_linked_inputs_survive(conn):
+    from clawjournal.workbench.review_snapshots import prune_review_snapshots
+    index.upsert_sessions(conn, [trace('pinned original')])
+    pinned = preview(conn)
+    share_id = create(conn, pinned)
+    for i in range(25):
+        index.upsert_sessions(conn, [trace(f'new revision {i}')])
+        latest = preview(conn)
+    assert conn.execute('SELECT COUNT(*) FROM share_review_snapshots').fetchone()[0] == 2
+    assert load_review_snapshot(conn, pinned, 'test-trace')['messages'][0]['content'] == 'pinned original'
+    assert load_review_snapshot(conn, latest, 'test-trace')['messages'][0]['content'] == 'new revision 24'
+    conn.execute("UPDATE shares SET shared_at = '2026-09-12', status = 'shared' WHERE share_id = ?", (share_id,))
+    prune_review_snapshots(conn)
+    assert conn.execute('SELECT payload FROM share_review_snapshots WHERE snapshot_id = ?', (pinned,)).fetchone()[0] == ''
+    assert conn.execute('SELECT COUNT(*) FROM share_snapshot_links').fetchone()[0] == 1
+    with pytest.raises(ReviewSnapshotError):
+        load_review_snapshot(conn, pinned, 'test-trace')
+
+
+def test_cache_limits_and_explicit_clear_keep_pending_links_safe(conn, monkeypatch):
+    from clawjournal.workbench import review_snapshots as cache
+    monkeypatch.setattr(cache, 'MAX_UNLINKED_SNAPSHOTS', 2)
+    for i in range(4):
+        sid = f'synthetic-{i}'
+        index.upsert_sessions(conn, [trace('raw credential example', sid)])
+        preview(conn, sid)
+    assert conn.execute('SELECT COUNT(*) FROM share_review_snapshots').fetchone()[0] == 2
+    index.upsert_sessions(conn, [trace('pinned')])
+    pinned = preview(conn)
+    share_id = create(conn, pinned)
+    cache.clear_review_cache(conn)
+    assert load_review_snapshot(conn, pinned, 'test-trace')
+    size = conn.execute('SELECT length(CAST(payload AS BLOB)) FROM share_review_snapshots').fetchone()[0]
+    monkeypatch.setattr(cache, 'MAX_SNAPSHOT_BYTES', size + 1)
+    index.upsert_sessions(conn, [trace('next', 'other')])
+    with pytest.raises(ReviewSnapshotError, match='cache is full'):
+        preview(conn, 'other')
+    assert load_review_snapshot(conn, pinned, 'test-trace')
+    cache.clear_review_cache(conn, include_linked=True)
+    assert index.share_revision_blockers(conn, share_id)
+    assert conn.execute("SELECT COALESCE(SUM(length(payload)), 0) FROM share_review_snapshots").fetchone()[0] == 0
+
+
+def test_snapshot_cannot_reshare_an_older_successful_revision(conn):
+    for content, date in [('version one', '2026-09-01'), ('version two', '2026-09-02')]:
+        index.upsert_sessions(conn, [trace(content)])
+        sid = index.create_share(conn, ['test-trace'])
+        conn.execute("UPDATE shares SET shared_at = ?, status = 'shared' WHERE share_id = ?", (date, sid))
+        conn.commit()
+    index.upsert_sessions(conn, [trace('version one')])
+    snapshot = preview(conn)
+    with pytest.raises(index.RevisionConflictError):
+        create(conn, snapshot)
+
+
+def test_cache_reserves_space_again_after_evicting_an_existing_preview(conn, monkeypatch):
+    from clawjournal.workbench import review_snapshots as cache
+    index.upsert_sessions(conn, [trace('pinned')])
+    pinned = preview(conn)
+    create(conn, pinned)
+    pinned_size = conn.execute('SELECT length(CAST(payload AS BLOB)) FROM share_review_snapshots').fetchone()[0]
+    index.upsert_sessions(conn, [trace('unused', 'other')])
+    unused = preview(conn, 'other')
+    monkeypatch.setattr(cache, 'MAX_SNAPSHOT_BYTES', pinned_size + 1)
+    with pytest.raises(ReviewSnapshotError, match='cache is full'):
+        preview(conn, 'other')
+    assert load_review_snapshot(conn, pinned, 'test-trace')
+    with pytest.raises(ReviewSnapshotError):
+        load_review_snapshot(conn, unused, 'other')
+
+
+def test_engine_change_flags_stored_blobs_without_repeated_backfill(conn, monkeypatch):
+    from clawjournal import findings
+    index.upsert_sessions(conn, [trace('stored blob with no original transcript')])
+    conn.execute("UPDATE sessions SET findings_backfill_needed = 0, findings_revision = 'old-engine-revision'")
+    conn.commit()
+    monkeypatch.setattr(findings, 'ENGINE_VERSION', findings.ENGINE_VERSION + 1)
+    index._migrate_redaction_cache_state(conn)
+    assert conn.execute('SELECT findings_backfill_needed FROM sessions').fetchone()[0] == 1
+    conn.execute('UPDATE sessions SET findings_backfill_needed = 0')
+    conn.commit()
+    index._migrate_redaction_cache_state(conn)
+    assert conn.execute('SELECT findings_backfill_needed FROM sessions').fetchone()[0] == 0
+
+
+def test_open_index_does_not_take_a_write_lock_for_an_unchanged_cache(conn):
+    # All API requests call open_index. An unconditional cache UPDATE would
+    # serialize otherwise read-only requests behind another writer.
+    conn.execute('BEGIN IMMEDIATE')
+    other = index.open_index()
+    other.close()
+    conn.rollback()
