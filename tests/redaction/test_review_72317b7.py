@@ -157,7 +157,8 @@ def test_an_arbitrary_import_never_authorizes_a_private_host(conn, prefix, fence
     assert share(conn, text) == text.replace('jenkins.internal', '[REDACTED_URL]')
 
 
-@pytest.mark.parametrize('prefix', ['', json.dumps({f'key{i}':i for i in range(600)}) + '\n', '#' * 70000 + '\n'])
+@pytest.mark.parametrize('prefix', ['', json.dumps({f'key{i}':i for i in range(600)}) + '\n', '#' * 70000 + '\n'],
+                         ids=['small', 'token-budget', 'character-budget'])
 def test_large_data_before_a_host_lookup_does_not_change_share_policy(conn, prefix):
     text = prefix + 'DB_HOST = svc.internal.' + 'L' * 70 + '(1)'
     assert share(conn, text) == text.replace('svc.internal', '[REDACTED_URL]')
