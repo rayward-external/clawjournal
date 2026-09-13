@@ -37,6 +37,7 @@ class CodeContext:
     ambiguous_emails: list[tuple[int, int]] = field(default_factory=list)
     references: list[tuple[int, int]] = field(default_factory=list)
     detected_hosts: set[tuple[int, int]] | None = None
+    detected_emails: dict[str, list[tuple[int, int]]] | None = None
 
     def protects(self, start: int, end: int) -> bool:
         return contains_span(self.protected, start, end)
@@ -72,6 +73,13 @@ class CodeContext:
         self.protected = move(self.protected)
         self.ambiguous_emails = move(self.ambiguous_emails)
         self.references = move(self.references)
+        if self.detected_emails is not None:
+            detected = {span for spans in self.detected_emails.values() for span in spans}
+            if all((start, end) in detected and replacement == '[REDACTED_EMAIL]'
+                   for start, end, replacement in edits):
+                self.detected_emails = {value: move(spans) for value, spans in self.detected_emails.items()}
+            else:
+                self.detected_emails = None
         if self.detected_hosts is not None:
             # Complete host replacements cannot introduce another hostname.
             # Other edits can expose a formerly embedded suffix (e.g. remove
@@ -219,7 +227,6 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
 
     def statements(body, bound):
         bound = set(bound)
-        libraries = set()
         for statement in body:
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 # An arbitrary import is not evidence that api.internal()
@@ -227,11 +234,10 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 # a known meaning here. Reimports also invalidate old hints.
                 names = {alias.asname or alias.name.split('.')[0]
                          for alias in statement.names if alias.name != '*'}
-                bound.difference_update(names)
-                libraries.difference_update(names)
-                if isinstance(statement, ast.Import):
-                    libraries.update(alias.asname or alias.name for alias in statement.names
-                                     if alias.name == 'threading')
+                if any(alias.name == '*' for alias in statement.names):
+                    bound.clear()
+                else:
+                    bound.difference_update(names)
                 continue
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = statement.args
@@ -239,22 +245,23 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 names.update(a.arg for a in (args.vararg, args.kwarg) if a is not None)
                 statements(statement.body, names)
                 bound.discard(statement.name)
-                libraries.discard(statement.name)
                 continue
             # Be conservative about control flow, classes, closures and rebinding.
             if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr, ast.Return)):
-                bound.difference_update(n.name for n in ast.walk(statement)
-                                        if isinstance(n, ast.ExceptHandler) and n.name)
-                bound.difference_update(n.id for n in ast.walk(statement)
-                                        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
-                libraries.intersection_update(bound)
+                changed = {n.name for n in ast.walk(statement)
+                           if isinstance(n, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name}
+                changed.update(n.id for n in ast.walk(statement)
+                               if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)))
+                imports = [n for n in ast.walk(statement) if isinstance(n, (ast.Import, ast.ImportFrom))]
+                changed.update(a.asname or a.name.split('.')[0] for n in imports for a in n.names)
+                if '*' in changed:
+                    changed.update(bound)
+                bound.difference_update(changed)
                 continue
             # Assignment expressions can rebind a receiver before a later
             # call in the same expression. Do not use stale object evidence.
             bound.difference_update(n.target.id for n in ast.walk(statement)
                                     if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name))
-            libraries.difference_update(n.target.id for n in ast.walk(statement)
-                                        if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name))
             host_assignment = any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
                                   and n.id.lower() in _HOST_NAMES for n in ast.walk(statement))
             for node in ast.walk(statement):
@@ -264,9 +271,7 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                 while isinstance(receiver, ast.Attribute):
                     receiver = receiver.value
                 if (node.func.attr in _HOST_ATTRS and not host_assignment
-                        and isinstance(receiver, ast.Name) and (receiver.id in bound or (
-                            receiver.id in libraries and node.func.attr == 'local'
-                            and node.func.value is receiver))):
+                        and isinstance(receiver, ast.Name) and receiver.id in bound):
                     found.add(node)
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -276,12 +281,67 @@ def _bound_host_calls(tree: ast.Module) -> set[ast.Call]:
                     for name in ast.walk(target):
                         if isinstance(name, ast.Name):
                             bound.discard(name.id)
-                            libraries.discard(name.id)
                     if creates_object and isinstance(target, ast.Name):
                         bound.add(target.id)
 
     statements(tree.body, set())
+    found.update(_stable_threading_calls(tree))
+    for scope in ast.walk(tree):
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found.update(_stable_threading_calls(scope))
     return found
+
+
+def _stable_threading_calls(tree: ast.Module | ast.FunctionDef | ast.AsyncFunctionDef) -> set[ast.Call]:
+    """Recognize nested stdlib calls only when the module alias never changes.
+
+    Any shadow, import, delete or assignment anywhere removes this optional
+    proof. This deliberately avoids inferring values across branch joins.
+    """
+    libraries = {a.asname or a.name: statement for statement in tree.body
+                 if isinstance(statement, ast.Import) for a in statement.names if a.name == 'threading'}
+    nodes = list(ast.walk(tree))
+    for node in nodes:
+        changed = set()
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            changed.add(node.id)
+        elif isinstance(node, ast.arg):
+            changed.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+            changed.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            changed.update(a.asname or a.name.split('.')[0] for a in node.names
+                           if not (isinstance(node, ast.Import) and a.name == 'threading'
+                                   and libraries.get(a.asname or a.name) is node))
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name):
+                changed.add(root.id)
+        if '*' in changed:
+            libraries.clear()
+        else:
+            for name in changed:
+                libraries.pop(name, None)
+    parents = {child: parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    calls = set()
+    for node in nodes:
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'local' and isinstance(node.func.value, ast.Name)):
+            continue
+        imported = libraries.get(node.func.value.id)
+        if imported is None or node.lineno <= imported.lineno:
+            continue
+        parent = parents.get(node)
+        while parent is not None and not isinstance(parent, (ast.Assign, ast.AnnAssign, ast.Module)):
+            parent = parents.get(parent)
+        if isinstance(parent, (ast.Assign, ast.AnnAssign)):
+            targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+            if any(isinstance(n, ast.Name) and n.id.lower() in _HOST_NAMES for target in targets for n in ast.walk(target)):
+                continue
+        calls.add(node)
+    return calls
 
 
 def _code_context(text: str) -> CodeContext:

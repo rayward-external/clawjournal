@@ -712,7 +712,11 @@ def _content_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[s
 def _content_findings_for_text(session_id: str, message_index: int, field: str, text: str) -> list[PIIFinding]:
     """Scan free-form text for PII patterns beyond JSON metadata."""
     from .code_context import code_context
+    from .candidate_formats import credentialed_urls, email_in_url_userinfo
+    from .secrets import _URL_TRANSPORT_USERS
     context = code_context(text)
+    transport_urls = [span for span in credentialed_urls(text)
+                      if text[span[0]:span[1]] in _URL_TRANSPORT_USERS]
     findings: list[PIIFinding] = []
     patterns: list[tuple[str, str, str, float, int]] = [
         # GitHub user/org in URLs — group 1 is the username/org
@@ -749,6 +753,8 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
                 continue
             if entity_type == "email" and context.protects(match.start(group), match.end(group)):
                 continue
+            if entity_type == "email" and email_in_url_userinfo(match.start(group), match.end(group), transport_urls):
+                continue  # A known transport username is not an email address.
             findings.append(normalize_finding({
                 "session_id": session_id,
                 "message_index": message_index,
@@ -764,6 +770,8 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
 
     existing = {(f["entity_type"], f["entity_text"]) for f in findings}
     for match in iter_format_candidates(text, context=context):
+        if match['type'] == 'email' and email_in_url_userinfo(match['start'], match['end'], transport_urls):
+            continue
         if match["type"] in {"email", "private_url"} and context.protects(match["start"], match["end"]):
             continue
         from .candidate_formats import _scanning_view

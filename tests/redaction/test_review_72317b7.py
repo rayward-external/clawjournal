@@ -94,20 +94,22 @@ def test_url_username_does_not_become_a_global_common_word(conn, user):
         assert result['messages'][1]['content'] == ordinary
         assert result['messages'][0]['content'].startswith('git clone https://')
         assert result['messages'][0]['content'].endswith('/team/app.git')
-        assert user + '@git.audit.test' not in result['messages'][0]['content']
+        expected = text.replace('deploy@', '[REDACTED_CREDENTIAL]@') if user == 'deploy' else text
+        assert result['messages'][0]['content'] == expected
 
 
-@pytest.mark.parametrize('address', ['tim@git.corp.acme.com', 'svc@db01.local'])
-def test_secrets_only_export_keeps_legacy_domain_coverage(address):
+@pytest.mark.parametrize('address,expected', [('tim@git.corp.acme.com', '[REDACTED_CREDENTIAL]@git.corp.acme.com'),
+                                            ('svc@db01.local', '[REDACTED_CREDENTIAL]@[REDACTED_URL]')])
+def test_secrets_only_export_separates_credentials_from_private_hosts(address, expected):
     text = 'git clone https://' + address + '/team/app.git'
-    assert secrets.redact_text(text, strict=True)[0] == 'git clone https://[REDACTED_EMAIL]/team/app.git'
+    assert secrets.redact_text(text, strict=True)[0] == 'git clone https://' + expected + '/team/app.git'
 
 
 @pytest.mark.parametrize('allowlist', [[{'type':'exact', 'text':'alice@corp.test'}],
                                     [{'type':'category', 'match_type':'email'}]])
-def test_username_only_url_honours_email_allowlist_without_allowing_passwords(allowlist):
+def test_email_allowlist_does_not_authorize_url_userinfo(allowlist):
     text = 'clone https://alice@corp.test/path; alice is a word'
-    assert secrets.redact_session(trace(text), user_allowlist=allowlist)[0]['messages'][0]['content'] == text
+    assert secrets.redact_session(trace(text), user_allowlist=allowlist)[0]['messages'][0]['content'] == text.replace('alice@', '[REDACTED_CREDENTIAL]@')
     secret = 'clone https://alice:fictional-password@corp.test/path'
     assert 'fictional-password' not in secrets.redact_session(trace(secret), user_allowlist=allowlist)[0]['messages'][0]['content']
 

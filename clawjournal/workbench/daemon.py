@@ -3449,7 +3449,7 @@ def _manifest_is_finalized_for_upload(
     ai_pii: bool | None = None,
     ai_backend: str | None = None,
 ) -> bool:
-    if manifest.get("blocked"):
+    if manifest.get("blocked") or manifest.get('local_copy_only'):
         return False
     summary = manifest.get("redaction_summary")
     if not isinstance(summary, dict):
@@ -7174,6 +7174,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 excluded_projects=settings["excluded_projects"],
                 blocked_domains=settings["blocked_domains"],
                 allowlist_entries=settings["allowlist_entries"],
+                copy_completed_artifact=True,
             )
             if export_dir is None:
                 _json_response(self, {"error": "output_path must not be a filesystem root directory"}, 400)

@@ -14,6 +14,64 @@ MAX_UNLINKED_SNAPSHOTS = 100
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 
 
+def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: str | None):
+    """Copy receipt-verified JSONL locally; never reconstruct or authorize upload.
+
+    Completed snapshots deliberately lose their raw payload. The receipt's
+    bundle_hash pins the exported JSONL independently of later scoring or trace
+    changes. No raw snapshot, current session data or unverified report is read.
+    """
+    from pathlib import Path
+    import os
+    import tempfile
+    from .index import CONFIG_DIR
+
+    row = conn.execute('SELECT shared_at, bundle_hash, manifest FROM shares WHERE share_id = ?', (share_id,)).fetchone()
+    if row is None or not row['shared_at']:
+        return None
+    directory = Path(output_path).resolve() if output_path else CONFIG_DIR / 'shares' / share_id / 'local-copy'
+    if directory == Path(directory.anchor):
+        return None, {}
+    try:
+        manifest = json.loads(row['manifest'] or '{}')
+        if not isinstance(manifest, dict):
+            raise ValueError('invalid manifest')
+        expected = str(row['bundle_hash'] or '')
+        if len(expected) != 64:
+            raise ValueError('missing receipt hash')
+        sources = [CONFIG_DIR / 'shares' / share_id / 'sessions.jsonl']
+        if isinstance(manifest.get('export_path'), str):
+            sources.append(Path(manifest['export_path']) / 'sessions.jsonl')
+        payload = None
+        for source in sources:
+            try:
+                with source.open('rb') as handle:
+                    candidate = handle.read(MAX_SNAPSHOT_BYTES + 1)
+            except OSError:
+                continue
+            if len(candidate) <= MAX_SNAPSHOT_BYTES and hashlib.sha256(candidate).hexdigest() == expected:
+                payload = candidate
+                break
+        if payload is None:
+            raise ValueError('missing or changed archived JSONL')
+        manifest = {**manifest, 'export_path': str(directory), 'local_copy_only': True}
+        directory.mkdir(parents=True, exist_ok=True)
+        # Validate the entire input before writing either destination file.
+        for name, data in [('sessions.jsonl', payload),
+                           ('manifest.json', json.dumps(manifest, ensure_ascii=True, indent=2).encode())]:
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=f'.{name}.', suffix='.tmp', delete=False) as handle:
+                temp = Path(handle.name)
+            try:
+                temp.write_bytes(data)
+                os.replace(temp, directory / name)
+            finally:
+                temp.unlink(missing_ok=True)
+        return directory, manifest
+    except (OSError, ValueError, TypeError):
+        return directory, {'blocked': True, 'block_reason': 'completed_artifact_unavailable',
+            'block_message': 'The saved completed export is missing or changed. Use the ZIP you previously downloaded. Current trace data cannot recreate the original export.'}
+
+
 def review_identity(detail: dict[str, Any]) -> str:
     """Scope plus a digest of reviewed export metadata; never another raw copy."""
     from .index import EXPORT_FIELDS
@@ -128,7 +186,7 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
     total = conn.execute("SELECT COALESCE(SUM(length(CAST(payload AS BLOB))), 0) FROM share_review_snapshots").fetchone()[0]
     if total + (0 if exists else size) > MAX_SNAPSHOT_BYTES:
         conn.commit()
-        raise ReviewSnapshotError("The review cache is full. Finish pending shares or run clawjournal review-cache --clear --all, then refresh previews.")
+        raise ReviewSnapshotError("The review cache is full. Finish pending shares, or go to Share > Queue > Clear saved reviews (CLI: clawjournal review-cache --clear --all), then refresh previews. Clearing saved reviews invalidates unsubmitted reviews.")
     conn.execute(
         "INSERT OR IGNORE INTO share_review_snapshots (snapshot_id, session_id, content_revision, payload, created_at) VALUES (?, ?, ?, ?, ?)",
         (snapshot_id, detail["session_id"], revision, payload, _now_iso()),

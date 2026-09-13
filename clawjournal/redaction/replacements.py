@@ -133,7 +133,7 @@ def secret_value_spans(text: str, secret: str, replacement: str):
                 label_start -= 1
             # Preserve a prefix such as TELEGRAM_BOT_ in a field name. A
             # separately known value glued to that name is still sensitive.
-            if secret.casefold() not in text[label_start:start].casefold():
+            if secret.casefold() not in text[label_start:match.start(1)].casefold():
                 start = label_start
             labels.append((start, match.start(1)))
     labels = merge_spans(labels)
@@ -150,3 +150,30 @@ def email_pattern(value: str, flags: int = 0):
     import re
     return re.compile(r"(?<![A-Za-z0-9._%+-])" + re.escape(value)
                       + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])", flags)
+
+
+def email_replacement_spans(text: str, value: str, replacement: str, *,
+                            flags: int = 0, context: CodeContext | None = None,
+                            protect_code: bool = True):
+    """Preserve detected occurrences without matching a different mailbox.
+
+    A propagation boundary may reject punctuation immediately before a
+    scanner's original match. Keep that original match as evidence, for every
+    field and every punctuation prefix, not just percent-encoded URLs.
+    """
+    from .code_context import code_context
+    from .secrets import _SECRET_EMAIL_PATTERN, _secret_matches
+
+    if context is None:
+        context = code_context(text)
+    if context.detected_emails is None:
+        context.detected_emails = {}
+        for match in _secret_matches(_SECRET_EMAIL_PATTERN, text):
+            context.detected_emails.setdefault(match.group().casefold(), []).append(match.span())
+    matches = {m.span() for m in email_pattern(value, flags).finditer(text)}
+    import re
+    for start, end in context.detected_emails.get(value.casefold(), ()):
+        if flags & re.IGNORECASE or text[start:end] == value:
+            matches.add((start, end))
+    return [(start, end, replacement) for start, end in sorted(matches)
+            if not protect_code or not context.protects(start, end)]

@@ -2014,6 +2014,23 @@ class TestSessionsAPI:
         status, detail = _get(server, "/api/sessions/sess-0")
         assert detail["review_status"] == "approved"
 
+    def test_redaction_preview_rejects_an_oversized_ai_finding_before_snapshot(self, server, monkeypatch):
+        value = 'Xy' * 60
+        conn = open_index()
+        upsert_sessions(conn, [{'session_id': 'ai-boundary-review', 'project': 'test-project',
+            'source': 'codex', 'messages': [{'role': 'user', 'content': value}], 'stats': {}}])
+        conn.close()
+        monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent',
+            lambda *a, **kw: [{'session_id': 'ai-boundary-review', 'entity_type': 'email',
+                              'entity_text': value, 'source': 'ai', 'confidence': .99}])
+        status, data = _get(server, '/api/sessions/ai-boundary-review/redaction-report?ai_pii=1')
+        assert status == 422
+        assert data['block_reason'] == 'redaction_boundary'
+        assert 'review_snapshot_id' not in data
+        conn = open_index()
+        assert conn.execute("SELECT COUNT(*) FROM share_review_snapshots WHERE session_id = 'ai-boundary-review'").fetchone()[0] == 0
+        conn.close()
+
     def test_bulk_route_does_not_shadow_a_session_id(self, server):
         conn = open_index()
         try:

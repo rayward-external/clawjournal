@@ -388,3 +388,95 @@ def test_review_identity_migration_retains_scope_and_runs_once(conn):
     assert identity == review_identity(index.get_session_detail(conn, 'test-trace'))
     assert len(identity) == 64 and 'synthetic-project' not in identity
     index._migrate_review_snapshot_identity(conn)
+
+
+@pytest.mark.parametrize('change', ['score', 'append', 'title'])
+def test_completed_local_copy_uses_receipted_bytes_after_live_changes(conn, tmp_path, monkeypatch, change):
+    import hashlib
+    from clawjournal.workbench.daemon import _manifest_is_finalized_for_upload
+    index.upsert_sessions(conn, [trace('Reviewed alice@audit.test')])
+    snapshot = preview(conn)
+    share_id = create(conn, snapshot)
+    first_dir, _ = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id))
+    expected = (first_dir / 'sessions.jsonl').read_bytes()
+    conn.execute("UPDATE shares SET status = 'shared', shared_at = '2026-09-13', bundle_hash = ? WHERE share_id = ?",
+                 (hashlib.sha256(expected).hexdigest(), share_id))
+    conn.commit()
+    if change == 'score':
+        index.update_session(conn, 'test-trace', ai_quality_score=4)
+    elif change == 'append':
+        index.upsert_sessions(conn, [trace('Later unreviewed message')])
+    else:
+        conn.execute("UPDATE sessions SET display_title = 'Later unreviewed title' WHERE session_id = 'test-trace'")
+        conn.commit()
+    db_manifest = conn.execute('SELECT manifest FROM shares WHERE share_id = ?', (share_id,)).fetchone()[0]
+    # No current raw trace or stale original input participates in a local copy.
+    monkeypatch.setattr(index, 'get_session_detail', lambda *a, **kw: pytest.fail('read live content'))
+    directory, result = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id),
+        output_path=str(tmp_path / 'copy'), copy_completed_artifact=True)
+    assert not result.get('blocked') and result['local_copy_only']
+    assert (directory / 'sessions.jsonl').read_bytes() == expected
+    assert not _manifest_is_finalized_for_upload(result)
+    assert conn.execute('SELECT payload FROM share_review_snapshots WHERE snapshot_id = ?', (snapshot,)).fetchone()[0] == ''
+    assert conn.execute('SELECT manifest FROM shares WHERE share_id = ?', (share_id,)).fetchone()[0] == db_manifest
+
+
+@pytest.mark.parametrize('damage', ['missing', 'modified', 'missing-hash'])
+def test_completed_local_copy_never_guesses_missing_or_modified_content(conn, tmp_path, damage):
+    import hashlib
+    index.upsert_sessions(conn, [trace()])
+    share_id = create(conn, preview(conn))
+    first_dir, _ = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id))
+    source = first_dir / 'sessions.jsonl'
+    conn.execute("UPDATE shares SET shared_at = '2026-09-13', bundle_hash = ? WHERE share_id = ?",
+                 (hashlib.sha256(source.read_bytes()).hexdigest(), share_id))
+    if damage == 'missing':
+        source.unlink()
+    elif damage == 'modified':
+        source.write_text('Unreviewed replacement data')
+    else:
+        conn.execute('UPDATE shares SET bundle_hash = NULL WHERE share_id = ?', (share_id,))
+    conn.commit()
+    destination = tmp_path / 'failed-copy'
+    _, result = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id),
+        output_path=str(destination), copy_completed_artifact=True)
+    assert result['blocked'] and result['block_reason'] == 'completed_artifact_unavailable'
+    assert not destination.exists()
+
+
+def test_bundle_export_cli_copies_completed_bytes_without_repreview_or_ai(conn, tmp_path, monkeypatch, capsys):
+    import hashlib
+    import zipfile
+    from types import SimpleNamespace
+    from clawjournal import cli
+    index.upsert_sessions(conn, [trace('Reviewed alice@audit.test')])
+    share_id = create(conn, preview(conn))
+    first_dir, _ = index.export_share_to_disk(conn, share_id, index.get_share(conn, share_id))
+    expected = (first_dir / 'sessions.jsonl').read_bytes()
+    conn.execute("UPDATE shares SET status = 'shared', shared_at = '2026-09-13', bundle_hash = ? WHERE share_id = ?",
+                 (hashlib.sha256(expected).hexdigest(), share_id))
+    conn.commit()
+    index.upsert_sessions(conn, [trace('Later unreviewed message')])
+    monkeypatch.setattr(cli, 'load_config', lambda: {})
+    monkeypatch.setattr('clawjournal.redaction.scanner_install.ensure_share_scanners', lambda **kw: {'ok': True})
+    monkeypatch.setattr('clawjournal.workbench.daemon.finalize_share_export_for_upload',
+                        lambda *a, **kw: pytest.fail('rebuilt completed share'))
+    output = tmp_path / 'completed-copy.zip'
+    cli._run_bundle_export(SimpleNamespace(share_id=share_id, output=str(output), zip=True,
+                                         ai_pii_review=False, training_format=False, json=True))
+    summary = json.loads(capsys.readouterr().out)
+    assert summary['zip_path'] == str(output)
+    with zipfile.ZipFile(output) as archive:
+        assert set(archive.namelist()) == {'sessions.jsonl', 'manifest.json'}
+        assert archive.read('sessions.jsonl') == expected
+        assert json.loads(archive.read('manifest.json'))['local_copy_only']
+
+
+def test_even_a_complete_scan_attestation_cannot_make_a_local_copy_uploadable():
+    from clawjournal.workbench.daemon import _manifest_is_finalized_for_upload
+    manifest = {'redaction_summary': {
+        'pii_review': {'ai_enabled': False}, 'trufflehog_post_pii': {},
+        'secret_scan_post_pii': {'tier_counts': {'block': 0, 'review': 0},
+                               'converged': True, 'bypassed': False, 'binary_missing': False}}}
+    assert _manifest_is_finalized_for_upload(manifest)
+    assert not _manifest_is_finalized_for_upload({**manifest, 'local_copy_only': True})

@@ -134,7 +134,7 @@ def test_long_fine_grained_pat_head_is_not_retained_locally(padding):
     prefix = 'ordinary ' * (padding // 9)
     text = prefix + 'git clone https://' + token + '@git.audit.test/project.git'
     result, count, log = secrets.redact_text(text)
-    assert result == prefix + 'git clone https://[REDACTED_GITHUB_TOKEN]/project.git'
+    assert result == prefix + 'git clone https://[REDACTED_GITHUB_TOKEN]@git.audit.test/project.git'
     assert count == 1
     assert any(entry['type'] == 'github_token' and entry['original_length'] == len(token) for entry in log)
     assert token[:40] not in result

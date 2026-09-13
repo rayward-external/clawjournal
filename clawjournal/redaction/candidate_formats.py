@@ -24,6 +24,7 @@ _HOST_FIELD = re.compile(
     r"[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._-]*)", re.I,
 )
 _SSH_HOST = re.compile(r"(?<![\w-])ssh[ \t]+(?:[A-Za-z0-9_.-]+@)?([A-Za-z0-9][A-Za-z0-9.-]*)")
+_SSH_PROSE_TAIL = re.compile(r'\s+(?:is|are|was|were|can|should|must|requires?|provides?|allows?)\b', re.I)
 _HOST_CHAIN = re.compile(r"[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*", re.I)
 _HOST_SUFFIX = re.compile(r"\.(?:local|internal|corp|lan|intranet|localnet)(?![A-Za-z0-9_])", re.I)
 _PERSONAL_HOST = re.compile(
@@ -38,7 +39,9 @@ def credentialed_urls(text: str):
     """Return explicit URL userinfo, independently of email length budgets."""
     for match in _URL_AUTHORITY.finditer(text):
         authority = match.group(1)
-        at = authority.find('@')
+        # A raw @ is invalid inside RFC userinfo, but occurs in connection
+        # strings. Treat everything before the final separator as sensitive.
+        at = authority.rfind('@')
         if at > 0 and at < len(authority) - 1:
             # A hostname followed by a list separator and an address is not
             # proof that the preceding URL contains that address as userinfo.
@@ -139,7 +142,7 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
             ascii_start = at
             while ascii_start > start and text[ascii_start - 1].isascii():
                 ascii_start -= 1
-            if (start < ascii_start < at and text[ascii_start].isalnum()
+            if (start < ascii_start < at and (text[ascii_start].isalnum() or ascii_start - start > 1)
                     and _unspaced_script(text[ascii_start - 1])):
                 start = ascii_start
         if not delimited:
@@ -298,6 +301,8 @@ def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
                 host_shape = '@' in match.group() or '.' in value or any(c.isdigit() for c in value)
                 if not command_prefix and not host_shape:
                     continue
+                if not host_shape and _SSH_PROSE_TAIL.match(view, match.end()):
+                    continue  # "ssh access is required" is an explanatory sentence.
             if (match.group(1).lower() not in {"localhost", "127.0.0.1"}
                     and not (pattern is _HOST_FIELD and is_reference_prefix(match, "host"))):
                 yield candidate(*match.span(1), "internal_host_context", "private_url")

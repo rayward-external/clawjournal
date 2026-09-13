@@ -243,9 +243,11 @@ Manual Share saves the input used for each redaction preview in the local index.
 When you include that preview, packaging uses its saved content version even if
 the conversation later grows. Later content stays local for a future share; it
 does not inherit this inclusion. Only successful previews are saved. There is
-no time-based approval expiry. Unlinked previews are limited to the latest
-revision per trace, 100 rows overall, and a total payload budget of 128 MiB
-including linked previews. Old unused previews can be evicted; affected tabs
+no time-based approval expiry. Unlinked previews normally retain the latest
+revision per trace and at most 100 rows. An active CLI selection protects its
+own previews and can exceed that row count; if abandoned, excess rows are
+pruned by the next preview or explicit cache cleanup. A total payload budget
+of 128 MiB applies throughout, including linked previews. Old unused previews can be evicted; affected tabs
 must refresh. Inputs linked to pending shares are preserved. If those inputs
 fill the cache, new previews stop with a clear cache-full message.
 
@@ -256,11 +258,16 @@ newer live trace. Index recovery preserves pending snapshot data and links.
 `clawjournal review-cache --clear --all` also clears linked payloads and requires
 fresh previews for pending shares. These operations remove database payloads;
 they are not a guarantee of forensic removal from backups or filesystem copies.
+For a completed share, local `bundle-export` copies the previously exported
+JSONL only after its SHA-256 matches the recorded receipt hash. Later messages,
+titles and scores do not enter that copy. Its manifest marks it as a local copy;
+it is not a newly prepared upload package. Missing or changed archived files
+cannot be reconstructed from current traces; use the previously downloaded ZIP.
 A refreshed preview must be included again. Failed or timed-out previews remain
 excluded while healthy traces can proceed. A boundary failure during optional
 AI review is reported as a blocked trace, not as successful rules-only coverage.
 
-Current holds, blocked status, source/project scope, exclusions, redaction rules,
+For preparing or submitting a share, current holds, blocked status, source/project scope, exclusions, redaction rules,
 consent, duplicate checks, and both secret-scan gates still apply. Missing or
 damaged saved content requires a fresh preview. This manual review mechanism
 does not grant or change recurring upload authority.

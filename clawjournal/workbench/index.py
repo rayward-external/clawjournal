@@ -8592,12 +8592,18 @@ def export_share_to_disk(
     excluded_projects: list[str] | None = None,
     blocked_domains: list[str] | None = None,
     allowlist_entries: list[dict[str, Any]] | None = None,
+    copy_completed_artifact: bool = False,
 ) -> tuple[Path | None, dict[str, Any]]:
     """Export a share's sessions to disk as JSONL + manifest.
 
     Returns (export_dir, manifest). Returns (None, {}) if output_path
     validation fails.
     """
+    if copy_completed_artifact:
+        from .review_snapshots import copy_completed_share
+        copied = copy_completed_share(conn, share_id, output_path)
+        if copied is not None:
+            return copied
     if output_path:
         export_dir = Path(output_path).resolve()
         # The caller explicitly selected this local destination. Keep the one

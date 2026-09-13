@@ -234,6 +234,7 @@ CONFIDENCE: dict[str, float] = {
 # removed so model-training data retains task structure.
 SECRET_PLACEHOLDER: dict[str, str] = {
     "url_userinfo": "[REDACTED_CREDENTIAL]",
+    "private_url": "[REDACTED_URL]",
     "jwt": "[REDACTED_JWT]",
     "jwt_partial": "[REDACTED_JWT]",
     "db_url": "[REDACTED_DB_URL]",
@@ -504,6 +505,18 @@ def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[st
     yield from _secret_continuation_matches(pattern, text)
 
 
+# Transport usernames, not a list of trusted credential destinations. A
+# password (including an encoded colon) never matches one of these literals.
+_URL_TRANSPORT_USERS = frozenset({'git', 'oauth2', 'x-access-token', 'anonymous',
+                                 'user', 'u', 'ci', 'noreply'})
+
+
+def _global_url_credential(value: str) -> bool:
+    """Only credential-shaped userinfo may replace copies outside URLs."""
+    return (len(value) >= 20 or ':' in value or '@' in value or '%' in value
+            or any(c.isdigit() for c in value))
+
+
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
     if not text or len(text) < _MIN_SCAN_LENGTH:
         return []
@@ -514,19 +527,22 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     from .code_context import code_context
     context = code_context(text)
 
-    from .candidate_formats import credentialed_urls
+    from .candidate_formats import credentialed_urls, email_in_url_userinfo
     url_spans = list(credentialed_urls(text))
     findings = []
     for start, end, _authority_end in url_spans:
+        host = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]*').match(text, end + 1, _authority_end)
+        if host and re.search(r'\.(?:local|internal|corp|lan|intranet|localnet)$', host.group(), re.I):
+            # Retain private-host coverage on secrets-only export paths too,
+            # independently of userinfo and its explicitly ignored findings.
+            if not _check_user_allowlist(host.group(), 'private_url', user_allowlist):
+                findings.append({'type': 'private_url', 'start': host.start(), 'end': host.end(),
+                                 'match': host.group(), 'confidence': .9})
         value = text[start:end]
-        # Username-only URLs retain the existing email allowlist policy.
-        # An email exception must never authorize an explicit password.
-        address = text[start:_authority_end].split('/', 1)[0].split(':', 1)[0]
-        if ':' not in value and (_check_user_allowlist(address, 'email', user_allowlist)
-                                 or any(pattern.search(address) for pattern in ALLOWLIST)):
+        # Email/IP false-positive exceptions say nothing about credentials.
+        # Classify only userinfo; github.com/localhost/app.* cannot authorize it.
+        if value in _URL_TRANSPORT_USERS:
             continue
-        if ':' not in value and re.fullmatch(r'[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', address):
-            continue  # The complete legacy email below also covers the host.
         if value not in _CREDENTIAL_PLACEHOLDERS and not _check_user_allowlist(value, "url_userinfo", user_allowlist):
             findings.append({"type": "url_userinfo", "start": start, "end": end,
                              "match": value, "confidence": 0.94})
@@ -539,6 +555,11 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
             if name in {"env_secret", "generic_secret"} and match.group(1) in set(SECRET_PLACEHOLDER.values()) | {REDACTED}:
                 continue
             if name == "email" and context.protects(match.start(), match.end()):
+                continue
+            if name == 'email' and email_in_url_userinfo(match.start(), match.end(), url_spans):
+                # Userinfo has its own finding. Do not mistake its separator
+                # for an email @ and consume an unrelated public hostname.
+                # The PII scanner still handles private hosts independently.
                 continue
             if name in {"env_secret", "generic_secret"} and context.is_reference(match.start(1), match.start(1) + 1):
                 continue
@@ -864,7 +885,7 @@ def _build_redaction_set(
         for f in _dedupe_overlapping_matches(findings):
             matched = f["match"]
             placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-            if f['type'] == 'url_userinfo':
+            if f['type'] == 'url_userinfo' and not _global_url_credential(matched):
                 secret_map.url_userinfo[matched] = placeholder
             elif "replacement_start" in f:
                 secret_map.add(text[f["replacement_start"]:f["replacement_end"]], placeholder)
@@ -914,10 +935,10 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
     """
     if not text or not secret_map:
         return text, 0
-    from .replacements import (ReplacementMap, coalesce_replacements, email_pattern,
+    from .replacements import (ReplacementMap, coalesce_replacements, email_replacement_spans,
                                replace_spans, secret_value_spans)
     from .code_context import code_context, outside_code_spans
-    from .candidate_formats import iter_partial_email_candidates, credentialed_urls, email_in_url_userinfo
+    from .candidate_formats import iter_partial_email_candidates, credentialed_urls
 
     context = None
     urls = None
@@ -936,18 +957,11 @@ def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, in
         elif replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
             if context is None:
                 context = code_context(text)
-            pattern = email_pattern(secret) if replacement == "[REDACTED_EMAIL]" else re.compile(re.escape(secret), re.I if host_case else 0)
-            spans.extend(outside_code_spans(text, pattern, replacement, context=context))
-            if replacement == "[REDACTED_EMAIL]" and '%' in text:
-                # A legacy finding can start inside a percent escape in URL
-                # userinfo. Preserve that detected occurrence without allowing
-                # a short email to match inside an unrelated percent mailbox.
-                if urls is None:
-                    urls = list(credentialed_urls(text))
-                for match in re.finditer(re.escape(secret), text):
-                    if email_in_url_userinfo(match.start(), match.end(), urls):
-                        spans.append((match.start(), match.end(), replacement))
-            if replacement == "[REDACTED_URL]":
+            if replacement == "[REDACTED_EMAIL]":
+                spans.extend(email_replacement_spans(text, secret, replacement, context=context))
+            else:
+                pattern = re.compile(re.escape(secret), re.I if host_case else 0)
+                spans.extend(outside_code_spans(text, pattern, replacement, context=context))
                 host_patterns.append(pattern)
         else:
             pattern = re.compile(
@@ -1268,7 +1282,7 @@ def _secret_map_from_text_decisions(
         if status == "ignored":
             continue
         placeholder = SECRET_PLACEHOLDER.get(finding["type"], REDACTED)
-        if finding['type'] == 'url_userinfo':
+        if finding['type'] == 'url_userinfo' and not _global_url_credential(matched):
             secret_map.url_userinfo[matched] = placeholder
         elif "replacement_start" in finding:
             secret_map.add(text[finding["replacement_start"]:finding["replacement_end"]], placeholder)

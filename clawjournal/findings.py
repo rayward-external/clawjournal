@@ -39,7 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 7  # Rebuild URL, mailbox-boundary and imported-host findings.
+ENGINE_VERSION = 8  # Rebuild URL credentials independently of email exceptions.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 
@@ -990,6 +990,13 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding], *, strict: boo
         if _is_partial_email_finding(finding) and finding.get("status") != "accepted":
             from .redaction.replacements import replace_email_fragments
             result, n = replace_email_fragments(result, {target: replacement}, ignore_case=True, context=context)
+            count += n
+            continue
+        if finding.get('entity_type') == 'email' and ('@' in target or '%40' in target.lower()):
+            from .redaction.replacements import email_replacement_spans
+            spans = email_replacement_spans(result, target, replacement,
+                flags=re.IGNORECASE, context=context, protect_code=finding.get('source') == 'rule')
+            result, n = replace_spans(result, spans, context=context)
             count += n
             continue
         escaped = re.escape(target)
