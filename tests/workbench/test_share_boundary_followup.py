@@ -34,7 +34,8 @@ def trace(sid, text):
     '<' + 'a' * 70 + '@audit.test>',
     'token 123456789:' + 'AbCDef01_' * 20,
     'host ' + 'a' * 70 + '.internal',
-], ids=['oversized-email', 'oversized-token', 'oversized-host'])
+    'clone https://git@' + 'a' * 70 + '.audit.test/repo',
+], ids=['oversized-email', 'oversized-token', 'oversized-host', 'oversized-url-host'])
 def test_one_boundary_failure_keeps_49_safe_traces_and_names_the_omission(conn, bad_text):
     rows = [trace(f'case-{i:02}', bad_text if i == 23 else f'ordinary text {i}') for i in range(50)]
     index.upsert_sessions(conn, rows)
@@ -260,3 +261,17 @@ def test_bundle_export_cli_names_boundary_omissions(conn, tmp_path, monkeypatch,
         assert 'cli-refused' in captured.out
         assert 'Report:' not in captured.out  # No nonexistent scan-report link.
         assert not (output / 'sessions.jsonl').exists()
+
+
+def test_url_host_replacement_budget_preserves_detection_and_legal_long_hosts():
+    # Detection stays total for ingest; only an external replacement refuses
+    # a hostname whose label exceeds the same budget as other host rules.
+    host = 'a'*70 + '.audit.test'
+    text = 'clone https://git@' + host + '/repo'
+    findings = secrets.scan_text(text)
+    assert any(f['match'] == host and f['type'] == 'private_url' for f in findings)
+    with pytest.raises(RedactionBoundaryError, match='url_hostname'):
+        secrets.redact_text(text, strict=True)
+    legal_host = '.'.join(['a'*63, 'b'*63, 'c'*63, 'd'*61])
+    assert len(legal_host) == 253
+    assert secrets.redact_text('clone https://git@' + legal_host + '/repo', strict=True)[0] == 'clone https://git@[REDACTED_URL]/repo'

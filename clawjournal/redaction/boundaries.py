@@ -45,7 +45,7 @@ def ensure_safe_replacement(value: str, rule: str) -> None:
             or len(local.encode("utf-8", errors="surrogatepass")) > 64
             or any(len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in domain.split("."))
         )
-    elif rule in {"internal_tld_host", "internal_host_context", "personal_hostname", "device_id"}:
+    elif rule in {"internal_tld_host", "internal_host_context", "personal_hostname", "device_id", "url_hostname"}:
         oversized = len(value.encode("utf-8", errors="surrogatepass")) > 253 or any(
             len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in value.rstrip(".").split(".")
         )
@@ -70,8 +70,15 @@ def ensure_text_boundaries(text: str, *, context=None) -> None:
     if context is None:
         context = code_context(text)
 
+    import re
     from .candidate_formats import credentialed_urls, email_in_url_userinfo
     url_spans = list(credentialed_urls(text))
+    # URL userinfo is separate from its host. Its email exemption must not
+    # waive the host replacement budget when the secret pass masks that host.
+    for _start, end, authority_end in url_spans:
+        host = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]*').match(text, end + 1, authority_end)
+        if host and '.' in host.group():
+            ensure_safe_replacement(host.group(), 'url_hostname')
 
     def check(value: str, rule: str, start: int, end: int) -> None:
         if rule.startswith("email") and email_in_url_userinfo(start, end, url_spans):
