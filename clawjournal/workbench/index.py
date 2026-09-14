@@ -283,7 +283,8 @@ def open_existing_index(
 # so a retried submission can tell them apart from a locally stale claim, and
 # version 12 separates append-only upload checkpoints from the logical
 # conversation projected by the local workbench, and version 13 adds the
-# durable, revision-keyed background scoring queue.
+# durable, revision-keyed background scoring queue. Version 14 saves immutable
+# manual Share previews so later appends do not invalidate the reviewed input.
 SECURITY_SCHEMA_VERSION = 2
 SESSION_IDENTITY_SCHEMA_VERSION = 3
 WIDENED_MESSAGE_SCHEMA_VERSION = 4
@@ -296,7 +297,10 @@ EXACT_SCOPE_PAIRS_SCHEMA_VERSION = 10
 RECEIVER_PREDECESSOR_SCHEMA_VERSION = 11
 LOGICAL_CHECKPOINT_SCHEMA_VERSION = 12
 SCORING_QUEUE_SCHEMA_VERSION = 13
-WORKBENCH_SCHEMA_VERSION = SCORING_QUEUE_SCHEMA_VERSION
+SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION = 14
+REDACTION_CACHE_SCHEMA_VERSION = 15
+REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION = 16
+WORKBENCH_SCHEMA_VERSION = REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION
 
 # `share_sessions.predecessor_source` values. NULL means the predecessor is the
 # create-time local baseline; RECEIVER means the hosted lineage preflight
@@ -1177,6 +1181,9 @@ def open_index() -> sqlite3.Connection:
     _migrate_receiver_predecessor(conn)
     _migrate_logical_checkpoint_projection(conn)
     _migrate_scoring_queue(conn)
+    _migrate_share_review_snapshots(conn)
+    _migrate_redaction_cache_state(conn)
+    _migrate_review_snapshot_identity(conn)
 
     # Clean up ai_outcome_badge values that the judge wrote before the
     # resolution validator rejected invalid labels. Keeps the normalized
@@ -2010,6 +2017,83 @@ def _migrate_scoring_queue(conn: sqlite3.Connection) -> None:
     try:
         _create_scoring_queue_schema(conn)
         conn.execute(f"PRAGMA user_version = {SCORING_QUEUE_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_share_review_snapshots(conn: sqlite3.Connection) -> None:
+    from .review_snapshots import create_schema
+
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version >= SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        create_schema(conn)
+        if version < SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION:
+            conn.execute(f"PRAGMA user_version = {SHARE_REVIEW_SNAPSHOT_SCHEMA_VERSION}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_redaction_cache_state(conn: sqlite3.Connection) -> None:
+    """Schedule one rebuild per engine version, including source-less blobs."""
+    from ..findings import ENGINE_VERSION
+    from .review_snapshots import install_cleanup_trigger, prune_review_snapshots
+
+    if conn.execute("PRAGMA user_version").fetchone()[0] < REDACTION_CACHE_SCHEMA_VERSION:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS findings_engine_state (id INTEGER PRIMARY KEY CHECK (id = 1), engine_version INTEGER NOT NULL)")
+            install_cleanup_trigger(conn)
+            prune_review_snapshots(conn)
+            conn.execute(f"PRAGMA user_version = {REDACTION_CACHE_SCHEMA_VERSION}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    row = conn.execute("SELECT engine_version FROM findings_engine_state WHERE id = 1").fetchone()
+    if row is not None and row[0] == ENGINE_VERSION:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT engine_version FROM findings_engine_state WHERE id = 1").fetchone()
+        if row is None or row[0] != ENGINE_VERSION:
+            conn.execute("UPDATE sessions SET findings_backfill_needed = 1 WHERE findings_revision IS NOT NULL")
+            conn.execute("INSERT OR REPLACE INTO findings_engine_state VALUES (1, ?)", (ENGINE_VERSION,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _migrate_review_snapshot_identity(conn: sqlite3.Connection) -> None:
+    """Retain only scope identity after completed raw previews are cleared."""
+    from .review_snapshots import review_identity
+    if conn.execute('PRAGMA user_version').fetchone()[0] >= REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION:
+        return
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        # Another opener may finish this migration while we wait for its
+        # transaction. Recovery can also retain a column with an older marker.
+        if conn.execute('PRAGMA user_version').fetchone()[0] >= REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION:
+            conn.commit()
+            return
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(share_review_snapshots)')}
+        if 'identity' not in columns:
+            conn.execute('ALTER TABLE share_review_snapshots ADD COLUMN identity TEXT')
+        for row in conn.execute("SELECT snapshot_id, payload FROM share_review_snapshots WHERE payload != ''").fetchall():
+            try:
+                detail = json.loads(row['payload'])
+                identity = review_identity(detail)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            conn.execute('UPDATE share_review_snapshots SET identity = ? WHERE snapshot_id = ?', (identity, row['snapshot_id']))
+        conn.execute(f'PRAGMA user_version = {REVIEW_SNAPSHOT_IDENTITY_SCHEMA_VERSION}')
         conn.commit()
     except Exception:
         conn.rollback()
@@ -6824,12 +6908,14 @@ def create_share(
     source_filter: str | list[str] | tuple[str, ...] | None = None,
     expected_revisions: dict[str, str] | None = None,
     expected_logical_revisions: dict[str, str] | None = None,
+    review_snapshot_ids: dict[str, str] | None = None,
 ) -> str:
     """Create a share linking the given sessions.
 
     Returns the new share_id. ``expected_revisions`` lets callers bind a UI
-    selection to the exact revisions the user reviewed; a concurrent append
-    raises ``ValueError`` before any share row is created.
+    selection to the exact revisions the user reviewed. With explicit
+    ``review_snapshot_ids``, those saved inputs are pinned instead of the live
+    blobs. Legacy callers still reject a concurrent content revision change.
     ``expected_logical_revisions`` additionally binds the selected physical
     subset to the family membership visible in the UI without requiring that
     already-shared or otherwise unselected active checkpoints be resubmitted.
@@ -6897,7 +6983,41 @@ def create_share(
         if inactive_blockers:
             raise RevisionConflictError(inactive_blockers)
 
-        if expected_logical_revisions is not None:
+        reviewed: dict[str, dict[str, Any]] = {}
+        if review_snapshot_ids is not None:
+            from .review_snapshots import ReviewSnapshotError, load_review_snapshot
+
+            if (
+                not isinstance(review_snapshot_ids, dict)
+                or any(not isinstance(value, str) for value in review_snapshot_ids.values())
+                or set(review_snapshot_ids) != set(session_ids)
+                or set(found_sessions) != set(session_ids)
+            ):
+                raise RevisionConflictError([{"reason": "incomplete_review_snapshots"}])
+            for sid, snapshot_id in review_snapshot_ids.items():
+                try:
+                    reviewed[sid] = load_review_snapshot(conn, snapshot_id, sid)
+                except ReviewSnapshotError as exc:
+                    raise RevisionConflictError([{"session_id": sid, "reason": str(exc)}]) from exc
+                found_sessions[sid] = reviewed[sid]["content_revision"]
+                latest = _latest_successful_revision(conn, sid)
+                already_sent = conn.execute(
+                    "SELECT 1 FROM share_sessions ss JOIN shares sh ON sh.share_id = ss.share_id "
+                    "WHERE ss.session_id = ? AND ss.content_revision = ? AND sh.shared_at IS NOT NULL LIMIT 1",
+                    (sid, found_sessions[sid]),
+                ).fetchone() is not None
+                if already_sent or latest != reviewed[sid]["_review_predecessor"]:
+                    raise RevisionConflictError([{
+                        "session_id": sid,
+                        "reason": "already_shared_revision" if already_sent else "stale_predecessor",
+                    }])
+            # The snapshots contain the physical records actually previewed.
+            # New members of a growing conversation belong to a future share.
+            blockers = release_gate_blockers(conn, session_ids)
+            if blockers:
+                raise RevisionConflictError(blockers)
+
+        if expected_logical_revisions is not None and review_snapshot_ids is None:
             selected_logical_ids = {
                 str(row["logical_session_id"] or row["session_id"])
                 for row in selected_rows
@@ -6983,6 +7103,11 @@ def create_share(
                 "VALUES (?, ?, ?, ?, ?)",
                 (share_id, sid, now, content_revision, replaces_revision),
             )
+            if review_snapshot_ids is not None:
+                conn.execute(
+                    "INSERT INTO share_snapshot_links VALUES (?, ?, ?)",
+                    (share_id, sid, review_snapshot_ids[sid]),
+                )
             conn.execute(
                 "UPDATE sessions SET share_id = ?, updated_at = ? "
                 "WHERE session_id = ?",
@@ -7100,6 +7225,8 @@ def share_revision_blockers(
         placeholders = ", ".join("?" for _ in selected_ids)
         session_filter = f"AND ss.session_id IN ({placeholders}) "
         params.extend(sorted(selected_ids))
+    from .review_snapshots import ReviewSnapshotError, load_share_snapshot
+
     query = (
         "SELECT ss.session_id, ss.content_revision AS expected_revision_hash, "
         "s.content_revision AS current_revision_hash, s.review_status "
@@ -7107,11 +7234,22 @@ def share_revision_blockers(
         "JOIN sessions s ON s.session_id = ss.session_id "
         "WHERE ss.share_id = ? "
         + session_filter
-        + "AND ss.content_revision IS NOT s.content_revision "
-        "ORDER BY ss.session_id"
+        + "ORDER BY ss.session_id"
     )
     rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+    blockers = []
+    for row in rows:
+        try:
+            snapshot = load_share_snapshot(conn, share_id, row["session_id"])
+        except ReviewSnapshotError as exc:
+            blockers.append({**dict(row), "reason": str(exc)})
+            continue
+        if snapshot is not None:
+            if snapshot["content_revision"] != row["expected_revision_hash"]:
+                blockers.append({**dict(row), "reason": "review_snapshot_revision_mismatch"})
+        elif row["expected_revision_hash"] != row["current_revision_hash"]:
+            blockers.append(dict(row))
+    return blockers
 
 
 def source_scope_blockers(
@@ -8454,12 +8592,18 @@ def export_share_to_disk(
     excluded_projects: list[str] | None = None,
     blocked_domains: list[str] | None = None,
     allowlist_entries: list[dict[str, Any]] | None = None,
+    copy_completed_artifact: bool = False,
 ) -> tuple[Path | None, dict[str, Any]]:
     """Export a share's sessions to disk as JSONL + manifest.
 
     Returns (export_dir, manifest). Returns (None, {}) if output_path
     validation fails.
     """
+    if copy_completed_artifact:
+        from .review_snapshots import copy_completed_share
+        copied = copy_completed_share(conn, share_id, output_path)
+        if copied is not None:
+            return copied
     if output_path:
         export_dir = Path(output_path).resolve()
         # The caller explicitly selected this local destination. Keep the one
@@ -8519,7 +8663,11 @@ def export_share_to_disk(
         if session_matches_excluded_projects(selected, excluded_projects):
             skipped_session_ids.append(session_id)
             continue
-        detail = get_session_detail(conn, session_id)
+        from .review_snapshots import load_share_snapshot
+
+        detail = load_share_snapshot(conn, share_id, session_id)
+        if detail is None:
+            detail = get_session_detail(conn, session_id)
         if detail is None:
             skipped_session_ids.append(session_id)
             continue
@@ -8541,6 +8689,8 @@ def export_share_to_disk(
         ))
     if preflight_blockers:
         return block_revision_conflicts(preflight_blockers)
+
+    from ..redaction.boundaries import RedactionBoundaryError
 
     try:
         with open(tmp_sessions_file, "w") as f:
@@ -8582,6 +8732,13 @@ def export_share_to_disk(
                     ),
                 })
         os.replace(tmp_sessions_file, sessions_file)
+    except RedactionBoundaryError as exc:
+        tmp_sessions_file.unlink(missing_ok=True)
+        manifest["blocked"] = True
+        manifest["block_reason"] = "redaction_boundary"
+        manifest["block_message"] = str(exc)
+        manifest["blocked_sessions"] = [{"session_id": selected["session_id"], "reason": "redaction_boundary"}]
+        return export_dir, manifest
     except BaseException:
         tmp_sessions_file.unlink(missing_ok=True)
         raise

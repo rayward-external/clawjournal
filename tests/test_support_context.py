@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from clawjournal import support_context
 
 
-def _environment(monkeypatch) -> support_context.SupportEnvironment:
-    monkeypatch.setattr(support_context.platform, "system", lambda: "Linux")
+def _environment(monkeypatch, *, os_family="Linux") -> support_context.SupportEnvironment:
+    monkeypatch.setattr(support_context.platform, "system", lambda: os_family)
     monkeypatch.setattr(support_context.platform, "release", lambda: "6.8.0-generic")
     monkeypatch.setattr(support_context.platform, "machine", lambda: "x86_64")
     return support_context.capture_support_environment(
@@ -57,6 +59,40 @@ def test_collect_support_context_has_an_exact_allowlisted_shape(monkeypatch):
         },
         "collection": {"status": "complete", "unavailable_sections": []},
     }
+
+
+@pytest.mark.parametrize("os_family,expected", [
+    ("Darwin", "macOS"),
+    ("macOS", "macOS"),
+    ("MACOS", "macOS"),
+    (" macOS ", "macOS"),
+    ("Linux", "Linux"),
+    ("Windows", "Windows"),
+    ("FreeBSD", "FreeBSD"),
+    ("macOS/private-user", "unknown"),
+    (None, "unknown"),
+])
+def test_captured_os_family_survives_report_revalidation(monkeypatch, os_family, expected):
+    # Exercise both public stages. Testing only capture misses the second
+    # normalization that previously turned Darwin -> macOS -> unknown.
+    environment = _environment(monkeypatch, os_family=os_family)
+    report = support_context.collect_support_context(
+        environment,
+        {
+            "status": "ready",
+            "filesystem_type": "apfs",
+            "storage_risk": "local",
+            "storage_migration_required": False,
+        },
+    )
+
+    assert environment.os_family == expected
+    assert report["runtime"]["os_family"] == expected
+    assert report["collection"] == {
+        "status": "partial" if expected == "unknown" else "complete",
+        "unavailable_sections": ["runtime_os"] if expected == "unknown" else [],
+    }
+    assert "private-user" not in json.dumps(report)
 
 
 def test_malicious_startup_and_health_fields_cannot_escape_allowlist(

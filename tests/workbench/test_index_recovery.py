@@ -1719,3 +1719,25 @@ def test_failed_rebuild_marker_survives_and_retry_uses_original_backup(
         ).fetchone()[0] == "pending_review"
     finally:
         conn.close()
+
+
+def test_guided_rebuild_preserves_pinned_review_after_append(recovery_install):
+    from clawjournal.workbench.review_snapshots import save_review_snapshot, load_share_snapshot
+    conn = index_module.open_index()
+    try:
+        index_module.upsert_sessions(conn, [_session('reviewed original')])
+        detail = index_module.get_session_detail(conn, 'session-recovery')
+        snapshot = save_review_snapshot(conn, detail)
+        share_id = index_module.create_share(conn, ['session-recovery'], review_snapshot_ids={'session-recovery': snapshot})
+        index_module.upsert_sessions(conn, [_session('later unreviewed content')])
+    finally:
+        conn.close()
+    result = index_recovery.guided_rebuild(_scan_one_session)
+    assert result['status'] == 'ready'
+    conn = index_module.open_index()
+    try:
+        restored = load_share_snapshot(conn, share_id, 'session-recovery')
+        assert restored['messages'][0]['content'] == 'reviewed original'
+        assert not index_module.share_revision_blockers(conn, share_id)
+    finally:
+        conn.close()

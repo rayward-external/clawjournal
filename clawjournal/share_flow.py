@@ -138,6 +138,8 @@ def build_redaction_record(conn, session_detail: dict, settings: dict,
     )
     buckets, th_hits = redaction_buckets(log)
 
+    from .redaction.boundaries import RedactionBoundaryError
+
     ai_findings: list[dict] = []
     ai_coverage = "disabled"
     if ai_pii:
@@ -147,9 +149,11 @@ def build_redaction_record(conn, session_detail: dict, settings: dict,
             findings = review_session_pii_with_agent(red, ignore_errors=False, backend=backend)
             ai_coverage = "full"
             if findings:
-                red, ai_count = apply_findings_to_session(red, findings)
+                red, ai_count = apply_findings_to_session(red, findings, strict=True)
                 count += ai_count
                 ai_findings = findings
+        except RedactionBoundaryError:
+            raise
         except Exception:  # noqa: BLE001
             ai_coverage = "rules_only"
 
@@ -215,6 +219,7 @@ def gate_blockers(conn, session_ids: list[str]) -> list[dict]:
 def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             note: str | None = None,
             expected_revisions: dict[str, str] | None = None,
+            review_snapshot_ids: dict[str, str] | None = None,
             ai_backend: str = "auto",
             before_ai_call: Callable[[], None] | None = None) -> dict:
     """Create a share row and seal the bundle. Returns:
@@ -236,14 +241,14 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             "blockers": source_blockers,
         }
     review_blockers = revision_review_blockers(conn, session_ids)
-    if review_blockers:
+    if review_blockers and review_snapshot_ids is None:
         return {
             "ok": False,
             "error": "Updated traces require fresh approval before re-upload",
             "blockers": review_blockers,
         }
     duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
-    if duplicate_blockers:
+    if duplicate_blockers and review_snapshot_ids is None:
         return {
             "ok": False,
             "error": "One or more selected trace revisions were already shared",
@@ -256,6 +261,7 @@ def package(conn, session_ids: list[str], settings: dict, *, ai_pii: bool,
             note=note,
             source_filter=settings.get("source_filter"),
             expected_revisions=expected_revisions,
+            review_snapshot_ids=review_snapshot_ids,
         )
     except RevisionConflictError as exc:
         return {

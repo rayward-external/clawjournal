@@ -1877,6 +1877,148 @@ def test_all_candidates_vanished_backs_off_instead_of_action_required(
         conn.close()
 
 
+@pytest.mark.parametrize("ambiguous_text", [
+    "A" * 1000 + "alice@audit.test", "result = numpy.array@torch.tensor",
+], ids=["oversized-email", "matrix-or-email"])
+def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolated_auto_upload, monkeypatch, ambiguous_text):
+    import copy
+
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    original = auto.get_session_detail(conn, "session-one")
+    candidates = [{"session_id": f"bad-{i}"} for i in range(5)] + [
+        {"session_id": f"good-{i}"} for i in range(7)
+    ]
+
+    def detail(_conn, session_id):
+        value = copy.deepcopy(original)
+        value["session_id"] = session_id
+        value["messages"][0]["content"] = (
+            ambiguous_text if session_id.startswith("bad")
+            else "Ordinary text <alice@audit.test> preserved."
+        )
+        return value
+
+    monkeypatch.setattr(auto, "get_session_detail", detail)
+    blocked = []
+    selected, by_size, missing = auto._ranked_size_prefix(
+        conn, candidates, settings={}, maximum_bundle_size=5_000_000,
+        boundary_blocked=blocked,
+    )
+    deferred = ambiguous_text.startswith("A" * 1000)
+    assert blocked == ([f"bad-{i}" for i in range(5)] if deferred else [])
+    assert [item["session_id"] for item in selected] == [f"{'good' if deferred else 'bad'}-{i}" for i in range(5)]
+    assert by_size == missing == 0
+    conn.close()
+
+
+def test_all_ambiguous_candidates_park_before_ai_or_upload(isolated_auto_upload, monkeypatch):
+    import copy
+
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    original = auto.get_session_detail(conn, "session-one")
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    def detail(*_args, **_kwargs):
+        value = copy.deepcopy(original)
+        value["messages"][0]["content"] = "A" * 1000 + "alice@audit.test"
+        return value
+
+    monkeypatch.setattr(auto, "get_session_detail", detail)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Ambiguous content must not reach AI packaging or submission")
+
+    monkeypatch.setattr(auto, "package", forbidden)
+    monkeypatch.setattr(auto, "submit_artifact", forbidden)
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "review_attention"
+    assert result["retryable"] is False
+    assert result["deferred_by_redaction"] == 1
+    conn = open_index()
+    try:
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["mode"] == "enabled"
+        assert enrollment["health"] == "ready"
+        assert enrollment["next_retry_at"] is None
+        assert conn.execute("SELECT hold_state FROM sessions WHERE session_id = 'session-one'").fetchone()[0] == "pending_review"
+        fresh = auto._candidate_report(conn, enrollment)
+        assert fresh["selected"] == []
+        assert fresh["exclusion_counts"]["held_or_embargoed"] == 1
+        assert conn.execute("SELECT COUNT(*) FROM shares").fetchone()[0] == 0
+    finally:
+        conn.close()
+    # A second cycle cannot reselect the deterministic failure indefinitely.
+    second = auto.run_cycle(force=True)
+    assert second["code"] == "nothing_new"
+
+
+def test_sizing_infrastructure_failure_retries_without_parking_content(isolated_auto_upload, monkeypatch):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    config = _save_scope_config()
+    conn = open_index()
+    _seed_released_session(conn, isolated_auto_upload["root"])
+    _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        raise auto.AutoUploadError("scanner_unavailable", "Synthetic scanner error", retryable=True)
+    monkeypatch.setattr(auto, "apply_share_redactions", unavailable)
+    monkeypatch.setattr(auto, "package", lambda *a, **kw: pytest.fail("No package after a scan error"))
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "scanner_unavailable"
+    assert result["retryable"] is True
+    conn = open_index()
+    try:
+        assert conn.execute("SELECT hold_state FROM sessions WHERE session_id = 'session-one'").fetchone()[0] == "released"
+        enrollment = get_auto_upload_enrollment(conn)
+        assert enrollment["health"] == "retrying"
+        assert auto._candidate_report(conn, enrollment)["selected"]
+    finally:
+        conn.close()
+
+
+def test_cycle_can_select_healthy_trace_after_five_boundary_deferrals(isolated_auto_upload, monkeypatch):
+    config = _save_scope_config()
+    conn = open_index()
+    for session_id in [f"bad-{i}" for i in range(5)] + ["healthy"]:
+        session, _raw = _session(isolated_auto_upload["root"], session_id)
+        if session_id.startswith("bad"):
+            session["messages"][1]["content"] = "A" * 1000 + "alice@audit.test"
+        assert upsert_sessions(conn, [session]) == 1
+        conn.execute("UPDATE sessions SET revision_stable_since = ? WHERE session_id = ?",
+                     ("2026-07-12T09:00:00+00:00", session_id))
+        conn.commit()
+        set_hold_state(conn, session_id, "released", changed_by="test", reason="fixture")
+    enrollment = _save_enabled_enrollment(conn, config, enrolled_at="2026-07-10T00:00:00+00:00")
+    report = auto._candidate_report(conn, enrollment)
+    assert [row["session_id"] for row in report["selected"]] == [f"bad-{i}" for i in range(5)]
+    conn.close()
+    write_credentials(_credentials())
+    _patch_runner_host(monkeypatch)
+    _patch_strict_scanner(monkeypatch)
+    packaged = []
+
+    def stop_before_external_work(_conn, session_ids, _settings, **_kwargs):
+        packaged.extend(session_ids)
+        raise auto.ControlChanged("Test stops after checking the chosen packaging input")
+
+    monkeypatch.setattr(auto, "package", stop_before_external_work)
+    result = auto.run_cycle(force=True)
+    assert result["code"] == "control_changed"
+    assert packaged == ["healthy"]
+
+
 @pytest.mark.parametrize("review_status", ["new", "blocked"])
 def test_revoked_fresh_approval_stops_before_ai_and_submit(
     isolated_auto_upload,
@@ -5300,9 +5442,11 @@ def test_nothing_new_advances_successful_daily_cadence(
         conn.close()
 
 
+@pytest.mark.parametrize("long_trace", [False, True])
 def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     isolated_auto_upload,
     monkeypatch,
+    long_trace,
 ):
     """Exercise the real scan, candidate, package, ledger, and cadence path."""
 
@@ -5344,6 +5488,9 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
         / "session-happy.jsonl"
     )
     raw_path.parent.mkdir(parents=True)
+    trace_text = ("SYNTHETIC AUTO START\n".ljust(1020) + "<bob@auto-audit.test>\n"
+                  + "ordinary words <alice@auto-audit.test>\n" * 2000
+                  + "这是普通正文" * 100 + "alice@auto-audit.test谢谢\nSYNTHETIC AUTO END") if long_trace else "report complete"
     raw_path.write_text(
         json.dumps(
             {
@@ -5360,7 +5507,7 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
                 "timestamp": "2026-07-12T09:00:00Z",
                 "message": {
                     "model": "claude-test",
-                    "content": [{"type": "text", "text": "report complete"}],
+                    "content": [{"type": "text", "text": trace_text}],
                     "usage": {"input_tokens": 5, "output_tokens": 2},
                 },
             }
@@ -5490,6 +5637,14 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
 
     monkeypatch.setattr(auto, "submit_artifact", submit)
 
+    from clawjournal.redaction import pii
+    scan_calls = []
+    original_scan = pii._content_continuation_matches
+    def record_scan(pattern, text):
+        scan_calls.append(len(text))
+        yield from original_scan(pattern, text)
+    monkeypatch.setattr(pii, "_content_continuation_matches", record_scan)
+
     before = datetime.now(timezone.utc)
     result = auto.run_cycle(force=True)
     after = datetime.now(timezone.utc)
@@ -5500,6 +5655,10 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
     assert result["receipt_reference"] == "receipt-happy-path"
     assert len(submissions) == 1
     submitted = submissions[0]
+    expected_text = trace_text.replace("alice@auto-audit.test", "[REDACTED_EMAIL]").replace("bob@auto-audit.test", "[REDACTED_EMAIL]")
+    assert submitted["transported_sessions"][0]["messages"][1]["content"] == expected_text
+    if long_trace:
+        assert any(length >= len(trace_text) for length in scan_calls)
     assert submitted["client_submission_id"] == result["client_submission_id"]
     assert submitted["authorization_revision"] == 1
     assert submitted["trace_revision_keys"] == [
@@ -5699,9 +5858,11 @@ def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
         conn.close()
 
 
+@pytest.mark.parametrize("block_reason", ["secret-scan-findings", "redaction-boundary"])
 def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
     isolated_auto_upload,
     monkeypatch,
+    block_reason,
 ):
     # Two candidates; the first packaging attempt maps a blocking
     # finding to session-one only. The runner parks that one trace and
@@ -5735,7 +5896,7 @@ def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
             "ok": False,
             "share_id": share_id,
             "error": "A blocking finding mapped to one trace.",
-            "block_reason": "secret-scan-findings",
+            "block_reason": block_reason,
             "blocked_sessions": [{"session_id": blocked_id}],
         }
 

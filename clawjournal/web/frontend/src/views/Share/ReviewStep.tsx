@@ -58,7 +58,8 @@ export function ReviewStep(p: ReviewStepProps) {
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
         Safe traces are included automatically. Anything uncertain stays out unless you
-        choose to review and include it.
+        choose to review and include it. This share uses the versions shown here.
+        Later changes stay local for a future share.
       </p>
 
       <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
@@ -270,12 +271,14 @@ function ReviewRow({
           padding: '16px 18px 18px', background: colors.gray50,
         }}>
           <p style={{ fontSize: 13, color: colors.gray700, margin: '0 0 14px', lineHeight: 1.55 }}>
-            {status === 'clear'
+            {data?.previewError
+              ? 'The preview could not be completed. This trace stays excluded. Go back to redaction and retry after resolving the error.'
+              : status === 'clear'
               ? <>This trace cleared automatically. Here&rsquo;s the redacted version that will ship &mdash; scan it if you&rsquo;d like extra peace of mind.</>
               : <>Here&rsquo;s the redacted trace. Scan it &mdash; if anything looks off, <strong style={{ color: colors.gray900 }}>remove it</strong>. Otherwise include it in the bundle.</>}
           </p>
 
-          {(aiUnavailable || aiDisabled) && (
+          {!data?.previewError && (aiUnavailable || aiDisabled) && (
             <div style={{
               display: 'flex', alignItems: 'center', gap: 10,
               padding: '10px 12px', marginBottom: 14,
@@ -305,7 +308,9 @@ function ReviewRow({
             </div>
           )}
 
-          {data?.loading ? (
+          {data?.previewError ? (
+            <div role="alert" style={{ color: colors.yellow700, fontSize: 13 }}>{data.previewError}</div>
+          ) : data?.loading ? (
             <div style={{ color: colors.gray500, fontSize: 13 }}>Still analyzing this trace...</div>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 14 }}>
@@ -401,14 +406,14 @@ function ReviewRow({
             <span style={{ fontSize: 12, color: colors.gray500, marginRight: 'auto' }}>
               {approved
                 ? 'Included with the redactions shown above.'
-                : 'This trace is currently excluded. Include it only if the redacted version looks good.'}
+                : data?.previewError ? 'A completed preview is required before inclusion.' : 'This trace is currently excluded. Include it only if the redacted version looks good.'}
             </span>
             {approved ? (
               <button onClick={onExclude} style={btnSecondary}>
                 Exclude from bundle
               </button>
             ) : (
-              <button onClick={onApprove} style={btnPrimary}>
+              <button onClick={onApprove} disabled={!!data?.previewError || !data?.reviewSnapshotId || !data?.reviewedRevision || data?.loading} style={btnPrimary}>
                 <Icon name="check" size={13} />
                 Include in bundle
               </button>

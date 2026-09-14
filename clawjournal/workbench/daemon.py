@@ -3109,6 +3109,18 @@ def _apply_upload_pii_redactions(
         }
 
     def redact_one(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
+        from ..redaction.boundaries import RedactionBoundaryError
+
+        try:
+            return redact_session(index, session)
+        except RedactionBoundaryError as exc:
+            # Keep the source identity when a provider finding cannot be
+            # applied. The automatic runner can park only this trace and
+            # retry the clean remainder. No file is rewritten on failure.
+            exc.session_id = str(session.get("session_id") or "")
+            raise
+
+    def redact_session(index: int, session: dict[str, Any]) -> tuple[int, dict[str, Any], int, int, str]:
         if ai_pii:
             findings, cov = review_session_pii_hybrid(
                 session,
@@ -3123,7 +3135,7 @@ def _apply_upload_pii_redactions(
             cov = "rules_only"
         replacement_count = 0
         if findings:
-            session, replacement_count = apply_findings_to_session(session, findings)
+            session, replacement_count = apply_findings_to_session(session, findings, strict=True)
         coverage_bucket = cov if cov in coverage else "rules_only"
         return index, session, len(findings), replacement_count, coverage_bucket
 
@@ -3191,9 +3203,6 @@ def finalize_share_export_for_upload(
     sessions_file = export_dir / "sessions.jsonl"
     manifest_file = export_dir / "manifest.json"
 
-    if not sessions_file.exists():
-        return {"error": "Export failed — no sessions file.", "status": 500}, manifest
-
     if manifest.get("blocked"):
         return {
             "error": manifest.get("block_message") or "Share blocked by the secret scan",
@@ -3203,6 +3212,9 @@ def finalize_share_export_for_upload(
             "secret_scan_summary": manifest.get("redaction_summary", {}).get("secret_scan"),
             "status": 422,
         }, manifest
+
+    if not sessions_file.exists():
+        return {"error": "Export failed — no sessions file.", "status": 500}, manifest
 
     _emit_packaging_stage(progress, "pii_review")
     pii_started = time.perf_counter()
@@ -3227,6 +3239,7 @@ def finalize_share_export_for_upload(
     except Exception as exc:
         from ..auto_upload import ControlChanged
         from ..redaction.pii import _AgentCallGateError
+        from ..redaction.boundaries import RedactionBoundaryError
 
         # A before_ai_call control gate (pause/disable/profile/revision/
         # generation change) fired during AI-PII review. review_session_pii_hybrid
@@ -3240,6 +3253,19 @@ def finalize_share_export_for_upload(
         if isinstance(exc, ControlChanged):
             raise
         _record_elapsed_ms(timings_ms, "pii_review", pii_started)
+        if isinstance(exc, RedactionBoundaryError):
+            reason = "redaction-boundary"
+            blocked = [{
+                "session_id": getattr(exc, "session_id", ""),
+                "reason": str(exc),
+            }]
+            message = str(exc)
+            manifest.update(blocked=True, block_reason=reason,
+                            block_message=message, blocked_sessions=blocked)
+            manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            return {"error": message, "block_reason": reason,
+                    "blocked_sessions": blocked,
+                    "status": 422}, manifest
         logger.warning("PII redaction pass failed: %s", exc)
         return {
             "error": "PII redaction failed — upload aborted. Try again or report this issue.",
@@ -3423,7 +3449,7 @@ def _manifest_is_finalized_for_upload(
     ai_pii: bool | None = None,
     ai_backend: str | None = None,
 ) -> bool:
-    if manifest.get("blocked"):
+    if manifest.get("blocked") or manifest.get('local_copy_only'):
         return False
     summary = manifest.get("redaction_summary")
     if not isinstance(summary, dict):
@@ -4723,6 +4749,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._handle_upload_share(share_id)
         elif path == "/api/shares":
             self._handle_create_share()
+        elif path == "/api/share-review-cache/clear":
+            self._handle_clear_share_review_cache()
         elif path.startswith("/api/shares/") and path.endswith("/export"):
             share_id = path[len("/api/shares/"):-len("/export")]
             self._handle_export_share(share_id)
@@ -5697,6 +5725,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_session_redacted(self, session_id: str) -> None:
         """Return session with secrets redacted — for pre-share review."""
+        from ..redaction.boundaries import RedactionBoundaryError
+
         conn = open_index()
         try:
             try:
@@ -5720,6 +5750,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 blocked_domains=settings["blocked_domains"],
             )
             _json_response(self, detail)
+        except RedactionBoundaryError as exc:
+            _json_response(self, {
+                "error": str(exc), "block_reason": "redaction_boundary",
+                "rule": exc.rule,
+            }, 422, cache_control="no-store")
         finally:
             conn.close()
 
@@ -5729,12 +5764,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         When *ai_pii* is True, also runs agent-based PII detection and
         applies the findings on top of the deterministic share redaction.
         """
+        from ..redaction.boundaries import RedactionBoundaryError
+
         conn = open_index()
         try:
             detail = get_session_detail(conn, session_id)
             if detail is None:
                 _json_response(self, {"error": "Session not found"}, 404)
                 return
+            from .review_snapshots import ReviewSnapshotError, save_review_snapshot
+
+            import copy
+            reviewed_input = copy.deepcopy(detail)
+            reviewed_revision = detail["content_revision"]
             settings = get_effective_share_settings(conn, load_config())
             detail, redaction_count, redaction_log = apply_share_redactions(
                 conn,
@@ -5764,7 +5806,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     )
                     ai_coverage = "full"
                     if findings:
-                        detail, ai_pii_count = apply_findings_to_session(detail, findings)
+                        detail, ai_pii_count = apply_findings_to_session(detail, findings, strict=True)
                         ai_pii_findings = [
                             {
                                 "entity_type": f.get("entity_type", ""),
@@ -5775,18 +5817,32 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                             }
                             for f in findings
                         ]
+                except RedactionBoundaryError:
+                    raise
                 except Exception as exc:
                     logger.warning("AI PII detection failed for %s: %s", session_id, exc)
                     ai_coverage = "rules_only"
 
+            try:
+                review_snapshot_id = save_review_snapshot(conn, reviewed_input)
+            except ReviewSnapshotError as exc:
+                _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
+                return
             _json_response(self, {
                 "session_id": session_id,
+                "review_snapshot_id": review_snapshot_id,
+                "reviewed_revision": reviewed_revision,
                 "redaction_count": redaction_count + ai_pii_count,
                 "redaction_log": redaction_log,
                 "ai_pii_findings": ai_pii_findings,
                 "ai_coverage": ai_coverage,
                 "redacted_session": detail,
             })
+        except RedactionBoundaryError as exc:
+            _json_response(self, {
+                "error": str(exc), "block_reason": "redaction_boundary",
+                "rule": exc.rule,
+            }, 422, cache_control="no-store")
         finally:
             conn.close()
 
@@ -6834,6 +6890,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _handle_clear_share_review_cache(self) -> None:
+        body = _read_body(self)
+        if not isinstance(body, dict) or body.get('confirm_invalidate_pending_reviews') is not True:
+            _json_response(self, {'error': 'Confirm that unsubmitted packages will need new reviews.'}, 400)
+            return
+        from .review_snapshots import clear_review_cache
+        conn = open_index()
+        try:
+            clear_review_cache(conn, include_linked=True)
+            _json_response(self, {'ok': True})
+        finally:
+            conn.close()
+
     def _handle_list_shares(self) -> None:
         conn = open_index()
         try:
@@ -6910,6 +6979,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 400,
             )
             return
+        review_snapshot_ids = body.get("review_snapshot_ids")
+        if review_snapshot_ids is not None and (
+            not isinstance(review_snapshot_ids, dict)
+            or any(not isinstance(value, str) for value in review_snapshot_ids.values())
+        ):
+            _json_response(self, {"error": "review_snapshot_ids must map session IDs to saved previews"}, 400)
+            return
         conn = open_index()
         try:
             settings = get_effective_share_settings(conn, load_config())
@@ -6921,14 +6997,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 }, 409)
                 return
             review_blockers = revision_review_blockers(conn, session_ids)
-            if review_blockers:
+            if review_blockers and review_snapshot_ids is None:
                 _json_response(self, {
                     "error": "Updated traces require fresh approval before re-upload.",
                     "blockers": review_blockers,
                 }, 409)
                 return
             duplicate_blockers = already_shared_revision_blockers(conn, session_ids)
-            if duplicate_blockers:
+            if duplicate_blockers and review_snapshot_ids is None:
                 _json_response(self, {
                     "error": "One or more selected trace revisions were already shared.",
                     "blockers": duplicate_blockers,
@@ -6942,6 +7018,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     source_filter=settings.get("source_filter"),
                     expected_revisions=expected_revisions,
                     expected_logical_revisions=expected_logical_revisions,
+                    review_snapshot_ids=review_snapshot_ids,
                 )
             except RevisionConflictError as exc:
                 _json_response(self, {
@@ -7097,6 +7174,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 excluded_projects=settings["excluded_projects"],
                 blocked_domains=settings["blocked_domains"],
                 allowlist_entries=settings["allowlist_entries"],
+                copy_completed_artifact=True,
             )
             if export_dir is None:
                 _json_response(self, {"error": "output_path must not be a filesystem root directory"}, 400)

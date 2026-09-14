@@ -53,7 +53,7 @@ def test_v12_to_v13_migration_creates_queue_schema(queue_db):
 
     reopened = index.open_index()
     try:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == index.WORKBENCH_SCHEMA_VERSION
         names = {
             row[0]
             for row in reopened.execute(

@@ -7,6 +7,22 @@ import pytest
 from clawjournal.redaction.anonymizer import Anonymizer
 
 
+def pytest_collection_modifyitems(items):
+    """Reject test names that cannot fit Windows PYTEST_CURRENT_TEST.
+
+    Pytest includes parameter IDs in an environment variable before setup.
+    Check every platform so a long-text fixture fails early on macOS/Linux,
+    with useful advice, instead of crashing setup and teardown on Windows.
+    """
+    for item in items:
+        value = item.nodeid + ' (teardown)'
+        if len(value.encode('utf-16-le', errors='surrogatepass')) // 2 >= 32767:
+            raise pytest.UsageError(
+                'Test name exceeds the Windows environment limit. Give long '
+                f'parameters concise ids=: {item.nodeid[:160]}…'
+            )
+
+
 def _clear_strict_scan_reuse() -> None:
     # getattr-guarded so a mixed setup (this conftest running against an
     # older installed clawjournal without the memo, e.g. the editable

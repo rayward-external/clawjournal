@@ -1690,7 +1690,7 @@ def _run_bundle_view(args) -> None:
         conn.close()
 
 
-def _write_bundle_zip(export_dir: Path, zip_path: Path | None = None) -> Path:
+def _write_bundle_zip(export_dir: Path, zip_path: Path | None = None, *, local_copy: bool = False) -> Path:
     zip_path = zip_path or export_dir.with_name(f"{export_dir.name}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for name in (
@@ -1701,6 +1701,8 @@ def _write_bundle_zip(export_dir: Path, zip_path: Path | None = None) -> Path:
             "secret-scan.json",
             "secret-scan.post-pii.json",
         ):
+            if local_copy and name not in ('sessions.jsonl', 'manifest.json'):
+                continue
             path = export_dir / name
             if path.exists():
                 zf.write(path, arcname=name)
@@ -1785,6 +1787,7 @@ def _run_bundle_export(args) -> None:
             excluded_projects=settings["excluded_projects"],
             blocked_domains=settings["blocked_domains"],
             allowlist_entries=settings["allowlist_entries"],
+            copy_completed_artifact=True,
         )
         if export_dir is None:
             print("Output path must not be a filesystem root directory.")
@@ -1799,7 +1802,9 @@ def _run_bundle_export(args) -> None:
         session_count = len(manifest.get("sessions", []))
         files = ["sessions.jsonl", "manifest.json", "trufflehog.json", "secret-scan.json"]
         zip_path = None
-        if getattr(args, "zip", False) is True:
+        if manifest.get('local_copy_only'):
+            files = ['sessions.jsonl', 'manifest.json']
+        if getattr(args, "zip", False) is True and not manifest.get('local_copy_only'):
             from .workbench.daemon import finalize_share_export_for_upload
 
             error, manifest = finalize_share_export_for_upload(
@@ -1828,7 +1833,7 @@ def _run_bundle_export(args) -> None:
             files.append("sessions.training.jsonl")
 
         if getattr(args, "zip", False) is True:
-            zip_path = _write_bundle_zip(export_dir, requested_zip_path)
+            zip_path = _write_bundle_zip(export_dir, requested_zip_path, local_copy=bool(manifest.get('local_copy_only')))
 
         if getattr(args, "json", False):
             result = {
@@ -5157,6 +5162,10 @@ def _main() -> None:
     ins.add_argument("--detail", action="store_true", help="Show detailed recommendations")
 
     # Refresh pricing
+    review_cache = sub.add_parser("review-cache", help="Clear local saved preview payloads")
+    review_cache.add_argument("--clear", action="store_true", required=True)
+    review_cache.add_argument("--all", action="store_true", help="Also invalidate saved inputs for pending shares; previews must be refreshed")
+
     sub.add_parser("refresh-pricing", help="Refresh model pricing cache from OpenRouter")
 
     # Search command
@@ -5416,6 +5425,17 @@ def _main() -> None:
 
     if command == "insights":
         _run_insights(args)
+        return
+
+    if command == "review-cache":
+        from .workbench.index import open_index
+        from .workbench.review_snapshots import clear_review_cache
+        conn = open_index()
+        try:
+            clear_review_cache(conn, include_linked=args.all)
+        finally:
+            conn.close()
+        print("Review cache cleared. Refresh previews before sharing." if args.all else "Unused review previews cleared.")
         return
 
     if command == "refresh-pricing":

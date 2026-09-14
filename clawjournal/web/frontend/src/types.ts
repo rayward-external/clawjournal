@@ -587,6 +587,8 @@ export interface AiPiiFinding {
 
 export interface RedactionReport {
   session_id: string;
+  review_snapshot_id?: string;
+  reviewed_revision?: string;
   redaction_count: number;
   redaction_log: RedactionLogEntry[];
   ai_pii_findings?: AiPiiFinding[];

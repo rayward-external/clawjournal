@@ -39,10 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 3  # Include fork_nickname in every session-level findings
-                    # scanner/apply path. Version 2 caches could not contain
-                    # findings from that metadata field, so force one rebuild
-                    # even when the transcript content itself is unchanged.
+ENGINE_VERSION = 8  # Rebuild URL credentials independently of email exceptions.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 
@@ -927,6 +924,15 @@ def write_findings(path: Path, findings: list[PIIFinding], meta: dict[str, Any] 
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _is_partial_email_finding(finding: PIIFinding) -> bool:
+    # Use rule provenance, not absence of '@': an AI finding can describe
+    # an obfuscated address (alice [at] host [dot] test) that still needs
+    # its original full-entity replacement.
+    return finding.get("entity_type") == "email" and finding.get("reason") in {
+        "Email-like identifier (truncated)", "email_truncated",
+    }
+
+
 def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> list[PIIFinding]:
     filtered = [f for f in findings if f.get("entity_text") and float(f.get("confidence", 0.0)) >= min_confidence]
     grouped: dict[tuple[str, int, str], list[PIIFinding]] = {}
@@ -943,16 +949,33 @@ def merge_findings(findings: list[PIIFinding], min_confidence: float = 0.0) -> l
             text_lower = text.lower()
             if any(text_lower == existing.get("entity_text", "").lower() for existing in chosen):
                 continue
-            if any(text_lower in existing.get("entity_text", "").lower() for existing in chosen):
+            # Distinct emails can occur separately even when one is a suffix
+            # of another. Keep both, including occurrence-scoped fragments.
+            if item.get("entity_type") != "email" and any(text_lower in existing.get("entity_text", "").lower() for existing in chosen):
                 continue
             chosen.append(item)
         merged.extend(chosen)
     return sorted(merged, key=lambda f: (f.get("session_id", ""), int(f.get("message_index", 0)), f.get("field", "content"), -len(f.get("entity_text", ""))))
 
 
-def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, int]:
+def apply_findings_to_text(text: str, findings: list[PIIFinding], *, strict: bool = False) -> tuple[str, int]:
     if not text or not findings:
         return text, 0
+    # A session-level finding may belong to another field, or an AI response
+    # may name text that is absent. It cannot replace or block this field.
+    findings = [f for f in findings if len(str(f.get("entity_text") or "")) >= 3
+                and re.search(re.escape(str(f["entity_text"])), text, re.IGNORECASE)]
+    if not findings:
+        return text, 0
+    from .redaction.boundaries import ensure_safe_replacement, ensure_text_boundaries
+    from .redaction.code_context import code_context
+    from .redaction.replacements import replace_spans
+
+    context = code_context(text)
+    if strict:
+        ensure_text_boundaries(text, context=context)
+        for finding in findings:
+            ensure_safe_replacement(str(finding.get("entity_text") or ""), str(finding.get("entity_type") or ""))
     ordered = sorted(
         [f for f in findings if f.get("entity_text")],
         key=lambda f: (-len(f.get("entity_text", "")), -float(f.get("confidence", 0.0))),
@@ -964,9 +987,35 @@ def apply_findings_to_text(text: str, findings: list[PIIFinding]) -> tuple[str, 
         replacement = finding.get("replacement") or replacement_for_type(str(finding.get("entity_type") or "custom_sensitive"))
         if len(target) < 3:
             continue
+        if _is_partial_email_finding(finding) and finding.get("status") != "accepted":
+            from .redaction.replacements import replace_email_fragments
+            result, n = replace_email_fragments(result, {target: replacement}, ignore_case=True, context=context)
+            count += n
+            continue
+        if finding.get('entity_type') == 'email' and ('@' in target or '%40' in target.lower()):
+            from .redaction.replacements import email_replacement_spans
+            spans = email_replacement_spans(result, target, replacement,
+                flags=re.IGNORECASE, context=context, protect_code=finding.get('source') == 'rule')
+            result, n = replace_spans(result, spans, context=context)
+            count += n
+            continue
         escaped = re.escape(target)
-        pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
-        result, n = pattern.subn(replacement, result)
+        # Email/token values already have a detected span. Unicode word
+        # boundaries would skip them next to ordinary Chinese prose.
+        if finding.get("entity_type") == "email" or str(finding.get("reason", "")).startswith("telegram") or finding.get("reason") == "Likely Telegram bot token":
+            if finding.get("entity_type") == "email" and ("@" in target or "%40" in target.lower()):
+                from .redaction.replacements import email_pattern
+                pattern = email_pattern(target, re.IGNORECASE)
+            else:
+                pattern = re.compile(escaped, re.IGNORECASE)
+        else:
+            pattern = re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+        if finding.get("source") == "rule" and finding.get("entity_type") in {"email", "private_url"}:
+            from .redaction.code_context import replace_outside_code
+            result, n = replace_outside_code(result, pattern, replacement, context=context)
+        else:
+            spans = [(m.start(), m.end(), m.expand(replacement)) for m in pattern.finditer(result)]
+            result, n = replace_spans(result, spans, context=context)
         count += n
     return result, count
 
@@ -975,6 +1024,7 @@ def apply_findings_to_session(
     session: dict[str, Any],
     findings: list[PIIFinding],
     min_confidence: float = 0.0,
+    *, strict: bool = False,
 ) -> tuple[dict[str, Any], int]:
     total = 0
     session_id = str(session.get("session_id") or "")
@@ -993,7 +1043,7 @@ def apply_findings_to_session(
     ):
         value = session.get(meta_field)
         if isinstance(value, str):
-            new_value, n = apply_findings_to_text(value, session_findings)
+            new_value, n = apply_findings_to_text(value, session_findings, strict=strict)
             session[meta_field] = new_value
             total += n
 
@@ -1002,11 +1052,11 @@ def apply_findings_to_session(
         try:
             detail = json.loads(raw_detail)
         except json.JSONDecodeError:
-            new_value, n = apply_findings_to_text(raw_detail, session_findings)
+            new_value, n = apply_findings_to_text(raw_detail, session_findings, strict=strict)
             session["ai_scoring_detail"] = new_value
             total += n
         else:
-            redacted_detail, n = _apply_findings_to_value(detail, session_findings)
+            redacted_detail, n = _apply_findings_to_value(detail, session_findings, strict=strict)
             session["ai_scoring_detail"] = json.dumps(redacted_detail)
             total += n
 
@@ -1020,7 +1070,7 @@ def apply_findings_to_session(
         for field in ("content", "thinking"):
             value = msg.get(field)
             if isinstance(value, str):
-                new_value, n = apply_findings_to_text(value, session_findings)
+                new_value, n = apply_findings_to_text(value, session_findings, strict=strict)
                 msg[field] = new_value
                 total += n
         for tool_use in msg.get("tool_uses", []):
@@ -1031,11 +1081,11 @@ def apply_findings_to_session(
                 if isinstance(value, dict):
                     for key in list(value.keys()):
                         if isinstance(value[key], str):
-                            new_value, n = apply_findings_to_text(value[key], session_findings)
+                            new_value, n = apply_findings_to_text(value[key], session_findings, strict=strict)
                             value[key] = new_value
                             total += n
                 elif isinstance(value, str):
-                    new_value, n = apply_findings_to_text(value, session_findings)
+                    new_value, n = apply_findings_to_text(value, session_findings, strict=strict)
                     tool_use[branch] = new_value
                     total += n
     return session, total
@@ -1044,14 +1094,15 @@ def apply_findings_to_session(
 def _apply_findings_to_value(
     value: Any,
     findings: list[PIIFinding],
+    *, strict: bool = False,
 ) -> tuple[Any, int]:
     if isinstance(value, str):
-        return apply_findings_to_text(value, findings)
+        return apply_findings_to_text(value, findings, strict=strict)
     if isinstance(value, list):
         total = 0
         out: list[Any] = []
         for item in value:
-            redacted, n = _apply_findings_to_value(item, findings)
+            redacted, n = _apply_findings_to_value(item, findings, strict=strict)
             out.append(redacted)
             total += n
         return out, total
@@ -1059,7 +1110,7 @@ def _apply_findings_to_value(
         total = 0
         out: dict[str, Any] = {}
         for key, item in value.items():
-            redacted, n = _apply_findings_to_value(item, findings)
+            redacted, n = _apply_findings_to_value(item, findings, strict=strict)
             out[key] = redacted
             total += n
         return out, total

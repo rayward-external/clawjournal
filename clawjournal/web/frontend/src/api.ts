@@ -649,6 +649,13 @@ export const api = {
   },
 
   shares: {
+    clearReviews(): Promise<{ ok: boolean }> {
+      return request('/share-review-cache/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm_invalidate_pending_reviews: true }),
+      });
+    },
     list(): Promise<Share[]> {
       return request('/shares');
     },
@@ -663,6 +670,7 @@ export const api = {
       attestation?: string,
       expectedRevisions?: Record<string, string>,
       expectedLogicalRevisions?: Record<string, string>,
+      reviewSnapshotIds?: Record<string, string>,
     ): Promise<{ share_id: string }> {
       return request('/shares', {
         method: 'POST',
@@ -673,6 +681,7 @@ export const api = {
           attestation,
           expected_revisions: expectedRevisions,
           expected_logical_revisions: expectedLogicalRevisions,
+          review_snapshot_ids: reviewSnapshotIds,
         }),
       });
     },

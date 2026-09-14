@@ -692,6 +692,7 @@ class _BundleRedactor:
             redacted, _count, log = redact_text(
                 lightly_redacted,
                 user_allowlist=self.user_allowlist,
+                strict=True,
             )
             self.counts.record(log)
             self._finalized[pid] = redacted

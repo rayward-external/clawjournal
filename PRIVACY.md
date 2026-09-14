@@ -36,6 +36,137 @@ At those boundaries, ClawJournal redacts several classes of sensitive data:
 
 You can also add custom strings and extra usernames to redact through `clawjournal config`.
 
+An email, Telegram token, or internal hostname can touch ordinary text without
+a space. The scanner uses delimiters and format clues to find candidates, then
+checks their replacement length. It does not discard an oversized candidate as
+safe. If the boundary is unclear, sharing stops for that trace before replacing
+the text. The original content stays local. Add a separator or an explicit
+custom redaction, then preview again. During automatic candidate selection,
+such traces are deferred so other eligible traces can fill the five slots;
+if all candidates are deferred, the runner backs off and retries.
+
+The email checks use a 64-byte local-part and 254-byte mailbox budget. Hostnames
+use 63 bytes per label and 253 bytes overall. These are conservative UTF-8
+replacement budgets, not complete address validators. The Telegram budget is
+128 characters; it is not a claim about the maximum possible token length.
+Email, Telegram-token and internal-domain regex searches use complete-candidate
+adapters. Required markers locate possible matches; the unchanged regexes
+validate them against the original field. They do not repeatedly retry each
+suffix of the same long run. No window copies, worker processes or interpreter
+launches are needed for these deterministic searches. Private keys retain
+complete-text handling. Code context, finding decisions and known-credential
+propagation use field/session scope. Overlapping replacements cover the union
+of detected sensitive spans. Weak truncated email fragments stay local to their
+occurrence unless their finding is explicitly accepted; accepted findings
+propagate to matching bare identifiers. Manual and automatic
+sharing use this same scanning path. Packaging and all scan gates finish
+before upload starts; faster scanning does not change network transfer time.
+
+A pure-Python literal prefilter checks required markers before the built-in
+secret and PII regex passes. Only exact reviewed regexes can be skipped; new
+or changed rules still run. Small fields use the original rules. Tests generate
+positive inputs from the live regexes to check that a necessary marker cannot
+reject a valid match. The prefilter retains no input between calls and requires
+no native extension. Neither pyahocorasick nor RE2 is required.
+
+Code evidence is collected from the original field and its offsets move with
+known replacements. It is not reparsed for each email or hostname, and edits
+cannot create new code exemptions. Host-boundary evidence is rechecked when
+other replacements can expose a new hostname. Hints are reused within each
+PII scan. Code analysis is optional and has size and complexity limits. A
+parse error, NUL byte or exhausted hint budget cancels the affected code
+exemptions; it never aborts secret detection, badge computation or indexing.
+The detector still scans the original text. NUL bytes are not removed or
+shifted in the source. Quoted data cannot authorize embedded Markdown fences.
+Fence lines are paired in one pass, then checked by Python's tokenizer. An
+ambiguous outer string disables fenced-code exemptions for that field. Code
+hints have a 65,536-character ceiling plus token budgets. Larger fields still
+receive full secret detection, but do not receive Python-code exemptions;
+code-shaped text can therefore be redacted as it was before these exemptions
+were added. Scanner threads do not change the process's warning filters or
+hold a parser mutex. Suspicious string escapes disable optional hints before
+tokenization. No trace text is executed.
+
+Local indexing, card rendering and local session export do not apply the sharing
+preflight. They retain full masking of recognized candidates, including long
+URL credentials; no leading credential bytes are kept just to limit a local
+email replacement. Sharing checks the original input with the strict boundary
+policy. Explicit URL userinfo is a credential with a complete URL boundary, so
+it is masked without imposing the email local-part limit. An explicit blocked
+domain or custom redaction can likewise remove an oversized value. Ambiguous
+email-like code without specific array evidence uses normal email redaction,
+rather than stopping the whole share.
+
+Pure detection returns its findings without applying replacement limits, so
+findings can be saved and unchanged sessions need not be scanned every tick.
+A blocked review request returns a structured error instead of closing the
+connection; an explicit custom redaction can resolve the candidate before
+retrying the preview.
+
+Automatic sharing persists content-boundary deferrals in that review queue,
+so later status reports exclude them and normal traces can proceed. A
+boundary failure during final PII application keeps its trace identity and
+does not rewrite the bundle; the automatic runner can park that trace and
+retry the remainder. An absent provider finding cannot block unrelated text.
+External scanner infrastructure failures remain retryable and do not change
+content holds. Betterleaks and TruffleHog remain the existing share gates;
+Gitleaks is not installed.
+
+A dotted call alone, such as `api01.internal()`, is not proof of ordinary
+code. A method exemption requires an explicit import, a preceding local
+object binding or a function parameter. Literals, comments and arguments still scan. Code hints
+cannot bypass replacement budgets: an oversized candidate remains a review
+case whether parsing succeeds or fails. A large JSON value without such an
+ambiguous candidate is still shareable.
+
+An ASCII email next to unspaced Chinese, Japanese, Korean or similar prose
+uses the script transition as a boundary. The surrounding prose stays intact.
+Accented local parts, Unicode domains, quoted mailboxes and explicitly
+angle-delimited mixed-script mailboxes remain supported. An unquoted
+mixed-script local part joined directly to prose is inherently ambiguous;
+use an explicit mailbox delimiter to retain its full intended span. These
+heuristics do not claim perfect word separation in every script.
+
+Fine-grained `github_pat_` credentials are recognized independently of email
+syntax, including overlong token-like values. Their complete detected value
+is masked locally rather than retaining a token prefix before the email
+replacement window. Strict sharing still checks the original input.
+
+Common encoded separators are checked against their original text offsets.
+Named Telegram assignments and database/SSH host contexts add coverage when
+the usual colon or private domain suffix is absent.
+
+Partial emails such as `abc@` only hide the local part at that occurrence;
+this also applies when `@` uses a supported separator escape. The ordinary
+word `abc` elsewhere is retained. A known hostname does not remove the same
+letters inside an unrelated longer word. Secret assignments retain the
+variable name, separator and quotes while hiding the value, including copies
+of that value in other fields. Existing review decisions still use the original
+finding hash.
+If a value was identified as a password or secret, that evidence takes
+precedence over automatic email/hostname code exemptions in other fields.
+
+Bounded Python syntax checks can distinguish a method call such as
+`obj.local()` from a hostname. Only the method's name is protected; strings,
+comments and arguments still scan. An email-shaped matrix expression is
+protected only with preceding NumPy/PyTorch imports, standard aliases and
+recognized array member names. Arbitrary imported aliases do not exempt addresses. A bare assignment such as
+`result = numpy.array@torch.tensor` is ambiguous and stops sharing instead of
+being deleted or silently treated as safe. This is a narrow syntax check, not
+a general code classifier; other languages and incomplete snippets can still
+produce false positives. External secret-scan gates remain mandatory.
+Configuration lookups such as `DB_HOST=config["db_host"]` and named Telegram
+property references retain their code identifiers; quoted values and call
+arguments still scan. A candidate ending inside a lookup or call is not
+treated as a complete host/token value. Independent credential and hostname
+rules still scan the expression and its arguments.
+
+These rules cannot infer every boundary: an unlabelled token fragment, an
+ordinary-looking private hostname, or code that has the same spelling as an
+email can remain ambiguous. A short word attached to an address may be
+redacted with it. Private-key detection keeps its previous coverage; this
+change does not add support for arbitrary keys without BEGIN/END markers.
+
 ## AI-assisted PII review
 
 Automatic secret redaction is useful, but it is not perfect. For higher confidence, run:
@@ -107,6 +238,39 @@ Depending on how you export, bundle content can include user messages, assistant
 ## Optional upload flow
 
 Uploading is a separate path from local export.
+
+Manual Share saves the input used for each redaction preview in the local index.
+When you include that preview, packaging uses its saved content version even if
+the conversation later grows. Later content stays local for a future share; it
+does not inherit this inclusion. Only successful previews are saved. There is
+no time-based approval expiry. Unlinked previews normally retain the latest
+revision per trace and at most 100 rows. An active CLI selection protects its
+own previews and can exceed that row count; if abandoned, excess rows are
+pruned by the next preview or explicit cache cleanup. A total payload budget
+of 128 MiB applies throughout, including linked previews. Old unused previews can be evicted; affected tabs
+must refresh. Inputs linked to pending shares are preserved. If those inputs
+fill the cache, new previews stop with a clear cache-full message.
+
+After every share referencing an input receives a receipt, its raw snapshot
+payload is cleared. Minimal links remain, so an old share cannot fall back to a
+newer live trace. Index recovery preserves pending snapshot data and links.
+`clawjournal review-cache --clear` removes unused previews;
+`clawjournal review-cache --clear --all` also clears linked payloads and requires
+fresh previews for pending shares. These operations remove database payloads;
+they are not a guarantee of forensic removal from backups or filesystem copies.
+For a completed share, local `bundle-export` copies the previously exported
+JSONL only after its SHA-256 matches the recorded receipt hash. Later messages,
+titles and scores do not enter that copy. Its manifest marks it as a local copy;
+it is not a newly prepared upload package. Missing or changed archived files
+cannot be reconstructed from current traces; use the previously downloaded ZIP.
+A refreshed preview must be included again. Failed or timed-out previews remain
+excluded while healthy traces can proceed. A boundary failure during optional
+AI review is reported as a blocked trace, not as successful rules-only coverage.
+
+For preparing or submitting a share, current holds, blocked status, source/project scope, exclusions, redaction rules,
+consent, duplicate checks, and both secret-scan gates still apply. Missing or
+damaged saved content requires a fresh preview. This manual review mechanism
+does not grant or change recurring upload authority.
 
 - Hosted research submission uses the local workbench Submit step by default. The browser talks to the local daemon, the daemon sends the finalized zip to Rayward's hosted API, and the hosted service returns a receipt ID. Self-hosters can override the destination with `CLAWJOURNAL_SHARE_URL`; setting `CLAWJOURNAL_SHARE_URL=` disables hosted submission.
 - Advanced self-hosted ingest upload is disabled unless `CLAWJOURNAL_INGEST_URL` is configured.

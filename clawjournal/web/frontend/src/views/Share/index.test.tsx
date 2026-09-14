@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api } from '../../api.ts';
+import { api, ApiError } from '../../api.ts';
 import { ToastProvider } from '../../components/Toast.tsx';
 import type { ReadySession, ShareReadyStats } from './types.ts';
 import { Share } from './index.tsx';
@@ -70,6 +70,61 @@ function mockInitialLoad(stats: ShareReadyStats) {
 afterEach(() => {
   window.localStorage.clear();
   vi.restoreAllMocks();
+});
+
+describe('Reviewed share versions', () => {
+  it('clears saved reviews only after confirmation and reports the result', async () => {
+    mockInitialLoad(readyStats(1));
+    const clear = vi.spyOn(api.shares, 'clearReviews').mockResolvedValue({ ok: true });
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear saved reviews' }));
+    expect(screen.getByText(/Unsubmitted packages will need new reviews/)).toBeInTheDocument();
+    expect(clear).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear reviews' }));
+    await waitFor(() => expect(clear).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/Saved reviews cleared/)).toBeInTheDocument();
+  });
+
+  it.each([true, false])('requires the saved preview and uses its revision (available=%s)', async (available) => {
+    const stats = readyStats(1);
+    stats.sessions[0].revision_hash = 'older-queue-revision';
+    mockInitialLoad(stats);
+    vi.spyOn(api.sessions, 'redactionReport').mockResolvedValue({
+      session_id: 's1',
+      review_snapshot_id: available ? 'saved-preview' : undefined,
+      reviewed_revision: available ? 'actually-reviewed-revision' : undefined,
+      redaction_count: 0,
+      redaction_log: [],
+      ai_pii_findings: [],
+      ai_coverage: 'full',
+      redacted_session: { messages: [{ role: 'user', content: 'Reviewed content' }] },
+    } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+    const create = vi.spyOn(api.shares, 'create').mockResolvedValue({ share_id: 'snapshot-share' });
+    vi.spyOn(api.shares, 'seal').mockResolvedValue({ ok: true } as Awaited<ReturnType<typeof api.shares.seal>>);
+    vi.spyOn(api.shares, 'packageStatus').mockResolvedValue({ progress: 100, message: 'Ready' } as Awaited<ReturnType<typeof api.shares.packageStatus>>);
+    render(
+      <MemoryRouter initialEntries={['/share?ai_pii=1']}>
+        <ToastProvider><Share /></ToastProvider>
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByText(/Later changes stay local for a future share/)).toBeInTheDocument();
+    if (available) {
+      fireEvent.click(screen.getByRole('button', { name: 'Package 1 trace' }));
+      await waitFor(() => expect(create).toHaveBeenCalledWith(
+        ['s1'], undefined, undefined,
+        { s1: 'actually-reviewed-revision' }, expect.any(Object),
+        { s1: 'saved-preview' },
+      ));
+    } else {
+      expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
+      expect(screen.getByText('Optional: inspect 1 excluded trace.')).toBeInTheDocument();
+      expect(create).not.toHaveBeenCalled();
+    }
+  });
 });
 
 describe('Share selection defaults', () => {
@@ -174,6 +229,8 @@ describe('Share selection defaults', () => {
     });
     const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -452,6 +509,8 @@ describe('Share selection defaults', () => {
     mockInitialLoad(readyStats(2));
     const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -722,6 +781,8 @@ describe('Redaction completion', () => {
     mockInitialLoad(readyStats(2));
     const redactionSpy = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -754,6 +815,8 @@ describe('One-click review defaults', () => {
     mockInitialLoad(readyStats(2));
     vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -790,6 +853,8 @@ describe('One-click review defaults', () => {
     mockInitialLoad(readyStats(2));
     vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => ({
       session_id: id,
+      review_snapshot_id: `preview-${id}`,
+      reviewed_revision: `reviewed-${id}`,
       redaction_count: 0,
       redaction_log: [],
       ai_pii_findings: [],
@@ -811,5 +876,59 @@ describe('One-click review defaults', () => {
     expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
     expect(screen.getByText('Optional: inspect 1 excluded trace.')).toBeInTheDocument();
     expect(screen.getByText('not included · 1 need review')).toBeInTheDocument();
+  });
+});
+
+
+describe('Failed saved previews', () => {
+  it.each([422, 408])('packages the healthy subset after a %i failure', async (status) => {
+    mockInitialLoad(readyStats(3));
+    const report = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (id) => {
+      if (id === 's3') throw new ApiError(status, 'Synthetic preview boundary needs an explicit redaction.');
+      return {
+        session_id: id, review_snapshot_id: `preview-${id}`, reviewed_revision: `revision-${id}`,
+        redaction_count: 0, redaction_log: [], ai_pii_findings: [], ai_coverage: 'disabled',
+        redacted_session: { messages: [{ role: 'user', content: 'Safe synthetic content' }] },
+      } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>;
+    });
+    const create = vi.spyOn(api.shares, 'create').mockResolvedValue({ share_id: 'safe-subset' });
+    vi.spyOn(api.shares, 'export').mockResolvedValue({} as Awaited<ReturnType<typeof api.shares.export>>);
+    vi.spyOn(api.shares, 'packageStatus').mockResolvedValue({ progress: 100, message: 'Ready' } as Awaited<ReturnType<typeof api.shares.packageStatus>>);
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Package 2 traces' }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toEqual(['s1', 's2']);
+    expect(report.mock.calls.filter(([id]) => id === 's3')).toHaveLength(1);
+  });
+
+  it('the Redact stepper refreshes a failed preview and requires inclusion again', async () => {
+    mockInitialLoad(readyStats(1));
+    const report = vi.spyOn(api.sessions, 'redactionReport')
+      .mockRejectedValueOnce(new ApiError(422, 'Add an explicit redaction before sharing.'))
+      .mockResolvedValue({
+        session_id: 's1', review_snapshot_id: 'refreshed', reviewed_revision: 'new-revision',
+        redaction_count: 0, redaction_log: [], ai_pii_findings: [], ai_coverage: 'disabled',
+        redacted_session: { messages: [] },
+      } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>);
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
+    fireEvent.click(screen.getByText('Inspect'));
+    expect(screen.getByRole('alert')).toHaveTextContent('Add an explicit redaction before sharing.');
+    expect(screen.queryByText('Nothing matched the deterministic rules.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Include in bundle' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: /Redact$/ }));
+    await waitFor(() => expect(report).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
   });
 });

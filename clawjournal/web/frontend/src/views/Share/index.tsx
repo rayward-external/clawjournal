@@ -715,11 +715,20 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setActiveStep('queue');
   }, [cancelRedaction, cancelAiRetries, readyStats, resetAddTracesPicker]);
 
+  const purgeFailedPreviews = () => {
+    const failed = new Set(Object.entries(redactedSessions)
+      .filter(([, d]) => d.previewError || !d.reviewSnapshotId || !d.reviewedRevision)
+      .map(([id]) => id));
+    setRedactedSessions((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => !failed.has(id))));
+    setApprovedIds((prev) => new Set([...prev].filter((id) => !failed.has(id))));
+  };
+
   const onStepClick = (key: string) => {
     const k = key as StepKey;
     if (k === guardedActiveStep) return;
     cancelAiRetries();
-    if (k === 'queue') { returnToQueue(); return; }
+    if (k === 'queue') { purgeFailedPreviews(); returnToQueue(); return; }
+    if (k === 'redact') purgeFailedPreviews();
     if (completedKeys.has(k)) setActiveStep(k);
   };
 
@@ -794,7 +803,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           if (!isActive()) throw e;
           // A hard request deadline means the daemon or response path is wedged.
           // Retrying immediately would only double the bounded wait.
-          if (e instanceof ApiError && e.status === 408) break;
+          if (e instanceof ApiError && [408, 409, 422].includes(e.status)) break;
           if (attempt < REDACTION_RETRIES) {
             // brief pause to let a flaky CLI/model settle before retrying
             await new Promise((r) => setTimeout(r, 800));
@@ -804,11 +813,16 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       throw lastErr;
     };
 
+    const completedReports: Record<string, RedactedSessionData> = {};
+
     const processOne = async (s: ReadySession) => {
       try {
         if (!isActive()) return;
         const report = await fetchReport(s.session_id);
         if (!isActive()) return;
+        if (!report.review_snapshot_id || !report.reviewed_revision) {
+          throw new Error('The saved preview is missing. Return to Redact to refresh this trace.');
+        }
         const msgs: RedactedReviewMessage[] = (report.redacted_session.messages || []).map((m) => ({
           role: m.role,
           content: m.content || '',
@@ -830,16 +844,18 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         // would discard its report, pinning the trace at `loading` with
         // nothing left to fetch it again. The abort signal is scoped to this
         // run, so it still rejects writes from a superseded one.
+        const completed: RedactedSessionData = {
+          messages: msgs, loading: false,
+          reviewSnapshotId: report.review_snapshot_id,
+          reviewedRevision: report.reviewed_revision,
+          redactionCount: report.redaction_count,
+          aiPiiFindings: report.ai_pii_findings || [],
+          aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
+          buckets, trufflehogHits,
+        };
+        completedReports[s.session_id] = completed;
         setRedactedSessions((prev) => (run.controller.signal.aborted ? prev : {
-          ...prev,
-          [s.session_id]: {
-            messages: msgs, loading: false,
-            redactionCount: report.redaction_count,
-            aiPiiFindings: report.ai_pii_findings || [],
-            aiCoverage: report.ai_coverage || (aiPiiEnabled ? 'rules_only' : 'disabled'),
-            buckets,
-            trufflehogHits,
-          },
+          ...prev, [s.session_id]: completed,
         }));
       } catch (error) {
         // A browser deadline is a queue-level stop condition. Let the outer
@@ -850,7 +866,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         setRedactedSessions((prev) => (run.controller.signal.aborted ? prev : {
           ...prev,
           [s.session_id]: {
-            messages: [{ role: 'system', content: '(unable to load redacted content)' }],
+            messages: [{ role: 'system', content: error instanceof Error ? error.message : 'Redaction preview failed. Return to Redact to retry.' }],
+            previewError: error instanceof Error ? error.message : 'Redaction preview failed.',
             loading: false,
             redactionCount: 0,
             aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
@@ -869,10 +886,11 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     } catch (error) {
       if (error instanceof ApiError && error.status === 408 && isActive()) {
         setRedactedSessions((prev) => settlePendingRedactionEntries(
-          prev,
+          { ...prev, ...completedReports },
           missing.map((session) => session.session_id),
           {
             messages: [{ role: 'system', content: '(redaction preview timed out)' }],
+            previewError: 'Redaction preview timed out. Return to Redact to retry.',
             loading: false,
             redactionCount: 0,
             aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
@@ -925,11 +943,14 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setApprovedIds((previous) => new Set(
       queuedSessions
         .filter((s) => (
-          previous.has(s.session_id)
+          !!redactedSessions[s.session_id]?.reviewSnapshotId
+          && !!redactedSessions[s.session_id]?.reviewedRevision
+          && !redactedSessions[s.session_id]?.previewError
+          && (previous.has(s.session_id)
           || (
             !manuallyExcludedIds.has(s.session_id)
             && classify(redactedSessions[s.session_id]) === 'clear'
-          )
+          ))
         ))
         .map((s) => s.session_id),
     ));
@@ -942,6 +963,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   // =================================================
 
   const approveTrace = (id: string) => {
+    const preview = redactedSessions[id];
+    if (!preview?.reviewSnapshotId || !preview.reviewedRevision || preview.previewError || preview.loading) return;
     setApprovedIds((prev) => new Set([...prev, id]));
     setManuallyExcludedIds((prev) => {
       if (!prev.has(id)) return prev;
@@ -978,6 +1001,13 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   const retryAiReview = async (id: string) => {
     const run = beginRedactionRetry(redactionRetryRef.current, id);
     if (!run) return;
+    // A refreshed preview may contain new messages. Inclusion of the previous
+    // preview must not silently approve the new version.
+    setApprovedIds((previous) => {
+      const next = new Set(previous);
+      next.delete(id);
+      return next;
+    });
     const isActive = () => isRedactionRetryActive(redactionRetryRef.current, id, run);
 
     try {
@@ -1028,6 +1058,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         ...prev,
         [id]: {
           messages: msgs, loading: false,
+          reviewSnapshotId: report.review_snapshot_id,
+          reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,
           aiPiiFindings: report.ai_pii_findings || [],
           aiCoverage: report.ai_coverage || 'rules_only',
@@ -1090,10 +1122,15 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
 
     try {
       const ids = approvedList.map((s) => s.session_id);
+      const reviewSnapshotIds = Object.fromEntries(ids.map((id) => {
+        const preview = redactedSessions[id];
+        if (!preview?.reviewSnapshotId || !preview.reviewedRevision || preview.loading) {
+          throw new Error('A saved review is missing. Return to Redact and refresh the affected trace.');
+        }
+        return [id, preview.reviewSnapshotId];
+      }));
       const expectedRevisions = Object.fromEntries(
-        approvedList
-          .filter((s): s is ReadySession & { revision_hash: string } => Boolean(s.revision_hash))
-          .map((s) => [s.session_id, s.revision_hash]),
+        ids.map((id) => [id, redactedSessions[id].reviewedRevision!]),
       );
       const expectedLogicalRevisions = collectExpectedLogicalRevisions(approvedList);
       const { share_id } = await api.shares.create(
@@ -1102,6 +1139,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         undefined,
         expectedRevisions,
         expectedLogicalRevisions,
+        reviewSnapshotIds,
       );
       setPackageProgress(2);
       setPackageLog('Starting local packaging...');
@@ -1161,7 +1199,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       stopProgressPolling();
       packagingStartedRef.current = false;
     }
-  }, [approvedSessions, note, toast, aiPiiEnabled]);
+  }, [approvedSessions, redactedSessions, note, toast, aiPiiEnabled]);
 
   const installScannersAndRetry = useCallback(async () => {
     if (installingScanners) return;
@@ -1337,6 +1375,13 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         onRemove={removeFromQueue}
         onAdd={addToQueue}
         onClearAll={clearQueue}
+        onReviewsCleared={() => {
+          cancelRedaction();
+          cancelAiRetries();
+          setRedactedSessions({});
+          setApprovedIds(new Set());
+          setPackagedShareId(null);
+        }}
         onAddMany={addManyToQueue}
         onRemoveMany={removeManyFromQueue}
         onReorder={reorderQueue}
@@ -1403,6 +1448,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         onRetryAi={retryAiReview}
         onBack={() => {
           cancelAiRetries();
+          purgeFailedPreviews();
           setActiveStep('redact');
         }}
         onPackage={handleStartPackage}

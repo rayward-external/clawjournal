@@ -33,6 +33,7 @@ _OS_RELEASE_PREFIX_RE = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}")
 
 _OS_FAMILY_ALIASES = {
     "darwin": "macOS",
+    "macos": "macOS",
     "freebsd": "FreeBSD",
     "linux": "Linux",
     "windows": "Windows",

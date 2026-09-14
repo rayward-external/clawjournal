@@ -23,6 +23,7 @@ from collections.abc import Iterable
 from enum import Enum
 from typing import Any
 
+from .prefilter import filter_rules
 from ..findings import RawFinding, hash_entity
 from ..parsing.widened import iter_widened_text_locations
 
@@ -48,6 +49,14 @@ def _normalize_findings_scanner_profile(
         ) from exc
 
 
+_PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
+_PRIVATE_KEY_END = re.compile(r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
+_PRIVATE_KEY_PATTERN = re.compile(
+    _PRIVATE_KEY_BEGIN.pattern + r"[\s\S]*?" + _PRIVATE_KEY_END.pattern
+)
+_SECRET_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+
 # Ordered from most specific to least specific
 SECRET_PATTERNS = [
     # JWT tokens — full 3-segment form
@@ -70,6 +79,9 @@ SECRET_PATTERNS = [
 
     # GitHub tokens
     ("github_token", re.compile(r"(?:ghp|gho|ghs|ghr)_[A-Za-z0-9]{30,}")),
+    # Fine-grained PATs have a separate prefix. Never retain the head of an
+    # oversized credential just because it also resembles an email local part.
+    ("github_token", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
 
     # PyPI tokens
     ("pypi_token", re.compile(r"pypi-[A-Za-z0-9_-]{50,}")),
@@ -121,11 +133,7 @@ SECRET_PATTERNS = [
     )),
 
     # Private keys
-    ("private_key", re.compile(
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-        r"[\s\S]*?"
-        r"-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-    )),
+    ("private_key", _PRIVATE_KEY_PATTERN),
 
     # CLI flags that pass tokens/secrets: --token VALUE, --access-token VALUE, etc.
     ("cli_token_flag", re.compile(
@@ -195,7 +203,7 @@ SECRET_PATTERNS = [
     )),
 
     # Email addresses (for PII removal) — require at least 2-char local part
-    ("email", re.compile(r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    ("email", _SECRET_EMAIL_PATTERN),
 
     # Long base64-like strings in quotes (checked for entropy — see scan_text)
     ("high_entropy", re.compile(r"""['"][A-Za-z0-9_/+=.-]{40,}['"]""")),
@@ -206,6 +214,7 @@ SECRET_PATTERNS = [
 # Medium (0.70-0.89): structural patterns, worth reviewing.
 # Low (<0.70): heuristic/PII, may be false positives.
 CONFIDENCE: dict[str, float] = {
+    "url_userinfo": 0.94,
     "jwt": 0.98, "private_key": 0.98,
     "anthropic_key": 0.98, "openai_key": 0.98,
     "github_token": 0.98, "hf_token": 0.98,
@@ -224,6 +233,8 @@ CONFIDENCE: dict[str, float] = {
 # Typed placeholders per secret type — preserves what kind of secret was
 # removed so model-training data retains task structure.
 SECRET_PLACEHOLDER: dict[str, str] = {
+    "url_userinfo": "[REDACTED_CREDENTIAL]",
+    "private_url": "[REDACTED_URL]",
     "jwt": "[REDACTED_JWT]",
     "jwt_partial": "[REDACTED_JWT]",
     "db_url": "[REDACTED_DB_URL]",
@@ -250,6 +261,10 @@ SECRET_PLACEHOLDER: dict[str, str] = {
     "email": "[REDACTED_EMAIL]",
     "high_entropy": "[REDACTED_SECRET]",
 }
+_CREDENTIAL_PLACEHOLDERS = frozenset(
+    placeholder for kind, placeholder in SECRET_PLACEHOLDER.items()
+    if kind not in {"email", "ip_address"}
+)
 
 TOOL_SERVER_ID_PLACEHOLDER = "[REDACTED_TOOL_SERVER_ID]"
 
@@ -447,6 +462,61 @@ def _ip_looks_like_version(text: str, match: "re.Match[str]") -> bool:
     return False
 
 
+def _secret_continuation_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    if pattern.pattern == r"\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b" and pattern.flags == re.UNICODE:
+        chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-")
+        cursor = consumed = 0
+        boundary = re.compile(r"\b")
+        while (at := text.find("@", cursor)) != -1:
+            start = at
+            while start > consumed and text[start - 1] in chars:
+                start -= 1
+            # Unlike PII's email rule this expression starts at a word
+            # boundary, which can occur inside the maximal local-part run.
+            while start < at and boundary.match(text, start) is None:
+                start += 1
+            match = pattern.match(text, start) if at - start >= 2 else None
+            if match is not None:
+                yield match
+                consumed = match.end()
+            cursor = max(at + 1, consumed)
+        return
+    if pattern != _PRIVATE_KEY_PATTERN:
+        yield from pattern.finditer(text)
+        return
+    cursor = 0
+    while begin := _PRIVATE_KEY_BEGIN.search(text, cursor):
+        end = _PRIVATE_KEY_END.search(text, begin.end())
+        if end is None:
+            # No later BEGIN can succeed either. Do not retry the whole tail.
+            return
+        # Preserve the old rule: earliest BEGIN through the first eligible END.
+        # Nested BEGINs do not reset the start; header/footer types need not
+        # agree. Tightening either condition would lose previously redacted text.
+        match = pattern.match(text, begin.start(), end.end())
+        if match is not None:
+            yield match
+        cursor = end.end()
+
+
+def _secret_matches(pattern: re.Pattern[str], text: str) -> Iterable[re.Match[str]]:
+    # Email and private-key adapters retain complete original-text matches.
+    # No child interpreter is required by deterministic scanning.
+    yield from _secret_continuation_matches(pattern, text)
+
+
+# Transport usernames, not a list of trusted credential destinations. A
+# password (including an encoded colon) never matches one of these literals.
+_URL_TRANSPORT_USERS = frozenset({'git', 'oauth2', 'x-access-token', 'anonymous',
+                                 'user', 'u', 'ci', 'noreply'})
+
+
+def _global_url_credential(value: str) -> bool:
+    """Only credential-shaped userinfo may replace copies outside URLs."""
+    return (len(value) >= 20 or ':' in value or '@' in value or '%' in value
+            or any(c.isdigit() for c in value))
+
+
 def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]:
     if not text or len(text) < _MIN_SCAN_LENGTH:
         return []
@@ -454,14 +524,45 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     # Fast-reject: skip the expensive assignment-style patterns when the
     # text has no separator character.
     has_assignment_sep = "=" in text or ":" in text
+    from .code_context import code_context
+    context = code_context(text)
 
+    from .candidate_formats import credentialed_urls, email_in_url_userinfo
+    url_spans = list(credentialed_urls(text))
     findings = []
-    for name, pattern in SECRET_PATTERNS:
+    for start, end, _authority_end in url_spans:
+        host = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]*').match(text, end + 1, _authority_end)
+        if host and re.search(r'\.(?:local|internal|corp|lan|intranet|localnet)$', host.group(), re.I):
+            # Retain private-host coverage on secrets-only export paths too,
+            # independently of userinfo and its explicitly ignored findings.
+            if not _check_user_allowlist(host.group(), 'private_url', user_allowlist):
+                findings.append({'type': 'private_url', 'start': host.start(), 'end': host.end(),
+                                 'match': host.group(), 'confidence': .9})
+        value = text[start:end]
+        # Email/IP false-positive exceptions say nothing about credentials.
+        # Classify only userinfo; github.com/localhost/app.* cannot authorize it.
+        if value in _URL_TRANSPORT_USERS:
+            continue
+        if value not in _CREDENTIAL_PLACEHOLDERS and not _check_user_allowlist(value, "url_userinfo", user_allowlist):
+            findings.append({"type": "url_userinfo", "start": start, "end": end,
+                             "match": value, "confidence": 0.94})
+    for name, pattern in filter_rules(text, SECRET_PATTERNS):
         if not has_assignment_sep and name in _ASSIGNMENT_PATTERNS:
             continue
 
-        for match in pattern.finditer(text):
+        for match in _secret_matches(pattern, text):
             matched_text = match.group(0)
+            if name in {"env_secret", "generic_secret"} and match.group(1) in set(SECRET_PLACEHOLDER.values()) | {REDACTED}:
+                continue
+            if name == "email" and context.protects(match.start(), match.end()):
+                continue
+            if name == 'email' and email_in_url_userinfo(match.start(), match.end(), url_spans):
+                # Userinfo has its own finding. Do not mistake its separator
+                # for an email @ and consume an unrelated public hostname.
+                # The PII scanner still handles private hosts independently.
+                continue
+            if name in {"env_secret", "generic_secret"} and context.is_reference(match.start(1), match.start(1) + 1):
+                continue
 
             if any(allow_pat.search(matched_text) for allow_pat in ALLOWLIST):
                 continue
@@ -485,24 +586,47 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
             if name == "ip_address" and _ip_looks_like_version(text, match):
                 continue
 
-            findings.append({
+            finding = {
                 "type": name,
                 "start": match.start(),
                 "end": match.end(),
                 "match": matched_text,
                 "confidence": CONFIDENCE.get(name, 0.5),
-            })
+            }
+            if name in {"env_secret", "generic_secret"}:
+                # Keep the full match/hash for existing review decisions.
+                # Like Gitleaks' secretGroup, replace only the value.
+                finding["replacement_start"] = match.start(1)
+                finding["replacement_end"] = match.end(1)
+            elif name == "high_entropy":
+                finding["replacement_start"] = match.start() + 1
+                finding["replacement_end"] = match.end() - 1
+            findings.append(finding)
 
     return findings
 
 
 def redact_text(
     text: str, user_allowlist: list[dict] | None = None,
+    *, strict: bool = False,
 ) -> tuple[str, int, list[dict]]:
-    """Redact secrets from text. Returns (redacted_text, count, redaction_log)."""
+    """Redact local display text without rejecting a project during ingest.
+
+    Export callers must request ``strict=True`` or run the complete share
+    preflight. A local display replacement is not a clean export verdict.
+    Returns (redacted_text, count, redaction_log).
+    """
+    return _redact_text(text, user_allowlist=user_allowlist, strict=strict)
+
+
+def _redact_text(text: str, *, user_allowlist: list[dict] | None, strict: bool):
     if not text:
         return text, 0, []
 
+    from .boundaries import ensure_text_boundaries
+
+    if strict:
+        ensure_text_boundaries(text)
     findings = scan_text(text, user_allowlist=user_allowlist)
     if not findings:
         return text, 0, []
@@ -510,11 +634,9 @@ def redact_text(
     # Sort by position (descending start) to replace without shifting indices
     findings.sort(key=lambda f: f["start"], reverse=True)
 
-    # Deduplicate overlapping findings (keep the later-starting match on overlap)
-    deduped = []
-    for f in findings:
-        if not deduped or f["end"] <= deduped[-1]["start"]:
-            deduped.append(f)
+    # Match the session/decision path's longest-span precedence. A quoted
+    # entropy match inside an assignment must not consume its quote marks.
+    deduped = sorted(_dedupe_overlapping_matches(findings), key=lambda f: f["start"], reverse=True)
 
     # Build redaction log (no secret text — only metadata)
     log: list[dict] = []
@@ -524,6 +646,8 @@ def redact_text(
             "confidence": f["confidence"],
             "original_length": len(f["match"]),
         }
+        if f.get("boundary_limited"):
+            entry["boundary_limited"] = True
         # Capture surrounding context for medium/low confidence findings
         if f["confidence"] < 0.90:
             start, end = f["start"], f["end"]
@@ -549,13 +673,13 @@ def redact_text(
             entry["context_after"] = safe_after
         log.append(entry)
 
-    # Replace from end-to-start (deduped is already in descending start order)
-    result = text
-    for f in deduped:
-        placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-        result = result[:f["start"]] + placeholder + result[f["end"]:]
-
-    return result, len(deduped), log
+    from .replacements import replace_spans, coalesce_replacements
+    spans = coalesce_replacements([
+        (f.get("replacement_start", f["start"]), f.get("replacement_end", f["end"]),
+         SECRET_PLACEHOLDER.get(f["type"], REDACTED)) for f in deduped
+    ])
+    result, count = replace_spans(text, spans)
+    return result, count, log
 
 
 def _blank_high_conf_overlaps(
@@ -655,7 +779,7 @@ def _redact_value(
 ) -> tuple[Any, int, list[dict]]:
     """Recursively redact secrets from a string, list, or dict value."""
     if isinstance(value, str):
-        result, count, log = redact_text(value, user_allowlist=user_allowlist)
+        result, count, log = redact_text(value, user_allowlist=user_allowlist, strict=True)
         if custom_strings:
             result, n = redact_custom_strings(result, custom_strings)
             count += n
@@ -740,21 +864,33 @@ def _build_redaction_set(
     texts: list[tuple[str, str, int | None, str | None]],
     user_allowlist: list[dict] | None = None,
     custom_strings: list[str] | None = None,
+    *, strict: bool = False,
 ) -> tuple[dict[str, str], list[dict]]:
     """Scan all text at once to build a global map of secret strings to typed placeholders.
 
     Returns (secret_map, redaction_log) where secret_map maps each secret
     string to its typed replacement (e.g. ``"sk-ant-xxx" -> "[REDACTED_ANTHROPIC_KEY]"``).
     """
-    secret_map: dict[str, str] = {}
+    from .replacements import ReplacementMap
+
+    secret_map = ReplacementMap()
     all_log: list[dict] = []
 
+    from .boundaries import ensure_text_boundaries
+
     for text, field, msg_idx, _tool_field in texts:
+        if strict:
+            ensure_text_boundaries(text)
         findings = scan_text(text, user_allowlist=user_allowlist)
-        for f in findings:
+        for f in _dedupe_overlapping_matches(findings):
             matched = f["match"]
             placeholder = SECRET_PLACEHOLDER.get(f["type"], REDACTED)
-            secret_map.setdefault(matched, placeholder)
+            if f['type'] == 'url_userinfo' and not _global_url_credential(matched):
+                secret_map.url_userinfo[matched] = placeholder
+            elif "replacement_start" in f:
+                secret_map.add(text[f["replacement_start"]:f["replacement_end"]], placeholder)
+            else:
+                secret_map.add(matched, placeholder)
 
             # For patterns with capture groups (env_secret, generic_secret,
             # cli_token_flag, aws_secret, url_token), also add the group
@@ -762,7 +898,7 @@ def _build_redaction_set(
                 if _name == f["type"]:
                     m = pattern.search(text[f["start"]:f["end"]])
                     if m and m.lastindex:
-                        secret_map.setdefault(m.group(m.lastindex), placeholder)
+                        secret_map.add(m.group(m.lastindex), placeholder)
                     break
 
             # Build log entry
@@ -792,39 +928,68 @@ def _build_redaction_set(
 
 
 def _apply_redaction_set(text: str, secret_map: dict[str, str]) -> tuple[str, int]:
-    """Replace all known secrets in text using typed placeholders.
+    """Plan all replacements in original coordinates, then mask their union.
 
-    Returns (redacted_text, replacement_count).
-
-    Short secrets (< 20 chars) that look like plain words use word-boundary
-    matching to avoid false positives (e.g. "Kai" matching inside "Kaizen").
-    Long secrets and those containing special characters use plain str.replace
-    since they are unique enough to match safely.
+    A longer partial overlap must not destroy the evidence needed to replace
+    a neighbouring credential. Code evidence is computed once per field.
     """
     if not text or not secret_map:
         return text, 0
+    from .replacements import (ReplacementMap, coalesce_replacements, email_replacement_spans,
+                               replace_spans, secret_value_spans)
+    from .code_context import code_context, outside_code_spans
+    from .candidate_formats import iter_partial_email_candidates, credentialed_urls
 
-    count = 0
-    # Sort by length descending so longer matches replace first
+    context = None
+    urls = None
+    lowered = text.lower()
+    spans = []
+    host_patterns = []
     for secret in sorted(secret_map, key=len, reverse=True):
         replacement = secret_map[secret]
-        # Short alphanumeric strings need boundaries to avoid matching
-        # inside unrelated words (e.g. custom redact_strings like "Kai").
-        # ASCII-only lookarounds rather than `\b`, which treats CJK
-        # neighbours as word characters and silently skips the match.
-        if len(secret) < 20 and secret.isalnum():
+        host_case = replacement == "[REDACTED_URL]" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", secret)
+        short_word = len(secret) < 20 and secret.isalnum()
+        insensitive = bool(host_case or short_word)
+        if (secret.lower() not in lowered) if insensitive else (secret not in text):
+            continue
+        if replacement in {"[REDACTED_ENV_SECRET]", "[REDACTED_SECRET]"}:
+            spans.extend(secret_value_spans(text, secret, replacement))
+        elif replacement in {"[REDACTED_EMAIL]", "[REDACTED_URL]"}:
+            if context is None:
+                context = code_context(text)
+            if replacement == "[REDACTED_EMAIL]":
+                spans.extend(email_replacement_spans(text, secret, replacement, context=context))
+            else:
+                pattern = re.compile(re.escape(secret), re.I if host_case else 0)
+                spans.extend(outside_code_spans(text, pattern, replacement, context=context))
+                host_patterns.append(pattern)
+        else:
             pattern = re.compile(
-                rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])",
-                re.IGNORECASE,
+                rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])" if short_word else re.escape(secret),
+                re.I if short_word else 0,
             )
-            text, n = pattern.subn(replacement, text)
-            count += n
-        elif secret in text:
-            n = text.count(secret)
-            text = text.replace(secret, replacement)
-            count += n
-
-    return text, count
+            spans.extend((m.start(), m.end(), replacement) for m in pattern.finditer(text))
+    if isinstance(secret_map, ReplacementMap) and secret_map.email_fragments:
+        fragments = secret_map.email_fragments
+        spans.extend((m['start'], m['end'], fragments[m['match']])
+                     for m in iter_partial_email_candidates(text) if m['match'] in fragments)
+    if isinstance(secret_map, ReplacementMap) and secret_map.url_userinfo:
+        if urls is None:
+            urls = list(credentialed_urls(text))
+        spans.extend((start, end, secret_map.url_userinfo[text[start:end]])
+                     for start, end, _ in urls if text[start:end] in secret_map.url_userinfo)
+    edits = coalesce_replacements(spans)
+    result, count = replace_spans(text, edits, context=context)
+    # A removed credential/custom prefix can expose a known hostname that
+    # was not independently detectable in the original field. Recheck only
+    # those known hosts, using rebased evidence, after the atomic first pass.
+    if any(replacement != "[REDACTED_URL]" for _start, _end, replacement in edits):
+        exposed = []
+        for pattern in host_patterns:
+            exposed.extend(outside_code_spans(result, pattern, "[REDACTED_URL]", context=context))
+        result, extra = replace_spans(result, coalesce_replacements(exposed), context=context)
+        count += extra
+    return result, count
 
 
 def _apply_to_value(value: Any, secret_map: dict[str, str]) -> tuple[Any, int]:
@@ -892,6 +1057,7 @@ def redact_session(
     session: dict, custom_strings: list[str] | None = None,
     user_allowlist: list[dict] | None = None,
     max_passes: int = 3,
+    *, strict: bool = False,
 ) -> tuple[dict, int, list[dict]]:
     """Redact all secrets in a session dict using scan-mark-replace strategy.
 
@@ -914,7 +1080,7 @@ def redact_session(
 
         # Step 2: Scan to build global redaction map (secret -> typed placeholder)
         secret_map, log = _build_redaction_set(
-            texts, user_allowlist=user_allowlist,
+            texts, user_allowlist=user_allowlist, strict=strict,
             custom_strings=custom_strings if pass_num == 0 else None,  # custom strings only on first pass
         )
         secret_map.update(_collect_infrastructure_secret_map(session))
@@ -1046,7 +1212,9 @@ def _dedupe_overlapping_matches(matches: list[dict]) -> list[dict]:
     kept: list[dict] = []
     for candidate in ordered:
         overlaps = any(
-            candidate["start"] < existing["end"] and candidate["end"] > existing["start"]
+            existing.get("replacement_start", existing["start"]) <= candidate.get("replacement_start", candidate["start"])
+            and existing.get("replacement_end", existing["end"]) >= candidate.get("replacement_end", candidate["end"])
+            and not (existing['type'] == 'email' and candidate['type'] != 'email')
             for existing in kept
         )
         if not overlaps:
@@ -1096,12 +1264,13 @@ def _secret_map_from_text_decisions(
     """Build a replace-map for one text value, skipping ignored hashes.
 
     `decisions` maps `entity_hash → status`; `scan_text` findings whose
-    hash lands in `ignored` are dropped. Capture-group-style patterns
-    (env_secret, etc.) keep their inner-group expansion so byte-
-    equivalent output to `_build_redaction_set` is preserved when all
-    statuses are open/accepted.
+    hash lands in `ignored` are dropped. Assignments and quoted entropy
+    findings map only their values; the full match still owns the review
+    hash. Other capture-group rules keep their existing inner expansion.
     """
-    secret_map: dict[str, str] = {}
+    from .replacements import ReplacementMap
+
+    secret_map = ReplacementMap()
     raw_matches = scan_text(text, user_allowlist=user_allowlist)
     # Same dedupe the scan path uses — keeps entity-level decisions
     # coherent: if a user ignored the longer match, the overlapping
@@ -1113,12 +1282,17 @@ def _secret_map_from_text_decisions(
         if status == "ignored":
             continue
         placeholder = SECRET_PLACEHOLDER.get(finding["type"], REDACTED)
-        secret_map.setdefault(matched, placeholder)
+        if finding['type'] == 'url_userinfo' and not _global_url_credential(matched):
+            secret_map.url_userinfo[matched] = placeholder
+        elif "replacement_start" in finding:
+            secret_map.add(text[finding["replacement_start"]:finding["replacement_end"]], placeholder)
+        else:
+            secret_map.add(matched, placeholder)
         for _name, pattern in SECRET_PATTERNS:
             if _name == finding["type"]:
                 inner = pattern.search(text[finding["start"]:finding["end"]])
                 if inner and inner.lastindex:
-                    secret_map.setdefault(inner.group(inner.lastindex), placeholder)
+                    secret_map.add(inner.group(inner.lastindex), placeholder)
                 break
     return secret_map
 
@@ -1145,6 +1319,14 @@ def apply_findings_to_blob(
     """
     scanner_profile = _normalize_findings_scanner_profile(scanner_profile)
 
+    from .boundaries import ensure_text_boundaries
+
+    # Check all exportable string values before any mutation or external scan.
+    for text, *_location in _collect_all_text(blob):
+        ensure_text_boundaries(text)
+    for text in _iter_ai_text_strings(blob):
+        ensure_text_boundaries(text)
+
     # Decisions are engine-agnostic at the apply step — same hash, same
     # answer. The pipeline guarantees that hashes are unique per
     # (session, entity), so collapsing to a single dict is safe.
@@ -1157,6 +1339,7 @@ def apply_findings_to_blob(
     # Lazy import to avoid pii.py → secrets.py import cycle.
     from .betterleaks import betterleaks_secret_map_from_blob
     from .pii import pii_secret_map_from_text_decisions
+    from .replacements import ReplacementMap
 
     # Betterleaks is the broad local detector. The Share path deliberately
     # defers live credential verification to the mandatory merged-artifact
@@ -1173,7 +1356,7 @@ def apply_findings_to_blob(
     total = 0
     for pass_num in range(max_passes):
         # Build a global replace map from every text location's current state.
-        secret_map: dict[str, str] = {}
+        secret_map = ReplacementMap()
         for text, _f, _m, _tf, _wk, _wkey in _iter_text_locations(blob):
             secret_map.update(
                 _secret_map_from_text_decisions(text, decisions, user_allowlist)

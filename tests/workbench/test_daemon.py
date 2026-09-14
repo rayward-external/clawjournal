@@ -2014,6 +2014,23 @@ class TestSessionsAPI:
         status, detail = _get(server, "/api/sessions/sess-0")
         assert detail["review_status"] == "approved"
 
+    def test_redaction_preview_rejects_an_oversized_ai_finding_before_snapshot(self, server, monkeypatch):
+        value = 'Xy' * 60
+        conn = open_index()
+        upsert_sessions(conn, [{'session_id': 'ai-boundary-review', 'project': 'test-project',
+            'source': 'codex', 'messages': [{'role': 'user', 'content': value}], 'stats': {}}])
+        conn.close()
+        monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent',
+            lambda *a, **kw: [{'session_id': 'ai-boundary-review', 'entity_type': 'email',
+                              'entity_text': value, 'source': 'ai', 'confidence': .99}])
+        status, data = _get(server, '/api/sessions/ai-boundary-review/redaction-report?ai_pii=1')
+        assert status == 422
+        assert data['block_reason'] == 'redaction_boundary'
+        assert 'review_snapshot_id' not in data
+        conn = open_index()
+        assert conn.execute("SELECT COUNT(*) FROM share_review_snapshots WHERE session_id = 'ai-boundary-review'").fetchone()[0] == 0
+        conn.close()
+
     def test_bulk_route_does_not_shadow_a_session_id(self, server):
         conn = open_index()
         try:
@@ -8377,3 +8394,92 @@ class TestShareAPI:
             sessions_content = archive.read("sessions.jsonl").decode("utf-8")
 
         assert "MySecretName" not in sessions_content
+
+
+def test_share_api_packages_the_previewed_revision_after_a_later_update(server, monkeypatch):
+    """The browser's explicit inclusion is bound to its server-saved preview."""
+    from clawjournal.workbench import index
+
+    monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+    original = {
+        "session_id": "review-snapshot-api", "project": "test-project", "source": "codex",
+        "messages": [{"role": "user", "content": "Already uploaded original"}],
+        "stats": {"user_messages": 1},
+    }
+    conn = open_index()
+    try:
+        upsert_sessions(conn, [original])
+        first = index.create_share(conn, [original["session_id"]])
+        conn.execute("UPDATE shares SET shared_at = '2026-09-01', status = 'shared' WHERE share_id = ?", (first,))
+        conn.commit()
+        reviewed = {**original, "messages": [{"role": "user", "content": "The reviewed update"}]}
+        upsert_sessions(conn, [reviewed])
+        status, report = _get(server, "/api/sessions/review-snapshot-api/redaction-report")
+        assert status == 200
+        assert report["review_snapshot_id"]
+        assert report["reviewed_revision"] == index.compute_content_revision(reviewed)
+        upsert_sessions(conn, [{**original, "messages": [{"role": "user", "content": "New content stays local"}]}])
+        # Requests without the saved preview retain the existing revision gate.
+        assert _post(server, "/api/shares", {"session_ids": [original["session_id"]]})[0] == 409
+        status, share = _post(server, "/api/shares", {
+            "session_ids": [original["session_id"]],
+            "expected_revisions": {original["session_id"]: report["reviewed_revision"]},
+            "review_snapshot_ids": {original["session_id"]: report["review_snapshot_id"]},
+        })
+        assert status == 201, share
+        output, manifest = index.export_share_to_disk(conn, share["share_id"], index.get_share(conn, share["share_id"]))
+        assert not manifest.get("blocked")
+        content = (output / "sessions.jsonl").read_text()
+        assert "The reviewed update" in content
+        assert "New content stays local" not in content
+        assert not index.share_revision_blockers(conn, share["share_id"])
+    finally:
+        conn.close()
+
+
+def test_review_cache_can_be_cleared_from_share_ui_with_explicit_confirmation(server):
+    from clawjournal.workbench import index
+    from clawjournal.workbench.review_snapshots import save_review_snapshot
+    with open_index() as conn:
+        upsert_sessions(conn, [{'session_id':'cache-ui', 'source':'codex', 'project':'synthetic',
+                               'messages':[{'role':'user', 'content':'Synthetic original trace'}]}])
+        snapshot = save_review_snapshot(conn, index.get_session_detail(conn, 'cache-ui'))
+        share_id = index.create_share(conn, ['cache-ui'], review_snapshot_ids={'cache-ui':snapshot})
+    assert _post(server, '/api/share-review-cache/clear', {})[0] == 400
+    with open_index() as conn:
+        assert not index.share_revision_blockers(conn, share_id)
+    assert _post(server, '/api/share-review-cache/clear', {'confirm_invalidate_pending_reviews':True})[0] == 200
+    with open_index() as conn:
+        assert index.share_revision_blockers(conn, share_id)
+        assert conn.execute("SELECT SUM(length(payload)) FROM share_review_snapshots").fetchone()[0] == 0
+        assert index.get_session_detail(conn, 'cache-ui')['messages'][0]['content'] == 'Synthetic original trace'
+
+
+@pytest.mark.parametrize('endpoint', ['redacted', 'redaction-report'])
+def test_boundary_review_returns_actionable_error_and_custom_redaction_can_resolve_it(server, endpoint):
+    value = 'a' * 70 + '@audit.test'
+    with open_index() as conn:
+        upsert_sessions(conn, [{
+            'session_id': 'boundary-review', 'source': 'claude', 'project': 'synthetic',
+            'messages': [{'role': 'user', 'content': 'Review this trace', 'tool_uses': []},
+                         {'role': 'assistant', 'content': 'Contact ' + value, 'tool_uses': []}],
+        }])
+        set_hold_state(conn, 'boundary-review', 'pending_review', changed_by='test', reason='Synthetic boundary')
+    path = f'/api/sessions/boundary-review/{endpoint}'
+    status, body = _get(server, path)
+    assert status == 422
+    assert body['block_reason'] == 'redaction_boundary'
+    assert body['rule'] == 'email'
+    assert value not in json.dumps(body)
+    assert 'review_snapshot_id' not in body
+    with open_index() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM share_review_snapshots WHERE session_id = 'boundary-review'").fetchone()[0] == 0
+    # Existing custom redaction is an actual recovery path, not Release and
+    # repeat the same failing scan. No production upload occurs in this test.
+    status, _ = _post(server, '/api/policies', {'policy_type': 'redact_string', 'value': value})
+    assert status == 201
+    status, body = _get(server, path)
+    assert status == 200
+    result = body['redacted_session'] if endpoint == 'redaction-report' else body
+    assert value not in json.dumps(result)
+    assert '[REDACTED' in json.dumps(result)

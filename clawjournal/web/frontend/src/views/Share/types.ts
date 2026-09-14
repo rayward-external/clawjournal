@@ -148,6 +148,9 @@ export interface AiPiiFindingLocal {
 
 export interface RedactedSessionData {
   messages: RedactedReviewMessage[];
+  reviewSnapshotId?: string;
+  reviewedRevision?: string;
+  previewError?: string;
   loading: boolean;
   redactionCount?: number;
   aiPiiFindings?: AiPiiFindingLocal[];
