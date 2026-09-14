@@ -10,8 +10,34 @@ import json
 import sqlite3
 from typing import Any
 
-MAX_UNLINKED_SNAPSHOTS = 100
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
+
+
+def sealed_jsonl_payload(artifact_path: str | None, artifact_sha256: str | None) -> bytes | None:
+    """Read only JSONL from a bounded ZIP matching the durable auto-upload seal."""
+    import hashlib
+    import io
+    import zipfile
+    import zlib
+    from pathlib import Path
+    if not artifact_path or not artifact_sha256:
+        return None
+    try:
+        with Path(artifact_path).open('rb') as handle:
+            data = handle.read(MAX_SNAPSHOT_BYTES + 1)
+        if len(data) > MAX_SNAPSHOT_BYTES or hashlib.sha256(data).hexdigest() != artifact_sha256:
+            return None
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            if archive.namelist().count('sessions.jsonl') != 1:
+                return None
+            info = archive.getinfo('sessions.jsonl')
+            if info.file_size > MAX_SNAPSHOT_BYTES:
+                return None
+            with archive.open(info) as handle:
+                payload = handle.read(MAX_SNAPSHOT_BYTES + 1)
+            return payload if len(payload) <= MAX_SNAPSHOT_BYTES else None
+    except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile, RuntimeError, zlib.error):
+        return None
 
 
 def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: str | None):
@@ -26,7 +52,7 @@ def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: s
     import tempfile
     from .index import CONFIG_DIR
 
-    row = conn.execute('SELECT shared_at, bundle_hash, manifest FROM shares WHERE share_id = ?', (share_id,)).fetchone()
+    row = conn.execute('SELECT shared_at, bundle_hash, manifest, submission_channel, sealed_artifact_path, sealed_artifact_sha256 FROM shares WHERE share_id = ?', (share_id,)).fetchone()
     if row is None or not row['shared_at']:
         return None
     directory = Path(output_path).resolve() if output_path else CONFIG_DIR / 'shares' / share_id / 'local-copy'
@@ -37,6 +63,11 @@ def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: s
         if not isinstance(manifest, dict):
             raise ValueError('invalid manifest')
         expected = str(row['bundle_hash'] or '')
+        sealed_payload = None
+        if row['submission_channel'] == 'auto_weekly':
+            sealed_payload = sealed_jsonl_payload(row['sealed_artifact_path'], row['sealed_artifact_sha256'])
+            if sealed_payload is not None and not expected:
+                expected = hashlib.sha256(sealed_payload).hexdigest()
         if len(expected) != 64:
             raise ValueError('missing receipt hash')
         sources = [CONFIG_DIR / 'shares' / share_id / 'sessions.jsonl']
@@ -52,6 +83,8 @@ def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: s
             if len(candidate) <= MAX_SNAPSHOT_BYTES and hashlib.sha256(candidate).hexdigest() == expected:
                 payload = candidate
                 break
+        if payload is None and sealed_payload is not None and hashlib.sha256(sealed_payload).hexdigest() == expected:
+            payload = sealed_payload
         if payload is None:
             raise ValueError('missing or changed archived JSONL')
         manifest = {**manifest, 'export_path': str(directory), 'local_copy_only': True}
@@ -84,7 +117,7 @@ def review_identity(detail: dict[str, Any]) -> str:
 
 def prune_review_snapshots(conn: sqlite3.Connection, *, reserve_bytes: int = 0,
                            keep_snapshot_ids: set[str] | None = None) -> None:
-    """Bound raw preview storage without changing in-flight share inputs.
+    """Release completed payloads without invalidating issued preview IDs.
 
     Keep links as tombstones after success: an old share must never silently
     fall back to a newer live blob. No approval expires just because time passes.
@@ -97,20 +130,8 @@ def prune_review_snapshots(conn: sqlite3.Connection, *, reserve_bytes: int = 0,
             SELECT 1 FROM share_snapshot_links l JOIN shares s ON s.share_id = l.share_id
             WHERE l.snapshot_id = share_review_snapshots.snapshot_id AND s.shared_at IS NULL
         )""")
-    rows = conn.execute("""SELECT r.snapshot_id, length(CAST(r.payload AS BLOB)) AS size
-        FROM share_review_snapshots r WHERE NOT EXISTS (
-            SELECT 1 FROM share_snapshot_links l WHERE l.snapshot_id = r.snapshot_id
-        ) ORDER BY r.created_at, r.rowid""").fetchall()
-    total = conn.execute("SELECT COALESCE(SUM(length(CAST(payload AS BLOB))), 0) FROM share_review_snapshots").fetchone()[0]
-    remaining = len(rows)
-    for row in rows:
-        if remaining <= MAX_UNLINKED_SNAPSHOTS and total + reserve_bytes <= MAX_SNAPSHOT_BYTES:
-            break
-        if row['snapshot_id'] in (keep_snapshot_ids or ()):
-            continue
-        conn.execute("DELETE FROM share_review_snapshots WHERE snapshot_id = ?", (row['snapshot_id'],))
-        total -= row['size']
-        remaining -= 1
+    # Successful preview IDs remain valid until explicit cleanup or completion.
+    # save_review_snapshot rejects new input before the byte budget is exceeded.
 
 
 def clear_review_cache(conn: sqlite3.Connection, *, include_linked: bool = False) -> None:
@@ -171,22 +192,16 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
     size = len(payload.encode('utf-8'))
     if size > MAX_SNAPSHOT_BYTES:
         raise ReviewSnapshotError("This trace exceeds the review cache limit. Select a smaller trace.")
-    # Replace abandoned revisions for this trace, but never inputs linked to a
-    # pending share. A second tab using the old preview must refresh explicitly.
-    conn.execute("""DELETE FROM share_review_snapshots
-        WHERE session_id = ? AND snapshot_id != ? AND NOT EXISTS (
-            SELECT 1 FROM share_snapshot_links l WHERE l.snapshot_id = share_review_snapshots.snapshot_id
-        )""", (detail['session_id'], snapshot_id))
     exists = conn.execute("SELECT 1 FROM share_review_snapshots WHERE snapshot_id = ? AND payload != ''", (snapshot_id,)).fetchone()
     keep = (keep_snapshot_ids or set()) | {snapshot_id}
     prune_review_snapshots(conn, reserve_bytes=0 if exists else size, keep_snapshot_ids=keep_snapshot_ids)
-    # Pruning can remove an existing unused copy after a cache-limit change.
-    # Recheck before reserving space; never return an immediately evicted ID.
+    # Completion cleanup can clear a previously saved payload. Reserve its
+    # bytes again if the user explicitly previews that input after completion.
     exists = conn.execute("SELECT 1 FROM share_review_snapshots WHERE snapshot_id = ? AND payload != ''", (snapshot_id,)).fetchone()
     total = conn.execute("SELECT COALESCE(SUM(length(CAST(payload AS BLOB))), 0) FROM share_review_snapshots").fetchone()[0]
     if total + (0 if exists else size) > MAX_SNAPSHOT_BYTES:
         conn.commit()
-        raise ReviewSnapshotError("The review cache is full. Finish pending shares, or go to Share > Queue > Clear saved reviews (CLI: clawjournal review-cache --clear --all), then refresh previews. Clearing saved reviews invalidates unsubmitted reviews.")
+        raise ReviewSnapshotError("The review cache is full. Existing previews are preserved. Finish pending shares, or go to Share > Queue > Clear saved reviews (CLI: clawjournal review-cache --clear --all). Clearing saved reviews invalidates unsubmitted reviews.")
     conn.execute(
         "INSERT OR IGNORE INTO share_review_snapshots (snapshot_id, session_id, content_revision, payload, created_at) VALUES (?, ?, ?, ?, ?)",
         (snapshot_id, detail["session_id"], revision, payload, _now_iso()),

@@ -8657,6 +8657,7 @@ def export_share_to_disk(
     )
     prepared: list[tuple[dict[str, Any], dict[str, Any], str, str | None]] = []
     skipped_session_ids: list[str] = []
+    boundary_skips: list[dict[str, str]] = []
     preflight_blockers: list[dict[str, Any]] = []
     for selected in selected_sessions:
         session_id = selected["session_id"]
@@ -8695,14 +8696,17 @@ def export_share_to_disk(
     try:
         with open(tmp_sessions_file, "w") as f:
             for selected, detail, revision_hash, replaces_revision_hash in prepared:
-                detail, n_redacted, redaction_log = apply_share_redactions(
-                    conn,
-                    detail,
-                    custom_strings=custom_strings,
-                    user_allowlist=allowlist_entries,
-                    extra_usernames=extra_usernames,
-                    blocked_domains=blocked_domains,
-                )
+                try:
+                    detail, n_redacted, redaction_log = apply_share_redactions(
+                        conn, detail, custom_strings=custom_strings,
+                        user_allowlist=allowlist_entries, extra_usernames=extra_usernames,
+                        blocked_domains=blocked_domains,
+                    )
+                except RedactionBoundaryError as exc:
+                    skipped_session_ids.append(selected['session_id'])
+                    boundary_skips.append({'session_id': selected['session_id'],
+                                           'reason': 'redaction_boundary', 'rule': exc.rule})
+                    continue
                 total_redactions += n_redacted
                 for entry in redaction_log:
                     rtype = entry.get("type", "unknown")
@@ -8731,14 +8735,15 @@ def export_share_to_disk(
                         conn, selected["session_id"],
                     ),
                 })
+        if boundary_skips:
+            manifest['skipped_sessions'] = boundary_skips
+            if not manifest['sessions']:
+                tmp_sessions_file.unlink(missing_ok=True)
+                manifest.update(blocked=True, block_reason='redaction_boundary', session_count=0,
+                    block_message='No trace could be safely exported. See blocked_sessions.',
+                    blocked_sessions=boundary_skips)
+                return export_dir, manifest
         os.replace(tmp_sessions_file, sessions_file)
-    except RedactionBoundaryError as exc:
-        tmp_sessions_file.unlink(missing_ok=True)
-        manifest["blocked"] = True
-        manifest["block_reason"] = "redaction_boundary"
-        manifest["block_message"] = str(exc)
-        manifest["blocked_sessions"] = [{"session_id": selected["session_id"], "reason": "redaction_boundary"}]
-        return export_dir, manifest
     except BaseException:
         tmp_sessions_file.unlink(missing_ok=True)
         raise
@@ -8803,6 +8808,7 @@ def export_share_to_disk(
     # mutation until all scanners complete so an exception leaves no open
     # partial selection change.
     for session_id in skipped_session_ids:
+        conn.execute("DELETE FROM share_snapshot_links WHERE share_id = ? AND session_id = ?", (share_id, session_id))
         conn.execute(
             "DELETE FROM share_sessions WHERE share_id = ? AND session_id = ?",
             (share_id, session_id),

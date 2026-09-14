@@ -714,7 +714,9 @@ def _build_records(conn, settings, chosen, ai_pii):
             snapshot_id = save_review_snapshot(conn, detail,
                 keep_snapshot_ids={rec['review_snapshot_id'] for rec in recs})
         except (ReviewSnapshotError, RedactionBoundaryError) as exc:
-            die(str(exc))
+            session_id = _CONTROL_CHARS_RE.sub('', str(r['session_id']))
+            print(f"Skipped trace {session_id}: {exc}", file=sys.stderr)
+            continue
         rec["row"] = {**r, "revision_hash": detail["content_revision"]}
         rec["review_snapshot_id"] = snapshot_id
         recs.append(rec)
@@ -732,6 +734,8 @@ def step_redact(conn, settings, chosen, assume_yes, ai_pii_requested) -> tuple[l
               f"(enable with --ai-pii-review).{RST}")
 
     scrubbed = _build_records(conn, settings, chosen, ai_pii_requested)
+    if not scrubbed:
+        die("No trace could be safely previewed. See the skipped session IDs above.")
     package_ai, uniform = effective_ai_pii(scrubbed, ai_pii_requested)
 
     # Keep preview == shipped: if AI was requested but couldn't run everywhere,

@@ -3694,6 +3694,10 @@ def _commit_receipt(
     accepted_at = receipt.get("accepted_at") or receipt.get("shared_at")
     shared_at = str(accepted_at) if _parse_time(accepted_at) else _iso(_now())
     checkpoint_at = _iso(_now())
+    from .workbench.review_snapshots import sealed_jsonl_payload
+    sealed = conn.execute('SELECT sealed_artifact_path, sealed_artifact_sha256 FROM shares WHERE share_id = ?', (share_id,)).fetchone()
+    payload = sealed_jsonl_payload(sealed['sealed_artifact_path'], sealed['sealed_artifact_sha256']) if sealed else None
+    bundle_hash = hashlib.sha256(payload).hexdigest() if payload is not None else None
     conn.execute("BEGIN IMMEDIATE")
     try:
         share = conn.execute(
@@ -3708,11 +3712,12 @@ def _commit_receipt(
         if share["submission_state"] in {"sealed", "submitting"}:
             conn.execute(
                 "UPDATE shares SET status = 'shared', shared_at = ?, hosted_receipt_id = ?, "
-                "hosted_status = ?, submission_state = 'accepted' WHERE share_id = ?",
+                "hosted_status = ?, bundle_hash = COALESCE(bundle_hash, ?), submission_state = 'accepted' WHERE share_id = ?",
                 (
                     shared_at,
                     receipt_id,
                     str(receipt.get("status") or "accepted"),
+                    bundle_hash,
                     share_id,
                 ),
             )
@@ -4829,14 +4834,8 @@ def _run_cycle_impl(
                     maximum_bundle_size=int(capabilities["maximum_bundle_size"]),
                     boundary_blocked=boundary_blocked,
                 )
-                # Persist content deferrals in the existing review queue.
-                # Fresh status/preview reports then exclude these sessions;
-                # a discarded local counter cannot stop endless reselection.
-                for session_id in boundary_blocked:
-                    set_hold_state(
-                        conn, session_id, "pending_review", changed_by="auto_upload",
-                        reason="Automatic share redaction boundary requires review",
-                    )
+                # A boundary refusal defers this cycle. It must not overwrite
+                # a user's release or hide the trace permanently from later scans.
                 report["deferred_by_cap"] = max(
                     0, len(report["eligible"]) - len(selected) - len(boundary_blocked)
                     - missing_candidates - deferred_by_size,
@@ -4851,8 +4850,8 @@ def _run_cycle_impl(
                         )
                         return {
                             "ok": False, "code": "review_attention", "count": len(boundary_blocked),
-                            "message": "Selected traces were moved to pending review because a redaction boundary is unclear.",
-                            "retryable": False, "deferred_by_redaction": len(boundary_blocked),
+                            "message": "Traces with unclear redaction boundaries remain local; hold states are unchanged. Review their redactions before retrying.",
+                            "retryable": False, "deferred_by_redaction": len(boundary_blocked), "deferred_session_ids": boundary_blocked,
                         }
                     if deferred_by_size:
                         # Candidates existed but none fit the hosted size budget
@@ -4910,6 +4909,17 @@ def _run_cycle_impl(
                     )
                     share_id = packaged.get("share_id")
                     if packaged.get("ok"):
+                        # A partial manual export may omit only explicitly
+                        # reported boundary failures. Narrow every later binding.
+                        omitted = packaged.get('manifest', {}).get('skipped_sessions', [])
+                        omitted_ids = {item.get('session_id') for item in omitted
+                                       if item.get('reason') == 'redaction_boundary'}
+                        if omitted_ids and len(omitted_ids) == len(omitted) and omitted_ids <= set(expected_revisions):
+                            boundary_blocked.extend(sorted(omitted_ids))
+                            selected = [item for item in selected if str(item['session_id']) not in omitted_ids]
+                            session_ids = [str(item['session_id']) for item in selected]
+                            expected_revisions = {key: value for key, value in expected_revisions.items() if key in session_ids}
+                            fingerprints = {key: value for key, value in fingerprints.items() if key in session_ids}
                         break
                     blocked = packaged.get("blocked_sessions") or []
                     mapped_ids: list[str] = []
@@ -4927,6 +4937,9 @@ def _run_cycle_impl(
                         # manual CLI's remove-and-retry loop) instead of
                         # waiting for the next scheduled run.
                         for session_id in sorted(set(mapped_ids)):
+                            if block_reason == 'redaction_boundary':
+                                boundary_blocked.append(session_id)
+                                continue
                             set_hold_state(
                                 conn,
                                 session_id,
@@ -4973,7 +4986,7 @@ def _run_cycle_impl(
                         return {
                             "ok": False,
                             "code": "review_attention",
-                            "message": "Selected revisions were moved to pending review.",
+                            "message": "Selected revisions could not be included. Boundary failures remain local without changing hold states; scanner findings require review.",
                             "retryable": True,
                             "count": len(review_moved),
                         }
@@ -4998,6 +5011,8 @@ def _run_cycle_impl(
                             ),
                             retryable=True,
                         )
+                    if block_reason == 'redaction_boundary':
+                        raise AutoUploadError('redaction_boundary', 'Redaction boundaries require review; no hold states were changed.', retryable=True)
                     if block_reason in ("trufflehog-findings", "secret-scan-findings") or blocked:
                         # Findings that cannot be mapped to individual traces:
                         # park the whole batch for human review and keep the
@@ -5146,6 +5161,7 @@ def _run_cycle_impl(
                     "artifact_sha256": artifact_hash,
                     "deferred_by_size": deferred_by_size,
                     "deferred_by_redaction": len(boundary_blocked),
+                    "deferred_session_ids": boundary_blocked,
                 }
             except ControlChanged as exc:
                 # A control change voids this cycle. Most causes (pause,

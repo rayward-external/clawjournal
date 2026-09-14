@@ -1796,9 +1796,15 @@ def _run_bundle_export(args) -> None:
         if manifest.get("blocked"):
             print(f"Share blocked: {manifest.get('block_reason', 'unknown')}")
             print(manifest.get("block_message", ""))
-            print(f"Report: {export_dir}/secret-scan.json")
+            for blocked in manifest.get('blocked_sessions', []):
+                print(f"Blocked trace {blocked['session_id']}: {blocked.get('reason', 'review required')}")
+            report_path = export_dir / 'secret-scan.json'
+            if report_path.is_file():
+                print(f"Report: {report_path}")
             sys.exit(2)
 
+        for skipped in manifest.get('skipped_sessions', []):
+            print(f"Skipped trace {skipped['session_id']}: {skipped['reason']}", file=sys.stderr)
         session_count = len(manifest.get("sessions", []))
         files = ["sessions.jsonl", "manifest.json", "trufflehog.json", "secret-scan.json"]
         zip_path = None
@@ -1840,6 +1846,7 @@ def _run_bundle_export(args) -> None:
                 "export_path": str(export_dir),
                 "session_count": session_count,
                 "files": files,
+                "skipped_sessions": manifest.get('skipped_sessions', []),
                 "redaction_summary": manifest.get("redaction_summary", {}),
             }
             if zip_path:
