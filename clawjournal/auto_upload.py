@@ -4930,6 +4930,10 @@ def _run_cycle_impl(
                         if candidate_id in expected_revisions:
                             mapped_ids.append(str(candidate_id))
                     block_reason = packaged.get("block_reason")
+                    # The final PII pass uses the hyphenated legacy reason;
+                    # both stages must defer boundaries without revoking release.
+                    if block_reason == "redaction-boundary":
+                        block_reason = "redaction_boundary"
                     if mapped_ids and len(mapped_ids) == len(blocked):
                         # Block/review-tier findings mapped cleanly to their
                         # traces: only those go to review. The clean remainder
