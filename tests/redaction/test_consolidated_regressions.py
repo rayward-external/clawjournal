@@ -125,7 +125,7 @@ def test_many_url_credentials_do_not_exempt_neighbouring_real_emails():
     text = 'before@audit.test\n' + '\n'.join(urls) + '\nafter@audit.test'
     result = secrets.redact_text(text, strict=True)[0]
     assert result == '[REDACTED_EMAIL]\n' + '\n'.join(
-        'https://[REDACTED_CREDENTIAL]@git.audit.test/repo' for _ in urls
+        'https://[REDACTED_CREDENTIAL]@[REDACTED_URL]/repo' for _ in urls
     ) + '\n[REDACTED_EMAIL]'
 
 

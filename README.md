@@ -160,11 +160,16 @@ If you are unsure at any point, stop before **Submit**. Your review and package 
 
 - **One long agent conversation still makes progress.** Claude Code and Codex logs are read incrementally and split only at complete assistant-turn checkpoints after bounded limits are reached. Closed checkpoints can become eligible while you keep using the same conversation; the current unfinished tail stays local.
 
-Saved Share previews use a bounded local cache. In Share, select **Clear saved reviews**
-to free this storage; unsubmitted packages will need new reviews. From the terminal,
-run `clawjournal review-cache --clear` to remove unused previews, or add `--all`
-to also discard inputs for pending shares. Original traces and downloaded ZIP files
-stay available. Clearing this cache sends nothing.
+A trace with an unclear redaction boundary stays local. Other selected traces
+can still be packaged. Exports record skipped session IDs in the manifest;
+terminal commands also report skipped traces. The upload gates still scan every
+exported trace.
+
+Saved Share previews use a bounded local cache. New previews do not evict
+previously reviewed queues. If the 128 MiB cache is full, finish pending shares
+or explicitly clear saved reviews. In Share, select **Clear saved reviews**, or
+run `clawjournal review-cache --clear` to remove unused previews. Add `--all`
+to also invalidate pending saved reviews.
 
 For the complete details, see [PRIVACY.md](PRIVACY.md).
 

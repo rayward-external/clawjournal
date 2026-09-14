@@ -39,7 +39,7 @@ from typing import Any, TypedDict
 
 from .paths import ensure_hash_salt
 
-ENGINE_VERSION = 8  # Rebuild URL credentials independently of email exceptions.
+ENGINE_VERSION = 9  # Rebuild independent URL host and credential coverage.
 SESSION_SETTLE_SECONDS = 120
 REVISION_FORMAT = "v1"
 

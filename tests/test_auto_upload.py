@@ -1912,7 +1912,7 @@ def test_ranked_size_prefix_boundary_deferrals_do_not_use_the_five_slots(isolate
     conn.close()
 
 
-def test_all_ambiguous_candidates_park_before_ai_or_upload(isolated_auto_upload, monkeypatch):
+def test_all_ambiguous_candidates_defer_without_overwriting_release(isolated_auto_upload, monkeypatch):
     import copy
 
     config = _save_scope_config()
@@ -1947,16 +1947,17 @@ def test_all_ambiguous_candidates_park_before_ai_or_upload(isolated_auto_upload,
         assert enrollment["mode"] == "enabled"
         assert enrollment["health"] == "ready"
         assert enrollment["next_retry_at"] is None
-        assert conn.execute("SELECT hold_state FROM sessions WHERE session_id = 'session-one'").fetchone()[0] == "pending_review"
+        assert conn.execute("SELECT hold_state FROM sessions WHERE session_id = 'session-one'").fetchone()[0] == "released"
         fresh = auto._candidate_report(conn, enrollment)
-        assert fresh["selected"] == []
-        assert fresh["exclusion_counts"]["held_or_embargoed"] == 1
+        assert [row["session_id"] for row in fresh["selected"]] == ["session-one"]
+        assert fresh["exclusion_counts"]["held_or_embargoed"] == 0
         assert conn.execute("SELECT COUNT(*) FROM shares").fetchone()[0] == 0
     finally:
         conn.close()
-    # A second cycle cannot reselect the deterministic failure indefinitely.
+    # Later cycles still enforce redaction, without revoking the user release.
     second = auto.run_cycle(force=True)
-    assert second["code"] == "nothing_new"
+    assert second["code"] == "review_attention"
+    assert second["deferred_session_ids"] == ["session-one"]
 
 
 def test_sizing_infrastructure_failure_retries_without_parking_content(isolated_auto_upload, monkeypatch):
@@ -5785,15 +5786,17 @@ def test_runner_rejects_append_between_strict_parse_and_initial_fingerprint(
         conn.close()
 
 
+@pytest.mark.parametrize('block_reason', ['secret-scan-findings', 'redaction_boundary', 'redaction-boundary'])
 def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
     isolated_auto_upload,
     monkeypatch,
+    block_reason,
 ):
     # A blocking finding with no safe line mapping used to raise a
     # durable non-retryable `unmappable_findings` — stalling every
     # future cycle while the sessions stayed candidates and re-failed
-    # forever. Now the whole batch is parked in pending_review (a human
-    # un-sticks it) and the runner stays healthy.
+    # forever. Secret findings still require review; unmapped boundary
+    # failures instead retry without changing the existing release.
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"])
@@ -5820,7 +5823,7 @@ def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
             "ok": False,
             "share_id": share_id,
             "error": "The secret scan found a finding without a safe line mapping.",
-            "block_reason": "secret-scan-findings",
+            "block_reason": block_reason,
             "blocked_sessions": [],
         }
 
@@ -5834,9 +5837,12 @@ def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
 
     result = auto.run_cycle(force=True)
 
-    assert result["code"] == "review_attention"
+    is_secret = block_reason == "secret-scan-findings"
+    expected_code = "review_attention" if is_secret else "redaction_boundary"
+    assert result["code"] == expected_code
     assert result["retryable"] is True
-    assert result["count"] == len(set(parked_ids))
+    if is_secret:
+        assert result["count"] == len(set(parked_ids))
     assert post_calls == []
     conn = open_index()
     try:
@@ -5845,14 +5851,14 @@ def test_unmappable_finding_parks_batch_for_review_instead_of_stalling(
         # No durable stall: the runner stays healthy and later cycles
         # proceed with other candidates.
         assert enrollment["health"] != "action_required"
-        assert enrollment["last_result_code"] == "review_attention"
-        # Every batch session left candidacy via pending_review.
+        assert enrollment["last_result_code"] == expected_code
+        # Only scanner findings change the hold; boundary errors do not.
         for session_id in set(parked_ids):
             row = conn.execute(
                 "SELECT hold_state FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            assert row["hold_state"] == "pending_review"
+            assert row["hold_state"] == ("pending_review" if is_secret else "released")
         assert conn.execute("SELECT 1 FROM shares").fetchone() is None
     finally:
         conn.close()
@@ -5865,9 +5871,9 @@ def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
     block_reason,
 ):
     # Two candidates; the first packaging attempt maps a blocking
-    # finding to session-one only. The runner parks that one trace and
-    # repackages the survivor in the SAME cycle (bounded to one retry —
-    # a second blocked attempt parks the rest and returns).
+    # finding to session-one only. The runner repackages the survivor in
+    # the same cycle, bounded to one retry. Only secret findings park
+    # content; repeated boundary failures preserve both releases.
     config = _save_scope_config()
     conn = open_index()
     _seed_released_session(conn, isolated_auto_upload["root"], "session-one")
@@ -5925,16 +5931,18 @@ def test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle(
                 "SELECT hold_state FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            assert row["hold_state"] == "pending_review"
+            assert row["hold_state"] == ("pending_review" if block_reason == "secret-scan-findings" else "released")
         enrollment = get_auto_upload_enrollment(conn)
         assert enrollment["health"] != "action_required"
     finally:
         conn.close()
 
 
+@pytest.mark.parametrize('failure_kind', ['secret-scan-findings', 'redaction_boundary', 'final-pii-boundary', 'partial-export'])
 def test_mapped_finding_retry_ships_survivors_with_narrowed_scope(
     isolated_auto_upload,
     monkeypatch,
+    failure_kind,
 ):
     # The headline tiered path end-to-end: attempt 1 maps a blocking
     # finding to session-one only, the retry packages just session-two,
@@ -5971,14 +5979,39 @@ def test_mapped_finding_retry_ships_survivors_with_narrowed_scope(
             session_ids,
             expected_revisions=kwargs["expected_revisions"],
         )
-        if len(package_calls) == 1:
+        if len(package_calls) == 1 and failure_kind != 'partial-export':
+            if failure_kind == 'final-pii-boundary':
+                from clawjournal.workbench import daemon
+                from clawjournal.redaction.boundaries import RedactionBoundaryError
+                export_dir = isolated_auto_upload['install'] / 'shares' / share_id
+                export_dir.mkdir(parents=True)
+                (export_dir / 'sessions.jsonl').write_text('{}\n')
+
+                def ambiguous_pii(*args, **kwargs):
+                    error = RedactionBoundaryError('email_extended')
+                    error.session_id = 'session-one'
+                    raise error
+
+                # Use the real producer of the final-stage error, so the
+                # consumer test cannot invent a different reason spelling.
+                with monkeypatch.context() as patch:
+                    patch.setattr(daemon, '_apply_upload_pii_redactions', ambiguous_pii)
+                    error, _ = daemon.finalize_share_export_for_upload(
+                        export_dir, {'session_count': len(session_ids)}, conn=conn,
+                    )
+                assert error is not None
+                return {**error, 'ok': False, 'share_id': share_id}
             return {
                 "ok": False,
                 "share_id": share_id,
                 "error": "A blocking finding mapped to one trace.",
-                "block_reason": "secret-scan-findings",
+                "block_reason": failure_kind,
                 "blocked_sessions": [{"session_id": "session-one"}],
             }
+        if failure_kind == 'partial-export':
+            conn.execute("DELETE FROM share_sessions WHERE share_id=? AND session_id='session-one'", (share_id,))
+            conn.execute("UPDATE sessions SET share_id=NULL WHERE session_id='session-one' AND share_id=?", (share_id,))
+            conn.commit()
         # The sealed-zip writer only accepts paths inside the guarded
         # share area (CONFIG_DIR/shares), like the real export.
         export_dir = (
@@ -6003,7 +6036,9 @@ def test_mapped_finding_retry_ships_survivors_with_narrowed_scope(
             "ok": True,
             "share_id": share_id,
             "export_dir": str(export_dir),
-            "manifest": {"session_count": len(session_ids)},
+            "manifest": {"session_count": 1, "skipped_sessions": ([
+                {"session_id": "session-one", "reason": "redaction_boundary"}
+            ] if failure_kind == 'partial-export' else [])},
             "blocked_sessions": [],
         }
 
@@ -6025,8 +6060,9 @@ def test_mapped_finding_retry_ships_survivors_with_narrowed_scope(
     assert result["ok"] is True
     assert result["code"] == "uploaded"
     assert result["count"] == 1
-    # Exactly two packaging attempts: full batch, then the survivor.
-    assert package_calls == [["session-one", "session-two"], ["session-two"]]
+    assert result['deferred_session_ids'] == ([] if failure_kind == 'secret-scan-findings' else ['session-one'])
+    # A partial export needs one pass; a blocked package retries the survivor.
+    assert package_calls == ([["session-one", "session-two"]] if failure_kind == "partial-export" else [["session-one", "session-two"], ["session-two"]])
     assert len(submissions) == 1
     submitted = submissions[0]
     # The submission carries the narrowed scope, not attempt 1's.
@@ -6041,7 +6077,7 @@ def test_mapped_finding_retry_ships_survivors_with_narrowed_scope(
                 "SELECT session_id, hold_state FROM sessions"
             ).fetchall()
         }
-        assert holds["session-one"] == "pending_review"
+        assert holds["session-one"] == ("pending_review" if failure_kind == "secret-scan-findings" else "released")
         assert holds["session-two"] == "released"
         share = conn.execute(
             "SELECT status, sealed_raw_fingerprints, sealed_artifact_sha256 "

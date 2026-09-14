@@ -531,11 +531,15 @@ class _BundleRedactor:
                 continue
             by_wb.setdefault(wb_id, []).append(piece_id)
 
+        from clawjournal.redaction.boundaries import RedactionBoundaryError
         for wb_id, piece_ids in by_wb.items():
-            if wb_id is None:
-                self._finalize_group_without_workbench(piece_ids)
-            else:
-                self._finalize_group_for_workbench(wb_id, piece_ids)
+            try:
+                if wb_id is None:
+                    self._finalize_group_without_workbench(piece_ids)
+                else:
+                    self._finalize_group_for_workbench(wb_id, piece_ids)
+            except RedactionBoundaryError as exc:
+                raise ExportGateBlocked(2, f"Export blocked for session {wb_id or 'without workbench record'}: {exc}") from exc
         self._pending.clear()
 
     def get(self, piece_id: Any) -> str | None:

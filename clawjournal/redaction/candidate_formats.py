@@ -155,9 +155,20 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
             elif rooted:
                 start += prefix.rfind('/') + 1
             else:
-                assignment = re.match(r'(?:[A-Z][A-Z0-9_]*|email|mail|recipient|owner)=', prefix)
-                if assignment:
+                assignment = re.match(r'[A-Za-z_][A-Za-z0-9_]*=', prefix)
+                query = re.search(r'[?&][A-Za-z_][A-Za-z0-9_.-]*=', prefix)
+                long_prefix = len(prefix.encode('utf-8', errors='surrogatepass')) > 64
+                if long_prefix and query and '?' in prefix and '&' in prefix:
+                    start += prefix.rfind('=') + 1
+                elif assignment and (long_prefix or re.fullmatch(r'(?:[A-Z][A-Z0-9_]*|email|mail|recipient|owner)=', assignment.group())
+                                     or '/' in prefix[assignment.end():]):
                     start += assignment.end()
+                # A relative path requires multiple path components or a
+                # suffix/assignment hint; sales/support@example remains valid.
+                path_prefix = text[start:at]
+                if ('/' in path_prefix and ((long_prefix and path_prefix.count('/') >= 2)
+                        or (assignment and start > at - len(prefix)) or path_prefix.startswith(('.', '~')))):
+                    start += path_prefix.rfind('/') + 1
         if start == at:
             continue
         domain = _DOMAIN.match(text, at + 1)

@@ -530,22 +530,30 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
     from .candidate_formats import credentialed_urls, email_in_url_userinfo
     url_spans = list(credentialed_urls(text))
     findings = []
+    masked_urls = []
     for start, end, _authority_end in url_spans:
         host = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]*').match(text, end + 1, _authority_end)
-        if host and re.search(r'\.(?:local|internal|corp|lan|intranet|localnet)$', host.group(), re.I):
-            # Retain private-host coverage on secrets-only export paths too,
-            # independently of userinfo and its explicitly ignored findings.
-            if not _check_user_allowlist(host.group(), 'private_url', user_allowlist):
+        if host:
+            hostname = host.group()
+            private_suffix = re.search(r'\.(?:local|internal|corp|lan|intranet|localnet)$', hostname, re.I)
+            # Keep the old user@host privacy coverage separately from credentials.
+            # Public-host email exceptions never authorize the userinfo itself.
+            private_host = private_suffix or (
+                '.' in hostname and not any(p.search('user@' + hostname) for p in ALLOWLIST)
+            )
+            if private_host and not _check_user_allowlist(hostname, 'private_url', user_allowlist):
                 findings.append({'type': 'private_url', 'start': host.start(), 'end': host.end(),
-                                 'match': host.group(), 'confidence': .9})
+                                 'match': hostname, 'confidence': .9})
         value = text[start:end]
         # Email/IP false-positive exceptions say nothing about credentials.
         # Classify only userinfo; github.com/localhost/app.* cannot authorize it.
         if value in _URL_TRANSPORT_USERS:
+            masked_urls.append((start, end, _authority_end))
             continue
         if value not in _CREDENTIAL_PLACEHOLDERS and not _check_user_allowlist(value, "url_userinfo", user_allowlist):
             findings.append({"type": "url_userinfo", "start": start, "end": end,
                              "match": value, "confidence": 0.94})
+            masked_urls.append((start, end, _authority_end))
     for name, pattern in filter_rules(text, SECRET_PATTERNS):
         if not has_assignment_sep and name in _ASSIGNMENT_PATTERNS:
             continue
@@ -556,7 +564,7 @@ def scan_text(text: str, user_allowlist: list[dict] | None = None) -> list[dict]
                 continue
             if name == "email" and context.protects(match.start(), match.end()):
                 continue
-            if name == 'email' and email_in_url_userinfo(match.start(), match.end(), url_spans):
+            if name == 'email' and email_in_url_userinfo(match.start(), match.end(), masked_urls):
                 # Userinfo has its own finding. Do not mistake its separator
                 # for an email @ and consume an unrelated public hostname.
                 # The PII scanner still handles private hosts independently.

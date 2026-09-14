@@ -222,7 +222,7 @@ def test_upgrade_from_v13_preserves_existing_rows(conn):
         reopened.close()
 
 
-def test_abandoned_revisions_are_replaced_but_linked_inputs_survive(conn):
+def test_issued_revisions_survive_until_explicit_cleanup_or_completion(conn):
     from clawjournal.workbench.review_snapshots import prune_review_snapshots
     index.upsert_sessions(conn, [trace('pinned original')])
     pinned = preview(conn)
@@ -230,7 +230,7 @@ def test_abandoned_revisions_are_replaced_but_linked_inputs_survive(conn):
     for i in range(25):
         index.upsert_sessions(conn, [trace(f'new revision {i}')])
         latest = preview(conn)
-    assert conn.execute('SELECT COUNT(*) FROM share_review_snapshots').fetchone()[0] == 2
+    assert conn.execute('SELECT COUNT(*) FROM share_review_snapshots').fetchone()[0] == 26
     assert load_review_snapshot(conn, pinned, 'test-trace')['messages'][0]['content'] == 'pinned original'
     assert load_review_snapshot(conn, latest, 'test-trace')['messages'][0]['content'] == 'new revision 24'
     conn.execute("UPDATE shares SET shared_at = '2026-09-12', status = 'shared' WHERE share_id = ?", (share_id,))
@@ -243,12 +243,11 @@ def test_abandoned_revisions_are_replaced_but_linked_inputs_survive(conn):
 
 def test_cache_limits_and_explicit_clear_keep_pending_links_safe(conn, monkeypatch):
     from clawjournal.workbench import review_snapshots as cache
-    monkeypatch.setattr(cache, 'MAX_UNLINKED_SNAPSHOTS', 2)
     for i in range(4):
         sid = f'synthetic-{i}'
         index.upsert_sessions(conn, [trace('raw credential example', sid)])
         preview(conn, sid)
-    assert conn.execute('SELECT COUNT(*) FROM share_review_snapshots').fetchone()[0] == 2
+    assert conn.execute('SELECT COUNT(*) FROM share_review_snapshots').fetchone()[0] == 4
     index.upsert_sessions(conn, [trace('pinned')])
     pinned = preview(conn)
     share_id = create(conn, pinned)
@@ -277,7 +276,7 @@ def test_snapshot_cannot_reshare_an_older_successful_revision(conn):
         create(conn, snapshot)
 
 
-def test_cache_reserves_space_again_after_evicting_an_existing_preview(conn, monkeypatch):
+def test_lowered_cache_limit_rejects_new_writes_but_keeps_existing_previews(conn, monkeypatch):
     from clawjournal.workbench import review_snapshots as cache
     index.upsert_sessions(conn, [trace('pinned')])
     pinned = preview(conn)
@@ -289,8 +288,7 @@ def test_cache_reserves_space_again_after_evicting_an_existing_preview(conn, mon
     with pytest.raises(ReviewSnapshotError, match='cache is full'):
         preview(conn, 'other')
     assert load_review_snapshot(conn, pinned, 'test-trace')
-    with pytest.raises(ReviewSnapshotError):
-        load_review_snapshot(conn, unused, 'other')
+    assert load_review_snapshot(conn, unused, 'other')
 
 
 def test_engine_change_flags_stored_blobs_without_repeated_backfill(conn, monkeypatch):
@@ -360,7 +358,6 @@ def test_cleared_snapshot_recovery_never_authorizes_different_inputs(conn, chang
 def test_active_cli_selection_cannot_evict_its_own_earlier_previews(conn, monkeypatch):
     from clawjournal import share_cli
     from clawjournal.workbench import review_snapshots as cache
-    monkeypatch.setattr(cache, 'MAX_UNLINKED_SNAPSHOTS', 100)
     for engine in ('betterleaks', 'trufflehog'):
         monkeypatch.setattr(f'clawjournal.redaction.{engine}.{engine}_secret_map_from_blob', lambda *a, **kw: {})
     rows = [trace('A synthetic trace', f'selection-{i}') for i in range(101)]

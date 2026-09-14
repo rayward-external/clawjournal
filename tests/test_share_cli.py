@@ -846,8 +846,8 @@ def test_cli_preview_failures_are_clean_and_do_not_save_raw_failed_previews(monk
             raise RedactionBoundaryError('email')
         return {}
     monkeypatch.setattr(share_cli, 'build_redaction_record', build)
-    with pytest.raises(SystemExit) as error:
-        share_cli._build_records(None, {}, [{'session_id': 'synthetic'}], False)
-    assert error.value.code == 1
+    assert share_cli._build_records(None, {}, [{'session_id': 'synthetic'}], False) == []
     assert saved == ([] if failure == 'boundary' else [True])
-    assert 'Traceback' not in capsys.readouterr().err
+    error_text = capsys.readouterr().err
+    assert 'Traceback' not in error_text
+    assert 'Skipped trace synthetic' in error_text

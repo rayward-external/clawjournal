@@ -46,7 +46,8 @@ def test_email_and_ip_exceptions_never_authorize_url_credentials(conn, path):
                          {'type': 'exact', 'text': f'{credential}@{host}'}]
             if path == 'text':
                 result = secrets.redact_text(text, user_allowlist=allowlist, strict=True)[0]
-                assert result == f'connect https://[REDACTED_CREDENTIAL]@{host}/v1 done.'
+                expected_host = '[REDACTED_URL]' if host == 'git.audit.test' else host
+                assert result == f'connect https://[REDACTED_CREDENTIAL]@{expected_host}/v1 done.'
             elif path == 'session':
                 result = secrets.redact_session(trace(text), user_allowlist=allowlist, strict=True)[0]['messages'][0]['content']
             else:
@@ -93,7 +94,7 @@ def test_known_credentials_propagate_but_usernames_do_not(conn, userinfo):
 def test_transport_username_exemption_is_about_the_value_not_the_host(userinfo):
     for host in ('github.com', 'localhost:8080', 'git.audit.test', 'buildbox'):
         text = f'ssh://{userinfo}@{host}/repo; {userinfo} is ordinary text'
-        assert secrets.redact_text(text, strict=True)[0] == text
+        assert secrets.redact_text(text, strict=True)[0] == text.replace('git.audit.test', '[REDACTED_URL]')
         with_password = f'ssh://{userinfo}:hunter2@{host}/repo'
         assert 'hunter2' not in secrets.redact_text(with_password, strict=True)[0]
 

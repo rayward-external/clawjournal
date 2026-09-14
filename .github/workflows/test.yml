@@ -60,7 +60,7 @@ jobs:
           tests/redaction/test_trufflehog_install.py
           -v
       - name: Deterministic redaction (native Windows)
-        run: python -m pytest tests/redaction/test_prefilter.py tests/redaction/test_prefilter_properties.py tests/redaction/test_consolidated_regressions.py tests/redaction/test_review_72317b7.py tests/redaction/test_review_e419ee3.py tests/workbench/test_review_snapshots.py tests/redaction/test_linear_scanning.py tests/redaction/test_code_context_reuse.py tests/redaction/test_ingest_boundary_policy.py tests/redaction/test_scan_entrypoints.py tests/redaction/test_review_regressions.py -v
+        run: python -m pytest tests/redaction/test_prefilter.py tests/redaction/test_prefilter_properties.py tests/redaction/test_consolidated_regressions.py tests/redaction/test_review_72317b7.py tests/redaction/test_review_e419ee3.py tests/workbench/test_review_snapshots.py tests/workbench/test_share_boundary_followup.py tests/test_auto_upload.py::test_unmappable_finding_parks_batch_for_review_instead_of_stalling tests/test_auto_upload.py::test_mapped_findings_park_only_bad_traces_and_retry_batch_same_cycle tests/test_auto_upload.py::test_mapped_finding_retry_ships_survivors_with_narrowed_scope tests/test_auto_upload.py::test_all_ambiguous_candidates_defer_without_overwriting_release tests/redaction/test_linear_scanning.py tests/redaction/test_code_context_reuse.py tests/redaction/test_ingest_boundary_policy.py tests/redaction/test_scan_entrypoints.py tests/redaction/test_review_regressions.py -v
 
   smoke:
     runs-on: ubuntu-latest

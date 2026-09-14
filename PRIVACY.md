@@ -243,13 +243,12 @@ Manual Share saves the input used for each redaction preview in the local index.
 When you include that preview, packaging uses its saved content version even if
 the conversation later grows. Later content stays local for a future share; it
 does not inherit this inclusion. Only successful previews are saved. There is
-no time-based approval expiry. Unlinked previews normally retain the latest
-revision per trace and at most 100 rows. An active CLI selection protects its
-own previews and can exceed that row count; if abandoned, excess rows are
-pruned by the next preview or explicit cache cleanup. A total payload budget
-of 128 MiB applies throughout, including linked previews. Old unused previews can be evicted; affected tabs
-must refresh. Inputs linked to pending shares are preserved. If those inputs
-fill the cache, new previews stop with a clear cache-full message.
+no time-based approval expiry. Successful preview IDs remain available until
+explicit cache cleanup or completed-share cleanup. New previews do not evict
+older queues or earlier revisions. A total payload budget of 128 MiB applies,
+including linked previews. At capacity, a new preview is refused with a clear
+message; existing previews and pending shares remain intact. Large batches may
+need smaller selections or explicit cache cleanup.
 
 After every share referencing an input receives a receipt, its raw snapshot
 payload is cleared. Minimal links remain, so an old share cannot fall back to a
@@ -259,10 +258,17 @@ newer live trace. Index recovery preserves pending snapshot data and links.
 fresh previews for pending shares. These operations remove database payloads;
 they are not a guarantee of forensic removal from backups or filesystem copies.
 For a completed share, local `bundle-export` copies the previously exported
-JSONL only after its SHA-256 matches the recorded receipt hash. Later messages,
+JSONL only after its SHA-256 matches the recorded receipt hash. Recurring shares
+also support recovery from their original sealed ZIP after verifying its saved
+hash; older recurring receipts need no reconstruction from live transcripts. Later messages,
 titles and scores do not enter that copy. Its manifest marks it as a local copy;
 it is not a newly prepared upload package. Missing or changed archived files
 cannot be reconstructed from current traces; use the previously downloaded ZIP.
+A boundary-refused trace is omitted from a mixed manual export and its session
+ID and rule are listed in the manifest. Terminal commands name the skipped
+trace. Healthy traces still pass both scan gates. If every trace is refused, no data file is exported.
+Recurring boundary deferrals do not overwrite hold states; scanner review/block
+findings still require review. A user release never bypasses redaction checks.
 A refreshed preview must be included again. Failed or timed-out previews remain
 excluded while healthy traces can proceed. A boundary failure during optional
 AI review is reported as a blocked trace, not as successful rules-only coverage.
