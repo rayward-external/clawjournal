@@ -40,6 +40,7 @@ export function RedactStep(p: RedactStepProps) {
     const d = p.redactedSessions[s.session_id];
     return d && !d.loading;
   }).length;
+  const failedCount = p.queuedSessions.filter((s) => classify(p.redactedSessions[s.session_id]) === 'blocked').length;
   const overallPct = p.queuedSessions.length === 0 ? 0 : Math.round((doneCount / p.queuedSessions.length) * 100);
   const visibleSessions = p.queuedSessions.slice(0, visibleCount);
   const hiddenCount = p.queuedSessions.length - visibleSessions.length;
@@ -80,8 +81,8 @@ export function RedactStep(p: RedactStepProps) {
         Redacting your traces
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
-        Before anything leaves your device, we strip out secrets and personal identifiers.
-        Watch it happen &mdash; nothing is hidden.
+        Local rules mask known secrets and personal identifiers first. If enabled, AI
+        reviews the remaining text using your configured backend.
       </p>
 
       <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
@@ -96,7 +97,7 @@ export function RedactStep(p: RedactStepProps) {
           </div>
           <div style={{ fontSize: 13, color: colors.gray500 }}>
             {p.aiPiiEnabled
-              ? 'Deterministic + policy rules run on your device. AI review sends the already-redacted text to your configured AI backend.'
+              ? 'Deterministic + policy rules run on your device. Your AI backend checks the remaining text and unclear device names.'
               : 'Deterministic rules \u2192 Policy rules. AI review is off for this bundle.'}
           </div>
         </div>
@@ -139,6 +140,7 @@ export function RedactStep(p: RedactStepProps) {
       {visibleSessions.map((s) => {
         const d = p.redactedSessions[s.session_id];
         const finished = !!d && !d.loading;
+        const failed = finished && classify(d) === 'blocked';
         const flagged = finished && classify(d) === 'review';
         const chips: string[] = [];
         if (finished && d.buckets) {
@@ -157,11 +159,11 @@ export function RedactStep(p: RedactStepProps) {
           }}>
             <div style={{
               width: 22, height: 22, borderRadius: '50%',
-              background: finished ? colors.green100 : colors.gray100,
-              color: finished ? colors.green500 : colors.gray500,
+              background: failed ? colors.yellow100 : finished ? colors.green100 : colors.gray100,
+              color: failed ? colors.yellow700 : finished ? colors.green500 : colors.gray500,
               display: 'grid', placeItems: 'center', flexShrink: 0,
             }}>
-              {finished ? <Icon name="check" size={12} /> : (
+              {finished ? <Icon name={failed ? "alert" : "check"} size={12} /> : (
                 <span style={{
                   display: 'inline-block', width: 12, height: 12, borderRadius: '50%',
                   border: `1.5px solid ${colors.gray400}`, borderTopColor: 'transparent',
@@ -196,13 +198,13 @@ export function RedactStep(p: RedactStepProps) {
                   {c}
                 </span>
               ))}
-              {flagged && (
+              {(failed || flagged) && (
                 <span style={{
                   fontSize: 11, color: colors.yellow700, padding: '2px 7px',
                   background: colors.yellow50, border: `1px solid ${colors.yellow200}`,
                   borderRadius: 10, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
                 }}>
-                  needs review
+                  {failed ? 'preview failed · cannot include' : 'needs review'}
                 </span>
               )}
             </div>
@@ -234,11 +236,13 @@ export function RedactStep(p: RedactStepProps) {
         }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             <div style={{ fontSize: 13, color: colors.gray900 }}>
-              {p.allDone ? 'Redaction complete' : 'Redacting...'}
+              {p.allDone ? (failedCount ? 'Redaction finished with failed previews' : 'Redaction complete') : 'Redacting...'}
             </div>
             <div style={{ fontSize: 11.5, color: colors.gray500, fontVariantNumeric: 'tabular-nums' }}>
               {p.allDone
-                ? (totals.flagged > 0
+                ? (failedCount > 0
+                  ? `${failedCount} failed preview${failedCount === 1 ? '' : 's'} excluded · ${totals.flagged} need review`
+                  : totals.flagged > 0
                   ? `${totals.flagged} item${totals.flagged === 1 ? '' : 's'} need your review next`
                   : 'Everything cleared automatically')
                 : (p.aiPiiEnabled

@@ -712,7 +712,7 @@ export function QueueStep(p: QueueStepProps) {
             <CheckboxRow checked={p.aiPiiEnabled} onChange={p.setAiPiiEnabled}>
               Use AI-assisted PII review for this bundle
               <span style={{ display: 'block', marginTop: 2, color: colors.gray500 }}>
-                Sends already-redacted trace text to your configured AI backend to flag contextual identifiers.
+                Local rules mask known sensitive data first. Your configured AI backend checks remaining text and unclear device names.
               </span>
             </CheckboxRow>
           </div>

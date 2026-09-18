@@ -109,7 +109,7 @@ describe('Reviewed share versions', () => {
     );
     expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
-    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    expect(await screen.findByText(available ? 'Redaction complete' : 'Redaction finished with failed previews')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     expect(await screen.findByText(/Later changes stay local for a future share/)).toBeInTheDocument();
     if (available) {
@@ -121,7 +121,7 @@ describe('Reviewed share versions', () => {
       ));
     } else {
       expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
-      expect(screen.getByText('Optional: inspect 1 excluded trace.')).toBeInTheDocument();
+      expect(screen.getByText('not included · 1 preview failed')).toBeInTheDocument();
       expect(create).not.toHaveBeenCalled();
     }
   });
@@ -897,7 +897,7 @@ describe('Failed saved previews', () => {
     render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
     expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
-    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Package 2 traces' }));
     await waitFor(() => expect(create).toHaveBeenCalled());
@@ -917,7 +917,7 @@ describe('Failed saved previews', () => {
     render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
     expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
-    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
@@ -925,10 +925,63 @@ describe('Failed saved previews', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Add an explicit redaction before sharing.');
     expect(screen.queryByText('Nothing matched the deterministic rules.')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Include in bundle' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Include in bundle' })).toHaveStyle({ opacity: '0.4', cursor: 'not-allowed' });
+    expect(screen.getByText('preview failed · cannot include')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Redact$/ }));
     await waitFor(() => expect(report).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+  });
+});
+
+describe('AI device boundary recovery', () => {
+  it.each([false, true])('requires explicit inclusion after recovery (retry=%s)', async (retry) => {
+    mockInitialLoad(readyStats(1));
+    const recovered = {
+      session_id: 's1', review_snapshot_id: 'recovered-preview', reviewed_revision: 'original-revision',
+      redaction_count: 1, redaction_log: [], ai_pii_findings: [], ai_coverage: 'full',
+      boundary_recovered: true,
+      recovered_fields: [{ label: 'project', text: 'Preserved project prefix [REDACTED_DEVICE_ID]' }],
+      redacted_session: { messages: [{ role: 'user', content: 'Prose [REDACTED_DEVICE_ID] after' }] },
+    } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>;
+    const report = vi.spyOn(api.sessions, 'redactionReport').mockResolvedValue(recovered);
+    if (retry) report.mockRejectedValueOnce(new ApiError(422, 'Unclear boundary.', { ai_recovery_available: true }));
+    render(<MemoryRouter initialEntries={['/share?ai_pii=1']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText(retry ? 'Redaction finished with failed previews' : 'Redaction complete')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
+    fireEvent.click(screen.getByText('Trace s1'));
+    if (retry) {
+      expect(screen.getByRole('button', { name: 'Include in bundle' })).toBeDisabled();
+      fireEvent.click(screen.getByRole('button', { name: 'Retry AI boundary review' }));
+    }
+    expect(await screen.findByText(/AI proposed a device-name boundary/)).toBeInTheDocument();
+    expect(screen.getByText('Preserved project prefix [REDACTED_DEVICE_ID]')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Include in bundle' }));
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+    expect(screen.queryByText(/not included · 1 need review/)).not.toBeInTheDocument();
+    expect(report).toHaveBeenCalledTimes(retry ? 2 : 1);
+  });
+
+  it('does not offer an AI call while the bundle AI toggle is off', async () => {
+    mockInitialLoad(readyStats(1));
+    const report = vi.spyOn(api.sessions, 'redactionReport').mockRejectedValue(
+      new ApiError(422, 'Unclear boundary.', { ai_recovery_available: true }),
+    );
+    render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
+    fireEvent.click(screen.getByText('Trace s1'));
+    expect(screen.getByText(/return to Queue and enable AI privacy review/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry AI boundary review' })).not.toBeInTheDocument();
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report.mock.calls[0][1]?.aiPii).toBe(false);
   });
 });

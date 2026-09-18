@@ -444,9 +444,10 @@ export function parseStep(value: string | null): StepKey {
   return STEPS.some((s) => s.key === value) ? value as StepKey : 'queue';
 }
 
-export function classify(d: RedactedSessionData | undefined): 'checking' | 'clear' | 'review' {
+export function classify(d: RedactedSessionData | undefined): 'checking' | 'clear' | 'review' | 'blocked' {
   if (!d || d.loading) return 'checking';
-  if (d.previewError) return 'review';
+  if (d.previewError) return 'blocked';
+  if (d.boundaryRecovered) return 'review';
   // `disabled` is an explicit user choice: the deterministic redaction and
   // policy passes still completed, so these traces can follow the one-click
   // safe default. `rules_only` means an enabled AI pass was unavailable and

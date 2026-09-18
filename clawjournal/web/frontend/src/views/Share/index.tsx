@@ -846,6 +846,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         // run, so it still rejects writes from a superseded one.
         const completed: RedactedSessionData = {
           messages: msgs, loading: false,
+          boundaryRecovered: report.boundary_recovered,
+          recoveredFields: report.recovered_fields,
           reviewSnapshotId: report.review_snapshot_id,
           reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,
@@ -868,6 +870,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           [s.session_id]: {
             messages: [{ role: 'system', content: error instanceof Error ? error.message : 'Redaction preview failed. Return to Redact to retry.' }],
             previewError: error instanceof Error ? error.message : 'Redaction preview failed.',
+            aiRecoveryAvailable: error instanceof ApiError && error.body?.ai_recovery_available === true,
             loading: false,
             redactionCount: 0,
             aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
@@ -999,6 +1002,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   };
 
   const retryAiReview = async (id: string) => {
+    if (!aiPiiEnabled) return;
     const run = beginRedactionRetry(redactionRetryRef.current, id);
     if (!run) return;
     // A refreshed preview may contain new messages. Inclusion of the previous
@@ -1028,7 +1032,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           break;
         } catch (e) {
           if (!isActive()) return;
-          if (e instanceof ApiError && e.status === 408) break;
+          if (e instanceof ApiError && [408, 409, 422].includes(e.status)) break;
           if (attempt === 0) await new Promise((r) => setTimeout(r, 800));
         }
       }
@@ -1058,6 +1062,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         ...prev,
         [id]: {
           messages: msgs, loading: false,
+          boundaryRecovered: report.boundary_recovered,
+          recoveredFields: report.recovered_fields,
           reviewSnapshotId: report.review_snapshot_id,
           reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,

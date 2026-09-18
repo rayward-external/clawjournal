@@ -586,6 +586,8 @@ export interface AiPiiFinding {
 }
 
 export interface RedactionReport {
+  boundary_recovered?: boolean;
+  recovered_fields?: Array<{ label: string; text: string }>;
   session_id: string;
   review_snapshot_id?: string;
   reviewed_revision?: string;

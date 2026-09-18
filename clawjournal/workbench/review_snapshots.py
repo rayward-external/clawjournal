@@ -179,7 +179,8 @@ def install_cleanup_trigger(conn: sqlite3.Connection) -> None:
 
 
 def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
-                         keep_snapshot_ids: set[str] | None = None) -> str:
+                         keep_snapshot_ids: set[str] | None = None,
+                         boundary_plan: list[dict[str, Any]] | None = None) -> str:
     """Persist a successful preview within a bounded local cache."""
     from .index import _latest_successful_revision, _now_iso, compute_content_revision
 
@@ -187,6 +188,9 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
     if revision != detail.get("content_revision"):
         raise ReviewSnapshotError("The trace changed while loading. Refresh its preview.")
     detail = {**detail, "_review_predecessor": _latest_successful_revision(conn, detail["session_id"])}
+    detail.pop("_review_boundary_plan", None)
+    if boundary_plan:
+        detail["_review_boundary_plan"] = boundary_plan
     payload = json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     snapshot_id = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     size = len(payload.encode('utf-8'))

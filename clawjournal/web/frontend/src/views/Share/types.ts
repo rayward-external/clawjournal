@@ -151,6 +151,9 @@ export interface RedactedSessionData {
   reviewSnapshotId?: string;
   reviewedRevision?: string;
   previewError?: string;
+  aiRecoveryAvailable?: boolean;
+  boundaryRecovered?: boolean;
+  recoveredFields?: Array<{ label: string; text: string }>;
   loading: boolean;
   redactionCount?: number;
   aiPiiFindings?: AiPiiFindingLocal[];

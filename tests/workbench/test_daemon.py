@@ -8483,3 +8483,62 @@ def test_boundary_review_returns_actionable_error_and_custom_redaction_can_resol
     result = body['redacted_session'] if endpoint == 'redaction-report' else body
     assert value not in json.dumps(result)
     assert '[REDACTED' in json.dumps(result)
+
+
+@pytest.mark.parametrize('mode', ['off', 'success', 'unavailable', 'invalid', 'held', 'changed', 'late-hold', 'gate-wrapper', 'scope'])
+def test_device_boundary_recovery_api(server, monkeypatch, mode):
+    """A saved recovered preview needs AI opt-in and current sharing controls."""
+    prefix, hostname = 'ordinaryprose' * 6, 'alex-laptop'
+    content = 'Before ' + prefix + hostname + ' after'
+    conn = open_index()
+    upsert_sessions(conn, [{'session_id': 'boundary-recovery', 'source': 'codex',
+        'project': 'test-project', 'messages': [{'role': 'user', 'content': content}], 'stats': {}}])
+    if mode == 'held':
+        set_hold_state(conn, 'boundary-recovery', 'pending_review', changed_by='user')
+    conn.close()
+    monkeypatch.setattr('clawjournal.redaction.betterleaks.scan_text', lambda text:
+        SimpleNamespace(bypassed=False, binary_missing=False, scan_error=None, findings=[]))
+    if mode == 'scope':
+        monkeypatch.setattr('clawjournal.workbench.daemon.load_config', lambda: {'source': 'claude'})
+    calls = []
+    def review(session, **kwargs):
+        calls.append(session)
+        kwargs['before_agent_call']()
+        assert 0 < kwargs['timeout_seconds'] <= 180
+        if mode == 'gate-wrapper':
+            from clawjournal.redaction.pii import _AgentCallGateError
+            from clawjournal.workbench.review_snapshots import ReviewSnapshotError
+            raise _AgentCallGateError(ReviewSnapshotError('Sharing controls changed.'))
+        if mode == 'unavailable':
+            raise RuntimeError('provider error with private contents')
+        if mode == 'changed' or (mode == 'late-hold' and not kwargs.get('rubric')):
+            current = open_index()
+            set_hold_state(current, 'boundary-recovery', 'pending_review', changed_by='user')
+            current.close()
+            if mode == 'late-hold':
+                raise RuntimeError('private provider output')
+        if not kwargs.get('rubric') or mode == 'invalid':
+            return []
+        return [{'message_index': 0, 'field': 'content', 'entity_type': 'device_id',
+                 'entity_text': hostname, 'confidence': .99}]
+    monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent', review)
+    suffix = '' if mode == 'off' else '?ai_pii=1'
+    status, data = _get(server, '/api/sessions/boundary-recovery/redaction-report' + suffix)
+    if mode == 'success':
+        assert status == 200
+        assert data['boundary_recovered'] is True and data['ai_coverage'] == 'full'
+        assert data['redacted_session']['messages'][0]['content'] == 'Before ' + prefix + '[REDACTED_DEVICE_ID] after'
+        assert data['review_snapshot_id']
+        assert data['recovered_fields'] == [{'label': 'Message 1 / content', 'text': 'Before ' + prefix + '[REDACTED_DEVICE_ID] after'}]
+        assert len(calls) == 2
+    else:
+        assert status == (409 if mode in {'held', 'changed', 'late-hold', 'gate-wrapper', 'scope'} else 422)
+        assert 'review_snapshot_id' not in data
+        assert 'private contents' not in json.dumps(data)
+    if mode in {'off', 'held', 'scope'}:
+        assert not calls
+    conn = open_index()
+    assert conn.execute("SELECT count(*) FROM share_review_snapshots WHERE session_id='boundary-recovery'").fetchone()[0] == (1 if mode == 'success' else 0)
+    assert conn.execute('SELECT count(*) FROM shares').fetchone()[0] == 0
+    assert __import__('clawjournal.workbench.index', fromlist=['get_session_detail']).get_session_detail(conn, 'boundary-recovery')['messages'][0]['content'] == content
+    conn.close()

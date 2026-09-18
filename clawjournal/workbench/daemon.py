@@ -5778,14 +5778,70 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             reviewed_input = copy.deepcopy(detail)
             reviewed_revision = detail["content_revision"]
             settings = get_effective_share_settings(conn, load_config())
-            detail, redaction_count, redaction_log = apply_share_redactions(
-                conn,
-                detail,
+            redaction_kwargs = dict(
                 custom_strings=settings["custom_strings"],
                 user_allowlist=settings["allowlist_entries"],
                 extra_usernames=settings["extra_usernames"],
                 blocked_domains=settings["blocked_domains"],
             )
+            boundary_plan = None
+            recovery_deadline = time.monotonic() + _upload_pii_timeout_seconds()
+
+            def recovery_controls():
+                from .index import release_gate_blockers, session_matches_excluded_projects, source_scope_blockers
+                current = get_session_detail(conn, session_id)
+                if (current is None or not current.get("checkpoint_active")
+                        or current.get("review_status") == "blocked"
+                        or any(current.get(k) != reviewed_input.get(k) for k in
+                               ("source", "project", "content_revision"))
+                        or release_gate_blockers(conn, [session_id])
+                        or source_scope_blockers(conn, [session_id], settings["source_filter"])
+                        or get_effective_share_settings(conn, load_config()) != settings
+                        or session_matches_excluded_projects(current, settings["excluded_projects"])):
+                    raise ReviewSnapshotError("The trace or sharing controls changed. Refresh its preview.")
+
+            def recovery_review(session, **kwargs):
+                from ..redaction.pii import _AgentCallGateError, review_session_pii_with_agent
+                recovery_controls()
+                remaining = int(recovery_deadline - time.monotonic())
+                if remaining <= 0:
+                    raise RedactionBoundaryError("personal_hostname")
+                try:
+                    return review_session_pii_with_agent(
+                        session, ignore_errors=False, backend="auto", timeout_seconds=remaining,
+                        before_agent_call=recovery_controls, **kwargs,
+                    )
+                except _AgentCallGateError as exc:
+                    raise exc.cause from exc
+
+            try:
+                detail, redaction_count, redaction_log = apply_share_redactions(
+                    conn, detail, **redaction_kwargs,
+                )
+            except RedactionBoundaryError as boundary_error:
+                if not ai_pii or boundary_error.rule != "personal_hostname":
+                    raise
+                from ..redaction.anonymizer import Anonymizer
+                from ..redaction.boundary_recovery import propose_boundary_plan
+                from .index import prepare_share_redactions
+                prepared = prepare_share_redactions(conn, copy.deepcopy(reviewed_input), **redaction_kwargs)[0]
+                try:
+                    boundary_plan = propose_boundary_plan(
+                        prepared,
+                        redact_locally=lambda value: apply_share_redactions(conn, value, **redaction_kwargs)[0],
+                        review=recovery_review,
+                        anonymize=Anonymizer(extra_usernames=settings["extra_usernames"]).text,
+                    )
+                    recovery_controls()
+                    detail, redaction_count, redaction_log = apply_share_redactions(
+                        conn, copy.deepcopy(reviewed_input), boundary_plan=boundary_plan, **redaction_kwargs,
+                    )
+                except ReviewSnapshotError:
+                    raise
+                except Exception:
+                    # Provider/scanner errors may contain private text. Keep
+                    # the public error and logs free of their raw output.
+                    raise boundary_error from None
 
             # Agent-based PII detection is opt-in for the preview. The
             # deterministic findings-backed pass above always runs.
@@ -5798,12 +5854,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     from ..redaction.pii import review_session_pii_with_agent, apply_findings_to_session
                     # Use AI-only detection (skip redundant rule-based PII scan
                     # since redact_session() already handles regex patterns)
-                    findings = review_session_pii_with_agent(
-                        detail,
-                        ignore_errors=False,
-                        backend="auto",
-                        timeout_seconds=_upload_pii_timeout_seconds(),
-                    )
+                    if boundary_plan:
+                        findings = recovery_review(detail)
+                        recovery_controls()
+                    else:
+                        findings = review_session_pii_with_agent(
+                            detail, ignore_errors=False, backend="auto",
+                            timeout_seconds=_upload_pii_timeout_seconds(),
+                        )
                     ai_coverage = "full"
                     if findings:
                         detail, ai_pii_count = apply_findings_to_session(detail, findings, strict=True)
@@ -5817,14 +5875,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                             }
                             for f in findings
                         ]
-                except RedactionBoundaryError:
+                except (RedactionBoundaryError, ReviewSnapshotError):
                     raise
                 except Exception as exc:
-                    logger.warning("AI PII detection failed for %s: %s", session_id, exc)
+                    if boundary_plan:
+                        logger.warning("AI PII detection unavailable after boundary recovery")
+                    else:
+                        logger.warning("AI PII detection failed for %s: %s", session_id, exc)
                     ai_coverage = "rules_only"
 
+            recovered_fields = []
+            if boundary_plan:
+                recovery_controls()
+                from ..redaction.boundary_recovery import recovered_field_previews
+                recovered_fields = recovered_field_previews(detail, boundary_plan)
             try:
-                review_snapshot_id = save_review_snapshot(conn, reviewed_input)
+                review_snapshot_id = save_review_snapshot(conn, reviewed_input, boundary_plan=boundary_plan)
             except ReviewSnapshotError as exc:
                 _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
                 return
@@ -5836,12 +5902,17 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "redaction_log": redaction_log,
                 "ai_pii_findings": ai_pii_findings,
                 "ai_coverage": ai_coverage,
+                "boundary_recovered": bool(boundary_plan),
+                "recovered_fields": recovered_fields,
                 "redacted_session": detail,
             })
+        except ReviewSnapshotError as exc:
+            _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
         except RedactionBoundaryError as exc:
             _json_response(self, {
                 "error": str(exc), "block_reason": "redaction_boundary",
                 "rule": exc.rule,
+                "ai_recovery_available": exc.rule == "personal_hostname",
             }, 422, cache_control="no-store")
         finally:
             conn.close()

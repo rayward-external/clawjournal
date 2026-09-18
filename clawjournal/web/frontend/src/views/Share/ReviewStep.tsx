@@ -33,14 +33,15 @@ export function ReviewStep(p: ReviewStepProps) {
   const sorted = [...p.queuedSessions].sort((a, b) => {
     const sa = classify(p.redactedSessions[a.session_id]);
     const sb = classify(p.redactedSessions[b.session_id]);
-    const order = { review: 0, checking: 1, clear: 2 };
+    const order = { blocked: 0, review: 1, checking: 2, clear: 3 };
     return order[sa] - order[sb];
   });
 
   const approvedCount = p.queuedSessions.filter((s) => p.approvedIds.has(s.session_id)).length;
   const needsReviewCount = p.queuedSessions.filter((s) => (
-    classify(p.redactedSessions[s.session_id]) === 'review'
+    !p.approvedIds.has(s.session_id) && classify(p.redactedSessions[s.session_id]) === 'review'
   )).length;
+  const blockedCount = p.queuedSessions.filter((s) => classify(p.redactedSessions[s.session_id]) === 'blocked').length;
   const excludedCount = p.queuedSessions.length - approvedCount;
   const canPackage = approvedCount > 0;
   const visibleSessions = sorted.slice(0, visibleCount);
@@ -58,7 +59,7 @@ export function ReviewStep(p: ReviewStepProps) {
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
         Safe traces are included automatically. Anything uncertain stays out unless you
-        choose to review and include it. This share uses the versions shown here.
+        choose to review and include it. Failed previews stay excluded until redaction succeeds. This share uses the versions shown here.
         Later changes stay local for a future share.
       </p>
 
@@ -73,7 +74,7 @@ export function ReviewStep(p: ReviewStepProps) {
         <SummaryStat value={approvedCount} label="ready to share" color={colors.green500} />
         <SummaryStat
           value={excludedCount}
-          label={needsReviewCount > 0 ? `not included · ${needsReviewCount} need review` : 'not included'}
+          label={`not included${needsReviewCount ? ` · ${needsReviewCount} need review` : ''}${blockedCount ? ` · ${blockedCount} preview failed` : ''}`}
           color={excludedCount > 0 ? colors.yellow700 : colors.gray500}
         />
       </div>
@@ -187,9 +188,10 @@ function ReviewRow({
   const aiDisabled = data?.aiCoverage === 'disabled' || !aiPiiEnabled;
 
   // Meta label under the title — no raw finding counts, just a neutral phrase.
-  const metaPhrase: string | null = status === 'review'
+  const metaPhrase: string | null = approved ? null : status === 'blocked' ? 'preview failed · cannot include' : status === 'review'
     ? (aiDisabled ? 'needs review · rules-only' : aiUnavailable ? 'needs review · AI unavailable' : 'needs review')
     : null;
+  const cannotInclude = !!data?.previewError || !data?.reviewSnapshotId || !data?.reviewedRevision || data?.loading;
 
   return (
     <div style={{
@@ -273,10 +275,26 @@ function ReviewRow({
           <p style={{ fontSize: 13, color: colors.gray700, margin: '0 0 14px', lineHeight: 1.55 }}>
             {data?.previewError
               ? 'The preview could not be completed. This trace stays excluded. Go back to redaction and retry after resolving the error.'
+              : data?.boundaryRecovered
+              ? 'AI proposed a device-name boundary. Local checks passed. Review the redacted text, then include this trace only if the change is correct.'
               : status === 'clear'
               ? <>This trace cleared automatically. Here&rsquo;s the redacted version that will ship &mdash; scan it if you&rsquo;d like extra peace of mind.</>
               : <>Here&rsquo;s the redacted trace. Scan it &mdash; if anything looks off, <strong style={{ color: colors.gray900 }}>remove it</strong>. Otherwise include it in the bundle.</>}
           </p>
+
+          {!data?.previewError && data?.boundaryRecovered && !!data.recoveredFields?.length && (
+            <div style={{ marginBottom: 14 }}>
+              <h4 style={{ fontSize: 12, color: colors.gray700 }}>Fields changed by boundary review</h4>
+              {data.recoveredFields.map((field) => (
+                <div key={field.label} style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 12, color: colors.gray500, marginBottom: 4 }}>{field.label}</div>
+                  <pre style={{ margin: 0, padding: 12, fontSize: 12, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 200, overflow: 'auto', background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 6 }}>
+                    {field.text}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          )}
 
           {!data?.previewError && (aiUnavailable || aiDisabled) && (
             <div style={{
@@ -309,7 +327,19 @@ function ReviewRow({
           )}
 
           {data?.previewError ? (
-            <div role="alert" style={{ color: colors.yellow700, fontSize: 13 }}>{data.previewError}</div>
+            <div role="alert" style={{ color: colors.yellow700, fontSize: 13 }}>
+              {data.previewError}
+              {data.aiRecoveryAvailable && (
+                <p>{aiPiiEnabled
+                  ? 'AI could not complete a safe preview. You can retry or add an explicit redaction.'
+                  : 'To try AI boundary review, return to Queue and enable AI privacy review. You can also add an explicit redaction.'}</p>
+              )}
+              {data.aiRecoveryAvailable && aiPiiEnabled && (
+                <button onClick={onRetryAi} disabled={data.loading} style={btnSecondary}>
+                  {data.loading ? 'Retrying...' : 'Retry AI boundary review'}
+                </button>
+              )}
+            </div>
           ) : data?.loading ? (
             <div style={{ color: colors.gray500, fontSize: 13 }}>Still analyzing this trace...</div>
           ) : (
@@ -413,7 +443,7 @@ function ReviewRow({
                 Exclude from bundle
               </button>
             ) : (
-              <button onClick={onApprove} disabled={!!data?.previewError || !data?.reviewSnapshotId || !data?.reviewedRevision || data?.loading} style={btnPrimary}>
+              <button onClick={onApprove} disabled={cannotInclude} style={{ ...btnPrimary, opacity: cannotInclude ? 0.4 : 1, cursor: cannotInclude ? 'not-allowed' : 'pointer' }}>
                 <Icon name="check" size={13} />
                 Include in bundle
               </button>

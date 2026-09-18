@@ -273,6 +273,24 @@ A refreshed preview must be included again. Failed or timed-out previews remain
 excluded while healthy traces can proceed. A boundary failure during optional
 AI review is reported as a blocked trace, not as successful rules-only coverage.
 
+When AI privacy review is enabled for a manual Share preview, it can also
+propose a boundary for an oversized personal device-name candidate. This uses
+the existing AI toggle and configured backend. Local rules and anonymization
+run first. The AI receives up to eight candidates of at most 512 characters,
+with up to 160 characters of locally masked context on each side. Residual
+personal details can remain in this input; finding them is the purpose of AI
+review. Candidate-bearing fields and the AI input must pass the local
+Betterleaks scan. A missing, failed, or bypassed scanner prevents recovery.
+
+The model can propose only an exact device-name suffix of at most 63 characters.
+Local code checks its location and length, then runs normal redaction again.
+The user must inspect and include the recovered preview. Its offset plan and
+field hashes are saved with that exact review input and replayed during export.
+Changed input or redaction settings can require a fresh preview. Uncertain,
+malformed, or unavailable AI results remain blocked. Other ambiguous candidate
+types still need an explicit local redaction. This recovery does not enable AI
+when the toggle is off or change recurring sharing.
+
 For preparing or submitting a share, current holds, blocked status, source/project scope, exclusions, redaction rules,
 consent, duplicate checks, and both secret-scan gates still apply. Missing or
 damaged saved content requires a fresh preview. This manual review mechanism
