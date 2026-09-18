@@ -46,6 +46,9 @@ def ensure_safe_replacement(value: str, rule: str) -> None:
             or any(len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in domain.split("."))
         )
     elif rule in {"internal_tld_host", "internal_host_context", "personal_hostname", "device_id", "url_hostname"}:
+        # personal_hostname candidates are bounded to 62 characters by their
+        # own pattern (candidate_formats.PERSONAL_HOST_PATTERN). This check
+        # still applies to non-ASCII case-fold letters and to the other rules.
         oversized = len(value.encode("utf-8", errors="surrogatepass")) > 253 or any(
             len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in value.rstrip(".").split(".")
         )
@@ -94,6 +97,9 @@ def ensure_text_boundaries(text: str, *, context=None) -> None:
     # can still redact one of those matches; an allowlist cannot make an
     # oversized replacement safe. Other PII rules need no length preflight.
     guarded = {"email", "email_truncated", "telegram_bot_token", "personal_hostname", "internal_tld_host"}
+    from .candidate_formats import has_personal_host_hint
+    if not has_personal_host_hint(text):
+        guarded.discard("personal_hostname")
     for rule, pattern, _kind, _confidence, group, _skip_kind in _PII_CONTENT_PATTERNS_COMPILED:
         if rule in guarded:
             for match in _content_matches(pattern, text):

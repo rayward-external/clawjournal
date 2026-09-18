@@ -81,8 +81,8 @@ export function RedactStep(p: RedactStepProps) {
         Redacting your traces
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
-        Local rules mask known secrets and personal identifiers first. If enabled, AI
-        reviews the remaining text using your configured backend.
+        Before anything leaves your device, we strip out secrets and personal identifiers.
+        Watch it happen &mdash; nothing is hidden.
       </p>
 
       <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
@@ -97,7 +97,7 @@ export function RedactStep(p: RedactStepProps) {
           </div>
           <div style={{ fontSize: 13, color: colors.gray500 }}>
             {p.aiPiiEnabled
-              ? 'Deterministic + policy rules run on your device. Your AI backend checks the remaining text and unclear device names.'
+              ? 'Deterministic + policy rules run on your device. AI review sends the already-redacted text to your configured AI backend.'
               : 'Deterministic rules \u2192 Policy rules. AI review is off for this bundle.'}
           </div>
         </div>

@@ -49,6 +49,12 @@ The email checks use a 64-byte local-part and 254-byte mailbox budget. Hostnames
 use 63 bytes per label and 253 bytes overall. These are conservative UTF-8
 replacement budgets, not complete address validators. The Telegram budget is
 128 characters; it is not a claim about the maximum possible token length.
+The scanner limits a personal device-name candidate (`<name>-macbook`,
+`<name>-laptop` and similar) to 62 characters around the device keyword. A
+longer run of ASCII letters or digits next to the keyword stays as ordinary
+text. For a name longer than 32 characters, the leading part stays visible.
+The other rules still scan that text. The hostname byte budget still applies
+to the candidate. Only non-ASCII letters can make this rule stop a share.
 Email, Telegram-token and internal-domain regex searches use complete-candidate
 adapters. Required markers locate possible matches; the unchanged regexes
 validate them against the original field. They do not repeatedly retry each
@@ -272,24 +278,6 @@ findings still require review. A user release never bypasses redaction checks.
 A refreshed preview must be included again. Failed or timed-out previews remain
 excluded while healthy traces can proceed. A boundary failure during optional
 AI review is reported as a blocked trace, not as successful rules-only coverage.
-
-When AI privacy review is enabled for a manual Share preview, it can also
-propose a boundary for an oversized personal device-name candidate. This uses
-the existing AI toggle and configured backend. Local rules and anonymization
-run first. The AI receives up to eight candidates of at most 512 characters,
-with up to 160 characters of locally masked context on each side. Residual
-personal details can remain in this input; finding them is the purpose of AI
-review. Candidate-bearing fields and the AI input must pass the local
-Betterleaks scan. A missing, failed, or bypassed scanner prevents recovery.
-
-The model can propose only an exact device-name suffix of at most 63 characters.
-Local code checks its location and length, then runs normal redaction again.
-The user must inspect and include the recovered preview. Its offset plan and
-field hashes are saved with that exact review input and replayed during export.
-Changed input or redaction settings can require a fresh preview. Uncertain,
-malformed, or unavailable AI results remain blocked. Other ambiguous candidate
-types still need an explicit local redaction. This recovery does not enable AI
-when the toggle is off or change recurring sharing.
 
 For preparing or submitting a share, current holds, blocked status, source/project scope, exclusions, redaction rules,
 consent, duplicate checks, and both secret-scan gates still apply. Missing or

@@ -275,26 +275,10 @@ function ReviewRow({
           <p style={{ fontSize: 13, color: colors.gray700, margin: '0 0 14px', lineHeight: 1.55 }}>
             {data?.previewError
               ? 'The preview could not be completed. This trace stays excluded. Go back to redaction and retry after resolving the error.'
-              : data?.boundaryRecovered
-              ? 'AI proposed a device-name boundary. Local checks passed. Review the redacted text, then include this trace only if the change is correct.'
               : status === 'clear'
               ? <>This trace cleared automatically. Here&rsquo;s the redacted version that will ship &mdash; scan it if you&rsquo;d like extra peace of mind.</>
               : <>Here&rsquo;s the redacted trace. Scan it &mdash; if anything looks off, <strong style={{ color: colors.gray900 }}>remove it</strong>. Otherwise include it in the bundle.</>}
           </p>
-
-          {!data?.previewError && data?.boundaryRecovered && !!data.recoveredFields?.length && (
-            <div style={{ marginBottom: 14 }}>
-              <h4 style={{ fontSize: 12, color: colors.gray700 }}>Fields changed by boundary review</h4>
-              {data.recoveredFields.map((field) => (
-                <div key={field.label} style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 12, color: colors.gray500, marginBottom: 4 }}>{field.label}</div>
-                  <pre style={{ margin: 0, padding: 12, fontSize: 12, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxHeight: 200, overflow: 'auto', background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 6 }}>
-                    {field.text}
-                  </pre>
-                </div>
-              ))}
-            </div>
-          )}
 
           {!data?.previewError && (aiUnavailable || aiDisabled) && (
             <div style={{
@@ -327,19 +311,7 @@ function ReviewRow({
           )}
 
           {data?.previewError ? (
-            <div role="alert" style={{ color: colors.yellow700, fontSize: 13 }}>
-              {data.previewError}
-              {data.aiRecoveryAvailable && (
-                <p>{aiPiiEnabled
-                  ? 'AI could not complete a safe preview. You can retry or add an explicit redaction.'
-                  : 'To try AI boundary review, return to Queue and enable AI privacy review. You can also add an explicit redaction.'}</p>
-              )}
-              {data.aiRecoveryAvailable && aiPiiEnabled && (
-                <button onClick={onRetryAi} disabled={data.loading} style={btnSecondary}>
-                  {data.loading ? 'Retrying...' : 'Retry AI boundary review'}
-                </button>
-              )}
-            </div>
+            <div role="alert" style={{ color: colors.yellow700, fontSize: 13 }}>{data.previewError}</div>
           ) : data?.loading ? (
             <div style={{ color: colors.gray500, fontSize: 13 }}>Still analyzing this trace...</div>
           ) : (

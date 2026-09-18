@@ -846,8 +846,6 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         // run, so it still rejects writes from a superseded one.
         const completed: RedactedSessionData = {
           messages: msgs, loading: false,
-          boundaryRecovered: report.boundary_recovered,
-          recoveredFields: report.recovered_fields,
           reviewSnapshotId: report.review_snapshot_id,
           reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,
@@ -870,7 +868,6 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           [s.session_id]: {
             messages: [{ role: 'system', content: error instanceof Error ? error.message : 'Redaction preview failed. Return to Redact to retry.' }],
             previewError: error instanceof Error ? error.message : 'Redaction preview failed.',
-            aiRecoveryAvailable: error instanceof ApiError && error.body?.ai_recovery_available === true,
             loading: false,
             redactionCount: 0,
             aiCoverage: aiPiiEnabled ? 'rules_only' : 'disabled',
@@ -1062,8 +1059,6 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         ...prev,
         [id]: {
           messages: msgs, loading: false,
-          boundaryRecovered: report.boundary_recovered,
-          recoveredFields: report.recovered_fields,
           reviewSnapshotId: report.review_snapshot_id,
           reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,

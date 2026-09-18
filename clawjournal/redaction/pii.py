@@ -19,6 +19,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
+from .candidate_formats import PERSONAL_HOST_PATTERN
 from .prefilter import filter_rules
 from .replacements import ReplacementMap
 
@@ -729,7 +730,7 @@ def _content_findings_for_text(session_id: str, message_index: int, field: str, 
         # Telegram bot tokens: numeric_id:alphanumeric_token
         (_TELEGRAM_PATTERN.pattern, "custom_sensitive", "Likely Telegram bot token", 0.95, 1),
         # Hostnames with personal identifiers (e.g., kais-macbook-pro, alice-desktop)
-        (r"\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b", "device_id", "Likely personal hostname", 0.80, 1),
+        (PERSONAL_HOST_PATTERN, "device_id", "Likely personal hostname", 0.80, 1),
         # Absolute home-directory paths (leaks username and directory structure)
         (r"(/(?:Users|home)/[A-Za-z0-9._-]{2,}/[^\s\"'`,;)}\]]{3,})", "path", "Home-directory file path", 0.85, 1),
         # Private/internal IP addresses (not localhost)
@@ -884,7 +885,7 @@ _PII_CONTENT_PATTERNS_COMPILED: list[tuple[str, "re.Pattern[str]", str, float, i
     ("email", _EMAIL_PATTERN, "email", 0.90, 1, "plain"),
     ("email_truncated", _TRUNCATED_EMAIL_PATTERN, "email", 0.75, 1, "plain"),
     ("telegram_bot_token", _TELEGRAM_PATTERN, "custom_sensitive", 0.95, 1, "plain"),
-    ("personal_hostname", re.compile(r"\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b"), "device_id", 0.80, 1, "plain"),
+    ("personal_hostname", re.compile(PERSONAL_HOST_PATTERN), "device_id", 0.80, 1, "plain"),
     ("home_dir_path", re.compile(r"(/(?:Users|home)/[A-Za-z0-9._-]{2,}/[^\s\"'`,;)}\]]{3,})"), "path", 0.85, 1, "plain"),
     ("private_ip_10", re.compile(r"\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),
     ("private_ip_172", re.compile(r"\b(172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"), "custom_sensitive", 0.70, 1, "plain"),

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import re
 
+from .candidate_formats import PERSONAL_HOST_PATTERN
+
 # Each tuple is an OR: every possible match contains at least one literal.
 # Keys intentionally repeat the complete regex and flags. Editing a detector
 # without updating this table removes its shortcut, not its detection.
@@ -44,7 +46,7 @@ _PATTERN_LITERALS = {
     re.compile(r"""([A-Za-z0-9_.+-]{3,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"""): ('@',),
     re.compile(r"""([A-Za-z0-9_.+-]{3,})@(?=\s|$)"""): ('@',),
     re.compile(r"""(\d{8,}:[A-Za-z0-9_-]{30,})"""): (':',),
-    re.compile(r"""\b([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)\b"""): ('-macbook', '-imac', '-laptop', '-desktop', '-pc', '-workstation', '-server'),
+    re.compile(PERSONAL_HOST_PATTERN): ('-macbook', '-imac', '-laptop', '-desktop', '-pc', '-workstation', '-server'),
     re.compile(r"""(/(?:Users|home)/[A-Za-z0-9._-]{2,}/[^\s\"'`,;)}\]]{3,})"""): ('/Users/', '/home/'),
     re.compile(r"""\b(10\.\d{1,3}\.\d{1,3}\.\d{1,3})\b"""): ('10.',),
     re.compile(r"""\b(172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"""): ('172.',),

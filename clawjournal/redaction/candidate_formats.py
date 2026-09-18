@@ -27,10 +27,34 @@ _SSH_HOST = re.compile(r"(?<![\w-])ssh[ \t]+(?:[A-Za-z0-9_.-]+@)?([A-Za-z0-9][A-
 _SSH_PROSE_TAIL = re.compile(r'\s+(?:is|are|was|were|can|should|must|requires?|provides?|allows?)\b', re.I)
 _HOST_CHAIN = re.compile(r"[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*", re.I)
 _HOST_SUFFIX = re.compile(r"\.(?:local|internal|corp|lan|intranet|localnet)(?![A-Za-z0-9_])", re.I)
-_PERSONAL_HOST = re.compile(
-    r"(?<![A-Za-z0-9_])([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)(?![A-Za-z0-9_])",
-    re.I,
+# A device-name label cannot exceed 63 bytes (RFC 1035). Keep only the core
+# next to the device keyword: at most 32 name characters (33 with a plural s)
+# before it and 16 after it, 62 characters in total. A longer run of letters
+# or digits is ordinary text; the other rules still scan it, and for a name
+# longer than 32 characters the leading part stays visible. The legacy PII
+# rule and the prefilter hint share this pattern, so an ASCII
+# personal_hostname candidate always fits the replacement budget in
+# boundaries.py. That byte budget still applies to the four non-ASCII letters
+# that case-insensitive [a-z] admits (U+0130, U+0131, U+017F, U+212A).
+# Compared with the old \b-bounded rule, ASCII lookarounds also match a
+# device name next to CJK text, and the unanchored 32-character alternative
+# matches after `_` or a leading digit; both changes add redaction.
+PERSONAL_HOST_PATTERN = (
+    r"((?:(?<![A-Za-z0-9_])[a-z][a-z0-9]{0,31}|[a-z0-9]{32})s?"
+    r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)"
+    r"(?:-?[a-z0-9]{0,16}(?![A-Za-z0-9_])|-?[a-z0-9]{16}))"
 )
+_PERSONAL_HOST = re.compile(PERSONAL_HOST_PATTERN, re.I)
+# Every PERSONAL_HOST_PATTERN match contains this. The unanchored alternative
+# is tried at every position of a long run, so skip fields without a keyword.
+_PERSONAL_HOST_HINT = re.compile(r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)", re.I)
+
+
+def has_personal_host_hint(text: str) -> bool:
+    """Linear pre-check before the bounded device-name scan."""
+    return _PERSONAL_HOST_HINT.search(text) is not None
+
+
 _ESCAPED_SEPARATOR = re.compile(r"%([234][0aAeE])|\\u00(2[eE]|3[aA]|40)|&#(?:0*(46|58|64)|[xX]0*(2[eE]|3[aA]|40));")
 _URL_AUTHORITY = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://([^\s/?#\"'`<>|]+)")
 
@@ -279,8 +303,9 @@ def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
     for match in _NAMED_TOKEN.finditer(view):
         if not is_reference_prefix(match, "telegram"):
             yield candidate(*match.span(1), "telegram_named", "custom_sensitive")
-    for match in _PERSONAL_HOST.finditer(view):
-        yield candidate(*match.span(1), "personal_hostname", "device_id")
+    if has_personal_host_hint(view):
+        for match in _PERSONAL_HOST.finditer(view):
+            yield candidate(*match.span(1), "personal_hostname", "device_id")
     suffixes = iter(_HOST_SUFFIX.finditer(view))
     suffix = next(suffixes, None)
     if suffix is not None:

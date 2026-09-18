@@ -2913,7 +2913,7 @@ def _apply_to_ai_text(
     session[AI_TEXT_DETAIL_FIELD] = json.dumps(detail)
 
 
-def prepare_share_redactions(
+def apply_share_redactions(
     conn: sqlite3.Connection,
     session: dict[str, Any],
     *,
@@ -2922,9 +2922,10 @@ def prepare_share_redactions(
     extra_usernames: list[str] | None = None,
     blocked_domains: list[str] | None = None,
 ) -> tuple[dict[str, Any], int, list[dict[str, Any]]]:
-    """Apply local normalization, explicit masks and home/user anonymization."""
+    """Apply the full share/export redaction pipeline to a session."""
     from ..redaction.anonymizer import Anonymizer
     from ..redaction.normalize import strip_terminal_control_sequences
+    from ..redaction.secrets import apply_findings_to_blob
 
     total_redactions = 0
     redaction_log: list[dict[str, Any]] = []
@@ -2935,7 +2936,7 @@ def prepare_share_redactions(
     # redaction patterns match cleanly, and stops TruffleHog's broad detectors
     # from flagging them as false positives. This is normalization, not
     # redaction, so it is not counted in total_redactions.
-    for field in ("display_title", "project", "git_branch", "fork_nickname"):
+    for field in ("display_title", "project", "git_branch"):
         if session.get(field):
             session[field] = _transform_nested_strings(
                 session[field], strip_terminal_control_sequences
@@ -2964,7 +2965,7 @@ def prepare_share_redactions(
 
     if custom_strings:
         custom_total = 0
-        for field in ("display_title", "project", "git_branch", "fork_nickname"):
+        for field in ("display_title", "project", "git_branch"):
             if session.get(field):
                 session[field], count = _redact_custom_strings_in_value(
                     session[field],
@@ -2973,7 +2974,7 @@ def prepare_share_redactions(
                 custom_total += count
 
         for msg in session.get("messages", []):
-            for field in ("content", "thinking", "author", "invocations", "snippets", "extra"):
+            for field in ("content", "thinking"):
                 if msg.get(field):
                     msg[field], count = _redact_custom_strings_in_value(
                         msg[field],
@@ -3010,7 +3011,7 @@ def prepare_share_redactions(
         domain_total = 0
         domain_log: list[dict[str, Any]] = []
 
-        for field in ("display_title", "project", "git_branch", "fork_nickname"):
+        for field in ("display_title", "project", "git_branch"):
             if session.get(field):
                 session[field], count, entries = _redact_blocked_domains_in_value(
                     session[field],
@@ -3021,7 +3022,7 @@ def prepare_share_redactions(
                 domain_log.extend(entries)
 
         for msg_idx, msg in enumerate(session.get("messages", [])):
-            for field in ("content", "thinking", "author", "invocations", "snippets", "extra"):
+            for field in ("content", "thinking"):
                 if msg.get(field):
                     msg[field], count, entries = _redact_blocked_domains_in_value(
                         msg[field],
@@ -3063,11 +3064,11 @@ def prepare_share_redactions(
         redaction_log.extend(domain_log)
 
     anonymizer = Anonymizer(extra_usernames=extra_usernames)
-    for field in ("display_title", "project", "git_branch", "fork_nickname"):
+    for field in ("display_title", "project", "git_branch"):
         if session.get(field):
             session[field] = _transform_nested_strings(session[field], anonymizer.text)
     for msg in session.get("messages", []):
-        for field in ("content", "thinking", "author", "invocations", "snippets", "extra"):
+        for field in ("content", "thinking"):
             if msg.get(field):
                 msg[field] = _transform_nested_strings(msg[field], anonymizer.text)
         for tool_use in msg.get("tool_uses", []):
@@ -3079,32 +3080,6 @@ def prepare_share_redactions(
                     )
 
     _apply_to_ai_text(session, lambda text, _label: anonymizer.text(text))
-
-    return session, total_redactions, redaction_log
-
-
-def apply_share_redactions(
-    conn: sqlite3.Connection,
-    session: dict[str, Any],
-    *,
-    custom_strings: list[str] | None = None,
-    user_allowlist: list[dict[str, Any]] | None = None,
-    extra_usernames: list[str] | None = None,
-    blocked_domains: list[str] | None = None,
-    boundary_plan: list[dict[str, Any]] | None = None,
-) -> tuple[dict[str, Any], int, list[dict[str, Any]]]:
-    """Apply local preparation, a pinned recovery plan, then all normal rules."""
-    from ..redaction.secrets import apply_findings_to_blob
-
-    session, total_redactions, redaction_log = prepare_share_redactions(
-        conn, session, custom_strings=custom_strings, user_allowlist=user_allowlist,
-        extra_usernames=extra_usernames, blocked_domains=blocked_domains,
-    )
-    if boundary_plan:
-        from ..redaction.boundary_recovery import apply_boundary_plan
-        entries = apply_boundary_plan(session, boundary_plan)
-        total_redactions += len(entries)
-        redaction_log.extend(entries)
 
     session_id = str(session.get("session_id") or "")
     if not session_id:
@@ -8682,7 +8657,6 @@ def export_share_to_disk(
     )
     prepared: list[tuple[dict[str, Any], dict[str, Any], str, str | None]] = []
     skipped_session_ids: list[str] = []
-    boundary_plans: dict[str, list[dict[str, Any]]] = {}
     boundary_skips: list[dict[str, str]] = []
     preflight_blockers: list[dict[str, Any]] = []
     for selected in selected_sessions:
@@ -8693,9 +8667,7 @@ def export_share_to_disk(
         from .review_snapshots import load_share_snapshot
 
         detail = load_share_snapshot(conn, share_id, session_id)
-        if detail is not None:
-            boundary_plans[session_id] = detail.pop("_review_boundary_plan", [])
-        else:
+        if detail is None:
             detail = get_session_detail(conn, session_id)
         if detail is None:
             skipped_session_ids.append(session_id)
@@ -8729,7 +8701,6 @@ def export_share_to_disk(
                         conn, detail, custom_strings=custom_strings,
                         user_allowlist=allowlist_entries, extra_usernames=extra_usernames,
                         blocked_domains=blocked_domains,
-                        boundary_plan=boundary_plans.get(selected["session_id"]),
                     )
                 except RedactionBoundaryError as exc:
                     skipped_session_ids.append(selected['session_id'])

@@ -7,6 +7,7 @@ External detectors are isolated here, so these are not upload-gate tests.
 import hashlib
 import itertools
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -259,12 +260,12 @@ def test_additional_rules_keep_ordinary_controls(render_builtin, text):
     "a" * 65 + "@audit.test", "user@" + "b" * 64 + ".test",
     "12345678:" + "A" * 200_000, "1" * 200_000 + ":" + TOKEN_BODY,
     "12345678%3A" + "A" * 200_000, "TELEGRAM_BOT_TOKEN=" + "A" * 200_000,
-    "a." * 100_000 + "local", "a" * 64 + ".local", "A" * 200_000 + "-laptop",
+    "a." * 100_000 + "local", "a" * 64 + ".local", "\u212a" * 32 + "-laptop",
     "DB_HOST=" + "a" * 200_000,
     ".".join(["a" * 63] * 3 + ["b" * 56, "local"]),
 ], ids=["attached-email", "truncated-email", "quoted-email", "local-65", "domain-label-64",
         "long-token-tail", "long-token-id", "escaped-token", "named-token",
-        "many-host-labels", "host-label-64", "uppercase-personal-host", "host-field", "host-254"])
+        "many-host-labels", "host-label-64", "kelvin-personal-host", "host-field", "host-254"])
 def test_oversized_candidates_are_deferred_without_mutation(render_builtin, value):
     from clawjournal.redaction.boundaries import RedactionBoundaryError
 
@@ -310,7 +311,8 @@ def test_short_telegram_id_in_documented_bot_url(render_builtin):
     assert render_builtin(text) == "https://api.telegram.org/bot[REDACTED]/getMe"
 
 
-@pytest.mark.parametrize("host", ["ALEX-LAPTOP", "Alexs-MacBook-Pro", "alex-laptop", "ALEX-PC"])
+@pytest.mark.parametrize("host", ["ALEX-LAPTOP", "Alexs-MacBook-Pro", "alex-laptop", "ALEX-PC",
+                                  "richards-macbook-pro", "alice-desktop-01", "Ilgins-MacBook-Air"])
 def test_personal_host_case_preserves_surrounding_text(render_builtin, host):
     assert render_builtin("前：" + host + "；后") == "前：[REDACTED_DEVICE_ID]；后"
 
@@ -755,3 +757,52 @@ def test_generic_secret_values_cannot_gain_configuration_reference_exemptions(re
     # Parentheses can be literal password characters in configuration data.
     # A Python parse alone must not exempt arbitrary credential assignments.
     assert render_builtin(field + '=SecretPass123()') == field + '=[REDACTED_ENV_SECRET]'
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("A" * 200_000 + "-laptop", "A" * 199_968 + "[REDACTED_DEVICE_ID]"),
+    ("image sha " + "a" * 64 + "-server ok", "image sha " + "a" * 32 + "[REDACTED_DEVICE_ID] ok"),
+    ("deploy app-server-" + "f" * 80 + " done", "deploy [REDACTED_DEVICE_ID]-" + "f" * 80 + " done"),
+    ("run Codex-Desktop-" + "0123456789abcdef" * 5 + " done",
+     "run [REDACTED_DEVICE_ID]-" + "0123456789abcdef" * 5 + " done"),
+    ("Before " + "ordinaryprose" * 6 + "alex-laptop after",
+     "Before " + ("ordinaryprose" * 6)[:50] + "[REDACTED_DEVICE_ID] after"),
+    ("alex-laptop-" + "f" * 17, "[REDACTED_DEVICE_ID]-" + "f" * 17),
+    ("alex-laptop-" + "f" * 10, "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop" + "A" * 30, "[REDACTED_DEVICE_ID]" + "A" * 14),
+], ids=["uppercase-personal-host", "hash-prefix", "hex-tail-with-dash", "mixed-case-product-tail",
+        "glued-prose", "long-dashed-tail", "short-dashed-tail", "undelimited-tail"])
+def test_personal_host_runs_are_bounded_instead_of_blocking(render_builtin, value, expected):
+    # Issue #230: a long run next to a device keyword refused the whole trace.
+    # The bounded core is replaced; the surplus run stays as ordinary text.
+    from clawjournal.redaction.boundaries import ensure_text_boundaries
+
+    assert render_builtin(value) == expected
+    ensure_text_boundaries(value)
+    secrets.redact_text(value, strict=True)
+
+
+def test_personal_host_candidates_never_exceed_the_replacement_budget():
+    from clawjournal.redaction.boundaries import ensure_safe_replacement, ensure_text_boundaries
+    from clawjournal.redaction.candidate_formats import _PERSONAL_HOST
+
+    legacy = next(row[1] for row in pii._PII_CONTENT_PATTERNS_COMPILED if row[0] == "personal_hostname")
+    keyword = re.compile(r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)", re.I)
+    rng = random.Random(230)
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEF0123456789"
+    keywords = ("macbook", "imac", "laptop", "desktop", "pc", "workstation", "server")
+
+    def run():
+        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 150)))
+
+    for _ in range(3000):
+        text = (rng.choice(("", " ", "/", "_", "x", "\u4e2d")) + run() + rng.choice(("", "s")) + "-"
+                + rng.choice(keywords) + rng.choice(("", "-")) + run()
+                + rng.choice(("", " ", "_", "\u4e2d", "-x")))
+        for pattern in (_PERSONAL_HOST, legacy):
+            for match in pattern.finditer(text):
+                candidate = match.group(1)
+                assert len(candidate.encode("utf-8")) <= 62, (len(candidate), text[:80])
+                assert keyword.search(candidate)
+                ensure_safe_replacement(candidate, "personal_hostname")
+        ensure_text_boundaries(text)

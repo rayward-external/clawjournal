@@ -151,8 +151,8 @@ export function HelpModal({ onClose, aiPiiEnabled = false }: { onClose: () => vo
       name: 'AI-assisted review',
       sub: aiPiiEnabled ? 'Opted in' : 'Off unless you opt in',
       desc: aiPiiEnabled
-        ? 'Names, orgs, private project names, and contextual identifiers are flagged. Local rules mask known sensitive data first. Your configured AI backend checks remaining text and unclear device names. If AI is unavailable, the trace falls back to rules-only and you’ll see a labeled reason.'
-        : 'The bundle uses deterministic and policy rules only — everything stays on your device. You can opt in before redaction to have your configured AI backend flag contextual identifiers (this sends locally masked text that can still contain personal details to that backend).',
+        ? 'Names, orgs, private project names, and contextual identifiers are flagged. This step sends the already-redacted (and anonymized) trace text to your configured AI backend (Claude Code or Codex) — it is the one stage that leaves your device. If AI is unavailable, the trace falls back to rules-only and you’ll see a labeled reason.'
+        : 'The bundle uses deterministic and policy rules only — everything stays on your device. You can opt in before redaction to have your configured AI backend flag contextual identifiers (this sends already-redacted text to that backend).',
       accent: colors.primary500,
       accentBg: colors.primary100,
     },
@@ -200,7 +200,7 @@ export function HelpModal({ onClose, aiPiiEnabled = false }: { onClose: () => vo
         <p style={{ margin: '0 0 18px', color: colors.gray500, fontSize: 13 }}>
           Four layers sit between your raw local trace and the redacted zip you download.
           Three run entirely on your device; the AI-assisted review (when enabled) sends
-          locally masked text to your configured AI backend to find remaining personal details and resolve unclear device names.
+          already-redacted text to your configured AI backend.
         </p>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           {stages.map((s, i) => (
