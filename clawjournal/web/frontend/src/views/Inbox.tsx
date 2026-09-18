@@ -146,7 +146,7 @@ export function Inbox() {
   // empty-state don't flash for a frame before the first fetch resolves.
   const [loaded, setLoaded] = useState(false);
   const [offset, setOffset] = useState(0);
-  const [pageSize, setPageSize] = useState(10);
+  const [pageSize, setPageSize] = useState(50);
   const [hasMore, setHasMore] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [expandedMessages, setExpandedMessages] = useState<Record<string, Array<{ role: string; content: string; tool_uses?: Array<{ tool: string }> }>>>({});
