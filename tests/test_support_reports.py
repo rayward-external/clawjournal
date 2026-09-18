@@ -18,6 +18,15 @@ import pytest
 from clawjournal import config, support_reports
 
 
+@pytest.fixture(autouse=True)
+def support_clock(monkeypatch):
+    # Match the receipt fixtures so they do not expire with the real date.
+    # Patch the shared clock for both timestamps and retention checks.
+    clock = [datetime(2026, 8, 16, tzinfo=timezone.utc)]
+    monkeypatch.setattr(support_reports, "_now_utc", lambda: clock[0])
+    return clock
+
+
 def _hold_support_lock(config_dir, acquired, release):
     support_reports.config_module.CONFIG_DIR = Path(config_dir)
     with support_reports.support_outbox_egress_lock():
@@ -847,14 +856,11 @@ def test_listing_expired_ambiguous_is_local_only_and_clears_plaintext(
 
 
 def test_public_listing_is_newest_first_and_never_exposes_private_fields(
-    outbox, capability, monkeypatch
+    outbox, capability, support_clock
 ):
-    timestamps = iter([
-        "2026-08-16T00:00:00.000001Z",
-        "2026-08-16T00:00:00.000002Z",
-    ])
-    monkeypatch.setattr(support_reports, "_utc_now", lambda: next(timestamps))
+    support_clock[0] += timedelta(microseconds=1)
     first = _enqueue(capability, "first private body")
+    support_clock[0] += timedelta(microseconds=1)
     second = _enqueue(capability, "second private body")
 
     result = support_reports.list_public_reports()
