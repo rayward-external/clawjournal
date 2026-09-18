@@ -760,21 +760,28 @@ def test_generic_secret_values_cannot_gain_configuration_reference_exemptions(re
 
 
 @pytest.mark.parametrize("value,expected", [
+    ("alex-laptop-alexandermontgomery", "[REDACTED_DEVICE_ID]"),
+    ("richardwilliamsmithjohnsonthe3rd1985-laptop", "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop-" + "f" * 17, "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop-" + "f" * 10, "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop" + "A" * 30, "[REDACTED_DEVICE_ID]"),
+    ("host " + "n" * 50 + "-laptop-" + "t" * 5 + " ok", "host [REDACTED_DEVICE_ID] ok"),
     ("A" * 200_000 + "-laptop", "A" * 199_968 + "[REDACTED_DEVICE_ID]"),
     ("image sha " + "a" * 64 + "-server ok", "image sha " + "a" * 32 + "[REDACTED_DEVICE_ID] ok"),
-    ("deploy app-server-" + "f" * 80 + " done", "deploy [REDACTED_DEVICE_ID]-" + "f" * 80 + " done"),
+    ("deploy app-server-" + "f" * 80 + " done", "deploy [REDACTED_DEVICE_ID]" + "f" * 64 + " done"),
     ("run Codex-Desktop-" + "0123456789abcdef" * 5 + " done",
-     "run [REDACTED_DEVICE_ID]-" + "0123456789abcdef" * 5 + " done"),
+     "run [REDACTED_DEVICE_ID]" + "0123456789abcdef" * 4 + " done"),
     ("Before " + "ordinaryprose" * 6 + "alex-laptop after",
      "Before " + ("ordinaryprose" * 6)[:50] + "[REDACTED_DEVICE_ID] after"),
-    ("alex-laptop-" + "f" * 17, "[REDACTED_DEVICE_ID]-" + "f" * 17),
-    ("alex-laptop-" + "f" * 10, "[REDACTED_DEVICE_ID]"),
-    ("alex-laptop" + "A" * 30, "[REDACTED_DEVICE_ID]" + "A" * 14),
-], ids=["uppercase-personal-host", "hash-prefix", "hex-tail-with-dash", "mixed-case-product-tail",
-        "glued-prose", "long-dashed-tail", "short-dashed-tail", "undelimited-tail"])
-def test_personal_host_runs_are_bounded_instead_of_blocking(render_builtin, value, expected):
+    ("p" * 40 + "-laptop-" + "t" * 30, "p" * 8 + "[REDACTED_DEVICE_ID]" + "t" * 14),
+    ("alex-laptop" + "b" * 70, "[REDACTED_DEVICE_ID]" + "b" * 54),
+], ids=["dashed-name-tail", "long-name", "dashed-tail-17", "dashed-tail-10", "undelimited-tail-30",
+        "budget-63", "uppercase-personal-host", "hash-prefix", "hex-tail-with-dash",
+        "mixed-case-product-tail", "glued-prose", "both-runs-long", "attached-tail-70"])
+def test_personal_host_candidates_within_budget_stay_complete_and_longer_ones_are_bounded(render_builtin, value, expected):
     # Issue #230: a long run next to a device keyword refused the whole trace.
-    # The bounded core is replaced; the surplus run stays as ordinary text.
+    # Up to 63 bytes the replacement is unchanged; beyond it, only a bounded
+    # core around the keyword is replaced and the surplus run stays.
     from clawjournal.redaction.boundaries import ensure_text_boundaries
 
     assert render_builtin(value) == expected
@@ -782,27 +789,61 @@ def test_personal_host_runs_are_bounded_instead_of_blocking(render_builtin, valu
     secrets.redact_text(value, strict=True)
 
 
-def test_personal_host_candidates_never_exceed_the_replacement_budget():
-    from clawjournal.redaction.boundaries import ensure_safe_replacement, ensure_text_boundaries
-    from clawjournal.redaction.candidate_formats import _PERSONAL_HOST
+_OLD_PERSONAL_HOST = r"([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)"
+_KEYWORD = re.compile(r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)", re.I)
 
-    legacy = next(row[1] for row in pii._PII_CONTENT_PATTERNS_COMPILED if row[0] == "personal_hostname")
-    keyword = re.compile(r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)", re.I)
+
+@pytest.mark.parametrize("flags,old_pattern", [
+    (re.I, "(?<![A-Za-z0-9_])" + _OLD_PERSONAL_HOST + "(?![A-Za-z0-9_])"),
+    (0, r"\b" + _OLD_PERSONAL_HOST + r"\b"),
+], ids=["candidate-scan", "legacy-rule"])
+def test_personal_host_matches_equal_the_original_rule_up_to_the_budget(flags, old_pattern):
+    # The scanning rules are the #225 rules, unchanged. The adapter must return
+    # their exact spans up to the budget and one bounded span beyond it.
+    from clawjournal.redaction import candidate_formats, pii
+    from clawjournal.redaction.boundaries import ensure_safe_replacement
+    from clawjournal.redaction.candidate_formats import PERSONAL_HOST_BUDGET, personal_host_matches
+
+    old = re.compile(old_pattern, flags)
+    new, core = ((candidate_formats._PERSONAL_HOST, candidate_formats._PERSONAL_HOST_CORE) if flags
+                 else (pii._PERSONAL_HOST_RULE, pii._PERSONAL_HOST_RULE_CORE))
+    assert new.pattern == old.pattern and new.flags == old.flags
     rng = random.Random(230)
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEF0123456789"
+    letters = "abcdefghijklmnopqrstuvwxyz" + ("ABCDEF" if flags else "")
+    alphabet = letters + "0123456789"
     keywords = ("macbook", "imac", "laptop", "desktop", "pc", "workstation", "server")
 
-    def run():
-        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 150)))
+    def run(minimum):
+        length = rng.choice((rng.randint(minimum, 12), rng.randint(minimum, 70), rng.randint(minimum, 150)))
+        return rng.choice(letters) + "".join(rng.choice(alphabet) for _ in range(length - 1))
 
-    for _ in range(3000):
-        text = (rng.choice(("", " ", "/", "_", "x", "\u4e2d")) + run() + rng.choice(("", "s")) + "-"
-                + rng.choice(keywords) + rng.choice(("", "-")) + run()
-                + rng.choice(("", " ", "_", "\u4e2d", "-x")))
-        for pattern in (_PERSONAL_HOST, legacy):
-            for match in pattern.finditer(text):
-                candidate = match.group(1)
-                assert len(candidate.encode("utf-8")) <= 62, (len(candidate), text[:80])
-                assert keyword.search(candidate)
-                ensure_safe_replacement(candidate, "personal_hostname")
-        ensure_text_boundaries(text)
+    for _ in range(4000):
+        text = " ".join(
+            rng.choice(("", "/", "(", "id:", "_", "9", "\u4e2d")) + run(1) + rng.choice(("", "s")) + "-"
+            + rng.choice(keywords) + rng.choice(("", "-", "-" + run(1), run(1)))
+            + rng.choice(("", ".", ")", "-x", "_", "\u4e2d", "- x"))
+            for _ in range(rng.randint(1, 3))
+        )
+        old_spans = [m.span(1) for m in old.finditer(text)]
+        new_spans = [m.span(1) for m in personal_host_matches(new, core, text)]
+        for start, end in old_spans:
+            if end - start <= PERSONAL_HOST_BUDGET:
+                assert (start, end) in new_spans, (text, (start, end), new_spans)
+            else:
+                inside = [span for span in new_spans if start <= span[0] < span[1] <= end]
+                assert len(inside) == 1, (text, (start, end), new_spans)
+                assert inside[0][1] - inside[0][0] <= PERSONAL_HOST_BUDGET
+        for start, end in new_spans:
+            assert any(s <= start < end <= e for s, e in old_spans), (text, (start, end), old_spans)
+            candidate = text[start:end]
+            assert _KEYWORD.search(candidate)
+            ensure_safe_replacement(candidate, "personal_hostname")
+
+
+@pytest.mark.parametrize("text", [
+    "foo_" + "b" * 40 + "-laptop", "1" + "b" * 39 + "-laptop", "foo_alex-laptop",
+], ids=["underscore-long-run", "digit-first-long-run", "underscore-short-run"])
+def test_runs_without_a_valid_start_keep_the_original_behaviour(render_builtin, text):
+    # The rules still require a word boundary and a leading letter, exactly
+    # as before; the bounded core applies only inside an oversized match.
+    assert render_builtin(text) == text

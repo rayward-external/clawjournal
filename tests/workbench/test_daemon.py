@@ -8492,11 +8492,13 @@ def test_issue_230_long_run_next_to_device_name_previews_without_ai(server, endp
     # is replaced and the rest of the run stays, so the preview completes.
     hashed = 'image sha ' + 'a' * 64 + '-server ok'
     glued = 'Before ' + 'ordinaryprose' * 6 + 'alex-laptop after'
+    complete = 'on alex-laptop-alexandermontgomery now'  # 31 bytes: replaced in full, as before
     with open_index() as conn:
         upsert_sessions(conn, [{
             'session_id': 'issue-230', 'source': 'codex', 'project': 'synthetic',
             'messages': [{'role': 'user', 'content': hashed, 'tool_uses': []},
-                         {'role': 'assistant', 'content': glued, 'tool_uses': []}],
+                         {'role': 'assistant', 'content': glued, 'tool_uses': []},
+                         {'role': 'user', 'content': complete, 'tool_uses': []}],
         }])
     status, body = _get(server, f'/api/sessions/issue-230/{endpoint}')
     assert status == 200, body
@@ -8504,8 +8506,9 @@ def test_issue_230_long_run_next_to_device_name_previews_without_ai(server, endp
     assert [m['content'] for m in result['messages']] == [
         'image sha ' + 'a' * 32 + '[REDACTED_DEVICE_ID] ok',
         'Before ' + ('ordinaryprose' * 6)[:50] + '[REDACTED_DEVICE_ID] after',
+        'on [REDACTED_DEVICE_ID] now',
     ]
-    assert 'alex-laptop' not in json.dumps(body)
+    assert 'alex-laptop' not in json.dumps(body) and 'montgomery' not in json.dumps(body)
     if endpoint == 'redaction-report':
         assert body['review_snapshot_id'] and body['reviewed_revision']
         assert body['ai_coverage'] == 'disabled'
