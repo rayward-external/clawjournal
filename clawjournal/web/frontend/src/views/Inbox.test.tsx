@@ -276,10 +276,10 @@ describe('Inbox bulk status updates', () => {
   });
 
   it('refills from the first page without reselecting a deliberately excluded row', async () => {
-    const initialSessions = Array.from({ length: 11 }, (_, index) => session(`s${index + 1}`));
+    const initialSessions = Array.from({ length: 51 }, (_, index) => session(`s${index + 1}`));
     const list = vi.spyOn(api.sessions, 'list')
       .mockResolvedValueOnce(initialSessions)
-      .mockResolvedValueOnce([session('s10'), session('s11')]);
+      .mockResolvedValueOnce([session('s50'), session('s51')]);
     vi.spyOn(api, 'stats').mockResolvedValue(stats(initialSessions.length));
     vi.spyOn(api.sessions, 'bulkStatus').mockImplementation(async ids => ({
       updated_ids: ids,
@@ -293,23 +293,26 @@ describe('Inbox bulk status updates', () => {
     );
 
     await screen.findByRole('checkbox', { name: 'Select session: Session s1' });
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select session: Session s10' }));
-    expect(screen.getByText('9 selected')).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Sessions per page' })).toHaveValue('50');
+    expect(screen.getByText('50 selected')).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: 'Select session: Session s51' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select session: Session s50' }));
+    expect(screen.getByText('49 selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Approve' }));
 
     const nextSession = await screen.findByRole('checkbox', {
-      name: 'Select session: Session s11',
+      name: 'Select session: Session s51',
     });
     expect(list).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole('checkbox', { name: 'Select session: Session s10' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Select session: Session s50' })).not.toBeChecked();
     expect(nextSession).toBeChecked();
     expect(screen.getByText('1 selected')).toBeInTheDocument();
     expect(screen.queryByText('Every session has been reviewed.')).not.toBeInTheDocument();
   });
 
   it('keeps new rows unselected after Clear opts out of automatic selection', async () => {
-    const initialSessions = Array.from({ length: 11 }, (_, index) => session(`s${index + 1}`));
+    const initialSessions = Array.from({ length: 51 }, (_, index) => session(`s${index + 1}`));
     vi.spyOn(api.sessions, 'list')
       .mockResolvedValueOnce(initialSessions)
       .mockResolvedValueOnce(initialSessions.slice(1));
@@ -335,7 +338,7 @@ describe('Inbox bulk status updates', () => {
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Approve' }));
 
     const nextSession = await screen.findByRole('checkbox', {
-      name: 'Select session: Session s11',
+      name: 'Select session: Session s51',
     });
     expect(screen.getByRole('checkbox', { name: 'Select session: Session s2' })).not.toBeChecked();
     expect(nextSession).not.toBeChecked();
