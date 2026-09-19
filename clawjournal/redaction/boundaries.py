@@ -46,6 +46,9 @@ def ensure_safe_replacement(value: str, rule: str) -> None:
             or any(len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in domain.split("."))
         )
     elif rule in {"internal_tld_host", "internal_host_context", "personal_hostname", "device_id", "url_hostname"}:
+        # ASCII personal_hostname candidates fit this budget by construction
+        # (candidate_formats.personal_host_matches). The check still applies
+        # to non-ASCII case-fold letters and to the other rules.
         oversized = len(value.encode("utf-8", errors="surrogatepass")) > 253 or any(
             len(label.encode("utf-8", errors="surrogatepass")) > 63 for label in value.rstrip(".").split(".")
         )

@@ -999,6 +999,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   };
 
   const retryAiReview = async (id: string) => {
+    if (!aiPiiEnabled) return;
     const run = beginRedactionRetry(redactionRetryRef.current, id);
     if (!run) return;
     // A refreshed preview may contain new messages. Inclusion of the previous
@@ -1028,7 +1029,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           break;
         } catch (e) {
           if (!isActive()) return;
-          if (e instanceof ApiError && e.status === 408) break;
+          if (e instanceof ApiError && [408, 409, 422].includes(e.status)) break;
           if (attempt === 0) await new Promise((r) => setTimeout(r, 800));
         }
       }

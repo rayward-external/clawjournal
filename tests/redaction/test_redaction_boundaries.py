@@ -7,6 +7,7 @@ External detectors are isolated here, so these are not upload-gate tests.
 import hashlib
 import itertools
 import random
+import re
 import sqlite3
 import subprocess
 import sys
@@ -259,12 +260,12 @@ def test_additional_rules_keep_ordinary_controls(render_builtin, text):
     "a" * 65 + "@audit.test", "user@" + "b" * 64 + ".test",
     "12345678:" + "A" * 200_000, "1" * 200_000 + ":" + TOKEN_BODY,
     "12345678%3A" + "A" * 200_000, "TELEGRAM_BOT_TOKEN=" + "A" * 200_000,
-    "a." * 100_000 + "local", "a" * 64 + ".local", "A" * 200_000 + "-laptop",
+    "a." * 100_000 + "local", "a" * 64 + ".local", "\u212a" * 32 + "-laptop",
     "DB_HOST=" + "a" * 200_000,
     ".".join(["a" * 63] * 3 + ["b" * 56, "local"]),
 ], ids=["attached-email", "truncated-email", "quoted-email", "local-65", "domain-label-64",
         "long-token-tail", "long-token-id", "escaped-token", "named-token",
-        "many-host-labels", "host-label-64", "uppercase-personal-host", "host-field", "host-254"])
+        "many-host-labels", "host-label-64", "kelvin-personal-host", "host-field", "host-254"])
 def test_oversized_candidates_are_deferred_without_mutation(render_builtin, value):
     from clawjournal.redaction.boundaries import RedactionBoundaryError
 
@@ -310,7 +311,8 @@ def test_short_telegram_id_in_documented_bot_url(render_builtin):
     assert render_builtin(text) == "https://api.telegram.org/bot[REDACTED]/getMe"
 
 
-@pytest.mark.parametrize("host", ["ALEX-LAPTOP", "Alexs-MacBook-Pro", "alex-laptop", "ALEX-PC"])
+@pytest.mark.parametrize("host", ["ALEX-LAPTOP", "Alexs-MacBook-Pro", "alex-laptop", "ALEX-PC",
+                                  "richards-macbook-pro", "alice-desktop-01", "Ilgins-MacBook-Air"])
 def test_personal_host_case_preserves_surrounding_text(render_builtin, host):
     assert render_builtin("前：" + host + "；后") == "前：[REDACTED_DEVICE_ID]；后"
 
@@ -755,3 +757,93 @@ def test_generic_secret_values_cannot_gain_configuration_reference_exemptions(re
     # Parentheses can be literal password characters in configuration data.
     # A Python parse alone must not exempt arbitrary credential assignments.
     assert render_builtin(field + '=SecretPass123()') == field + '=[REDACTED_ENV_SECRET]'
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("alex-laptop-alexandermontgomery", "[REDACTED_DEVICE_ID]"),
+    ("richardwilliamsmithjohnsonthe3rd1985-laptop", "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop-" + "f" * 17, "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop-" + "f" * 10, "[REDACTED_DEVICE_ID]"),
+    ("alex-laptop" + "A" * 30, "[REDACTED_DEVICE_ID]"),
+    ("host " + "n" * 50 + "-laptop-" + "t" * 5 + " ok", "host [REDACTED_DEVICE_ID] ok"),
+    ("A" * 200_000 + "-laptop", "A" * 199_968 + "[REDACTED_DEVICE_ID]"),
+    ("image sha " + "a" * 64 + "-server ok", "image sha " + "a" * 32 + "[REDACTED_DEVICE_ID] ok"),
+    ("deploy app-server-" + "f" * 80 + " done", "deploy [REDACTED_DEVICE_ID]" + "f" * 64 + " done"),
+    ("run Codex-Desktop-" + "0123456789abcdef" * 5 + " done",
+     "run [REDACTED_DEVICE_ID]" + "0123456789abcdef" * 4 + " done"),
+    ("Before " + "ordinaryprose" * 6 + "alex-laptop after",
+     "Before " + ("ordinaryprose" * 6)[:50] + "[REDACTED_DEVICE_ID] after"),
+    ("p" * 40 + "-laptop-" + "t" * 30, "p" * 8 + "[REDACTED_DEVICE_ID]" + "t" * 14),
+    ("alex-laptop" + "b" * 70, "[REDACTED_DEVICE_ID]" + "b" * 54),
+], ids=["dashed-name-tail", "long-name", "dashed-tail-17", "dashed-tail-10", "undelimited-tail-30",
+        "budget-63", "uppercase-personal-host", "hash-prefix", "hex-tail-with-dash",
+        "mixed-case-product-tail", "glued-prose", "both-runs-long", "attached-tail-70"])
+def test_personal_host_candidates_within_budget_stay_complete_and_longer_ones_are_bounded(render_builtin, value, expected):
+    # Issue #230: a long run next to a device keyword refused the whole trace.
+    # Up to 63 bytes the replacement is unchanged; beyond it, only a bounded
+    # core around the keyword is replaced and the surplus run stays.
+    from clawjournal.redaction.boundaries import ensure_text_boundaries
+
+    assert render_builtin(value) == expected
+    ensure_text_boundaries(value)
+    secrets.redact_text(value, strict=True)
+
+
+_OLD_PERSONAL_HOST = r"([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)"
+_KEYWORD = re.compile(r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)", re.I)
+
+
+@pytest.mark.parametrize("flags,old_pattern", [
+    (re.I, "(?<![A-Za-z0-9_])" + _OLD_PERSONAL_HOST + "(?![A-Za-z0-9_])"),
+    (0, r"\b" + _OLD_PERSONAL_HOST + r"\b"),
+], ids=["candidate-scan", "legacy-rule"])
+def test_personal_host_matches_equal_the_original_rule_up_to_the_budget(flags, old_pattern):
+    # The scanning rules are the #225 rules, unchanged. The adapter must return
+    # their exact spans up to the budget and one bounded span beyond it.
+    from clawjournal.redaction import candidate_formats, pii
+    from clawjournal.redaction.boundaries import ensure_safe_replacement
+    from clawjournal.redaction.candidate_formats import PERSONAL_HOST_BUDGET, personal_host_matches
+
+    old = re.compile(old_pattern, flags)
+    new, core = ((candidate_formats._PERSONAL_HOST, candidate_formats._PERSONAL_HOST_CORE) if flags
+                 else (pii._PERSONAL_HOST_RULE, pii._PERSONAL_HOST_RULE_CORE))
+    assert new.pattern == old.pattern and new.flags == old.flags
+    rng = random.Random(230)
+    letters = "abcdefghijklmnopqrstuvwxyz" + ("ABCDEF" if flags else "")
+    alphabet = letters + "0123456789"
+    keywords = ("macbook", "imac", "laptop", "desktop", "pc", "workstation", "server")
+
+    def run(minimum):
+        length = rng.choice((rng.randint(minimum, 12), rng.randint(minimum, 70), rng.randint(minimum, 150)))
+        return rng.choice(letters) + "".join(rng.choice(alphabet) for _ in range(length - 1))
+
+    for _ in range(4000):
+        text = " ".join(
+            rng.choice(("", "/", "(", "id:", "_", "9", "\u4e2d")) + run(1) + rng.choice(("", "s")) + "-"
+            + rng.choice(keywords) + rng.choice(("", "-", "-" + run(1), run(1)))
+            + rng.choice(("", ".", ")", "-x", "_", "\u4e2d", "- x"))
+            for _ in range(rng.randint(1, 3))
+        )
+        old_spans = [m.span(1) for m in old.finditer(text)]
+        new_spans = [m.span(1) for m in personal_host_matches(new, core, text)]
+        for start, end in old_spans:
+            if end - start <= PERSONAL_HOST_BUDGET:
+                assert (start, end) in new_spans, (text, (start, end), new_spans)
+            else:
+                inside = [span for span in new_spans if start <= span[0] < span[1] <= end]
+                assert len(inside) == 1, (text, (start, end), new_spans)
+                assert inside[0][1] - inside[0][0] <= PERSONAL_HOST_BUDGET
+        for start, end in new_spans:
+            assert any(s <= start < end <= e for s, e in old_spans), (text, (start, end), old_spans)
+            candidate = text[start:end]
+            assert _KEYWORD.search(candidate)
+            ensure_safe_replacement(candidate, "personal_hostname")
+
+
+@pytest.mark.parametrize("text", [
+    "foo_" + "b" * 40 + "-laptop", "1" + "b" * 39 + "-laptop", "foo_alex-laptop",
+], ids=["underscore-long-run", "digit-first-long-run", "underscore-short-run"])
+def test_runs_without_a_valid_start_keep_the_original_behaviour(render_builtin, text):
+    # The rules still require a word boundary and a leading letter, exactly
+    # as before; the bounded core applies only inside an oversized match.
+    assert render_builtin(text) == text

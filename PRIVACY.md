@@ -49,6 +49,13 @@ The email checks use a 64-byte local-part and 254-byte mailbox budget. Hostnames
 use 63 bytes per label and 253 bytes overall. These are conservative UTF-8
 replacement budgets, not complete address validators. The Telegram budget is
 128 characters; it is not a claim about the maximum possible token length.
+A personal device-name candidate (`<name>-macbook`, `<name>-laptop` and
+similar) of up to 63 bytes is replaced in full, as before. The scanner
+replaces a longer candidate only around its device keyword: at most 32
+characters before the keyword and 16 after it. The rest of that run stays as
+ordinary text, and the other rules still scan it. The hostname byte budget
+still applies to the replaced text. Only non-ASCII letters can make this rule
+stop a share.
 Email, Telegram-token and internal-domain regex searches use complete-candidate
 adapters. Required markers locate possible matches; the unchanged regexes
 validate them against the original field. They do not repeatedly retry each

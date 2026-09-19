@@ -31,6 +31,51 @@ _PERSONAL_HOST = re.compile(
     r"(?<![A-Za-z0-9_])([a-z][a-z0-9]*s?-(?:macbook|imac|laptop|desktop|pc|workstation|server)-?[a-z0-9]*)(?![A-Za-z0-9_])",
     re.I,
 )
+# A device-name label cannot exceed 63 bytes (RFC 1035), so a candidate longer
+# than that is a run of ordinary text or data joined to a device name. The
+# scanning rules above and in pii.py are unchanged; personal_host_matches()
+# reduces an oversized match to this bounded core inside the match's own
+# span: at most 32 characters (33 with a plural s) before the device keyword
+# and 16 after it. The rest of the run stays as ordinary text, and the other
+# rules still scan it. An oversized ASCII personal_hostname candidate can
+# therefore no longer reach the replacement budget in boundaries.py. That
+# byte budget still applies to the four non-ASCII letters that
+# case-insensitive [a-z] admits (U+0130, U+0131, U+017F, U+212A).
+PERSONAL_HOST_CORE_PATTERN = (
+    r"((?:(?<![A-Za-z0-9_])[a-z][a-z0-9]{0,31}|[a-z0-9]{32})s?"
+    r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)"
+    r"(?:-?[a-z0-9]{16}|-?[a-z0-9]{0,16}(?![A-Za-z0-9_])))"
+)
+PERSONAL_HOST_BUDGET = 63
+_PERSONAL_HOST_CORE = re.compile(PERSONAL_HOST_CORE_PATTERN, re.I)
+# Every device-name match contains this; skip fields without a keyword.
+_PERSONAL_HOST_HINT = re.compile(r"-(?:macbook|imac|laptop|desktop|pc|workstation|server)", re.I)
+
+
+def has_personal_host_hint(text: str) -> bool:
+    """Linear pre-check before the device-name scan."""
+    return _PERSONAL_HOST_HINT.search(text) is not None
+
+
+def personal_host_matches(pattern: re.Pattern[str], core: re.Pattern[str], text: str) -> Iterator[re.Match[str]]:
+    """Yield the rule's own matches; reduce an oversized one to its core.
+
+    `pattern` is an unchanged device-name rule and `core` is
+    PERSONAL_HOST_CORE_PATTERN compiled with the same flags. A match within
+    the replacement budget is returned as is. A longer match is searched
+    again inside its own span, which yields the bounded core. If that search
+    fails, the original match is returned and the budget check still applies.
+    """
+    if not has_personal_host_hint(text):
+        return
+    for match in pattern.finditer(text):
+        if len(match.group(1)) <= PERSONAL_HOST_BUDGET:
+            yield match
+            continue
+        bounded = core.search(text, match.start(1), match.end(1))
+        yield match if bounded is None else bounded
+
+
 _ESCAPED_SEPARATOR = re.compile(r"%([234][0aAeE])|\\u00(2[eE]|3[aA]|40)|&#(?:0*(46|58|64)|[xX]0*(2[eE]|3[aA]|40));")
 _URL_AUTHORITY = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://([^\s/?#\"'`<>|]+)")
 
@@ -279,7 +324,7 @@ def iter_format_candidates(text: str, *, context=None) -> Iterator[dict]:
     for match in _NAMED_TOKEN.finditer(view):
         if not is_reference_prefix(match, "telegram"):
             yield candidate(*match.span(1), "telegram_named", "custom_sensitive")
-    for match in _PERSONAL_HOST.finditer(view):
+    for match in personal_host_matches(_PERSONAL_HOST, _PERSONAL_HOST_CORE, view):
         yield candidate(*match.span(1), "personal_hostname", "device_id")
     suffixes = iter(_HOST_SUFFIX.finditer(view))
     suffix = next(suffixes, None)

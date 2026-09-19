@@ -249,10 +249,10 @@ export function HelpModal({ onClose, aiPiiEnabled = false }: { onClose: () => vo
   );
 }
 
-export function StatusDot({ status }: { status: 'checking' | 'clear' | 'review' }) {
+export function StatusDot({ status }: { status: 'checking' | 'clear' | 'review' | 'blocked' }) {
   const palette = status === 'clear'
     ? { dot: colors.green500, halo: colors.green100 }
-    : status === 'review'
+    : status === 'review' || status === 'blocked'
       ? { dot: colors.yellow400, halo: colors.yellow100 }
       : { dot: colors.gray400, halo: colors.gray200 };
   return (

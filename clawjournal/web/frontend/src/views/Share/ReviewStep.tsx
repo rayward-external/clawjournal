@@ -33,14 +33,15 @@ export function ReviewStep(p: ReviewStepProps) {
   const sorted = [...p.queuedSessions].sort((a, b) => {
     const sa = classify(p.redactedSessions[a.session_id]);
     const sb = classify(p.redactedSessions[b.session_id]);
-    const order = { review: 0, checking: 1, clear: 2 };
+    const order = { blocked: 0, review: 1, checking: 2, clear: 3 };
     return order[sa] - order[sb];
   });
 
   const approvedCount = p.queuedSessions.filter((s) => p.approvedIds.has(s.session_id)).length;
   const needsReviewCount = p.queuedSessions.filter((s) => (
-    classify(p.redactedSessions[s.session_id]) === 'review'
+    !p.approvedIds.has(s.session_id) && classify(p.redactedSessions[s.session_id]) === 'review'
   )).length;
+  const blockedCount = p.queuedSessions.filter((s) => classify(p.redactedSessions[s.session_id]) === 'blocked').length;
   const excludedCount = p.queuedSessions.length - approvedCount;
   const canPackage = approvedCount > 0;
   const visibleSessions = sorted.slice(0, visibleCount);
@@ -58,7 +59,7 @@ export function ReviewStep(p: ReviewStepProps) {
       </h1>
       <p style={{ margin: '0 0 20px', fontSize: 14, color: colors.gray500, maxWidth: '60ch', lineHeight: 1.55 }}>
         Safe traces are included automatically. Anything uncertain stays out unless you
-        choose to review and include it. This share uses the versions shown here.
+        choose to review and include it. Failed previews stay excluded until redaction succeeds. This share uses the versions shown here.
         Later changes stay local for a future share.
       </p>
 
@@ -73,7 +74,7 @@ export function ReviewStep(p: ReviewStepProps) {
         <SummaryStat value={approvedCount} label="ready to share" color={colors.green500} />
         <SummaryStat
           value={excludedCount}
-          label={needsReviewCount > 0 ? `not included · ${needsReviewCount} need review` : 'not included'}
+          label={`not included${needsReviewCount ? ` · ${needsReviewCount} need review` : ''}${blockedCount ? ` · ${blockedCount} preview failed` : ''}`}
           color={excludedCount > 0 ? colors.yellow700 : colors.gray500}
         />
       </div>
@@ -187,9 +188,10 @@ function ReviewRow({
   const aiDisabled = data?.aiCoverage === 'disabled' || !aiPiiEnabled;
 
   // Meta label under the title — no raw finding counts, just a neutral phrase.
-  const metaPhrase: string | null = status === 'review'
+  const metaPhrase: string | null = approved ? null : status === 'blocked' ? 'preview failed · cannot include' : status === 'review'
     ? (aiDisabled ? 'needs review · rules-only' : aiUnavailable ? 'needs review · AI unavailable' : 'needs review')
     : null;
+  const cannotInclude = !!data?.previewError || !data?.reviewSnapshotId || !data?.reviewedRevision || data?.loading;
 
   return (
     <div style={{
@@ -413,7 +415,7 @@ function ReviewRow({
                 Exclude from bundle
               </button>
             ) : (
-              <button onClick={onApprove} disabled={!!data?.previewError || !data?.reviewSnapshotId || !data?.reviewedRevision || data?.loading} style={btnPrimary}>
+              <button onClick={onApprove} disabled={cannotInclude} style={{ ...btnPrimary, opacity: cannotInclude ? 0.4 : 1, cursor: cannotInclude ? 'not-allowed' : 'pointer' }}>
                 <Icon name="check" size={13} />
                 Include in bundle
               </button>

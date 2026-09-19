@@ -7797,6 +7797,70 @@ class TestShareAPI:
         assert status == 200, data
         assert captured["manifest"]["redaction_summary"]["pii_review"]["ai_enabled"] is False
 
+    @pytest.mark.parametrize("ai_pii", [False, True], ids=["ai-off", "ai-on"])
+    def test_issue_230_device_names_preview_and_upload(
+        self, server, monkeypatch, issue_230_device_text, ai_pii,
+    ):
+        """The saved preview and uploaded ZIP both redact oversized device names."""
+        from clawjournal.workbench.index import get_session_detail, get_share
+
+        original, expected = issue_230_device_text
+        session_id = "issue-230-upload"
+        self._seed_released_session(session_id, original)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: _share_config())
+        preview_ai = MagicMock(return_value=[])
+        upload_ai = MagicMock(return_value=([], "full"))
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_with_agent", preview_ai)
+        monkeypatch.setattr("clawjournal.redaction.pii.review_session_pii_hybrid", upload_ai)
+        monkeypatch.setattr(WorkbenchHandler, "_last_share_time", 0.0)
+
+        status, report = _get(
+            server, f"/api/sessions/{session_id}/redaction-report?ai_pii={int(ai_pii)}",
+        )
+        assert status == 200, report
+        assert report["redacted_session"]["messages"][0]["content"] == expected
+        assert report["ai_coverage"] == ("full" if ai_pii else "disabled")
+        status, created = _post(server, "/api/shares", {
+            "session_ids": [session_id],
+            "expected_revisions": {session_id: report["reviewed_revision"]},
+            "review_snapshot_ids": {session_id: report["review_snapshot_id"]},
+        })
+        assert status == 201, created
+        share_id = created["share_id"]
+        captured = []
+
+        def inspect_upload(req):
+            body = req.data
+            start, end = body.index(b"PK\x03\x04"), body.rfind(b"\r\n--")
+            with zipfile.ZipFile(BytesIO(body[start:end])) as archive:
+                sessions = [json.loads(line) for line in archive.read("sessions.jsonl").splitlines()]
+                assert len(sessions) == 1
+                assert sessions[0]["messages"][0]["content"] == expected
+                assert sessions[0]["revision_hash"] == report["reviewed_revision"]
+                manifest = json.loads(archive.read("manifest.json"))
+                assert manifest["redaction_summary"]["pii_review"]["ai_enabled"] is ai_pii
+                captured.append(sessions[0])
+
+        with patch(
+            "clawjournal.workbench.daemon.urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(upload_assert=inspect_upload),
+        ):
+            status, result = _post(server, f"/api/shares/{share_id}/upload", {
+                **self._consent_body(), "ai_pii": ai_pii,
+            })
+        assert status == 200, result
+        assert result["receipt_id"] == "rcpt-test-123"
+        assert len(captured) == 1
+        for reviewer in (preview_ai, upload_ai):
+            if ai_pii:
+                reviewer.assert_called_once()
+                assert reviewer.call_args.args[0]["messages"][0]["content"] == expected
+            else:
+                reviewer.assert_not_called()
+        with open_index() as conn:
+            assert get_share(conn, share_id)["status"] == "shared"
+            assert get_session_detail(conn, session_id)["messages"][0]["content"] == original
+
     def test_share_upload_requires_consent_body(self, server, monkeypatch):
         WorkbenchHandler._last_share_time = 0.0
         share_id = self._create_and_export_share(server)
@@ -8483,3 +8547,56 @@ def test_boundary_review_returns_actionable_error_and_custom_redaction_can_resol
     result = body['redacted_session'] if endpoint == 'redaction-report' else body
     assert value not in json.dumps(result)
     assert '[REDACTED' in json.dumps(result)
+
+
+@pytest.fixture
+def issue_230_device_text():
+    """Synthetic reproductions; Richard's exact source trace is not available."""
+    return (
+        '\n'.join([
+            'image sha ' + 'a' * 64 + '-server ok',
+            'Before ' + 'ordinaryprose' * 6 + 'alex-laptop after',
+            'deploy app-server-' + 'f' * 80 + ' done',
+            'on alex-laptop-alexandermontgomery now',
+            'host ' + 'n' * 50 + '-laptop-' + 't' * 5 + ' ok',
+        ]),
+        '\n'.join([
+            'image sha ' + 'a' * 32 + '[REDACTED_DEVICE_ID] ok',
+            'Before ' + ('ordinaryprose' * 6)[:50] + '[REDACTED_DEVICE_ID] after',
+            'deploy [REDACTED_DEVICE_ID]' + 'f' * 64 + ' done',
+            'on [REDACTED_DEVICE_ID] now',
+            'host [REDACTED_DEVICE_ID] ok',
+        ]),
+    )
+
+
+@pytest.mark.parametrize('endpoint,ai_pii', [
+    ('redacted', False), ('redaction-report', False), ('redaction-report', True),
+], ids=['redacted', 'report-ai-off', 'report-ai-on'])
+def test_issue_230_long_run_next_to_device_name_previews(
+    server, monkeypatch, issue_230_device_text, endpoint, ai_pii,
+):
+    # Issue #230: Codex Desktop traces were refused with a personal_hostname
+    # boundary error while the AI toggle was off. The bounded device-name core
+    # is replaced and the rest of the run stays, so the preview completes.
+    original, expected = issue_230_device_text
+    reviewer = MagicMock(return_value=[])
+    monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent', reviewer)
+    with open_index() as conn:
+        upsert_sessions(conn, [{
+            'session_id': 'issue-230', 'source': 'codex', 'project': 'synthetic',
+            'messages': [{'role': 'user', 'content': original, 'tool_uses': []}],
+        }])
+    status, body = _get(server, f'/api/sessions/issue-230/{endpoint}?ai_pii={int(ai_pii)}')
+    assert status == 200, body
+    result = body['redacted_session'] if endpoint == 'redaction-report' else body
+    assert result['messages'][0]['content'] == expected
+    assert 'alex-laptop' not in json.dumps(body) and 'montgomery' not in json.dumps(body)
+    if endpoint == 'redaction-report':
+        assert body['review_snapshot_id'] and body['reviewed_revision']
+        assert body['ai_coverage'] == ('full' if ai_pii else 'disabled')
+    if ai_pii:
+        reviewer.assert_called_once()
+        assert reviewer.call_args.args[0]['messages'][0]['content'] == expected
+    else:
+        reviewer.assert_not_called()

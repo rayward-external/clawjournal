@@ -109,7 +109,7 @@ describe('Reviewed share versions', () => {
     );
     expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
-    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    expect(await screen.findByText(available ? 'Redaction complete' : 'Redaction finished with failed previews')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     expect(await screen.findByText(/Later changes stay local for a future share/)).toBeInTheDocument();
     if (available) {
@@ -121,7 +121,7 @@ describe('Reviewed share versions', () => {
       ));
     } else {
       expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
-      expect(screen.getByText('Optional: inspect 1 excluded trace.')).toBeInTheDocument();
+      expect(screen.getByText('not included · 1 preview failed')).toBeInTheDocument();
       expect(create).not.toHaveBeenCalled();
     }
   });
@@ -897,7 +897,7 @@ describe('Failed saved previews', () => {
     render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
     expect(await screen.findByText('3 traces selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
-    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Package 2 traces' }));
     await waitFor(() => expect(create).toHaveBeenCalled());
@@ -917,7 +917,7 @@ describe('Failed saved previews', () => {
     render(<MemoryRouter initialEntries={['/share']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
     expect(await screen.findByText('1 trace selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
-    expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
+    expect(await screen.findByText('Redaction finished with failed previews')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
     expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Review details' }));
@@ -925,6 +925,8 @@ describe('Failed saved previews', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Add an explicit redaction before sharing.');
     expect(screen.queryByText('Nothing matched the deterministic rules.')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Include in bundle' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Include in bundle' })).toHaveStyle({ opacity: '0.4', cursor: 'not-allowed' });
+    expect(screen.getByText('preview failed · cannot include')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Redact$/ }));
     await waitFor(() => expect(report).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Redaction complete')).toBeInTheDocument();
