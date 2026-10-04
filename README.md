@@ -186,6 +186,7 @@ clawjournal share --interactive --weekly --no-score # guided sharing without AI 
 clawjournal status                       # check your setup
 clawjournal --version                    # show the package version and checkout revision
 clawjournal doctor index --json          # collect bounded, path-free index diagnostics
+clawjournal storage allow-network        # keep state on cluster/network storage for this machine only
 clawjournal selfupdate --check           # see whether a newer version is available
 clawjournal selfupdate --reinstall       # update and rerun the installer in one step
 clawjournal selfupdate --reinstall --with-frontend --with-sharing # also add UI + managed scanners
@@ -214,6 +215,17 @@ can positively identify the state directory as a network filesystem. Unknown
 filesystem types keep the existing behavior, so cluster users should still
 confirm the target with their administrator. Do not use an ephemeral node-local
 temporary directory for state that must survive a reboot or job migration.
+
+Many HPC clusters have no private, persistent local storage at all: home is on
+NFS, scratch is on Lustre or GPFS and purged on a schedule, and `/tmp` is wiped
+on reboot. There, keep the state where it is (normally your home directory, not
+purged scratch) and run `clawjournal storage allow-network` once. ClawJournal
+then uses its state on network storage from that machine only; it uses SQLite's
+rollback journal, which works on network storage as long as only one machine
+uses it. Every other machine stays blocked so two login nodes can never write
+the index at the same time. To switch machines, stop ClawJournal on the old one
+and run `clawjournal storage allow-network --take-over` on the new one. The
+command refuses filesystems that do not support the file locks SQLite needs.
 
 `clawjournal doctor index --json` is read-only and does not require the external
 `sqlite3` command. Its output is deliberately bounded and omits state paths,

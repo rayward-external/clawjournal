@@ -67,7 +67,23 @@ describe('IndexRecoveryScreen', () => {
     expect(screen.getByRole('button', { name: 'Back up and rebuild index' })).toBeEnabled();
   });
 
-  it('requires a complete home migration and withholds sensitive storage diagnostics', () => {
+  it('keeps recovery available on network storage allowed for this machine', () => {
+    render(
+      <IndexRecoveryScreen
+        health={recoveryRequired({
+          storage_risk: 'network',
+          filesystem_type: 'nfs4',
+          storage_migration_required: false,
+          network_storage_claim: 'this_machine',
+        })}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Back up and rebuild index' })).toBeEnabled();
+  });
+
+  it('offers a complete home migration or a single-machine network allowance', () => {
     const rebuild = vi.spyOn(api.index, 'rebuild');
     render(
       <IndexRecoveryScreen
@@ -84,12 +100,15 @@ describe('IndexRecoveryScreen', () => {
     );
 
     const alert = screen.getByRole('alert');
-    expect(alert).toHaveAccessibleName('Copy ClawJournal state to local storage first');
-    expect(screen.getByRole('list', { name: 'Required storage migration steps' })).toHaveTextContent(
+    expect(alert).toHaveAccessibleName('ClawJournal state is on network storage');
+    expect(screen.getByRole('list', { name: 'Steps to move state to local storage' })).toHaveTextContent(
       'Copy the entire CLAWJOURNAL_HOME directory',
     );
     expect(alert).toHaveTextContent('Keep the original unchanged until recovery succeeds');
     expect(alert).toHaveTextContent('Do not copy only the index database');
+    const allowSteps = screen.getByRole('list', { name: 'Steps to allow network storage on this machine' });
+    expect(allowSteps).toHaveTextContent('clawjournal storage allow-network');
+    expect(allowSteps).toHaveTextContent('use it only from this machine');
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
     expect(screen.queryByText(/network\/users\/alice|server:\/private\/home/i)).not.toBeInTheDocument();
     expect(rebuild).not.toHaveBeenCalled();
@@ -106,7 +125,7 @@ describe('IndexRecoveryScreen', () => {
       />,
     );
 
-    expect(screen.getByRole('heading', { name: 'Copy ClawJournal state to local storage first' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'ClawJournal state is on network storage' })).toBeInTheDocument();
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
   });
 
@@ -126,11 +145,39 @@ describe('IndexRecoveryScreen', () => {
     );
 
     const alert = screen.getByRole('alert');
-    expect(alert).toHaveTextContent('will not open, create, or rebuild');
+    expect(alert).toHaveTextContent('has not opened, created, or rebuilt');
     expect(alert).toHaveTextContent('offer repair only if it is still needed');
     expect(alert).not.toHaveTextContent('raw backend message');
     expect(alert).not.toHaveTextContent('/private/cluster/alice');
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it('explains how to move a network allowance from another machine', () => {
+    const rebuild = vi.spyOn(api.index, 'rebuild');
+    render(
+      <IndexRecoveryScreen
+        health={{
+          status: 'unavailable',
+          message: 'This raw backend message must stay hidden.',
+          storage_risk: 'network',
+          filesystem_type: 'nfs4',
+          storage_migration_required: true,
+          network_storage_claim: 'other_machine',
+          database_path: '/private/cluster/alice/index.db',
+        }}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveAccessibleName('ClawJournal is set up on another machine');
+    expect(screen.getByRole('list', { name: 'Steps to move ClawJournal to this machine' })).toHaveTextContent(
+      'clawjournal storage allow-network --take-over',
+    );
+    expect(alert).not.toHaveTextContent('raw backend message');
+    expect(alert).not.toHaveTextContent('/private/cluster/alice');
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(rebuild).not.toHaveBeenCalled();
   });
 
   it('submits once, disables the action, and accepts an asynchronous rebuilding response', async () => {

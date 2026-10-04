@@ -61,6 +61,50 @@ def test_collect_support_context_has_an_exact_allowlisted_shape(monkeypatch):
     }
 
 
+def test_network_storage_allowed_for_this_machine_is_not_a_migration(monkeypatch):
+    report = support_context.collect_support_context(
+        _environment(monkeypatch),
+        {
+            "status": "ready",
+            "filesystem_type": "nfs4",
+            "storage_risk": "network",
+            "storage_migration_required": False,
+            "network_storage_claim": "this_machine",
+        },
+    )
+
+    assert report["storage"] == {
+        "filesystem_type": "nfs4",
+        "storage_risk": "network",
+        "storage_migration_required": False,
+    }
+    assert report["index"] == {"status": "ready", "condition": None}
+    assert "network_storage_claim" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("claim", [None, "other_machine", "unexpected"])
+def test_network_storage_without_this_machine_claim_stays_fail_closed(
+    monkeypatch,
+    claim,
+):
+    health = {
+        "status": "ready",
+        "filesystem_type": "nfs4",
+        "storage_risk": "network",
+        "storage_migration_required": False,
+    }
+    if claim is not None:
+        health["network_storage_claim"] = claim
+
+    report = support_context.collect_support_context(
+        _environment(monkeypatch),
+        health,
+    )
+
+    assert report["storage"]["storage_migration_required"] is True
+    assert report["index"]["condition"] == "storage_migration_required"
+
+
 @pytest.mark.parametrize("os_family,expected", [
     ("Darwin", "macOS"),
     ("macOS", "macOS"),

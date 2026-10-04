@@ -292,14 +292,14 @@ def _index_path() -> Path:
 
 
 def _filesystem_health_fields(database: Path) -> dict[str, str | bool]:
-    return filesystem_module.classify_filesystem(database).health_fields()
+    return filesystem_module.classify_state_storage(database).health_fields()
 
 
 def _storage_migration_health(
     database: Path,
     storage: filesystem_module.FilesystemInfo | None = None,
 ) -> dict[str, Any]:
-    classification = storage or filesystem_module.classify_filesystem(database)
+    classification = storage or filesystem_module.classify_state_storage(database)
     return {
         "status": "unavailable",
         "code": "storage_migration_required",
@@ -323,7 +323,7 @@ def _require_safe_recovery_storage(
 ) -> filesystem_module.FilesystemInfo:
     """Recheck storage immediately before a recovery filesystem mutation."""
 
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         raise UnsafeIndexRecovery(
             filesystem_module.storage_migration_message(storage)
@@ -403,7 +403,7 @@ def begin_index_health_check() -> dict[str, Any]:
     """Publish the fail-closed startup state before HTTP begins serving."""
 
     database = _index_path()
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         return _set_health(_storage_migration_health(database, storage))
     return _set_health({
@@ -434,7 +434,7 @@ def synchronize_index_health() -> dict[str, Any]:
 
     health = current_index_health()
     database = _index_path()
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         return _set_health(_storage_migration_health(database, storage))
     if (
@@ -465,7 +465,7 @@ def begin_guided_rebuild() -> dict[str, Any]:
 
     with _STATE_LOCK:
         database = _index_path()
-        storage = filesystem_module.classify_filesystem(database)
+        storage = filesystem_module.classify_state_storage(database)
         if storage.storage_migration_required:
             blocked = _storage_migration_health(database, storage)
             _INDEX_HEALTH.clear()
@@ -490,7 +490,7 @@ def begin_guided_rebuild() -> dict[str, Any]:
             try:
                 _write_marker(database, marker)
             except UnsafeIndexRecovery:
-                storage = filesystem_module.classify_filesystem(database)
+                storage = filesystem_module.classify_state_storage(database)
                 if storage.storage_migration_required:
                     blocked = _storage_migration_health(database, storage)
                     _INDEX_HEALTH.clear()
@@ -694,7 +694,7 @@ def _snapshot_from_path(
 
 def inspect_index_health(path: Path | None = None) -> dict[str, Any]:
     database = Path(path) if path is not None else _index_path()
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         return _storage_migration_health(database, storage)
     base: dict[str, Any] = {
@@ -1931,7 +1931,7 @@ def _guided_rebuild_locked(
     # The worker rechecks after acquiring the exclusive connection lease and
     # before publishing a marker or creating the one authoritative backup.
     # This closes the Queue -> worker mount-change window.
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         blocked = _storage_migration_health(database, storage)
         _set_health(blocked)
@@ -2106,7 +2106,7 @@ def _guided_rebuild_locked(
         finally:
             rebuilt.close()
     except Exception as exc:
-        failed_storage = filesystem_module.classify_filesystem(database)
+        failed_storage = filesystem_module.classify_state_storage(database)
         if failed_storage.storage_migration_required:
             # Do not update even the recovery marker after a remount. Its last
             # local, durable stage and v2 backup identity are sufficient for a
@@ -2138,7 +2138,7 @@ def _guided_rebuild_locked(
     finally:
         index_module._set_index_recovery_access(previous_recovery_access)
 
-    final_storage = filesystem_module.classify_filesystem(database)
+    final_storage = filesystem_module.classify_state_storage(database)
     if final_storage.storage_migration_required:
         blocked = _storage_migration_health(database, final_storage)
         _set_health(blocked)
@@ -2169,7 +2169,7 @@ def guided_rebuild(
     """Rebuild only after every guarded cross-process connection has closed."""
 
     database = _index_path()
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         blocked = _storage_migration_health(database, storage)
         _set_health(blocked)
@@ -2185,7 +2185,7 @@ def guided_rebuild(
         try:
             _write_marker(database, marker)
         except UnsafeIndexRecovery:
-            storage = filesystem_module.classify_filesystem(database)
+            storage = filesystem_module.classify_state_storage(database)
             if storage.storage_migration_required:
                 _set_health(_storage_migration_health(database, storage))
             raise
@@ -2214,7 +2214,7 @@ def guided_rebuild(
                 on_source_retired=on_source_retired,
             )
         except UnsafeIndexRecovery:
-            storage = filesystem_module.classify_filesystem(database)
+            storage = filesystem_module.classify_state_storage(database)
             if storage.storage_migration_required:
                 _set_health(_storage_migration_health(database, storage))
             raise

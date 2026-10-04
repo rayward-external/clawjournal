@@ -4,18 +4,48 @@ Only filesystem kinds that can be identified without exposing mount sources or
 mount paths are returned.  Unknown platforms and unrecognised filesystem kinds
 remain usable: callers fail closed only for an explicit, known network or
 cluster filesystem.
+
+Some machines have no private, persistent local storage at all (HPC login
+nodes typically mount home on NFS, scratch on Lustre, and purge /tmp). For
+those, the user can explicitly allow the state root to stay on network storage
+from one machine at a time; see ``allow_network_storage``.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import errno
+import hashlib
+import hmac
+import json
 import os
 import re
+import secrets
+import socket
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
 StorageRisk = Literal["network", "local", "unknown"]
+# Whether the state root on network storage was explicitly allowed for this
+# machine. "other_machine" also covers an unreadable setting: nothing proves
+# that this machine is the only one using the state.
+NetworkStorageClaim = Literal["none", "this_machine", "other_machine"]
+NetworkStorageResult = Literal[
+    "not_needed",
+    "already_allowed",
+    "allowed",
+    "taken_over",
+    "claimed_elsewhere",
+    "locks_unsupported",
+]
+
+NETWORK_STORAGE_FILENAME = "network-storage.json"
+_NETWORK_STORAGE_VERSION = 1
+_NETWORK_STORAGE_DIGEST_CONTEXT = b"clawjournal-network-storage-machine-v1"
+_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class UnsafeStateStorageError(RuntimeError):
@@ -28,17 +58,28 @@ class FilesystemInfo:
 
     filesystem_type: str
     storage_risk: StorageRisk
+    network_storage_claim: NetworkStorageClaim = "none"
+
+    @property
+    def network_storage_allowed(self) -> bool:
+        return (
+            self.storage_risk == "network"
+            and self.network_storage_claim == "this_machine"
+        )
 
     @property
     def storage_migration_required(self) -> bool:
-        return self.storage_risk == "network"
+        return self.storage_risk == "network" and not self.network_storage_allowed
 
     def health_fields(self) -> dict[str, str | bool]:
-        return {
+        fields: dict[str, str | bool] = {
             "filesystem_type": self.filesystem_type,
             "storage_risk": self.storage_risk,
             "storage_migration_required": self.storage_migration_required,
         }
+        if self.storage_risk == "network" and self.network_storage_claim != "none":
+            fields["network_storage_claim"] = self.network_storage_claim
+        return fields
 
 
 _NETWORK_FILESYSTEM_ALIASES = {
@@ -260,14 +301,198 @@ def classify_filesystem(path: Path) -> FilesystemInfo:
     return _classify_linux_mountinfo(target, refreshed_mountinfo)
 
 
+def _network_storage_machine_digest(nonce: str) -> str:
+    """Return a salted, non-reversible identifier for this machine."""
+
+    hostname = socket.gethostname().strip().lower()
+    return hashlib.sha256(
+        b"\0".join((
+            _NETWORK_STORAGE_DIGEST_CONTEXT,
+            nonce.encode("ascii"),
+            hostname.encode("utf-8", "surrogateescape"),
+        ))
+    ).hexdigest()
+
+
+def _network_storage_claim(state_dir: Path) -> NetworkStorageClaim:
+    """Read whether network storage was allowed for this machine."""
+
+    try:
+        payload = json.loads(
+            (state_dir / NETWORK_STORAGE_FILENAME).read_text(encoding="utf-8")
+        )
+    except FileNotFoundError:
+        return "none"
+    except (OSError, ValueError):
+        return "other_machine"
+    if not isinstance(payload, dict):
+        return "other_machine"
+    nonce = payload.get("machine_nonce")
+    digest = payload.get("machine_digest")
+    if (
+        payload.get("version") != _NETWORK_STORAGE_VERSION
+        or not isinstance(nonce, str)
+        or _HEX_64.fullmatch(nonce) is None
+        or not isinstance(digest, str)
+        or _HEX_64.fullmatch(digest) is None
+    ):
+        return "other_machine"
+    if hmac.compare_digest(digest, _network_storage_machine_digest(nonce)):
+        return "this_machine"
+    return "other_machine"
+
+
+def classify_state_storage(database: Path) -> FilesystemInfo:
+    """Classify the index location, honoring an explicit network allowance.
+
+    The allowance lives beside the index in the state root. Use the lexical
+    parent: resolving a known network path can block on a disconnected hard
+    mount.
+    """
+
+    info = classify_filesystem(database)
+    if info.storage_risk != "network":
+        return info
+    state_dir = Path(os.path.abspath(Path(database))).parent
+    return dataclasses.replace(
+        info,
+        network_storage_claim=_network_storage_claim(state_dir),
+    )
+
+
+def _file_locks_supported(directory: Path) -> bool:
+    """Probe the advisory locks SQLite and the index lease rely on.
+
+    Some cluster mounts (for example Lustre without ``flock``) reject them.
+    """
+
+    if os.name == "nt":
+        return True
+    import fcntl
+
+    probe = directory / f".{NETWORK_STORAGE_FILENAME}.{secrets.token_hex(8)}.probe"
+    descriptor = os.open(probe, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"0")
+        try:
+            # SQLite's unix VFS uses fcntl byte-range locks; the index
+            # connection lease uses flock.
+            fcntl.lockf(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.lockf(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            return False
+    finally:
+        os.close(descriptor)
+        probe.unlink(missing_ok=True)
+    return True
+
+
+def _fsync_directory(directory: Path) -> None:
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        # Some network filesystems do not support fsync on directories.
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def allow_network_storage(
+    state_dir: Path,
+    *,
+    take_over: bool = False,
+) -> tuple[NetworkStorageResult, FilesystemInfo]:
+    """Allow the state root to stay on network storage for this machine only.
+
+    SQLite's rollback journal (the index never uses WAL) is reliable on
+    network storage while every process using it runs on one machine, so
+    cross-machine lock and cache coherence never matter. The allowance records a
+    salted identifier for this machine; every other machine stays blocked
+    until the user explicitly moves the allowance with ``take_over``.
+    """
+
+    state_dir = Path(os.path.abspath(Path(state_dir)))
+    database = state_dir / "index.db"
+    info = classify_state_storage(database)
+    if info.storage_risk != "network":
+        return "not_needed", info
+    if info.network_storage_claim == "this_machine":
+        return "already_allowed", info
+    replacing = info.network_storage_claim == "other_machine"
+    if replacing and not take_over:
+        return "claimed_elsewhere", info
+
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not _file_locks_supported(state_dir):
+        return "locks_unsupported", info
+
+    nonce = secrets.token_hex(32)
+    payload = json.dumps(
+        {
+            "version": _NETWORK_STORAGE_VERSION,
+            "allowed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "machine_nonce": nonce,
+            "machine_digest": _network_storage_machine_digest(nonce),
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    target = state_dir / NETWORK_STORAGE_FILENAME
+    if replacing:
+        temporary = state_dir / f".{NETWORK_STORAGE_FILENAME}.{secrets.token_hex(8)}.tmp"
+        try:
+            _write_new_file(temporary, payload)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    else:
+        try:
+            # O_EXCL keeps a concurrent allowance from another machine from
+            # being silently overwritten. A partial file reads as another
+            # machine's claim, so a reader can only fail closed.
+            _write_new_file(target, payload)
+        except FileExistsError:
+            claimed = classify_state_storage(database)
+            if claimed.network_storage_claim == "this_machine":
+                return "already_allowed", claimed
+            return "claimed_elsewhere", claimed
+    _fsync_directory(state_dir)
+    return ("taken_over" if replacing else "allowed"), classify_state_storage(database)
+
+
+def _write_new_file(path: Path, text: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        file.write(text)
+        file.flush()
+        os.fsync(file.fileno())
+
+
 def storage_migration_message(info: FilesystemInfo) -> str:
     """Return the actionable, path-free message for unsafe SQLite storage."""
 
     filesystem_type = sanitized_filesystem_type(info.filesystem_type)
+    if info.network_storage_claim == "other_machine":
+        return (
+            "ClawJournal's state directory is on network storage "
+            f"({filesystem_type}) that is set up for use from another machine. "
+            "Stop ClawJournal on that machine, then run "
+            "clawjournal storage allow-network --take-over on this one and "
+            "restart. Never use the same state from two machines at once."
+        )
     return (
         "ClawJournal's state directory is on a network or shared filesystem "
         f"({filesystem_type}). Stop all ClawJournal processes, copy the "
         "entire state directory to private persistent local storage, set "
         "CLAWJOURNAL_HOME to that local directory, and restart before scanning "
-        "or rebuilding the index."
+        "or rebuilding the index. If this machine has no persistent local "
+        "storage (common on HPC clusters), instead run clawjournal storage "
+        "allow-network to keep the state in place for this machine only, then "
+        "restart."
     )
