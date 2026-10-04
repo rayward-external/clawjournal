@@ -4285,6 +4285,26 @@ def _main() -> None:
     doctor_index.add_argument(
         "--json", action="store_true", help="Output structured JSON report"
     )
+    storage = sub.add_parser(
+        "storage",
+        help="Choose whether ClawJournal state may stay on network storage",
+    )
+    storage_sub = storage.add_subparsers(dest="storage_command", required=True)
+    storage_allow = storage_sub.add_parser(
+        "allow-network",
+        help=(
+            "Keep state on network storage (for example an HPC home directory) "
+            "and use it from this machine only"
+        ),
+    )
+    storage_allow.add_argument(
+        "--take-over",
+        action="store_true",
+        help=(
+            "Move the allowance here from another machine; stop ClawJournal "
+            "on that machine first"
+        ),
+    )
     cf = sub.add_parser("confirm", help="Scan for PII, summarize export, and record review state (JSON)")
     cf.add_argument("--file", "-f", type=Path, default=None, help="Path to export JSONL file")
     cf.add_argument("--full-name", type=str, default=None,
@@ -5236,6 +5256,10 @@ def _main() -> None:
         exit_code = diagnostics_exit_code(report)
         if exit_code:
             raise SystemExit(exit_code)
+        return
+
+    if command == "storage":
+        _run_storage_allow_network(take_over=args.take_over)
         return
 
     if command == "serve":
@@ -7628,6 +7652,84 @@ def _print_pii_guidance(output_path: Path) -> None:
     print(f"  clawjournal export -o {abs_output}")
     print()
     print(f"Found an issue? Help improve ClawJournal: {REPO_URL}/issues")
+
+
+def _run_storage_allow_network(*, take_over: bool) -> None:
+    """Allow network-backed state for this machine, or explain why not."""
+
+    from .filesystem import (
+        allow_network_storage,
+        sanitized_filesystem_type,
+        storage_migration_message,
+    )
+    from .workbench import index as index_module
+
+    # The guard reads the allowance beside the index, so write it there.
+    state_dir = Path(str(index_module.INDEX_DB)).parent
+    try:
+        result, storage = allow_network_storage(state_dir, take_over=take_over)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        print(
+            f"error: could not update the ClawJournal state directory: {reason}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    filesystem_type = sanitized_filesystem_type(storage.filesystem_type)
+
+    if result == "not_needed":
+        print(
+            "ClawJournal did not detect network storage for its state "
+            "directory, so nothing was changed."
+        )
+        return
+    if result == "already_allowed":
+        print(
+            f"Network storage ({filesystem_type}) is already allowed for "
+            "ClawJournal on this machine."
+        )
+        return
+    if result in {"index_symlink", "storage_unavailable"}:
+        print(f"error: {storage_migration_message(storage)}", file=sys.stderr)
+        raise SystemExit(1)
+    if result == "claimed_elsewhere":
+        print(
+            "error: ClawJournal's state on network storage is set up for use "
+            "from another machine. Stop ClawJournal on that machine, then rerun "
+            "clawjournal storage allow-network --take-over here.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if result == "locks_unsupported":
+        print(
+            f"error: this network filesystem ({filesystem_type}) does not "
+            "support the file locks ClawJournal's index needs, so it was not "
+            "allowed. Copy the whole state directory to other storage (on many "
+            "clusters the home directory works), set CLAWJOURNAL_HOME to it, "
+            "and try again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if result == "taken_over":
+        print(
+            f"Moved ClawJournal's network-storage ({filesystem_type}) allowance "
+            "to this machine. ClawJournal on the previous machine is now blocked."
+        )
+    else:
+        print(
+            f"Allowed ClawJournal to keep its state on network storage "
+            f"({filesystem_type}) for this machine only."
+        )
+    print(
+        "Run ClawJournal only from this machine. To switch machines later, stop "
+        "ClawJournal here, then run clawjournal storage allow-network "
+        "--take-over on the other machine."
+    )
+    print(
+        "If ClawJournal is already running, stop it, then start it again "
+        "(for example, clawjournal open) to continue."
+    )
 
 
 def main() -> None:

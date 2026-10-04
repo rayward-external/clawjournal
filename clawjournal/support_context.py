@@ -361,6 +361,7 @@ def _project_cached_health(value: object) -> tuple[dict[str, object], bool]:
         raw_filesystem_type = value.get("filesystem_type")
         raw_storage_risk = value.get("storage_risk")
         raw_migration_required = value.get("storage_migration_required")
+        raw_network_storage_claim = value.get("network_storage_claim")
         raw_status = value.get("status")
         raw_code = value.get("code")
         interrupted_recovery = value.get("interrupted_recovery")
@@ -379,8 +380,11 @@ def _project_cached_health(value: object) -> tuple[dict[str, object], bool]:
         if isinstance(raw_status, str) and raw_status in _INDEX_HEALTH_STATUSES
         else "unknown"
     )
-    migration_required = (
-        raw_migration_required is True or storage_risk == "network"
+    # Network storage is acceptable only when explicitly allowed for this
+    # machine; anything else about it stays fail-closed.
+    migration_required = raw_migration_required is True or (
+        storage_risk == "network"
+        and raw_network_storage_claim != "this_machine"
     )
 
     condition: str | None = None

@@ -130,7 +130,7 @@ def _storage_report(state_dir: Path) -> dict[str, object]:
     """
 
     try:
-        from .filesystem import classify_filesystem, sanitized_filesystem_type
+        from .filesystem import classify_state_storage, sanitized_filesystem_type
     except (ImportError, AttributeError):
         return {
             "filesystem_type": "unknown",
@@ -139,7 +139,9 @@ def _storage_report(state_dir: Path) -> dict[str, object]:
         }
 
     try:
-        raw = classify_filesystem(state_dir)
+        # The index path lets an explicit network-storage allowance in the
+        # state root count; without one, network storage still needs moving.
+        raw = classify_state_storage(state_dir / "index.db")
     except Exception:
         raw = None
 

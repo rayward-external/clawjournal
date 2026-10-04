@@ -74,6 +74,13 @@ Verify (PowerShell):
 & "$HOME\.clawjournal-venv\Scripts\clawjournal.exe" status
 ```
 
+**Network or cluster storage.** If ClawJournal reports that its state directory is on network or shared storage (NFS, Lustre, GPFS, and similar; common on HPC clusters), explain both options and let the user choose:
+
+- If the machine has private, persistent local storage: stop ClawJournal, copy the whole state directory there (keep the original), set `CLAWJOURNAL_HOME` to the copy, and restart.
+- If it has none (for example, home is on NFS, scratch is purged, and `/tmp` is wiped on reboot): with the user's agreement, run `clawjournal storage allow-network`, then restart ClawJournal. The state stays where it is and is used from this machine only. Do not move the state to scratch space that is purged automatically.
+
+If ClawJournal later reports that the state is set up for another machine, ask the user to stop ClawJournal on that machine before running `clawjournal storage allow-network --take-over`.
+
 ## 2. Scan Sessions
 
 Discover all local coding agent sessions:

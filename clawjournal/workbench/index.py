@@ -53,7 +53,7 @@ class UnsafeIndexStorageError(filesystem_module.UnsafeStateStorageError):
 
 
 def _assert_safe_index_storage(database: Path) -> None:
-    storage = filesystem_module.classify_filesystem(database)
+    storage = filesystem_module.classify_state_storage(database)
     if storage.storage_migration_required:
         raise UnsafeIndexStorageError(storage)
 

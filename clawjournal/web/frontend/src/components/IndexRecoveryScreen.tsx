@@ -54,8 +54,10 @@ export function IndexRecoveryScreen({
 }: IndexRecoveryScreenProps) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const networkStorageClaim = health?.network_storage_claim;
+  // Network storage is usable only after the user allowed it for this machine.
   const storageMigrationRequired = health?.storage_migration_required === true
-    || health?.storage_risk === 'network';
+    || (health?.storage_risk === 'network' && networkStorageClaim !== 'this_machine');
 
   const startRecovery = async () => {
     if (submitting || storageMigrationRequired) return;
@@ -112,29 +114,119 @@ export function IndexRecoveryScreen({
     );
   } else if (
     storageMigrationRequired
+    && networkStorageClaim === 'unavailable'
     && (health.status === 'recovery_required' || health.status === 'unavailable')
   ) {
+    content = (
+      <div role="alert" aria-labelledby="storage-check-heading">
+        <h1
+          id="storage-check-heading"
+          style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
+        >
+          Cannot check network storage
+        </h1>
+        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          ClawJournal could not check whether this machine is allowed to use the state on network storage. Its index remains blocked.
+        </p>
+        <p style={{ margin: 0, color: colors.gray600, fontSize: 14, lineHeight: 1.55 }}>
+          Check that the network filesystem is accessible, then restart ClawJournal and try again.
+        </p>
+      </div>
+    );
+  } else if (
+    storageMigrationRequired
+    && networkStorageClaim === 'index_symlink'
+    && (health.status === 'recovery_required' || health.status === 'unavailable')
+  ) {
+    content = (
+      <div role="alert" aria-labelledby="storage-layout-heading">
+        <h1
+          id="storage-layout-heading"
+          style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
+        >
+          Keep the index with ClawJournal state
+        </h1>
+        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          The index on network storage is a symlink. ClawJournal cannot safely use an index stored separately from its machine allowance and other state.
+        </p>
+        <ol
+          aria-label="Steps to keep ClawJournal state together"
+          style={{ margin: 0, paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
+        >
+          <li>Stop all ClawJournal processes.</li>
+          <li>Keep the index, review decisions, credentials, and other state together in one directory. Do not symlink only <code>index.db</code>.</li>
+          <li>Set <code>CLAWJOURNAL_HOME</code> to the whole state directory, then restart ClawJournal.</li>
+        </ol>
+      </div>
+    );
+  } else if (
+    storageMigrationRequired
+    && networkStorageClaim === 'other_machine'
+    && (health.status === 'recovery_required' || health.status === 'unavailable')
+  ) {
+    content = (
+      <div role="alert" aria-labelledby="storage-claim-heading">
+        <h1
+          id="storage-claim-heading"
+          style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
+        >
+          ClawJournal is set up on another machine
+        </h1>
+        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          This state is on network storage that was allowed for use from a different machine. ClawJournal will not open it here, because two machines writing to it at once can damage the index.
+        </p>
+        <ol
+          aria-label="Steps to move ClawJournal to this machine"
+          style={{ margin: '0 0 14px', paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
+        >
+          <li>Stop ClawJournal on the other machine.</li>
+          <li>Stop ClawJournal here, then run <code>clawjournal storage allow-network --take-over</code> on this machine.</li>
+          <li>Start ClawJournal again.</li>
+        </ol>
+      </div>
+    );
+  } else if (
+    storageMigrationRequired
+    && (health.status === 'recovery_required' || health.status === 'unavailable')
+  ) {
+    const optionHeadingStyle = {
+      margin: '0 0 4px',
+      fontSize: 14.5,
+      fontWeight: 600,
+      color: colors.gray800,
+    };
     content = (
       <div role="alert" aria-labelledby="storage-migration-heading">
         <h1
           id="storage-migration-heading"
           style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
         >
-          Copy ClawJournal state to local storage first
+          ClawJournal state is on network storage
         </h1>
-        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
-          ClawJournal detected shared or network storage. It will not open, create, or rebuild its writable index there. Move its state to persistent local storage first.
+        <p style={{ margin: '0 0 14px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          ClawJournal detected shared or network storage and has not opened, created, or rebuilt its writable index there. Stop ClawJournal completely, then choose one option.
         </p>
+        <h2 style={optionHeadingStyle}>If this machine has private, persistent local storage</h2>
         <ol
-          aria-label="Required storage migration steps"
-          style={{ margin: '0 0 14px', paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
+          aria-label="Steps to move state to local storage"
+          style={{ margin: '0 0 8px', paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
         >
-          <li>Stop ClawJournal completely.</li>
-          <li>Copy the entire <code>CLAWJOURNAL_HOME</code> directory to private, persistent local storage. Keep the original unchanged until recovery succeeds.</li>
+          <li>Copy the entire <code>CLAWJOURNAL_HOME</code> directory there. Keep the original unchanged until recovery succeeds.</li>
           <li>Set <code>CLAWJOURNAL_HOME</code> to the new directory, then restart ClawJournal.</li>
         </ol>
+        <p style={{ margin: '0 0 14px', color: colors.gray600, fontSize: 13.5, lineHeight: 1.55 }}>
+          Do not copy only the index database. Review decisions, recovery data, credentials, and other state must remain together.
+        </p>
+        <h2 style={optionHeadingStyle}>If it has none (common on HPC clusters)</h2>
+        <ol
+          aria-label="Steps to allow network storage on this machine"
+          style={{ margin: '0 0 14px', paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
+        >
+          <li>Run <code>clawjournal storage allow-network</code> on this machine. Keep the state where it is; avoid scratch space that is purged automatically.</li>
+          <li>Restart ClawJournal, and use it only from this machine. To switch machines later, run the same command with <code>--take-over</code> on the new one.</li>
+        </ol>
         <p style={{ margin: 0, color: colors.gray600, fontSize: 13.5, lineHeight: 1.55 }}>
-          Do not copy only the index database. Review decisions, recovery data, credentials, and other state must remain together. After restart, ClawJournal will recheck the new location and offer repair only if it is still needed.
+          After restart, ClawJournal will recheck the location and offer repair only if it is still needed.
         </p>
       </div>
     );
