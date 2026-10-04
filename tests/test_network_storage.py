@@ -7,6 +7,8 @@ import json
 import os
 import stat
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -337,3 +339,159 @@ def test_cli_allow_network_changes_nothing_on_local_storage(
 
     assert "nothing was changed" in capsys.readouterr().out
     assert not network_state.exists()
+
+
+@posix_only
+def test_index_symlinks_cannot_use_independent_machine_allowances(
+    tmp_path,
+    monkeypatch,
+):
+    """Two local state roots must not both authorize the same network index."""
+
+    shared = tmp_path / "network" / "index.db"
+    shared.parent.mkdir()
+    shared.write_bytes(b"shared index must remain untouched")
+    mountinfo = "\n".join((
+        "36 25 0:32 / / rw,relatime - ext4 /dev/root rw",
+        f"37 36 0:33 / {shared.parent.as_posix()} rw - nfs4 server:/home rw",
+    ))
+    monkeypatch.setattr(filesystem_module.sys, "platform", "linux")
+    monkeypatch.setattr(filesystem_module, "_read_linux_mountinfo", lambda: mountinfo)
+    monkeypatch.setattr(
+        filesystem_module,
+        "_file_locks_supported",
+        lambda _: pytest.fail("must not probe the local directory's locks"),
+    )
+
+    for hostname in ("node-a", "node-b"):
+        _use_machine(monkeypatch, hostname)
+        state_dir = tmp_path / hostname
+        state_dir.mkdir()
+        database = state_dir / "index.db"
+        database.symlink_to(shared)
+        # Even a previously written allowance matching this machine cannot
+        # authorize an index stored separately from its lease and state.
+        nonce = "0" * 64
+        (state_dir / NETWORK_STORAGE_FILENAME).write_text(json.dumps({
+            "version": 1,
+            "machine_nonce": nonce,
+            "machine_digest": filesystem_module._network_storage_machine_digest(nonce),
+        }), encoding="utf-8")
+        original_allowance = (state_dir / NETWORK_STORAGE_FILENAME).read_bytes()
+        assert filesystem_module.classify_filesystem(state_dir).storage_risk == "local"
+        storage = filesystem_module.classify_state_storage(database)
+        assert storage.network_storage_claim == "index_symlink"
+        assert storage.storage_migration_required is True
+        for take_over in (False, True):
+            assert filesystem_module.allow_network_storage(
+                state_dir, take_over=take_over,
+            )[0] == "index_symlink"
+        with pytest.raises(index_module.UnsafeIndexStorageError, match="symlink"):
+            index_module.open_existing_index(database=database)
+        monkeypatch.setattr(index_module, "INDEX_DB", database)
+        with pytest.raises(index_module.UnsafeIndexStorageError, match="symlink"):
+            index_module.open_index()
+        assert not (state_dir / index_module.INDEX_CONNECTION_LEASE_FILENAME).exists()
+        assert (state_dir / NETWORK_STORAGE_FILENAME).read_bytes() == original_allowance
+    assert shared.read_bytes() == b"shared index must remain untouched"
+
+
+@posix_only
+def test_symlink_to_the_whole_state_directory_remains_usable(
+    network_state,
+    tmp_path,
+):
+    filesystem_module.allow_network_storage(network_state)
+    conn = index_module.open_index()
+    conn.close()
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(network_state, target_is_directory=True)
+
+    assert _state_storage(alias).network_storage_allowed is True
+    conn = index_module.open_existing_index(database=alias / "index.db")
+    conn.close()
+
+
+@pytest.mark.parametrize("blocked_operation", ["read", "symlink_check"])
+def test_stalled_storage_checks_are_bounded_and_reuse_one_worker(
+    network_state,
+    monkeypatch,
+    capsys,
+    blocked_operation,
+):
+    filesystem_module.allow_network_storage(network_state)
+    assert index_recovery.initialize_index_health()["status"] == "ready"
+    monkeypatch.setattr(filesystem_module, "_NETWORK_STORAGE_CHECK_TIMEOUT", 0.02)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    method = "read_text" if blocked_operation == "read" else "is_symlink"
+    original = getattr(Path, method)
+    blocked_name = NETWORK_STORAGE_FILENAME if method == "read_text" else "index.db"
+
+    def stalled(path, *args, **kwargs):
+        if path.name == blocked_name:
+            calls.append(path)
+            entered.set()
+            release.wait(5)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, stalled)
+    try:
+        started = time.monotonic()
+        storage = _state_storage(network_state)
+        assert entered.wait(1)
+        assert time.monotonic() - started < 1
+        assert storage.network_storage_claim == "unavailable"
+        assert storage.storage_migration_required is True
+        database = network_state / "index.db"
+        pending = filesystem_module._NETWORK_STORAGE_CHECKS[database]
+        health = index_recovery.begin_index_health_check()
+        assert health["status"] == "unavailable"
+        assert health["network_storage_claim"] == "unavailable"
+        assert index_recovery.synchronize_index_health()["status"] == "unavailable"
+        report = diagnostics.collect_index_diagnostics(state_dir=network_state)
+        assert report["index"]["health_code"] == "network_storage_not_inspected"
+        with pytest.raises(index_module.UnsafeIndexStorageError):
+            index_module.open_index()
+        for take_over in (False, True):
+            assert filesystem_module.allow_network_storage(
+                network_state, take_over=take_over,
+            )[0] == "storage_unavailable"
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(monkeypatch, "storage", "allow-network", "--take-over")
+        assert exc_info.value.code == 1
+        error = capsys.readouterr().err
+        assert "check" in error
+        assert "--take-over" not in error
+        assert str(network_state) not in error
+        assert len(calls) == 1
+        assert filesystem_module._NETWORK_STORAGE_CHECKS[database] is pending
+    finally:
+        release.set()
+        assert entered.wait(1)
+        # Wait until the background I/O really finished before undoing mocks.
+        pending = filesystem_module._NETWORK_STORAGE_CHECKS.get(network_state / "index.db")
+        if pending is not None:
+            assert pending.completed.wait(1)
+
+    # Completed reads are never cached: a later check must see a new owner.
+    assert network_state / "index.db" not in filesystem_module._NETWORK_STORAGE_CHECKS
+    _use_machine(monkeypatch, "node-b")
+    assert _state_storage(network_state).network_storage_claim == "other_machine"
+
+
+@posix_only
+def test_cli_explains_refused_index_symlink(network_state, monkeypatch, capsys):
+    network_state.mkdir()
+    (network_state / "index.db").symlink_to(network_state / "other.db")
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_cli(monkeypatch, "storage", "allow-network", "--take-over")
+
+    assert exc_info.value.code == 1
+    error = capsys.readouterr().err
+    assert "symlink" in error
+    assert "whole state directory" in error
+    assert str(network_state) not in error
+    assert not (network_state / NETWORK_STORAGE_FILENAME).exists()

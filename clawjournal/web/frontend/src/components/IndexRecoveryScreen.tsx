@@ -114,6 +114,53 @@ export function IndexRecoveryScreen({
     );
   } else if (
     storageMigrationRequired
+    && networkStorageClaim === 'unavailable'
+    && (health.status === 'recovery_required' || health.status === 'unavailable')
+  ) {
+    content = (
+      <div role="alert" aria-labelledby="storage-check-heading">
+        <h1
+          id="storage-check-heading"
+          style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
+        >
+          Cannot check network storage
+        </h1>
+        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          ClawJournal could not check whether this machine is allowed to use the state on network storage. Its index remains blocked.
+        </p>
+        <p style={{ margin: 0, color: colors.gray600, fontSize: 14, lineHeight: 1.55 }}>
+          Check that the network filesystem is accessible, then restart ClawJournal and try again.
+        </p>
+      </div>
+    );
+  } else if (
+    storageMigrationRequired
+    && networkStorageClaim === 'index_symlink'
+    && (health.status === 'recovery_required' || health.status === 'unavailable')
+  ) {
+    content = (
+      <div role="alert" aria-labelledby="storage-layout-heading">
+        <h1
+          id="storage-layout-heading"
+          style={{ margin: '0 0 8px', fontSize: 21, color: colors.gray900 }}
+        >
+          Keep the index with ClawJournal state
+        </h1>
+        <p style={{ margin: '0 0 12px', color: colors.red700, fontSize: 14, lineHeight: 1.55 }}>
+          The index on network storage is a symlink. ClawJournal cannot safely use an index stored separately from its machine allowance and other state.
+        </p>
+        <ol
+          aria-label="Steps to keep ClawJournal state together"
+          style={{ margin: 0, paddingLeft: 22, color: colors.gray600, fontSize: 14, lineHeight: 1.7 }}
+        >
+          <li>Stop all ClawJournal processes.</li>
+          <li>Keep the index, review decisions, credentials, and other state together in one directory. Do not symlink only <code>index.db</code>.</li>
+          <li>Set <code>CLAWJOURNAL_HOME</code> to the whole state directory, then restart ClawJournal.</li>
+        </ol>
+      </div>
+    );
+  } else if (
+    storageMigrationRequired
     && networkStorageClaim === 'other_machine'
     && (health.status === 'recovery_required' || health.status === 'unavailable')
   ) {

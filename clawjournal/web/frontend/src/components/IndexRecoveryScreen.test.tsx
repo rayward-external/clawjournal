@@ -180,6 +180,35 @@ describe('IndexRecoveryScreen', () => {
     expect(rebuild).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { claim: 'unavailable' as const, heading: 'Cannot check network storage', guidance: 'network filesystem is accessible' },
+    { claim: 'index_symlink' as const, heading: 'Keep the index with ClawJournal state', guidance: 'Do not symlink only index.db' },
+  ])('explains $claim without suggesting takeover or recovery', ({ claim, heading, guidance }) => {
+    const rebuild = vi.spyOn(api.index, 'rebuild');
+    render(
+      <IndexRecoveryScreen
+        health={recoveryRequired({
+          storage_risk: 'network',
+          filesystem_type: 'nfs4',
+          storage_migration_required: true,
+          network_storage_claim: claim,
+          database_path: '/private/cluster/alice/index.db',
+          message: 'This raw backend message must stay hidden.',
+        })}
+        onHealthChange={vi.fn()}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveAccessibleName(heading);
+    expect(alert).toHaveTextContent(guidance);
+    expect(alert).not.toHaveTextContent('raw backend message');
+    expect(alert).not.toHaveTextContent('/private/cluster/alice');
+    expect(alert).not.toHaveTextContent('--take-over');
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(rebuild).not.toHaveBeenCalled();
+  });
+
   it('submits once, disables the action, and accepts an asynchronous rebuilding response', async () => {
     let resolveRebuild!: (value: IndexRebuildResponse) => void;
     const rebuild = vi.spyOn(api.index, 'rebuild').mockImplementationOnce(() => (

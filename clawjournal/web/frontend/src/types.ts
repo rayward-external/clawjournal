@@ -238,8 +238,8 @@ export interface IndexHealth {
   storage_risk?: 'network' | 'local' | 'unknown';
   /** Recovery must wait until the complete state directory is copied locally. */
   storage_migration_required?: boolean;
-  /** Present only on network storage the user explicitly allowed, and for which machine. */
-  network_storage_claim?: 'this_machine' | 'other_machine';
+  /** Allowance ownership or the reason its network-storage check was refused. */
+  network_storage_claim?: 'this_machine' | 'other_machine' | 'index_symlink' | 'unavailable';
   automatic_recovery_available?: boolean;
   interrupted_recovery?: boolean;
   unreadable_state?: string[];

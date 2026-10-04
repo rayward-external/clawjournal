@@ -226,6 +226,10 @@ uses it. Every other machine stays blocked so two login nodes can never write
 the index at the same time. To switch machines, stop ClawJournal on the old one
 and run `clawjournal storage allow-network --take-over` on the new one. The
 command refuses filesystems that do not support the file locks SQLite needs.
+Keep the index, allowance, and other state in the same directory; a symlink for
+only `index.db` on network storage is refused. If checking the allowance stalls,
+ClawJournal keeps the index blocked and reports that network storage could not
+be checked. Restore access to the mount, then restart ClawJournal.
 
 `clawjournal doctor index --json` is read-only and does not require the external
 `sqlite3` command. Its output is deliberately bounded and omits state paths,

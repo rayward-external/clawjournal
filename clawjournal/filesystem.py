@@ -23,6 +23,7 @@ import re
 import secrets
 import socket
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -32,7 +33,9 @@ StorageRisk = Literal["network", "local", "unknown"]
 # Whether the state root on network storage was explicitly allowed for this
 # machine. "other_machine" also covers an unreadable setting: nothing proves
 # that this machine is the only one using the state.
-NetworkStorageClaim = Literal["none", "this_machine", "other_machine"]
+NetworkStorageClaim = Literal[
+    "none", "this_machine", "other_machine", "index_symlink", "unavailable",
+]
 NetworkStorageResult = Literal[
     "not_needed",
     "already_allowed",
@@ -40,12 +43,25 @@ NetworkStorageResult = Literal[
     "taken_over",
     "claimed_elsewhere",
     "locks_unsupported",
+    "index_symlink",
+    "storage_unavailable",
 ]
 
 NETWORK_STORAGE_FILENAME = "network-storage.json"
 _NETWORK_STORAGE_VERSION = 1
 _NETWORK_STORAGE_DIGEST_CONTEXT = b"clawjournal-network-storage-machine-v1"
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+_NETWORK_STORAGE_CHECK_TIMEOUT = 1.0
+
+
+@dataclass
+class _NetworkStorageCheck:
+    completed: threading.Event = dataclasses.field(default_factory=threading.Event)
+    claim: NetworkStorageClaim = "unavailable"
+
+
+_NETWORK_STORAGE_CHECKS: dict[Path, _NetworkStorageCheck] = {}
+_NETWORK_STORAGE_CHECKS_LOCK = threading.Lock()
 
 
 class UnsafeStateStorageError(RuntimeError):
@@ -314,7 +330,7 @@ def _network_storage_machine_digest(nonce: str) -> str:
     ).hexdigest()
 
 
-def _network_storage_claim(state_dir: Path) -> NetworkStorageClaim:
+def _read_network_storage_claim(state_dir: Path) -> NetworkStorageClaim:
     """Read whether network storage was allowed for this machine."""
 
     try:
@@ -342,21 +358,73 @@ def _network_storage_claim(state_dir: Path) -> NetworkStorageClaim:
     return "other_machine"
 
 
+def _check_network_storage(database: Path, check: _NetworkStorageCheck) -> None:
+    """Perform potentially blocking mount I/O outside the calling thread."""
+
+    try:
+        # A symlink for the whole state root still shares the allowance and
+        # lease. An index-only symlink can put those in separate local roots,
+        # allowing two machines to independently authorize the same database.
+        if database.is_symlink():
+            check.claim = "index_symlink"
+        else:
+            check.claim = _read_network_storage_claim(database.parent)
+    except Exception:
+        # Failed metadata checks must never authorize database access.
+        check.claim = "unavailable"
+    finally:
+        with _NETWORK_STORAGE_CHECKS_LOCK:
+            # Do not cache completed claims: every subsequent open must read
+            # the allowance again so it can detect a takeover.
+            _NETWORK_STORAGE_CHECKS.pop(database, None)
+            check.completed.set()
+
+
+def _network_storage_claim(database: Path) -> NetworkStorageClaim:
+    """Bound the caller's wait, with one pending I/O worker per index path.
+
+    A hard NFS mount may never finish even an lstat or open. Daemon workers
+    cannot hold up process exit, and a stalled worker is reused rather than
+    spawning another on every HTTP health poll. A timeout never trusts an old
+    successful read or permits a takeover to overwrite an unchecked claim.
+    """
+
+    with _NETWORK_STORAGE_CHECKS_LOCK:
+        check = _NETWORK_STORAGE_CHECKS.get(database)
+        if check is None:
+            check = _NetworkStorageCheck()
+            _NETWORK_STORAGE_CHECKS[database] = check
+            try:
+                threading.Thread(
+                    target=_check_network_storage,
+                    args=(database, check),
+                    daemon=True,
+                    name="network-storage-check",
+                ).start()
+            except RuntimeError:
+                _NETWORK_STORAGE_CHECKS.pop(database, None)
+                return "unavailable"
+    if not check.completed.wait(_NETWORK_STORAGE_CHECK_TIMEOUT):
+        return "unavailable"
+    return check.claim
+
+
 def classify_state_storage(database: Path) -> FilesystemInfo:
     """Classify the index location, honoring an explicit network allowance.
 
     The allowance lives beside the index in the state root. Use the lexical
-    parent: resolving a known network path can block on a disconnected hard
-    mount.
+    parent and check it in a bounded worker: resolving or reading a known
+    network path can block on a disconnected hard mount. Index-only symlinks
+    are refused so the index, allowance, and lease cannot live separately.
     """
 
     info = classify_filesystem(database)
     if info.storage_risk != "network":
         return info
-    state_dir = Path(os.path.abspath(Path(database))).parent
+    database = Path(os.path.abspath(Path(database)))
     return dataclasses.replace(
         info,
-        network_storage_claim=_network_storage_claim(state_dir),
+        network_storage_claim=_network_storage_claim(database),
     )
 
 
@@ -422,6 +490,10 @@ def allow_network_storage(
     info = classify_state_storage(database)
     if info.storage_risk != "network":
         return "not_needed", info
+    if info.network_storage_claim == "index_symlink":
+        return "index_symlink", info
+    if info.network_storage_claim == "unavailable":
+        return "storage_unavailable", info
     if info.network_storage_claim == "this_machine":
         return "already_allowed", info
     replacing = info.network_storage_claim == "other_machine"
@@ -478,6 +550,19 @@ def storage_migration_message(info: FilesystemInfo) -> str:
     """Return the actionable, path-free message for unsafe SQLite storage."""
 
     filesystem_type = sanitized_filesystem_type(info.filesystem_type)
+    if info.network_storage_claim == "index_symlink":
+        return (
+            "ClawJournal's index on network storage is a symlink. Stop all "
+            "ClawJournal processes and keep the index, allowance, and other "
+            "state together in one directory. Set CLAWJOURNAL_HOME to the "
+            "whole state directory, then restart. Do not symlink only index.db."
+        )
+    if info.network_storage_claim == "unavailable":
+        return (
+            "ClawJournal could not check its network-storage allowance. "
+            "Its index remains blocked. Check that the network filesystem "
+            "is accessible, then restart ClawJournal and try again."
+        )
     if info.network_storage_claim == "other_machine":
         return (
             "ClawJournal's state directory is on network storage "

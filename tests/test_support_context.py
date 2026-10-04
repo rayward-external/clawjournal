@@ -82,7 +82,7 @@ def test_network_storage_allowed_for_this_machine_is_not_a_migration(monkeypatch
     assert "network_storage_claim" not in json.dumps(report)
 
 
-@pytest.mark.parametrize("claim", [None, "other_machine", "unexpected"])
+@pytest.mark.parametrize("claim", [None, "other_machine", "index_symlink", "unavailable", "unexpected"])
 def test_network_storage_without_this_machine_claim_stays_fail_closed(
     monkeypatch,
     claim,

@@ -7657,7 +7657,11 @@ def _print_pii_guidance(output_path: Path) -> None:
 def _run_storage_allow_network(*, take_over: bool) -> None:
     """Allow network-backed state for this machine, or explain why not."""
 
-    from .filesystem import allow_network_storage, sanitized_filesystem_type
+    from .filesystem import (
+        allow_network_storage,
+        sanitized_filesystem_type,
+        storage_migration_message,
+    )
     from .workbench import index as index_module
 
     # The guard reads the allowance beside the index, so write it there.
@@ -7685,6 +7689,9 @@ def _run_storage_allow_network(*, take_over: bool) -> None:
             "ClawJournal on this machine."
         )
         return
+    if result in {"index_symlink", "storage_unavailable"}:
+        print(f"error: {storage_migration_message(storage)}", file=sys.stderr)
+        raise SystemExit(1)
     if result == "claimed_elsewhere":
         print(
             "error: ClawJournal's state on network storage is set up for use "
