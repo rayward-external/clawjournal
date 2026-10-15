@@ -2239,9 +2239,40 @@ class TestVerifyEmail:
         assert payload["status"] == "verification_sent"
         assert payload["next_command"] == "clawjournal verify-email test@university.edu --code <CODE>"
 
+    @pytest.mark.parametrize(
+        "email",
+        ["researcher@institute.res.in", "student@college.ac.in", "researcher@cs.fau.de"],
+    )
+    def test_verify_email_request_defers_domain_check_to_hosted_policy(self, monkeypatch, capsys, email):
+        """The CLI must not pre-reject addresses with its own domain list: a
+        stale local list blocked hosted-eligible users before any code was
+        requested. request_email_verification applies the hosted policy."""
+        requested = []
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.request_email_verification",
+            lambda email: requested.append(email) or {"verification_id": "verify-123"},
+        )
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email", email])
+        main()
+        payload = json.loads(capsys.readouterr().out)
+        assert requested == [email]
+        assert payload["status"] == "verification_sent"
+
+    def test_verify_email_request_surfaces_domain_rejection(self, monkeypatch, capsys):
+        def reject(email):
+            raise ValueError("Enter a valid academic email address.")
+
+        monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.request_email_verification", reject)
+        monkeypatch.setattr("sys.argv", ["clawjournal", "verify-email", "someone@gmail.com"])
+        with pytest.raises(SystemExit):
+            main()
+        payload = json.loads(capsys.readouterr().out)
+        assert "Enter a valid academic email address." in payload["error"]
+
     def test_verify_email_request_suppresses_dev_code_on_prod(self, monkeypatch, capsys):
         monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
-        monkeypatch.setattr("clawjournal.workbench.daemon._is_edu_email", lambda email: True)
         monkeypatch.setattr(
             "clawjournal.workbench.daemon.request_email_verification",
             lambda email: {"status": "ok", "dev_code": "424242"},
@@ -2254,7 +2285,6 @@ class TestVerifyEmail:
 
     def test_verify_email_request_surfaces_dev_code_on_local(self, monkeypatch, capsys):
         monkeypatch.setattr("clawjournal.cli.load_config", lambda: {})
-        monkeypatch.setattr("clawjournal.workbench.daemon._is_edu_email", lambda email: True)
         monkeypatch.setattr(
             "clawjournal.workbench.daemon.request_email_verification",
             lambda email: {"status": "ok", "dev_code": "424242"},
