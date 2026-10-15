@@ -5848,21 +5848,19 @@ class TestVerifyEmailAPI:
             "test@university.edu",
             "researcher@institute.res.in",
             "student@college.ac.in",
-            "student@nus.edu.sg",
-            "researcher@cs.fau.de",
-            "student@mail.utoronto.ca",
-            "researcher@ethz.ch",
-            "member@openrefinery.ai",
+            # A domain no client-side list contains: only the host knows it.
+            "member@newly-eligible.example.org",
         ],
     )
-    def test_request_verification_falls_back_when_capabilities_unavailable(self, monkeypatch, email):
+    def test_request_verification_defers_to_host_when_capabilities_unavailable(self, monkeypatch, email):
         """A momentarily unreachable capabilities doc must not block requesting a
-        code: domain validation falls back to the built-in default suffixes and
-        the verify-email POST still proceeds. The fallback must cover every
-        domain the hosted default policy accepts, not just the original few."""
+        code, and must not reject an address with a client-side copy of the
+        host's allowlist: such a copy drifted from the host and turned away
+        eligible users. The address goes to the host, which decides."""
         from clawjournal.workbench.daemon import request_email_verification
 
         saved = {}
+        posted = []
         monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
         monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
@@ -5873,6 +5871,7 @@ class TestVerifyEmailAPI:
             if "/.well-known/clawjournal-share.json" in url:
                 raise urllib.error.URLError("capabilities down")
             if "/api/verify-email" in url:
+                posted.append(json.loads(req.data.decode())["email"])
                 resp = MagicMock()
                 resp.read.return_value = json.dumps({
                     "verification_id": "verify-123",
@@ -5886,21 +5885,16 @@ class TestVerifyEmailAPI:
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             result = request_email_verification(email)
 
+        assert posted == [email]
         assert result["verification_id"] == "verify-123"
         assert saved["pending_verification_id"] == "verify-123"
 
     @pytest.mark.parametrize(
         "email",
-        [
-            "someone@gmail.com",
-            "person@notfau.de",
-            "person@fau.de.example.com",
-            "person@res.in.example.com",
-        ],
+        ["@university.edu", "student@", "two@@university.edu", "first last@university.edu", "no-at-sign"],
     )
-    def test_request_verification_still_rejects_bad_domain_when_capabilities_down(self, monkeypatch, email):
-        """The capabilities fallback must not weaken domain validation: a
-        non-academic address is still rejected using the default suffixes."""
+    def test_request_verification_rejects_malformed_email_when_capabilities_down(self, monkeypatch, email):
+        """Deferring eligibility to the host must not skip the syntax checks."""
         from clawjournal.workbench.daemon import request_email_verification
 
         monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
@@ -5911,11 +5905,63 @@ class TestVerifyEmailAPI:
             url = req.full_url if hasattr(req, "full_url") else str(req)
             if "/.well-known/clawjournal-share.json" in url:
                 raise urllib.error.URLError("capabilities down")
-            raise AssertionError("verify-email POST should not be reached for a rejected domain")
+            raise AssertionError("verify-email POST should not be reached for a malformed address")
 
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError, match="valid academic email"):
                 request_email_verification(email)
+
+    def test_host_domain_rejection_surfaces_cleanly_when_capabilities_down(self, server, monkeypatch):
+        """With no published policy to check locally, an ineligible address is
+        turned away by the host's 400, which must reach the caller as a clean
+        400 with the host's message and leave no pending verification behind."""
+        saved = {}
+        posted = []
+        monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
+        monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config", lambda: {})
+        monkeypatch.setattr("clawjournal.workbench.daemon.save_config", lambda config: saved.update(config))
+
+        def mock_urlopen(req, **kwargs):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "/.well-known/clawjournal-share.json" in url:
+                raise urllib.error.URLError("capabilities down")
+            if "/api/verify-email" in url:
+                posted.append(json.loads(req.data.decode())["email"])
+                raise urllib.error.HTTPError(
+                    url=url,
+                    code=400,
+                    msg="Bad Request",
+                    hdrs={},
+                    fp=BytesIO(json.dumps({"error": "This email domain is not eligible."}).encode()),  # type: ignore[arg-type]
+                )
+            raise ValueError(f"Unexpected URL: {url}")
+
+        with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
+            status, data = _post(server, "/api/share/verify-email", {"email": "someone@gmail.com"})
+
+        assert posted == ["someone@gmail.com"]
+        assert status == 400
+        assert data == {"error": "This email domain is not eligible."}
+        assert "pending_verification_id" not in saved
+
+    @pytest.mark.parametrize(
+        ("capabilities", "email", "allowed"),
+        [
+            # No capabilities, or a document without a policy: defer to the host.
+            (None, "someone@gmail.com", True),
+            ({"submissions_open": True}, "someone@gmail.com", True),
+            ({"supported_institution_email_policy": {"explicit_collaborators_supported": False}}, "someone@gmail.com", True),
+            # A published policy is the host's own list, so it still applies locally.
+            ({"supported_institution_email_policy": {"domain_suffixes": [".edu"]}}, "someone@gmail.com", False),
+            ({"supported_institution_email_policy": {"domain_suffixes": [".edu"]}}, "student@university.edu", True),
+            ({"supported_institution_email_policy": {"domain_suffixes": ["res.in"]}}, "person@res.in.example.com", False),
+        ],
+    )
+    def test_email_domain_allowed_applies_only_the_published_policy(self, capabilities, email, allowed):
+        from clawjournal.workbench.daemon import _email_domain_allowed
+
+        assert _email_domain_allowed(email, capabilities) is allowed
 
     def test_request_verification_defers_explicit_collaborator_check_to_host(self, monkeypatch):
         from clawjournal.workbench.daemon import request_email_verification
