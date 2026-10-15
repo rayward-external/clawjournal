@@ -397,7 +397,63 @@ _index_recovery_thread: threading.Thread | None = None
 _support_report_recovery_lock = threading.Lock()
 _support_report_recovery_thread: threading.Thread | None = None
 _support_report_recovery_stop: threading.Event | None = None
-_HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
+# Fallback email-domain policy, used only when the hosted capabilities document
+# cannot be fetched. Mirrors the hosted service's default allowlist; keep the
+# two in sync so a capabilities outage never rejects an address the host
+# accepts. The host re-checks every address, so this list never widens access.
+_HOSTED_EMAIL_SUFFIXES_DEFAULT = (
+    # Academic and research institution suffixes.
+    ".edu",
+    ".ac.uk",
+    ".edu.au",
+    ".edu.cn",
+    "edu.sg",
+    "ac.jp",
+    ".ac.in",
+    ".res.in",
+    # Internal and collaborator organization domains.
+    "rayward.ai",
+    "openrefinery.ai",
+    # Additional eligible research institutions.
+    "gu.se",
+    "liu.se",
+    "dkfz.de",
+    "fau.de",
+    "polito.it",
+    # Canadian universities (no academic TLD).
+    "utoronto.ca",
+    "ubc.ca",
+    "mcgill.ca",
+    "uwaterloo.ca",
+    "ualberta.ca",
+    "mcmaster.ca",
+    "queensu.ca",
+    "uottawa.ca",
+    "umontreal.ca",
+    "ucalgary.ca",
+    "uwo.ca",
+    "yorku.ca",
+    "sfu.ca",
+    "uvic.ca",
+    "dal.ca",
+    "concordia.ca",
+    "umanitoba.ca",
+    "ulaval.ca",
+    "carleton.ca",
+    "usask.ca",
+    # Swiss universities (no academic TLD).
+    "ethz.ch",
+    "epfl.ch",
+    "uzh.ch",
+    "unige.ch",
+    "unibe.ch",
+    "unibas.ch",
+    "unil.ch",
+    "unifr.ch",
+    "unine.ch",
+    "usi.ch",
+    "unisg.ch",
+)
 _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 
 
@@ -2104,11 +2160,6 @@ def _expiry_timestamp(value: Any) -> float | None:
 def _expiry_is_valid(value: Any, *, grace_seconds: int = 60) -> bool:
     timestamp = _expiry_timestamp(value)
     return timestamp is not None and time.time() < (timestamp - grace_seconds)
-
-
-def _is_edu_email(email: str) -> bool:
-    """Check if an email address matches the hosted academic-email policy."""
-    return _email_domain_allowed(email)
 
 
 def _missing_ingest_url_error() -> str:

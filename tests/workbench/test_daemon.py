@@ -5842,10 +5842,24 @@ class TestVerifyEmailAPI:
         assert status == 429
         assert data["error"] == "Too many verification attempts"
 
-    def test_request_verification_falls_back_when_capabilities_unavailable(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "email",
+        [
+            "test@university.edu",
+            "researcher@institute.res.in",
+            "student@college.ac.in",
+            "student@nus.edu.sg",
+            "researcher@cs.fau.de",
+            "student@mail.utoronto.ca",
+            "researcher@ethz.ch",
+            "member@openrefinery.ai",
+        ],
+    )
+    def test_request_verification_falls_back_when_capabilities_unavailable(self, monkeypatch, email):
         """A momentarily unreachable capabilities doc must not block requesting a
         code: domain validation falls back to the built-in default suffixes and
-        the verify-email POST still proceeds."""
+        the verify-email POST still proceeds. The fallback must cover every
+        domain the hosted default policy accepts, not just the original few."""
         from clawjournal.workbench.daemon import request_email_verification
 
         saved = {}
@@ -5870,12 +5884,21 @@ class TestVerifyEmailAPI:
             raise ValueError(f"Unexpected URL: {url}")
 
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
-            result = request_email_verification("test@university.edu")
+            result = request_email_verification(email)
 
         assert result["verification_id"] == "verify-123"
         assert saved["pending_verification_id"] == "verify-123"
 
-    def test_request_verification_still_rejects_bad_domain_when_capabilities_down(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "email",
+        [
+            "someone@gmail.com",
+            "person@notfau.de",
+            "person@fau.de.example.com",
+            "person@res.in.example.com",
+        ],
+    )
+    def test_request_verification_still_rejects_bad_domain_when_capabilities_down(self, monkeypatch, email):
         """The capabilities fallback must not weaken domain validation: a
         non-academic address is still rejected using the default suffixes."""
         from clawjournal.workbench.daemon import request_email_verification
@@ -5892,7 +5915,7 @@ class TestVerifyEmailAPI:
 
         with patch("clawjournal.workbench.daemon.urllib.request.urlopen", side_effect=mock_urlopen):
             with pytest.raises(ValueError):
-                request_email_verification("someone@gmail.com")
+                request_email_verification(email)
 
     def test_request_verification_defers_explicit_collaborator_check_to_host(self, monkeypatch):
         from clawjournal.workbench.daemon import request_email_verification
