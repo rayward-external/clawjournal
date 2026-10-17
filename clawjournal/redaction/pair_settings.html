@@ -1,0 +1,24 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-pair-settings'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Original and redacted conversation permission</title>
+<style>body{font:17px/1.6 system-ui;max-width:800px;margin:32px auto;padding:0 24px}label{display:block;padding:12px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}button{font:inherit;padding:12px}aside{background:#fff1d4;padding:16px}</style></head><body>
+<h1>Share original and redacted conversations?</h1>
+<aside><strong>Originals may contain personal information.</strong> This permission is separate from sharing edited snippets or normal redacted uploads. It is optional and starts off.</aside>
+<p id="purpose"></p><p id="destination"></p>
+<p>This covers future conversations captured into this local evaluation store after enabling. Both full normalized conversations—not only labelled snippets—can be sent. Only authorized administrators at the selected service can download these pairs. Hosted copies expire after 30 days. Downloaded research copies must remain access-restricted, follow the same purpose restriction and be deleted within that period.</p>
+<p>Originals containing possible credentials are blocked by local scanning. Automatic scanners can miss other private information. Labels remain drafts unless separately reviewed. Permission does not mean every label is correct.</p>
+<label><input type="checkbox" id="rights"> I have permission to share these future conversations, including other people's information they may contain.</label>
+<label><input type="checkbox" id="share_redacted"> I consent to sharing redacted conversations for evaluating and improving the redaction pipeline.</label>
+<label><input type="checkbox" id="share_original"> I separately consent to sharing original, unredacted conversations only to evaluate and improve the redaction pipeline, including redaction-specific model training. This does not permit general research, unrelated benchmarks, or general-purpose model training.</label>
+<button id="approve" disabled>Download paired-conversation permission</button>
+<p id="status"></p><pre id="commands"></pre>
+<p>Opening this page or downloading the permission file does not enable uploads. Import the permission file first. Each upload is a separate command. Turning this permission off stops future exports/uploads and removes managed local pair bundles. It cannot recall downloaded copies; use the hosted withdrawal command for already uploaded pairs.</p>
+<pre>clawjournal redaction-eval --store YOUR_STORE pairs disable</pre>
+<script nonce="pair-settings" type="application/json" id="pair-data">__PAIR_DATA__</script>
+<script nonce="pair-settings">
+"use strict";
+const data=JSON.parse(document.getElementById("pair-data").textContent),$=id=>document.getElementById(id),fields=["rights","share_original","share_redacted"];
+$("purpose").textContent=data.purpose;$("destination").textContent=`Destination: ${data.destination}. Retention: ${data.retention_days} days.`;
+for(const key of fields){$(key).checked=false;$(key).addEventListener("change",()=>{$("approve").disabled=!fields.every(k=>$(k).checked);});}
+$("approve").addEventListener("click",()=>{if(!fields.every(k=>$(k).checked))return;const permission={...data};for(const key of fields)permission[key]=true;const url=URL.createObjectURL(new Blob([JSON.stringify(permission,null,2)],{type:"application/json"}));const link=document.createElement("a");link.href=url;link.download="paired-conversation-permission.json";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);$("status").textContent="Permission downloaded; nothing enabled or uploaded yet.";$("commands").textContent="clawjournal redaction-eval --store YOUR_STORE pairs consent paired-conversation-permission.json";});
+</script></body></html>

@@ -5193,6 +5193,9 @@ def _main() -> None:
     review_cache.add_argument("--clear", action="store_true", required=True)
     review_cache.add_argument("--all", action="store_true", help="Also invalidate saved inputs for pending shares; previews must be refreshed")
 
+    from .cli_redaction_eval import register_parser as register_redaction_eval
+    register_redaction_eval(sub)
+
     sub.add_parser("refresh-pricing", help="Refresh model pricing cache from OpenRouter")
 
     # Search command
@@ -5226,6 +5229,11 @@ def _main() -> None:
 
     args = parser.parse_args()
     command = args.command or "export"
+
+    if command == "redaction-eval":
+        from .cli_redaction_eval import run as run_redaction_eval
+        run_redaction_eval(args)
+        return
 
     if command == "open":
         from .desktop import run_open_command

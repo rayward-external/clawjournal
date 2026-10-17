@@ -80,6 +80,8 @@ jobs:
           npm test -- --reporter=dot
           npm run build
       - run: test -f clawjournal/web/frontend/dist/index.html
+      - name: Contribution consent page contract
+        run: node --test tests/test_contribution_review_ui.cjs
       - run: python -m pip wheel . --no-deps --no-build-isolation -w /tmp/clawjournal-wheelcheck
       - name: Verify wheel contains frontend assets
         run: |
