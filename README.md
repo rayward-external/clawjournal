@@ -332,3 +332,311 @@ ClawJournal builds on early work from [dataclaw](https://github.com/peteromallet
 ## License
 
 Apache-2.0
+## Local redaction evaluation (opt-in)
+
+Use `clawjournal redaction-eval` to retain an original input and its local redacted
+preview, record corrections, and repeat a PII benchmark. This is a separate local
+evaluation workspace. It does not add originals to share bundles, change findings
+decisions, or authorize an upload. The normal intake/export workflow does not
+automatically collect examples.
+
+```bash
+# Use a dedicated private directory outside your source repository.
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" init
+
+# Capture one UTF-8 conversation/snippet that you own or have permission to use.
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" capture \
+  --text-file conversation.txt --group contributor-001 --split dev \
+  --source-kind owned --provenance "My research conversation; approved for local evaluation"
+
+# Substitute the capture_id printed above. Open the resulting local HTML file.
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" review CAPTURE_ID
+
+# Select original text, label redact/preserve/uncertain, then download corrections.
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" import-corrections corrections.json
+
+# Repeatable local tests; reports contain offsets/counts, not conversation text.
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" run --engine rules
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" run \
+  --engine gliner --model-dir /absolute/path/to/downloaded/model --threshold 0.3
+```
+
+`--session-json` also accepts **one normalized ClawJournal session object** with
+`messages`, including nested content/tool fields. A provider's full ZIP or JSON
+export must first be converted into this shape. Capture runs the existing local
+share-preview redactor using config strings, usernames and allowlists, with empty
+saved finding decisions. It does not import indexed policy rules or reproduce an
+already approved share. It requires Betterleaks; the final TruffleHog package gate
+is outside this experiment. Input may already have been sanitized by an earlier
+intake step: capture cannot recover removed originals.
+
+In the review page, corrections apply to selected spans in the **original**, using
+Unicode code-point offsets (end exclusive). Select previously missed PII as well
+as unnecessary redactions. Corrections can also be entered with `annotate
+CAPTURE_ID --unit /messages/0/content --start 10 --end 26 --decision redact
+--entity-type email`. Labels default to `assistant_draft`. Only a person who has
+checked the label should mark the page's human-review checkbox or use
+`--human-reviewed`. Default tests exclude drafts and uncertain labels;
+`--include-drafts` explicitly enables exploratory results. Reopen a fresh review
+page after importing: imports reject stale revisions, overlapping spans and
+incorrect capture hashes. Label corrections never automatically unredact exports.
+
+The versioned policy `actual-identifiers-v1` redacts actual identifiers, including
+public email addresses, while preserving measurements and ordinary numbers.
+Reviewers should use `uncertain` for unresolved cases. Benchmark reports include
+TP/FP/FN/TN, accuracy, precision, recall/TPR, FNR, specificity/TNR, FPR and F1.
+Detection means **any overlap** with the annotated target; the separate sensitive
+span coverage section checks **every character**. A partial hit counts as detected
+but is not fully protected. Undefined rates are `null`, not zero. Results measure
+selected targets with 120 characters of surrounding context on each side, not
+whole-conversation recall. Targets over 256 characters or GLiNER contexts over 256
+model tokens fail explicitly rather than silently truncate.
+
+Keep related conversations/participants in the same pseudonymous `--group`.
+Groups are locked to `train`, `dev` or `test`; exact-source duplicates cannot move
+to another group. Near duplicates and repeated identities still need manual
+grouping. Tune settings on `dev`, train on `train`, and leave `test` untouched
+until a final evaluation. Reports fingerprint the dataset, policy, evaluator,
+model files, library versions and threshold. The rules engine is the PII regex
+baseline, not the entire production redaction pipeline. GLiNER runs on CPU using
+an already downloaded local model in an environment with `gliner`, `torch` and
+`onnxruntime`; these are optional and not added to the base install. The evaluator
+uses offline model loading, disables hub telemetry and refuses Python socket
+connections. It does not download weights or call a hosted inference API.
+
+These are **selected-span labels**, not complete NER training annotations. Before
+fine-tuning, fully annotate chosen training windows, resolve uncertain labels and
+freeze an independent human-reviewed test set. Otherwise an unlabelled identifier
+could incorrectly be taught as safe text. Model output and existing redactions
+are suggestions to check, not an answer key.
+
+Originals and review pages are plaintext, protected by local directory/file
+permissions (0700/0600 on POSIX), not application-level encryption. Keep the store
+off shared/synced folders and out of Git. `init` defaults to a 30-day retention
+period and 100 MiB of original/redacted payloads; configure these at creation with
+`--retention-days` and `--max-mib`. Expired captures, labels and managed review
+pages are deleted when an evaluation command opens the store or on `prune`;
+there is no background deletion timer. `disable` stops new captures without
+deleting existing examples; `delete CAPTURE_ID` removes a capture and its labels
+and managed page. Re-running `init` does not re-enable a disabled store. Review
+downloads, copied pages, backups and reports are not automatically purged. The
+payload quota excludes labels, reports and SQLite overhead; it is not a disk cap.
+
+### Optional snippet contributions
+
+`redaction-eval contribute` lets a volunteer choose a small example for the
+ClawJournal project's redaction training/evaluation. It is a **local bundle
+workflow**, not an admin-site integration or automatic uploader. Normal shares,
+hold states, project confirmation and recurring-upload permissions are unchanged.
+Opening a contribution page grants no consent. By default, each snippet needs
+its own explicit approval covering the exact displayed version. Volunteers can
+instead opt in to ongoing permission for future local captures, described below.
+
+1. Capture a conversation you may use, review its labels, and import the reviewed
+   corrections as described above. Choose a small window (at most 800 Unicode
+   characters) with 1–40 resolved, human-reviewed labels. Label every occurrence
+   of identifiers and review the surrounding text. Unlabelled rule matches and
+   possible secrets block preparation; a scanner cannot prove the absence of PII.
+2. Prepare that window. All selected names, emails, usernames, phone numbers and
+   addresses labelled `redact` are replaced with invented stand-ins. Supported
+   aliases are `name`, `phone` and `home_username`. Other sensitive categories
+   currently block preparation: trim the window instead of retaining the real
+   value. Research values labelled `preserve` are kept. Repeated occurrences of
+   the same identifier receive the same substitute within a proposal.
+3. Open the generated contribution HTML page. Inspect the original and the exact
+   proposed snippet. Four unchecked boxes ask about permission, context review,
+   label/replacement review and consent to training/evaluation. The approval
+   download stays disabled until all four are selected. **No, don't contribute**
+   creates no approval. The page cannot modify an approval already imported into
+   the CLI; it shows a withdrawal command for that case.
+4. Import the approval and export the local bundle. Delivering that bundle to a
+   maintainer is a separate, deliberate action; this feature sends no bundle to
+   a server. Prepare a fresh proposal after any correction—old approvals cannot
+   authorize revised text, labels or invented replacements.
+
+```bash
+# End is exclusive; use original-text Unicode code-point offsets.
+clawjournal redaction-eval --store YOUR_STORE contribute prepare CAPTURE_ID \
+  --unit /messages/0/content --start 0 --end 120
+
+# Open the printed HTML path, inspect the snippet and download approval.
+clawjournal redaction-eval --store YOUR_STORE contribute approve approval-PROPOSAL_ID.json
+clawjournal redaction-eval --store YOUR_STORE contribute export PROPOSAL_ID
+
+# Reopen a review or withdraw a pending/approved proposal.
+clawjournal redaction-eval --store YOUR_STORE contribute review PROPOSAL_ID
+clawjournal redaction-eval --store YOUR_STORE contribute withdraw PROPOSAL_ID
+```
+
+Export requires the installed Betterleaks and TruffleHog scanners, refuses bypass
+flags and fails closed on scanner errors. Betterleaks first checks the proposed
+bundle locally. The existing final share gate then scans the exact candidate;
+its TruffleHog verified-credential check retains its existing network behavior.
+Only the proposed edited candidate is scanned at that stage. A finding, rewrite
+or changed authorization prevents bundle creation; labels are never silently
+shifted after approval. This does not authorize an upload or release a held
+session through the ordinary share flow.
+
+Portable bundles contain the edited snippet, its label offsets, a random
+contributor pseudonym, the split and a matching approval record. They omit
+original identifiers and their replacement map, original session/capture IDs,
+source hashes, file paths, free-text notes and provenance fields. Remaining
+unlabelled **context is included**, so the volunteer must inspect all of it.
+Invented emails use `research.example.org`, phone numbers use the fictional
+`202-555-01xx` range, and names/addresses are generated from limited vocabularies.
+These constraints help avoid exporting real identifiers but introduce a dataset
+bias; generated names are not guaranteed unique to fiction. Incoming labels must
+use these supported stand-in formats. This does not prove that a manually
+constructed bundle has no sensitive content.
+
+The installation stores one random contributor UUID and one split in
+`$CLAWJOURNAL_HOME/redaction-contributor.db` (normally `~/.clawjournal/`). The first
+proposal adopts its source capture's split; later proposals across evaluation
+stores cannot move that contributor to another split. Plan the split before
+collecting data. On another device, pass the same assigned UUID with
+`contribute prepare --contributor-id UUID` on first use. Never use an email/name
+as that ID, and do not create another identity to move known examples into a
+test set. A device cannot independently establish that two identities belong to
+one person; the maintainer must track that association.
+
+Maintainers combine approved bundles using a **stable assigned contributor UUID**
+for each person, including across devices:
+
+```bash
+clawjournal redaction-eval contribute collect PROPOSAL_ID.bundle.json \
+  --collection /private/local/collection --contributor-id ASSIGNED_UUID
+```
+
+The collection rescans incoming bundles and validates the strict schema, approval
+hash and label boundaries. It stores them in `collection.db`. Repeat imports are
+idempotent; conflicting IDs, contributor split changes, inconsistent contributor
+aliases and identical/equivalent snippets crossing splits are rejected. Equivalent
+snippets are compared after replacing labelled invented identifiers with their
+types, so changing a fake name does not bypass this check. Paraphrases and other
+near duplicates still need curator review. Approval records are attestations,
+not cryptographic proof of human consent; an eventual hosted collector must bind
+them to authenticated contributor accounts. These snippets still carry
+`selected-spans-not-exhaustive-NER`: inspect and fully annotate training windows
+before treating unlabelled tokens as safe.
+
+Withdrawal, capture deletion/expiry and changed source labels remove managed
+contribution review pages/bundles; they cannot recall downloads, backups or files
+already delivered elsewhere. Contribution records are deleted with their source
+capture. The pseudonym/split profile and maintainer collection persist separately
+to prevent accidental reassignment; they are not covered by capture retention.
+
+#### Ongoing permission for future examples
+
+Volunteers can choose **Review each contribution** (the default) or **Allow
+ongoing contributions**. Open the local preference page, read the scope and
+select its three initially unchecked acknowledgements. Download and import the
+permission file to enable the setting:
+
+```bash
+clawjournal redaction-eval --store YOUR_STORE contribute settings
+clawjournal redaction-eval --store YOUR_STORE contribute consent import ongoing-contribution-permission.json
+clawjournal redaction-eval --store YOUR_STORE contribute consent status
+
+# After future conversations are captured and their draft/reviewed labels saved:
+clawjournal redaction-eval --store YOUR_STORE contribute process --limit 5
+
+# Stop automatic preparation/export and remove managed automatic bundles:
+clawjournal redaction-eval --store YOUR_STORE contribute consent disable
+```
+
+Permission is specific to this evaluation store, its stated training/evaluation
+purpose and the current terms version. It covers **new captures after opt-in**,
+not existing captures or unrelated projects/stores. Existing research membership,
+software updates and automatic-upload settings never enable it implicitly. A
+permission file from another store or an earlier revoked setting is rejected.
+Re-enabling does not revive old automatic proposals.
+
+`process` is a bounded local batch command suitable for calling from an existing
+automation runner; no scheduler, daemon hook or hosted upload is installed. It
+uses labels already recorded in the evaluation store, selects small surrounding
+windows, replaces supported identifiers, runs the mandatory scanners, and writes
+at most five candidate results per invocation. Captures without labels produce
+no examples. Repeated runs skip existing managed bundles and withdrawn proposals.
+Uncertain labels, unsupported types, unlabelled detected PII and scanner failures
+are held locally for review. Other automatically missed PII may remain in context;
+consent explicitly acknowledges that limitation. Correct held examples through
+the existing label-review workflow and rerun the command.
+
+Automatic bundles use schema v2. They record ongoing authorization separately
+from review: `reviewed_context` and `reviewed_labels` are **false**, context is
+`unreviewed`, and each label keeps its actual `assistant_draft` or
+`human_reviewed` status. They are candidates for curation, not a trusted benchmark
+or a fully annotated training set. The collector accepts both manual v1 and
+automatic v2 bundles, preserving these distinctions and contributor split checks.
+The existing benchmark continues excluding draft labels unless explicitly asked
+to include them. To approve a candidate manually, review/correct the source labels
+and prepare a fresh manual proposal; consent cannot promote draft labels.
+
+Permission is checked again after scanning before writing an automatic bundle.
+Disable prevents further automatic exports and removes managed automatic bundles;
+it leaves separately approved manual contributions intact. Previously copied,
+delivered, or collected files cannot be recalled locally. Delivering any bundle
+to maintainers remains a separate action, and normal session-sharing gates remain
+unchanged.
+
+#### Separately sharing original and redacted conversations
+
+Snippet consent never includes originals. The optional `redaction-eval pairs`
+workflow requires a **separate unchecked permission** for full normalized
+conversations, including original personal information. The permission is bound
+to one HTTPS destination and future captures in one local evaluation store.
+
+**Original conversations are used only to evaluate and improve the redaction
+pipeline, including redaction-specific model training. They are not for general
+research, unrelated benchmarks, or general-purpose model training.** This exact
+purpose is recorded with the contribution and shown on the hosted admin table.
+
+```bash
+clawjournal redaction-eval --store YOUR_STORE pairs settings --destination https://data.rayward.ai
+# Open the printed page, select the separate original/redacted permissions,
+# download the permission file, then import it. Opening the page changes nothing.
+clawjournal redaction-eval --store YOUR_STORE pairs consent paired-conversation-permission.json
+clawjournal redaction-eval --store YOUR_STORE pairs status
+
+# Capture a NEW conversation after opt-in using the existing capture command.
+# Existing project confirmation, exclusions and indexed holds still apply.
+clawjournal config --confirm-projects
+clawjournal redaction-eval --store YOUR_STORE pairs export CAPTURE_ID
+# Save a verified upload token from the destination's existing email-verification
+# flow in a private text file (chmod 600). Tokens are single-use for new uploads.
+clawjournal redaction-eval --store YOUR_STORE pairs upload CAPTURE_ID --upload-token-file TOKEN_FILE
+
+clawjournal redaction-eval --store YOUR_STORE pairs disable
+# A fresh verified token for the same contributor can withdraw a hosted pair,
+# including after local permission has been disabled.
+clawjournal redaction-eval --store YOUR_STORE pairs withdraw BUNDLE_UUID --upload-token-file FRESH_TOKEN_FILE
+```
+
+Paired files contain both complete normalized conversations, hashes joining the
+pair, labels with their actual review status, and the purpose-specific consent.
+The redacted conversation is the captured pipeline preview checked by the final
+secret gate; label corrections are annotations, not edits to that stored preview.
+Originals are scanned locally for possible secrets and blocked on findings or
+scanner errors; originals never enter online credential verification. The
+redacted side passes the existing mandatory share gate. No originals are added
+to ordinary redacted session uploads or invented-identifier snippet bundles.
+Original normalized objects may include personal metadata; consent covers the
+whole object. Captured labels are not exhaustive or automatically verified.
+
+Upload requires a compatible hosted service with paired collection explicitly
+enabled; it fails if that endpoint is unavailable and does not fall back to a
+normal share. Redirects are refused, and permission is rechecked before sending.
+There is no background upload enrollment in this feature. Disable removes
+managed local pair files and prevents further pair exports/uploads; already
+delivered copies require hosted withdrawal. Expiring/deleting a local capture
+also removes its managed pair file. Local files are private but unencrypted;
+use an encrypted disk and avoid cloud-synced folders.
+
+Authorized administrators can use `/admin/redaction-pairs` to download the
+original, redacted version, or a JSON object containing both. Its CSV table
+contains pair/contributor IDs, dataset split, hashes, expiry and download links;
+it does not embed raw text. Hosted payloads are encrypted separately, excluded
+from the normal research ingestion feed, expire after 30 days and can be withdrawn.
+Administrators must retain the same purpose/access restrictions on downloaded
+copies and delete them by their expiry. Deployment and retention cleanup belong
+to the companion hosted-service change; this client change does not deploy it.
