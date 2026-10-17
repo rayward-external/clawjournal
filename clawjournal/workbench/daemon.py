@@ -397,7 +397,6 @@ _index_recovery_thread: threading.Thread | None = None
 _support_report_recovery_lock = threading.Lock()
 _support_report_recovery_thread: threading.Thread | None = None
 _support_report_recovery_stop: threading.Event | None = None
-_HOSTED_EMAIL_SUFFIXES_DEFAULT = (".edu", ".ac.uk", ".edu.au", ".edu.cn", "ac.jp", "rayward.ai")
 _hosted_capabilities_cache: tuple[str, float, dict[str, Any]] | None = None
 
 
@@ -2018,6 +2017,14 @@ def _email_domain_allowed(
     email: str,
     capabilities: dict[str, Any] | None = None,
 ) -> bool:
+    """Check an address against the hosted service's published email policy.
+
+    Without a published ``domain_suffixes`` list (capabilities unavailable, or
+    a document that omits the policy) only the address syntax is checked and
+    eligibility is left to the host, which re-checks every address on
+    ``POST /api/verify-email``. A built-in copy of the host's allowlist drifted
+    from it and rejected eligible users, so there is deliberately none.
+    """
     normalized = _normalize_email(email)
     if normalized.count("@") != 1:
         return False
@@ -2025,9 +2032,9 @@ def _email_domain_allowed(
     if not local_part or not domain or any(character.isspace() for character in normalized):
         return False
     policy = (capabilities or {}).get("supported_institution_email_policy")
-    suffixes = _HOSTED_EMAIL_SUFFIXES_DEFAULT
-    if isinstance(policy, dict) and isinstance(policy.get("domain_suffixes"), list):
-        suffixes = tuple(str(item).lower() for item in policy["domain_suffixes"] if item)
+    if not isinstance(policy, dict) or not isinstance(policy.get("domain_suffixes"), list):
+        return True
+    suffixes = tuple(str(item).lower() for item in policy["domain_suffixes"] if item)
     for suffix in suffixes:
         normalized_suffix = suffix.strip().lower()
         if not normalized_suffix:
@@ -2035,10 +2042,7 @@ def _email_domain_allowed(
         bare_suffix = normalized_suffix[1:] if normalized_suffix.startswith(".") else normalized_suffix
         if domain == bare_suffix or domain.endswith(f".{bare_suffix}"):
             return True
-    return bool(
-        isinstance(policy, dict)
-        and policy.get("explicit_collaborators_supported") is True
-    )
+    return policy.get("explicit_collaborators_supported") is True
 
 
 class _AmbiguousTimestamp(ValueError):
@@ -2104,11 +2108,6 @@ def _expiry_timestamp(value: Any) -> float | None:
 def _expiry_is_valid(value: Any, *, grace_seconds: int = 60) -> bool:
     timestamp = _expiry_timestamp(value)
     return timestamp is not None and time.time() < (timestamp - grace_seconds)
-
-
-def _is_edu_email(email: str) -> bool:
-    """Check if an email address matches the hosted academic-email policy."""
-    return _email_domain_allowed(email)
 
 
 def _missing_ingest_url_error() -> str:
@@ -2633,10 +2632,10 @@ def request_email_verification(email: str) -> dict:
         capabilities = _fetch_hosted_share_capabilities()
     except (OSError, ValueError, RuntimeError, urllib.error.URLError):
         # The capabilities doc is only a best-effort source for the institution
-        # email policy. If it is momentarily unreachable, fall back to the
-        # built-in default suffixes rather than blocking the student from
-        # requesting a code; a genuine outage still surfaces on the verify-email
-        # POST below.
+        # email policy. If it is momentarily unreachable, check the address
+        # syntax only and let the verify-email POST below decide eligibility:
+        # the host re-checks every address and answers 400 for an ineligible
+        # one, and a genuine outage still surfaces there.
         capabilities = None
     if not _email_domain_allowed(normalized, capabilities):
         raise ValueError("Enter a valid academic email address.")

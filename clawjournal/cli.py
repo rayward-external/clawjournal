@@ -1980,7 +1980,6 @@ def _run_verify_email(args) -> None:
     from .workbench.daemon import (
         _expiry_is_valid,
         _hosted_is_local_dev,
-        _is_edu_email,
         confirm_email_verification,
         request_email_verification,
     )
@@ -2019,13 +2018,9 @@ def _run_verify_email(args) -> None:
         print(json.dumps({"error": "Email address required."}, indent=2))
         sys.exit(1)
 
-    if not _is_edu_email(email):
-        print(json.dumps({
-            "error": f"'{email}' is not an accepted academic email address.",
-            "hint": "Use an academic email address, or contact support if you are an explicit collaborator.",
-        }, indent=2))
-        sys.exit(1)
-
+    # Domain eligibility is checked by request_email_verification against the
+    # hosted service's published policy, and by the host itself; a local
+    # pre-check here would drift from that policy and reject eligible users.
     if args.code:
         # Step 2: Confirm with verification code
         try:
