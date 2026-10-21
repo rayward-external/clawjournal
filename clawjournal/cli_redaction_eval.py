@@ -9,6 +9,8 @@ def register_parser(sub):
     parser = sub.add_parser("redaction-eval", help="Opt-in local capture, corrections and PII evaluation")
     parser.add_argument("--store", type=Path, default=CONFIG_DIR / "redaction-eval")
     commands = parser.add_subparsers(dest="eval_command", required=True)
+    serve = commands.add_parser("serve", help="Review and save consent/corrections directly through the local service")
+    serve.add_argument("--port", type=int, default=0, help="Loopback port; default chooses an available port")
     init = commands.add_parser("init", help="Opt in to retaining originals locally")
     init.add_argument("--retention-days", type=int, default=30)
     init.add_argument("--max-mib", type=int, default=100)
@@ -126,6 +128,12 @@ def run(args):
                                       gliner_predictor, private_write, rules_predictor)
     store = None
     try:
+        if args.eval_command == "serve":
+            from .redaction.local_review import serve
+            if not 0 <= args.port <= 65535:
+                raise ValueError("Port must be between 0 and 65535")
+            serve(args.store, args.port)
+            return
         if args.eval_command == "contribute" and args.contribution_command == "collect":
             print(json.dumps(_contribute(args, None), indent=2))
             return

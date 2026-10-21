@@ -21,10 +21,23 @@
 <script type="application/json" nonce="contribution-settings" id="settings-data">__SETTINGS_DATA__</script>
 <script nonce="contribution-settings">
 "use strict";
+let saving=false;
 const data=JSON.parse(document.getElementById("settings-data").textContent),$=id=>document.getElementById(id);
 const fields=["rights","accept_automated_review","consent"];
 $("current").textContent=`Current setting when this page was created: ${data.mode === "ongoing" ? "Ongoing contributions" : "Review each contribution"}.`;
-for(const field of fields){$(field).checked=false;$(field).addEventListener("change",()=>{$("enable").disabled=data.mode==="ongoing"||!fields.every(id=>$(id).checked);});}
+for(const field of fields){$(field).checked=false;$(field).addEventListener("change",()=>{$("enable").disabled=saving||data.mode==="ongoing"||!fields.every(id=>$(id).checked);});}
 $("instructions").textContent="Opening this page does not change your preference. Import the permission file to enable it.";
-$("enable").addEventListener("click",()=>{if(data.mode==="ongoing"||!fields.every(id=>$(id).checked))return;const grant={nonce:data.nonce,version:data.version,scope:data.scope,purpose:data.purpose};for(const f of fields)grant[f]=true;const url=URL.createObjectURL(new Blob([JSON.stringify(grant,null,2)],{type:"application/json"}));const a=document.createElement("a");a.href=url;a.download="ongoing-contribution-permission.json";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);$("status").textContent="Permission downloaded; your preference has not changed yet.";$("instructions").textContent="clawjournal redaction-eval --store YOUR_STORE contribute consent import ongoing-contribution-permission.json\nclawjournal redaction-eval --store YOUR_STORE contribute process";});
+if(window.clawjournalLocal){$("enable").textContent="Save ongoing permission";$("instructions").textContent="Save records your preference locally. No examples are uploaded here.";}
+$("enable").addEventListener("click",async()=>{
+  if(saving||data.mode==="ongoing"||!fields.every(id=>$(id).checked))return;
+  const grant={nonce:data.nonce,version:data.version,scope:data.scope,purpose:data.purpose};for(const f of fields)grant[f]=true;
+  if(window.clawjournalLocal){saving=true;$("enable").disabled=true;$("status").textContent="Saving preference locally…";
+    try{await window.clawjournalLocal.save('ongoing-consent',grant);data.mode="ongoing";for(const field of fields)$(field).disabled=true;$("current").textContent="Current setting: Ongoing contributions.";$("status").textContent="Ongoing permission saved on this computer. Nothing has been uploaded.";}
+    catch(error){$("status").textContent="Save not confirmed. "+error.message;}
+    finally{saving=false;$("enable").disabled=data.mode==="ongoing"||!fields.every(id=>$(id).checked);}return;
+  }
+  const url=URL.createObjectURL(new Blob([JSON.stringify(grant,null,2)],{type:"application/json"}));const a=document.createElement("a");a.href=url;a.download="ongoing-contribution-permission.json";document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+  $("status").textContent="Download requested; confirm the file was saved. Your preference has not changed yet.";
+  $("instructions").textContent="Import the saved permission file, or use: clawjournal redaction-eval --store YOUR_STORE serve";
+});
 </script></body></html>

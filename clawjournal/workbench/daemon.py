@@ -4527,6 +4527,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        if urlparse(self.path).path.startswith(("/redaction-eval", "/api/redaction-eval/")):
+            from ..redaction.local_review import handle
+            if handle(self):
+                return
         if not self._check_api_auth():
             self._reject_unauthenticated()
             return
@@ -4691,6 +4695,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._serve_static(parsed.path)
 
     def do_POST(self) -> None:
+        if urlparse(self.path).path.startswith(("/redaction-eval", "/api/redaction-eval/")):
+            from ..redaction.local_review import handle
+            if handle(self):
+                return
         if not self._check_api_auth():
             self._reject_unauthenticated()
             return

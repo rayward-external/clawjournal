@@ -334,6 +334,37 @@ ClawJournal builds on early work from [dataclaw](https://github.com/peteromallet
 Apache-2.0
 ## Local redaction evaluation (opt-in)
 
+### Save consent and corrections directly (recommended)
+
+After initializing and capturing into your evaluation store, run:
+
+```bash
+clawjournal redaction-eval --store "$HOME/.clawjournal/redaction-eval" serve
+```
+
+Open the printed `review_url`. This uses the workbench's local HTTP and bearer
+authentication framework, without starting conversation discovery or uploads.
+The original/redacted permission, ongoing snippet permission, individual snippet
+approval, and correction screens save directly to the selected local store.
+Success appears only after the existing backend validators commit the change.
+No permission-file download or manual import is needed. Each permission remains
+separate; saving permission does not upload a conversation or certify labels.
+
+The normal `clawjournal serve` workbench also exposes `/redaction-eval` for the
+default evaluation store. For a custom store use the command above; `--port`
+optionally chooses a loopback port. Stop the standalone service with Ctrl+C.
+It accepts only local same-origin writes with the existing API token. Store
+paths cannot be chosen through a browser request. Review responses are not cached.
+
+Failed or stale saves leave corrections unsaved and keep the navigation warning.
+If edits are made while a save is in progress, those newer edits still need a
+second save. Reopening a page reloads its current revision from local storage.
+Existing CLI import commands and standalone HTML pages remain available. The
+standalone pages say “Download requested,” since they cannot confirm a saved
+file; use the local service if the browser cannot save their generated files.
+
+### Capture and evaluate
+
 Use `clawjournal redaction-eval` to retain an original input and its local redacted
 preview, record corrections, and repeat a PII benchmark. This is a separate local
 evaluation workspace. It does not add originals to share bundles, change findings
