@@ -2921,11 +2921,26 @@ def apply_share_redactions(
     user_allowlist: list[dict[str, Any]] | None = None,
     extra_usernames: list[str] | None = None,
     blocked_domains: list[str] | None = None,
+    attachment_ids: list[str] | None = None,
+    visual_attachments: dict | None = None,
 ) -> tuple[dict[str, Any], int, list[dict[str, Any]]]:
     """Apply the full share/export redaction pipeline to a session."""
     from ..redaction.anonymizer import Anonymizer
     from ..redaction.normalize import strip_terminal_control_sequences
     from ..redaction.secrets import apply_findings_to_blob
+    from ..attachments import prepare
+
+    if visual_attachments:
+        from .visual_share import validate_approval
+        settings = {"custom_strings": custom_strings, "allowlist_entries": user_allowlist,
+                    "extra_usernames": extra_usernames, "blocked_domains": blocked_domains}
+        for identity, approval in visual_attachments.items():
+            validate_approval(approval, attachment_id=identity, source_revision=session.get("content_revision"), settings=settings)
+
+    session = prepare(session, attachment_ids, visual_attachments=visual_attachments)
+    if visual_attachments:
+        import copy
+        approved_view = copy.deepcopy(session)
 
     total_redactions = 0
     redaction_log: list[dict[str, Any]] = []
@@ -2980,7 +2995,12 @@ def apply_share_redactions(
                         msg[field],
                         custom_strings,
                     )
-                    custom_total += count
+                custom_total += count
+            if isinstance(msg.get("extra"), dict) and "attachment_review" in msg["extra"]:
+                msg["extra"]["attachment_review"], count = _redact_custom_strings_in_value(
+                    msg["extra"]["attachment_review"], custom_strings,
+                )
+                custom_total += count
             for tool_use in msg.get("tool_uses", []):
                 for tool_field in ("input", "output"):
                     if tool_use.get(tool_field):
@@ -3022,6 +3042,13 @@ def apply_share_redactions(
                 domain_log.extend(entries)
 
         for msg_idx, msg in enumerate(session.get("messages", [])):
+            if isinstance(msg.get("extra"), dict) and "attachment_review" in msg["extra"]:
+                msg["extra"]["attachment_review"], count, entries = _redact_blocked_domains_in_value(
+                    msg["extra"]["attachment_review"], domain_patterns,
+                    field="extra.attachment_review", message_index=msg_idx,
+                )
+                domain_total += count
+                domain_log.extend(entries)
             for field in ("content", "thinking"):
                 if msg.get(field):
                     msg[field], count, entries = _redact_blocked_domains_in_value(
@@ -3064,6 +3091,11 @@ def apply_share_redactions(
         redaction_log.extend(domain_log)
 
     anonymizer = Anonymizer(extra_usernames=extra_usernames)
+    for msg in session.get("messages", []):
+        if isinstance(msg.get("extra"), dict) and "attachment_review" in msg["extra"]:
+            msg["extra"]["attachment_review"] = _transform_nested_strings(
+                msg["extra"]["attachment_review"], anonymizer.text,
+            )
     for field in ("display_title", "project", "git_branch"):
         if session.get(field):
             session[field] = _transform_nested_strings(session[field], anonymizer.text)
@@ -3121,6 +3153,9 @@ def apply_share_redactions(
     # bucket counts come from the log and will undercount those
     # multi-pass finds; the Package-step gate is authoritative.
 
+    if visual_attachments:
+        from .visual_share import assert_visual_unchanged
+        assert_visual_unchanged(approved_view, session)
     return session, total_redactions, redaction_log
 
 
@@ -8669,6 +8704,10 @@ def export_share_to_disk(
         detail = load_share_snapshot(conn, share_id, session_id)
         if detail is None:
             detail = get_session_detail(conn, session_id)
+            if detail is not None:
+                # Imported metadata cannot grant attachment sharing consent.
+                detail.pop("_review_attachment_ids", None)
+                detail.pop("_review_visual_attachments", None)
         if detail is None:
             skipped_session_ids.append(session_id)
             continue
@@ -8693,14 +8732,22 @@ def export_share_to_disk(
 
     from ..redaction.boundaries import RedactionBoundaryError
 
+    from ..attachments import AttachmentSelectionError
+    from ..visual_assets import VisualAssetError, validate_bundle as validate_visual_bundle
+    from .visual_share import collect_assets, write_bundle_assets
+    visual_assets = {}
+    exported_sessions = []
     try:
         with open(tmp_sessions_file, "w") as f:
             for selected, detail, revision_hash, replaces_revision_hash in prepared:
+                approved_visuals = detail.get("_review_visual_attachments") or {}
                 try:
                     detail, n_redacted, redaction_log = apply_share_redactions(
                         conn, detail, custom_strings=custom_strings,
                         user_allowlist=allowlist_entries, extra_usernames=extra_usernames,
                         blocked_domains=blocked_domains,
+                        attachment_ids=detail.get("_review_attachment_ids"),
+                        visual_attachments=detail.get("_review_visual_attachments"),
                     )
                 except RedactionBoundaryError as exc:
                     skipped_session_ids.append(selected['session_id'])
@@ -8721,6 +8768,8 @@ def export_share_to_disk(
                 clean = {k: v for k, v in detail.items() if k in EXPORT_FIELDS}
                 clean["revision_hash"] = revision_hash
                 clean["replaces_revision_hash"] = replaces_revision_hash
+                visual_assets.update(collect_assets(approved_visuals))
+                exported_sessions.append(clean)
                 f.write(json.dumps(clean, default=str) + "\n")
                 manifest["sessions"].append({
                     "session_id": clean.get("session_id") or selected["session_id"],
@@ -8744,6 +8793,11 @@ def export_share_to_disk(
                     blocked_sessions=boundary_skips)
                 return export_dir, manifest
         os.replace(tmp_sessions_file, sessions_file)
+        write_bundle_assets(export_dir, manifest, exported_sessions, visual_assets)
+    except (AttachmentSelectionError, VisualAssetError) as exc:
+        tmp_sessions_file.unlink(missing_ok=True)
+        manifest.update(blocked=True, block_reason="attachment_review_changed", block_message=str(exc))
+        return export_dir, manifest
     except BaseException:
         tmp_sessions_file.unlink(missing_ok=True)
         raise
@@ -8765,6 +8819,13 @@ def export_share_to_disk(
     from .share_gate import build_blocked_sessions, run_share_gate
 
     gate_report = run_share_gate(sessions_file, manifest, conn=conn)
+    if visual_assets:
+        try:
+            validate_visual_bundle(manifest, [json.loads(line) for line in sessions_file.read_text().splitlines() if line.strip()], visual_assets)
+        except VisualAssetError as exc:
+            manifest.update(blocked=True, block_reason="attachment_review_changed", block_message=str(exc))
+            (export_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            return export_dir, manifest
     scan_policy.write_report(export_dir / "secret-scan.json", gate_report)
     # Legacy artifact + manifest key: the TruffleHog sub-report
     # (verified-only) keeps its historical name so existing consumers

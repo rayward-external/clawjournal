@@ -630,6 +630,9 @@ def export_to_jsonl(
                     skipped += 1
                     continue
 
+                from .attachments import prepare as prepare_attachments
+                # Non-interactive exports have no per-attachment approval.
+                session = prepare_attachments(session)
                 session, n_redacted, _ = redact_session(session, custom_strings=custom_strings)
                 total_redactions += n_redacted
 

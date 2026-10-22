@@ -73,6 +73,37 @@ afterEach(() => {
 });
 
 describe('Reviewed share versions', () => {
+  it('requires fresh conversation approval after changing an attachment choice', async () => {
+    mockInitialLoad(readyStats(1));
+    const report = vi.spyOn(api.sessions, 'redactionReport').mockImplementation(async (_id, opts) => ({
+      session_id: 's1', review_snapshot_id: opts?.attachmentIds?.length ? 'with-attachment' : 'without-attachment',
+      reviewed_revision: 'current-revision', redaction_count: 0, redaction_log: [], ai_coverage: 'full',
+      attachments: [{ id: 'attachment-choice', name: 'results.txt', message_index: 0,
+        availability: 'extracted_text', can_include: true, reason: '', original_text: 'loss=0.125' }],
+      selected_attachment_ids: opts?.attachmentIds || [],
+      redacted_session: { messages: [{ role: 'user', content: 'Compare results.', extra: {
+        attachment_review: { schema_version: 'clawjournal.attachments.v1', items: [{
+          attachment_id: 'attachment-1', message_index: 0, availability: 'extracted_text',
+          status: opts?.attachmentIds?.length ? 'included' : 'excluded',
+          ...(opts?.attachmentIds?.length ? { text: 'loss=0.125', name: 'results.txt' } : {}),
+        }] },
+      } }] },
+    } as unknown as Awaited<ReturnType<typeof api.sessions.redactionReport>>));
+    render(<MemoryRouter initialEntries={['/share?ai_pii=1']}><ToastProvider><Share /></ToastProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Redact & review' }));
+    await screen.findByText('Redaction complete');
+    fireEvent.click(screen.getByRole('button', { name: /Review what I.m sharing/ }));
+    expect(await screen.findByRole('button', { name: 'Package 1 trace' })).toBeEnabled();
+    const choice = screen.getByRole('checkbox', { name: /results.txt/ });
+    expect(choice).not.toBeChecked();
+    fireEvent.click(choice);
+    await waitFor(() => expect(report).toHaveBeenLastCalledWith('s1', expect.objectContaining({
+      attachmentIds: ['attachment-choice'], expectedRevision: 'current-revision',
+    })));
+    await waitFor(() => expect(choice).toBeChecked());
+    expect(screen.queryByRole('button', { name: 'Package 1 trace' })).not.toBeInTheDocument();
+  });
+
   it('clears saved reviews only after confirmation and reports the result', async () => {
     mockInitialLoad(readyStats(1));
     const clear = vi.spyOn(api.shares, 'clearReviews').mockResolvedValue({ ok: true });

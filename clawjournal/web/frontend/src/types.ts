@@ -152,6 +152,56 @@ export interface Message {
   thinking?: string;
   tool_uses?: ToolUse[];
   timestamp?: string;
+  extra?: { attachment_review?: { schema_version: string; items: AttachmentRecord[] } };
+}
+
+export interface AttachmentRecord {
+  attachment_id: string;
+  message_index: number | null;
+  availability: 'original_file' | 'extracted_text' | 'reference_only';
+  status: 'included' | 'excluded' | 'unavailable';
+  name?: string;
+  text?: string;
+  visual_context_missing?: boolean;
+  pages?: { page_index: number; asset_path: string; sha256: string; width: number; height: number; text: string; redaction_count: number }[];
+}
+
+export interface AttachmentChoice {
+  id: string;
+  message_index: number | null;
+  name: string;
+  availability: AttachmentRecord['availability'];
+  can_include: boolean;
+  reason: string;
+  original_text: string;
+  can_preview_image?: boolean;
+  can_review_visual?: boolean;
+  visual_context_missing?: boolean;
+}
+
+export type VisualBox = [number, number, number, number];
+export interface VisualPage {
+  index: number;
+  width: number;
+  height: number;
+  status: 'unscanned' | 'scanned';
+  version: string;
+  candidates: { id: number; text: string; start: number; end: number }[];
+  selected_candidate_ids: number[];
+  manual_boxes: VisualBox[];
+  warnings: string[];
+  redacted_text: string;
+}
+export interface VisualReview {
+  review_id: string;
+  attachment_id: string;
+  reviewed_revision: string;
+  pages: VisualPage[];
+  sharing_authorized: false;
+  privacy_checked?: boolean;
+  approved?: boolean;
+  redacted_name?: string;
+  scanner_engine?: string;
 }
 
 export interface ToolUse {
@@ -596,6 +646,9 @@ export interface RedactionReport {
   ai_pii_findings?: AiPiiFinding[];
   ai_coverage?: 'full' | 'rules_only' | 'disabled';
   redacted_session: SessionDetail;
+  attachments?: AttachmentChoice[];
+  selected_attachment_ids?: string[];
+  visual_review_ids?: Record<string, string>;
 }
 
 export interface AllowlistEntry {

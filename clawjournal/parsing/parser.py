@@ -1,5 +1,6 @@
 """Parse Claude Code, Claude Science, Codex, Gemini CLI, OpenCode, and OpenClaw session data into conversations."""
 
+import copy
 import dataclasses
 import hashlib
 import io
@@ -16,10 +17,41 @@ from pathlib import Path
 from typing import Any
 
 from ..config import CONFIG_DIR
+from ..attachments import MEDIA
 from ..redaction.anonymizer import Anonymizer
 from ..redaction.secrets import redact_text
 
 logger = logging.getLogger(__name__)
+
+
+def _message_attachments(payload: dict[str, Any]) -> list[Any]:
+    """Keep local source attachments for explicit Share review; never fetch files."""
+    records = []
+    content = payload.get("content")
+    if isinstance(content, list):
+        records.extend(block for block in content if isinstance(block, dict)
+                       and isinstance(block.get("type"), str) and block["type"] in MEDIA)
+    for key in ("attachments", "files", "images", "local_images", "input_images", "audio"):
+        values = payload.get(key)
+        if values:
+            for value in values if isinstance(values, list) else [values]:
+                if isinstance(value, str) and value.startswith("data:"):
+                    value = {"type": "file", "file_data": value}
+                records.append(value)
+    # These are private import records, not sharing choices. Export removes
+    # them unless the researcher selects their supported text in Share.
+    return copy.deepcopy(records)
+
+
+def _retain_message_attachments(message: dict, records: list, *, replace=False) -> None:
+    if replace and isinstance(message.get("extra"), dict):
+        message["extra"].pop("attachments", None)
+    if records:
+        target = message.setdefault("extra", {}).setdefault("attachments", [])
+        for record in records:
+            if record not in target:
+                target.append(copy.deepcopy(record))
+
 
 CLAUDE_SOURCE = "claude"
 CLAUDE_SCIENCE_SOURCE = "claude-science"
@@ -1713,8 +1745,11 @@ def _process_claude_science_entry(
 
     if role == "user":
         content = _extract_claude_science_user_content(msg_data, anonymizer)
-        if content is not None:
-            messages.append({"role": "user", "content": content, "timestamp": None})
+        attachments = _message_attachments(msg_data)
+        if content is not None or attachments:
+            message = {"role": "user", "content": content or "", "timestamp": None}
+            _retain_message_attachments(message, attachments)
+            messages.append(message)
             stats["user_messages"] += 1
         return
 
@@ -3341,7 +3376,7 @@ def _parse_codex_session_fragments(
                     message_parts = _codex_user_message_parts(payload, anonymizer)
                     if message_parts is not None:
                         replaced_retry_user = _ingest_codex_user_message(
-                            state, message_parts, timestamp, "event_msg"
+                            state, message_parts, timestamp, "event_msg", _message_attachments(payload)
                         )
                     else:
                         _flush_codex_pending(state, timestamp)
@@ -3659,7 +3694,8 @@ def _codex_response_user_message_parts(
     """Extract (anonymized text, identity hash) from a user `response_item`.
 
     Returns None for synthetic context records (AGENTS.md instructions,
-    environment context, hook prompts, ...) and for messages with no text.
+    environment context, hook prompts, ...) and for messages with neither
+    text nor an attachment.
     A wrapper that embeds the real request after ``## My request for
     Codex:`` is preserved rather than dropped."""
     blocks = payload.get("content")
@@ -3669,8 +3705,9 @@ def _codex_response_user_message_parts(
     contextual_texts: list[str] = []
     images: list[dict[str, Any]] = []
     audios: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
     has_media = any(
-        isinstance(block, dict) and block.get("type") in ("input_image", "input_audio")
+        isinstance(block, dict) and block.get("type") in ("input_image", "input_audio", "input_file")
         for block in blocks
     )
     for block in blocks:
@@ -3696,6 +3733,8 @@ def _codex_response_user_message_parts(
             )
         elif block_type == "input_audio":
             audios.append({"audio_url": block.get("audio_url")})
+        elif block_type == "input_file":
+            files.append(block)
     raw_content = "\n\n".join(part.strip() for part in texts).strip()
     if not raw_content:
         # A fully-contextual bundle may still embed the user's request
@@ -3708,11 +3747,11 @@ def _codex_response_user_message_parts(
                 text[idx + len(_CODEX_USER_REQUEST_MARKER):].strip()
             )
             break
-    if not raw_content:
+    if not raw_content and (not has_media or contextual_texts):
         return None
     input_hash = _codex_user_identity_hash(
         raw_content,
-        [("input_images", images), ("input_audio", audios)],
+        [("input_images", images), ("input_audio", audios)] + ([("input_files", files)] if files else []),
     )
     return anonymizer.text(raw_content), input_hash
 
@@ -3747,7 +3786,7 @@ def _handle_codex_response_item(
             if message_parts is None:
                 return False
             return _ingest_codex_user_message(
-                state, message_parts, timestamp, "response_item"
+                state, message_parts, timestamp, "response_item", _message_attachments(payload)
             )
         elif role == "assistant":
             _clear_codex_retry_candidate(state)
@@ -3811,7 +3850,9 @@ def _codex_user_message_parts(
     payload: dict[str, Any], anonymizer: Anonymizer,
 ) -> tuple[str, str] | None:
     content = payload.get("message")
-    if not isinstance(content, str) or not content.strip():
+    if not isinstance(content, str):
+        content = ""
+    if not content.strip() and not _message_attachments(payload):
         return None
     raw_content = content.strip()
     input_hash = _codex_user_identity_hash(
@@ -3906,6 +3947,7 @@ def _replace_codex_retry_user_message(
 def _ingest_codex_user_message(
     state: _CodexParseState, message_parts: tuple[str, str],
     timestamp: str | None, origin: str,
+    attachments: list | None = None,
 ) -> bool:
     """Route one user message (either rollout format) into the transcript.
 
@@ -3921,11 +3963,14 @@ def _ingest_codex_user_message(
     ):
         # The same message already arrived via the other rollout format;
         # consume the pair so a genuine identical resend is kept.
+        _retain_message_attachments(state.messages[-1], attachments or [])
         state.last_message_origin = None
         return False
     if _replace_codex_retry_user_message(state, message_parts, timestamp, origin):
+        _retain_message_attachments(state.messages[-1], attachments or [], replace=True)
         return True
     _handle_codex_user_message(state, message_parts, timestamp, origin)
+    _retain_message_attachments(state.messages[-1], attachments or [])
     return False
 
 
@@ -4497,8 +4542,11 @@ def _process_entry(
 
     if entry_type == "user":
         content = _extract_user_content(entry, anonymizer)
-        if content is not None:
-            messages.append({"role": "user", "content": content, "timestamp": timestamp})
+        attachments = _message_attachments(entry.get("message", {}))
+        if content is not None or attachments:
+            message = {"role": "user", "content": content or "", "timestamp": timestamp}
+            _retain_message_attachments(message, attachments)
+            messages.append(message)
             stats["user_messages"] += 1
             _update_time_bounds(metadata, timestamp)
         # Detect user interrupts (Escape key)
@@ -4580,10 +4628,12 @@ def _extract_assistant_content(
                     tu["status"] = result["status"]
             tool_uses.append(tu)
 
-    if not text_parts and not tool_uses and not thinking_parts:
+    attachments = _message_attachments(msg_data)
+    if not text_parts and not tool_uses and not thinking_parts and not attachments:
         return None
 
     msg: dict[str, Any] = {"role": "assistant"}
+    _retain_message_attachments(msg, attachments)
     if text_parts:
         msg["content"] = "\n\n".join(text_parts)
     if thinking_parts:

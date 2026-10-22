@@ -2909,7 +2909,7 @@ def _share_zip_input_snapshot(export_dir: Path) -> dict[str, Any]:
     if missing:
         raise FileNotFoundError(f"Finalized share is missing {', '.join(missing)}")
 
-    inputs: dict[str, dict[str, int]] = {}
+    inputs: dict[str, dict[str, Any]] = {}
     for name in _SHARE_ZIP_MEMBERS:
         path = export_dir / name
         if not path.exists():
@@ -2919,6 +2919,11 @@ def _share_zip_input_snapshot(export_dir: Path) -> dict[str, Any]:
             "size": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
         }
+    from .visual_share import verified_bundle_assets
+    for name, data in verified_bundle_assets(export_dir).items():
+        stat = (export_dir / name).stat()
+        inputs[name] = {"size": len(data), "mtime_ns": stat.st_mtime_ns,
+                        "sha256": hashlib.sha256(data).hexdigest()}
     return {"version": _SHARE_ZIP_CACHE_VERSION, "inputs": inputs}
 
 
@@ -2960,7 +2965,7 @@ def _finalized_share_zip(export_dir: Path) -> tuple[Path, bool]:
             )
             try:
                 with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name in _SHARE_ZIP_MEMBERS:
+                    for name in snapshot["inputs"]:
                         path = export_dir / name
                         if not path.exists():
                             continue
@@ -4587,6 +4592,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         # API routes
         elif path == "/api/sessions":
             self._handle_list_sessions(params)
+        elif path.startswith("/api/sessions/") and path.endswith("/attachment-visual-page"):
+            from .attachment_reviews import handle
+            handle(self, _api_session_id(path, suffix="/attachment-visual-page"), params=parse_qs(parsed.query))
+        elif path.startswith("/api/sessions/") and path.endswith("/attachment-preview"):
+            session_id = _api_session_id(path, suffix="/attachment-preview")
+            self._handle_attachment_preview(session_id, params)
         elif path.startswith("/api/sessions/") and path.endswith("/redaction-report"):
             session_id = _api_session_id(path, suffix="/redaction-report")
             ai_pii = params.get("ai_pii", [""])[0] == "1"
@@ -4714,6 +4725,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         elif path == "/api/session-status/bulk":
             self._handle_bulk_update_review_status()
+        elif path.startswith("/api/sessions/") and path.endswith("/attachment-visual-review"):
+            from .attachment_reviews import handle
+            handle(self, _api_session_id(path, suffix="/attachment-visual-review"), body=_read_body(self))
+        elif path.startswith("/api/sessions/") and path.endswith("/redaction-report"):
+            session_id = _api_session_id(path, suffix="/redaction-report")
+            body = _read_body(self)
+            if (not isinstance(body, dict) or not isinstance(body.get("attachment_ids"), list)
+                    or not isinstance(body.get("expected_revision"), str)
+                    or type(body.get("ai_pii", False)) is not bool):
+                _json_response(self, {"error": "Attachment choices and the reviewed revision are required."}, 400)
+                return
+            self._handle_redaction_report(session_id, ai_pii=body.get("ai_pii", False),
+                                          attachment_ids=body["attachment_ids"],
+                                          expected_revision=body["expected_revision"],
+                                          visual_review_ids=body.get("visual_review_ids"))
         elif path.startswith("/api/sessions/") and path.endswith("/score"):
             session_id = _api_session_id(path, suffix="/score")
             self._handle_score_session(session_id)
@@ -5765,13 +5791,54 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _handle_redaction_report(self, session_id: str, *, ai_pii: bool = False) -> None:
+    def _handle_attachment_preview(self, session_id: str, params: dict) -> None:
+        """Serve one local image preview without creating any sharing consent."""
+        from ..attachments import AttachmentSelectionError, image_preview
+
+        attachment_id = params.get("attachment_id", [""])[0]
+        revision = params.get("expected_revision", [""])[0]
+        if not attachment_id or not revision:
+            _json_response(self, {"error": "Attachment ID and source revision are required."}, 400,
+                           cache_control="no-store")
+            return
+        with open_index() as conn:
+            detail = get_session_detail(conn, session_id)
+        if detail is None:
+            _json_response(self, {"error": "Session not found"}, 404, cache_control="no-store")
+            return
+        if revision != detail["content_revision"]:
+            _json_response(self, {"error": "The conversation changed. Refresh the attachment list."},
+                           409, cache_control="no-store")
+            return
+        try:
+            data = image_preview(detail, attachment_id)
+        except AttachmentSelectionError as exc:
+            _json_response(self, {"error": str(exc)}, 422, cache_control="no-store")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Content-Disposition", 'inline; filename="attachment-preview.png"')
+        origin = _cors_origin(self)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_redaction_report(self, session_id: str, *, ai_pii: bool = False,
+                                 attachment_ids: list[str] | None = None,
+                                 expected_revision: str | None = None,
+                                 visual_review_ids: dict | None = None) -> None:
         """Return redacted session WITH the full redaction log for review.
 
         When *ai_pii* is True, also runs agent-based PII detection and
         applies the findings on top of the deterministic share redaction.
         """
         from ..redaction.boundaries import RedactionBoundaryError
+        from ..attachments import AttachmentSelectionError, inventory, prepare
 
         conn = open_index()
         try:
@@ -5782,9 +5849,32 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             from .review_snapshots import ReviewSnapshotError, save_review_snapshot
 
             import copy
-            reviewed_input = copy.deepcopy(detail)
-            reviewed_revision = detail["content_revision"]
+            if expected_revision is not None and expected_revision != detail["content_revision"]:
+                _json_response(self, {"error": "The conversation changed. Refresh the attachment list."}, 409,
+                               cache_control="no-store")
+                return
+            attachments = inventory(detail)
             settings = get_effective_share_settings(conn, load_config())
+            visual_review_ids = {} if visual_review_ids is None else visual_review_ids
+            if attachment_ids is not None and (not isinstance(attachment_ids, list)
+                    or any(not isinstance(identity, str) for identity in attachment_ids)):
+                raise AttachmentSelectionError("Attachment choices must be a list of IDs.")
+            if (not isinstance(visual_review_ids, dict)
+                    or any(not isinstance(k, str) or not isinstance(v, str) for k, v in visual_review_ids.items())
+                    or not set(visual_review_ids) <= set(attachment_ids or [])):
+                raise AttachmentSelectionError("Visual approvals must match the selected attachments.")
+            from .attachment_reviews import reviews
+            from .visual_share import profile_hash, assert_visual_unchanged
+            visual_attachments = {identity: reviews.export_approved(review_id,
+                (session_id, detail["content_revision"], identity, profile_hash(settings)))
+                for identity, review_id in visual_review_ids.items()}
+            approved_view = prepare(detail, attachment_ids, visual_attachments=visual_attachments)
+            for attachment in attachments:
+                if attachment["id"] in visual_attachments:
+                    attachment.update(can_include=True, visual_context_missing=False, reason="Approved visual pages selected for sharing.")
+            reviewed_input = copy.deepcopy(detail)
+            reviewed_input["_review_attachment_ids"] = attachment_ids or []
+            reviewed_revision = detail["content_revision"]
             detail, redaction_count, redaction_log = apply_share_redactions(
                 conn,
                 detail,
@@ -5792,6 +5882,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 user_allowlist=settings["allowlist_entries"],
                 extra_usernames=settings["extra_usernames"],
                 blocked_domains=settings["blocked_domains"],
+                attachment_ids=attachment_ids,
+                visual_attachments=visual_attachments,
             )
 
             # Agent-based PII detection is opt-in for the preview. The
@@ -5830,8 +5922,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     logger.warning("AI PII detection failed for %s: %s", session_id, exc)
                     ai_coverage = "rules_only"
 
+            assert_visual_unchanged(approved_view, detail)
             try:
-                review_snapshot_id = save_review_snapshot(conn, reviewed_input)
+                review_snapshot_id = save_review_snapshot(conn, reviewed_input, attachment_ids=attachment_ids,
+                                                         visual_attachments=visual_attachments)
             except ReviewSnapshotError as exc:
                 _json_response(self, {"error": str(exc), "block_reason": "revision_conflict"}, 409)
                 return
@@ -5844,7 +5938,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "ai_pii_findings": ai_pii_findings,
                 "ai_coverage": ai_coverage,
                 "redacted_session": detail,
-            })
+                "attachments": attachments,
+                "selected_attachment_ids": attachment_ids or [],
+                "visual_review_ids": visual_review_ids,
+            }, cache_control="no-store")
+        except AttachmentSelectionError as exc:
+            _json_response(self, {"error": str(exc)}, 409, cache_control="no-store")
         except RedactionBoundaryError as exc:
             _json_response(self, {
                 "error": str(exc), "block_reason": "redaction_boundary",
@@ -6906,6 +7005,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         conn = open_index()
         try:
             clear_review_cache(conn, include_linked=True)
+            from .attachment_reviews import reviews
+            reviews.clear()
             _json_response(self, {'ok': True})
         finally:
             conn.close()

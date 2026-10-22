@@ -8,7 +8,7 @@ import { AutoUploadOffer } from '../../components/AutoUploadControls.tsx';
 
 export interface DoneStepProps {
   stepperHeader: React.ReactNode;
-  bundle: { traces: number; created: string; approxSize: string } | null;
+  bundle: { traces: number; created: string; approxSize: string; attachmentFiles?: number } | null;
   receiptId: string | null;
   hostedStatus: string | null;
   supportContact: string | null;
@@ -57,6 +57,7 @@ export function DoneStep(p: DoneStepProps) {
     { name: 'sessions.jsonl', detail: p.bundle ? `${p.bundle.traces} redacted traces` : 'redacted traces' },
     { name: 'trufflehog.json', detail: 'secret scan' },
     { name: 'trufflehog.post-pii.json', detail: 'final scan' },
+    ...(p.bundle?.attachmentFiles ? [{ name: 'attachments/', detail: `${p.bundle.attachmentFiles} reviewed page images` }] : []),
   ];
 
   return (
