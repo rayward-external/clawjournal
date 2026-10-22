@@ -49,6 +49,7 @@ exclude = ["clawjournal.web*"]
     "events/docs/*.md",
     "events/docs/_features.yaml",
     "redaction/*.toml",
+    "redaction/*.html",
 ]
 
 [project.optional-dependencies]

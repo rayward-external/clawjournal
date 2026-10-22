@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-contribution-settings'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<title>Contribution preferences</title>
+<style>body{font:17px/1.6 system-ui;max-width:800px;margin:32px auto;padding:0 24px;color:#172c3b;background:#f5f8fa}label{display:block;padding:12px 0}button{font:inherit;padding:10px 16px;margin:12px 0}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:16px}.notice{background:#e1edf4;padding:16px}</style></head><body>
+<h1>How would you like to contribute?</h1>
+<p>To separately share full original and redacted conversations <strong>only to improve the redaction pipeline</strong>, use <code>clawjournal redaction-eval --store YOUR_STORE pairs settings</code>. The snippet permission below never includes originals.</p>
+<p id="current"></p>
+<p><strong>Review each contribution</strong> is the default. You can inspect and approve each small snippet separately.</p>
+<p><strong>Allow ongoing contributions</strong> lets the local batch command prepare eligible examples without asking for permission each time. This covers only conversations captured into this local evaluation store <em>after</em> you enable it, for the ClawJournal project's redaction-model training and evaluation.</p>
+<p class="notice">Labelled personal identifiers are replaced with invented values. The surrounding text is included, and automated checks can miss private information. Uncertain or unsupported matches are held for review. Automatic labels stay drafts; ongoing consent does not certify that the labels or surrounding text were checked by a person.</p>
+<p>This preference does not upload anything or change ordinary ClawJournal upload permissions. The batch command writes local bundles. Delivering them is a separate action. Secret scanning may contact credential providers during the final verification step.</p>
+<label><input id="rights" type="checkbox"> I have permission to contribute future examples from conversations I capture into this store.</label>
+<label><input id="accept_automated_review" type="checkbox"> I understand that future eligible snippets, including their context, can be prepared without my individual review and automated checks can miss private information.</label>
+<label><input id="consent" type="checkbox"> Allow ongoing contributions from future captures to improve ClawJournal's redaction training and evaluation.</label>
+<button id="enable" disabled>Download ongoing permission</button>
+<p id="status" role="status"></p><pre id="instructions"></pre>
+<h2>Turn off ongoing contributions</h2>
+<p>You can stop at any time. This also removes managed local automatic bundles. Files already copied or delivered elsewhere cannot be recalled by this command. Earlier individual approvals stay separate.</p>
+<pre>clawjournal redaction-eval --store YOUR_STORE contribute consent disable</pre>
+<script type="application/json" nonce="contribution-settings" id="settings-data">__SETTINGS_DATA__</script>
+<script nonce="contribution-settings">
+"use strict";
+let saving=false;
+const data=JSON.parse(document.getElementById("settings-data").textContent),$=id=>document.getElementById(id);
+const fields=["rights","accept_automated_review","consent"];
+$("current").textContent=`Current setting when this page was created: ${data.mode === "ongoing" ? "Ongoing contributions" : "Review each contribution"}.`;
+for(const field of fields){$(field).checked=false;$(field).addEventListener("change",()=>{$("enable").disabled=saving||data.mode==="ongoing"||!fields.every(id=>$(id).checked);});}
+$("instructions").textContent="Opening this page does not change your preference. Import the permission file to enable it.";
+if(window.clawjournalLocal){$("enable").textContent="Save ongoing permission";$("instructions").textContent="Save records your preference locally. No examples are uploaded here.";}
+$("enable").addEventListener("click",async()=>{
+  if(saving||data.mode==="ongoing"||!fields.every(id=>$(id).checked))return;
+  const grant={nonce:data.nonce,version:data.version,scope:data.scope,purpose:data.purpose};for(const f of fields)grant[f]=true;
+  if(window.clawjournalLocal){saving=true;$("enable").disabled=true;$("status").textContent="Saving preference locally…";
+    try{await window.clawjournalLocal.save('ongoing-consent',grant);data.mode="ongoing";for(const field of fields)$(field).disabled=true;$("current").textContent="Current setting: Ongoing contributions.";$("status").textContent="Ongoing permission saved on this computer. Nothing has been uploaded.";}
+    catch(error){$("status").textContent="Save not confirmed. "+error.message;}
+    finally{saving=false;$("enable").disabled=data.mode==="ongoing"||!fields.every(id=>$(id).checked);}return;
+  }
+  const url=URL.createObjectURL(new Blob([JSON.stringify(grant,null,2)],{type:"application/json"}));const a=document.createElement("a");a.href=url;a.download="ongoing-contribution-permission.json";document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+  $("status").textContent="Download requested; confirm the file was saved. Your preference has not changed yet.";
+  $("instructions").textContent="Import the saved permission file, or use: clawjournal redaction-eval --store YOUR_STORE serve";
+});
+</script></body></html>

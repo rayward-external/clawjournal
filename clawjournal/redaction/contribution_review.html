@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-snippet-review'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<title>Choose whether to contribute this snippet</title>
+<style>body{font:16px/1.55 system-ui;max-width:1200px;margin:32px auto;padding:0 24px;color:#172c3b;background:#f5f8fa}h1{line-height:1.2}.panes{display:grid;grid-template-columns:1fr 1fr;gap:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;border:1px solid #b6c6d0;padding:16px;max-height:450px;overflow:auto}label{display:block;padding:10px 0}button{font:inherit;padding:10px 16px;margin:8px 12px 8px 0;cursor:pointer}button:disabled{cursor:not-allowed;opacity:.5}input:focus,button:focus{outline:3px solid #1675b9}li{padding:8px;background:white;margin:5px 0}.notice{background:#e1edf4;padding:16px}.redact{background:#ffe3da}.preserve{background:#def2e3}code{overflow-wrap:anywhere}#status{font-weight:600}@media(max-width:750px){.panes{grid-template-columns:1fr}}</style></head><body>
+<h1>Would you like to contribute this snippet?</h1>
+<p>Contributing is optional. Approving permits this exact edited snippet to be used by the ClawJournal project for redaction-model training and evaluation. Declining does not affect normal ClawJournal use.</p>
+<p class="notice">This page stays on your computer. Original identifiers are replaced with invented stand-ins in the proposed contribution. Read the entire edited snippet: automated checks can miss private information in the remaining context. Nothing is uploaded by this page or the contribution command.</p>
+<p id="split"></p>
+<div class="panes"><section><h2>Original — stays local</h2><pre id="original" tabindex="0"></pre></section><section><h2>Exact proposed contribution</h2><pre id="proposed" tabindex="0"></pre></section></div>
+<h2>Check the labels</h2><p>“Redact” identifies an invented substitute that represents private information. “Preserve” identifies content the redactor should keep.</p><ul id="labels"></ul>
+<p>If anything is wrong, return to the label-review page, correct the labels, and prepare a new snippet. Shrink the selection to exclude confidential context. Editing labels invalidates this proposal.</p>
+<h2>Your choice</h2>
+<p>Prefer ongoing permission for future examples? Open contribution preferences with <code>clawjournal redaction-eval --store YOUR_STORE contribute settings</code>. Ongoing permission does not mark labels as reviewed.</p>
+<label><input id="rights" type="checkbox"> I have permission to contribute this snippet and its remaining context.</label>
+<label><input id="reviewed_context" type="checkbox"> I checked the entire proposed snippet, including unhighlighted text, and approve the remaining context for contribution.</label>
+<label><input id="reviewed_labels" type="checkbox"> I checked all labels and invented replacements shown above.</label>
+<label><input id="consent" type="checkbox"> Yes, I want this exact proposed snippet used for the ClawJournal project’s redaction training and evaluation.</label>
+<button id="approve" disabled>Download my approval</button><button id="decline">No, don’t contribute</button>
+<p id="status" role="status"></p><pre id="instructions"></pre>
+<p>In the local review service, Save records approval directly. Downloading an approval from a standalone HTML file is not an upload. Import it using the approval command, then export a local bundle. Export runs the existing secret-scan gate; its final credential verification may contact credential providers if a possible credential is detected. Delivering a bundle to maintainers is a separate action. Declining or withdrawing locally cannot recall copies already delivered elsewhere.</p>
+<script type="application/json" nonce="snippet-review" id="contribution-data">__CONTRIBUTION_DATA__</script>
+<script nonce="snippet-review">
+"use strict";
+let saving=false,saved=false;
+const data=JSON.parse(document.getElementById("contribution-data").textContent);
+const $=id=>document.getElementById(id),fields=["rights","reviewed_context","reviewed_labels","consent"],automatic=data.payload.context_review_status==="unreviewed";
+$("original").textContent=data.original;
+$("split").textContent=`Dataset split: ${data.payload.split}. Contributor pseudonym: ${data.payload.contributor_id}. Keep this identity and split when contributing from another device.`;
+const chars=Array.from(data.payload.text);let offset=0;
+for(const label of data.payload.labels){$("proposed").append(document.createTextNode(chars.slice(offset,label.start).join("")));const mark=document.createElement("mark");mark.className=label.decision;mark.textContent=chars.slice(label.start,label.end).join("");$("proposed").append(mark);offset=label.end;const li=document.createElement("li");li.textContent=`${label.decision} · ${label.entity_type}${label.review_status ? " · "+label.review_status : ""}: ${mark.textContent}`;$("labels").append(li);}
+$("proposed").append(document.createTextNode(chars.slice(offset).join("")));
+for(const field of fields){$(field).checked=false;$(field).addEventListener("change",()=>{$("approve").disabled=saving||saved||automatic||!fields.every(id=>$(id).checked);});}
+$("instructions").textContent="Use your existing --store directory with the commands below.";
+if(automatic)$("status").textContent="Prepared under ongoing permission. Context has not been human-reviewed; labels retain their recorded review status. Correct and review labels, then prepare a new manual proposal to approve it individually.";
+if(window.clawjournalLocal){$("approve").textContent="Save my approval";$("instructions").textContent="Save records approval for this exact snippet locally. Export and delivery remain separate actions.";}
+$("approve").addEventListener("click",async()=>{
+  if(saving||saved||automatic||!fields.every(id=>$(id).checked))return;
+  const approval={proposal_id:data.proposal_id,snapshot_hash:data.snapshot_hash,consent_version:data.consent_version};for(const f of fields)approval[f]=true;
+  if(window.clawjournalLocal){saving=true;$("approve").disabled=true;$("decline").disabled=true;$("status").textContent="Saving approval locally…";
+    try{await window.clawjournalLocal.save('snippet-approve',approval);saved=true;$("status").textContent="Approval saved on this computer. Nothing has been exported or uploaded.";}
+    catch(error){$("status").textContent="Save not confirmed. "+error.message;}
+    finally{saving=false;$("approve").disabled=saved||automatic||!fields.every(id=>$(id).checked);$("decline").disabled=false;}return;
+  }
+  const url=URL.createObjectURL(new Blob([JSON.stringify(approval,null,2)],{type:"application/json"}));const link=document.createElement("a");link.href=url;link.download=`approval-${data.proposal_id}.json`;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+  $("status").textContent="Download requested; confirm the file was saved. Approval has not been saved to the store.";
+  $("instructions").textContent=`Import the saved approval, or use: clawjournal redaction-eval --store YOUR_STORE serve`;
+});
+$("decline").addEventListener("click",async()=>{
+  if(saving)return;
+  if(window.clawjournalLocal){saving=true;$("approve").disabled=true;$("decline").disabled=true;
+    try{await window.clawjournalLocal.save('snippet-withdraw',{proposal_id:data.proposal_id});saved=true;for(const f of fields){$(f).checked=false;$(f).disabled=true;}$("status").textContent="Contribution declined locally. Previously delivered copies cannot be recalled.";}
+    catch(error){$("status").textContent="Decline not confirmed. "+error.message;}
+    finally{saving=false;$("approve").disabled=saved||automatic||!fields.every(id=>$(id).checked);$("decline").disabled=saved;}return;
+  }
+  for(const f of fields)$(f).checked=false;$("approve").disabled=true;$("status").textContent="You chose not to contribute. Close this page; no data was sent. If you previously imported an approval, withdraw it using this command:";$("instructions").textContent=`clawjournal redaction-eval --store YOUR_STORE contribute withdraw ${data.proposal_id}`;
+});
+</script></body></html>

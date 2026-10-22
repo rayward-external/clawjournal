@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-local-evaluation'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Local redaction review</title>
+<style>
+body{font:16px/1.5 system-ui;max-width:1400px;margin:32px auto;padding:0 24px;color:#172c3b;background:#f4f7f9}h1{margin-bottom:8px}label{display:inline-block;margin:8px 12px 8px 0}select,input,button{font:inherit;padding:7px;max-width:100%}button{cursor:pointer}button:focus,input:focus,select:focus{outline:3px solid #1675b9}#unit{width:100%}.panes{display:grid;grid-template-columns:1fr 1fr;gap:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;border:1px solid #bccbd5;padding:16px;max-height:420px;overflow:auto}#selection{min-height:24px;color:#14597d}#status{font-weight:600}li{margin:8px 0;padding:8px;background:white}li button{margin-left:16px}small{display:block}.panel{background:#e2edf4;padding:16px;margin:20px 0}@media(max-width:750px){.panes{grid-template-columns:1fr}}
+</style></head><body>
+<h1>Local redaction review</h1>
+<p>This page contains original conversation text. Review data stays on this computer; nothing is sent to a hosted service. Corrections label evaluation examples; they do not change sharing or unredact an upload.</p>
+<p id="policy"></p>
+<label for="unit">Message field</label><select id="unit"></select>
+<div class="panes"><section><h2>Original input</h2><pre id="original" tabindex="0"></pre></section><section><h2>Redacted preview</h2><pre id="redacted" tabindex="0"></pre></section></div>
+<div class="panel"><p>Select a specific value in the original text, then record what should happen to it. You can also enter character offsets below (Unicode code points, end excluded).</p>
+<p id="selection" aria-live="polite">No selection yet.</p>
+<label>Start <input id="start" type="number" min="0" size="8"></label><label>End <input id="end" type="number" min="1" size="8"></label>
+<label>Decision <select id="decision"><option value="redact">Redact: real identifier</option><option value="preserve">Preserve: research / ordinary text</option><option value="uncertain">Uncertain: needs discussion</option></select></label>
+<label>Type <input id="entity" placeholder="email, credit_card_number, measurement…"></label>
+<label>Reason <input id="note" maxlength="1000" placeholder="Why this decision?"></label>
+<label><input id="human" type="checkbox"> I personally checked this label</label>
+<button id="add">Add correction</button></div>
+<h2>Recorded corrections</h2><p>To change a label, remove it and add a replacement. Drafts do not enter the default benchmark.</p><ul id="annotations"></ul>
+<button id="download">Download correction file</button>
+<p>Use the local review service to save corrections directly. For standalone HTML files, import the downloaded JSON using <code>clawjournal redaction-eval --store YOUR_STORE import-corrections FILE</code>. Reopen a fresh review page after importing. Unsaved changes are lost on closing.</p>
+<p id="status" role="status"></p>
+<section class="panel"><h2>Optional: contribute a small example</h2><p>First save your reviewed labels (or import them when using a standalone page). Then select a short window in the original text and show the command below. Preparation proposes invented identifiers; contribution still requires a separate review and explicit consent.</p><button id="contribution-command">Show contribution command</button><pre id="contribution-instructions"></pre></section>
+<script nonce="local-evaluation" id="capture-data" type="application/json">__CAPTURE_DATA__</script>
+<script nonce="local-evaluation">
+"use strict";
+const data=JSON.parse(document.getElementById("capture-data").textContent);
+const $=id=>document.getElementById(id);
+let dirty=false,saving=false,editVersion=0;
+$("policy").textContent=data.policy_text;
+for(const unit of Object.keys(data.original)) { const option=document.createElement("option");option.value=unit;option.textContent=unit;$("unit").append(option); }
+function showUnit(){const unit=$("unit").value;$("original").textContent=data.original[unit]??"";$("redacted").textContent=data.redacted[unit]??"[Field absent from redacted preview]";$("start").value="";$("end").value="";$("selection").textContent="No selection yet.";}
+$("unit").addEventListener("change",showUnit);
+document.addEventListener("selectionchange",()=>{const sel=window.getSelection();if(!sel.rangeCount||sel.isCollapsed)return;const range=sel.getRangeAt(0),original=$("original");if(!original.contains(range.startContainer)||!original.contains(range.endContainer))return;const prefix=range.cloneRange();prefix.selectNodeContents(original);prefix.setEnd(range.startContainer,range.startOffset);const start=Array.from(prefix.toString()).length;const end=start+Array.from(range.toString()).length;$("start").value=start;$("end").value=end;$("selection").textContent=`Selected characters ${start}–${end}`;});
+function render(){const list=$("annotations");list.replaceChildren();data.annotations.forEach((a,index)=>{const li=document.createElement("li"),span=document.createElement("span"),button=document.createElement("button");const target=Array.from(data.original[a.unit]).slice(a.start,a.end).join("");span.textContent=`${a.decision} · ${a.entity_type||"unclassified"} · ${a.review_status}: ${target}`;li.append(span);const detail=document.createElement("small");detail.textContent=`${a.unit} [${a.start}, ${a.end}) ${a.note||""}`;li.append(detail);button.textContent="Remove";button.addEventListener("click",()=>{data.annotations.splice(index,1);dirty=true;editVersion++;render();});li.append(button);list.append(li);});}
+$("add").addEventListener("click",()=>{const start=Number($("start").value),end=Number($("end").value),unit=$("unit").value,decision=$("decision").value,entity=$("entity").value.trim();if($("start").value===""||$("end").value===""||!Number.isInteger(start)||!Number.isInteger(end)||start<0||end<=start||end>Array.from(data.original[unit]??"").length){$("status").textContent="Select a valid original-text range first.";return;}if(decision==="redact"&&!entity){$("status").textContent="Enter the type of identifier.";return;}if(data.annotations.some(a=>a.unit===unit&&a.start<end&&a.end>start)){$("status").textContent="That range overlaps an existing correction. Remove that correction first.";return;}data.annotations.push({unit,start,end,decision,entity_type:entity,note:$("note").value,review_status:$("human").checked?"human_reviewed":"assistant_draft"});dirty=true;editVersion++;render();$("human").checked=false;$("status").textContent=window.clawjournalLocal?"Correction added. Click Save corrections to save it on this computer.":"Correction added locally. Download and import to save it.";});
+if(window.clawjournalLocal)$("download").textContent="Save corrections";
+$("download").addEventListener("click",async()=>{
+  if(saving)return;
+  const payload={capture_id:data.capture_id,pair_hash:data.pair_hash,revision:data.revision,policy:data.policy,annotations:data.annotations};
+  if(window.clawjournalLocal){const version=editVersion;saving=true;$("download").disabled=true;$("status").textContent="Saving corrections locally…";
+    try{const result=await window.clawjournalLocal.save('corrections',payload);data.revision=result.revision;if(editVersion===version){dirty=false;$("status").textContent="Corrections saved on this computer.";}else{$("status").textContent="Earlier corrections saved. Your newer edits are still unsaved.";}}
+    catch(error){$("status").textContent="Save not confirmed. Your edits remain on this page. "+error.message;}
+    finally{saving=false;$("download").disabled=false;}return;
+  }
+  const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:"application/json"}));const link=document.createElement("a");link.href=url;link.download=`corrections-${data.capture_id}.json`;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
+  $("status").textContent="Download requested. Confirm the file was saved and import it. The unsaved-changes warning remains active. You can also save directly with the local review service.";
+});
+window.addEventListener("beforeunload",event=>{if(dirty||saving){event.preventDefault();event.returnValue="";}});
+$("contribution-command").addEventListener("click",()=>{const start=Number($("start").value),end=Number($("end").value),unit=$("unit").value;if($("start").value===""||$("end").value===""||!Number.isInteger(start)||!Number.isInteger(end)||start<0||end<=start||end-start>800||end>Array.from(data.original[unit]??"").length){$("contribution-instructions").textContent="Select an original-text window of 1–800 characters first.";return;}const quote=value=>"'"+value.replace(/'/g,"'\"'\"'")+"'";$("contribution-instructions").textContent=`clawjournal redaction-eval --store YOUR_STORE contribute prepare ${quote(data.capture_id)} --unit ${quote(unit)} --start ${start} --end ${end}`;});
+showUnit();render();
+</script></body></html>
