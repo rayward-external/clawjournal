@@ -14,6 +14,12 @@ from clawjournal.redaction.scan_policy import GateReport
 SETTINGS = {"custom_strings": [], "allowlist_entries": [], "extra_usernames": [], "blocked_domains": []}
 
 
+@pytest.mark.parametrize("messages", [5, None, {}, "invalid", ["not-an-object"]])
+def test_visual_transport_rejects_malformed_messages(messages):
+    with pytest.raises(visual_assets.VisualAssetError, match="must be an"):
+        visual_assets.validate_bundle({}, [{"messages": messages}], {})
+
+
 @pytest.fixture
 def conn(tmp_path, monkeypatch):
     monkeypatch.setattr(index, "INDEX_DB", tmp_path / "index.db")

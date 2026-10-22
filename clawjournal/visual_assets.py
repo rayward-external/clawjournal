@@ -78,7 +78,14 @@ def png_dimensions(data):
 
 def visual_records(sessions):
     for row, session in enumerate(sessions):
-        for message_index, message in enumerate(session.get("messages", [])):
+        if not isinstance(session, dict):
+            raise VisualAssetError(f"session {row + 1} must be an object")
+        messages = session.get("messages", [])
+        if not isinstance(messages, list):
+            raise VisualAssetError(f"session {row + 1} messages must be an array")
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise VisualAssetError(f"session {row + 1} message {message_index + 1} must be an object")
             extra = message.get("extra") if isinstance(message, dict) else None
             review = extra.get("attachment_review") if isinstance(extra, dict) else None
             if not isinstance(review, dict):
