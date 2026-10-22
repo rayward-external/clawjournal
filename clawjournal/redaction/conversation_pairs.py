@@ -20,6 +20,10 @@ def schema(store):
         id TEXT PRIMARY KEY, capture_id TEXT REFERENCES captures(id) ON DELETE CASCADE,
         generation TEXT, revision INTEGER, destination TEXT NOT NULL,
         UNIQUE(capture_id,generation,revision))""")
+    # Pairs admitted for upload. No capture reference: hosted withdrawal must
+    # outlive local deletion and retention. Holds IDs and destinations only.
+    store.conn.execute("""CREATE TABLE IF NOT EXISTS hosted_pairs (
+        id TEXT PRIMARY KEY, destination TEXT NOT NULL, admitted REAL NOT NULL)""")
 
 
 def status(store):
@@ -123,18 +127,24 @@ def _check_controls(original):
     settings = config.load_config()
     if settings.get("projects_confirmed") is not True:
         raise ValueError("Confirm project exclusions with config --confirm-projects before paired export")
-    excluded = settings.get("excluded_projects", [])
-    if index.session_matches_excluded_projects(original, excluded):
-        raise ValueError("Conversation belongs to an excluded project")
-    if original.get("review_status") == "blocked" or ("hold_state" in original and
-            index.effective_hold_state(original["hold_state"], original.get("embargo_until")) not in {"released", "auto_redacted"}):
-        raise ValueError("Conversation is held or blocked")
     path = config.CONFIG_DIR / "index.db"
-    if not path.exists():
-        return  # Explicitly captured imports may have no indexed session.
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = None
     try:
+        if path.exists():
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            # Same merge as the share path: config exclusions plus workbench
+            # exclude_project policies, normalized to stored project names.
+            excluded = index.get_effective_share_settings(conn, settings)["excluded_projects"]
+        else:
+            excluded = config.normalize_excluded_project_names(list(settings.get("excluded_projects") or []))
+        if index.session_matches_excluded_projects(original, excluded):
+            raise ValueError("Conversation belongs to an excluded project")
+        if original.get("review_status") == "blocked" or ("hold_state" in original and
+                index.effective_hold_state(original["hold_state"], original.get("embargo_until")) not in {"released", "auto_redacted"}):
+            raise ValueError("Conversation is held or blocked")
+        if conn is None:
+            return  # Explicitly captured imports may have no indexed session.
         session_id = original.get("session_id")
         row = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         if row:
@@ -146,7 +156,8 @@ def _check_controls(original):
     except sqlite3.Error:
         raise ValueError("Cannot verify current conversation sharing controls") from None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def export_pair(store, capture_id):
@@ -200,8 +211,10 @@ def upload(store, capture_id, token_file):
     raw = path.read_bytes()
     payload = contract.validate(json.loads(raw))
     token = _token(token_file)
-    # Serialize Disable with the final send admission. No retry/redirect can
-    # silently move originals to a different destination.
+    # Serialize Disable with the final send admission, and record the admitted
+    # pair before sending so it stays withdrawable. The lock is released before
+    # the request: holding it for the whole send locks out other local commands.
+    # No retry/redirect can silently move originals to a different destination.
     with store.conn:
         store.conn.execute("BEGIN IMMEDIATE")
         current = grant(store, capture_id)
@@ -211,21 +224,24 @@ def upload(store, capture_id, token_file):
                 or current["destination"] != payload["consent"]["destination"]
                 or not saved_pair or saved_pair["revision"] != store.get(capture_id)["revision"]):
             raise ValueError("Original-sharing permission changed before upload")
-        request = urllib.request.Request(current["destination"] + "/api/redaction-pairs",
-            data=raw, headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
-        try:
-            with urllib.request.build_opener(_NoRedirect()).open(request, timeout=45) as response:
-                result = json.loads(response.read(65537))
-        except (OSError, ValueError):
-            raise ValueError("Pair upload did not return a confirmed receipt; retry the same pair after checking the service") from None
-        if not isinstance(result, dict) or result.get("bundle_id") != payload["bundle_id"] or result.get("status") != "accepted":
-            raise ValueError("Pair upload returned an invalid receipt")
+        store.conn.execute("INSERT OR IGNORE INTO hosted_pairs VALUES(?,?,?)",
+                           (payload["bundle_id"], current["destination"], time.time()))
+    request = urllib.request.Request(current["destination"] + "/api/redaction-pairs",
+        data=raw, headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+    try:
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=45) as response:
+            result = json.loads(response.read(65537))
+    except (OSError, ValueError):
+        raise ValueError("Pair upload did not return a confirmed receipt; retry the same pair after checking the service") from None
+    if not isinstance(result, dict) or result.get("bundle_id") != payload["bundle_id"] or result.get("status") != "accepted":
+        raise ValueError("Pair upload returned an invalid receipt")
     return {"bundle_id": payload["bundle_id"], "status": "accepted", "destination": current["destination"]}
 
 
 def withdraw_hosted(store, bundle_id, token_file):
     schema(store)
-    row = store.conn.execute("SELECT destination FROM conversation_pairs WHERE id=?", (bundle_id,)).fetchone()
+    row = (store.conn.execute("SELECT destination FROM hosted_pairs WHERE id=?", (bundle_id,)).fetchone()
+           or store.conn.execute("SELECT destination FROM conversation_pairs WHERE id=?", (bundle_id,)).fetchone())
     if not row or not contract.is_uuid(bundle_id):
         raise ValueError("Unknown hosted pair; contact its service administrator if the local record expired")
     destination = contract.origin(row["destination"])

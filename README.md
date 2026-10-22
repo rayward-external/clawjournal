@@ -589,9 +589,11 @@ windows, replaces supported identifiers, runs the mandatory scanners, and writes
 at most five candidate results per invocation. Captures without labels produce
 no examples. Repeated runs skip existing managed bundles and withdrawn proposals.
 Uncertain labels, unsupported types, unlabelled detected PII and scanner failures
-are held locally for review. Other automatically missed PII may remain in context;
-consent explicitly acknowledges that limitation. Correct held examples through
-the existing label-review workflow and rerun the command.
+are held locally for review; later runs retry held windows only after fresh ones,
+least recently tried first, so they cannot crowd out new captures. Other
+automatically missed PII may remain in context; consent explicitly acknowledges
+that limitation. Correct held examples through the existing label-review
+workflow and rerun the command.
 
 Automatic bundles use schema v2. They record ongoing authorization separately
 from review: `reviewed_context` and `reviewed_labels` are **false**, context is
@@ -659,9 +661,11 @@ enabled; it fails if that endpoint is unavailable and does not fall back to a
 normal share. Redirects are refused, and permission is rechecked before sending.
 There is no background upload enrollment in this feature. Disable removes
 managed local pair files and prevents further pair exports/uploads; already
-delivered copies require hosted withdrawal. Expiring/deleting a local capture
-also removes its managed pair file. Local files are private but unencrypted;
-use an encrypted disk and avoid cloud-synced folders.
+delivered copies, including an upload already sending when Disable runs, require
+hosted withdrawal. Expiring/deleting a local capture also removes its managed
+pair file; the store keeps only each uploaded pair's ID and destination, so
+hosted withdrawal still works afterwards. Local files are private but
+unencrypted; use an encrypted disk and avoid cloud-synced folders.
 
 Authorized administrators can use `/admin/redaction-pairs` to download the
 original, redacted version, or a JSON object containing both. Its CSV table

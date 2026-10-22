@@ -22,6 +22,12 @@ def _schema(store):
     store.conn.execute("""CREATE TABLE IF NOT EXISTS automatic_proposals (
         proposal_id TEXT PRIMARY KEY REFERENCES contribution_proposals(id) ON DELETE CASCADE,
         generation TEXT NOT NULL)""")
+    # Windows that failed to prepare or export at a capture revision.
+    store.conn.execute("""CREATE TABLE IF NOT EXISTS automatic_holds (
+        capture_id TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL, unit TEXT NOT NULL, start INTEGER NOT NULL,
+        end INTEGER NOT NULL, attempted REAL NOT NULL,
+        PRIMARY KEY(capture_id, revision, unit, start, end))""")
 
 
 def status(store):
@@ -150,17 +156,43 @@ def process(store, limit=5):
 
     Labels must already exist. Uncertain/unsupported matches remain local.
     No hosted upload, background enrollment, or automatic gold labels.
+    Windows held by an earlier run retry only after fresh windows, so
+    candidates that keep failing cannot starve later captures.
     """
     if type(limit) is not int or not 1 <= limit <= 5:
         raise ValueError("Process limit must be between 1 and 5")
     state = status(store)
     if state["mode"] != "ongoing":
         raise ValueError("Ongoing contribution permission is off")
-    results = []
+    results, deferred = [], []
+
+    def attempt(capture_id, revision, unit, start, end, proposal_id):
+        """Prepare and export one window; return False once permission is off."""
+        try:
+            if not proposal_id:
+                proposal_id, _ = c.prepare(store, capture_id, unit, start, end, automatic=True)
+            path = c.export_bundle(store, proposal_id)
+        except ValueError:
+            # Do not echo scanner/source content. Fail closed, keep candidate
+            # local, and let the normal review tools resolve its labels.
+            results.append({"status": "held-for-review", "capture_id": capture_id, "proposal_id": proposal_id})
+            if status(store)["mode"] != "ongoing":
+                return False
+            with store.conn:
+                store.conn.execute("""INSERT OR REPLACE INTO automatic_holds
+                    SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM captures WHERE id=?)""",
+                    (capture_id, revision, unit, start, end, time.time(), capture_id))
+            return True
+        results.append({"status": "exported-unreviewed", "proposal_id": proposal_id, "local_bundle": str(path)})
+        return True
+
     for entry in store.list():
         if entry["created"] <= state["future_captures_after"]:
             continue
         capture = store.get(entry["id"])
+        held = {(r["unit"], r["start"], r["end"]): r["attempted"] for r in store.conn.execute(
+            "SELECT unit,start,end,attempted FROM automatic_holds WHERE capture_id=? AND revision=?",
+            (entry["id"], capture["revision"]))}
         for unit, start, end in _windows(capture):
             old = store.conn.execute("""SELECT p.id,p.state FROM contribution_proposals p
                 JOIN automatic_proposals a ON a.proposal_id=p.id
@@ -170,20 +202,16 @@ def process(store, limit=5):
                 continue
             if old and (store.root / "contributions" / (old["id"] + ".bundle.json")).exists():
                 continue
-            if len(results) >= limit:
+            window = (entry["id"], capture["revision"], unit, start, end, old["id"] if old else None)
+            if (unit, start, end) in held:
+                deferred.append((held[unit, start, end], window))
+                continue
+            if len(results) >= limit or not attempt(*window):
                 return {"results": results, "uploaded": False}
-            proposal_id = old["id"] if old else None
-            try:
-                if not proposal_id:
-                    proposal_id, _ = c.prepare(store, entry["id"], unit, start, end, automatic=True)
-                path = c.export_bundle(store, proposal_id)
-                results.append({"status": "exported-unreviewed", "proposal_id": proposal_id, "local_bundle": str(path)})
-            except ValueError:
-                # Do not echo scanner/source content. Fail closed, keep candidate
-                # local, and let the normal review tools resolve its labels.
-                results.append({"status": "held-for-review", "capture_id": entry["id"], "proposal_id": proposal_id})
-                if status(store)["mode"] != "ongoing":
-                    break
         if status(store)["mode"] != "ongoing":
+            return {"results": results, "uploaded": False}
+    # Least recently attempted first, so held windows also take turns.
+    for _attempted, window in sorted(deferred, key=lambda item: item[0]):
+        if len(results) >= limit or not attempt(*window):
             break
     return {"results": results, "uploaded": False}

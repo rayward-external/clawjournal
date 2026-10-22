@@ -139,8 +139,11 @@ class Store:
                 CREATE TABLE IF NOT EXISTS corrections (capture_id TEXT PRIMARY KEY
                     REFERENCES captures(id) ON DELETE CASCADE, payload TEXT NOT NULL);
             """)
-            self.conn.execute("INSERT OR IGNORE INTO settings VALUES(1,1,?,?)",
-                              (retention_days, max_mib * 1024 * 1024))
+            # Opening an existing store must not need the write lock, so list,
+            # status and review keep working while another command writes.
+            if self.conn.execute("SELECT 1 FROM settings").fetchone() is None:
+                self.conn.execute("INSERT OR IGNORE INTO settings VALUES(1,1,?,?)",
+                                  (retention_days, max_mib * 1024 * 1024))
         self.prune()
 
     def close(self):

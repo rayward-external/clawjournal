@@ -100,6 +100,19 @@ def test_retention_deletes_originals_labels_and_managed_page(store):
     assert store.conn.execute("SELECT COUNT(*) FROM corrections").fetchone()[0] == 0
 
 
+def test_opening_store_does_not_wait_for_another_writer(store):
+    capture(store)
+    store.conn.execute("BEGIN IMMEDIATE")
+    try:
+        other = Store(store.root)
+        try:
+            assert len(other.list()) == 1
+        finally:
+            other.close()
+    finally:
+        store.conn.rollback()
+
+
 def test_store_symlinks_rejected(tmp_path):
     real = tmp_path / "real"
     real.mkdir()

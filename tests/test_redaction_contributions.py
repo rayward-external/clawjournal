@@ -463,6 +463,25 @@ def test_batch_is_bounded_repeatable_and_does_not_recreate_withdrawals(store, mo
         ongoing.process(store, 10)
 
 
+def test_held_windows_cannot_starve_later_captures(store, monkeypatch):
+    enable_ongoing(store)
+    def scan(b, d):
+        if "Blocked" in b["example"]["text"]:
+            raise ValueError("Contribution secret scan failed or found possible secrets; revise the snippet")
+    monkeypatch.setattr(c, "_scan_candidate", scan)
+    for i in range(5):
+        capture(store, text=TEXT + f" Blocked {i}.", status="assistant_draft")
+    assert [r["status"] for r in ongoing.process(store)["results"]] == ["held-for-review"] * 5
+    fresh = capture(store, text=TEXT + " Fresh capture.", status="assistant_draft")
+    first = ongoing.process(store)["results"][0]
+    assert first["status"] == "exported-unreviewed"
+    assert c._get(store, first["proposal_id"])[0]["capture_id"] == fresh
+    # Held windows still retry after fresh ones, so a cleared failure recovers.
+    monkeypatch.setattr(c, "_scan_candidate", lambda b, d: None)
+    assert [r["status"] for r in ongoing.process(store)["results"]] == ["exported-unreviewed"] * 5
+    assert ongoing.process(store)["results"] == []
+
+
 def test_automatic_draft_cannot_override_detected_pii_as_preserve(store):
     enable_ongoing(store)
     text = "Contact: +1-212-555-0174"

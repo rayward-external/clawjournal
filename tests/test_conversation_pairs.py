@@ -125,6 +125,52 @@ def test_upload_uses_exact_destination_and_validates_receipt(store, monkeypatch)
     assert sent[0].get_header("Authorization") == "Bearer fake-verified-token"
 
 
+class Receipt:
+    def __init__(self, receipt): self.receipt = receipt
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def read(self, size): return json.dumps(self.receipt).encode()
+
+
+def test_hosted_withdrawal_survives_local_capture_deletion(store, monkeypatch):
+    pairs.enable(store, permission(store)); cid = capture(store)
+    monkeypatch.setattr(pairs, "_scan", lambda *args: None)
+    token_file = store.root / "token"; token_file.write_text("fake-verified-token")
+    sent = []
+    class Opener:
+        def open(self, request, timeout):
+            sent.append(request)
+            if request.full_url.endswith("/withdraw"):
+                return Receipt({"bundle_id": request.full_url.split("/")[-2], "status": "withdrawn"})
+            return Receipt({"bundle_id": json.loads(request.data)["bundle_id"], "status": "accepted"})
+    monkeypatch.setattr(pairs.urllib.request, "build_opener", lambda *args: Opener())
+    bundle_id = pairs.upload(store, cid, token_file)["bundle_id"]
+    store.delete(cid)
+    assert store.conn.execute("SELECT COUNT(*) FROM conversation_pairs").fetchone()[0] == 0
+    assert pairs.withdraw_hosted(store, bundle_id, token_file)["status"] == "withdrawn"
+    assert sent[-1].full_url == f"https://research.example.org/api/redaction-pairs/{bundle_id}/withdraw"
+
+
+def test_upload_does_not_hold_the_store_lock_while_sending(store, monkeypatch):
+    pairs.enable(store, permission(store)); cid = capture(store)
+    monkeypatch.setattr(pairs, "_scan", lambda *args: None)
+    token_file = store.root / "token"; token_file.write_text("fake-verified-token")
+    class Opener:
+        def open(self, request, timeout):
+            other = Store(store.root)  # e.g. list/status/review, or Disable
+            try:
+                pairs.disable(other)
+            finally:
+                other.close()
+            return Receipt({"bundle_id": json.loads(request.data)["bundle_id"], "status": "accepted"})
+    monkeypatch.setattr(pairs.urllib.request, "build_opener", lambda *args: Opener())
+    bundle_id = pairs.upload(store, cid, token_file)["bundle_id"]
+    assert not pairs.status(store)["enabled"]
+    # Admitted before Disable, so it stays withdrawable.
+    assert store.conn.execute("SELECT destination FROM hosted_pairs WHERE id=?",
+                              (bundle_id,)).fetchone()[0] == "https://research.example.org"
+
+
 def test_pair_transport_refuses_redirects():
     assert pairs._NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.example.org") is None
 
@@ -136,6 +182,23 @@ def test_pair_export_cannot_bypass_project_confirmation_or_holds(store, monkeypa
         pairs._check_controls({})
     monkeypatch.setattr(config, "load_config", lambda: {"projects_confirmed": True, "excluded_projects": ["private"]})
     with pytest.raises(ValueError, match="excluded"):
-        pairs._check_controls({"project": "private"})
+        pairs._check_controls({"source": "claude", "project": "private"})
     with pytest.raises(ValueError, match="held"):
         pairs._check_controls({"hold_state": "pending_review"})
+
+
+def test_pair_export_honors_workbench_exclude_project_policies(monkeypatch):
+    from clawjournal import config
+    from clawjournal.workbench import index
+    monkeypatch.setattr(index, "CONFIG_DIR", config.CONFIG_DIR)
+    monkeypatch.setattr(index, "INDEX_DB", config.CONFIG_DIR / "index.db")
+    monkeypatch.setattr(index, "BLOBS_DIR", config.CONFIG_DIR / "blobs")
+    conn = index.open_index()
+    try:
+        index.add_policy(conn, "exclude_project", "private-client")
+    finally:
+        conn.close()
+    session = {"source": "claude", "project": "private-client", "session_id": "not-indexed"}
+    with pytest.raises(ValueError, match="excluded"):
+        pairs._check_controls(session)
+    pairs._check_controls({**session, "project": "other-project"})
