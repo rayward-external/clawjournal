@@ -111,6 +111,7 @@ export interface ShareDestination {
 }
 
 export interface HostedConsent {
+  original_conversations?: {schema: string; consent_version: string; purpose: string; retention: string; retention_text: string};
   consent_text: string;
   retention_text: string;
   consent_version: string;

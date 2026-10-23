@@ -10,6 +10,7 @@ import type {
 } from '../../types.ts';
 import type { HostedConsent, ShareDestination } from './types.ts';
 import { SHARE_SHELL_WIDTH, btnPrimary, btnSecondary } from './styles.tsx';
+import { OriginalConversations } from './OriginalConversations.tsx';
 import { CheckboxRow, Icon } from './shared.tsx';
 import { cancelSuccessChime, playSuccessChime, primeSuccessChime } from './successChime.ts';
 
@@ -57,6 +58,8 @@ export function SubmitStep(p: SubmitStepProps) {
   const [devCode, setDevCode] = useState<string | null>(null);
   const [acceptTerms, setAcceptTerms] = useState(false);
   const [ownership, setOwnership] = useState(false);
+  const [originalDigest, setOriginalDigest] = useState<string | null>(null);
+  const [originalPending, setOriginalPending] = useState(false);
   const [autoUploadStatus, setAutoUploadStatus] =
     useState<AutoUploadStatus | null>(null);
   const [autoUploadChallenge, setAutoUploadChallenge] =
@@ -272,7 +275,7 @@ export function SubmitStep(p: SubmitStepProps) {
   };
 
   const submit = async () => {
-    if (!p.shareId) return;
+    if (!p.shareId || originalPending) return;
     let submitted = false;
     primeSuccessChime();
     setBusy(true);
@@ -284,7 +287,15 @@ export function SubmitStep(p: SubmitStepProps) {
         setError('Verification expired. Send a new code to continue.');
         return;
       }
+      if (originalDigest && (consentData.original_conversations?.schema !== 'clawjournal-upload-originals-v1'
+          || consentData.original_conversations?.consent_version !== consent?.original_conversations?.consent_version)) {
+        setError('Original-sharing terms changed. Inspect the originals and select the option again.');
+        return;
+      }
       const result = await api.shares.upload(p.shareId, {
+        ...(originalDigest ? {include_original: true,
+          original_consent_version: consentData.original_conversations?.consent_version,
+          original_preview_digest: originalDigest} : {}),
         accept_terms: acceptTerms,
         ownership_certification: ownership,
         consent_version: consentData.consent_version,
@@ -367,7 +378,7 @@ export function SubmitStep(p: SubmitStepProps) {
     autoUploadChallenge?.cadence_days ?? autoUploadStatus?.cadence_days ?? 1;
   const automaticUploadScopeEntries =
     autoUploadChallenge?.scope.entries ?? autoUploadStatus?.scope.entries ?? [];
-  const disabled = busy || loadingConsent || !p.shareId || !tokenValid
+  const disabled = originalPending || busy || loadingConsent || !p.shareId || !tokenValid
     || !acceptTerms || !ownership || !consent
     || (enableAutomaticUploads && automaticUploadOptionLoading);
   const supportContact = consent?.support_contact || p.shareDestination?.support_contact || null;
@@ -502,6 +513,8 @@ export function SubmitStep(p: SubmitStepProps) {
             </div>
 
             <div style={{ background: colors.white, border: `1px solid ${colors.gray200}`, borderRadius: 8, padding: 14, display: 'grid', gap: 10 }}>
+              <OriginalConversations shareId={p.shareId} offer={consent?.original_conversations}
+                disabled={busy} onChange={setOriginalDigest} onPending={setOriginalPending} />
               <CheckboxRow checked={acceptTerms} onChange={setAcceptTerms}>
                 I accept the displayed consent and data-use terms.
               </CheckboxRow>

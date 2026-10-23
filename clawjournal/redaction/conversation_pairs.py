@@ -108,7 +108,7 @@ def grant(store, capture_id):
     return dict(row)
 
 
-def _scan(original, redacted, pair_id, directory):
+def _scan_original(original):
     from . import betterleaks
     from .secrets import scan_text
     # Originals never enter online credential verification or an AI backend.
@@ -118,6 +118,10 @@ def _scan(original, redacted, pair_id, directory):
         raise ValueError("Original contains possible secrets or local scanner is unavailable")
     if any(m["type"] not in {"email", "ip_address", "private_url"} for m in scan_text(raw)):
         raise ValueError("Possible credentials in original; this conversation cannot be shared")
+
+
+def _scan(original, redacted, pair_id, directory):
+    _scan_original(original)
     _scan_candidate({"example": {"contribution_id": pair_id}, "redacted": redacted}, directory)
 
 

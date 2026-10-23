@@ -2579,6 +2579,7 @@ def get_effective_share_settings(
     from ..findings import get_enabled_engines
 
     return {
+        "projects_confirmed": resolved.get("projects_confirmed") is True,
         "custom_strings": _dedupe_strings(custom_strings),
         "extra_usernames": _dedupe_strings(extra_usernames),
         "allowlist_entries": allowlist_entries,
