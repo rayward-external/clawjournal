@@ -1894,6 +1894,67 @@ class TestDiscoverProjects:
         assert roles == ["user", "assistant", "user", "assistant"]
         assert result["messages"][0]["content"] == "apply the patch"
 
+    def test_codex_tool_only_rollout_keeps_its_entry_clock(
+        self, tmp_path, mock_anonymizer
+    ):
+        """No parsed message means no message clock, but every rollout entry
+        is timestamped. The trailing tool calls used to flush with timestamp
+        None and the session had no start or end, so hosted reports could not
+        place it in any month."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            {
+                "timestamp": f"2026-08-01T10:0{minute}:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": "{\"command\": [\"ls\"]}",
+                    "call_id": f"call-{minute}",
+                },
+            }
+            for minute in (2, 5)
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert [m["role"] for m in result["messages"]] == ["assistant"]
+        assert len(result["messages"][0]["tool_uses"]) == 2
+        assert result["messages"][0]["timestamp"] == "2026-08-01T10:05:00.000Z"
+        assert result["start_time"] == "2026-08-01T10:00:00.000Z"
+        assert result["end_time"] == "2026-08-01T10:05:00.000Z"
+
+    def test_codex_message_clock_still_bounds_the_session(
+        self, tmp_path, mock_anonymizer
+    ):
+        """The entry clock is only a fallback: with timestamped messages the
+        session still spans its messages, not session_meta or later records."""
+        session_file = self._write_codex_rollout(tmp_path, [
+            self._codex_event(
+                "user_message", timestamp="2026-08-01T10:01:00.000Z", message="go"
+            ),
+            self._codex_event(
+                "agent_message", timestamp="2026-08-01T10:02:00.000Z", message="ok"
+            ),
+            self._codex_event("task_complete", timestamp="2026-08-01T10:09:00.000Z"),
+        ])
+
+        result = _parse_codex_session_file(
+            session_file,
+            mock_anonymizer,
+            include_thinking=True,
+            target_cwd="/repo",
+        )
+
+        assert result is not None
+        assert result["start_time"] == "2026-08-01T10:01:00.000Z"
+        assert result["end_time"] == "2026-08-01T10:02:00.000Z"
+
     def test_claude_parser_captures_per_message_token_snapshots(
         self, tmp_path, mock_anonymizer
     ):

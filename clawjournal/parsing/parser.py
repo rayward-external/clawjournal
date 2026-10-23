@@ -3066,6 +3066,10 @@ class _CodexParseState:
     # message once per format; the duplicate arrives from the *other*
     # format, so a same-format repeat is a genuine resend and is kept.
     last_message_origin: str | None = None
+    # Every rollout entry is timestamped, not only messages. Kept so a
+    # session whose messages never parsed still leaves with a clock.
+    first_entry_timestamp: str | None = None
+    last_entry_timestamp: str | None = None
 
 
 def _coalesce_codex_output(raw: Any) -> str:
@@ -3303,6 +3307,10 @@ def _parse_codex_session_fragments(
             replaced_retry_user = False
             user_message_record = False
             timestamp = _normalize_timestamp(entry.get("timestamp"))
+            if timestamp is not None:
+                if state.first_entry_timestamp is None:
+                    state.first_entry_timestamp = timestamp
+                state.last_entry_timestamp = timestamp
             entry_type = entry.get("type")
 
             if entry_type == "session_meta":
@@ -3423,8 +3431,20 @@ def _parse_codex_session_fragments(
     if state.raw_cwd != target_cwd:
         return None
 
+    # With no timestamped message (a rollout of tool calls only, or one whose
+    # messages use a record shape this parser does not read), the trailing
+    # tool calls used to flush with timestamp None and the session left with
+    # no start or end at all, so the hosted reports could not place it in any
+    # month. Fall back to the span of the rollout's own entries.
+    entry_clock_only = state.metadata["start_time"] is None
+    if entry_clock_only:
+        state.metadata["start_time"] = state.first_entry_timestamp
     before_flush = len(state.messages)
-    _flush_codex_pending(state, timestamp=state.metadata["end_time"])
+    _flush_codex_pending(
+        state, timestamp=state.metadata["end_time"] or state.last_entry_timestamp
+    )
+    if entry_clock_only:
+        state.metadata["end_time"] = state.last_entry_timestamp
     if capture_raw_offsets and len(state.messages) > before_flush:
         raw_message_start_offsets.extend(
             [int(parse_snapshot.get("record_start") or 0)]
