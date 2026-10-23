@@ -111,6 +111,7 @@ export interface ShareDestination {
 }
 
 export interface HostedConsent {
+  original_conversations?: {enabled: boolean; consent_version: string; purpose: string; retention_days: number};
   consent_text: string;
   retention_text: string;
   consent_version: string;

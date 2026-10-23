@@ -6068,6 +6068,47 @@ class TestShareAPI:
         monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
         monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
 
+    def test_original_choice_attaches_exact_preview_to_main_upload(self, server, monkeypatch):
+        from email.parser import BytesParser
+        from email.policy import default
+        from clawjournal.redaction.pair_contract import TERMS_VERSION, digest
+        monkeypatch.setattr("clawjournal.workbench.daemon.load_config",
+                            lambda: _share_config(projects_confirmed=True))
+        share_id = self._create_and_export_share(server)
+        status, preview = _post(server, f"/api/shares/{share_id}/originals", {})
+        assert status == 200, preview
+        assert preview["document"]["sessions"][0]["messages"][0]["content"].startswith("Task")
+        scans = []
+        monkeypatch.setattr("clawjournal.redaction.conversation_pairs._scan",
+                            lambda original, redacted, *args: scans.append((original, redacted)))
+        sent = []
+        def check_request(req):
+            message = BytesParser(policy=default).parsebytes(
+                ("Content-Type: " + req.get_header("Content-type") + "\r\n\r\n").encode() + req.data)
+            parts = {part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+                     for part in message.iter_parts()}
+            assert parts["include_original"] == b"true"
+            assert parts["original_consent_version"].decode() == TERMS_VERSION
+            original = json.loads(parts["originals"])
+            assert digest(original) == preview["preview_digest"]
+            import zipfile
+            with zipfile.ZipFile(BytesIO(parts["bundle"])) as archive:
+                name = next(name for name in archive.namelist() if name.endswith("sessions.jsonl"))
+                redacted = [json.loads(line) for line in archive.read(name).splitlines()]
+            assert {x["session_id"] for x in original["sessions"]} == {x["session_id"] for x in redacted}
+            sent.append(parts)
+        mock_open = _mock_urlopen_factory(
+            capabilities={"submissions_open": True, "original_conversations": {"enabled": True, "consent_version": TERMS_VERSION}},
+            upload_response={"receipt_id": "paired-receipt", "status": "received", "originals_status": "available"},
+            upload_assert=check_request)
+        monkeypatch.setattr("clawjournal.workbench.daemon.urllib.request.urlopen", mock_open)
+        monkeypatch.setattr("clawjournal.workbench.daemon.urllib.request.build_opener", lambda *args: SimpleNamespace(open=mock_open))
+        body = {**self._consent_body(), "include_original": True, "original_consent_version": TERMS_VERSION,
+                "original_preview_digest": preview["preview_digest"]}
+        status, result = _post(server, f"/api/shares/{share_id}/upload", body)
+        assert status == 200, result
+        assert result["originals_status"] == "available" and len(sent) == 1 and len(scans) == 2
+
     def _create_and_export_share(self, port):
         """Helper: create a share and export it, return share_id.
 

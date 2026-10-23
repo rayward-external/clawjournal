@@ -552,6 +552,7 @@ export const api = {
 
   share: {
     consent(): Promise<{
+      original_conversations?: {enabled: boolean; consent_version: string; purpose: string; retention_days: number};
       consent_text: string;
       retention_text: string;
       consent_version: string;
@@ -777,7 +778,28 @@ export const api = {
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
     },
 
+    originals(id: string): Promise<{document: {schema: string; sessions: unknown[]}; preview_digest: string}> {
+      return request(`/shares/${encodeURIComponent(id)}/originals`, {method: 'POST', body: JSON.stringify({})});
+    },
+    async downloadOriginals(id: string, previewDigest: string): Promise<void> {
+      const res = await fetch(`${BASE}/shares/${encodeURIComponent(id)}/originals`, {
+        method: 'POST', headers: {...authHeader(), 'Content-Type': 'application/json'},
+        body: JSON.stringify({download: true, preview_digest: previewDigest}),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new ApiError(res.status, body.error || 'Could not export originals', body);
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a'); a.href = url; a.download = 'original-conversations.json';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    },
+
     upload(id: string, body: {
+      include_original?: boolean;
+      original_consent_version?: string;
+      original_preview_digest?: string;
       accept_terms: boolean;
       ownership_certification: boolean;
       consent_version: string;

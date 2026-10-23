@@ -4029,6 +4029,9 @@ def submit_share_to_hosted(
     settings: dict[str, Any],
     ai_pii_review_enabled: bool | None = None,
     force: bool = False,
+    include_original: bool = False,
+    original_consent_version: str = "",
+    original_preview_digest: str = "",
 ) -> dict[str, Any]:
     """Submit a finalized share zip to the hosted research API."""
     # The HTTP handler already checks for missing keys; these checks keep
@@ -4131,6 +4134,15 @@ def submit_share_to_hosted(
             "support_contact": capabilities.get("contact_email"),
             "status": 403,
         }
+
+    if include_original:
+        from . import upload_originals
+        offer = capabilities.get("original_conversations") or {}
+        if (offer.get("enabled") is not True or original_consent_version != upload_originals.TERMS_VERSION
+                or offer.get("consent_version") != original_consent_version):
+            return {"error": "Original sharing is unavailable or its consent changed. Refresh the upload screen.", "status": 409}
+        if not original_preview_digest:
+            return {"error": "Inspect the originals before submitting them.", "status": 400}
 
     export_dir: Path | None = None
     manifest: dict[str, Any] = {}
@@ -4306,22 +4318,24 @@ def submit_share_to_hosted(
             sha.update(chunk)
     bundle_hash = sha.hexdigest()
 
-    upload_body, content_type = _build_multipart_body(
-        fields={
-            "upload_token": upload_token,
-            "consent_version": consent_version,
-            "retention_policy_version": retention_policy_version,
-            "accept_terms": "true" if accept_terms else "false",
-            "ownership_certification": "true" if ownership_certification else "false",
-        },
-        files={
-            "bundle": (
-                f"clawjournal-share-{share_id[:8]}.zip",
-                zip_bytes,
-                "application/zip",
-            ),
-        },
-    )
+    upload_fields = {
+        "upload_token": upload_token, "consent_version": consent_version,
+        "retention_policy_version": retention_policy_version,
+        "accept_terms": "true" if accept_terms else "false",
+        "ownership_certification": "true" if ownership_certification else "false",
+    }
+    upload_files = {"bundle": (f"clawjournal-share-{share_id[:8]}.zip", zip_bytes, "application/zip")}
+    if include_original:
+        try:
+            from . import upload_originals
+            redacted = [json.loads(line) for line in sessions_file.read_text().splitlines() if line.strip()]
+            original_bytes = upload_originals.checked_bytes(conn, share_id, settings,
+                approved_digest=original_preview_digest, redacted=redacted)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"error": str(exc), "status": 409}
+        upload_fields.update(include_original="true", original_consent_version=original_consent_version)
+        upload_files["originals"] = ("original-conversations.json", original_bytes, "application/json")
+    upload_body, content_type = _build_multipart_body(fields=upload_fields, files=upload_files)
     req = urllib.request.Request(
         f"{_hosted_api_base()}/api/submissions",
         data=upload_body,
@@ -4353,7 +4367,12 @@ def submit_share_to_hosted(
         return final_gate_error
 
     try:
-        with urllib.request.urlopen(req, timeout=_SHARE_UPLOAD_TIMEOUT) as resp:
+        if include_original:
+            from ..redaction.conversation_pairs import _NoRedirect
+            open_request = urllib.request.build_opener(_NoRedirect()).open
+        else:
+            open_request = urllib.request.urlopen
+        with open_request(req, timeout=_SHARE_UPLOAD_TIMEOUT) as resp:
             hosted_result = json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return _hosted_http_error_result(exc)
@@ -4406,6 +4425,7 @@ def submit_share_to_hosted(
         "bundle_hash": bundle_hash,
         "zip_size_bytes": len(zip_bytes),
         "zip_reused": zip_reused,
+        "originals_status": hosted_result.get("originals_status", "not_shared"),
         "redaction_summary": redaction_summary,
     }
 
@@ -4708,6 +4728,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         if path == "/api/support-reports":
             self._handle_create_support_report()
+        elif path.startswith("/api/shares/") and path.endswith("/originals"):
+            share_id = path[len("/api/shares/"):-len("/originals")]
+            self._handle_share_originals(share_id)
         elif path == "/api/index/rebuild":
             self._handle_index_rebuild()
         elif path.startswith("/api/") and self._reject_unhealthy_index():
@@ -7395,6 +7418,36 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _handle_share_originals(self, share_id: str) -> None:
+        from . import upload_originals
+        body = _read_body(self)
+        conn = open_index()
+        try:
+            settings = get_effective_share_settings(conn, load_config())
+            document = upload_originals.prepare(conn, share_id, settings)
+            if body.get("download") is True:
+                export_dir, _, error = _prepare_share_export_for_upload(
+                    conn, share_id, get_share(conn, share_id), settings, reuse_finalized=True)
+                if error or export_dir is None:
+                    _json_response(self, error or {"error": "Prepare the redacted ZIP first."}, 409)
+                    return
+                redacted = [json.loads(line) for line in (export_dir / "sessions.jsonl").read_text().splitlines() if line.strip()]
+                raw = upload_originals.checked_bytes(conn, share_id, settings,
+                    approved_digest=body.get("preview_digest"), redacted=redacted)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Disposition", 'attachment; filename="original-conversations.json"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            else:
+                _json_response(self, {"document": document, "preview_digest": upload_originals.digest(document)}, cache_control="no-store")
+        except (ValueError, OSError, RuntimeError) as exc:
+            _json_response(self, {"error": str(exc)}, 409)
+        finally:
+            conn.close()
+
     def _handle_upload_share(self, share_id: str) -> None:
         """Submit a share to hosted research after consent."""
         # Validate the request BEFORE the rate-limit gate so a malformed request
@@ -7451,6 +7504,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 conn,
                 share_id,
                 force=force,
+                include_original=body.get("include_original") is True,
+                original_consent_version=str(body.get("original_consent_version") or ""),
+                original_preview_digest=str(body.get("original_preview_digest") or ""),
                 settings=settings,
                 ai_pii_review_enabled=ai_pii_override,
                 accept_terms=_body_bool(body.get("accept_terms")),

@@ -88,7 +88,7 @@ def validate(bundle):
     if not isinstance(consent, dict) or set(consent) != {"version", "purpose", "destination", "rights", "share_original", "share_redacted", "grant_id", "retention_days", "scope"}:
         raise ValueError("Separate permission for originals and redacted conversations is required")
     if (consent["version"] != TERMS_VERSION or consent["purpose"] != PURPOSE
-            or consent["scope"] != SCOPE or not is_uuid(consent["grant_id"])
+            or consent["scope"] not in (SCOPE, "this-upload-only") or not is_uuid(consent["grant_id"])
             or type(consent["retention_days"]) is not int or consent["retention_days"] != RETENTION_DAYS
             or any(consent[k] is not True for k in ("rights", "share_original", "share_redacted"))
             or origin(consent["destination"]) != consent["destination"]):

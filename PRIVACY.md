@@ -322,3 +322,28 @@ The academic email is used for verification and short-lived upload authorization
 - If you want self-hosted network upload, configure ingest explicitly and treat that as a separate opt-in step.
 
 For security reporting and threat-model scope, see [SECURITY.md](SECURITY.md).
+
+### Optional originals for redaction improvement
+
+The manual Submit screen can offer **Include my original conversation to help
+improve redaction** when the destination supports it. This is off by default and
+applies only to that submission. It does not grant automatic sharing of originals.
+Original conversations are used only to evaluate and improve the redaction
+pipeline, including redaction-specific model training, not general research,
+unrelated benchmarks, or general-purpose model training.
+
+The preview reads the selected reviewed local snapshots, shows their original
+messages, and binds approval to those exact bytes. The final submission rechecks
+scope, hold state and revision, runs local credential checks, and attaches a
+separate originals file beside the final redacted ZIP. Originals never enter that
+research ZIP or an AI redaction backend. Missing originals, changed revisions,
+unavailable scanners, or possible credentials block original sharing. No new
+persistent raw cache or ongoing authorization is created by this option.
+
+For the website upload, use **Download originals for the website upload** and the
+matching redacted ZIP. The originals JSON contains normalized message content and
+session IDs, not an original vendor ZIP or arbitrary binary attachments. Keep it
+private. The website requires separate consent and displays the selected file
+before sending it. The server stores matched pairs encrypted for up to 30 days,
+restricts downloads to administrators, and deletes them on withdrawal or expiry
+cleanup. Downloaded copies must also be deleted by the stated expiry.
