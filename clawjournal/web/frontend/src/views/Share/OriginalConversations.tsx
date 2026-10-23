@@ -12,15 +12,15 @@ export function OriginalConversations({ shareId, offer, disabled, onChange, onPe
   const [selected, setSelected] = useState(false);
   const [preview, setPreview] = useState<Awaited<ReturnType<typeof api.shares.originals>> | null>(null);
   const [error, setError] = useState('');
-  const generation = useRef(0);
+  const generation = useRef<object>({});
   useEffect(() => {
-    generation.current++;
+    generation.current = {};
     setSelected(false); setPreview(null); onChange(null); onPending(false);
-    return () => { generation.current++; };
+    return () => { generation.current = {}; };
   }, [shareId, offer?.enabled, offer?.consent_version, onChange, onPending]);
 
   async function choose(enabled: boolean) {
-    const request = ++generation.current;
+    const request = generation.current = {};
     setSelected(enabled); setPreview(null); setError(''); onChange(null); onPending(enabled);
     if (!enabled || !shareId) return;
     try {
