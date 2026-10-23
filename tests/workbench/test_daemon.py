@@ -6088,8 +6088,7 @@ class TestShareAPI:
         assert status == 200, preview
         assert preview["document"]["sessions"][0]["messages"][0]["content"].startswith("Task")
         scans = []
-        monkeypatch.setattr("clawjournal.redaction.conversation_pairs._scan",
-                            lambda original, redacted, *args: scans.append((original, redacted)))
+        monkeypatch.setattr("clawjournal.redaction.conversation_pairs._scan_original", scans.append)
         sent = []
         def check_request(req):
             message = BytesParser(policy=default).parsebytes(

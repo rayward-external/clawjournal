@@ -3,9 +3,6 @@
 No persistent opt-in, raw file in the research bundle, or automatic-upload grant.
 """
 import json
-import tempfile
-import uuid
-from pathlib import Path
 
 from ..redaction.pair_contract import canonical, digest, MAX_BYTES
 
@@ -44,20 +41,31 @@ def prepare(conn, share_id, settings):
 
 
 def checked_bytes(conn, share_id, settings, *, approved_digest, redacted, current_settings=None):
-    """Recheck exact preview and run existing local-only original credential checks."""
-    from ..redaction.conversation_pairs import _scan
+    """Recheck exact preview and run existing local-only original credential checks.
+
+    The redacted side is the research ZIP itself, already through the mandatory
+    share gate. It is not rescanned with the stricter contribution gate, which
+    refuses the warn-only findings the share gate deliberately lets through.
+    """
+    from ..redaction.conversation_pairs import _scan_original
     document = prepare(conn, share_id, settings)
     if not approved_digest or digest(document) != approved_digest:
         raise ValueError("Originals changed or were not reviewed. Inspect and approve them again.")
     by_id = {row["session_id"]: row for row in redacted}
     if set(by_id) != {row["session_id"] for row in document["sessions"]}:
         raise ValueError("The finalized conversations differ from the original preview. Review this share again.")
-    with tempfile.TemporaryDirectory(prefix="clawjournal-original-check-") as directory:
-        for original in document["sessions"]:
-            final = by_id[original["session_id"]]
-            if final.get("revision_hash") != "sha256:" + digest({"messages": original["messages"]}):
-                raise ValueError("Original does not match the finalized redacted conversation.")
-            _scan(original, final, str(uuid.uuid4()), Path(directory))
+    pairs = []
+    for original in document["sessions"]:
+        final = by_id[original["session_id"]]
+        if final.get("revision_hash") != "sha256:" + digest({"messages": original["messages"]}):
+            raise ValueError("Original does not match the finalized redacted conversation.")
+        pairs.append((original, final))
+    # The hosted service bounds originals plus their redacted versions; use its measure.
+    if len(canonical(pairs).encode()) > MAX_BYTES:
+        raise ValueError("Originals and their redacted versions together exceed 36 MiB. "
+                         "Share fewer conversations to include originals.")
+    for original in document["sessions"]:
+        _scan_original(original)
     latest_settings = current_settings() if current_settings else settings
     if digest(prepare(conn, share_id, latest_settings)) != approved_digest:
         raise ValueError("Originals changed while scanning. Review this share again.")

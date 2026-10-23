@@ -21,16 +21,31 @@ def test_original_preview_is_the_reviewed_revision_without_private_metadata(conn
     assert set(document) == {"schema", "sessions"}
 
 
-def test_checked_export_pairs_exact_final_redaction_and_scans_both_sides(conn, monkeypatch):
+def test_checked_export_pairs_exact_final_redaction_and_scans_the_original(conn, monkeypatch):
     share_id = selected(conn)
     document = originals.prepare(conn, share_id, SETTINGS)
     calls = []
-    monkeypatch.setattr(conversation_pairs, "_scan", lambda original, redacted, *args: calls.append((original, redacted)))
+    monkeypatch.setattr(conversation_pairs, "_scan_original", calls.append)
+    def regated(*args): raise AssertionError("The redacted ZIP already passed the share gate")
+    monkeypatch.setattr(conversation_pairs, "_scan_candidate", regated)
     final = {"session_id": "test-trace", "messages": [{"role": "user", "content": "[EMAIL]"}],
              "revision_hash": index.compute_content_revision(trace())}
     raw = originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document), redacted=[final])
     assert json.loads(raw) == document
-    assert calls == [(document["sessions"][0], final)]
+    assert calls == [document["sessions"][0]]
+
+
+def test_combined_size_matches_the_hosted_limit(conn, monkeypatch):
+    share_id = selected(conn)
+    document = originals.prepare(conn, share_id, SETTINGS)
+    # The originals alone fit; together with their redacted versions they do not.
+    monkeypatch.setattr(originals, "MAX_BYTES", len(originals.canonical(document).encode()))
+    def unexpected(*args): raise AssertionError("Must reject before scans")
+    monkeypatch.setattr(conversation_pairs, "_scan_original", unexpected)
+    final = {"session_id": "test-trace", "messages": [{"role": "user", "content": "[REDACTED] " * 200}],
+             "revision_hash": index.compute_content_revision(trace())}
+    with pytest.raises(ValueError, match="together exceed"):
+        originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document), redacted=[final])
 
 
 @pytest.mark.parametrize("problem", ["consent", "revision", "selection", "hold", "projects"])
@@ -46,7 +61,7 @@ def test_original_export_refuses_stale_or_unapproved_data(conn, monkeypatch, pro
     if problem == "hold": index.set_hold_state(conn, "test-trace", "pending_review", changed_by="test")
     if problem == "projects": settings["projects_confirmed"] = False
     def unexpected(*args): raise AssertionError("Must reject before scans or egress")
-    monkeypatch.setattr(conversation_pairs, "_scan", unexpected)
+    monkeypatch.setattr(conversation_pairs, "_scan_original", unexpected)
     with pytest.raises(ValueError):
         originals.checked_bytes(conn, share_id, settings, approved_digest=approved, redacted=[final])
 
@@ -65,7 +80,7 @@ def test_hold_during_scanning_blocks_original_download(conn, monkeypatch):
     document = originals.prepare(conn, share_id, SETTINGS)
     def hold(*args):
         index.set_hold_state(conn, "test-trace", "pending_review", changed_by="test")
-    monkeypatch.setattr(conversation_pairs, "_scan", hold)
+    monkeypatch.setattr(conversation_pairs, "_scan_original", hold)
     with pytest.raises(ValueError, match="blocked"):
         originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document),
             redacted=[{"session_id": "test-trace", "messages": [], "revision_hash": index.compute_content_revision(trace())}])
@@ -75,7 +90,7 @@ def test_hold_during_scanning_blocks_original_download(conn, monkeypatch):
 def test_changed_config_during_scanning_blocks_original_export(conn, monkeypatch, changed):
     share_id = selected(conn)
     document = originals.prepare(conn, share_id, SETTINGS)
-    monkeypatch.setattr(conversation_pairs, "_scan", lambda *args: None)
+    monkeypatch.setattr(conversation_pairs, "_scan_original", lambda *args: None)
     with pytest.raises(ValueError):
         originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document),
             redacted=[{"session_id": "test-trace", "messages": [], "revision_hash": index.compute_content_revision(trace())}],
