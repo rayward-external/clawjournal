@@ -42,7 +42,7 @@ def prepare(conn, share_id, settings):
     return document
 
 
-def checked_bytes(conn, share_id, settings, *, approved_digest, redacted):
+def checked_bytes(conn, share_id, settings, *, approved_digest, redacted, current_settings=None):
     """Recheck exact preview and run existing local-only original credential checks."""
     from ..redaction.conversation_pairs import _scan
     document = prepare(conn, share_id, settings)
@@ -57,6 +57,7 @@ def checked_bytes(conn, share_id, settings, *, approved_digest, redacted):
             if final.get("revision_hash") != "sha256:" + digest({"messages": original["messages"]}):
                 raise ValueError("Original does not match the finalized redacted conversation.")
             _scan(original, final, str(uuid.uuid4()), Path(directory))
-    if digest(prepare(conn, share_id, settings)) != approved_digest:
+    latest_settings = current_settings() if current_settings else settings
+    if digest(prepare(conn, share_id, latest_settings)) != approved_digest:
         raise ValueError("Originals changed while scanning. Review this share again.")
     return canonical(document).encode()

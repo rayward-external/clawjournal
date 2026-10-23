@@ -69,3 +69,14 @@ def test_hold_during_scanning_blocks_original_download(conn, monkeypatch):
     with pytest.raises(ValueError, match="blocked"):
         originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document),
             redacted=[{"session_id": "test-trace", "messages": [], "revision_hash": index.compute_content_revision(trace())}])
+
+
+@pytest.mark.parametrize("changed", [{"projects_confirmed": False}, {"source_filter": ["claude"]}, {"excluded_projects": ["synthetic-project"]}])
+def test_changed_config_during_scanning_blocks_original_export(conn, monkeypatch, changed):
+    share_id = selected(conn)
+    document = originals.prepare(conn, share_id, SETTINGS)
+    monkeypatch.setattr(conversation_pairs, "_scan", lambda *args: None)
+    with pytest.raises(ValueError):
+        originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document),
+            redacted=[{"session_id": "test-trace", "messages": [], "revision_hash": index.compute_content_revision(trace())}],
+            current_settings=lambda: {**SETTINGS, **changed})

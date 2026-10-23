@@ -4330,7 +4330,8 @@ def submit_share_to_hosted(
             from . import upload_originals
             redacted = [json.loads(line) for line in sessions_file.read_text().splitlines() if line.strip()]
             original_bytes = upload_originals.checked_bytes(conn, share_id, settings,
-                approved_digest=original_preview_digest, redacted=redacted)
+                approved_digest=original_preview_digest, redacted=redacted,
+                current_settings=lambda: get_effective_share_settings(conn, load_config()))
         except (ValueError, OSError, RuntimeError) as exc:
             return {"error": str(exc), "status": 409}
         upload_fields.update(include_original="true", original_consent_version=original_consent_version)
@@ -7433,7 +7434,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     return
                 redacted = [json.loads(line) for line in (export_dir / "sessions.jsonl").read_text().splitlines() if line.strip()]
                 raw = upload_originals.checked_bytes(conn, share_id, settings,
-                    approved_digest=body.get("preview_digest"), redacted=redacted)
+                    approved_digest=body.get("preview_digest"), redacted=redacted,
+                    current_settings=lambda: get_effective_share_settings(conn, load_config()))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Disposition", 'attachment; filename="original-conversations.json"')
