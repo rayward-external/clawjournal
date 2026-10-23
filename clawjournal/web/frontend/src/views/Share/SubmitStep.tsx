@@ -287,7 +287,7 @@ export function SubmitStep(p: SubmitStepProps) {
         setError('Verification expired. Send a new code to continue.');
         return;
       }
-      if (originalDigest && (consentData.original_conversations?.enabled !== true
+      if (originalDigest && (consentData.original_conversations?.schema !== 'clawjournal-upload-originals-v1'
           || consentData.original_conversations?.consent_version !== consent?.original_conversations?.consent_version)) {
         setError('Original-sharing terms changed. Inspect the originals and select the option again.');
         return;

@@ -7,9 +7,10 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from ..redaction.pair_contract import canonical, digest, MAX_BYTES, TERMS_VERSION
+from ..redaction.pair_contract import canonical, digest, MAX_BYTES
 
 SCHEMA = "clawjournal-upload-originals-v1"
+TERMS_VERSION = "redaction-improvement-upload-originals-v2"
 
 
 def prepare(conn, share_id, settings):

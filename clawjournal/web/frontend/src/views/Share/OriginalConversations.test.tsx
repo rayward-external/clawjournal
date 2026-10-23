@@ -4,7 +4,7 @@ import { cleanup } from '@testing-library/react';
 import { api } from '../../api.ts';
 import { OriginalConversations } from './OriginalConversations.tsx';
 
-const offer = {enabled: true, consent_version: 'originals-v1', purpose: 'Only to improve redaction.', retention_days: 30};
+const offer = {schema: 'clawjournal-upload-originals-v1', consent_version: 'redaction-improvement-upload-originals-v2', purpose: 'Only to improve redaction.', retention: 'until-withdrawal', retention_text: 'No automatic expiration; withdraw to delete.'};
 const preview = {document: {schema: 'example', sessions: [{messages: ['invented@example.org']}]}, preview_digest: 'reviewed-digest'};
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
@@ -14,6 +14,7 @@ it('starts unselected and reads originals only when the user chooses them', asyn
   render(<OriginalConversations shareId="share" offer={offer} disabled={false} onChange={onChange} onPending={onPending} />);
   expect(screen.getByRole('checkbox')).not.toBeChecked();
   expect(read).not.toHaveBeenCalled();
+  expect(screen.getByText(/No automatic expiration/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole('checkbox'));
   expect(onPending).toHaveBeenLastCalledWith(true);
   await waitFor(() => expect(onChange).toHaveBeenLastCalledWith('reviewed-digest'));
@@ -49,9 +50,9 @@ it('ignores a late preview after the user removes consent', async () => {
 });
 
 it('explains when collection is unavailable and disables consent', () => {
-  render(<OriginalConversations shareId="share" offer={{...offer, enabled: false}} disabled={false} onChange={vi.fn()} onPending={vi.fn()} />);
+  render(<OriginalConversations shareId="share" offer={{...offer, consent_version: 'old-terms'}} disabled={false} onChange={vi.fn()} onPending={vi.fn()} />);
   expect(screen.getByRole('checkbox')).toBeDisabled();
-  expect(screen.getByText(/not enabled on this server/)).toBeInTheDocument();
+  expect(screen.getByText(/server needs an update/)).toBeInTheDocument();
 });
 
 it('downloads only on request and uses the approved preview digest', async () => {

@@ -552,7 +552,7 @@ export const api = {
 
   share: {
     consent(): Promise<{
-      original_conversations?: {enabled: boolean; consent_version: string; purpose: string; retention_days: number};
+      original_conversations?: {schema: string; consent_version: string; purpose: string; retention: string; retention_text: string};
       consent_text: string;
       retention_text: string;
       consent_version: string;

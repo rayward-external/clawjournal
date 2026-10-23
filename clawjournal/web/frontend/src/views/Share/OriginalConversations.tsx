@@ -9,6 +9,8 @@ export function OriginalConversations({ shareId, offer, disabled, onChange, onPe
   onChange: (digest: string | null) => void;
   onPending: (pending: boolean) => void;
 }) {
+  const supported = offer?.schema === 'clawjournal-upload-originals-v1'
+    && offer?.consent_version === 'redaction-improvement-upload-originals-v2';
   const [selected, setSelected] = useState(false);
   const [preview, setPreview] = useState<Awaited<ReturnType<typeof api.shares.originals>> | null>(null);
   const [error, setError] = useState('');
@@ -17,7 +19,7 @@ export function OriginalConversations({ shareId, offer, disabled, onChange, onPe
     generation.current = {};
     setSelected(false); setPreview(null); onChange(null); onPending(false);
     return () => { generation.current = {}; };
-  }, [shareId, offer?.enabled, offer?.consent_version, onChange, onPending]);
+  }, [shareId, supported, offer?.consent_version, onChange, onPending]);
 
   async function choose(enabled: boolean) {
     const request = generation.current = {};
@@ -41,11 +43,11 @@ export function OriginalConversations({ shareId, offer, disabled, onChange, onPe
 
   return <fieldset style={{ border: '1px solid #ddd', borderRadius: 8, padding: 12 }}>
     <legend>Optional: help improve redaction</legend>
-    <label><input type="checkbox" checked={selected} disabled={disabled || !offer?.enabled || !shareId}
+    <label><input type="checkbox" checked={selected} disabled={disabled || !supported || !shareId}
       onChange={e => void choose(e.target.checked)} /> Include my original conversation to help improve redaction.</label>
     <p>{offer?.purpose || 'Original conversations are used only to evaluate and improve the redaction pipeline, including redaction-specific model training.'}</p>
-    <p>Stored separately for up to {offer?.retention_days ?? 30} days. This choice applies only to this upload; it does not enable automatic sharing of originals.</p>
-    {!offer?.enabled && <p>Original sharing is not enabled on this server yet. You can still submit the redacted conversation.</p>}
+    <p>{offer?.retention_text || "Stored separately with no automatic expiration. You can withdraw your upload to delete the stored originals. Withdrawal does not undo completed training or automatically recall downloaded copies."} This choice applies only to this upload; it does not enable automatic sharing of originals.</p>
+    {!supported && <p>This server needs an update before it can accept originals with these terms. You can still submit the redacted conversation.</p>}
     {selected && !preview && !error && <p role="status">Loading your local originals…</p>}
     {error && <p role="alert">{error}</p>}
     {preview && <>

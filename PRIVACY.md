@@ -344,6 +344,11 @@ For the website upload, use **Download originals for the website upload** and th
 matching redacted ZIP. The originals JSON contains normalized message content and
 session IDs, not an original vendor ZIP or arbitrary binary attachments. Keep it
 private. The website requires separate consent and displays the selected file
-before sending it. The server stores matched pairs encrypted for up to 30 days,
-restricts downloads to administrators, and deletes them on withdrawal or expiry
-cleanup. Downloaded copies must also be deleted by the stated expiry.
+before sending it. Matched pairs are stored separately in the service's existing
+database under its normal access controls, with administrator-only downloads.
+They have **no automatic expiration** and may be used later for redaction-specific
+training. Withdrawing the upload deletes its stored originals; it does not undo
+completed training or automatically recall downloaded copies. This upload flow
+does not add application-level encryption or a separate encryption key. The new
+consent version does not extend retention for contributions made under older
+30-day terms.

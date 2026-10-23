@@ -6068,10 +6068,19 @@ class TestShareAPI:
         monkeypatch.setattr("clawjournal.workbench.daemon._HOSTED_SHARE_URL", "https://hosted.example.test/share")
         monkeypatch.setattr("clawjournal.workbench.daemon._hosted_capabilities_cache", None)
 
+    def test_original_preview_respects_index_health_gate(self, server, monkeypatch):
+        from clawjournal.workbench import daemon
+        def reject(handler):
+            daemon._json_response(handler, {"error": "Index needs rebuilding"}, 503)
+            return True
+        monkeypatch.setattr(daemon.WorkbenchHandler, "_reject_unhealthy_index", reject)
+        status, result = _post(server, "/api/shares/unavailable/originals", {})
+        assert status == 503 and result["error"] == "Index needs rebuilding"
+
     def test_original_choice_attaches_exact_preview_to_main_upload(self, server, monkeypatch):
         from email.parser import BytesParser
         from email.policy import default
-        from clawjournal.redaction.pair_contract import TERMS_VERSION, digest
+        from clawjournal.workbench.upload_originals import TERMS_VERSION, SCHEMA, digest
         monkeypatch.setattr("clawjournal.workbench.daemon.load_config",
                             lambda: _share_config(projects_confirmed=True))
         share_id = self._create_and_export_share(server)
@@ -6098,7 +6107,7 @@ class TestShareAPI:
             assert {x["session_id"] for x in original["sessions"]} == {x["session_id"] for x in redacted}
             sent.append(parts)
         mock_open = _mock_urlopen_factory(
-            capabilities={"submissions_open": True, "original_conversations": {"enabled": True, "consent_version": TERMS_VERSION}},
+            capabilities={"submissions_open": True, "original_conversations": {"schema": SCHEMA, "consent_version": TERMS_VERSION}},
             upload_response={"receipt_id": "paired-receipt", "status": "received", "originals_status": "available"},
             upload_assert=check_request)
         monkeypatch.setattr("clawjournal.workbench.daemon.urllib.request.urlopen", mock_open)

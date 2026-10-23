@@ -4138,7 +4138,7 @@ def submit_share_to_hosted(
     if include_original:
         from . import upload_originals
         offer = capabilities.get("original_conversations") or {}
-        if (offer.get("enabled") is not True or original_consent_version != upload_originals.TERMS_VERSION
+        if (offer.get("schema") != upload_originals.SCHEMA or original_consent_version != upload_originals.TERMS_VERSION
                 or offer.get("consent_version") != original_consent_version):
             return {"error": "Original sharing is unavailable or its consent changed. Refresh the upload screen.", "status": 409}
         if not original_preview_digest:
@@ -4729,13 +4729,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
         if path == "/api/support-reports":
             self._handle_create_support_report()
-        elif path.startswith("/api/shares/") and path.endswith("/originals"):
-            share_id = path[len("/api/shares/"):-len("/originals")]
-            self._handle_share_originals(share_id)
         elif path == "/api/index/rebuild":
             self._handle_index_rebuild()
         elif path.startswith("/api/") and self._reject_unhealthy_index():
             return
+        elif path.startswith("/api/shares/") and path.endswith("/originals"):
+            share_id = path[len("/api/shares/"):-len("/originals")]
+            self._handle_share_originals(share_id)
         elif path == "/api/session-status/bulk":
             self._handle_bulk_update_review_status()
         elif path.startswith("/api/sessions/") and path.endswith("/score"):
