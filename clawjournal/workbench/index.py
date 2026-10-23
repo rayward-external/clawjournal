@@ -2995,7 +2995,7 @@ def apply_share_redactions(
                         msg[field],
                         custom_strings,
                     )
-                custom_total += count
+                    custom_total += count
             if isinstance(msg.get("extra"), dict) and "attachment_review" in msg["extra"]:
                 msg["extra"]["attachment_review"], count = _redact_custom_strings_in_value(
                     msg["extra"]["attachment_review"], custom_strings,
