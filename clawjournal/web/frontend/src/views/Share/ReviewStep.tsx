@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AttachmentsPanel } from './AttachmentsPanel.tsx';
 import { RedactedText } from '../../components/RedactedText.tsx';
 import { ToolUseCard } from '../../components/ToolUseCard.tsx';
 import { colors } from '../../theme.ts';
@@ -20,6 +21,7 @@ export interface ReviewStepProps {
   onApprove: (id: string) => void;
   onExclude: (id: string) => void;
   onRetryAi: (id: string) => void;
+  onAttachmentsChange?: (id: string, ids: string[], visuals?: Record<string, string>) => void;
   onBack: () => void;
   onPackage: () => void;
   globalStyles: React.ReactNode;
@@ -64,6 +66,16 @@ export function ReviewStep(p: ReviewStepProps) {
       </p>
 
       <UsageDisclosure onLearnMore={() => p.setShowHelp(true)} aiPiiEnabled={p.aiPiiEnabled} />
+
+      {p.onAttachmentsChange && p.queuedSessions.map(s => {
+        const data = p.redactedSessions[s.session_id];
+        return data?.attachments?.length ? <AttachmentsPanel key={s.session_id} sessionId={s.session_id} title={s.display_title || s.session_id}
+          data={data} onChange={(ids, visuals) => {
+            setShowDetails(true);
+            if (!p.expandedIds.has(s.session_id)) p.onToggleExpand(s.session_id);
+            p.onAttachmentsChange?.(s.session_id, ids, visuals);
+          }} /> : null;
+      })}
 
       <div style={{
         padding: '16px', marginBottom: 14, background: colors.white,
@@ -275,6 +287,8 @@ function ReviewRow({
           <p style={{ fontSize: 13, color: colors.gray700, margin: '0 0 14px', lineHeight: 1.55 }}>
             {data?.previewError
               ? 'The preview could not be completed. This trace stays excluded. Go back to redaction and retry after resolving the error.'
+              : data?.selectedAttachmentIds?.length
+              ? 'Review the selected attachments’ redacted text above and the conversation below before including this trace.'
               : status === 'clear'
               ? <>This trace cleared automatically. Here&rsquo;s the redacted version that will ship &mdash; scan it if you&rsquo;d like extra peace of mind.</>
               : <>Here&rsquo;s the redacted trace. Scan it &mdash; if anything looks off, <strong style={{ color: colors.gray900 }}>remove it</strong>. Otherwise include it in the bundle.</>}

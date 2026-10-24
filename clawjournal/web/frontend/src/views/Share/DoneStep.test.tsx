@@ -24,6 +24,14 @@ function props(receiptId: string | null): DoneStepProps {
   };
 }
 
+it('lists reviewed attachment images when the finalized bundle includes them', () => {
+  const input = props(null);
+  input.bundle = { ...input.bundle!, attachmentFiles: 2 };
+  render(<DoneStep {...input} />);
+  expect(screen.getByText(/attachments\//)).toBeInTheDocument();
+  expect(screen.getByText('2 reviewed page images')).toBeInTheDocument();
+});
+
 describe('DoneStep success celebration', () => {
   it('showers main-content confetti after a hosted submission succeeds', () => {
     render(<DoneStep {...props('receipt-123')} />);

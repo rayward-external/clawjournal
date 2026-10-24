@@ -35,6 +35,8 @@ import type {
   SupportReportStatus,
   ScoringControlResponse,
   ScoringQueueStatus,
+  VisualReview,
+  VisualBox,
 } from './types.ts';
 
 const BASE = '/api';
@@ -255,7 +257,45 @@ export const api = {
       return request(`/sessions/${encodeURIComponent(id)}/redacted`);
     },
 
-    async redactionReport(id: string, opts?: { aiPii?: boolean; signal?: AbortSignal; timeoutMs?: number }): Promise<RedactionReport> {
+    async attachmentPreview(id: string, attachmentId: string, revision: string, signal?: AbortSignal): Promise<Blob> {
+      const query = new URLSearchParams({ attachment_id: attachmentId, expected_revision: revision });
+      const response = await fetch(`${BASE}/sessions/${encodeURIComponent(id)}/attachment-preview?${query}`, {
+        headers: authHeader(), cache: 'no-store', signal,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new ApiError(response.status, body.error || 'Image preview failed');
+      }
+      if (response.headers.get('Content-Type') !== 'image/png') throw new Error('Unexpected image preview format');
+      return response.blob();
+    },
+
+    visualReview(id: string, body: {
+      action: 'start' | 'update' | 'prepare' | 'approve'; attachment_id: string; expected_revision: string;
+      review_id?: string; page?: number; version?: string; versions?: string[]; reviewed_pages?: number[];
+      selected_candidate_ids?: number[]; manual_boxes?: VisualBox[];
+    }, signal?: AbortSignal): Promise<VisualReview> {
+      return request(`/sessions/${encodeURIComponent(id)}/attachment-visual-review`, {
+        method: 'POST', body: JSON.stringify(body), signal, cache: 'no-store',
+      });
+    },
+
+    async visualPage(id: string, params: {
+      attachment_id: string; expected_revision: string; review_id: string;
+      page: string; version: string; variant: 'original' | 'redacted';
+    }, signal?: AbortSignal): Promise<Blob> {
+      const response = await fetch(`${BASE}/sessions/${encodeURIComponent(id)}/attachment-visual-page?${new URLSearchParams(params)}`, {
+        headers: authHeader(), cache: 'no-store', signal,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new ApiError(response.status, body.error || 'Page preview failed');
+      }
+      if (response.headers.get('Content-Type') !== 'image/png') throw new Error('Unexpected page preview format');
+      return response.blob();
+    },
+
+    async redactionReport(id: string, opts?: { aiPii?: boolean; signal?: AbortSignal; timeoutMs?: number; attachmentIds?: string[]; expectedRevision?: string; visualReviewIds?: Record<string, string> }): Promise<RedactionReport> {
       const q = opts?.aiPii ? '?ai_pii=1' : '';
       const controller = new AbortController();
       let timedOut = false;
@@ -268,6 +308,11 @@ export const api = {
       }, opts?.timeoutMs ?? REDACTION_REPORT_TIMEOUT_MS);
       try {
         return await request(`/sessions/${encodeURIComponent(id)}/redaction-report${q}`, {
+          ...(opts?.attachmentIds !== undefined ? {
+            method: 'POST',
+            body: JSON.stringify({ attachment_ids: opts.attachmentIds, visual_review_ids: opts.visualReviewIds,
+              expected_revision: opts.expectedRevision, ai_pii: opts.aiPii ?? false }),
+          } : {}),
           signal: controller.signal,
         });
       } catch (error) {

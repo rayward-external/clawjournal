@@ -250,6 +250,147 @@ def _get_raw(port, path, *, skip_auth=False):
     return resp.status, resp.getheader("Content-Type", ""), resp.read()
 
 
+def test_attachment_choices_are_authenticated_revision_bound_and_exported(server):
+    from clawjournal.workbench import index
+    raw = {"session_id": "attachments-http", "source": "custom", "project": "synthetic",
+           "messages": [{"role": "user", "content": "See results.", "extra": {"attachments": [
+               {"file_name": "results.txt", "extracted_content": "loss=0.125; alice@audit.test"},
+               {"file_name": "excluded.txt", "extracted_content": "excluded-lab-data"},
+           ]}}]}
+    with open_index() as conn:
+        upsert_sessions(conn, [raw])
+    route = "/api/sessions/attachments-http/redaction-report"
+    assert _get(server, route, skip_auth=True)[0] == 401
+    status, initial = _get(server, route)
+    assert status == 200 and initial["selected_attachment_ids"] == []
+    assert "loss=0.125" not in json.dumps(initial["redacted_session"])
+    choices = {"attachment_ids": [initial["attachments"][0]["id"]],
+               "expected_revision": initial["reviewed_revision"], "ai_pii": False}
+    assert _post(server, route, choices, skip_auth=True)[0] == 401
+    assert _post(server, route, {**choices, "expected_revision": "stale"})[0] == 409
+    assert _post(server, route, {**choices, "attachment_ids": ["not-current"]})[0] == 409
+    status, report = _post(server, route, choices)
+    assert status == 200, report
+    assert report["review_snapshot_id"] != initial["review_snapshot_id"]
+    redacted = json.dumps(report["redacted_session"])
+    assert "loss=0.125" in redacted and "alice@audit.test" not in redacted
+    assert "excluded-lab-data" not in redacted
+    status, created = _post(server, "/api/shares", {
+        "session_ids": [raw["session_id"]],
+        "expected_revisions": {raw["session_id"]: report["reviewed_revision"]},
+        "review_snapshot_ids": {raw["session_id"]: report["review_snapshot_id"]},
+    })
+    assert status == 201, created
+    with open_index() as conn:
+        folder, manifest = index.export_share_to_disk(conn, created["share_id"], index.get_share(conn, created["share_id"]))
+    assert not manifest.get("blocked")
+    exported = (folder / "sessions.jsonl").read_text()
+    assert "loss=0.125" in exported and "alice@audit.test" not in exported
+    assert "excluded-lab-data" not in exported
+    status, deselected = _post(server, route, {**choices, "attachment_ids": []})
+    assert status == 200
+    assert "loss=0.125" not in json.dumps(deselected["redacted_session"])
+
+
+def test_attachment_image_preview_requires_auth_and_exact_revision(server):
+    import base64
+    from urllib.parse import urlencode
+    pytest.importorskip("PIL", minversion="13.0.0")
+    from PIL import Image
+
+    pixels = BytesIO()
+    Image.new("RGB", (8, 4), "navy").save(pixels, format="PNG")
+    raw = {"session_id": "image-preview-http", "source": "custom", "model": "test", "project": "synthetic",
+           "messages": [{"role": "user", "content": "See plot", "extra": {"attachments": [
+               {"file_name": "private-plot.png", "mime_type": "image/png",
+                "file_data": base64.b64encode(pixels.getvalue()).decode()}
+           ]}}]}
+    with open_index() as conn:
+        upsert_sessions(conn, [raw])
+    _, report = _get(server, "/api/sessions/image-preview-http/redaction-report")
+    choice = report["attachments"][0]
+    assert choice["can_preview_image"] and not choice["can_include"]
+    assert "file_data" not in json.dumps(report)
+    base = "/api/sessions/image-preview-http/attachment-preview"
+    query = {"attachment_id": choice["id"], "expected_revision": report["reviewed_revision"]}
+    route = base + "?" + urlencode(query)
+    assert _get(server, route, skip_auth=True)[0] == 401
+    assert _get(server, base)[0] == 400
+    assert _get(server, base + "?" + urlencode({**query, "expected_revision": "old"}))[0] == 409
+    assert _get(server, base + "?" + urlencode({**query, "attachment_id": "unknown"}))[0] == 422
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    connection.request("GET", route, headers=_api_auth_headers())
+    response = connection.getresponse()
+    assert response.status == 200
+    assert response.getheader("Content-Type") == "image/png"
+    assert response.getheader("Cache-Control") == "no-store"
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+    assert "private-plot" not in response.getheader("Content-Disposition")
+    with Image.open(BytesIO(response.read())) as image:
+        assert image.size == (8, 4)
+    connection.close()
+    _, after = _get(server, "/api/sessions/image-preview-http/redaction-report")
+    assert after["selected_attachment_ids"] == []
+    assert after["review_snapshot_id"] == report["review_snapshot_id"]
+
+
+def test_attachment_visual_review_is_private_version_bound_and_never_export_consent(server, monkeypatch):
+    import base64
+    from urllib.parse import urlencode
+    from clawjournal import attachment_visuals as visual
+    from clawjournal.workbench import attachment_reviews
+    pytest.importorskip("PIL", minversion="13.0.0")
+    from PIL import Image
+    png = BytesIO()
+    Image.new("RGB", (400, 200), "white").save(png, format="PNG")
+    raw = {"session_id": "visual-review-http", "source": "custom", "model": "test", "project": "synthetic",
+           "messages": [{"role": "user", "content": "See plot", "extra": {"attachments": [
+               {"file_name": "private-plot.png", "mime_type": "image/png", "file_data": base64.b64encode(png.getvalue()).decode()}
+           ]}}]}
+    with open_index() as conn:
+        upsert_sessions(conn, [raw])
+    monkeypatch.setattr(attachment_reviews, "reviews", attachment_reviews.VisualReviews())
+    monkeypatch.setattr(visual, "recognize_text", lambda p: visual.OcrResult(p.digest, "alice@audit.test", (
+        visual.Word("alice@audit.test", 0, 16, (10, 10, 180, 30), 99),), ("Review visually.",)))
+    base = "/api/sessions/visual-review-http"
+    _, report = _get(server, base + "/redaction-report")
+    assert report["attachments"][0]["can_review_visual"]
+    request = {"action": "start", "attachment_id": report["attachments"][0]["id"], "expected_revision": report["reviewed_revision"]}
+    assert _post(server, base + "/attachment-visual-review", request, skip_auth=True)[0] == 401
+    assert _post(server, base + "/attachment-visual-review", {**request, "expected_revision": "old"})[0] == 409
+    status, started = _post(server, base + "/attachment-visual-review", request)
+    assert status == 200, started
+    assert started["sharing_authorized"] is False
+    update = {**request, "action": "update", "review_id": started["review_id"], "page": 0, "version": started["pages"][0]["version"]}
+    status, scanned = _post(server, base + "/attachment-visual-review", update)
+    assert status == 200, scanned
+    assert "alice" not in scanned["pages"][0]["redacted_text"]
+    query = {"attachment_id": request["attachment_id"], "expected_revision": request["expected_revision"],
+             "review_id": started["review_id"], "page": "0", "variant": "redacted", "version": scanned["pages"][0]["version"]}
+    page_route = base + "/attachment-visual-page?" + urlencode(query)
+    assert _get(server, page_route, skip_auth=True)[0] == 401
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    connection.request("GET", page_route, headers=_api_auth_headers())
+    response = connection.getresponse()
+    assert response.status == 200 and response.getheader("Cache-Control") == "no-store"
+    with Image.open(BytesIO(response.read())) as pixels:
+        assert pixels.getpixel((10, 10)) == (0, 0, 0)
+    connection.close()
+    assert _post(server, base + "/attachment-visual-review", {**update, "selected_candidate_ids": []})[0] == 409
+    _, after = _get(server, base + "/redaction-report")
+    assert after["selected_attachment_ids"] == [] and after["review_snapshot_id"] == report["review_snapshot_id"]
+    assert _post(server, "/api/share-review-cache/clear", {"confirm_invalidate_pending_reviews": True})[0] == 200
+    assert _get(server, page_route)[0] == 410
+    status, restarted = _post(server, base + "/attachment-visual-review", request)
+    assert status == 200, restarted
+    query.update(review_id=restarted["review_id"], version=restarted["pages"][0]["version"], variant="original")
+    page_route = base + "/attachment-visual-page?" + urlencode(query)
+    raw["messages"][0]["content"] = "Changed source"
+    with open_index() as conn:
+        upsert_sessions(conn, [raw])
+    assert _get(server, page_route)[0] == 409
+
+
 def _post(port, path, data=None, *, skip_auth=False):
     conn = HTTPConnection("127.0.0.1", port, timeout=5)
     body = json.dumps(data or {}).encode()
