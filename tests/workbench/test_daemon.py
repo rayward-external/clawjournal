@@ -37,6 +37,7 @@ from clawjournal.workbench.daemon import (
     trigger_scoring_warmup,
 )
 from clawjournal.workbench.daemon import MAX_SCAN_BACKOFF, SCAN_INTERVAL
+from clawjournal.scoring.backends import format_codex_runtime_error
 from clawjournal.workbench.index import add_policy, open_index, set_hold_state, upsert_sessions
 
 
@@ -2217,6 +2218,86 @@ class TestSessionsAPI:
         status, data = _post(server, "/api/sessions/sess-0/score")
         assert status == 503
         assert "Re-run `clawjournal scan`" in data["error"]
+
+    @staticmethod
+    def _scored():
+        return SimpleNamespace(
+            quality=4, reason="ok", detail_json="{}", task_type="t",
+            outcome_label="resolved", value_labels=[], risk_level=[],
+            display_title="T", effort_estimate=0.5, summary="s",
+        )
+
+    @staticmethod
+    def _confirm_codex_with_claude_fallback(monkeypatch):
+        monkeypatch.delenv("CLAWJOURNAL_SCORER_BACKEND", raising=False)
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.load_config",
+            lambda: {"scorer_backend": "codex"},
+        )
+        monkeypatch.setattr(
+            "clawjournal.workbench.daemon.installed_fallback_chain",
+            lambda primary: [primary] + [b for b in ("codex", "claude") if b != primary],
+        )
+
+    def test_score_session_endpoint_falls_back_on_unsupported_codex_model(
+        self, server, monkeypatch
+    ):
+        """The Score button uses the confirmed backend and its fallbacks."""
+        self._confirm_codex_with_claude_fallback(monkeypatch)
+        calls = []
+
+        def fake_score(conn, session_id, model=None, backend="auto", **kwargs):
+            calls.append((backend, model))
+            if backend == "codex":
+                raise RuntimeError(format_codex_runtime_error(
+                    1, "", 'ERROR: {"message":"The \'gpt-5.4-mini\' model is not '
+                    'supported when using Codex with a ChatGPT account.",'
+                    '"code":"model_not_found"}',
+                ))
+            return self._scored()
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        status, data = _post(server, "/api/sessions/sess-0/score", {"model": "gpt-5.4-mini"})
+        assert status == 200
+        assert data["ai_quality_score"] == 4
+        # The explicit model stays with the requested backend.
+        assert calls == [("codex", "gpt-5.4-mini"), ("claude", None)]
+
+    def test_score_session_endpoint_reports_each_unusable_backend(
+        self, server, monkeypatch
+    ):
+        self._confirm_codex_with_claude_fallback(monkeypatch)
+
+        def fake_score(conn, session_id, model=None, backend="auto", **kwargs):
+            raise RuntimeError(f"{backend} exited 1: out of credits")
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        status, data = _post(server, "/api/sessions/sess-0/score", {"backend": "auto"})
+        assert status == 503
+        assert data["error"] == (
+            "codex: codex exited 1: out of credits; "
+            "claude: claude exited 1: out of credits"
+        )
+
+    def test_score_session_endpoint_does_not_fall_back_on_judge_errors(
+        self, server, monkeypatch
+    ):
+        self._confirm_codex_with_claude_fallback(monkeypatch)
+        calls = []
+
+        def fake_score(conn, session_id, model=None, backend="auto", **kwargs):
+            calls.append(backend)
+            raise RuntimeError("could not parse scoring JSON")
+
+        monkeypatch.setattr("clawjournal.scoring.scoring.score_session", fake_score)
+
+        # An explicit backend in the request wins over the confirmed one.
+        status, data = _post(server, "/api/sessions/sess-0/score", {"backend": "claude"})
+        assert status == 503
+        assert data["error"] == "could not parse scoring JSON"
+        assert calls == ["claude"]
 
 
 class TestStatsAPI:

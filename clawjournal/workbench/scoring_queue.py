@@ -739,4 +739,8 @@ def classify_scoring_error(error: BaseException) -> tuple[str, str]:
         return "cooldown", "backend_temporary"
     if "unsupported backend" in message or "unsupported clawjournal_scorer_backend" in message:
         return "action_required", "backend_unavailable"
+    # The signed-in account can't use the scoring model (e.g. Codex with a
+    # ChatGPT sign-in); retrying the same backend can't succeed.
+    if "model_not_found" in message:
+        return "action_required", "backend_unavailable"
     return "job", "score_failed"

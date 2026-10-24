@@ -179,6 +179,16 @@ def test_distill_error_classification():
     assert not _distill_plan_unavailable("you are out of credits")
 
 
+def test_codex_chatgpt_model_rejection_counts_as_plan_unavailable():
+    from clawjournal.scoring.backends import format_codex_runtime_error
+    from clawjournal.skill.distill import _distill_plan_unavailable
+    msg = format_codex_runtime_error(
+        1, "", 'ERROR: {"message":"The \'gpt-5.5\' model is not supported when using '
+        'Codex with a ChatGPT account.","code":"model_not_found"}',
+    )
+    assert _distill_plan_unavailable(msg)
+
+
 def test_default_caller_never_relaxes_tool_isolation(monkeypatch):
     import clawjournal.skill.distill as d
     captured = {}

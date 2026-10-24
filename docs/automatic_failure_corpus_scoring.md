@@ -55,7 +55,24 @@ clawjournal config --scorer-backend none    # clear the confirmation
 ```
 
 `CLAWJOURNAL_SCORER_BACKEND` is also honored and takes precedence over the
-stored confirmation.
+stored confirmation. The workbench's per-session Score button uses the same
+backend, and like background scoring it moves to the next installed backend when
+one is unusable (no credits, signed out, or an unsupported model).
+
+### Codex model
+
+Codex scoring defaults to `gpt-5.4-mini`. Codex with a ChatGPT sign-in only
+serves some models and rejects the rest with `model_not_found`. To use a model
+the account serves:
+
+```bash
+clawjournal config --codex-model <model>         # any model your Codex account serves
+clawjournal config --codex-model codex-default   # omit --model; Codex picks its own default
+clawjournal config --codex-model none            # back to the ClawJournal default
+```
+
+`CLAWJOURNAL_CODEX_MODEL` takes precedence over the stored value. Skill
+distillation keeps its own Codex default.
 
 Hermes Agent (`https://github.com/NousResearch/hermes-agent`) is supported as a
 scoring backend only. ClawJournal invokes Hermes' scripted one-shot CLI mode and

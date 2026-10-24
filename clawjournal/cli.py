@@ -40,7 +40,14 @@ from .parsing.parser import (
     discover_projects,
     parse_project_sessions,
 )
-from .scoring.backends import BACKEND_CHOICES, DEFAULT_CLAUDE_MODEL, DEFAULT_CODEX_MODEL
+from .scoring.backends import (
+    BACKEND_CHOICES,
+    CODEX_AGENT_DEFAULT_MODEL,
+    CODEX_MODEL_CONFIG_KEY,
+    CODEX_MODEL_ENV,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_CODEX_MODEL,
+)
 from .redaction.pii import apply_findings_to_session, load_findings, load_jsonl_sessions, review_session_pii, review_session_pii_hybrid, review_session_pii_with_agent, write_findings, write_jsonl_sessions
 from .scoring.scoring import SCORING_BACKEND_CHOICES
 from .redaction.secrets import _has_mixed_char_types, _shannon_entropy, redact_session
@@ -445,6 +452,7 @@ def configure(
     repo: str | None = None,
     source: str | None = None,
     scorer_backend: str | None = None,
+    codex_model: str | None = None,
     exclude: list[str] | None = None,
     redact: list[str] | None = None,
     redact_usernames: list[str] | None = None,
@@ -471,6 +479,11 @@ def configure(
         else:
             config["scorer_backend"] = scorer_backend
             config["scorer_backend_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+    if codex_model is not None:
+        if codex_model == "none":
+            config.pop(CODEX_MODEL_CONFIG_KEY, None)
+        else:
+            config[CODEX_MODEL_CONFIG_KEY] = codex_model
     if exclude is not None:
         if config.get("excluded_projects"):
             config["excluded_projects"] = normalize_excluded_project_names(
@@ -4473,6 +4486,10 @@ def _main() -> None:
                      help="Set export source scope explicitly: claude, claude-science, codex, gemini, workbuddy, or all")
     cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
                      help="Confirm the AI scoring backend for automatic workbench scoring")
+    cfg.add_argument("--codex-model", type=str,
+                     help=f"Codex model for AI scoring (default {DEFAULT_CODEX_MODEL}). Use "
+                          f"'{CODEX_AGENT_DEFAULT_MODEL}' to let Codex pick its own default, or "
+                          f"'none' to clear. The {CODEX_MODEL_ENV} env var takes precedence.")
     cfg.add_argument("--exclude", type=str, help="Comma-separated projects to exclude")
     cfg.add_argument("--redact", type=str,
                      help="Comma-separated strings to always redact (API keys, usernames, domains)")
@@ -5856,10 +5873,12 @@ def _handle_config(args) -> None:
     # is the inverse "declined" boolean.
     scoring_warmup = getattr(args, "scoring_warmup", None)
     scoring_warmup_declined = None if scoring_warmup is None else (not scoring_warmup)
+    codex_model = (getattr(args, "codex_model", None) or "").strip() or None
     has_changes = (
         args.repo
         or args.source
         or args.scorer_backend
+        or codex_model
         or args.exclude
         or args.redact
         or args.redact_usernames
@@ -5875,6 +5894,7 @@ def _handle_config(args) -> None:
         repo=args.repo,
         source=args.source,
         scorer_backend=args.scorer_backend,
+        codex_model=codex_model,
         exclude=_parse_csv_arg(args.exclude),
         redact=_parse_csv_arg(args.redact),
         redact_usernames=_parse_csv_arg(args.redact_usernames),

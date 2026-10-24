@@ -39,6 +39,7 @@ from ..scoring.backends import (
     SUPPORTED_BACKENDS,
     detect_available_backend,
     installed_fallback_chain,
+    is_backend_unavailable_error,
     require_backend_command,
     resolve_backend,
 )
@@ -5324,7 +5325,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _handle_score_session(self, session_id: str) -> None:
         body = _read_body(self) or {}
-        backend = body.get("backend", "auto")
+        backend = str(body.get("backend") or "auto").strip().lower()
+        if backend == "auto":
+            # The Score button sends "auto": use the backend background scoring
+            # confirmed rather than re-detecting from the daemon's environment.
+            backend = _confirmed_scoring_backend() or "auto"
         model = body.get("model")
 
         from ..scoring.egress_lock import scoring_egress_lock
@@ -5413,30 +5418,48 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 redaction_settings = _score_redaction_settings(
                     get_effective_share_settings(conn, load_config())
                 )
-                score_kwargs: dict[str, Any] = {
-                    "model": model,
-                    "backend": backend,
-                }
+                score_kwargs: dict[str, Any] = {}
                 if redaction_settings is not None:
                     score_kwargs["redaction_settings"] = redaction_settings
                 if _score_accepts_parameter(score_session, "before_egress"):
                     score_kwargs["before_egress"] = before_egress
-                try:
-                    result = score_session(
-                        conn, representative_id, **score_kwargs
+                # Same fallback chain as background scoring: an unusable
+                # backend (credits, auth, unsupported model) hands the session
+                # to the next installed one. An explicit model only applies to
+                # the requested backend; fallbacks use their own defaults.
+                result = None
+                failures: list[tuple[str, str]] = []
+                for index, candidate in enumerate(_scoring_backend_chain(backend)):
+                    try:
+                        result = score_session(
+                            conn,
+                            representative_id,
+                            model=model if index == 0 else None,
+                            backend=candidate,
+                            **score_kwargs,
+                        )
+                        break
+                    except ScoringAborted:
+                        _json_response(
+                            self,
+                            {
+                                "error": "Session changed while scoring; retry the current revision.",
+                                "block_reason": "stale_revision",
+                            },
+                            409,
+                        )
+                        return
+                    except RuntimeError as exc:
+                        failures.append((candidate, str(exc)))
+                        if not is_backend_unavailable_error(str(exc)):
+                            break
+                if result is None:
+                    error = (
+                        failures[0][1]
+                        if len(failures) == 1
+                        else "; ".join(f"{name}: {err}" for name, err in failures)
                     )
-                except ScoringAborted:
-                    _json_response(
-                        self,
-                        {
-                            "error": "Session changed while scoring; retry the current revision.",
-                            "block_reason": "stale_revision",
-                        },
-                        409,
-                    )
-                    return
-                except RuntimeError as exc:
-                    _json_response(self, {"error": str(exc)}, 503)
+                    _json_response(self, {"error": error}, 503)
                     return
 
                 conn.execute("BEGIN IMMEDIATE")
