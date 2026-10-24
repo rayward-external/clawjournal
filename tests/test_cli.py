@@ -378,6 +378,20 @@ class TestConfigure:
         configure(ai_pii_review=False)
         assert saved["ai_pii_review_enabled"] is False
 
+    def test_sets_and_clears_codex_model(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)
+        monkeypatch.setattr(
+            "clawjournal.cli.load_config", lambda: {"scorer_codex_model": "gpt-old"}
+        )
+        saved = []
+        monkeypatch.setattr("clawjournal.cli.save_config", lambda c: saved.append(dict(c)))
+
+        configure(codex_model="codex-default")
+        assert saved[-1]["scorer_codex_model"] == "codex-default"
+
+        configure(codex_model="none")
+        assert "scorer_codex_model" not in saved[-1]
+
     def test_ai_pii_review_unset_leaves_config_untouched(self, tmp_config, monkeypatch, capsys):
         # The tri-state default (None) must not write the key when the flag is omitted.
         monkeypatch.setattr("clawjournal.cli.CONFIG_FILE", tmp_config)

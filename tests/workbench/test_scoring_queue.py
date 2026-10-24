@@ -271,6 +271,24 @@ def test_raw_backend_error_never_enters_queue_or_status(queue_db):
     assert ids[0] not in status_text
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        'codex exited 1: ERROR: {"status":400,"error":{"message":"The \'gpt-5.4-mini\' '
+        'model is not supported when using Codex with a ChatGPT account.",'
+        '"code":"model_not_found"}}',
+        "Codex model 'gpt-5.4-mini' is unavailable for this account (model_not_found); "
+        "a ChatGPT sign-in only serves some models.",
+    ],
+    ids=["raw", "formatted"],
+)
+def test_unsupported_model_needs_action_instead_of_retry(message):
+    assert queue.classify_scoring_error(RuntimeError(message)) == (
+        "action_required",
+        "backend_unavailable",
+    )
+
+
 def test_retry_failed_only_resets_current_revisions(queue_db):
     ids = _seed(queue_db, 2)
     queue.enqueue_session_ids(queue_db, ids, now=BASE)

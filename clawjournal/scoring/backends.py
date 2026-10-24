@@ -33,6 +33,13 @@ DEFAULT_BACKEND_MODELS: dict[str, str] = {
     "claude": DEFAULT_CLAUDE_MODEL,
     "codex": DEFAULT_CODEX_MODEL,
 }
+# Codex with a ChatGPT sign-in only serves some models, and that set changes
+# server-side, so the fast Codex model can be overridden: env var first, then
+# config.json (written by `clawjournal config --codex-model`). The
+# CODEX_AGENT_DEFAULT_MODEL value omits --model so Codex uses its own default.
+CODEX_MODEL_ENV = "CLAWJOURNAL_CODEX_MODEL"
+CODEX_MODEL_CONFIG_KEY = "scorer_codex_model"
+CODEX_AGENT_DEFAULT_MODEL = "codex-default"
 
 # Prefix of the RuntimeError raised by resolve_backend() when no usable backend
 # can be found. Kept as a constant so callers (e.g. the daemon's auto-score
@@ -56,13 +63,21 @@ BACKEND_COMMANDS: dict[str, str] = {
 }
 
 # Errors that mean the backend itself is unusable (no credits, auth failure,
-# rate limit, or CLI missing), so callers can try another installed backend.
+# rate limit, CLI missing, or the account can't use the requested model), so
+# callers can try another installed backend.
 _BACKEND_UNAVAILABLE_RE = re.compile(
     r"out of credits|not logged in|please run|log\s?in|unauthoriz|forbidden|"
     r"\b40[13]\b|\b429\b|quota|insufficient|usage limit|rate.?limit|limit reached|"
     r"limit (?:will )?reset|resets? at|too many requests|"
-    r"cli not found|command not found|not installed|no such file",
+    r"cli not found|command not found|not installed|no such file|"
+    r"model_not_found|the '[^']+' model is not supported",
     re.IGNORECASE,
+)
+# Codex's rejection of a model the signed-in account can't use, e.g.
+# "The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT
+# account." (error code model_not_found).
+_CODEX_UNSUPPORTED_MODEL_RE = re.compile(
+    r"the '([^']+)' model is not supported|model_not_found", re.IGNORECASE
 )
 
 
@@ -99,8 +114,26 @@ BACKEND_COMMAND_ALIASES: dict[str, tuple[str, ...]] = {
 _TEXT_SUBPROCESS_KW = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
+def _codex_model_override() -> str | None:
+    """Return the user's Codex model override from env or config, if any."""
+    value = (os.environ.get(CODEX_MODEL_ENV) or "").strip()
+    if not value:
+        from ..config import load_config
+
+        try:
+            config = load_config()
+        except Exception:  # noqa: BLE001 - unreadable config keeps the default
+            config = {}
+        value = str(config.get(CODEX_MODEL_CONFIG_KEY) or "").strip()
+    return value or None
+
+
 def default_model_for_backend(backend: str) -> str | None:
     """Return ClawJournal's fast default model for a resolved backend."""
+    if backend == "codex":
+        override = _codex_model_override()
+        if override:
+            return None if override.lower() == CODEX_AGENT_DEFAULT_MODEL else override
     return DEFAULT_BACKEND_MODELS.get(backend)
 
 
@@ -339,6 +372,19 @@ def format_codex_runtime_error(returncode: int, stderr: str, stdout: str = "") -
             "Codex runs through `codex exec` in non-interactive mode. "
             "`codex exec` reuses saved CLI authentication by default; for automation, "
             "run `codex login` or set `CODEX_API_KEY` before running clawjournal."
+        )
+
+    unsupported_model = _CODEX_UNSUPPORTED_MODEL_RE.search(combined)
+    if unsupported_model:
+        # Keep "model_not_found" in the text: fallback detection and the
+        # scoring queue's error classifier both key on it.
+        model = unsupported_model.group(1)
+        named = f"Codex model '{model}'" if model else "The Codex model"
+        return (
+            f"{named} is unavailable for this account (model_not_found); "
+            "a ChatGPT sign-in only serves some models. Run "
+            "`clawjournal config --codex-model <model>` (or `codex-default` to let "
+            "Codex pick its own default), or choose another scoring backend."
         )
 
     if "invalid_json_schema" in lower or "response_format" in lower:

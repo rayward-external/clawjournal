@@ -10,6 +10,8 @@ import pytest
 from clawjournal.scoring.backends import (
     AgentResult,
     BACKEND_CHOICES,
+    CODEX_MODEL_CONFIG_KEY,
+    CODEX_MODEL_ENV,
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
     DEFAULT_DISTILL_EFFORTS,
@@ -40,6 +42,19 @@ from clawjournal.scoring.backends import (
     validate_effort_for_backend,
 )
 
+# Codex's rejection of the default scoring model under a ChatGPT sign-in.
+CHATGPT_UNSUPPORTED_MODEL_ERROR = (
+    'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+    '"message":"The \'gpt-5.4-mini\' model is not supported when using Codex with a '
+    'ChatGPT account.","code":"model_not_found"}}'
+)
+
+
+@pytest.fixture
+def no_codex_model_override(monkeypatch):
+    monkeypatch.delenv(CODEX_MODEL_ENV, raising=False)
+    monkeypatch.setattr("clawjournal.config.load_config", lambda: {})
+
 
 class TestConstants:
     def test_backend_choices_include_auto(self):
@@ -48,7 +63,7 @@ class TestConstants:
     def test_supported_backends(self):
         assert set(SUPPORTED_BACKENDS) == {"claude", "codex", "hermes", "openclaw"}
 
-    def test_default_backend_models(self):
+    def test_default_backend_models(self, no_codex_model_override):
         assert DEFAULT_CLAUDE_MODEL == "claude-haiku-4-5"
         assert DEFAULT_CODEX_MODEL == "gpt-5.4-mini"
         assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
@@ -90,6 +105,9 @@ class TestBackendFallbackHelpers:
         assert is_backend_unavailable_error("You've hit your usage limit; resets at 5pm")
         assert is_backend_unavailable_error("rate limited (HTTP 429)")
         assert is_backend_unavailable_error("limit reached, will reset tomorrow")
+        assert is_backend_unavailable_error(
+            f"codex exited 1: {CHATGPT_UNSUPPORTED_MODEL_ERROR}"
+        )
         assert not is_backend_unavailable_error("judge timed out after 120s")
         assert not is_backend_unavailable_error("could not parse scoring JSON")
 
@@ -177,6 +195,58 @@ class TestErrorFormatting:
         msg = format_codex_runtime_error(1, "error: something broke")
         assert "codex exited 1" in msg
         assert "something broke" in msg
+
+    def test_codex_unsupported_model_error(self):
+        msg = format_codex_runtime_error(1, "", CHATGPT_UNSUPPORTED_MODEL_ERROR)
+        assert "'gpt-5.4-mini'" in msg
+        assert "clawjournal config --codex-model" in msg
+        # Must still read as "backend unusable" so scoring falls back.
+        assert is_backend_unavailable_error(msg)
+
+
+class TestCodexModelOverride:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, no_codex_model_override):
+        pass
+
+    def test_config_override_replaces_codex_default_only(self, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.config.load_config",
+            lambda: {CODEX_MODEL_CONFIG_KEY: "gpt-5.3-codex"},
+        )
+        assert default_model_for_backend("codex") == "gpt-5.3-codex"
+        assert resolve_model_for_backend("codex", None) == "gpt-5.3-codex"
+        assert resolve_model_for_backend("codex", "explicit") == "explicit"
+        assert default_model_for_backend("claude") == DEFAULT_CLAUDE_MODEL
+
+    def test_env_override_wins_over_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "clawjournal.config.load_config",
+            lambda: {CODEX_MODEL_CONFIG_KEY: "from-config"},
+        )
+        monkeypatch.setenv(CODEX_MODEL_ENV, "from-env")
+        assert default_model_for_backend("codex") == "from-env"
+
+    def test_codex_default_omits_model_flag(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(CODEX_MODEL_ENV, "codex-default")
+        model = resolve_model_for_backend("codex", None)
+        assert model is None
+        cmd = _build_codex_cmd(
+            "codex", cwd=tmp_path, model=model, sandbox=None,
+            output_schema_path=None, output_file_path=None,
+        )
+        assert "--model" not in cmd
+
+    def test_unreadable_config_keeps_default(self, monkeypatch):
+        def broken():
+            raise OSError("disk gone")
+
+        monkeypatch.setattr("clawjournal.config.load_config", broken)
+        assert default_model_for_backend("codex") == DEFAULT_CODEX_MODEL
+
+    def test_distill_keeps_its_frontier_default(self, monkeypatch):
+        monkeypatch.setenv(CODEX_MODEL_ENV, "from-env")
+        assert default_distill_model_for_backend("codex") == "gpt-5.5"
 
     def test_summarize_process_error_finds_error_line(self):
         stderr = "info: starting\nerror: connection refused\n"
