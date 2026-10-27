@@ -6168,9 +6168,8 @@ class TestShareAPI:
         status, preview = _post(server, f"/api/shares/{share_id}/originals", {})
         assert status == 200, preview
         assert preview["document"]["sessions"][0]["messages"][0]["content"].startswith("Task")
-        def unexpected_original_scan(*args):
-            raise AssertionError("Consented originals must not be rescanned")
-        monkeypatch.setattr("clawjournal.redaction.conversation_pairs._scan_original", unexpected_original_scan)
+        scans = []
+        monkeypatch.setattr("clawjournal.redaction.conversation_pairs._scan_original", scans.append)
         sent = []
         def check_request(req):
             message = BytesParser(policy=default).parsebytes(
@@ -6197,7 +6196,7 @@ class TestShareAPI:
                 "original_preview_digest": preview["preview_digest"]}
         status, result = _post(server, f"/api/shares/{share_id}/upload", body)
         assert status == 200, result
-        assert result["originals_status"] == "available" and len(sent) == 1
+        assert result["originals_status"] == "available" and len(sent) == 1 and len(scans) == 2
 
     def _create_and_export_share(self, port):
         """Helper: create a share and export it, return share_id.

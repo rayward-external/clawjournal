@@ -334,13 +334,10 @@ unrelated benchmarks, or general-purpose model training.
 
 The preview reads the selected reviewed local snapshots, shows their original
 messages, and binds approval to those exact bytes. The final submission rechecks
-scope, hold state and revision, and attaches a
+scope, hold state and revision, runs local credential checks, and attaches a
 separate originals file beside the final redacted ZIP. Originals never enter that
-research ZIP or an AI redaction backend. The redacted ZIP still passes the normal
-mandatory export scans. This option does not run an additional credential scan
-on the separately approved originals: they can contain sensitive information,
-including credentials removed from the redacted version. Missing originals,
-changed revisions, or missing approval block original sharing. No new
+research ZIP or an AI redaction backend. Missing originals, changed revisions,
+unavailable scanners, or possible credentials block original sharing. No new
 persistent raw cache or ongoing authorization is created by this option.
 
 For the website upload, use **Download originals for the website upload** and the
