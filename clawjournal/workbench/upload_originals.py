@@ -41,13 +41,13 @@ def prepare(conn, share_id, settings):
 
 
 def checked_bytes(conn, share_id, settings, *, approved_digest, redacted, current_settings=None):
-    """Recheck exact preview and run existing local-only original credential checks.
+    """Validate the approved original and its link to the final redacted export.
 
     The redacted side is the research ZIP itself, already through the mandatory
-    share gate. It is not rescanned with the stricter contribution gate, which
-    refuses the warn-only findings the share gate deliberately lets through.
+    share gate. The separately consented original is preserved verbatim, including
+    any credentials removed from the redacted side; no additional content scan
+    is applied here. Consent, scope, revisions and size limits still apply.
     """
-    from ..redaction.conversation_pairs import _scan_original
     document = prepare(conn, share_id, settings)
     if not approved_digest or digest(document) != approved_digest:
         raise ValueError("Originals changed or were not reviewed. Inspect and approve them again.")
@@ -64,9 +64,7 @@ def checked_bytes(conn, share_id, settings, *, approved_digest, redacted, curren
     if len(canonical(pairs).encode()) > MAX_BYTES:
         raise ValueError("Originals and their redacted versions together exceed 36 MiB. "
                          "Share fewer conversations to include originals.")
-    for original in document["sessions"]:
-        _scan_original(original)
     latest_settings = current_settings() if current_settings else settings
     if digest(prepare(conn, share_id, latest_settings)) != approved_digest:
-        raise ValueError("Originals changed while scanning. Review this share again.")
+        raise ValueError("Originals changed while preparing the upload. Review this share again.")
     return canonical(document).encode()
