@@ -105,6 +105,15 @@ def test_original_is_only_scanned_locally_and_secrets_block(store, monkeypatch):
         pairs._scan({}, {}, "fixture", store.root)
 
 
+def test_original_scan_ignores_placeholders_but_blocks_credentials(monkeypatch):
+    from clawjournal.redaction import betterleaks
+    monkeypatch.setattr(betterleaks, "scan_text", lambda text: SimpleNamespace(bypassed=False,binary_missing=False,scan_error=None,findings=[]))
+    # JSON escaping once joined the placeholder to the next line and read as a secret.
+    pairs._scan_original({"messages": [{"content": 'token = [REDACTED]\nprint("done")'}]})
+    with pytest.raises(ValueError, match="Possible credentials"):
+        pairs._scan_original({"messages": [{"tool_uses": [{"input": {"cmd": 'TOKEN="hf_' + "A1b2C3d4" * 5 + '"'}}]}]})
+
+
 def test_upload_uses_exact_destination_and_validates_receipt(store, monkeypatch):
     pairs.enable(store, permission(store)); cid = capture(store)
     monkeypatch.setattr(pairs, "_scan", lambda *args: None)
