@@ -174,7 +174,7 @@ assert.match(reviewStep, /data\?\.loading \? 'Retrying\.\.\.' : 'Retry AI'/);
 
 const apiSource = await readFile(new URL('../src/api.ts', import.meta.url), 'utf8');
 assert.match(apiSource, /REDACTION_REPORT_TIMEOUT_MS = 200_000/);
-assert.match(apiSource, /redactionReport\(id: string, opts\?: \{ aiPii\?: boolean; signal\?: AbortSignal; timeoutMs\?: number \}\)/);
+assert.match(apiSource, /redactionReport\(id: string, opts\?: \{ aiPii\?: boolean; signal\?: AbortSignal; timeoutMs\?: number; attachmentIds\?: string\[\]; expectedRevision\?: string; visualReviewIds\?: Record<string, string> \}\)/);
 assert.match(apiSource, /signal: controller\.signal/);
 
 const apiOutput = ts.transpileModule(apiSource, {

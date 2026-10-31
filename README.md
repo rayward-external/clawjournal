@@ -675,3 +675,121 @@ from the normal research ingestion feed, expire after 30 days and can be withdra
 Administrators must retain the same purpose/access restrictions on downloaded
 copies and delete them by their expiry. Deployment and retention cleanup belong
 to the companion hosted-service change; this client change does not deploy it.
+
+### Optional attachments in manual Share
+
+The Share review screen lists attachments next to their source message. Each
+starts unchecked. Availability distinguishes original bytes present in the
+import, extracted text only, and a filename/reference with no contents.
+Select an item to scan its text, compare its local original with the redacted
+preview, then include the conversation. Changing attachment choices removes the
+conversation's approval until the new preview is reviewed. Failed scans do not
+leave an approvable saved preview.
+
+This version supports extracted text and embedded base64 UTF-8 text files up to
+2 MiB of decoded text per attachment. Original binary bytes are not shared.
+Embedded images and PDFs require the separate page review below; unsupported
+formats remain unavailable for selection. A filename, local path, URL, or
+provider ID is never fetched automatically. Separate files in a provider's ZIP
+must first be imported by an adapter that supplies supported contents; this
+feature does not claim those files are present from their names alone.
+
+Embedded still PNG, JPEG, WebP, and PDF files have a local visual review in Share.
+Open the attachment, choose **Start page review**, and **Scan this page** on each
+page. Compare the original and redacted images, correct suggested redactions with
+their checkboxes, or use **Hide an area** to drag over another area. The last
+drawn rectangle can be undone. Recognized text changes with the pixel redactions.
+Then run **Run full privacy check**, inspect each final redacted page, and tick
+its review checkbox. **Approve and include attachment** selects the approved
+pages for the conversation preview. Any correction requires a new privacy check
+and page review. Conversation approval and submission remain separate steps.
+
+Visual review requires Python 3.11+ and Pillow 13. Python 3.10 installations retain
+the text workflow and receive an upgrade message for visual review. For PDFs,
+install `.[visual-attachments]`; scanning requires a local Tesseract installation
+with English language data. Processing is on demand and requires the local API
+token, exact source revision, and unchanged redaction settings. Drafts live only
+in process memory, limited to four files and 128 MiB; after 15 minutes of
+inactivity they become invalid and are removed on the next cache access. Restarting
+the daemon or choosing **Clear saved reviews** removes them. Closing the preview
+releases its browser image URLs. Failed scans do not create a redacted preview.
+
+Images are limited to 10 MiB and 20 megapixels, with their full resolution used
+for recognition and redaction. Corrupt or animated images are rejected. PDFs are
+rendered in a separate process into metadata-free page images, retaining visible
+figures and layout. Limits are 20 MiB per PDF, 20 pages, 20 megapixels per page,
+50 MiB total rendered output, and 45 seconds to render. An incomplete render
+fails the entire file rather than silently omitting pages. Images retain full
+resolution within the existing input limits for text recognition and redaction.
+Local English OCR supplies word coordinates; deterministic rules and custom
+strings suggest masks, and explicit rectangles can cover additional areas.
+Masks replace pixels and remove overlapping recognized words. OCR failures and
+low-confidence results remain explicit; absence of recognized text is not a
+clean privacy verdict. A rendered or redacted page does not authorize sharing.
+The full check applies export redaction rules and both mandatory scanners to
+recognized text, maps further changes onto the page, and scans again. A missing
+scanner, bypass, or unstable result prevents approval. The export contains fresh
+RGB PNG pages with the approved redactions, not the original PDF or image file.
+Page hashes and message records bind the final bytes; a later text rewrite
+requires another page review so older visible text cannot silently remain.
+
+New Claude Code and Claude Science imports retain message attachment blocks for
+the checklist, including attachment-only messages. Codex user-message imports
+retain file/image/audio blocks and local-file references from both rollout
+formats. Duplicate message records merge attachment metadata; an explicitly
+replaced prompt does not retain the old prompt's attachments. Embedded data URLs
+count as file contents, while paths remain references. Existing indexed records
+that were parsed without this information need re-importing from their original
+logs; no missing bytes can be recovered from the old parsed record alone.
+
+Attachment choices apply only to that saved preview. Unattended/manual CLI
+exports omit attachments by default. Re-importing a prepared share requires
+fresh choices. Re-imported page references alone do not count as original files:
+recognized text is offered as an unchecked text choice, with missing visual
+content and unknown message attribution retained. Export removes known attachment carriers and duplicate raw
+message copies, while retaining ordinary conversation text—including text that
+already quotes an attachment. Excluded attachment names and provider IDs stay
+local. This does not change the separate, purpose-limited consent for original
+conversation pairs used to improve redaction.
+
+Selected text passes through the existing custom rules, username/path masking,
+deterministic secret/PII scans, optional AI review, and final package scans.
+Selected text is stored under each message's
+`extra.attachment_review.items`, with schema `clawjournal.attachments.v1`.
+Each item records `attachment_id`, zero-based `message_index`, `availability`,
+and `status` (`included`, `excluded`, or `unavailable`). Included items also
+carry the scanned `name` and `text`; omissions carry neither. A null message
+index identifies a conversation-level attachment whose source message is unknown.
+Selected text from a recognized PDF or image also carries
+`visual_context_missing: true`: text alone does not preserve its figures or layout.
+This limitation survives re-import and reaches STEMTraceBench as missing context.
+Missing context is explicit; selection does not certify scientific sufficiency.
+
+Messages with approved visual pages use `clawjournal.attachments.v2`. Each visual
+item contains its scanned name and ordered `pages`, with the page index, PNG
+path and hash, dimensions, recognized text, and redaction count. The manifest
+lists the exact message records and files. Completed local copies preserve these
+files and refuse missing or changed pages. Hosted validation and STEMTraceBench
+transport support this format. A local walkthrough with invented text, an image,
+and a PDF verified page review, real scanner checks, authenticated ZIP download,
+receiver validation, and ingestion. The embedded browser's download-event hook
+did not confirm a saved download; the authenticated endpoint returned the exact
+finalized bytes. Production deployment has not been performed.
+
+Run `pytest tests/workbench/test_attachments.py` for inventory, exclusion,
+redaction, stale-choice, re-import, and saved-preview/export regressions.
+`tests/workbench/test_daemon.py::test_attachment_choices_are_authenticated_revision_bound_and_exported`
+covers the authenticated HTTP workflow. Frontend tests include the checklist,
+original/redacted comparison, and removal of prior approval after changes.
+`pytest tests/parsing/test_parser.py tests/parsing/test_segmenter.py` also checks
+that message imports and retry handling preserve attachment context.
+`pytest tests/workbench/test_attachment_reviews.py` checks local draft limits,
+revision/settings binding, explicit approval, corrections, and cleanup.
+`pytest tests/workbench/test_visual_share.py` checks complete privacy processing,
+exact page export, completed local copies, and invalidation after privacy changes.
+The attachment HTTP tests
+and frontend visual-review tests cover authentication and interactive controls.
+`pytest tests/workbench/test_attachment_visuals.py` checks local visual rendering,
+OCR failures, pixel/text redaction and preservation of invented scientific data.
+PDF tests require the optional dependency; the real OCR test also requires
+Tesseract. Skipped integration tests do not verify visual processing.

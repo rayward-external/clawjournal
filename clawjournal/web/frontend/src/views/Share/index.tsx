@@ -239,7 +239,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   const [blockedPackageSessions, setBlockedPackageSessions] = useState<BlockedShareSession[]>([]);
 
   // Done state
-  const [bundleInfo, setBundleInfo] = useState<{ traces: number; created: string; approxSize: string } | null>(null);
+  const [bundleInfo, setBundleInfo] = useState<{ traces: number; created: string; approxSize: string; attachmentFiles?: number } | null>(null);
   const [receiptId, setReceiptId] = useState<string | null>(null);
   const [hostedStatus, setHostedStatus] = useState<string | null>(null);
   const [supportContact, setSupportContact] = useState<string | null>(null);
@@ -544,10 +544,12 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       }
       if (share.hosted_status) setHostedStatus(share.hosted_status);
       if (share.session_count) {
+        const visualAssets = (share.manifest?.visual_attachments as { assets?: unknown } | undefined)?.assets;
         setBundleInfo((current) => current || {
           traces: share.session_count,
           created: share.created_at ? formatDate(share.created_at) : '',
           approxSize: share.zip_size_bytes ? formatBytes(share.zip_size_bytes) : 'ready',
+          attachmentFiles: Array.isArray(visualAssets) ? visualAssets.length : 0,
         });
       }
     }).catch(() => { });
@@ -829,6 +831,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
           thinking: m.thinking,
           tool_uses: m.tool_uses,
           timestamp: m.timestamp,
+          extra: m.extra,
         }));
         const buckets = emptyBuckets();
         for (const entry of report.redaction_log || []) {
@@ -847,6 +850,9 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         const completed: RedactedSessionData = {
           messages: msgs, loading: false,
           reviewSnapshotId: report.review_snapshot_id,
+          attachments: report.attachments,
+          selectedAttachmentIds: report.selected_attachment_ids,
+          visualReviewIds: report.visual_review_ids,
           reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,
           aiPiiFindings: report.ai_pii_findings || [],
@@ -998,8 +1004,8 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
     setManuallyExcludedIds((prev) => new Set([...prev, id]));
   };
 
-  const retryAiReview = async (id: string) => {
-    if (!aiPiiEnabled) return;
+  const retryAiReview = async (id: string, attachmentIds?: string[], visualReviewIds?: Record<string, string>) => {
+    if (!aiPiiEnabled && attachmentIds === undefined) return;
     const run = beginRedactionRetry(redactionRetryRef.current, id);
     if (!run) return;
     // A refreshed preview may contain new messages. Inclusion of the previous
@@ -1023,7 +1029,10 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         if (!isActive()) return;
         try {
           report = await api.sessions.redactionReport(id, {
-            aiPii: true,
+            aiPii: aiPiiEnabled,
+            attachmentIds: attachmentIds ?? redactedSessions[id]?.selectedAttachmentIds,
+            visualReviewIds: visualReviewIds ?? Object.fromEntries(Object.entries(redactedSessions[id]?.visualReviewIds || {}).filter(([key]) => (attachmentIds ?? redactedSessions[id]?.selectedAttachmentIds ?? []).includes(key))),
+            expectedRevision: redactedSessions[id]?.reviewedRevision,
             signal: run.controller.signal,
           });
           break;
@@ -1035,10 +1044,10 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       }
       if (!isActive()) return;
       if (!report) {
-        toast('AI review retry failed', 'error');
+        toast('Redaction preview failed. Retry before including this conversation.', 'error');
         setRedactedSessions((prev) => ({
           ...prev,
-          [id]: { ...(prev[id] || { messages: [] }), loading: false },
+          [id]: { ...(prev[id] || { messages: [] }), loading: false, previewError: 'The new preview failed. Retry before including this conversation.', reviewSnapshotId: undefined },
         }));
         return;
       }
@@ -1048,6 +1057,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         thinking: m.thinking,
         tool_uses: m.tool_uses,
         timestamp: m.timestamp,
+          extra: m.extra,
       }));
       const buckets = emptyBuckets();
       for (const entry of report.redaction_log || []) buckets[bucketOf(entry.type)] += 1;
@@ -1060,6 +1070,9 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         [id]: {
           messages: msgs, loading: false,
           reviewSnapshotId: report.review_snapshot_id,
+          attachments: report.attachments,
+          selectedAttachmentIds: report.selected_attachment_ids,
+          visualReviewIds: report.visual_review_ids,
           reviewedRevision: report.reviewed_revision,
           redactionCount: report.redaction_count,
           aiPiiFindings: report.ai_pii_findings || [],
@@ -1070,10 +1083,10 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       }));
     } catch {
       if (isActive()) {
-        toast('AI review retry failed', 'error');
+        toast('Redaction preview failed. Retry before including this conversation.', 'error');
         setRedactedSessions((prev) => ({
           ...prev,
-          [id]: { ...(prev[id] || { messages: [] }), loading: false },
+          [id]: { ...(prev[id] || { messages: [] }), loading: false, previewError: 'The new preview failed. Retry before including this conversation.', reviewSnapshotId: undefined },
         }));
       }
     } finally {
@@ -1164,17 +1177,23 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
       const totalTokens = approvedList.reduce((sum, s) => sum + sessionTotalTokens(s), 0);
       const approxMB = Math.max(0.1, (totalTokens * 0.3) / (1024 * 1024));
       const sizeLabel = sealed.zip_size_bytes ? formatBytes(sealed.zip_size_bytes) : (approxMB >= 1 ? `${approxMB.toFixed(1)} MB` : `${(approxMB * 1024).toFixed(0)} KB`);
+      const attachmentFiles = new Set(approvedList.flatMap(s =>
+        (redactedSessions[s.session_id]?.messages || []).flatMap(m =>
+          (m.extra?.attachment_review?.items || []).flatMap(a =>
+            a.status === 'included' ? (a.pages || []).map(p => p.asset_path) : [])))).size;
       try {
         setBundleInfo({
           traces: approvedList.length,
           created: new Date().toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
           approxSize: sizeLabel,
+          attachmentFiles,
         });
       } catch {
         setBundleInfo({
           traces: approvedList.length,
           created: new Date().toISOString().slice(11, 16),
           approxSize: sizeLabel,
+          attachmentFiles,
         });
       }
 
@@ -1447,6 +1466,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
         onApprove={approveTrace}
         onExclude={excludeTrace}
         onRetryAi={retryAiReview}
+        onAttachmentsChange={(id, ids, visuals) => void retryAiReview(id, ids, visuals)}
         onBack={() => {
           cancelAiRetries();
           purgeFailedPreviews();

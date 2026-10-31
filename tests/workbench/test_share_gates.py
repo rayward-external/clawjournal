@@ -66,6 +66,18 @@ def _settled_session(session_id, content=None):
     }
 
 
+@pytest.mark.parametrize("message,expected_count", [
+    ({"role": "user", "content": "orchid sample"}, 1),
+    ({"role": "assistant", "thinking": "orchid sample"}, 1),
+    ({"role": "assistant", "content": "", "thinking": ""}, 0),
+])
+def test_custom_redactions_count_only_present_message_fields(conn, message, expected_count):
+    session = {"session_id": "custom-count-test", "messages": [message]}
+    redacted, count, _ = apply_share_redactions(conn, session, custom_strings=["orchid sample"])
+    assert "orchid sample" not in json.dumps(redacted)
+    assert count == expected_count
+
+
 class TestReleaseGate:
     def test_default_auto_redacted_is_shareable(self, conn):
         upsert_sessions(conn, [_settled_session("a"), _settled_session("b")])

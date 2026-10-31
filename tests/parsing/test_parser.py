@@ -524,6 +524,28 @@ class TestProcessEntry:
         assert stats["user_messages"] == 1
         assert meta["git_branch"] == "main"
 
+    def test_attachment_only_user_message_keeps_local_source_and_position(self, mock_anonymizer):
+        from clawjournal.attachments import inventory, prepare
+        block = {"type": "document", "_filename": "results.txt", "source": {
+            "type": "text", "data": "loss=0.125; lambda=1"}}
+        msgs, _, stats = self._run({"type": "user", "message": {"content": [block]}}, mock_anonymizer)
+        assert len(msgs) == 1 and stats["user_messages"] == 1
+        row = {"messages": msgs}
+        choices = inventory(row)
+        assert choices[0]["name"] == "results.txt"
+        assert choices[0]["message_index"] == 0
+        assert "loss=0.125" not in json.dumps(prepare(row))
+        assert "loss=0.125" in json.dumps(prepare(row, [choices[0]["id"]]))
+
+    def test_assistant_attachment_is_retained_without_implicit_selection(self, mock_anonymizer):
+        from clawjournal.attachments import inventory, prepare
+        msgs, _, stats = self._run({"type": "assistant", "message": {"content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+        ]}}, mock_anonymizer)
+        assert len(msgs) == 1 and stats["assistant_messages"] == 1
+        assert inventory({"messages": msgs})[0]["availability"] == "original_file"
+        assert "QUJD" not in json.dumps(prepare({"messages": msgs}))
+
     def test_assistant_entry(self, mock_anonymizer, sample_assistant_entry):
         msgs, meta, stats = self._run(sample_assistant_entry, mock_anonymizer)
         assert len(msgs) == 1
@@ -4478,6 +4500,58 @@ class TestCodexResponseItemMessages:
             include_thinking=True,
             target_cwd="/repo",
         )
+
+    def test_attachment_only_message_survives_import_as_unselected(self, tmp_path, mock_anonymizer):
+        from clawjournal.attachments import inventory, prepare
+        session_file = self._write_rollout(tmp_path, [self._ri_message("user", [
+            {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+        ])])
+        result = self._parse(session_file, mock_anonymizer)
+        assert result is not None and len(result["messages"]) == 1
+        choices = inventory(result)
+        assert len(choices) == 1 and choices[0]["availability"] == "original_file"
+        assert choices[0]["message_index"] == 0
+        assert "QUJD" not in json.dumps(prepare(result))
+        assert '"unavailable"' in json.dumps(prepare(result))
+
+    def test_duplicate_formats_merge_attachment_metadata_without_losing_message(self, tmp_path, mock_anonymizer):
+        from clawjournal.attachments import inventory
+        session_file = self._write_rollout(tmp_path, [
+            self._em("user_message", message="Inspect the plot", local_images=["plot.png"]),
+            self._ri_message("user", [
+                {"type": "input_text", "text": "Inspect the plot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+            ]),
+        ])
+        result = self._parse(session_file, mock_anonymizer)
+        assert len(result["messages"]) == 1
+        # The export gives no shared ID proving these are the same attachment.
+        assert len(inventory(result)) == 2
+        assert {a["availability"] for a in inventory(result)} == {"original_file", "reference_only"}
+
+    def test_confirmed_replacement_does_not_keep_old_attachments(self, tmp_path, mock_anonymizer):
+        from clawjournal.attachments import inventory
+        session_file = self._write_rollout(tmp_path, [
+            self._em("user_message", message="Inspect the old plot", local_images=["old.png"]),
+            self._em("turn_aborted", reason="replaced", timestamp="2026-08-25T10:00:02.000Z"),
+            self._em("user_message", message="Use this text instead", timestamp="2026-08-25T10:00:03.000Z"),
+        ])
+        result = self._parse(session_file, mock_anonymizer)
+        assert len(result["messages"]) == 1
+        assert result["messages"][0]["content"] == "Use this text instead"
+        assert inventory(result) == []
+
+    def test_input_file_only_message_can_be_selected_after_import(self, tmp_path, mock_anonymizer):
+        from clawjournal.attachments import inventory, prepare
+        session_file = self._write_rollout(tmp_path, [self._ri_message("user", [
+            {"type": "input_file", "filename": "results.txt", "file_data": "data:text/plain;base64,bGFtYmRhPTE="},
+        ])])
+        result = self._parse(session_file, mock_anonymizer)
+        choices = inventory(result)
+        assert len(choices) == 1 and choices[0]["availability"] == "original_file"
+        assert choices[0]["original_text"] == "lambda=1"
+        assert "lambda=1" not in json.dumps(prepare(result))
+        assert "lambda=1" in json.dumps(prepare(result, [choices[0]["id"]]))
 
     def test_new_format_messages_discovered(self, tmp_path, mock_anonymizer):
         """A rollout with only response_item message records parses."""

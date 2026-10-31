@@ -25,6 +25,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    "Pillow>=13.0.0,<14; python_version >= '3.11'",
     "pyyaml>=6.0",
     "prompt_toolkit>=3.0",
 ]
@@ -54,6 +55,7 @@ exclude = ["clawjournal.web*"]
 
 [project.optional-dependencies]
 dev = ["pytest", "tomli; python_version < '3.11'"]
+visual-attachments = ["pypdfium2>=5.14.0,<6; python_version >= '3.11'"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

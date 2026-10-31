@@ -1,4 +1,4 @@
-import type { ToolUse } from '../../types.ts';
+import type { ToolUse, AttachmentChoice, AttachmentRecord } from '../../types.ts';
 
 export type StepKey = 'queue' | 'redact' | 'review' | 'package' | 'submit' | 'done';
 
@@ -137,6 +137,7 @@ export interface RedactedReviewMessage {
   thinking?: string;
   tool_uses?: ToolUse[];
   timestamp?: string;
+  extra?: { attachment_review?: { schema_version: string; items: AttachmentRecord[] } };
 }
 
 export interface AiPiiFindingLocal {
@@ -158,6 +159,9 @@ export interface RedactedSessionData {
   aiCoverage?: 'full' | 'rules_only' | 'disabled';
   buckets?: BucketCounts;
   trufflehogHits?: number;
+  attachments?: AttachmentChoice[];
+  selectedAttachmentIds?: string[];
+  visualReviewIds?: Record<string, string>;
 }
 
 export const CONFIDENCE_THRESHOLD = 0.85;

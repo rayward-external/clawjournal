@@ -41,7 +41,7 @@ def sealed_jsonl_payload(artifact_path: str | None, artifact_sha256: str | None)
 
 
 def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: str | None):
-    """Copy receipt-verified JSONL locally; never reconstruct or authorize upload.
+    """Copy receipt-verified JSONL and approved pages locally; never authorize upload.
 
     Completed snapshots deliberately lose their raw payload. The receipt's
     bundle_hash pins the exported JSONL independently of later scoring or trace
@@ -74,6 +74,7 @@ def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: s
         if isinstance(manifest.get('export_path'), str):
             sources.append(Path(manifest['export_path']) / 'sessions.jsonl')
         payload = None
+        asset_source = None
         for source in sources:
             try:
                 with source.open('rb') as handle:
@@ -82,13 +83,24 @@ def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: s
                 continue
             if len(candidate) <= MAX_SNAPSHOT_BYTES and hashlib.sha256(candidate).hexdigest() == expected:
                 payload = candidate
+                asset_source = source.parent
                 break
         if payload is None and sealed_payload is not None and hashlib.sha256(sealed_payload).hexdigest() == expected:
             payload = sealed_payload
         if payload is None:
             raise ValueError('missing or changed archived JSONL')
+        from ..visual_assets import validate_bundle
+        from .visual_share import verified_bundle_assets, write_bundle_assets
+        sessions = [json.loads(line) for line in payload.splitlines() if line.strip()]
+        assets = {}
+        if manifest.get('visual_attachments') is not None:
+            if asset_source is None:
+                raise ValueError('missing archived visual pages')
+            assets = verified_bundle_assets(asset_source)
+        validate_bundle(manifest, sessions, assets)
         manifest = {**manifest, 'export_path': str(directory), 'local_copy_only': True}
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_bundle_assets(directory, manifest, sessions, assets)
         # Validate the entire input before writing either destination file.
         for name, data in [('sessions.jsonl', payload),
                            ('manifest.json', json.dumps(manifest, ensure_ascii=True, indent=2).encode())]:
@@ -179,6 +191,8 @@ def install_cleanup_trigger(conn: sqlite3.Connection) -> None:
 
 
 def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
+                         attachment_ids: list[str] | None = None,
+                         visual_attachments: dict | None = None,
                          keep_snapshot_ids: set[str] | None = None) -> str:
     """Persist a successful preview within a bounded local cache."""
     from .index import _latest_successful_revision, _now_iso, compute_content_revision
@@ -186,7 +200,11 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
     revision = compute_content_revision(detail)
     if revision != detail.get("content_revision"):
         raise ReviewSnapshotError("The trace changed while loading. Refresh its preview.")
-    detail = {**detail, "_review_predecessor": _latest_successful_revision(conn, detail["session_id"])}
+    from ..attachments import prepare
+    prepare(detail, attachment_ids, visual_attachments=visual_attachments)
+    detail = {**detail, "_review_attachment_ids": attachment_ids or [],
+              "_review_visual_attachments": visual_attachments or {},
+              "_review_predecessor": _latest_successful_revision(conn, detail["session_id"])}
     payload = json.dumps(detail, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     snapshot_id = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     size = len(payload.encode('utf-8'))
