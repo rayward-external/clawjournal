@@ -41,7 +41,8 @@ export function OriginalConversations({ shareId, offer, disabled, onChange, onPe
     catch (e) { setError(e instanceof Error ? e.message : 'Could not download originals'); }
   }
 
-  return <fieldset style={{ border: '1px solid #ddd', borderRadius: 8, padding: 12 }}>
+  // Same text size as the consent CheckboxRows that follow it.
+  return <fieldset style={{ border: '1px solid #ddd', borderRadius: 8, padding: 12, fontSize: 12.5, lineHeight: 1.4 }}>
     <legend>Optional: help improve redaction</legend>
     <label><input type="checkbox" checked={selected} disabled={disabled || !supported || !shareId}
       onChange={e => void choose(e.target.checked)} /> Include my original conversation to help improve redaction.</label>
