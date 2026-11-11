@@ -65,6 +65,10 @@ quoted value longer than the budget is still a candidate and still stops the
 share. A quoted mailbox written with escaped quotes, such as
 `\"jane roe\"@example.com` inside a JSON string, is replaced together with
 its backslashes.
+Columns joined to an address by `|` without spaces, as in `git log --format`
+output, are replaced with it while the whole run fits the local-part budget.
+Beyond the budget only the last column is the email candidate. If that column
+is empty or still too long, the share stops as before.
 Email, Telegram-token and internal-domain regex searches use complete-candidate
 adapters. Required markers locate possible matches; the unchanged regexes
 validate them against the original field. They do not repeatedly retry each

@@ -987,3 +987,41 @@ else:
     raise AssertionError("An oversized quoted value was allowed")
 '''
     subprocess.run([sys.executable, "-c", code], check=True, timeout=15, capture_output=True, text=True)
+
+
+_COLUMN_NAME = "octo-contributor-bot"
+_COLUMN_ADDRESS = "12345678+" + _COLUMN_NAME + "@users.noreply.github.com"
+
+
+@pytest.mark.parametrize("before,address,after", [
+    ("   1 " + _COLUMN_NAME + "|" + _COLUMN_NAME + "|", _COLUMN_ADDRESS, "  \n  37 other|other|"),
+    ("a" * 70 + "|", "alice@audit.test", " done"),
+    ("é" * 20 + "|" + "é" * 20 + "|", "dave@audit.test", ""),
+    ("| " + "a" * 30 + " | ", "b" * 40 + "|carol@audit.test", " |"),
+], ids=["git-log-columns", "one-long-column", "utf8-columns", "columns-within-budget"])
+def test_pipe_separated_columns_are_not_part_of_an_oversized_local_part(render_builtin, before, address, after):
+    # git log --format="%an|%cn|%ae" piped through uniq -c: | is RFC atext,
+    # so the walk-back joined the name columns to a 29-byte local part and the
+    # 69-byte result refused the trace. Beyond the budget the candidate is
+    # the last column; within it the complete run is replaced, as before.
+    text = before + address + after
+    matches = pii._dedupe_overlapping_pii([m for m in pii.scan_text_for_pii(text) if m["type"] == "email"])
+    assert [(m["match"], m["start"]) for m in matches] == [(address, len(before))]
+    assert render_builtin(text) == before + "[REDACTED_EMAIL]" + after
+    secrets.redact_text(text, strict=True)
+
+
+@pytest.mark.parametrize("text", [
+    "x|" + "a" * 65 + "@audit.test",
+    "a" * 70 + "|@audit.test",
+    "<" + "a" * 40 + "|" + "b" * 40 + "@audit.test>",
+    "a" * 40 + "/" + "b" * 40 + "@audit.test",
+    "a" * 70 + "|alice@" + "b" * 64 + ".test",
+], ids=["last-column-65", "empty-last-column", "angle-delimited", "no-pipe", "domain-label-64"])
+def test_oversized_candidates_with_or_without_columns_are_still_deferred(render_builtin, text):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    with pytest.raises(RedactionBoundaryError):
+        render_builtin(text)
+    with pytest.raises(RedactionBoundaryError):
+        secrets.redact_text(text, strict=True)

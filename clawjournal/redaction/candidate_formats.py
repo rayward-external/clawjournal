@@ -279,6 +279,15 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                 if ('/' in path_prefix and ((long_prefix and path_prefix.count('/') >= 2)
                         or (assignment and start > at - len(prefix)) or path_prefix.startswith(('.', '~')))):
                     start += path_prefix.rfind('/') + 1
+            # RFC atext also includes |, the column separator of tables and
+            # of git log --format output. A prefix beyond the 64-octet budget
+            # cannot be one local part, so the address is its last column.
+            # An empty last column keeps the complete oversized candidate.
+            columns = text[start:at]
+            if '|' in columns and len(columns.encode('utf-8', errors='surrogatepass')) > 64:
+                last_column = columns.rfind('|') + 1
+                if last_column < len(columns):
+                    start += last_column
         if start == at:
             continue
         domain = _DOMAIN.match(text, at + 1)
