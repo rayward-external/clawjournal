@@ -170,30 +170,108 @@ def _is_unbroken_quoted_value(text: str, opening: int, at: int) -> bool:
     return pos - 1 == opening
 
 
-_ESCAPED_LINE_BREAK = re.compile(r"(\\+)[nr]")
+_ESCAPED_CHARACTER = re.compile(r"(\\+)([^\\]?)")
+_SHELL_WORD = re.compile(r'''(?:\\[^\r\n]|[^\s\\'"`$;&|()<>])+''')
 
 
-def _spans_escaped_line_break(text: str, opening: int, at: int) -> bool:
-    """Whether an escaped closing quote is on a later line than ``opening``.
+def _is_shell_argument_quote(text: str, quote: int, width: int) -> bool:
+    start = quote - width + 1
+    if start and text[start - 1] not in " \t\r\n;|&()<>=":
+        return False
+    while start and text[start - 1] in " \t":
+        start -= 1
+    if start and text[start - 1] in "[{,":
+        return False
+    if start and text[start - 1] == ":":
+        start -= 1
+        while start and text[start - 1] in " \t":
+            start -= 1
+        if start and text[start - 1] == '"':
+            return False  # A JSON field value, not a shell argument.
+    return True
 
-    Inside a JSON or shell string a line break is written \\n or \\r. For a
-    closing quote of escape width w it is a line break when its backslash
-    count is not a multiple of w; a multiple of w is that many literal
-    backslashes and a letter, as in a path. An unescaped closing quote has
-    width 1: at its level those two characters are ordinary text.
-    """
+
+def _quote_escape_width(text: str, at: int) -> int:
     closing = at - 1
     slashes = 0
     while closing > slashes and text[closing - slashes - 1] == "\\":
         slashes += 1
-    width = (slashes + 1) & -(slashes + 1)
+    return (slashes + 1) & -(slashes + 1)
+
+
+def _spans_escaped_line_break(
+    text: str, opening: int, at: int, *, width: int | None = None,
+) -> bool:
+    """Whether a JSON escape layer contains a represented line break.
+
+    A multiple of the quote width is literal backslashes and a letter.
+    Shell escaping has different semantics; a complete shell mailbox word
+    is checked separately before discarding its candidate.
+    """
+    if width is None:
+        width = _quote_escape_width(text, at)
+    # Consume each full backslash run, even without n/r afterwards. A failed
+    # search from every suffix of a long run would be quadratic.
     return width > 1 and any(
-        len(match.group(1)) % width for match in _ESCAPED_LINE_BREAK.finditer(text, opening, at)
+        match.group(2) in {"n", "r"} and len(match.group(1)) % width
+        for match in _ESCAPED_CHARACTER.finditer(text, opening, at)
     )
 
 
+def _shell_quoted_local(
+    text: str, start: int, at: int, width: int, local: str,
+    enclosing: tuple[int, int] | None,
+) -> str | None:
+    """Recognize a complete shell mailbox argument without executing it.
+
+    ``local`` has only the outer JSON layers removed. In an unquoted shell
+    word, backslash-n/r means a literal letter; inside double quotes it is
+    a literal backslash and letter. Neither is a newline. Require complete
+    word boundaries or a complete enclosing quoted mailbox, so unrelated
+    strings in serialized source do not gain this exception.
+    """
+    domain = _DOMAIN.match(text, at + 1)
+    domain_end = domain.end() if domain else at + 1
+    cursor = at + 1
+    while cursor < len(text) and (
+        text[cursor] in ".-" or unicodedata.category(text[cursor])[0] in "LMN"
+    ):
+        cursor += 1
+    domain_end = max(domain_end, cursor)
+    if domain_end == at + 1:
+        return None
+    outer_quote = "\\" * (width // 2 - 1) + '"'
+    if (start and text[start - 1] == '"'
+            and _quote_escape_width(text, start) == width // 2
+            and text.startswith(outer_quote, domain_end)):
+        return re.sub(r'\\([$`"\\])', r'\1', local)
+    separators = " \t\r\n;|&()<>"
+    if enclosing is not None:
+        _outer_start, outer_end = enclosing
+        if outer_end >= domain_end:
+            # A quoted shell argument can contain prose around its mailbox.
+            # A JSON field's opening quote is not shell-argument evidence.
+            return re.sub(r'\\([$`"\\])', r'\1', local)
+    # A serialized command can end at an enclosing JSON quote, whose
+    # escaping level is lower than the mailbox's shell quote level.
+    closing = domain_end
+    while closing < len(text) and text[closing] == "\\":
+        closing += 1
+    json_end = (closing < len(text) and text[closing] == '"'
+                and _quote_escape_width(text, closing + 1) <= width // 2)
+    json_start = (start > 0 and text[start - 1] == '"'
+                  and _quote_escape_width(text, start) < width // 2)
+    if ((start == 0 or text[start - 1] in separators + "=" or json_start)
+            and (domain_end == len(text) or text[domain_end] in separators + "'"
+                 or json_end)
+            and _SHELL_WORD.fullmatch(local)):
+        return re.sub(r"\\(.)", r"\1", local)
+    return None
+
+
 def _escaped_quoted_local_start(
-    text: str, at: int, pair: tuple[int, int] | None,
+    text: str, at: int, pair: tuple[int, int, int | None] | None,
+    quote_ends: dict[int, int], shell_quotes: set[int],
 ) -> int | None:
     """Find the start of a quoted local part written with escaped quotes.
 
@@ -205,11 +283,21 @@ def _escaped_quoted_local_start(
     """
     if pair is None:
         return None
-    start, width = pair
+    start, width, parent = pair
+    shell_escape = _spans_escaped_line_break(text, start, at, width=width)
+    if shell_escape and _spans_escaped_line_break(text, start, at, width=width // 2):
+        return None  # An actual line break in an outer JSON layer.
     local = text[start:at]
-    while width > 1:
+    original_width = width
+    while width > (2 if shell_escape else 1):
         local = re.sub(r'\\([\\"])', r'\1', local)
         width //= 2
+    if shell_escape:
+        enclosing = ((parent, quote_ends[parent])
+                     if parent in shell_quotes and parent in quote_ends else None)
+        local = _shell_quoted_local(text, start, at, original_width, local, enclosing)
+        if local is None:
+            return None
     if (_fits_quoted_local(local, 0, len(local))
             or _is_unbroken_quoted_value(local, 0, len(local))):
         return start
@@ -220,7 +308,9 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
     end_of_match = 0
     cursor = 0
     quote_positions: list[int] | None = None
-    escaped_pairs: dict[int, tuple[int, int]] = {}
+    escaped_pairs: dict[int, tuple[int, int, int | None]] = {}
+    quote_ends: dict[int, int] = {}
+    shell_quotes: set[int] = set()
     while (at := text.find("@", cursor)) != -1:
         cursor = at + 1
         start = at
@@ -235,22 +325,16 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                 for pos, char in enumerate(text):
                     if char in "\r\n":
                         quote_stack.clear()
-                    elif slashes and char in "nr":
-                        # A line break written as an escape: s backslashes
-                        # and n or r. It ends the line for every quote
-                        # wider than the lowest set bit of s: \n for \"
-                        # and \\\", \\n for \\\" but not for \". At a
-                        # width that divides s the backslashes are
-                        # literal, as in a path. Widths increase toward
-                        # the top of the stack, so pop from there.
-                        while quote_stack and quote_stack[-1][1] > (slashes & -slashes):
-                            quote_stack.pop()
+                    # Keep represented line breaks until validating the pair:
+                    # an innermost shell escape may be a literal n/r instead.
                     if char == '"':
                         # After d JSON-style escape layers, a delimiter has
                         # 2**d - 1 backslashes, plus multiples of 2**(d+1)
                         # for literal backslashes in the mailbox. Thus the
                         # lowest set bit of slashes + 1 identifies its level.
                         width = (slashes + 1) & -(slashes + 1)
+                        if _is_shell_argument_quote(text, pos, width):
+                            shell_quotes.add(pos)
                         if width == 1:
                             quote_positions.append(pos)
                         # Skip quotes belonging to inner escaped content,
@@ -260,8 +344,11 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                             quote_stack.pop()
                         if quote_stack and quote_stack[-1][1] == width:
                             opening, _ = quote_stack.pop()
+                            quote_ends[opening] = pos
                             if width > 1:
-                                escaped_pairs[pos] = (opening - width + 1, width)
+                                parent = (quote_stack[-1][0] if quote_stack
+                                          and quote_stack[-1][1] == width // 2 else None)
+                                escaped_pairs[pos] = (opening - width + 1, width, parent)
                         quote_stack.append((pos, width))
                     slashes = slashes + 1 if char == "\\" else 0
             before_closing = bisect.bisect_left(quote_positions, at - 1) - 1
@@ -271,7 +358,9 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                  and not _spans_escaped_line_break(text, opening, at))
                 or _is_unbroken_quoted_value(text, opening, at)
             ):
-                opening = _escaped_quoted_local_start(text, at, escaped_pairs.get(at - 1))
+                opening = _escaped_quoted_local_start(
+                    text, at, escaped_pairs.get(at - 1), quote_ends, shell_quotes,
+                )
             if opening is not None and opening >= end_of_match:
                 start, quoted = opening, True
         if not quoted:

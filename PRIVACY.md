@@ -69,7 +69,10 @@ backslash. Pairing checks the quoted part after removing the enclosing
 layers of quote/backslash escaping. A line break written as an escape at
 that level, such as `\n` between two `\"` quotes in a JSON string, counts
 as a line break: quotes on different lines of escaped source are not a
-mailbox. The replacement budget still checks
+mailbox. Complete shell mailbox arguments and values remain candidates:
+shell backslash-n/r can mean literal letters or backslashes rather than a
+line break, including inside a quoted argument or serialized command.
+The replacement budget still checks
 the complete original span: if escaping expands that span beyond the
 budget, the share stops instead of allowing the address through unchanged.
 Columns joined to an address by `|` without spaces, as in `git log --format`

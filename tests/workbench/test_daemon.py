@@ -8872,3 +8872,32 @@ def test_quote_before_decorator_or_file_mention_previews(server, monkeypatch, en
     assert 'jane roe' not in json.dumps(body)
     if endpoint == 'redaction-report':
         assert body['review_snapshot_id'] and body['reviewed_revision']
+
+
+@pytest.mark.parametrize('endpoint,ai_pii', [
+    ('redacted', False), ('redaction-report', False), ('redaction-report', True),
+], ids=['redacted', 'report-ai-off', 'report-ai-on'])
+@pytest.mark.parametrize('serialized', [False, True], ids=['shell', 'json-shell'])
+def test_shell_mailbox_is_redacted_before_preview_and_ai_review(server, monkeypatch, endpoint, ai_pii, serialized):
+    address = r'\"john\roe\"@audit.test'
+    original = "printf '%s\\n' " + address
+    expected = original.replace(address, '[REDACTED_EMAIL]')
+    if serialized:
+        original, expected = json.dumps({'command': original}), json.dumps({'command': expected})
+    reviewer = MagicMock(return_value=[])
+    monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent', reviewer)
+    with open_index() as conn:
+        upsert_sessions(conn, [{
+            'session_id': 'shell-quoted-mailbox', 'source': 'claude', 'project': 'synthetic',
+            'messages': [{'role': 'user', 'content': original, 'tool_uses': []}],
+        }])
+    status, body = _get(server, f'/api/sessions/shell-quoted-mailbox/{endpoint}?ai_pii={int(ai_pii)}')
+    assert status == 200, body
+    result = body['redacted_session'] if endpoint == 'redaction-report' else body
+    assert result['messages'][0]['content'] == expected
+    assert 'john' not in json.dumps(body)
+    if ai_pii:
+        reviewer.assert_called_once()
+        assert reviewer.call_args.args[0]['messages'][0]['content'] == expected
+    else:
+        reviewer.assert_not_called()

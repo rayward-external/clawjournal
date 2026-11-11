@@ -982,6 +982,80 @@ def test_distant_escaped_quotes_before_decorator_still_do_not_form_a_mailbox(ren
     assert render_builtin(text) == text
 
 
+@pytest.mark.parametrize("levels", [0, 1, 2], ids=["raw-command", "json-command", "nested-json-command"])
+@pytest.mark.parametrize("address,mailbox", [
+    (r'\"john\name\"@audit.test', '"johnname"@audit.test'),
+    (r'\"john\roe\"@audit.test', '"johnroe"@audit.test'),
+    (r'\"john\ name\roe\"@audit.test', '"john nameroe"@audit.test'),
+], ids=["shell-backslash-n", "shell-backslash-r", "shell-space-and-backslash-r"])
+@pytest.mark.parametrize("before", [
+    "printf %s ",
+    "RECIPIENT=",
+    "curl --mail-rcpt=",
+    'printf "%s" ready\nprintf %s ',
+    'printf "%s" ready\n' + "echo ordinary; " * 8 + "printf %s ",
+], ids=["no-earlier-quote", "assignment", "option-value", "near-earlier-quote", "far-earlier-quote"])
+def test_shell_escaped_quoted_mailboxes_are_redacted_in_serialized_commands(
+    render_builtin, address, mailbox, before, levels,
+):
+    # Unquoted shell backslash-n/r spell literal n/r, not line breaks.
+    # Backslash-space likewise keeps a space inside the same argument.
+    # Tool-input serialization adds JSON escaping without changing those
+    # shell semantics or making any part of the mailbox safe to share.
+    import shlex
+
+    assert shlex.split("printf %s " + address) == ["printf", "%s", mailbox]
+    after = " && echo done"
+
+    def serialize(command):
+        if not levels:
+            return command
+        encoded = json.dumps({"command": command}, ensure_ascii=False)
+        for _ in range(levels - 1):
+            encoded = json.dumps(encoded, ensure_ascii=False)
+        return encoded
+
+    text = serialize(before + address + after)
+    expected = serialize(before + "[REDACTED_EMAIL]" + after)
+    assert render_builtin(text) == expected
+
+
+@pytest.mark.parametrize("levels", [0, 1, 2], ids=["raw", "json", "nested-json"])
+@pytest.mark.parametrize("local", [r"john doe\roe", r"john (doe)\name"])
+@pytest.mark.parametrize("prefix,suffix", [("", ""), ("send to ", " today")])
+def test_shell_double_quoted_mailbox_keeps_its_enclosing_quotes(render_builtin, local, levels, prefix, suffix):
+    import shlex
+
+    address = r'\"' + local + r'\"@audit.test'
+    command = 'printf %s "' + prefix + address + suffix + '"'
+    assert shlex.split(command)[-1] == prefix + '"' + local + '"@audit.test' + suffix
+    expected = command.replace(address, "[REDACTED_EMAIL]")
+    for _ in range(levels):
+        command, expected = json.dumps(command), json.dumps(expected)
+    assert render_builtin(command) == expected
+
+
+@pytest.mark.parametrize("levels", [0, 1, 2], ids=["raw", "json", "nested-json"])
+def test_oversized_shell_escaped_mailbox_still_fails_closed(render_builtin, levels):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    text = 'printf %s ' + r'\"' + "a" * 60 + r'\r\"@audit.test'
+    for _ in range(levels):
+        text = json.dumps(text)
+    with pytest.raises(RedactionBoundaryError):
+        render_builtin(text)
+
+
+@pytest.mark.parametrize("levels", [1, 2, 3], ids=["json", "nested-json", "triple-json"])
+@pytest.mark.parametrize("container", ["object", "array"])
+def test_json_container_quotes_are_not_shell_argument_evidence(render_builtin, levels, container):
+    source = 'print("one")\n' + " " * 20 + 'source = f"@pytest.fixture"'
+    text = json.dumps({'output': source} if container == "object" else ["earlier", source])
+    for _ in range(levels - 1):
+        text = json.dumps(text)
+    assert render_builtin(text) == text
+
+
 # Follow-up to the quote-pairing fix: JSON-escaped source keeps its line
 # breaks as \n. The closing \" of one string and the opening \" of
 # "@pytest.fixture" on the next source line were still paired, because only
@@ -1073,7 +1147,7 @@ def test_backslash_n_that_is_not_a_line_break_at_the_quote_level_changes_nothing
     assert render_builtin(text) == expected
 
 
-def test_escaped_quote_pairs_never_span_an_escaped_line_break():
+def test_escaped_quote_pairs_never_span_an_outer_json_line_break():
     from clawjournal.redaction.candidate_formats import iter_format_candidates
 
     rng = random.Random(252)
@@ -1093,7 +1167,10 @@ def test_escaped_quote_pairs_never_span_an_escaped_line_break():
                 continue
             checked += 1
             assert "\n" not in local and "\r" not in local, (text, local)
-            assert not any(len(m.group(1)) % width for m in escaped_break.finditer(local)), (text, local)
+            # The innermost escape may belong to a complete shell mailbox
+            # word, where backslash-n/r is literal. Actual breaks in outer
+            # JSON layers still disqualify the pair.
+            assert not any(len(m.group(1)) % (width // 2) for m in escaped_break.finditer(local)), (text, local)
     assert checked > 250
 
 
