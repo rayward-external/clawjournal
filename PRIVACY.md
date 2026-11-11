@@ -64,7 +64,11 @@ candidate, so it stays as written and does not stop a share. One unbroken
 quoted value longer than the budget is still a candidate and still stops the
 share. A quoted mailbox written with escaped quotes, such as
 `\"jane roe\"@example.com` inside a JSON string, is replaced together with
-its backslashes.
+its escape backslashes, including when the mailbox ends in a literal
+backslash. Pairing checks the quoted part after removing the enclosing
+layers of quote/backslash escaping. The replacement budget still checks
+the complete original span: if escaping expands that span beyond the
+budget, the share stops instead of allowing the address through unchanged.
 Columns joined to an address by `|` without spaces, as in `git log --format`
 output, are replaced with it while the whole run fits the local-part budget.
 Beyond the budget only the last column is the email candidate. If that column

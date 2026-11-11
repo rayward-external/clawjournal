@@ -170,36 +170,27 @@ def _is_unbroken_quoted_value(text: str, opening: int, at: int) -> bool:
     return pos - 1 == opening
 
 
-def _escaped_quoted_local_start(text: str, at: int) -> int | None:
+def _escaped_quoted_local_start(
+    text: str, at: int, pair: tuple[int, int] | None,
+) -> int | None:
     """Find the start of a quoted local part written with escaped quotes.
 
-    Inside a JSON or shell string the mailbox reads \\"john doe\\"@host. Its
-    opening quote has as many backslashes as the closing one. A quote with
-    more is a character of the local part; one with fewer ends the enclosing
-    string. The span starts at the opening backslashes, so replacing it
-    leaves no stray escape. The scan stays inside the 64-octet window.
+    Pairing uses the quote's encoding level, not its raw backslash count:
+    a mailbox ending in an escaped backslash adds content before its closing
+    quote. Decode only the enclosing layers of backslash/quote escaping to
+    check the mailbox's size. Return original offsets, including the quote's
+    escape backslashes, so an oversized representation still fails preflight.
     """
-    closing = at - 1
-    depth = 0
-    while depth < _QUOTED_LOCAL_BUDGET and closing > depth and text[closing - depth - 1] == "\\":
-        depth += 1
-    if depth % 2 == 0:
-        return None  # An unescaped closing quote pairs with an unescaped one.
-    pos = closing - depth - 1
-    lowest = max(0, at - _QUOTED_LOCAL_BUDGET)
-    while pos >= lowest:
-        if text[pos] in "\r\n":
-            return None
-        if text[pos] == '"':
-            slashes = 0
-            while slashes <= depth and pos > slashes and text[pos - slashes - 1] == "\\":
-                slashes += 1
-            if slashes == depth:
-                start = pos - depth
-                return start if _fits_quoted_local(text, start, at) else None
-            if slashes < depth:
-                return None
-        pos -= 1
+    if pair is None:
+        return None
+    start, width = pair
+    local = text[start:at]
+    while width > 1:
+        local = re.sub(r'\\([\\"])', r'\1', local)
+        width //= 2
+    if (_fits_quoted_local(local, 0, len(local))
+            or _is_unbroken_quoted_value(local, 0, len(local))):
+        return start
     return None
 
 
@@ -207,6 +198,7 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
     end_of_match = 0
     cursor = 0
     quote_positions: list[int] | None = None
+    escaped_pairs: dict[int, tuple[int, int]] = {}
     while (at := text.find("@", cursor)) != -1:
         cursor = at + 1
         start = at
@@ -217,15 +209,34 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
             if quote_positions is None:
                 quote_positions = []
                 slashes = 0
+                quote_stack: list[tuple[int, int]] = []
                 for pos, char in enumerate(text):
-                    if char == '"' and slashes % 2 == 0:
-                        quote_positions.append(pos)
+                    if char in "\r\n":
+                        quote_stack.clear()
+                    if char == '"':
+                        # After d JSON-style escape layers, a delimiter has
+                        # 2**d - 1 backslashes, plus multiples of 2**(d+1)
+                        # for literal backslashes in the mailbox. Thus the
+                        # lowest set bit of slashes + 1 identifies its level.
+                        width = (slashes + 1) & -(slashes + 1)
+                        if width == 1:
+                            quote_positions.append(pos)
+                        # Skip quotes belonging to inner escaped content,
+                        # but never cross an enclosing-string delimiter.
+                        # Each quote is pushed/popped once, even on long logs.
+                        while quote_stack and quote_stack[-1][1] > width:
+                            quote_stack.pop()
+                        if quote_stack and quote_stack[-1][1] == width:
+                            opening, _ = quote_stack.pop()
+                            if width > 1:
+                                escaped_pairs[pos] = (opening - width + 1, width)
+                        quote_stack.append((pos, width))
                     slashes = slashes + 1 if char == "\\" else 0
             before_closing = bisect.bisect_left(quote_positions, at - 1) - 1
             opening = quote_positions[before_closing] if before_closing >= 0 else None
             if opening is None or not (_fits_quoted_local(text, opening, at)
                                        or _is_unbroken_quoted_value(text, opening, at)):
-                opening = _escaped_quoted_local_start(text, at)
+                opening = _escaped_quoted_local_start(text, at, escaped_pairs.get(at - 1))
             if opening is not None and opening >= end_of_match:
                 start, quoted = opening, True
         if not quoted:
