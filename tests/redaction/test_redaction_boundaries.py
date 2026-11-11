@@ -6,6 +6,7 @@ External detectors are isolated here, so these are not upload-gate tests.
 """
 import hashlib
 import itertools
+import json
 import random
 import re
 import sqlite3
@@ -847,3 +848,255 @@ def test_runs_without_a_valid_start_keep_the_original_behaviour(render_builtin, 
     # The rules still require a word boundary and a leading letter, exactly
     # as before; the bounded core applies only inside an oversized match.
     assert render_builtin(text) == text
+
+
+# A quote directly before an @ used to pair with the nearest earlier quote
+# anywhere in the field. In agent traces that joined unrelated text: the
+# opening quote of "@pytest.fixture" or of an @-file mention, and the last
+# quote of some earlier string. The candidates were 80 to 29,000 characters
+# long, so the replacement budget refused the whole trace.
+_UNRELATED_QUOTES = {
+    "call-argument": 'old = suite.read_text("utf-8")\n    start = old.index("@pytest.fixture\\ndef harness")',
+    "f-string": 'lines = ["def {fixture}(tmp_path_factory):",\n' + " " * 60 + 'f"@pytest.fixture(scope={scope!r})"]',
+    "escaped-quote": '{"command": "' + "python - <<EOF " * 6 + r'start = old.index(\"@pytest.fixture\\ndef harness\")"}',
+    "file-mention": 'The user said "attach the design".\n   - "@Design.pdf summarise this"',
+    "same-line-prose": 'See "notes" ' + "and then " * 12 + 'search for ("@pytest.fixture") again.',
+    "next-line": 'print("hello")\nmark = "@pytest.fixture"',
+    "carriage-return": 'print("hello")\rmark = "@pytest.fixture"',
+    "long-field": 'a = "x"\n' + "ordinary code line\n" * 2000 + 'b = old.index("@pytest.fixture")',
+}
+
+
+@pytest.mark.parametrize("text", list(_UNRELATED_QUOTES.values()), ids=list(_UNRELATED_QUOTES))
+def test_unrelated_quotes_around_an_at_sign_are_not_a_quoted_mailbox(render_builtin, text):
+    from clawjournal.redaction.boundaries import ensure_text_boundaries
+    from clawjournal.redaction.candidate_formats import iter_format_candidates
+
+    assert [c for c in iter_format_candidates(text) if c["type"] == "email"] == []
+    assert [m for m in pii.scan_text_for_pii(text) if m["type"] == "email"] == []
+    ensure_text_boundaries(text)
+    assert secrets.redact_text(text, strict=True)[0] == text
+    assert render_builtin(text) == text
+
+
+@pytest.mark.parametrize("address", [
+    '"john doe"@audit.test', r'"escaped.\".name"@audit.test', '"name@inside"@audit.test',
+    '"' + "a" * 62 + '"@audit.test', '"' + "é" * 31 + '"@audit.test', '""@audit.test',
+], ids=["spaces", "escaped-quote-inside", "at-inside", "local-64-octets", "utf8-64-octets", "empty"])
+@pytest.mark.parametrize("before,after", [
+    ("before<", ">after"),
+    ('He said "fine" ' + "and then " * 12 + "wrote to ", " today."),
+    ('title = "weekly notes"\ncc: ', "\nbody"),
+    ('f("@pytest.fixture")\n', "\n"),
+], ids=["angle", "far-earlier-quote", "earlier-line-quote", "after-decorator-string"])
+def test_quoted_mailboxes_are_still_replaced_in_full(render_builtin, address, before, after):
+    text = before + address + after
+    matches = [m for m in pii.scan_text_for_pii(text) if m["type"] == "email"]
+    assert [(m["match"], m["start"]) for m in matches] == [(address, len(before))]
+    assert render_builtin(text) == before + "[REDACTED_EMAIL]" + after
+
+
+@pytest.mark.parametrize("address", [
+    r'\"john doe\"@audit.test', r'\\\"john doe\\\"@audit.test', r'\"a\\\"b\"@audit.test',
+], ids=["escaped-once", "escaped-twice", "escaped-quote-inside"])
+@pytest.mark.parametrize("before,after", [
+    ('{"note": "' + "ordinary words " * 8 + "cc ", '"}'),
+    ('note = "first line\ncc ', ' today"'),
+    ("cc ", " today"),
+], ids=["far-string-start", "string-start-on-earlier-line", "no-enclosing-string"])
+def test_escaped_quoted_mailbox_is_replaced_without_its_enclosing_string(render_builtin, address, before, after):
+    # The enclosing string may start anywhere. The mailbox is the span
+    # between two quotes escaped alike, and its backslashes go with it.
+    text = before + address + after
+    assert render_builtin(text) == before + "[REDACTED_EMAIL]" + after
+
+
+def _escape_json_string_content(value, levels):
+    for _ in range(levels):
+        value = json.dumps(value, ensure_ascii=False)[1:-1]
+    return value
+
+
+@pytest.mark.parametrize("levels", [1, 2, 3], ids=["json-once", "json-twice", "json-thrice"])
+@pytest.mark.parametrize("local", [
+    "a" * 62,
+    "é" * 31,
+    "john " + "a" * 57,
+    "a" * 59 + r'\"b',
+    "a" * 100,
+], ids=["ascii-64", "utf8-64", "spaces-64", "escaped-quote-64", "oversized-unbroken"])
+def test_escaped_quoted_mailbox_over_raw_budget_is_still_deferred(render_builtin, local, levels):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError, ensure_text_boundaries
+    from clawjournal.redaction.candidate_formats import iter_format_candidates
+
+    address = _escape_json_string_content('"' + local + '"@audit.test', levels)
+    before, after = '{"note": "' + "ordinary words " * 8 + "cc ", ' today"}'
+    text = before + address + after
+    assert len(address.rpartition("@")[0].encode()) > 64
+    # Serialization can make a valid local part exceed the raw replacement
+    # budget. Keep the complete candidate so that budget still fails closed.
+    matches = [c for c in iter_format_candidates(text) if c["type"] == "email"]
+    assert [(m["match"], m["start"]) for m in matches] == [(address, len(before))]
+    for redact in (ensure_text_boundaries, render_builtin, lambda s: secrets.redact_text(s, strict=True)):
+        with pytest.raises(RedactionBoundaryError):
+            redact(text)
+
+
+@pytest.mark.parametrize("levels", [1, 2, 3], ids=["json-once", "json-twice", "json-thrice"])
+@pytest.mark.parametrize("local", [
+    r"john\\", r"john\\\\", r'a\"b\\',
+], ids=["trailing-backslash", "two-trailing-backslashes", "escaped-quote-and-backslash"])
+def test_escaped_quoted_mailbox_with_trailing_backslash_is_replaced_in_full(render_builtin, local, levels):
+    address = _escape_json_string_content('"' + local + '"@audit.test', levels)
+    before, after = '{"note": "' + "ordinary words " * 8 + "cc ", ' today"}'
+    text = before + address + after
+    # The closing quote has extra backslashes from the local part itself;
+    # they do not change which serialized opening quote belongs to it.
+    matches = [m for m in pii.scan_text_for_pii(text) if m["type"] == "email"]
+    assert [(m["match"], m["start"]) for m in matches] == [(address, len(before))]
+    assert render_builtin(text) == before + "[REDACTED_EMAIL]" + after
+
+
+@pytest.mark.parametrize("levels", [1, 2], ids=["json-once", "json-twice"])
+def test_escaped_mailbox_preserves_backslashes_before_its_opening_quote(render_builtin, levels):
+    address = _escape_json_string_content('"john doe"@audit.test', levels)
+    prefix = _escape_json_string_content("cc " + "\\" * 2, levels)
+    before, after = '{"note": "' + "ordinary words " * 8 + prefix, ' today"}'
+    text = before + address + after
+    # Only the quote's escape backslashes belong to the mailbox. Literal
+    # backslashes immediately before it remain part of the surrounding text.
+    matches = [m for m in pii.scan_text_for_pii(text) if m["type"] == "email"]
+    assert [(m["match"], m["start"]) for m in matches] == [(address, len(before))]
+    assert render_builtin(text) == before + "[REDACTED_EMAIL]" + after
+
+
+@pytest.mark.parametrize("levels", [1, 2], ids=["json-once", "json-twice"])
+def test_distant_escaped_quotes_before_decorator_still_do_not_form_a_mailbox(render_builtin, levels):
+    from clawjournal.redaction.boundaries import ensure_text_boundaries
+    from clawjournal.redaction.candidate_formats import iter_format_candidates
+
+    command = 'grep "notes" ' + "ordinary words " * 8 + '"@pytest.fixture"'
+    text = '{"command": "' + _escape_json_string_content(command, levels) + '"}'
+    assert [c for c in iter_format_candidates(text) if c["type"] == "email"] == []
+    ensure_text_boundaries(text)
+    assert render_builtin(text) == text
+
+
+@pytest.mark.parametrize("text", [
+    '"' + "a" * 63 + '"@audit.test',
+    '"' + "é" * 32 + '"@audit.test',
+    'key = "' + "A1b2/C3d4+" * 20 + '"@audit.test',
+    'f("@pytest.fixture")\n' + "a" * 65 + "@audit.test",
+    'say "hi" then ' + "a" * 65 + "@audit.test",
+    '"john doe"@' + "b" * 64 + ".test",
+    r'cc \"john doe\"@' + "b" * 64 + ".test",
+], ids=["quoted-local-65", "quoted-utf8-66", "quoted-token", "unquoted-after-decorator-string",
+        "unquoted-after-quotes", "quoted-domain-label-64", "escaped-quoted-domain-label-64"])
+def test_oversized_values_next_to_quotes_are_still_deferred(render_builtin, text):
+    # Only a pair that encloses ordinary text stops being a candidate. One
+    # unbroken quoted value, an unquoted run and an oversized domain are still
+    # complete candidates, and none of them may be shared unchanged.
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    with pytest.raises(RedactionBoundaryError):
+        render_builtin(text)
+    with pytest.raises(RedactionBoundaryError):
+        secrets.redact_text(text, strict=True)
+
+
+@pytest.mark.parametrize("text,candidate,expected", [
+    ('a = "x"; b = "@pytest.fixture"', '"; b = "@pytest.fixture', 'a = "x"; b = "@pytest.fixture"'),
+    ('x " or "@audit.test y', '" or "@audit.test', "x [REDACTED_EMAIL] y"),
+    (r'{"cmd": "grep \"@pytest.fixture\" tests"}', r'"grep \"@pytest.fixture', r'{"cmd": [REDACTED_EMAIL]\" tests"}'),
+    (r'{"to": "\"john doe\"@audit.test"}', r'"\"john doe\"@audit.test', '{"to": [REDACTED_EMAIL]"}'),
+], ids=["two-strings", "spaced-pair", "escaped-quote-in-short-string", "escaped-mailbox-in-short-string"])
+def test_short_quote_pair_on_one_line_is_still_a_candidate(render_builtin, text, candidate, expected):
+    # Two unrelated quotes within 64 octets on one line are also a complete
+    # RFC quoted mailbox. The scanner cannot tell an opening quote from a
+    # closing one, so the candidate and the rendered result are unchanged.
+    assert [m["match"] for m in pii.scan_text_for_pii(text) if m["type"] == "email"] == [candidate]
+    assert render_builtin(text) == expected
+
+
+def test_quoted_candidates_stay_on_one_line_and_oversized_spans_fail_closed():
+    from clawjournal.redaction.boundaries import RedactionBoundaryError, ensure_safe_replacement
+    from clawjournal.redaction.candidate_formats import _LOCAL_CHARS, iter_format_candidates
+
+    rng = random.Random(250)
+    pieces = ['"', '"', '\\"', '\\\\\\"', "@", '"@', '\\"@', "audit.test", "pytest.fixture", " ", " ", "\n", "\r",
+              "ab", "word", "x" * 20, "a" * 70, "é", "中", "(", ")", "<", ">", "=", "/", ".", ",", "\\", "'"]
+    quoted = 0
+    for _ in range(8000):
+        text = "".join(rng.choices(pieces, k=rng.randint(1, 40)))
+        for candidate in iter_format_candidates(text):
+            match = candidate["match"]
+            if candidate["rule"] != "email_extended" or not match.lstrip("\\").startswith('"'):
+                continue
+            quoted += 1
+            local = match.rpartition("@")[0]
+            assert "\n" not in local and "\r" not in local, (text, match)
+            if len(local.encode("utf-8", errors="surrogatepass")) > 64:
+                with pytest.raises(RedactionBoundaryError):
+                    ensure_safe_replacement(match, candidate["rule"])
+                if local.startswith('"'):
+                    assert local.endswith('"'), (text, match)
+                    assert all(char in _LOCAL_CHARS or char.isalnum() for char in local[1:-1]), (text, match)
+    assert quoted > 300
+
+
+def test_quote_pairing_has_a_deadline():
+    code = r'''
+from clawjournal.redaction.boundaries import ensure_text_boundaries, RedactionBoundaryError
+for text in [
+    'a = "x"\n' + ("y" * 70 + ' = f("@pytest.fixture")\n') * 20_000,
+    '{"c": "' + r'word \"@pytest.fixture\" ' * 20_000 + '"}',
+    ("a" * 100 + '"@') * 20_000,
+    "\\" * 200_000 + '"@pytest.fixture ' * 30,
+]:
+    ensure_text_boundaries(text)
+try:
+    ensure_text_boundaries('"' + "a" * 200_000 + '"@audit.test')
+except RedactionBoundaryError:
+    pass
+else:
+    raise AssertionError("An oversized quoted value was allowed")
+'''
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=15, capture_output=True, text=True)
+
+
+_COLUMN_NAME = "octo-contributor-bot"
+_COLUMN_ADDRESS = "12345678+" + _COLUMN_NAME + "@users.noreply.github.com"
+
+
+@pytest.mark.parametrize("before,address,after", [
+    ("   1 " + _COLUMN_NAME + "|" + _COLUMN_NAME + "|", _COLUMN_ADDRESS, "  \n  37 other|other|"),
+    ("a" * 70 + "|", "alice@audit.test", " done"),
+    ("é" * 20 + "|" + "é" * 20 + "|", "dave@audit.test", ""),
+    ("| " + "a" * 30 + " | ", "b" * 40 + "|carol@audit.test", " |"),
+], ids=["git-log-columns", "one-long-column", "utf8-columns", "columns-within-budget"])
+def test_pipe_separated_columns_are_not_part_of_an_oversized_local_part(render_builtin, before, address, after):
+    # git log --format="%an|%cn|%ae" piped through uniq -c: | is RFC atext,
+    # so the walk-back joined the name columns to a 29-byte local part and the
+    # 69-byte result refused the trace. Beyond the budget the candidate is
+    # the last column; within it the complete run is replaced, as before.
+    text = before + address + after
+    matches = pii._dedupe_overlapping_pii([m for m in pii.scan_text_for_pii(text) if m["type"] == "email"])
+    assert [(m["match"], m["start"]) for m in matches] == [(address, len(before))]
+    assert render_builtin(text) == before + "[REDACTED_EMAIL]" + after
+    secrets.redact_text(text, strict=True)
+
+
+@pytest.mark.parametrize("text", [
+    "x|" + "a" * 65 + "@audit.test",
+    "a" * 70 + "|@audit.test",
+    "<" + "a" * 40 + "|" + "b" * 40 + "@audit.test>",
+    "a" * 40 + "/" + "b" * 40 + "@audit.test",
+    "a" * 70 + "|alice@" + "b" * 64 + ".test",
+], ids=["last-column-65", "empty-last-column", "angle-delimited", "no-pipe", "domain-label-64"])
+def test_oversized_candidates_with_or_without_columns_are_still_deferred(render_builtin, text):
+    from clawjournal.redaction.boundaries import RedactionBoundaryError
+
+    with pytest.raises(RedactionBoundaryError):
+        render_builtin(text)
+    with pytest.raises(RedactionBoundaryError):
+        secrets.redact_text(text, strict=True)

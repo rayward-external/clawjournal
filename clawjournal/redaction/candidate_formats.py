@@ -140,30 +140,106 @@ def _scanning_view(text: str) -> tuple[str, list[int], list[int]]:
     return "".join(parts), offsets, shifts
 
 
+# A quoted local part is one RFC 5321 quoted-string: it has no raw line break
+# and, with its quotes, is at most 64 octets (section 4.5.3.1.1). A quote
+# before an @ can therefore close a mailbox only if its opening quote lies
+# inside that window. A wider pair is normally two unrelated quotes around
+# ordinary text, such as the opening quote of "@pytest.fixture" and the last
+# quote of an earlier string; that @ gets the unquoted walk-back instead.
+# The exception is one unbroken quoted value: it stays a complete candidate,
+# so the replacement budget in boundaries.py still keeps its trace local.
+_QUOTED_LOCAL_BUDGET = 64
+
+
+def _fits_quoted_local(text: str, start: int, at: int) -> bool:
+    if at - start > _QUOTED_LOCAL_BUDGET:
+        return False
+    local = text[start:at]
+    return ("\n" not in local and "\r" not in local
+            and len(local.encode("utf-8", errors="surrogatepass")) <= _QUOTED_LOCAL_BUDGET)
+
+
+def _is_unbroken_quoted_value(text: str, opening: int, at: int) -> bool:
+    """Whether only local-part characters separate the two quotes."""
+    pos = at - 1
+    while pos - 1 > opening and (
+        text[pos - 1] in _LOCAL_CHARS
+        or unicodedata.category(text[pos - 1])[0] in "LMN"
+    ):
+        pos -= 1
+    return pos - 1 == opening
+
+
+def _escaped_quoted_local_start(
+    text: str, at: int, pair: tuple[int, int] | None,
+) -> int | None:
+    """Find the start of a quoted local part written with escaped quotes.
+
+    Pairing uses the quote's encoding level, not its raw backslash count:
+    a mailbox ending in an escaped backslash adds content before its closing
+    quote. Decode only the enclosing layers of backslash/quote escaping to
+    check the mailbox's size. Return original offsets, including the quote's
+    escape backslashes, so an oversized representation still fails preflight.
+    """
+    if pair is None:
+        return None
+    start, width = pair
+    local = text[start:at]
+    while width > 1:
+        local = re.sub(r'\\([\\"])', r'\1', local)
+        width //= 2
+    if (_fits_quoted_local(local, 0, len(local))
+            or _is_unbroken_quoted_value(local, 0, len(local))):
+        return start
+    return None
+
+
 def _email_spans(text: str) -> Iterator[tuple[int, int]]:
     end_of_match = 0
     cursor = 0
     quote_positions: list[int] | None = None
+    escaped_pairs: dict[int, tuple[int, int]] = {}
     while (at := text.find("@", cursor)) != -1:
         cursor = at + 1
         start = at
+        quoted = False
         if start and text[start - 1] == '"':
             # Index quotes once. Repeated escaped quotes followed by @ must
             # not make each candidate walk the entire preceding text again.
             if quote_positions is None:
                 quote_positions = []
                 slashes = 0
+                quote_stack: list[tuple[int, int]] = []
                 for pos, char in enumerate(text):
-                    if char == '"' and slashes % 2 == 0:
-                        quote_positions.append(pos)
+                    if char in "\r\n":
+                        quote_stack.clear()
+                    if char == '"':
+                        # After d JSON-style escape layers, a delimiter has
+                        # 2**d - 1 backslashes, plus multiples of 2**(d+1)
+                        # for literal backslashes in the mailbox. Thus the
+                        # lowest set bit of slashes + 1 identifies its level.
+                        width = (slashes + 1) & -(slashes + 1)
+                        if width == 1:
+                            quote_positions.append(pos)
+                        # Skip quotes belonging to inner escaped content,
+                        # but never cross an enclosing-string delimiter.
+                        # Each quote is pushed/popped once, even on long logs.
+                        while quote_stack and quote_stack[-1][1] > width:
+                            quote_stack.pop()
+                        if quote_stack and quote_stack[-1][1] == width:
+                            opening, _ = quote_stack.pop()
+                            if width > 1:
+                                escaped_pairs[pos] = (opening - width + 1, width)
+                        quote_stack.append((pos, width))
                     slashes = slashes + 1 if char == "\\" else 0
             before_closing = bisect.bisect_left(quote_positions, at - 1) - 1
-            if before_closing < 0:
-                continue
-            start = quote_positions[before_closing]
-            if start < end_of_match:
-                continue
-        else:
+            opening = quote_positions[before_closing] if before_closing >= 0 else None
+            if opening is None or not (_fits_quoted_local(text, opening, at)
+                                       or _is_unbroken_quoted_value(text, opening, at)):
+                opening = _escaped_quoted_local_start(text, at, escaped_pairs.get(at - 1))
+            if opening is not None and opening >= end_of_match:
+                start, quoted = opening, True
+        if not quoted:
             while start > end_of_match and (
                 text[start - 1] in _LOCAL_CHARS
                 or unicodedata.category(text[start - 1])[0] in "LMN"
@@ -175,7 +251,7 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
         # delimiters retain mixed-script local parts. A JSON/string-opening
         # quote is not a mailbox delimiter; it may enclose a whole sentence.
         # Punctuation joins (e.g. ツ-test) remain part of the local part.
-        delimited = text[start:start + 1] == '"' or (start > 0 and text[start - 1] == '<')
+        delimited = quoted or (start > 0 and text[start - 1] == '<')
         # A complete value in an address field is an explicit SMTPUTF8
         # mailbox. Merely quoting prose cannot make its prefix a mailbox.
         if (start and text[start - 1] in "\"'"
@@ -214,6 +290,15 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                 if ('/' in path_prefix and ((long_prefix and path_prefix.count('/') >= 2)
                         or (assignment and start > at - len(prefix)) or path_prefix.startswith(('.', '~')))):
                     start += path_prefix.rfind('/') + 1
+            # RFC atext also includes |, the column separator of tables and
+            # of git log --format output. A prefix beyond the 64-octet budget
+            # cannot be one local part, so the address is its last column.
+            # An empty last column keeps the complete oversized candidate.
+            columns = text[start:at]
+            if '|' in columns and len(columns.encode('utf-8', errors='surrogatepass')) > 64:
+                last_column = columns.rfind('|') + 1
+                if last_column < len(columns):
+                    start += last_column
         if start == at:
             continue
         domain = _DOMAIN.match(text, at + 1)

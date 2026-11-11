@@ -8799,3 +8799,73 @@ def test_issue_230_long_run_next_to_device_name_previews(
         assert reviewer.call_args.args[0]['messages'][0]['content'] == expected
     else:
         reviewer.assert_not_called()
+
+
+@pytest.mark.parametrize('endpoint,ai_pii', [
+    ('redacted', False), ('redaction-report', False), ('redaction-report', True),
+], ids=['redacted', 'report-ai-off', 'report-ai-on'])
+@pytest.mark.parametrize('address,expected_status', [
+    ('"' + 'a' * 62 + '"@audit.test', 422),
+    ('"john' + '\\' * 2 + '"@audit.test', 200),
+], ids=['escaped-local-over-raw-budget', 'escaped-trailing-backslash'])
+def test_escaped_quoted_mailbox_preview_never_returns_the_address(
+    server, monkeypatch, endpoint, ai_pii, address, expected_status,
+):
+    original = json.dumps({'note': 'ordinary words ' * 8 + 'cc ' + address})
+    encoded_address = json.dumps(address)[1:-1]
+    expected = original.replace(encoded_address, '[REDACTED_EMAIL]')
+    reviewer = MagicMock(return_value=[])
+    monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent', reviewer)
+    with open_index() as conn:
+        upsert_sessions(conn, [{
+            'session_id': 'escaped-quoted-mailbox', 'source': 'claude', 'project': 'synthetic',
+            'messages': [{'role': 'user', 'content': original, 'tool_uses': []}],
+        }])
+    status, body = _get(server, f'/api/sessions/escaped-quoted-mailbox/{endpoint}?ai_pii={int(ai_pii)}')
+    assert status == expected_status, body
+    if expected_status == 422:
+        assert body['block_reason'] == 'redaction_boundary'
+        assert body['rule'] == 'email_extended'
+        assert 'redacted_session' not in body
+        reviewer.assert_not_called()
+    else:
+        result = body['redacted_session'] if endpoint == 'redaction-report' else body
+        assert result['messages'][0]['content'] == expected
+        if ai_pii:
+            reviewer.assert_called_once()
+            assert reviewer.call_args.args[0]['messages'][0]['content'] == expected
+        else:
+            reviewer.assert_not_called()
+
+
+@pytest.mark.parametrize('endpoint,ai_pii', [
+    ('redacted', False), ('redaction-report', False), ('redaction-report', True),
+], ids=['redacted', 'report-ai-off', 'report-ai-on'])
+def test_quote_before_decorator_or_file_mention_previews(server, monkeypatch, endpoint, ai_pii):
+    # A quote directly before an @ paired with the nearest earlier quote in
+    # the field, however far away. Such a pair is not a quoted mailbox, so
+    # the preview completes and the text stays as written. The complete
+    # quoted mailbox in the same trace is still replaced.
+    original = '\n'.join([
+        'old = suite.read_text("utf-8")',
+        '    start = old.index("@pytest.fixture\\ndef harness")',
+        'The user said "attach the design".',
+        '   - "@Design.pdf summarise this"',
+        '{"command": "' + 'python - <<EOF ' * 6 + r'old.index(\"@pytest.fixture\")"}',
+        'cc <"jane roe"@audit.test> when done',
+    ])
+    expected = original.replace('"jane roe"@audit.test', '[REDACTED_EMAIL]')
+    reviewer = MagicMock(return_value=[])
+    monkeypatch.setattr('clawjournal.redaction.pii.review_session_pii_with_agent', reviewer)
+    with open_index() as conn:
+        upsert_sessions(conn, [{
+            'session_id': 'quote-before-at', 'source': 'claude', 'project': 'synthetic',
+            'messages': [{'role': 'user', 'content': original, 'tool_uses': []}],
+        }])
+    status, body = _get(server, f'/api/sessions/quote-before-at/{endpoint}?ai_pii={int(ai_pii)}')
+    assert status == 200, body
+    result = body['redacted_session'] if endpoint == 'redaction-report' else body
+    assert result['messages'][0]['content'] == expected
+    assert 'jane roe' not in json.dumps(body)
+    if endpoint == 'redaction-report':
+        assert body['review_snapshot_id'] and body['reviewed_revision']

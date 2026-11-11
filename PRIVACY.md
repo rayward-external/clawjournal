@@ -56,6 +56,23 @@ characters before the keyword and 16 after it. The rest of that run stays as
 ordinary text, and the other rules still scan it. The hostname byte budget
 still applies to the replaced text. Only non-ASCII letters can make this rule
 stop a share.
+A quote directly before an `@` closes a quoted mailbox only when its opening
+quote is on the same line and the quoted part, quotes included, fits the
+64-byte local-part budget. Two quotes further apart enclose ordinary text,
+such as the code before `"@pytest.fixture"`. That text is not an email
+candidate, so it stays as written and does not stop a share. One unbroken
+quoted value longer than the budget is still a candidate and still stops the
+share. A quoted mailbox written with escaped quotes, such as
+`\"jane roe\"@example.com` inside a JSON string, is replaced together with
+its escape backslashes, including when the mailbox ends in a literal
+backslash. Pairing checks the quoted part after removing the enclosing
+layers of quote/backslash escaping. The replacement budget still checks
+the complete original span: if escaping expands that span beyond the
+budget, the share stops instead of allowing the address through unchanged.
+Columns joined to an address by `|` without spaces, as in `git log --format`
+output, are replaced with it while the whole run fits the local-part budget.
+Beyond the budget only the last column is the email candidate. If that column
+is empty or still too long, the share stops as before.
 Email, Telegram-token and internal-domain regex searches use complete-candidate
 adapters. Required markers locate possible matches; the unchanged regexes
 validate them against the original field. They do not repeatedly retry each
