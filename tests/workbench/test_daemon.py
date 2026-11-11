@@ -8852,6 +8852,9 @@ def test_quote_before_decorator_or_file_mention_previews(server, monkeypatch, en
         'The user said "attach the design".',
         '   - "@Design.pdf summarise this"',
         '{"command": "' + 'python - <<EOF ' * 6 + r'old.index(\"@pytest.fixture\")"}',
+        # JSON-escaped source: the two strings are on different source lines.
+        '{"output": "' + 'ordinary text ' * 8 + r'print(\"one\")\n' + ' ' * 48 + r'source = f\"@pytest.fixture\\ndef client\")"}',
+        '{"output": "' + 'ordinary text ' * 8 + r'print(\"one\")\n' + ' ' * 20 + r'source = f\"@pytest.fixture\\ndef client\")"}',
         'cc <"jane roe"@audit.test> when done',
     ])
     expected = original.replace('"jane roe"@audit.test', '[REDACTED_EMAIL]')

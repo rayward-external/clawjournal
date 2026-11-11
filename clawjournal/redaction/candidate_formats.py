@@ -170,6 +170,28 @@ def _is_unbroken_quoted_value(text: str, opening: int, at: int) -> bool:
     return pos - 1 == opening
 
 
+_ESCAPED_LINE_BREAK = re.compile(r"(\\+)[nr]")
+
+
+def _spans_escaped_line_break(text: str, opening: int, at: int) -> bool:
+    """Whether an escaped closing quote is on a later line than ``opening``.
+
+    Inside a JSON or shell string a line break is written \\n or \\r. For a
+    closing quote of escape width w it is a line break when its backslash
+    count is not a multiple of w; a multiple of w is that many literal
+    backslashes and a letter, as in a path. An unescaped closing quote has
+    width 1: at its level those two characters are ordinary text.
+    """
+    closing = at - 1
+    slashes = 0
+    while closing > slashes and text[closing - slashes - 1] == "\\":
+        slashes += 1
+    width = (slashes + 1) & -(slashes + 1)
+    return width > 1 and any(
+        len(match.group(1)) % width for match in _ESCAPED_LINE_BREAK.finditer(text, opening, at)
+    )
+
+
 def _escaped_quoted_local_start(
     text: str, at: int, pair: tuple[int, int] | None,
 ) -> int | None:
@@ -213,6 +235,16 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                 for pos, char in enumerate(text):
                     if char in "\r\n":
                         quote_stack.clear()
+                    elif slashes and char in "nr":
+                        # A line break written as an escape: s backslashes
+                        # and n or r. It ends the line for every quote
+                        # wider than the lowest set bit of s: \n for \"
+                        # and \\\", \\n for \\\" but not for \". At a
+                        # width that divides s the backslashes are
+                        # literal, as in a path. Widths increase toward
+                        # the top of the stack, so pop from there.
+                        while quote_stack and quote_stack[-1][1] > (slashes & -slashes):
+                            quote_stack.pop()
                     if char == '"':
                         # After d JSON-style escape layers, a delimiter has
                         # 2**d - 1 backslashes, plus multiples of 2**(d+1)
@@ -234,8 +266,11 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                     slashes = slashes + 1 if char == "\\" else 0
             before_closing = bisect.bisect_left(quote_positions, at - 1) - 1
             opening = quote_positions[before_closing] if before_closing >= 0 else None
-            if opening is None or not (_fits_quoted_local(text, opening, at)
-                                       or _is_unbroken_quoted_value(text, opening, at)):
+            if opening is None or not (
+                (_fits_quoted_local(text, opening, at)
+                 and not _spans_escaped_line_break(text, opening, at))
+                or _is_unbroken_quoted_value(text, opening, at)
+            ):
                 opening = _escaped_quoted_local_start(text, at, escaped_pairs.get(at - 1))
             if opening is not None and opening >= end_of_match:
                 start, quoted = opening, True
