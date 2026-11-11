@@ -140,6 +140,69 @@ def _scanning_view(text: str) -> tuple[str, list[int], list[int]]:
     return "".join(parts), offsets, shifts
 
 
+# A quoted local part is one RFC 5321 quoted-string: it has no raw line break
+# and, with its quotes, is at most 64 octets (section 4.5.3.1.1). A quote
+# before an @ can therefore close a mailbox only if its opening quote lies
+# inside that window. A wider pair is normally two unrelated quotes around
+# ordinary text, such as the opening quote of "@pytest.fixture" and the last
+# quote of an earlier string; that @ gets the unquoted walk-back instead.
+# The exception is one unbroken quoted value: it stays a complete candidate,
+# so the replacement budget in boundaries.py still keeps its trace local.
+_QUOTED_LOCAL_BUDGET = 64
+
+
+def _fits_quoted_local(text: str, start: int, at: int) -> bool:
+    if at - start > _QUOTED_LOCAL_BUDGET:
+        return False
+    local = text[start:at]
+    return ("\n" not in local and "\r" not in local
+            and len(local.encode("utf-8", errors="surrogatepass")) <= _QUOTED_LOCAL_BUDGET)
+
+
+def _is_unbroken_quoted_value(text: str, opening: int, at: int) -> bool:
+    """Whether only local-part characters separate the two quotes."""
+    pos = at - 1
+    while pos - 1 > opening and (
+        text[pos - 1] in _LOCAL_CHARS
+        or unicodedata.category(text[pos - 1])[0] in "LMN"
+    ):
+        pos -= 1
+    return pos - 1 == opening
+
+
+def _escaped_quoted_local_start(text: str, at: int) -> int | None:
+    """Find the start of a quoted local part written with escaped quotes.
+
+    Inside a JSON or shell string the mailbox reads \\"john doe\\"@host. Its
+    opening quote has as many backslashes as the closing one. A quote with
+    more is a character of the local part; one with fewer ends the enclosing
+    string. The span starts at the opening backslashes, so replacing it
+    leaves no stray escape. The scan stays inside the 64-octet window.
+    """
+    closing = at - 1
+    depth = 0
+    while depth < _QUOTED_LOCAL_BUDGET and closing > depth and text[closing - depth - 1] == "\\":
+        depth += 1
+    if depth % 2 == 0:
+        return None  # An unescaped closing quote pairs with an unescaped one.
+    pos = closing - depth - 1
+    lowest = max(0, at - _QUOTED_LOCAL_BUDGET)
+    while pos >= lowest:
+        if text[pos] in "\r\n":
+            return None
+        if text[pos] == '"':
+            slashes = 0
+            while slashes <= depth and pos > slashes and text[pos - slashes - 1] == "\\":
+                slashes += 1
+            if slashes == depth:
+                start = pos - depth
+                return start if _fits_quoted_local(text, start, at) else None
+            if slashes < depth:
+                return None
+        pos -= 1
+    return None
+
+
 def _email_spans(text: str) -> Iterator[tuple[int, int]]:
     end_of_match = 0
     cursor = 0
@@ -147,6 +210,7 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
     while (at := text.find("@", cursor)) != -1:
         cursor = at + 1
         start = at
+        quoted = False
         if start and text[start - 1] == '"':
             # Index quotes once. Repeated escaped quotes followed by @ must
             # not make each candidate walk the entire preceding text again.
@@ -158,12 +222,13 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
                         quote_positions.append(pos)
                     slashes = slashes + 1 if char == "\\" else 0
             before_closing = bisect.bisect_left(quote_positions, at - 1) - 1
-            if before_closing < 0:
-                continue
-            start = quote_positions[before_closing]
-            if start < end_of_match:
-                continue
-        else:
+            opening = quote_positions[before_closing] if before_closing >= 0 else None
+            if opening is None or not (_fits_quoted_local(text, opening, at)
+                                       or _is_unbroken_quoted_value(text, opening, at)):
+                opening = _escaped_quoted_local_start(text, at)
+            if opening is not None and opening >= end_of_match:
+                start, quoted = opening, True
+        if not quoted:
             while start > end_of_match and (
                 text[start - 1] in _LOCAL_CHARS
                 or unicodedata.category(text[start - 1])[0] in "LMN"
@@ -175,7 +240,7 @@ def _email_spans(text: str) -> Iterator[tuple[int, int]]:
         # delimiters retain mixed-script local parts. A JSON/string-opening
         # quote is not a mailbox delimiter; it may enclose a whole sentence.
         # Punctuation joins (e.g. ツ-test) remain part of the local part.
-        delimited = text[start:start + 1] == '"' or (start > 0 and text[start - 1] == '<')
+        delimited = quoted or (start > 0 and text[start - 1] == '<')
         # A complete value in an address field is an explicit SMTPUTF8
         # mailbox. Merely quoting prose cannot make its prefix a mailbox.
         if (start and text[start - 1] in "\"'"
