@@ -10,6 +10,7 @@ const SOURCE_ICONS: Record<string, string> = {
   codex: 'CX',
   openclaw: 'OC',
   workbuddy: 'WB',
+  kiro: 'KR',
 };
 
 function formatDuration(seconds: number | null): string {

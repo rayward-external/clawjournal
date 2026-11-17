@@ -2,7 +2,7 @@
 
 ClawJournal helps you review the work you have done with coding agents, remove sensitive information, and choose what—if anything—you want to share.
 
-It works with Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, WorkBuddy, Cursor, Copilot, and Aider.
+It works with Claude Code, Claude Desktop, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, Kiro, WorkBuddy, Cursor, Copilot, and Aider.
 
 ## Start with a prompt
 

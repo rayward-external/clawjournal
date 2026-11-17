@@ -55,6 +55,7 @@ _FS_PROBES: tuple[tuple[str, str], ...] = (
     ("gemini", "GEMINI_DIR"),
     ("opencode", "OPENCODE_DIR"),
     ("kimi", "KIMI_DIR"),
+    ("kiro", "KIRO_DIR"),
     ("cursor", "CURSOR_DIR"),
     ("copilot", "COPILOT_DIR"),
 )

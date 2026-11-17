@@ -42,6 +42,11 @@ export function sourceFullLabel(s: { source: string; client_origin?: string | nu
   if (s.source === 'claude-science') return { label: 'Claude Science', color: '#9333ea' };
   if (s.source === 'openclaw') return { label: 'OpenClaw', color: '#6b7280' };
   if (s.source === 'workbuddy') return { label: 'WorkBuddy', color: '#0f766e' };
+  if (s.source === 'kiro') {
+    // The current store is shared by the CLI and the IDE, so origin can be unknown.
+    const label = s.client_origin === 'desktop' ? 'Kiro IDE' : s.client_origin === 'cli' ? 'Kiro CLI' : 'Kiro';
+    return { label, color: '#4f46e5' };
+  }
   return { label: s.source, color: '#6b7280' };
 }
 
