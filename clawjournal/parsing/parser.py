@@ -1,6 +1,8 @@
-"""Parse Claude Code, Claude Science, Codex, Gemini CLI, OpenCode, and OpenClaw session data into conversations."""
+"""Parse Claude Code, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, and Kiro session data into conversations."""
 
+import base64
 import dataclasses
+import difflib
 import hashlib
 import io
 import json
@@ -11,8 +13,9 @@ import re
 import sqlite3
 import zipfile
 from collections.abc import Iterable
+from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from ..config import CONFIG_DIR
@@ -32,6 +35,7 @@ CURSOR_SOURCE = "cursor"
 COPILOT_SOURCE = "copilot"
 AIDER_SOURCE = "aider"
 WORKBUDDY_SOURCE = "workbuddy"
+KIRO_SOURCE = "kiro"
 CUSTOM_SOURCE = "custom"
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -69,6 +73,25 @@ WORKBUDDY_MAX_FILE_BYTES = 100 * 1024 * 1024
 WORKBUDDY_MAX_ZIP_MEMBER_BYTES = 25 * 1024 * 1024
 WORKBUDDY_TRACE_SUFFIXES = {".json", ".jsonl", ".ndjson", ".log"}
 WORKBUDDY_ARCHIVE_SUFFIXES = {".zip"}
+
+# Kiro (https://kiro.dev) keeps sessions in three places: the ~/.kiro/sessions
+# tree shared by the current CLI and IDE, the Kiro CLI's SQLite database, and
+# the Kiro IDE's VS Code-style extension storage.
+KIRO_DIR = Path.home() / ".kiro"
+KIRO_SESSIONS_DIR = KIRO_DIR / "sessions"
+if platform.system() == "Darwin":
+    KIRO_CLI_DIR = Path.home() / "Library" / "Application Support" / "kiro-cli"
+    _KIRO_IDE_USER_DATA_DIR = Path.home() / "Library" / "Application Support" / "Kiro"
+elif platform.system() == "Windows":
+    _KIRO_APPDATA = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    KIRO_CLI_DIR = _KIRO_APPDATA / "kiro-cli"
+    _KIRO_IDE_USER_DATA_DIR = _KIRO_APPDATA / "Kiro"
+else:
+    KIRO_CLI_DIR = Path.home() / ".local" / "share" / "kiro-cli"
+    _KIRO_IDE_USER_DATA_DIR = Path.home() / ".config" / "Kiro"
+KIRO_CLI_DB_PATH = KIRO_CLI_DIR / "data.sqlite3"
+KIRO_IDE_DIR = _KIRO_IDE_USER_DATA_DIR / "User" / "globalStorage" / "kiro.kiroagent"
+UNKNOWN_KIRO_CWD = "<unknown-cwd>"
 
 CUSTOM_DIR = CONFIG_DIR / "custom"
 
@@ -113,6 +136,7 @@ _KIMI_PROJECT_INDEX: dict[str, list[Path]] = {}
 _CURSOR_PROJECT_INDEX: dict[str, list[Path]] = {}
 _AIDER_PROJECT_INDEX: dict[str, Path] = {}
 _WORKBUDDY_PROJECT_INDEX: dict[str, list[Path]] = {}
+_KIRO_PROJECT_INDEX: dict[str, list[dict[str, Any]]] = {}
 
 
 def _build_gemini_hash_map() -> dict[str, str]:
@@ -497,6 +521,7 @@ def discover_projects(source_filter: str | None = None) -> list[dict]:
         COPILOT_SOURCE: _discover_copilot_projects,
         AIDER_SOURCE: _discover_aider_projects,
         WORKBUDDY_SOURCE: _discover_workbuddy_projects,
+        KIRO_SOURCE: _discover_kiro_projects,
         CUSTOM_SOURCE: _discover_custom_projects,
     }
 
@@ -1992,6 +2017,11 @@ def parse_project_sessions(
 
     if source == WORKBUDDY_SOURCE:
         return _parse_workbuddy_project_sessions(
+            project_dir_name, anonymizer, include_thinking,
+        )
+
+    if source == KIRO_SOURCE:
+        return _parse_kiro_project_sessions(
             project_dir_name, anonymizer, include_thinking,
         )
 
@@ -4324,6 +4354,12 @@ def _build_workbuddy_project_name(dir_name: str) -> str:
     return f"workbuddy:{Path(dir_name).name or dir_name}"
 
 
+def _build_kiro_project_name(cwd: str) -> str:
+    if cwd == UNKNOWN_KIRO_CWD:
+        return "kiro:unknown"
+    return f"kiro:{Path(cwd).name or cwd}"
+
+
 def _get_opencode_project_index(refresh: bool = False) -> dict[str, list[str]]:
     global _OPENCODE_PROJECT_INDEX
     if refresh or not _OPENCODE_PROJECT_INDEX:
@@ -5191,3 +5227,765 @@ def _parse_aider_history_file(
                 sessions.append(result)
 
     return sessions
+
+
+# ---------------------------------------------------------------------------
+# Kiro parser
+# ---------------------------------------------------------------------------
+#
+# Kiro has changed its on-disk format several times, and one install can hold
+# sessions in more than one of them:
+#
+#   event log     ~/.kiro/sessions/[<workspace-hash>/]sess_<id>/messages.jsonl
+#                 with a session.json beside it (current Kiro CLI and IDE)
+#   CLI database  <Kiro CLI data dir>/data.sqlite3, tables conversations_v2
+#                 and conversations (Kiro CLI 1.x and 2.x)
+#   CLI JSONL     ~/.kiro/sessions/cli/<id>.jsonl with <id>.json beside it
+#                 (Kiro CLI 2.x)
+#   IDE session   <IDE storage>/workspace-sessions/<base64url(cwd)>/<id>.json
+#                 (earlier Kiro IDE)
+#
+# Projects are keyed by working directory, as for Codex and OpenCode.
+
+_KIRO_EXECUTION_ID_RE = re.compile(rb'"executionId"\s*:\s*"([^"]+)"')
+
+
+def _kiro_str(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _load_kiro_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def _kiro_timestamp(value: Any) -> str | None:
+    """Normalize Kiro's timestamps to ISO-8601 UTC.
+
+    Depending on the store they are ISO strings (sometimes with a local
+    offset), epoch seconds, epoch milliseconds, or milliseconds as a string.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = value / 1000 if abs(value) >= 1e11 else value
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = _kiro_str(value)
+    if text is None:
+        return None
+    if text.isdigit():
+        return _kiro_timestamp(int(text))
+    try:
+        # Python 3.10 rejects a "Z" suffix and more than six fractional digits.
+        parsed = datetime.fromisoformat(
+            re.sub(r"(\.\d{6})\d+", r"\1", text.replace("Z", "+00:00"))
+        )
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        return text
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _kiro_text(value: Any, *, structured: bool = False) -> str:
+    """Flatten Kiro content, a string or a list of typed blocks, to text.
+
+    A text block is {"Text": ...} in the CLI database, {"kind": "text",
+    "data": ...} in CLI JSONL and {"type": "text", "text": ...} in the IDE.
+    ``structured`` also keeps JSON payloads, which is how tool results carry
+    command output; message text drops them so attachments are not inlined.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = (_kiro_text(item, structured=structured) for item in value)
+        return "\n\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        if isinstance(value.get("Text"), str):
+            return value["Text"].strip()
+        if value.get("kind") == "text" and isinstance(value.get("data"), str):
+            return value["data"].strip()
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            return value["text"].strip()
+        if structured:
+            if "Json" in value:
+                value = value["Json"]
+            elif value.get("kind") == "json" and "data" in value:
+                value = value["data"]
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return ""
+
+
+def _kiro_title(value: Any, anonymizer: Anonymizer) -> str | None:
+    title = re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+    return anonymizer.text(title) if title else None
+
+
+def _kiro_model(value: Any) -> str | None:
+    model = _kiro_str(value)
+    # "auto" is Kiro's model router, not a model another agent could mean.
+    return "kiro-auto" if model and model.lower() == "auto" else model
+
+
+def _kiro_tool_input(tool_name: str, args: Any, anonymizer: Anonymizer) -> dict:
+    args = _json_loads_maybe(args)
+    parsed = _parse_tool_input(tool_name, {} if args is None else args, anonymizer)
+    # _parse_tool_input leaves nested containers alone, but Kiro tools such as
+    # fs_read put their paths inside a list of operations.
+    return {
+        key: _anonymize_claude_science_value(value, anonymizer, key)
+        if isinstance(value, (dict, list))
+        else value
+        for key, value in parsed.items()
+    }
+
+
+class _KiroTranscript:
+    """Builds the shared message shape from any of Kiro's storage formats.
+
+    Kiro stores an assistant turn as separate text, reasoning, tool-call and
+    tool-result records. This folds them back into one assistant message per
+    model response, with each tool result attached to the call it answers.
+    """
+
+    def __init__(self, session_id: str, anonymizer: Anonymizer) -> None:
+        self.metadata: dict[str, Any] = {
+            "session_id": session_id,
+            "cwd": None,
+            "git_branch": None,
+            "model": None,
+            "model_effort": None,
+            "start_time": None,
+            "end_time": None,
+        }
+        self.anonymizer = anonymizer
+        self.messages: list[dict[str, Any]] = []
+        self.stats = _make_stats()
+        self._open: dict[str, Any] | None = None
+        self._calls: dict[str, dict[str, Any]] = {}
+
+    def close(self) -> None:
+        """End the current assistant message; the next part starts a new one."""
+        self._open = None
+
+    def user(self, text: Any, timestamp: str | None) -> None:
+        text = _kiro_str(text)
+        if text is None:
+            return
+        self._open = None
+        self.messages.append(
+            {"role": "user", "content": self.anonymizer.text(text), "timestamp": timestamp}
+        )
+        self.stats["user_messages"] += 1
+        _update_time_bounds(self.metadata, timestamp)
+
+    def _assistant(self, timestamp: str | None) -> dict[str, Any]:
+        if self._open is None:
+            self._open = {"role": "assistant", "timestamp": timestamp}
+            self.messages.append(self._open)
+            self.stats["assistant_messages"] += 1
+        _update_time_bounds(self.metadata, timestamp)
+        return self._open
+
+    def assistant_text(
+        self, text: Any, timestamp: str | None, *, thinking: bool = False
+    ) -> bool:
+        text = _kiro_str(text)
+        if text is None:
+            return False
+        # Reasoning after a reply, or a reply after tool calls, is a new response.
+        if self._open is not None and (
+            "tool_uses" in self._open or (thinking and "content" in self._open)
+        ):
+            self._open = None
+        message = self._assistant(timestamp)
+        key = "thinking" if thinking else "content"
+        text = self.anonymizer.text(text)
+        message[key] = f"{message[key]}\n\n{text}" if key in message else text
+        return True
+
+    def tool_call(self, call_id: Any, name: Any, args: Any, timestamp: str | None) -> bool:
+        name = _kiro_str(name)
+        if name is None:
+            return False
+        tool_use = {"tool": name, "input": _kiro_tool_input(name, args, self.anonymizer)}
+        self._assistant(timestamp).setdefault("tool_uses", []).append(tool_use)
+        self.stats["tool_uses"] += 1
+        if isinstance(call_id, str) and call_id:
+            self._calls[call_id] = tool_use
+        return True
+
+    def tool_result(self, call_id: Any, content: Any, status: Any = None) -> None:
+        # Whatever the model says next is a response to this result.
+        self._open = None
+        tool_use = self._calls.pop(call_id, None) if isinstance(call_id, str) else None
+        if tool_use is None:
+            return
+        text = _kiro_text(content, structured=True)
+        tool_use["output"] = {"text": self.anonymizer.text(text)} if text else {}
+        if isinstance(status, str) and status:
+            tool_use["status"] = "error" if status.lower() == "error" else "success"
+
+    def result(self) -> dict[str, Any] | None:
+        if not self.metadata["model"]:
+            self.metadata["model"] = "kiro-unknown"
+        return _make_session_result(self.metadata, self.messages, self.stats)
+
+
+def _kiro_ref(
+    kind: str, session_id: str, cwd: Any, path: Path, size: int, **extra: Any
+) -> dict[str, Any]:
+    return {
+        "kind": kind,
+        "id": session_id,
+        "cwd": _kiro_str(cwd),
+        "path": path,
+        "size": size,
+        **extra,
+    }
+
+
+def _kiro_file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _list_kiro_event_log_refs() -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    try:
+        entries = sorted(p for p in KIRO_SESSIONS_DIR.iterdir() if p.is_dir())
+    except OSError:
+        return refs
+    for entry in entries:
+        if entry.name.startswith("sess_"):
+            session_dirs = [entry]
+        else:
+            try:
+                session_dirs = sorted(
+                    p for p in entry.iterdir() if p.is_dir() and p.name.startswith("sess_")
+                )
+            except OSError:
+                continue
+        for session_dir in session_dirs:
+            transcript = session_dir / "messages.jsonl"
+            size = _kiro_file_size(transcript)
+            if size is None:
+                continue
+            meta = _load_kiro_json(session_dir / "session.json")
+            paths = meta.get("workspacePaths") if isinstance(meta, dict) else None
+            cwd = paths[0] if isinstance(paths, list) and paths else None
+            refs.append(_kiro_ref("event-log", session_dir.name, cwd, transcript, size))
+    return refs
+
+
+def _list_kiro_cli_db_refs() -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    if not KIRO_CLI_DB_PATH.is_file():
+        return refs
+    try:
+        with closing(_connect_sqlite_readonly(KIRO_CLI_DB_PATH)) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if "conversations_v2" in tables:
+                # A conversation can be stored under several directories; the
+                # most recently updated row comes first and wins in the index.
+                for row in conn.execute(
+                    "SELECT key, conversation_id, length(value) AS size "
+                    "FROM conversations_v2 ORDER BY updated_at DESC, created_at DESC"
+                ):
+                    session_id = _kiro_str(row["conversation_id"])
+                    if session_id:
+                        refs.append(_kiro_ref(
+                            "cli-db", session_id, row["key"], KIRO_CLI_DB_PATH,
+                            _safe_int(row["size"]), table="conversations_v2", key=row["key"],
+                        ))
+            if "conversations" in tables:
+                # Kiro CLI 1.x kept one conversation per directory.
+                for row in conn.execute("SELECT key, value FROM conversations"):
+                    value = row["value"]
+                    session_id = _kiro_str(_load_json_field(value).get("conversation_id"))
+                    if session_id:
+                        refs.append(_kiro_ref(
+                            "cli-db", session_id, row["key"], KIRO_CLI_DB_PATH,
+                            len(value), table="conversations", key=row["key"],
+                        ))
+    except sqlite3.Error:
+        logger.warning("Failed to read Kiro CLI database %s", KIRO_CLI_DB_PATH)
+    return refs
+
+
+def _list_kiro_cli_jsonl_refs() -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for directory in (KIRO_SESSIONS_DIR / "cli", KIRO_SESSIONS_DIR):
+        try:
+            transcripts = sorted(directory.glob("*.jsonl"))
+        except OSError:
+            continue
+        for transcript in transcripts:
+            size = _kiro_file_size(transcript)
+            if size is None:
+                continue
+            meta = _load_kiro_json(transcript.with_suffix(".json"))
+            meta = meta if isinstance(meta, dict) else {}
+            session_id = _kiro_str(meta.get("session_id")) or transcript.stem
+            refs.append(_kiro_ref("cli-jsonl", session_id, meta.get("cwd"), transcript, size))
+    return refs
+
+
+def _decode_kiro_workspace_dir(name: str) -> str | None:
+    """The IDE names each workspace-sessions folder base64url(workspace path)."""
+    try:
+        decoded = base64.urlsafe_b64decode(name + "=" * (-len(name) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if PurePosixPath(decoded).is_absolute() or PureWindowsPath(decoded).is_absolute():
+        return decoded
+    return None
+
+
+def _list_kiro_ide_session_refs() -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    try:
+        workspace_dirs = sorted(
+            p for p in (KIRO_IDE_DIR / "workspace-sessions").iterdir() if p.is_dir()
+        )
+    except OSError:
+        return refs
+    for workspace_dir in workspace_dirs:
+        listing = _load_kiro_json(workspace_dir / "sessions.json")
+        listed = {
+            entry["sessionId"]: entry
+            for entry in (listing if isinstance(listing, list) else [])
+            if isinstance(entry, dict) and isinstance(entry.get("sessionId"), str)
+        }
+        try:
+            session_files = sorted(workspace_dir.glob("*.json"))
+        except OSError:
+            continue
+        for session_file in session_files:
+            size = _kiro_file_size(session_file)
+            if size is None or session_file.name == "sessions.json":
+                continue
+            entry = listed.get(session_file.stem, {})
+            cwd = _kiro_str(entry.get("workspaceDirectory")) or _decode_kiro_workspace_dir(
+                workspace_dir.name
+            )
+            if cwd is None:
+                # Neither the listing nor the folder name gave a path, so read
+                # it from the session itself.
+                session = _load_kiro_json(session_file)
+                cwd = session.get("workspaceDirectory") if isinstance(session, dict) else None
+            refs.append(_kiro_ref(
+                "ide-session", session_file.stem, cwd, session_file, size,
+                title=entry.get("title"), created=entry.get("dateCreated"),
+            ))
+    return refs
+
+
+def _get_kiro_project_index(refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    global _KIRO_PROJECT_INDEX
+    if refresh or not _KIRO_PROJECT_INDEX:
+        _KIRO_PROJECT_INDEX = _build_kiro_project_index()
+    return _KIRO_PROJECT_INDEX
+
+
+def _build_kiro_project_index() -> dict[str, list[dict[str, Any]]]:
+    """Group every Kiro session by working directory.
+
+    A conversation can sit in more than one store, so stores are read newest
+    format first and a session ID that was already seen is skipped.
+    """
+    index: dict[str, list[dict[str, Any]]] = {}
+    seen: set[str] = set()
+    for list_refs in (
+        _list_kiro_event_log_refs,
+        _list_kiro_cli_db_refs,
+        _list_kiro_cli_jsonl_refs,
+        _list_kiro_ide_session_refs,
+    ):
+        for ref in list_refs():
+            if ref["id"] in seen:
+                continue
+            seen.add(ref["id"])
+            index.setdefault(ref["cwd"] or UNKNOWN_KIRO_CWD, []).append(ref)
+    return index
+
+
+def _discover_kiro_projects() -> list[dict]:
+    index = _get_kiro_project_index(refresh=True)
+    return [
+        {
+            "dir_name": cwd,
+            "display_name": _build_kiro_project_name(cwd),
+            "session_count": len(refs),
+            "total_size_bytes": sum(ref["size"] for ref in refs),
+            "source": KIRO_SOURCE,
+        }
+        for cwd, refs in sorted(index.items())
+    ]
+
+
+def _parse_kiro_project_sessions(
+    project_dir_name: str,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> list[dict]:
+    sessions = []
+    executions: dict[str, Path] | None = None
+    for ref in _get_kiro_project_index().get(project_dir_name, []):
+        raw_source_path = str(ref["path"])
+        client_origin = None
+        if ref["kind"] == "event-log":
+            # Written by both the CLI and the IDE, so the origin is unknown.
+            parsed = _parse_kiro_event_log(ref, anonymizer, include_thinking)
+        elif ref["kind"] == "cli-db":
+            parsed = _parse_kiro_cli_db_conversation(ref, anonymizer)
+            raw_source_path += f"#conversation={ref['id']}"
+            client_origin = "cli"
+        elif ref["kind"] == "cli-jsonl":
+            parsed = _parse_kiro_cli_jsonl(ref, anonymizer)
+            client_origin = "cli"
+        else:
+            if executions is None:
+                executions = _kiro_ide_execution_index(ref["cwd"]) if ref["cwd"] else {}
+            parsed = _parse_kiro_ide_session(ref, anonymizer, executions)
+            client_origin = "desktop"
+        if not parsed or not parsed["messages"]:
+            continue
+        parsed["project"] = _build_kiro_project_name(project_dir_name)
+        parsed["source"] = KIRO_SOURCE
+        parsed["raw_source_path"] = raw_source_path
+        if client_origin:
+            parsed["client_origin"] = client_origin
+        sessions.append(parsed)
+    return sessions
+
+
+def _parse_kiro_event_log(
+    ref: dict[str, Any], anonymizer: Anonymizer, include_thinking: bool
+) -> dict | None:
+    """Parse sess_<id>/messages.jsonl: one {id, timestamp, payload} event per line."""
+    transcript = _KiroTranscript(ref["id"], anonymizer)
+    meta = _load_kiro_json(ref["path"].parent / "session.json")
+    meta = meta if isinstance(meta, dict) else {}
+    metadata = transcript.metadata
+    metadata["model"] = _kiro_model(meta.get("modelId"))
+    metadata["start_time"] = _kiro_timestamp(meta.get("createdAt"))
+    metadata["end_time"] = _kiro_timestamp(meta.get("lastModifiedAt"))
+    metadata["segment_title"] = _kiro_title(meta.get("title"), anonymizer)
+
+    try:
+        for entry in _iter_jsonl(ref["path"]):
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            timestamp = _kiro_timestamp(entry.get("timestamp"))
+            kind = payload.get("type")
+            if kind == "user":
+                transcript.user(_kiro_text(payload.get("content")), timestamp)
+            elif kind == "assistant":
+                if metadata["model"] is None:
+                    metadata["model"] = _kiro_model(payload.get("reasoningModelId"))
+                thinking = payload.get("operationType") == "Reasoning"
+                if include_thinking or not thinking:
+                    transcript.assistant_text(
+                        _kiro_text(payload.get("content")), timestamp, thinking=thinking
+                    )
+            elif kind == "tool_call":
+                transcript.tool_call(
+                    payload.get("toolCallId"), payload.get("toolName"),
+                    payload.get("args"), timestamp,
+                )
+            elif kind == "tool_result":
+                transcript.tool_result(payload.get("toolCallId"), payload.get("content"))
+            elif kind == "sub_agent_start":
+                # A subagent spawn is recorded as its own event pair rather
+                # than a tool call; its session ID is what links the two.
+                transcript.tool_call(
+                    payload.get("subSessionId"),
+                    "invoke_subagent",
+                    {
+                        "subagent_type": payload.get("subAgentName"),
+                        "description": payload.get("explanation"),
+                        "prompt": payload.get("prompt"),
+                    },
+                    timestamp,
+                )
+            elif kind == "sub_agent_complete":
+                transcript.tool_result(
+                    payload.get("subSessionId"),
+                    payload.get("response") or payload.get("errorMessage"),
+                    payload.get("status"),
+                )
+    except OSError:
+        return None
+    return transcript.result()
+
+
+def _parse_kiro_cli_db_conversation(ref: dict[str, Any], anonymizer: Anonymizer) -> dict | None:
+    """Parse one conversation row of the Kiro CLI database.
+
+    The row's value is the CLI's serialized conversation state, whose
+    ``history`` is a list of {user, assistant, request_metadata} turns.
+    """
+    v2 = ref["table"] == "conversations_v2"
+    try:
+        with closing(_connect_sqlite_readonly(ref["path"])) as conn:
+            if v2:
+                row = conn.execute(
+                    "SELECT value, created_at, updated_at FROM conversations_v2 "
+                    "WHERE conversation_id = ? AND key = ?",
+                    (ref["id"], ref["key"]),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT value FROM conversations WHERE key = ?", (ref["key"],)
+                ).fetchone()
+    except sqlite3.Error:
+        logger.warning("Failed to parse Kiro conversation %s in %s", ref["id"], ref["path"])
+        return None
+    if row is None:
+        return None
+    state = _load_json_field(row["value"])
+
+    transcript = _KiroTranscript(ref["id"], anonymizer)
+    metadata = transcript.metadata
+    if v2:
+        metadata["start_time"] = _kiro_timestamp(row["created_at"])
+        metadata["end_time"] = _kiro_timestamp(row["updated_at"])
+    model_info = state.get("model_info")
+    metadata["model"] = _kiro_model(
+        model_info.get("model_id") if isinstance(model_info, dict) else state.get("model")
+    )
+
+    history = state.get("history")
+    for turn in history if isinstance(history, list) else []:
+        if isinstance(turn, dict):
+            user, assistant, request = (
+                turn.get("user"), turn.get("assistant"), turn.get("request_metadata")
+            )
+        elif isinstance(turn, list) and len(turn) >= 2:
+            # Early versions stored each turn as a [user, assistant] pair.
+            user, assistant, request = turn[0], turn[1], None
+        else:
+            continue
+
+        if isinstance(user, dict) and isinstance(user.get("content"), dict):
+            timestamp = _kiro_timestamp(user.get("timestamp"))
+            content = user["content"]
+            prompt = content.get("Prompt")
+            results = content.get("ToolUseResults")
+            cancelled = content.get("CancelledToolUses")
+            for block in (results, cancelled):
+                tool_results = block.get("tool_use_results") if isinstance(block, dict) else None
+                for item in tool_results if isinstance(tool_results, list) else []:
+                    if isinstance(item, dict):
+                        transcript.tool_result(
+                            item.get("tool_use_id"), item.get("content"), item.get("status")
+                        )
+            for block in (prompt, cancelled):
+                if isinstance(block, dict):
+                    transcript.user(block.get("prompt"), timestamp)
+
+        if isinstance(assistant, dict):
+            reply = assistant.get("ToolUse") or assistant.get("Response")
+            if not isinstance(reply, dict):
+                continue
+            timestamp = _kiro_timestamp(
+                request.get("stream_end_timestamp_ms") if isinstance(request, dict) else None
+            )
+            # Each turn holds exactly one model response.
+            transcript.close()
+            transcript.assistant_text(reply.get("content"), timestamp)
+            tool_uses = reply.get("tool_uses")
+            for tool_use in tool_uses if isinstance(tool_uses, list) else []:
+                if isinstance(tool_use, dict):
+                    transcript.tool_call(
+                        tool_use.get("id"), tool_use.get("name"), tool_use.get("args"), timestamp
+                    )
+    return transcript.result()
+
+
+def _parse_kiro_cli_jsonl(ref: dict[str, Any], anonymizer: Anonymizer) -> dict | None:
+    """Parse a Kiro CLI <id>.jsonl: one {version, kind, data} record per line."""
+    transcript = _KiroTranscript(ref["id"], anonymizer)
+    meta = _load_kiro_json(ref["path"].with_suffix(".json"))
+    meta = meta if isinstance(meta, dict) else {}
+    metadata = transcript.metadata
+    metadata["start_time"] = _kiro_timestamp(meta.get("created_at"))
+    metadata["end_time"] = _kiro_timestamp(meta.get("updated_at"))
+    metadata["segment_title"] = _kiro_title(meta.get("title"), anonymizer)
+    model: Any = meta
+    for key in ("session_state", "rts_model_state", "model_info", "model_id"):
+        model = model.get(key) if isinstance(model, dict) else None
+    metadata["model"] = _kiro_model(model)
+
+    try:
+        for entry in _iter_jsonl(ref["path"]):
+            data = entry.get("data") if isinstance(entry, dict) else None
+            if not isinstance(data, dict):
+                continue
+            record_meta = data.get("meta")
+            timestamp = _kiro_timestamp(
+                record_meta.get("timestamp") if isinstance(record_meta, dict) else None
+            )
+            content = data.get("content")
+            blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+            kind = entry.get("kind")
+            if kind == "Prompt":
+                transcript.user(_kiro_text(blocks), timestamp)
+            elif kind == "AssistantMessage":
+                # Each record holds exactly one model response.
+                transcript.close()
+                for block in blocks:
+                    block_data = block.get("data")
+                    if block.get("kind") == "text":
+                        transcript.assistant_text(block_data, timestamp)
+                    elif block.get("kind") == "toolUse" and isinstance(block_data, dict):
+                        transcript.tool_call(
+                            block_data.get("toolUseId"), block_data.get("name"),
+                            block_data.get("input"), timestamp,
+                        )
+            elif kind == "ToolResults":
+                for block in blocks:
+                    block_data = block.get("data")
+                    if block.get("kind") == "toolResult" and isinstance(block_data, dict):
+                        transcript.tool_result(
+                            block_data.get("toolUseId"), block_data.get("content"),
+                            block_data.get("status"),
+                        )
+    except OSError:
+        return None
+    return transcript.result()
+
+
+def _kiro_ide_execution_index(workspace: str) -> dict[str, Path]:
+    """Map executionId to its execution log for one IDE workspace.
+
+    An IDE session file is only the conversation spine. What the agent said
+    and did in each turn is in extensionless JSON execution logs under
+    <IDE storage>/<sha256(workspace)[:32]>/<bucket>/, linked by executionId.
+    """
+    root = KIRO_IDE_DIR / hashlib.sha256(workspace.encode("utf-8")).hexdigest()[:32]
+    index: dict[str, Path] = {}
+    try:
+        buckets = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return index
+    for bucket in buckets:
+        try:
+            logs = [p for p in bucket.iterdir() if p.is_file() and not p.suffix]
+        except OSError:
+            continue
+        for log in logs:
+            try:
+                with log.open("rb") as handle:
+                    match = _KIRO_EXECUTION_ID_RE.search(handle.read(2048))
+            except OSError:
+                continue
+            if match:
+                index[match.group(1).decode("utf-8", errors="replace")] = log
+    return index
+
+
+def _kiro_ide_action_input(action_input: dict[str, Any]) -> dict[str, Any]:
+    """Reduce an IDE file action to its path plus what changed.
+
+    An edit stores the whole file before and after, which would otherwise put
+    two full copies of every edited file into the trace.
+    """
+    result = {
+        key: value
+        for key, value in action_input.items()
+        if key not in ("originalContent", "modifiedContent")
+    }
+    original = action_input.get("originalContent")
+    modified = action_input.get("modifiedContent")
+    if isinstance(modified, str):
+        if isinstance(original, str) and original:
+            name = action_input.get("file") if isinstance(action_input.get("file"), str) else "file"
+            result["diff"] = "\n".join(difflib.unified_diff(
+                original.splitlines(), modified.splitlines(),
+                fromfile=f"a/{name}", tofile=f"b/{name}", lineterm="",
+            ))
+        else:
+            result["content"] = modified
+    return result
+
+
+def _replay_kiro_ide_execution(transcript: _KiroTranscript, execution_log: Path) -> bool:
+    """Add one execution log's actions in order; return whether any were added."""
+    execution = _load_kiro_json(execution_log)
+    actions = execution.get("actions") if isinstance(execution, dict) else None
+    added = False
+    for action in actions if isinstance(actions, list) else []:
+        if not isinstance(action, dict):
+            continue
+        action_type = action.get("actionType")
+        action_input = action.get("input")
+        output = action.get("output")
+        if action_type == "say":
+            message = output.get("message") if isinstance(output, dict) else None
+            added |= transcript.assistant_text(message, None)
+        elif isinstance(action_input, dict) and action_input:
+            added |= transcript.tool_call(
+                action.get("actionId"), action_type, _kiro_ide_action_input(action_input), None
+            )
+    return added
+
+
+def _parse_kiro_ide_session(
+    ref: dict[str, Any], anonymizer: Anonymizer, executions: dict[str, Path]
+) -> dict | None:
+    """Parse a Kiro IDE workspace-sessions/<base64url(cwd)>/<id>.json file."""
+    session = _load_kiro_json(ref["path"])
+    history = session.get("history") if isinstance(session, dict) else None
+    if not isinstance(history, list):
+        return None
+
+    transcript = _KiroTranscript(ref["id"], anonymizer)
+    metadata = transcript.metadata
+    # Messages carry no timestamps, so the session spans from its listed
+    # creation time to the file's last write.
+    try:
+        modified = datetime.fromtimestamp(
+            ref["path"].stat().st_mtime, tz=timezone.utc
+        ).isoformat()
+    except OSError:
+        modified = None
+    metadata["start_time"] = _kiro_timestamp(ref.get("created")) or modified
+    metadata["end_time"] = modified
+    metadata["segment_title"] = _kiro_title(session.get("title") or ref.get("title"), anonymizer)
+
+    for item in history:
+        message = item.get("message") if isinstance(item, dict) else None
+        if not isinstance(message, dict):
+            continue
+        text = _kiro_text(message.get("content"))
+        if message.get("role") == "user":
+            transcript.user(text, None)
+        elif message.get("role") == "assistant":
+            transcript.close()
+            execution_id = item.get("executionId")
+            execution_log = executions.get(execution_id) if isinstance(execution_id, str) else None
+            if execution_log and _replay_kiro_ide_execution(transcript, execution_log):
+                continue
+            if not text:
+                # No execution log and no reply text: use the raw completions.
+                prompt_logs = item.get("promptLogs")
+                text = _kiro_text([
+                    log.get("completion")
+                    for log in (prompt_logs if isinstance(prompt_logs, list) else [])
+                    if isinstance(log, dict)
+                ])
+            transcript.assistant_text(text, None)
+    return transcript.result()

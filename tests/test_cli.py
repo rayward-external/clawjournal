@@ -644,7 +644,7 @@ class TestListProjects:
         monkeypatch.setattr("clawjournal.cli.discover_projects", lambda source_filter=None: [])
         list_projects()
         captured = capsys.readouterr()
-        assert "No Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, or Custom sessions" in captured.out
+        assert "No Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, Kiro, or Custom sessions" in captured.out
 
     def test_source_filter_codex(self, monkeypatch, capsys):
         monkeypatch.setattr(

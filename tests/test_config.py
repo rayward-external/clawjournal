@@ -196,7 +196,7 @@ class TestMigrateExcludedProjects:
     def test_prefixed_names_unchanged(self):
         config = {"excluded_projects": [
             "codex:proj", "gemini:proj", "opencode:proj",
-            "openclaw:proj", "kimi:proj", "cline:proj", "custom:proj",
+            "openclaw:proj", "kimi:proj", "kiro:proj", "cline:proj", "custom:proj",
         ]}
         assert _migrate_excluded_projects(config) is False
 

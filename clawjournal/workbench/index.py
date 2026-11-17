@@ -6337,6 +6337,9 @@ def get_dashboard_analytics(
         "  WHEN source = 'cursor' THEN 'Cursor' "
         "  WHEN source = 'copilot' THEN 'Copilot CLI' "
         "  WHEN source = 'aider' THEN 'Aider' "
+        "  WHEN source = 'kiro' AND client_origin = 'desktop' THEN 'Kiro IDE' "
+        "  WHEN source = 'kiro' AND client_origin = 'cli' THEN 'Kiro CLI' "
+        "  WHEN source = 'kiro' THEN 'Kiro' "
         "  ELSE source "
         "END as agent, COUNT(*) as count "
         f"FROM sessions{filtered_where} GROUP BY agent ORDER BY count DESC",

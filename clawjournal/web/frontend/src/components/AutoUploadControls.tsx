@@ -97,6 +97,7 @@ function sourceLabel(source: string): string {
     custom: 'Custom',
     gemini: 'Gemini',
     kimi: 'Kimi',
+    kiro: 'Kiro',
     openclaw: 'OpenClaw',
     opencode: 'OpenCode',
     workbuddy: 'WorkBuddy',
