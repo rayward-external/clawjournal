@@ -171,6 +171,24 @@ def test_objective_universe_preserves_scope_and_release_gates(index_conn, ins):
     assert corpus.objective_session_ids == ["keep"]
 
 
+def test_secondary_workspace_exclusion_applies_to_all_skill_inputs(index_conn, ins):
+    for sid, projects in (("public", '["antigravity:public"]'),
+                          ("mixed", '["antigravity:public", "antigravity:private"]')):
+        ins(index_conn, sid, source="antigravity", project="antigravity:public",
+            fvs=4, learning="Fix the build", modes='["execution_error"]')
+        index_conn.execute(
+            "UPDATE sessions SET project_memberships = ? WHERE session_id = ?", (projects, sid)
+        )
+
+    corpus = select_skill_candidates(
+        index_conn, now=NOW, sources=["antigravity"], excluded_projects=["antigravity:private"]
+    )
+
+    assert [c.session_id for c in corpus.failures] == ["public"]
+    assert corpus.eligible_session_ids == ["public"]
+    assert corpus.objective_session_ids == ["public"]
+
+
 def test_window_and_source_scope(index_conn, ins):
     ins(index_conn, "recent", fvs=4, learning="x", start_time="2026-05-28T00:00:00+00:00")
     ins(index_conn, "old", fvs=4, learning="x", start_time="2026-05-01T00:00:00+00:00")

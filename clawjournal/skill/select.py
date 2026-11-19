@@ -235,14 +235,14 @@ def select_skill_candidates(
     def _keep(row: Any) -> bool:
         if not _in_window(row["start_time"]):
             return False
-        return not session_matches_excluded_projects(
-            {"project": row["project"], "source": row["source"]}, excluded_projects)
+        return not session_matches_excluded_projects(dict(row), excluded_projects)
 
+    scope_cols = "session_id, start_time, project, source, project_memberships"
     cols = (
-        "session_id, project, source, ai_failure_value_score, ai_quality_score, "
+        f"{scope_cols}, ai_failure_value_score, ai_quality_score, "
         "ai_failure_modes, ai_recovery_labels, ai_outcome_badge, "
         "ai_learning_summary, ai_score_reason, "
-        "ai_display_title, display_title, fork_of, fork_nickname, start_time"
+        "ai_display_title, display_title, fork_of, fork_nickname"
     )
     base = f"FROM sessions WHERE start_time >= ? AND review_status != 'segmented'{src_clause}"
 
@@ -272,7 +272,7 @@ def select_skill_candidates(
     # by score, by outcome badge, or by failure_modes+recovery — so count any judge verdict.
     # Excluded projects are dropped here too (they're not candidates).
     eligible_sql = (
-        f"SELECT session_id, start_time, project, source {base} AND (ai_failure_value_score IS NOT NULL "
+        f"SELECT {scope_cols} {base} AND (ai_failure_value_score IS NOT NULL "
         "OR ai_quality_score IS NOT NULL OR ai_outcome_badge IS NOT NULL "
         "OR ai_failure_modes IS NOT NULL)"
     )
@@ -283,7 +283,7 @@ def select_skill_candidates(
     # session in the same time/source/project scope, whether or not the scoring budget has
     # reached it. Run the hold-state gate once over this superset; judge candidates and
     # eligible_ids are subsets, so the same blocked set protects both paths.
-    objective_sql = f"SELECT session_id, start_time, project, source {base}"
+    objective_sql = f"SELECT {scope_cols} {base}"
     objective_ids = [
         r["session_id"]
         for r in conn.execute(objective_sql, [window_floor, *src]).fetchall()

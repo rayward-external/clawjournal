@@ -17,6 +17,7 @@ from ._helpers import (
     PERMISSIVE_CONFIG,
     insert_event,
     insert_event_session,
+    insert_workbench_session,
     make_conn,
 )
 
@@ -123,6 +124,23 @@ def test_global_config_gate_rejects_unconfirmed_source(populated_conn, tmp_path,
             config={"source": None, "projects_confirmed": True},
             allow_no_workbench_row=True,
         )
+
+
+def test_export_rejects_session_with_excluded_secondary_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr("clawjournal.config.CONFIG_DIR", tmp_path / ".clawjournal")
+    conn = make_conn()
+    key = "antigravity:public:mixed"
+    insert_event_session(conn, session_key=key, client="antigravity")
+    insert_workbench_session(
+        conn, session_id="mixed", session_key=key, project="antigravity:public", source="antigravity"
+    )
+    conn.execute(
+        "UPDATE sessions SET project_memberships = ? WHERE session_id = 'mixed'",
+        ('["antigravity:public", "antigravity:private"]',),
+    )
+    config = {**PERMISSIVE_CONFIG, "source": "antigravity", "excluded_projects": ["antigravity:private"]}
+    with pytest.raises(ExportGateBlocked, match="belongs to an excluded project"):
+        export_session_bundle(conn, key, config=config)
 
 
 def test_global_config_gate_rejects_unconfirmed_projects(populated_conn, tmp_path, monkeypatch):

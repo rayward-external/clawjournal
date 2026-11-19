@@ -3565,8 +3565,8 @@ def _load_finalized_share_export(
         # subset of the share's rows. Compare only what the bundle actually
         # ships: a rebased predecessor still invalidates the cache, while a
         # skipped session no longer forces a rebuild on every seal / download /
-        # submit. Composition changes arrive through `excluded_projects`, which
-        # `redaction_settings_fingerprint` already covers.
+        # submit. The caller supplies only currently eligible sessions because
+        # a rescan can discover another workspace without changing the messages.
         if any(
             expected_lineage.get(session_id) != lineage
             for session_id, lineage in manifest_lineage.items()
@@ -3618,14 +3618,6 @@ def _prepare_share_export_for_upload(
             "status": 409,
         }
     settings_fingerprint = _redaction_settings_fingerprint(settings)
-    expected_lineage = {
-        str(session["session_id"]): (
-            str(session["share_content_revision"]),
-            session.get("share_replaces_revision"),
-        )
-        for session in share.get("sessions") or []
-        if session.get("session_id") and session.get("share_content_revision")
-    }
     if reuse_finalized:
         # Pass the RAW override (not effective_ai_pii) on purpose: a finalized
         # export is a point-in-time artifact. With an explicit ai_pii override
@@ -3636,6 +3628,18 @@ def _prepare_share_export_for_upload(
         # settings changed since seal, so we never reuse stale-redacted bytes.
         # A cache miss still finalizes with effective_ai_pii below.
         cache_lookup_started = time.perf_counter()
+        current_share = get_share(conn, share_id)
+        if current_share is None:
+            return None, {}, {"error": "Share not found", "status": 404}
+        expected_lineage = {
+            str(session["session_id"]): (
+                str(session["share_content_revision"]),
+                session.get("share_replaces_revision"),
+            )
+            for session in current_share["sessions"]
+            if session.get("share_content_revision")
+            and not session_matches_excluded_projects(session, settings.get("excluded_projects"))
+        }
         cached = _load_finalized_share_export(
             share_id,
             ai_pii=ai_pii_review_enabled,
@@ -3733,8 +3737,22 @@ def _final_manual_share_egress_gate(
     source_filter: str | list[str] | tuple[str, ...] | None,
     *,
     accepted_predecessors: dict[str, str | None] | None = None,
+    packaged_session_ids: list[str] | None = None,
+    excluded_projects: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Re-check mutable share gates immediately before manual upload egress."""
+    if packaged_session_ids:
+        effective = get_effective_share_settings(conn, load_config())
+        exclusions = [*effective["excluded_projects"], *(excluded_projects or [])]
+        if exclusions:
+            placeholders = ",".join("?" for _ in packaged_session_ids)
+            rows = conn.execute(
+                "SELECT project, source, project_memberships FROM sessions "
+                f"WHERE session_id IN ({placeholders})", packaged_session_ids,
+            )
+            if any(session_matches_excluded_projects(dict(row), exclusions) for row in rows):
+                return {"error": "A packaged session belongs to an excluded project.", "status": 409}
+
     release_blockers = release_gate_blockers(conn, session_ids)
     if release_blockers:
         return {
@@ -3925,7 +3943,9 @@ def upload_share_to_self_hosted_ingest(
     )
 
     final_gate_error = _final_manual_share_egress_gate(
-        conn, share_id, session_ids, source_filter
+        conn, share_id, session_ids, source_filter,
+        packaged_session_ids=[item["session_id"] for item in manifest["sessions"]],
+        excluded_projects=excluded_projects,
     )
     if final_gate_error:
         return final_gate_error
@@ -4367,6 +4387,8 @@ def submit_share_to_hosted(
         session_ids,
         settings.get("source_filter"),
         accepted_predecessors=accepted_predecessors,
+        packaged_session_ids=session_ids,
+        excluded_projects=settings.get("excluded_projects"),
     )
     if final_gate_error:
         return final_gate_error
@@ -5757,11 +5779,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 allowed_sources = {source_filter}
             else:
                 allowed_sources = set(source_filter)
-            rows = conn.execute(
-                "SELECT project, source, COUNT(*) as session_count, "
-                "SUM(input_tokens + output_tokens) as total_tokens "
-                "FROM sessions GROUP BY project, source ORDER BY project"
-            ).fetchall()
+            rows = conn.execute("""
+                WITH workspaces AS (
+                    SELECT project, source, input_tokens, output_tokens FROM sessions
+                    UNION ALL
+                    SELECT m.value, s.source, s.input_tokens, s.output_tokens
+                    FROM sessions s, json_each(
+                        CASE WHEN json_valid(s.project_memberships) THEN s.project_memberships END
+                    ) m
+                    WHERE s.source = 'antigravity' AND m.type = 'text' AND m.value != s.project
+                )
+                SELECT project, source, COUNT(*) AS session_count,
+                       SUM(input_tokens + output_tokens) AS total_tokens
+                FROM workspaces GROUP BY project, source ORDER BY project
+            """).fetchall()
             excluded_projects = settings["excluded_projects"]
             projects = []
             for row in rows:
@@ -5772,7 +5803,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 ):
                     continue
                 project["excluded"] = session_matches_excluded_projects(
-                    project,
+                    {**project, "project_memberships": [project["project"]]},
                     excluded_projects,
                 )
                 projects.append(project)

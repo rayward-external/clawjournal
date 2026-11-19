@@ -165,8 +165,7 @@ def _workbench_rows_for(
     try:
         return list(
             conn.execute(
-                "SELECT session_id, hold_state, embargo_until, project, source "
-                "FROM sessions WHERE session_key = ?",
+                "SELECT * FROM sessions WHERE session_key = ?",
                 (session_key,),
             )
         )
@@ -230,7 +229,7 @@ def _enforce_session_gates(
         )
 
     if excluded_projects and session_matches_excluded_projects(
-        {"project": row["project"], "source": row["source"]},
+        dict(row),
         excluded_projects,
     ):
         raise ExportGateBlocked(

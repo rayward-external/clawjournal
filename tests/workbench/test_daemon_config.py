@@ -86,6 +86,27 @@ class TestGetConfig:
 
 
 class TestProjects:
+    def test_lists_secondary_antigravity_workspace_for_exclusion(self, api):
+        save_config({"excluded_projects": ["antigravity:private"]})
+        conn = open_index()
+        try:
+            upsert_sessions(conn, [{
+                "session_id": "mixed",
+                "project": "antigravity:public",
+                "project_memberships": ["antigravity:public", "antigravity:private"],
+                "source": "antigravity",
+                "messages": [{"role": "user", "content": "Inspect both workspaces"}],
+                "stats": {"input_tokens": 10, "output_tokens": 5},
+            }])
+        finally:
+            conn.close()
+
+        status, rows = _get(api, "/api/projects")
+        assert status == 200
+        assert [(r["project"], r["session_count"], r["excluded"]) for r in rows] == [
+            ("antigravity:private", 1, True), ("antigravity:public", 1, False),
+        ]
+
     @pytest.mark.parametrize(
         ("source", "expected_sources"),
         [

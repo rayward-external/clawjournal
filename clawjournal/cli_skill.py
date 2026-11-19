@@ -560,10 +560,9 @@ def _ensure_corpus(window_days: int, *, do_scan: bool, do_score: bool,
             from .workbench.index import session_matches_excluded_projects
             win_where = "review_status != 'segmented'" + (" AND start_time >= ?" if since else "")
             for r in conn.execute(
-                    f"SELECT session_id, project, source FROM sessions WHERE {win_where}",
+                    f"SELECT session_id, project, source, project_memberships FROM sessions WHERE {win_where}",
                     ([since] if since else [])).fetchall():
-                if session_matches_excluded_projects(
-                        {"project": r["project"], "source": r["source"]}, excluded_projects):
+                if session_matches_excluded_projects(dict(r), excluded_projects):
                     excluded_ids.add(r["session_id"])
         skip = blocked | excluded_ids
 

@@ -10,7 +10,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Iterator, Mapping, cast
 
 from .redaction.anonymizer import Anonymizer
 from .config import (
@@ -435,6 +435,25 @@ def _build_status_next_steps(
     )
 
 
+def _project_selection(projects: list[dict], excluded: set[str]) -> list[dict]:
+    rows = []
+    for project in projects:
+        row = {
+            "name": project["display_name"],
+            "sessions": project["session_count"],
+            "size": _format_size(project["total_size_bytes"]),
+            "excluded": project["display_name"] in excluded,
+            "source": project.get("source", "unknown"),
+        }
+        if project.get("additional_projects"):
+            row["additional_projects"] = [
+                {"name": name, "excluded": name in excluded}
+                for name in project["additional_projects"]
+            ]
+        rows.append(row)
+    return rows
+
+
 def list_projects(source_filter: str = "auto") -> None:
     """Print all projects as JSON (for agents to parse)."""
     projects = discover_projects(source_filter=source_filter)
@@ -443,14 +462,7 @@ def list_projects(source_filter: str = "auto") -> None:
         return
     config = load_config()
     excluded = set(normalize_excluded_project_names(config.get("excluded_projects", [])))
-    print(json.dumps(
-        [{"name": p["display_name"], "sessions": p["session_count"],
-          "size": _format_size(p["total_size_bytes"]),
-          "excluded": p["display_name"] in excluded,
-          "source": p.get("source", "unknown")}
-         for p in projects],
-        indent=2,
-    ))
+    print(json.dumps(_project_selection(projects, excluded), indent=2))
 
 
 def _merge_config_list(config: ClawJournalConfig, key: str, new_values: list[str]) -> None:
@@ -617,12 +629,29 @@ def _anonymize_session_metadata(session: dict, anonymizer: Anonymizer, custom_st
             msg["timestamp"] = _coarsen_timestamp(msg["timestamp"])
 
 
+def _local_export_sessions(
+    sessions: list[dict], excluded_projects: set[str] | None,
+) -> Iterator[dict]:
+    from .workbench.index import session_matches_excluded_projects
+
+    for session in sessions:
+        if session.get("source") == "antigravity":
+            if session_matches_excluded_projects(session, excluded_projects):
+                continue
+            # Workspace memberships are local selection metadata.
+            session = session.copy()
+            session.pop("project_memberships", None)
+        yield session
+
+
 def export_to_jsonl(
     selected_projects: list[dict],
     output_path: Path,
     anonymizer: Anonymizer,
     include_thinking: bool = True,
     custom_strings: list[str] | None = None,
+    *,
+    excluded_projects: set[str] | None = None,
 ) -> dict:
     """Export selected projects to JSONL. Returns metadata."""
     total = 0
@@ -649,7 +678,7 @@ def export_to_jsonl(
                 locator=project.get("locator"),
             )
             proj_count = 0
-            for session in sessions:
+            for session in _local_export_sessions(sessions, excluded_projects):
                 model = session.get("model")
                 if not model or model == "<synthetic>":
                     skipped += 1
@@ -1292,16 +1321,7 @@ def prep(source_filter: str = "auto") -> None:
         "source_filter": resolved_source_choice,
         "source_selection_confirmed": source_explicit,
         "repo": repo_id,
-        "projects": [
-            {
-                "name": p["display_name"],
-                "sessions": p["session_count"],
-                "size": _format_size(p["total_size_bytes"]),
-                "excluded": p["display_name"] in excluded,
-                "source": p.get("source", "unknown"),
-            }
-            for p in projects
-        ],
+        "projects": _project_selection(projects, excluded),
         "redact_strings": [_mask_secret(s) for s in config.get("redact_strings", [])],
         "redact_usernames": config.get("redact_usernames", []),
         "config_file": str(CONFIG_FILE),
@@ -7487,16 +7507,7 @@ def _run_export(args) -> None:
                 "Send the full project/folder list below to the user in a message and get explicit "
                 "confirmation on exclusions before exporting."
             ),
-            "projects": [
-                {
-                    "name": p["display_name"],
-                    "source": p.get("source", "unknown"),
-                    "sessions": p["session_count"],
-                    "size": _format_size(p["total_size_bytes"]),
-                    "excluded": p["display_name"] in excluded,
-                }
-                for p in projects
-            ],
+            "projects": _project_selection(projects, excluded),
             "blocked_on_step": "Step 2/4",
             "process_steps": SETUP_TO_PUBLISH_STEPS,
             "next_command": "clawjournal config --confirm-projects",
@@ -7565,7 +7576,7 @@ def _run_export(args) -> None:
                 source=project.get("source", "claude"),
                 locator=project.get("locator"),
             )
-            for session in sessions:
+            for session in _local_export_sessions(sessions, excluded):
                 if not session.get("display_title"):
                     # Generate title from first user message
                     for m in session.get("messages", []):
@@ -7599,6 +7610,7 @@ def _run_export(args) -> None:
     meta = export_to_jsonl(
         included, output_path, anonymizer, not args.no_thinking,
         custom_strings=custom_strings,
+        excluded_projects=excluded,
     )
     file_size = output_path.stat().st_size
     print(f"\nExported {meta['sessions']} sessions ({_format_size(file_size)})")

@@ -6069,49 +6069,43 @@ def _load_antigravity_summaries() -> dict[str, dict[str, Any]]:
     """Read each conversation's folder, title and parent from conversation_summaries.db."""
     db_path = ANTIGRAVITY_DIR / "conversation_summaries.db"
     summaries: dict[str, dict[str, Any]] = {}
-    if not db_path.is_file():
-        return summaries
     try:
-        with closing(_connect_sqlite_readonly(db_path)) as conn:
-            columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(conversation_summaries)")
+        db_path.stat()
+    except FileNotFoundError:
+        # Older installations may provide only the resume files.
+        return summaries
+    with closing(_connect_sqlite_readonly(db_path)) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversation_summaries)")}
+        if "conversation_id" not in columns:
+            raise ValueError("missing conversation_summaries.conversation_id")
+        # Earlier builds lack some of these columns.
+        wanted = [
+            column
+            for column in ("workspace_uris", "title", "parent_conversation_id")
+            if column in columns
+        ]
+        for row in conn.execute(
+            f"SELECT {', '.join(['conversation_id', *wanted])} FROM conversation_summaries"
+        ):
+            conversation_id = _kiro_str(row["conversation_id"])
+            if conversation_id is None:
+                continue
+            values = {column: row[column] for column in wanted}
+            uris = _json_loads_maybe(values.get("workspace_uris"))
+            if uris is not None and not isinstance(uris, list):
+                raise ValueError("invalid workspace_uris")
+            folders = map(_antigravity_file_uri_path, uris or [])
+            summaries[conversation_id] = {
+                "folders": [folder for folder in folders if folder],
+                "title": values.get("title"),
+                "parent": _kiro_str(values.get("parent_conversation_id")),
             }
-            if "conversation_id" not in columns:
-                return summaries
-            # Earlier builds lack some of these columns.
-            wanted = [
-                column
-                for column in ("workspace_uris", "title", "parent_conversation_id")
-                if column in columns
-            ]
-            for row in conn.execute(
-                f"SELECT {', '.join(['conversation_id', *wanted])} FROM conversation_summaries"
-            ):
-                conversation_id = _kiro_str(row["conversation_id"])
-                if conversation_id is None:
-                    continue
-                values = {column: row[column] for column in wanted}
-                # workspace_uris is a JSON array of file:// URIs.
-                uris = _json_loads_maybe(values.get("workspace_uris"))
-                folders = map(_antigravity_file_uri_path, uris if isinstance(uris, list) else [])
-                summaries[conversation_id] = {
-                    "cwd": next((folder for folder in folders if folder), None),
-                    "title": values.get("title"),
-                    "parent": _kiro_str(values.get("parent_conversation_id")),
-                }
-    except sqlite3.Error:
-        logger.warning("Failed to read Antigravity CLI conversation summaries %s", db_path)
     return summaries
 
 
-def _load_antigravity_prompt_workspaces() -> dict[str, str]:
-    """Map conversations to the folder the CLI's resume files record for them.
-
-    history.jsonl holds one {display, timestamp, workspace, conversationId}
-    line per submitted prompt, and cache/last_conversations.json maps each
-    folder to its newest conversation.
-    """
-    workspaces: dict[str, str] = {}
+def _load_antigravity_prompt_workspaces() -> dict[str, list[str]]:
+    """Read the workspace names recorded by history.jsonl and the resume cache."""
+    workspaces: dict[str, dict[str, None]] = {}
     try:
         for entry in _iter_jsonl(ANTIGRAVITY_DIR / "history.jsonl"):
             if not isinstance(entry, dict):
@@ -6119,32 +6113,76 @@ def _load_antigravity_prompt_workspaces() -> dict[str, str]:
             conversation_id = _kiro_str(entry.get("conversationId"))
             workspace = _kiro_str(entry.get("workspace"))
             if conversation_id and workspace:
-                workspaces.setdefault(conversation_id, workspace)
-    except OSError:
+                workspaces.setdefault(conversation_id, {})[workspace] = None
+    except FileNotFoundError:
         pass
-    newest = _load_kiro_json(ANTIGRAVITY_DIR / "cache" / "last_conversations.json")
-    for workspace, conversation_id in newest.items() if isinstance(newest, dict) else ():
+    try:
+        with (ANTIGRAVITY_DIR / "cache" / "last_conversations.json").open(encoding="utf-8") as f:
+            newest = json.load(f)
+    except FileNotFoundError:
+        newest = {}
+    if not isinstance(newest, dict):
+        raise ValueError("invalid Antigravity resume cache")
+    for workspace, conversation_id in newest.items():
         workspace = _kiro_str(workspace)
         if isinstance(conversation_id, str) and workspace:
-            workspaces.setdefault(conversation_id, workspace)
-    return workspaces
+            workspaces.setdefault(conversation_id, {})[workspace] = None
+    return {sid: list(folders) for sid, folders in workspaces.items()}
 
 
-def _antigravity_cwd(
+def _antigravity_system_message(content: str) -> tuple[str, str | None, str]:
+    block = _ANTIGRAVITY_SYSTEM_MESSAGE_RE.search(content)
+    text = (block.group(1) if block else content).strip()
+    sent = _ANTIGRAVITY_MESSAGE_RE.match(text)
+    if sent:
+        return text, sent.group(1), sent.group(2).strip()
+    return text, None, ""
+
+
+def _antigravity_assignment(records: Iterable[Any]) -> tuple[str, str] | None:
+    """Find the opening assignment in a promptless child's possibly out-of-order steps."""
+    first_step = None
+    assignment = None
+    step = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("type")
+        if kind == "USER_INPUT":
+            # A user conversation can also receive reports from its children.
+            return None
+        index = record.get("step_index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            step = index
+        if first_step is not None and step >= first_step:
+            continue
+        if kind == "PLANNER_RESPONSE":
+            # A message received after work started is not the opening assignment.
+            first_step, assignment = step, None
+        elif kind == "SYSTEM_MESSAGE" and record.get("source") != "SYSTEM_SDK":
+            content = record.get("content")
+            if isinstance(content, str):
+                _, sender, body = _antigravity_system_message(content)
+                if sender and _UUID_RE.fullmatch(sender):
+                    first_step, assignment = step, (sender, body)
+    return assignment
+
+
+def _antigravity_folders(
     conversation_id: str | None,
     summaries: dict[str, dict[str, Any]],
-    workspaces: dict[str, str],
-) -> str | None:
+    workspaces: dict[str, list[str]],
+) -> list[str]:
+    # A subagent can have its own worktree while still belonging to its parent's project.
     seen: set[str] = set()
+    folders: list[str] = []
     while conversation_id and conversation_id not in seen:
         seen.add(conversation_id)
         summary = summaries.get(conversation_id, {})
-        cwd = summary.get("cwd") or workspaces.get(conversation_id)
-        if cwd:
-            return cwd
-        # A subagent with no folder recorded works in its parent's.
-        conversation_id = summary.get("parent")
-    return None
+        folders.extend(summary.get("folders", []))
+        folders.extend(workspaces.get(conversation_id, []))
+        conversation_id = summary.get("parent") or summary.get("inferred_parent")
+    return list(dict.fromkeys(folders)) or [UNKNOWN_ANTIGRAVITY_CWD]
 
 
 def _antigravity_transcript(conversation_dir: Path) -> tuple[Path, int] | None:
@@ -6173,38 +6211,59 @@ def _build_antigravity_project_index() -> dict[str, list[dict[str, Any]]]:
         )
     except OSError:
         return index
-    summaries = _load_antigravity_summaries()
-    workspaces = _load_antigravity_prompt_workspaces()
-    for conversation_dir in conversation_dirs:
-        # A folder without a log is a conversation that has not had a prompt yet.
-        transcript = _antigravity_transcript(conversation_dir)
-        if transcript is None:
-            continue
-        conversation_id = conversation_dir.name
-        summary = summaries.get(conversation_id, {})
-        cwd = _antigravity_cwd(conversation_id, summaries, workspaces)
-        index.setdefault(cwd or UNKNOWN_ANTIGRAVITY_CWD, []).append({
+    transcripts: dict[str, tuple[Path, int]] = {}
+    try:
+        summaries = _load_antigravity_summaries()
+        workspaces = _load_antigravity_prompt_workspaces()
+        for conversation_dir in conversation_dirs:
+            transcript = _antigravity_transcript(conversation_dir)
+            if transcript is None:
+                continue
+            conversation_id = conversation_dir.name
+            transcripts[conversation_id] = transcript
+            summary = summaries.setdefault(conversation_id, {})
+            if not summary.get("parent"):
+                assignment = _antigravity_assignment(_iter_jsonl(transcript[0]))
+                if assignment:
+                    summary["inferred_parent"] = assignment[0]
+    except (OSError, sqlite3.Error, ValueError):
+        # Partial ownership data could move an excluded trace into an allowed
+        # project. Defer this source and leave its previously indexed rows intact.
+        logger.warning("Deferring Antigravity CLI discovery: cannot read project metadata")
+        return index
+
+    for conversation_id, (path, size) in transcripts.items():
+        summary = summaries[conversation_id]
+        folders = _antigravity_folders(conversation_id, summaries, workspaces)
+        memberships = list(dict.fromkeys(map(_build_antigravity_project_name, folders)))
+        index.setdefault(folders[0], []).append({
             "id": conversation_id,
-            "path": transcript[0],
-            "size": transcript[1],
+            "path": path,
+            "size": size,
             "title": summary.get("title"),
             "parent": summary.get("parent"),
+            "inferred_parent": summary.get("inferred_parent"),
+            "project_memberships": memberships,
         })
     return index
 
 
 def _discover_antigravity_projects() -> list[dict]:
     index = _get_antigravity_project_index(refresh=True)
-    return [
-        {
+    projects = []
+    for cwd, refs in sorted(index.items()):
+        project = {
             "dir_name": cwd,
             "display_name": _build_antigravity_project_name(cwd),
             "session_count": len(refs),
             "total_size_bytes": sum(ref["size"] for ref in refs),
             "source": ANTIGRAVITY_SOURCE,
         }
-        for cwd, refs in sorted(index.items())
-    ]
+        additional = {name for ref in refs for name in ref["project_memberships"][1:]}
+        if additional:
+            project["additional_projects"] = sorted(additional)
+        projects.append(project)
+    return projects
 
 
 def _parse_antigravity_project_sessions(
@@ -6218,6 +6277,7 @@ def _parse_antigravity_project_sessions(
         if not parsed or not parsed["messages"]:
             continue
         parsed["project"] = _build_antigravity_project_name(project_dir_name)
+        parsed["project_memberships"] = ref["project_memberships"]
         parsed["source"] = ANTIGRAVITY_SOURCE
         parsed["raw_source_path"] = str(ref["path"])
         parsed["client_origin"] = "cli"
@@ -6303,9 +6363,15 @@ def _parse_antigravity_transcript(
     # Results carry no call ID. The nth call of the response at step N is
     # answered by the step at N + n, so calls are kept by that step.
     calls_by_result_step: dict[int, dict[str, Any]] = {}
-    has_prompt = False
-    # (sender, text) of the first message another conversation sent this one.
-    assignment: tuple[str, str] | None = None
+    assignment = _antigravity_assignment(record for _, _, record in records)
+    parent = ref.get("parent")
+    if not parent:
+        parent = assignment[0] if assignment else None
+        if parent != ref.get("inferred_parent"):
+            # The file changed after discovery. Resolve ownership on the next scan.
+            return None
+    if assignment and assignment[1] and metadata["segment_title"] is None:
+        metadata["segment_title"] = _kiro_title(assignment[1].split("\n", 1)[0], anonymizer)
 
     for step, _, record in records:
         kind = record.get("type")
@@ -6314,7 +6380,6 @@ def _parse_antigravity_transcript(
         content = content if isinstance(content, str) else ""
 
         if kind == "USER_INPUT":
-            has_prompt = True
             if metadata["model"] is None:
                 # The model is only named in the settings change that the CLI
                 # appends to a conversation's first prompt.
@@ -6365,10 +6430,7 @@ def _parse_antigravity_transcript(
             # Text the CLI hands the model in the user's turn: a background
             # task's result, or a message from another conversation (a
             # subagent's report, or the task its parent gave it).
-            block = _ANTIGRAVITY_SYSTEM_MESSAGE_RE.search(content)
-            text = (block.group(1) if block else content).strip()
-            sent = _ANTIGRAVITY_MESSAGE_RE.match(text)
-            sender, body = (sent.group(1), sent.group(2).strip()) if sent else (None, "")
+            text, sender, body = _antigravity_system_message(content)
             # The CLI's own reminders and notices are not part of the
             # conversation. It adds one each time a conversation is resumed.
             if record.get("source") == "SYSTEM_SDK" or (
@@ -6377,8 +6439,6 @@ def _parse_antigravity_transcript(
                 continue
             if not text:
                 continue
-            if assignment is None and sender and _UUID_RE.match(sender):
-                assignment = (sender, body)
             messages.append(
                 {"role": "user", "content": anonymizer.text(text), "timestamp": timestamp}
             )
@@ -6400,12 +6460,6 @@ def _parse_antigravity_transcript(
         # CHECKPOINT (a compaction summary of steps already in the log),
         # CONVERSATION_HISTORY and ERROR_MESSAGE add nothing to the conversation.
 
-    parent = _kiro_str(ref.get("parent"))
-    if not has_prompt and assignment is not None:
-        # A subagent has no prompt of its own; it starts with its parent's message.
-        parent = parent or assignment[0]
-        if metadata["segment_title"] is None and assignment[1]:
-            metadata["segment_title"] = _kiro_title(assignment[1].split("\n", 1)[0], anonymizer)
     if metadata["model"] is None:
         metadata["model"] = "antigravity-unknown"
 
