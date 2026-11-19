@@ -94,6 +94,12 @@ def _isolate_kiro(tmp_path, monkeypatch):
     monkeypatch.setattr("clawjournal.parsing.parser._KIRO_PROJECT_INDEX", {})
 
 
+@pytest.fixture(autouse=True)
+def _isolate_antigravity(tmp_path, monkeypatch):
+    monkeypatch.setattr("clawjournal.parsing.parser.ANTIGRAVITY_DIR", tmp_path / "no-antigravity")
+    monkeypatch.setattr("clawjournal.parsing.parser._ANTIGRAVITY_PROJECT_INDEX", {})
+
+
 def test_iter_jsonl_decodes_utf8_explicitly(tmp_path):
     path = tmp_path / "session.jsonl"
     payload = {"message": "research note with Cyrillic: с"}

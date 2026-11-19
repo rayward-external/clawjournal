@@ -42,6 +42,8 @@ function sourceLabel(s: { source: string; client_origin?: string | null; runtime
     const label = s.client_origin === 'desktop' ? 'Kiro IDE' : s.client_origin === 'cli' ? 'Kiro CLI' : 'Kiro';
     return { label, color: '#4f46e5' };
   }
+  if (s.source === 'antigravity')
+    return { label: 'Antigravity CLI', color: '#be185d' };
   return { label: s.source, color: '#6b7280' };
 }
 

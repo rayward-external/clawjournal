@@ -5466,6 +5466,7 @@ def test_runner_happy_path_seals_exact_artifact_and_commits_hosted_receipt(
         "CODEX_SESSIONS_DIR": home / ".codex" / "sessions",
         "CODEX_ARCHIVED_DIR": home / ".codex" / "archived_sessions",
         "GEMINI_DIR": home / ".gemini" / "tmp",
+        "ANTIGRAVITY_DIR": home / ".gemini" / "antigravity-cli",
         "OPENCODE_DIR": home / ".local" / "share" / "opencode",
         "OPENCODE_DB_PATH": home / ".local" / "share" / "opencode" / "opencode.db",
         "OPENCLAW_DIR": home / ".openclaw",

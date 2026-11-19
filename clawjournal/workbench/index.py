@@ -6340,6 +6340,7 @@ def get_dashboard_analytics(
         "  WHEN source = 'kiro' AND client_origin = 'desktop' THEN 'Kiro IDE' "
         "  WHEN source = 'kiro' AND client_origin = 'cli' THEN 'Kiro CLI' "
         "  WHEN source = 'kiro' THEN 'Kiro' "
+        "  WHEN source = 'antigravity' THEN 'Antigravity CLI' "
         "  ELSE source "
         "END as agent, COUNT(*) as count "
         f"FROM sessions{filtered_where} GROUP BY agent ORDER BY count DESC",

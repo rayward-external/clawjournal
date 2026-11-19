@@ -1,4 +1,4 @@
-"""Parse Claude Code, Claude Science, Codex, Gemini CLI, OpenCode, OpenClaw, and Kiro session data into conversations."""
+"""Parse Claude Code, Claude Science, Codex, Gemini CLI, Antigravity CLI, OpenCode, OpenClaw, and Kiro session data into conversations."""
 
 import base64
 import dataclasses
@@ -17,6 +17,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from ..config import CONFIG_DIR
 from ..redaction.anonymizer import Anonymizer
@@ -36,6 +37,7 @@ COPILOT_SOURCE = "copilot"
 AIDER_SOURCE = "aider"
 WORKBUDDY_SOURCE = "workbuddy"
 KIRO_SOURCE = "kiro"
+ANTIGRAVITY_SOURCE = "antigravity"
 CUSTOM_SOURCE = "custom"
 
 CLAUDE_DIR = Path.home() / ".claude"
@@ -93,6 +95,11 @@ KIRO_CLI_DB_PATH = KIRO_CLI_DIR / "data.sqlite3"
 KIRO_IDE_DIR = _KIRO_IDE_USER_DATA_DIR / "User" / "globalStorage" / "kiro.kiroagent"
 UNKNOWN_KIRO_CWD = "<unknown-cwd>"
 
+# Antigravity CLI (`agy`, https://antigravity.google/product/antigravity-cli)
+# keeps its data beside Gemini CLI's.
+ANTIGRAVITY_DIR = Path.home() / ".gemini" / "antigravity-cli"
+UNKNOWN_ANTIGRAVITY_CWD = "<unknown-cwd>"
+
 CUSTOM_DIR = CONFIG_DIR / "custom"
 
 # Claude Desktop local-agent-mode-sessions (macOS only for now)
@@ -137,6 +144,7 @@ _CURSOR_PROJECT_INDEX: dict[str, list[Path]] = {}
 _AIDER_PROJECT_INDEX: dict[str, Path] = {}
 _WORKBUDDY_PROJECT_INDEX: dict[str, list[Path]] = {}
 _KIRO_PROJECT_INDEX: dict[str, list[dict[str, Any]]] = {}
+_ANTIGRAVITY_PROJECT_INDEX: dict[str, list[dict[str, Any]]] = {}
 
 
 def _build_gemini_hash_map() -> dict[str, str]:
@@ -522,6 +530,7 @@ def discover_projects(source_filter: str | None = None) -> list[dict]:
         AIDER_SOURCE: _discover_aider_projects,
         WORKBUDDY_SOURCE: _discover_workbuddy_projects,
         KIRO_SOURCE: _discover_kiro_projects,
+        ANTIGRAVITY_SOURCE: _discover_antigravity_projects,
         CUSTOM_SOURCE: _discover_custom_projects,
     }
 
@@ -2022,6 +2031,11 @@ def parse_project_sessions(
 
     if source == KIRO_SOURCE:
         return _parse_kiro_project_sessions(
+            project_dir_name, anonymizer, include_thinking,
+        )
+
+    if source == ANTIGRAVITY_SOURCE:
+        return _parse_antigravity_project_sessions(
             project_dir_name, anonymizer, include_thinking,
         )
 
@@ -4360,6 +4374,12 @@ def _build_kiro_project_name(cwd: str) -> str:
     return f"kiro:{Path(cwd).name or cwd}"
 
 
+def _build_antigravity_project_name(cwd: str) -> str:
+    if cwd == UNKNOWN_ANTIGRAVITY_CWD:
+        return "antigravity:unknown"
+    return f"antigravity:{Path(cwd).name or cwd}"
+
+
 def _get_opencode_project_index(refresh: bool = False) -> dict[str, list[str]]:
     global _OPENCODE_PROJECT_INDEX
     if refresh or not _OPENCODE_PROJECT_INDEX:
@@ -5989,3 +6009,407 @@ def _parse_kiro_ide_session(
                 ])
             transcript.assistant_text(text, None)
     return transcript.result()
+
+
+# Antigravity CLI (`agy`) writes a plaintext step log per conversation:
+#
+#   <data dir>/brain/<conversation-id>/.system_generated/logs/
+#       transcript_full.jsonl   every step, nothing cut
+#       transcript.jsonl        the same steps, with long fields cut and tool
+#                               arguments encoded as JSON strings
+#
+# A line is one step: {step_index, source, type, status, created_at} plus
+# content, thinking, tool_calls and token counts, depending on the type. The
+# log names neither the working directory nor a title. Those come from
+# conversation_summaries.db, with history.jsonl and
+# cache/last_conversations.json as further sources for the directory.
+#
+# Projects are keyed by working directory, as for Codex and Kiro.
+
+_ANTIGRAVITY_TRANSCRIPT_NAMES = ("transcript_full.jsonl", "transcript.jsonl")
+_ANTIGRAVITY_USER_REQUEST_RE = re.compile(r"<USER_REQUEST>(.*)</USER_REQUEST>", re.DOTALL)
+# Blocks the CLI appends to a prompt: the local time, and settings changes.
+_ANTIGRAVITY_INJECTED_BLOCK_RE = re.compile(
+    r"<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>.*?</\1>", re.DOTALL
+)
+_ANTIGRAVITY_MODEL_RE = re.compile(r"`Model Selection` from .+? to (.+?)\.(?=\s|$)")
+# The tag must start a line: the sentence introducing the block names it too.
+_ANTIGRAVITY_SYSTEM_MESSAGE_RE = re.compile(
+    r"^<SYSTEM_MESSAGE>(.*)</SYSTEM_MESSAGE>", re.DOTALL | re.MULTILINE
+)
+_ANTIGRAVITY_MESSAGE_RE = re.compile(
+    r"\[Message\] timestamp=\S+ sender=(\S+)(?: priority=\S+)?(?: content=|\s+)?(.*)",
+    re.DOTALL,
+)
+# The line a command's result opens with, after its Created At / Completed At
+# lines. Anchored so the same words inside a command's own output never match.
+_ANTIGRAVITY_EXIT_CODE_RE = re.compile(
+    r"\A(?:(?:Created|Completed) At:[^\n]*\n)*\s*(?:The )?[Cc]ommand exited with code (-?\d+)\."
+)
+
+
+def _antigravity_file_uri_path(uri: Any) -> str | None:
+    """Return the local path a file:// URI names, or None if it names none."""
+    if not isinstance(uri, str):
+        return None
+    try:
+        parts = urlsplit(uri.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "file" or parts.netloc.lower() not in ("", "localhost"):
+        return None
+    path = unquote(parts.path)
+    # file:///C:/Users/dev/project names C:/Users/dev/project.
+    if re.match(r"/[A-Za-z]:", path):
+        path = path[1:]
+    return (path.rstrip("/") or path) or None
+
+
+def _load_antigravity_summaries() -> dict[str, dict[str, Any]]:
+    """Read each conversation's folder, title and parent from conversation_summaries.db."""
+    db_path = ANTIGRAVITY_DIR / "conversation_summaries.db"
+    summaries: dict[str, dict[str, Any]] = {}
+    if not db_path.is_file():
+        return summaries
+    try:
+        with closing(_connect_sqlite_readonly(db_path)) as conn:
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(conversation_summaries)")
+            }
+            if "conversation_id" not in columns:
+                return summaries
+            # Earlier builds lack some of these columns.
+            wanted = [
+                column
+                for column in ("workspace_uris", "title", "parent_conversation_id")
+                if column in columns
+            ]
+            for row in conn.execute(
+                f"SELECT {', '.join(['conversation_id', *wanted])} FROM conversation_summaries"
+            ):
+                conversation_id = _kiro_str(row["conversation_id"])
+                if conversation_id is None:
+                    continue
+                values = {column: row[column] for column in wanted}
+                # workspace_uris is a JSON array of file:// URIs.
+                uris = _json_loads_maybe(values.get("workspace_uris"))
+                folders = map(_antigravity_file_uri_path, uris if isinstance(uris, list) else [])
+                summaries[conversation_id] = {
+                    "cwd": next((folder for folder in folders if folder), None),
+                    "title": values.get("title"),
+                    "parent": _kiro_str(values.get("parent_conversation_id")),
+                }
+    except sqlite3.Error:
+        logger.warning("Failed to read Antigravity CLI conversation summaries %s", db_path)
+    return summaries
+
+
+def _load_antigravity_prompt_workspaces() -> dict[str, str]:
+    """Map conversations to the folder the CLI's resume files record for them.
+
+    history.jsonl holds one {display, timestamp, workspace, conversationId}
+    line per submitted prompt, and cache/last_conversations.json maps each
+    folder to its newest conversation.
+    """
+    workspaces: dict[str, str] = {}
+    try:
+        for entry in _iter_jsonl(ANTIGRAVITY_DIR / "history.jsonl"):
+            if not isinstance(entry, dict):
+                continue
+            conversation_id = _kiro_str(entry.get("conversationId"))
+            workspace = _kiro_str(entry.get("workspace"))
+            if conversation_id and workspace:
+                workspaces.setdefault(conversation_id, workspace)
+    except OSError:
+        pass
+    newest = _load_kiro_json(ANTIGRAVITY_DIR / "cache" / "last_conversations.json")
+    for workspace, conversation_id in newest.items() if isinstance(newest, dict) else ():
+        workspace = _kiro_str(workspace)
+        if isinstance(conversation_id, str) and workspace:
+            workspaces.setdefault(conversation_id, workspace)
+    return workspaces
+
+
+def _antigravity_cwd(
+    conversation_id: str | None,
+    summaries: dict[str, dict[str, Any]],
+    workspaces: dict[str, str],
+) -> str | None:
+    seen: set[str] = set()
+    while conversation_id and conversation_id not in seen:
+        seen.add(conversation_id)
+        summary = summaries.get(conversation_id, {})
+        cwd = summary.get("cwd") or workspaces.get(conversation_id)
+        if cwd:
+            return cwd
+        # A subagent with no folder recorded works in its parent's.
+        conversation_id = summary.get("parent")
+    return None
+
+
+def _antigravity_transcript(conversation_dir: Path) -> tuple[Path, int] | None:
+    """Return the step log to read for a conversation, and its size."""
+    for name in _ANTIGRAVITY_TRANSCRIPT_NAMES:
+        path = conversation_dir / ".system_generated" / "logs" / name
+        size = _kiro_file_size(path)
+        if size:
+            return path, size
+    return None
+
+
+def _get_antigravity_project_index(refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    global _ANTIGRAVITY_PROJECT_INDEX
+    if refresh or not _ANTIGRAVITY_PROJECT_INDEX:
+        _ANTIGRAVITY_PROJECT_INDEX = _build_antigravity_project_index()
+    return _ANTIGRAVITY_PROJECT_INDEX
+
+
+def _build_antigravity_project_index() -> dict[str, list[dict[str, Any]]]:
+    """Group every conversation that has a step log by working directory."""
+    index: dict[str, list[dict[str, Any]]] = {}
+    try:
+        conversation_dirs = sorted(
+            p for p in (ANTIGRAVITY_DIR / "brain").iterdir() if p.is_dir()
+        )
+    except OSError:
+        return index
+    summaries = _load_antigravity_summaries()
+    workspaces = _load_antigravity_prompt_workspaces()
+    for conversation_dir in conversation_dirs:
+        # A folder without a log is a conversation that has not had a prompt yet.
+        transcript = _antigravity_transcript(conversation_dir)
+        if transcript is None:
+            continue
+        conversation_id = conversation_dir.name
+        summary = summaries.get(conversation_id, {})
+        cwd = _antigravity_cwd(conversation_id, summaries, workspaces)
+        index.setdefault(cwd or UNKNOWN_ANTIGRAVITY_CWD, []).append({
+            "id": conversation_id,
+            "path": transcript[0],
+            "size": transcript[1],
+            "title": summary.get("title"),
+            "parent": summary.get("parent"),
+        })
+    return index
+
+
+def _discover_antigravity_projects() -> list[dict]:
+    index = _get_antigravity_project_index(refresh=True)
+    return [
+        {
+            "dir_name": cwd,
+            "display_name": _build_antigravity_project_name(cwd),
+            "session_count": len(refs),
+            "total_size_bytes": sum(ref["size"] for ref in refs),
+            "source": ANTIGRAVITY_SOURCE,
+        }
+        for cwd, refs in sorted(index.items())
+    ]
+
+
+def _parse_antigravity_project_sessions(
+    project_dir_name: str,
+    anonymizer: Anonymizer,
+    include_thinking: bool,
+) -> list[dict]:
+    sessions = []
+    for ref in _get_antigravity_project_index().get(project_dir_name, []):
+        parsed = _parse_antigravity_transcript(ref, anonymizer, include_thinking)
+        if not parsed or not parsed["messages"]:
+            continue
+        parsed["project"] = _build_antigravity_project_name(project_dir_name)
+        parsed["source"] = ANTIGRAVITY_SOURCE
+        parsed["raw_source_path"] = str(ref["path"])
+        parsed["client_origin"] = "cli"
+        sessions.append(parsed)
+    return sessions
+
+
+def _antigravity_prompt(content: str) -> str:
+    """Return the prompt the user sent, without the blocks the CLI adds to it."""
+    request = _ANTIGRAVITY_USER_REQUEST_RE.search(content)
+    if request:
+        return request.group(1).strip()
+    return _ANTIGRAVITY_INJECTED_BLOCK_RE.sub("", content).strip()
+
+
+def _antigravity_tool_input(args: Any, anonymizer: Anonymizer) -> dict:
+    """Anonymize a tool call's arguments, keeping every field.
+
+    Antigravity names arguments in PascalCase (CommandLine, TargetFile, Cwd),
+    which the field names _parse_tool_input knows do not cover.
+    """
+    args = _json_loads_maybe(args)
+    if args is None:
+        return {}
+    if not isinstance(args, dict):
+        return {"raw": anonymizer.text(str(args))}
+    result: dict[str, Any] = {}
+    for key, value in args.items():
+        if key == "CommandLine" and isinstance(value, str):
+            redacted, _, _ = redact_text(value)
+            result[key] = anonymizer.text(redacted)
+        else:
+            result[key] = _anonymize_claude_science_value(value, anonymizer, str(key))
+    return result
+
+
+def _antigravity_result_status(record: dict[str, Any], content: str) -> str | None:
+    status = record.get("status")
+    if status == "RUNNING":
+        # Sent to the background. Its end arrives later as a system message.
+        return None
+    if status == "ERROR" or record.get("error"):
+        return "error"
+    # A command that exits nonzero is still DONE; only its exit code says so.
+    exit_code = record.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        reported = _ANTIGRAVITY_EXIT_CODE_RE.match(content)
+        exit_code = int(reported.group(1)) if reported else 0
+    return "error" if exit_code else "success"
+
+
+def _parse_antigravity_transcript(
+    ref: dict[str, Any], anonymizer: Anonymizer, include_thinking: bool
+) -> dict | None:
+    """Parse one conversation's step log into the shared session shape."""
+    records: list[tuple[int, int, dict[str, Any]]] = []
+    try:
+        for position, record in enumerate(_iter_jsonl(ref["path"])):
+            if not isinstance(record, dict):
+                continue
+            step = record.get("step_index")
+            if isinstance(step, bool) or not isinstance(step, int):
+                # No index: keep the line right after the one before it.
+                step = records[-1][0] if records else 0
+            records.append((step, position, record))
+    except OSError:
+        return None
+    # Steps are appended as they settle, which is not always in step order.
+    records.sort(key=lambda item: item[:2])
+
+    messages: list[dict[str, Any]] = []
+    metadata: dict[str, Any] = {
+        "session_id": ref["id"],
+        "cwd": None,
+        "git_branch": None,
+        "model": None,
+        "model_effort": None,
+        "start_time": None,
+        "end_time": None,
+        "segment_title": _kiro_title(ref.get("title"), anonymizer),
+    }
+    stats = _make_stats()
+    # Results carry no call ID. The nth call of the response at step N is
+    # answered by the step at N + n, so calls are kept by that step.
+    calls_by_result_step: dict[int, dict[str, Any]] = {}
+    has_prompt = False
+    # (sender, text) of the first message another conversation sent this one.
+    assignment: tuple[str, str] | None = None
+
+    for step, _, record in records:
+        kind = record.get("type")
+        timestamp = _kiro_timestamp(record.get("created_at"))
+        content = record.get("content")
+        content = content if isinstance(content, str) else ""
+
+        if kind == "USER_INPUT":
+            has_prompt = True
+            if metadata["model"] is None:
+                # The model is only named in the settings change that the CLI
+                # appends to a conversation's first prompt.
+                model = _ANTIGRAVITY_MODEL_RE.search(content)
+                if model:
+                    metadata["model"] = model.group(1).strip()
+            prompt = _antigravity_prompt(content)
+            if prompt:
+                messages.append(
+                    {"role": "user", "content": anonymizer.text(prompt), "timestamp": timestamp}
+                )
+                stats["user_messages"] += 1
+                _update_time_bounds(metadata, timestamp)
+
+        elif kind == "PLANNER_RESPONSE":
+            message: dict[str, Any] = {"role": "assistant", "timestamp": timestamp}
+            text = _kiro_str(content)
+            if text:
+                message["content"] = anonymizer.text(text)
+            thinking = _kiro_str(record.get("thinking")) if include_thinking else None
+            if thinking:
+                message["thinking"] = anonymizer.text(thinking)
+            tool_uses: list[dict[str, Any]] = []
+            calls = _json_loads_maybe(record.get("tool_calls"))
+            for offset, call in enumerate(calls if isinstance(calls, list) else [], start=1):
+                name = _kiro_str(call.get("name")) if isinstance(call, dict) else None
+                if name is None:
+                    continue
+                tool_use = {
+                    "tool": name,
+                    "input": _antigravity_tool_input(call.get("args"), anonymizer),
+                }
+                tool_uses.append(tool_use)
+                calls_by_result_step[step + offset] = tool_use
+            if tool_uses:
+                message["tool_uses"] = tool_uses
+            # input_tokens excludes what cache_read_tokens counts.
+            stats["input_tokens"] += _safe_int(record.get("input_tokens"))
+            stats["output_tokens"] += _safe_int(record.get("output_tokens"))
+            stats["cache_read_tokens"] += _safe_int(record.get("cache_read_tokens"))
+            if len(message) > 2:
+                messages.append(message)
+                stats["assistant_messages"] += 1
+                stats["tool_uses"] += len(tool_uses)
+                _update_time_bounds(metadata, timestamp)
+
+        elif kind == "SYSTEM_MESSAGE":
+            # Text the CLI hands the model in the user's turn: a background
+            # task's result, or a message from another conversation (a
+            # subagent's report, or the task its parent gave it).
+            block = _ANTIGRAVITY_SYSTEM_MESSAGE_RE.search(content)
+            text = (block.group(1) if block else content).strip()
+            sent = _ANTIGRAVITY_MESSAGE_RE.match(text)
+            sender, body = (sent.group(1), sent.group(2).strip()) if sent else (None, "")
+            # The CLI's own reminders and notices are not part of the
+            # conversation. It adds one each time a conversation is resumed.
+            if record.get("source") == "SYSTEM_SDK" or (
+                sender == "system" and body.startswith("[Notice]")
+            ):
+                continue
+            if not text:
+                continue
+            if assignment is None and sender and _UUID_RE.match(sender):
+                assignment = (sender, body)
+            messages.append(
+                {"role": "user", "content": anonymizer.text(text), "timestamp": timestamp}
+            )
+            stats["user_messages"] += 1
+            _update_time_bounds(metadata, timestamp)
+
+        elif record.get("source") == "MODEL":
+            # Any other step the model produced is a tool's result.
+            tool_use = calls_by_result_step.get(step)
+            if tool_use is None:
+                continue
+            text = content.strip() or _kiro_str(record.get("error")) or ""
+            tool_use["output"] = {"text": anonymizer.text(text)} if text else {}
+            status = _antigravity_result_status(record, content)
+            if status:
+                tool_use["status"] = status
+            _update_time_bounds(metadata, timestamp)
+
+        # CHECKPOINT (a compaction summary of steps already in the log),
+        # CONVERSATION_HISTORY and ERROR_MESSAGE add nothing to the conversation.
+
+    parent = _kiro_str(ref.get("parent"))
+    if not has_prompt and assignment is not None:
+        # A subagent has no prompt of its own; it starts with its parent's message.
+        parent = parent or assignment[0]
+        if metadata["segment_title"] is None and assignment[1]:
+            metadata["segment_title"] = _kiro_title(assignment[1].split("\n", 1)[0], anonymizer)
+    if metadata["model"] is None:
+        metadata["model"] = "antigravity-unknown"
+
+    result = _make_session_result(metadata, messages, stats)
+    if result is not None and parent and parent != ref["id"]:
+        result["parent_session_id"] = parent
+    return result

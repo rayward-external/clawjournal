@@ -23,6 +23,7 @@ from .config import (
     set_source_scope,
 )
 from .parsing.parser import (
+    ANTIGRAVITY_DIR,
     CLAUDE_DIR,
     CLAUDE_SCIENCE_DIR,
     CLAUDE_SCIENCE_SOURCE,
@@ -122,9 +123,9 @@ SETUP_TO_PUBLISH_STEPS = [
     "Step 4/4: Review and confirm: clawjournal confirm ...",
 ]
 
-EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "kimi", "kiro", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"}
-SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "kimi", "kiro", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"]
-WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "gemini", "kimi", "kiro"]
+EXPLICIT_SOURCE_CHOICES = {"claude", "claude-science", "codex", "custom", "gemini", "antigravity", "kimi", "kiro", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"}
+SOURCE_CHOICES = ["auto", "claude", "claude-science", "codex", "custom", "gemini", "antigravity", "kimi", "kiro", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "all", "both"]
+WORKBENCH_SOURCE_CHOICES = ["claude", "claude-science", "codex", "opencode", "openclaw", "cursor", "copilot", "aider", "workbuddy", "gemini", "kimi", "kiro", "antigravity"]
 EVENT_SOURCE_CHOICES = ["auto", "claude", "codex", "openclaw", "all"]
 PII_PROVIDER_CHOICES = ("rules", "ai", "hybrid")
 FAILURE_VALUE_SOURCE_SCOPE = ("claude", "claude-science", "codex", "opencode", "openclaw", "workbuddy")
@@ -236,6 +237,8 @@ def _source_label(source_filter: str) -> str:
         return "Codex"
     if source_filter == "gemini":
         return "Gemini CLI"
+    if source_filter == "antigravity":
+        return "Antigravity CLI"
     if source_filter == "opencode":
         return "OpenCode"
     if source_filter == "openclaw":
@@ -254,7 +257,7 @@ def _source_label(source_filter: str) -> str:
         return "WorkBuddy"
     if source_filter == "custom":
         return "Custom"
-    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, Kiro, or Custom"
+    return "Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, Antigravity CLI, OpenCode, OpenClaw, Kimi CLI, Kiro, or Custom"
 
 
 def _normalize_source_filter(source_filter: str) -> str:
@@ -298,6 +301,8 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
         return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CODEX_DIR.exists()
     if source_filter == "gemini":
         return GEMINI_DIR.exists()
+    if source_filter == "antigravity":
+        return ANTIGRAVITY_DIR.exists()
     if source_filter == "opencode":
         return OPENCODE_DIR.exists()
     if source_filter == "openclaw":
@@ -317,7 +322,7 @@ def _has_session_sources(source_filter: str = "auto") -> bool:
         return bool(_get_aider_project_index())
     if source_filter == "workbuddy":
         return WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
-    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or KIMI_DIR.exists() or KIRO_DIR.exists() or KIRO_CLI_DIR.exists() or KIRO_IDE_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists() or WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
+    return CLAUDE_DIR.exists() or LOCAL_AGENT_DIR.exists() or CLAUDE_SCIENCE_DIR.exists() or CODEX_DIR.exists() or CUSTOM_DIR.exists() or GEMINI_DIR.exists() or ANTIGRAVITY_DIR.exists() or KIMI_DIR.exists() or KIRO_DIR.exists() or KIRO_CLI_DIR.exists() or KIRO_IDE_DIR.exists() or OPENCODE_DIR.exists() or OPENCLAW_DIR.exists() or CURSOR_DIR.exists() or COPILOT_DIR.exists() or WORKBUDDY_DIR.exists() or WORKBUDDY_IMPORT_DIR.exists()
 
 
 def _filter_projects_by_source(projects: list[dict], source_filter: str) -> list[dict]:
@@ -1243,11 +1248,14 @@ def prep(source_filter: str = "auto") -> None:
         elif effective_source_filter == "gemini":
             from .parsing.parser import GEMINI_DIR
             err = f"{GEMINI_DIR} was not found."
+        elif effective_source_filter == "antigravity":
+            err = f"{ANTIGRAVITY_DIR} was not found."
         else:
             err = (
                 "No supported session sources were found. Checked the standard "
                 "agent directories (~/.claude, ~/.claude-science, ~/.codex, "
-                f"~/.gemini/tmp, ~/.kiro, ~/WorkBuddy), {WORKBUDDY_IMPORT_DIR}, and "
+                "~/.gemini/tmp, ~/.gemini/antigravity-cli, ~/.kiro, ~/WorkBuddy), "
+                f"{WORKBUDDY_IMPORT_DIR}, and "
                 f"{CUSTOM_DIR}."
             )
         print(json.dumps({"error": err}))
@@ -4490,7 +4498,7 @@ def _main() -> None:
     cfg = sub.add_parser("config", help="View or set config")
     cfg.add_argument("--repo", type=str, help=argparse.SUPPRESS)
     cfg.add_argument("--source", choices=sorted(EXPLICIT_SOURCE_CHOICES),
-                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, kiro, workbuddy, or all")
+                     help="Set export source scope explicitly: claude, claude-science, codex, gemini, antigravity, kiro, workbuddy, or all")
     cfg.add_argument("--scorer-backend", choices=[b for b in SCORING_BACKEND_CHOICES if b != "auto"] + ["none"],
                      help="Confirm the AI scoring backend for automatic workbench scoring")
     cfg.add_argument("--codex-model", type=str,
@@ -7448,11 +7456,14 @@ def _run_export(args) -> None:
         elif source_filter == "gemini":
             from .parsing.parser import GEMINI_DIR
             print(f"Error: {GEMINI_DIR} not found.", file=sys.stderr)
+        elif source_filter == "antigravity":
+            print(f"Error: {ANTIGRAVITY_DIR} not found.", file=sys.stderr)
         else:
             print(
                 "Error: no supported session sources were found. Checked the "
                 "standard agent directories (~/.claude, ~/.claude-science, "
-                f"~/.codex, ~/.gemini/tmp, ~/.kiro, ~/WorkBuddy), {WORKBUDDY_IMPORT_DIR}, "
+                "~/.codex, ~/.gemini/tmp, ~/.gemini/antigravity-cli, ~/.kiro, "
+                f"~/WorkBuddy), {WORKBUDDY_IMPORT_DIR}, "
                 f"and {CUSTOM_DIR}.",
                 file=sys.stderr,
             )

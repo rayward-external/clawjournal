@@ -644,7 +644,7 @@ class TestListProjects:
         monkeypatch.setattr("clawjournal.cli.discover_projects", lambda source_filter=None: [])
         list_projects()
         captured = capsys.readouterr()
-        assert "No Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, OpenCode, OpenClaw, Kimi CLI, Kiro, or Custom sessions" in captured.out
+        assert "No Claude Code, Claude Science, Codex, Cursor, Copilot CLI, Aider, WorkBuddy, Gemini CLI, Antigravity CLI, OpenCode, OpenClaw, Kimi CLI, Kiro, or Custom sessions" in captured.out
 
     def test_source_filter_codex(self, monkeypatch, capsys):
         monkeypatch.setattr(
@@ -2947,3 +2947,12 @@ class TestHasSessionSourcesClaude:
         monkeypatch.setattr("clawjournal.cli.OPENCODE_DIR", tmp_path / "no")
         monkeypatch.setattr("clawjournal.cli.OPENCLAW_DIR", tmp_path / "no")
         assert _has_session_sources("auto") is True
+
+
+class TestHasSessionSourcesAntigravity:
+    def test_follows_the_antigravity_cli_data_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("clawjournal.cli.ANTIGRAVITY_DIR", tmp_path / "nonexistent")
+        assert _has_session_sources("antigravity") is False
+
+        monkeypatch.setattr("clawjournal.cli.ANTIGRAVITY_DIR", tmp_path)
+        assert _has_session_sources("antigravity") is True
