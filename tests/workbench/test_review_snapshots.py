@@ -144,6 +144,26 @@ def test_changed_previously_shared_trace_can_use_explicit_preview_without_global
     assert index.auto_upload_review_blockers(conn, ["test-trace"])
 
 
+def test_antigravity_saved_review_binds_secondary_workspaces(conn):
+    detail = {
+        **trace(), "source": "antigravity", "project": "antigravity:public",
+        "project_memberships": ["antigravity:public", "antigravity:private"],
+    }
+    index.upsert_sessions(conn, [detail])
+    saved = preview(conn)
+    share_id = create(conn, saved)
+    # Even shrinking the reported scope must not release a historical preview
+    # that still contains a transcript from the removed workspace.
+    detail["project_memberships"] = ["antigravity:public"]
+    index.upsert_sessions(conn, [detail])
+    with pytest.raises(ReviewSnapshotError, match="workspaces changed"):
+        load_review_snapshot(conn, saved, "test-trace")
+    assert index.share_revision_blockers(conn, share_id)
+    assert load_review_snapshot(conn, preview(conn), "test-trace")["project_memberships"] == [
+        "antigravity:public",
+    ]
+
+
 def test_snapshot_cannot_be_substituted_for_a_different_trace(conn):
     index.upsert_sessions(conn, [trace(), trace("Different trace", "other")])
     snapshot = preview(conn)

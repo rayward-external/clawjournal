@@ -12,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import Any, BinaryIO, Iterator
 
 from .. import filesystem as filesystem_module
@@ -360,6 +360,7 @@ SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id         TEXT PRIMARY KEY,
     project            TEXT NOT NULL,
+    project_memberships TEXT,
     source             TEXT NOT NULL,
     model              TEXT,
     model_effort       TEXT,
@@ -1111,6 +1112,7 @@ def open_index() -> sqlite3.Connection:
         ("ai_risk_badges", "TEXT"),
         ("ai_display_title", "TEXT"),
         ("parent_session_id", "TEXT"),
+        ("project_memberships", "TEXT"),
         ("segment_index", "INTEGER"),
         ("segment_start_message", "INTEGER"),
         ("segment_end_message", "INTEGER"),
@@ -2512,9 +2514,23 @@ def backfill_session_keys(conn: sqlite3.Connection) -> int:
     return max(cursor.rowcount, 0)
 
 
+def antigravity_project_memberships(value: Any) -> set[str]:
+    """Read the parser's workspace labels from a session or its SQLite row."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return set()
+    if not isinstance(value, list) or not all(
+        isinstance(name, str) and name.startswith("antigravity:") for name in value
+    ):
+        return set()
+    return set(value)
+
+
 def session_matches_excluded_projects(
     session: dict[str, Any],
-    excluded_projects: list[str] | None = None,
+    excluded_projects: Collection[str] | None = None,
 ) -> bool:
     """Return True when a session belongs to an excluded project."""
     if not excluded_projects:
@@ -2528,6 +2544,15 @@ def session_matches_excluded_projects(
     candidates = {project}
     if isinstance(source, str) and source and ":" not in project:
         candidates.add(f"{source}:{project}")
+    if source == "antigravity":
+        memberships = antigravity_project_memberships(session.get("project_memberships"))
+        if not memberships:
+            # A row indexed before workspace membership was recorded cannot
+            # establish that its other workspaces are outside an exclusion.
+            if any(isinstance(name, str) and name.startswith("antigravity:")
+                   for name in excluded_projects):
+                return True
+        candidates.update(memberships)
     if any(candidate in excluded_projects for candidate in candidates):
         return True
 
@@ -3699,6 +3724,8 @@ def upsert_sessions(
         if not project or not source:
             continue
 
+        memberships = session.get("project_memberships")
+        memberships_json = json.dumps(memberships) if memberships is not None else None
         session_key = _derive_session_key_from_source(
             source, session.get("raw_source_path")
         )
@@ -3853,6 +3880,7 @@ def upsert_sessions(
             segment_range = session.get("segment_message_range") or None
             replacement_values: dict[str, Any] = {
                 "project": project,
+                "project_memberships": memberships_json,
                 "source": source,
                 "model": session.get("model"),
                 "model_effort": session.get("model_effort"),
@@ -3917,7 +3945,7 @@ def upsert_sessions(
         if row_write_needed:
             conn.execute(
             """INSERT INTO sessions (
-                session_id, project, source, model, model_effort,
+                session_id, project, project_memberships, source, model, model_effort,
                 start_time, end_time, duration_seconds,
                 git_branch,
                 user_messages, assistant_messages, tool_uses,
@@ -3948,7 +3976,7 @@ def upsert_sessions(
                 hold_state, content_revision, revision_stable_since,
                 logical_session_id, checkpoint_active, logical_revision
             ) VALUES (
-                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
                 ?, ?, ?,
                 ?,
                 ?, ?, ?,
@@ -3980,6 +4008,7 @@ def upsert_sessions(
             )
             ON CONFLICT(session_id) DO UPDATE SET
                 project = excluded.project,
+                project_memberships = excluded.project_memberships,
                 source = excluded.source,
                 model = excluded.model,
                 model_effort = excluded.model_effort,
@@ -4114,7 +4143,7 @@ def upsert_sessions(
                 content_revision = excluded.content_revision
             """,
             (
-                session_id, project, source, session.get("model"), session.get("model_effort"),
+                session_id, project, memberships_json, source, session.get("model"), session.get("model_effort"),
                 session.get("start_time"), session.get("end_time"), duration,
                 session.get("git_branch"),
                 session_stats.get("user_messages", 0),
@@ -4696,7 +4725,7 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict[str, A
     # Parse JSON fields
     for field in (
         "value_badges", "risk_badges", "files_touched", "commands_run",
-        "ai_recovery_labels", "ai_failure_modes",
+        "ai_recovery_labels", "ai_failure_modes", "project_memberships",
     ):
         val = result.get(field)
         if isinstance(val, str):
@@ -5656,6 +5685,7 @@ SCORE_SETTLE_SECONDS = 180
 
 _UNSCORED_RETURN_KEYS = (
     "session_id", "display_title", "task_type", "outcome_badge", "project", "source",
+    "project_memberships",
 )
 
 
@@ -5723,7 +5753,7 @@ def query_unscored_sessions(
     else:
         where = score_missing
     sql = (
-        "SELECT session_id, display_title, task_type, outcome_badge, project, source, "
+        "SELECT session_id, display_title, task_type, outcome_badge, project, source, project_memberships, "
         "end_time, ai_scored_at, ai_quality_score, ai_failure_value_score "
         f"FROM sessions WHERE {where} AND review_status != 'segmented' "
         "AND COALESCE(checkpoint_active, 1) = 1"
@@ -5795,7 +5825,7 @@ def query_sessions_for_rescore(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
     params: list[Any] = [cutoff]
     sql = (
-        "SELECT session_id, display_title, task_type, outcome_badge, project, source "
+        "SELECT session_id, display_title, task_type, outcome_badge, project, source, project_memberships "
         "FROM sessions WHERE start_time >= ? AND review_status != 'segmented' "
         "AND COALESCE(checkpoint_active, 1) = 1"
     )
@@ -8374,7 +8404,7 @@ def get_share_ready_stats(
     where_sql = f" WHERE {' AND '.join(where_clauses)}"
     rows = conn.execute(
         _LATEST_SUCCESSFUL_REVISIONS_CTE
-        + "SELECT s.session_id, s.project, s.model, s.source, s.display_title,"
+        + "SELECT s.session_id, s.project, s.project_memberships, s.model, s.source, s.display_title,"
         " s.ai_quality_score, s.ai_failure_value_score, s.ai_recovery_labels,"
         " s.ai_failure_attribution, s.ai_failure_modes, s.ai_learning_summary,"
         " s.user_messages, s.assistant_messages, s.tool_uses,"
@@ -8401,7 +8431,7 @@ def get_share_ready_stats(
         " (s.review_status = 'approved') DESC, s.ai_quality_score DESC",
         params,
     ).fetchall()
-    cols = ["session_id", "project", "model", "source", "display_title",
+    cols = ["session_id", "project", "project_memberships", "model", "source", "display_title",
             "ai_quality_score", "ai_failure_value_score", "ai_recovery_labels",
             "ai_failure_attribution", "ai_failure_modes", "ai_learning_summary",
             "user_messages", "assistant_messages", "tool_uses", "input_tokens",

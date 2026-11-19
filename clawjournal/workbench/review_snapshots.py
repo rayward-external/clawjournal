@@ -107,11 +107,16 @@ def copy_completed_share(conn: sqlite3.Connection, share_id: str, output_path: s
 
 def review_identity(detail: dict[str, Any]) -> str:
     """Scope plus a digest of reviewed export metadata; never another raw copy."""
-    from .index import EXPORT_FIELDS
+    from .index import EXPORT_FIELDS, antigravity_project_memberships
     metadata = {key: detail[key] for key in EXPORT_FIELDS if key != 'messages' and key in detail}
     encoded = json.dumps(metadata, ensure_ascii=True, sort_keys=True, default=str).encode('utf-8')
-    identity = json.dumps({**{key: detail.get(key) for key in ('source', 'project', 'logical_session_id')},
-                           'metadata_sha256': hashlib.sha256(encoded).hexdigest()}, sort_keys=True)
+    scope = {key: detail.get(key) for key in ('source', 'project', 'logical_session_id')}
+    if detail.get("source") == "antigravity":
+        memberships = antigravity_project_memberships(detail.get("project_memberships"))
+        if memberships:
+            scope["project_memberships"] = sorted(memberships)
+    identity = json.dumps({**scope, 'metadata_sha256': hashlib.sha256(encoded).hexdigest()},
+                          sort_keys=True)
     return hashlib.sha256(identity.encode('utf-8')).hexdigest()
 
 
@@ -223,7 +228,7 @@ def save_review_snapshot(conn: sqlite3.Connection, detail: dict[str, Any], *,
 def load_review_snapshot(
     conn: sqlite3.Connection, snapshot_id: str, session_id: str,
 ) -> dict[str, Any]:
-    from .index import compute_content_revision
+    from .index import antigravity_project_memberships, compute_content_revision
 
     row = conn.execute(
         "SELECT * FROM share_review_snapshots WHERE snapshot_id = ? AND session_id = ?",
@@ -247,6 +252,11 @@ def load_review_snapshot(
         raise ReviewSnapshotError("The reviewed trace is no longer active. Refresh its preview.")
     if any(current[key] != detail.get(key) for key in ("source", "project", "logical_session_id")):
         raise ReviewSnapshotError("The reviewed trace's source or project changed. Refresh its preview.")
+    if current["source"] == "antigravity" and (
+        antigravity_project_memberships(current["project_memberships"])
+        != antigravity_project_memberships(detail.get("project_memberships"))
+    ):
+        raise ReviewSnapshotError("The reviewed trace's workspaces changed. Refresh its preview.")
     if current["review_status"] == "blocked":
         raise ReviewSnapshotError("The reviewed trace is now blocked from sharing.")
     return detail

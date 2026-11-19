@@ -818,6 +818,40 @@ class TestSecretScanGate:
         assert cached_dir == export_dir
         assert cached_manifest == manifest
 
+    def test_rescan_excludes_newly_identified_workspace_from_sealed_share(
+        self, conn, monkeypatch, tmp_path,
+    ):
+        from clawjournal.workbench import daemon
+
+        monkeypatch.setattr(daemon, "CONFIG_DIR", tmp_path)
+        _mock_gate_engines(monkeypatch)
+        kept = _settled_session("keep", content="Keep this trace.")
+        mixed = _settled_session("mixed", content="Review both folders.")
+        mixed.update(source="antigravity", project="antigravity:public",
+                     project_memberships=["antigravity:public"])
+        upsert_sessions(conn, [kept, mixed])
+        share_id = create_share(conn, ["keep", "mixed"], note="scope test")
+        share = get_share(conn, share_id)
+        settings = daemon.get_effective_share_settings(conn, {"excluded_projects": ["antigravity:private"]})
+
+        def package():
+            _, manifest, error = daemon._prepare_share_export_for_upload(
+                conn, share_id, share, settings, reuse_finalized=True,
+            )
+            assert error is None
+            return {row["session_id"] for row in manifest["sessions"]}
+
+        assert package() == {"keep", "mixed"}
+        mixed["project_memberships"].append("antigravity:private")
+        upsert_sessions(conn, [mixed])
+        # A rescan can update workspace ownership after sealing or during upload preparation.
+        blocked = daemon._final_manual_share_egress_gate(
+            conn, share_id, ["keep", "mixed"], None, packaged_session_ids=["keep", "mixed"],
+            excluded_projects=settings["excluded_projects"],
+        )
+        assert blocked is not None and blocked["status"] == 409
+        assert package() == {"keep"}
+
     def test_finalized_export_reuse_rejects_a_rebased_predecessor(
         self,
         conn,

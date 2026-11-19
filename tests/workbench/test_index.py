@@ -18,6 +18,7 @@ from clawjournal.workbench.index import (
     bulk_update_review_status,
     create_share,
     effective_hold_state,
+    export_share_to_disk,
     get_effective_share_settings,
     get_dashboard_analytics,
     get_share,
@@ -2164,6 +2165,47 @@ class TestShares:
         )
 
         assert [s["session_id"] for s in stats["sessions"]] == ["public"]
+
+    def test_antigravity_workspace_exclusion_after_rescan(self, index_conn, tmp_path):
+        public, private = "antigravity:public", "antigravity:private"
+        mixed = _make_session("mixed", project=public, source="antigravity")
+        allowed = _make_session("allowed", project=public, source="antigravity")
+        allowed["project_memberships"] = [public]
+        upsert_sessions(index_conn, [mixed, allowed])
+
+        def ready_ids():
+            stats = get_share_ready_stats(
+                index_conn, include_unapproved=True, excluded_projects=[private],
+            )
+            return {row["session_id"] for row in stats["sessions"]}
+
+        # Legacy index rows have no membership data until a successful rescan.
+        assert ready_ids() == {"allowed"}
+        mixed["project_memberships"] = [public]
+        upsert_sessions(index_conn, [mixed])
+        assert ready_ids() == {"allowed", "mixed"}
+
+        share_id = create_share(index_conn, ["mixed", "allowed"])
+        saved_share = get_share(index_conn, share_id)
+
+        # Only the metadata changed. A share created before the rescan must
+        # still check the updated workspace scope before producing its JSONL.
+        mixed["project_memberships"] = [public, private]
+        upsert_sessions(index_conn, [mixed])
+        assert ready_ids() == {"allowed"}
+        assert get_session_detail(index_conn, "mixed")["project_memberships"] == [public, private]
+        candidates = query_unscored_sessions(index_conn, source="antigravity")
+        assert {s["session_id"] for s in candidates if session_matches_excluded_projects(
+            s, [private],
+        )} == {"mixed"}
+        out, manifest = export_share_to_disk(
+            index_conn, share_id, saved_share, output_path=str(tmp_path / "export"),
+            excluded_projects=[private],
+        )
+        assert [s["session_id"] for s in manifest["sessions"]] == ["allowed"]
+        payload = json.loads((out / "sessions.jsonl").read_text())
+        assert payload["session_id"] == "allowed"
+        assert "project_memberships" not in payload
 
     def test_share_ready_respects_source_scope(self, index_conn):
         from datetime import datetime, timedelta, timezone

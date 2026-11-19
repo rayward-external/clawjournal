@@ -480,6 +480,28 @@ def test_excluded_projects_do_not_count(index_conn, ins):
     assert not status.due and status.reason == "quiet"
 
 
+def test_nudge_omits_sessions_in_an_excluded_secondary_workspace(index_conn, ins):
+    from clawjournal.config import load_config, save_config
+
+    _seed_skill_state(index_conn, installed_days_ago=15)
+    cfg = load_config()
+    cfg.update(source="antigravity", excluded_projects=["antigravity:private"])
+    save_config(cfg)
+    start = (NOW - timedelta(days=2)).isoformat()
+    for i in range(6):
+        ins(index_conn, f"mixed-{i}", source="antigravity", project="antigravity:public", start_time=start)
+    index_conn.execute(
+        "UPDATE sessions SET project_memberships = ?", ('["antigravity:public","antigravity:private"]',)
+    )
+    ins(index_conn, "public", source="antigravity", project="antigravity:public", start_time=start)
+    index_conn.execute(
+        "UPDATE sessions SET project_memberships = ? WHERE session_id = 'public'", ('["antigravity:public"]',)
+    )
+
+    status = distill_due_on_connection(index_conn, NOW)
+    assert status.new_sessions == 1
+
+
 def test_held_sessions_do_not_count(index_conn, ins):
     # the nudge line reaches agent context, so even aggregate counts must honor
     # the hold-state gate (Codex review, PR #181)

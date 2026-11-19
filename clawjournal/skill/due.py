@@ -309,8 +309,14 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
     # out of range). The precise instant check happens on the parsed value.
     lex_lo = (anchor - timedelta(days=2)).isoformat()
     lex_hi = (now + timedelta(days=2)).isoformat()
+    # The startup hook opens existing indexes without applying migrations.
+    scope_cols = "project, source"
+    if excluded and "antigravity" in sources and any(
+        col[1] == "project_memberships" for col in conn.execute("PRAGMA table_info(sessions)")
+    ):
+        scope_cols += ", project_memberships"
     sql = (
-        "SELECT session_id, project, source, start_time, "
+        f"SELECT session_id, {scope_cols}, start_time, "
         "ai_failure_value_score, ai_outcome_badge "
         "FROM sessions WHERE review_status != 'segmented' "
         f"AND source IN ({placeholders}) "
@@ -340,8 +346,7 @@ def distill_due_on_connection(conn: sqlite3.Connection, now: datetime) -> DueSta
             parsed = _parse_start_time(r["start_time"])
             if parsed is None or not (anchor < parsed <= now):
                 continue
-            if excluded and session_matches_excluded_projects(
-                    {"project": r["project"], "source": r["source"]}, excluded):
+            if excluded and session_matches_excluded_projects(dict(r), excluded):
                 continue
             page_kept.append(r)
         # Hold-state gate: the nudge line reaches agent context (and so the

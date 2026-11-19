@@ -6,6 +6,7 @@ directory; none is copied from a real conversation.
 
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -193,9 +194,12 @@ class TestAntigravityDiscovery:
             (CWD, "antigravity:agy-app", 2),
             ("/workspace/my notes", "antigravity:my notes", 1),
         ]
+        assert projects[1]["additional_projects"] == ["antigravity:extra"]
+        mixed, = parse_project_sessions("/workspace/my notes", mock_anonymizer, source="antigravity")
+        assert mixed["project_memberships"] == ["antigravity:my notes", "antigravity:extra"]
         sessions = parse_project_sessions(CWD, mock_anonymizer, source="antigravity")
         assert sorted(s["session_id"] for s in sessions) == sorted([CONVERSATION, OTHER])
-        assert {s["project"] for s in sessions} == {"antigravity:agy-app"}
+        assert all(s["project_memberships"] == ["antigravity:agy-app"] for s in sessions)
 
     def test_workspace_falls_back_to_the_resume_files(self, agy):
         """Without a summary row, history.jsonl and last_conversations.json say where."""
@@ -240,6 +244,62 @@ class TestAntigravityDiscovery:
 
         assert [(p["dir_name"], p["session_count"]) for p in projects] == [(CWD, 2)]
 
+    def test_resolves_nested_transcript_parents_before_grouping(self, agy, mock_anonymizer):
+        # The grandchildren sort before their parents on disk. No summary row
+        # records either parent link, and one child has a worktree of its own.
+        root = OTHER
+        child = CONVERSATION
+        grandchild = "00000000-0000-4000-8000-000000000001"
+        _hello(agy, root)
+        for sid, parent in [(child, root), (grandchild, child)]:
+            _write_transcript(agy, [
+                _system_message(0, "Keep working.", source="SYSTEM_SDK"),
+                _system_message(1, f"[Message] timestamp=now sender={parent} content=Check the build"),
+                _response(2, content="Finished."),
+            ], sid)
+        _write_summaries(agy, [
+            _summary(root, workspace_uris=["file:///src/public", "file:///src/private"]),
+            _summary(grandchild, cwd="/src/worktree"),
+        ])
+
+        projects = discover_projects(source_filter="antigravity")
+        by_id = {
+            session["session_id"]: session for project in projects
+            for session in parse_project_sessions(project["dir_name"], mock_anonymizer, source="antigravity")
+        }
+
+        assert [p["session_count"] for p in projects] == [2, 1]
+        assert by_id[child]["parent_session_id"] == root
+        assert by_id[child]["project_memberships"] == ["antigravity:public", "antigravity:private"]
+        assert by_id[grandchild]["parent_session_id"] == child
+        assert by_id[grandchild]["project_memberships"] == [
+            "antigravity:worktree", "antigravity:public", "antigravity:private"
+        ]
+
+    def test_reply_flushed_before_the_user_prompt_does_not_establish_parent(self, agy, mock_anonymizer):
+        _write_transcript(agy, [
+            _system_message(2, f"[Message] timestamp=now sender={OTHER} content=Build passed"),
+            _prompt(0, "Check the build"),
+        ])
+        _write_summaries(agy, [_summary(OTHER)])
+        session = _only_session(mock_anonymizer, cwd="<unknown-cwd>")
+        assert "parent_session_id" not in session
+
+    def test_defer_transcript_that_gains_an_assignment_after_discovery(self, agy, mock_anonymizer):
+        _hello(agy, OTHER)
+        steps = [_system_message(0, "Keep working.", source="SYSTEM_SDK")]
+        _write_transcript(agy, steps)
+        _write_summaries(agy, [_summary(OTHER)])
+        discover_projects(source_filter="antigravity")
+
+        _write_transcript(agy, steps + [
+            _system_message(1, f"[Message] timestamp=now sender={OTHER} content=Check the build"),
+            _response(2, content="Finished."),
+        ])
+        assert parse_project_sessions("<unknown-cwd>", mock_anonymizer, source="antigravity") == []
+        assert discover_projects(source_filter="antigravity")[0]["session_count"] == 2
+        assert len(parse_project_sessions(CWD, mock_anonymizer, source="antigravity")) == 2
+
     def test_skips_conversations_without_a_step_log(self, agy):
         # /clear makes the folder at once and the log only with the next prompt.
         (agy / "brain" / OTHER).mkdir(parents=True)
@@ -276,34 +336,59 @@ class TestAntigravityDiscovery:
         assert session["raw_source_path"] == str(compact)
         assert session["messages"][1]["content"] == "from compact"
 
-    @pytest.mark.parametrize("schema", [
-        # Builds that predate the workspace, title and parent columns.
-        "CREATE TABLE conversation_summaries (conversation_id text PRIMARY KEY, "
-        "last_modified_time datetime, last_user_input_time datetime)",
-        "CREATE TABLE something_else (conversation_id text, "
-        "last_modified_time datetime, last_user_input_time datetime)",
-    ])
-    def test_summaries_from_another_schema(self, agy, mock_anonymizer, schema):
+    def test_summary_schema_before_workspace_and_parent_columns(self, agy, mock_anonymizer):
         _hello(agy)
-        table = schema.split()[2]
-        conn = sqlite3.connect(agy / "conversation_summaries.db")
-        conn.execute(schema)
-        conn.execute(f"INSERT INTO {table} (conversation_id) VALUES (?)", (CONVERSATION,))
-        conn.commit()
-        conn.close()
+        _write_summaries(agy, [{"conversation_id": CONVERSATION}], schema=(
+            "CREATE TABLE conversation_summaries (conversation_id text PRIMARY KEY, "
+            "last_modified_time datetime, last_user_input_time datetime)"
+        ))
 
         session = _only_session(mock_anonymizer, cwd="<unknown-cwd>")
 
         assert session["project"] == "antigravity:unknown"
         assert "segment_title" not in session
 
-    def test_unreadable_summaries_database(self, agy, mock_anonymizer):
+    def test_locked_summaries_defer_until_release(self, agy, mock_anonymizer, monkeypatch):
         _hello(agy)
-        (agy / "conversation_summaries.db").write_text("not a database", encoding="utf-8")
+        _write_summaries(agy, [_summary()])
+        assert _only_session(mock_anonymizer)["project_memberships"] == ["antigravity:agy-app"]
 
-        session = _only_session(mock_anonymizer, cwd="<unknown-cwd>")
+        connect_readonly = parser._connect_sqlite_readonly
 
-        assert [m["content"] for m in session["messages"]] == ["hi", "hello"]
+        def without_busy_wait(path):
+            conn = connect_readonly(path)
+            conn.execute("PRAGMA busy_timeout = 0")
+            return conn
+
+        monkeypatch.setattr(parser, "_connect_sqlite_readonly", without_busy_wait)
+        writer = sqlite3.connect(agy / "conversation_summaries.db")
+        try:
+            writer.execute("BEGIN EXCLUSIVE")
+            assert discover_projects(source_filter="antigravity") == []
+        finally:
+            writer.close()
+
+        assert _only_session(mock_anonymizer)["project"] == "antigravity:agy-app"
+
+    @pytest.mark.parametrize("damage", ["corrupt", "missing-table"])
+    def test_defers_refresh_when_summaries_unreadable(self, agy, mock_anonymizer, caplog, damage):
+        _hello(agy)
+        _write_summaries(agy, [_summary()])
+        assert _only_session(mock_anonymizer)["project"] == "antigravity:agy-app"
+        db = agy / "conversation_summaries.db"
+        backup = db.with_suffix(".bak")
+        db.rename(backup)
+        if damage == "corrupt":
+            db.write_text("not a database", encoding="utf-8")
+        else:
+            with closing(sqlite3.connect(db)) as conn:
+                conn.execute("CREATE TABLE something_else (conversation_id text)")
+        assert discover_projects(source_filter="antigravity") == []
+        assert "Deferring Antigravity CLI discovery" in caplog.text
+        assert parse_project_sessions("<unknown-cwd>", mock_anonymizer, source="antigravity") == []
+
+        backup.replace(db)
+        assert _only_session(mock_anonymizer)["project"] == "antigravity:agy-app"
 
 
 class TestAntigravityTranscript:
