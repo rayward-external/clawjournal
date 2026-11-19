@@ -11,6 +11,7 @@ const SOURCE_ICONS: Record<string, string> = {
   openclaw: 'OC',
   workbuddy: 'WB',
   kiro: 'KR',
+  antigravity: 'AG',
 };
 
 function formatDuration(seconds: number | null): string {

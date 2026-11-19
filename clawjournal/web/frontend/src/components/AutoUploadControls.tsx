@@ -88,6 +88,7 @@ function sourceLabel(source: string): string {
   const labels: Record<string, string> = {
     all: 'All agents',
     aider: 'Aider',
+    antigravity: 'Antigravity CLI',
     both: 'Claude Code and Codex',
     claude: 'Claude Code',
     'claude-science': 'Claude Science',

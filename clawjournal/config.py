@@ -164,7 +164,7 @@ DEFAULT_CONFIG: ClawJournalConfig = {
 }
 
 
-_KNOWN_PREFIXES = ("claude:", "claude-science:", "codex:", "gemini:", "opencode:", "openclaw:", "kimi:", "kiro:", "cline:", "workbuddy:", "custom:")
+_KNOWN_PREFIXES = ("claude:", "claude-science:", "codex:", "gemini:", "antigravity:", "opencode:", "openclaw:", "kimi:", "kiro:", "cline:", "workbuddy:", "custom:")
 _BOTH_SOURCES = ("claude", "codex")
 
 # The receipt-issued recurring-enrollment grant travels as one unit: the
