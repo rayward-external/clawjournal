@@ -8,8 +8,8 @@ from test_review_snapshots import conn, trace, preview, create
 SETTINGS = {"projects_confirmed": True, "source_filter": ["codex"]}
 
 
-def selected(conn):
-    index.upsert_sessions(conn, [trace()])
+def selected(conn, *content):
+    index.upsert_sessions(conn, [trace(*content)])
     index.set_hold_state(conn, "test-trace", "released", changed_by="test")
     return create(conn, preview(conn))
 
@@ -33,6 +33,29 @@ def test_checked_export_pairs_exact_final_redaction_and_scans_the_original(conn,
     raw = originals.checked_bytes(conn, share_id, SETTINGS, approved_digest=originals.digest(document), redacted=[final])
     assert json.loads(raw) == document
     assert calls == [document["sessions"][0]]
+
+
+@pytest.mark.parametrize("content, shared", [
+    ('token = [REDACTED]\nprint("done")', True),
+    ('Accuracy: 0.987; λ=1\nPath: C:\\research\\results.csv', True),
+    ('token = "hf_' + 'A1b2C3d4' * 5 + '"\n# Invented test credential', False),
+])
+def test_original_scan_reads_message_text_not_json_escapes(conn, monkeypatch, content, shared):
+    from types import SimpleNamespace
+    from clawjournal.redaction import betterleaks
+    monkeypatch.setattr(betterleaks, "scan_text", lambda text: SimpleNamespace(
+        bypassed=False, binary_missing=False, scan_error=None, findings=[]))
+    share_id = selected(conn, content)
+    document = originals.prepare(conn, share_id, SETTINGS)
+    final = {"session_id": "test-trace", "messages": [{"role": "user", "content": "[REDACTED]"}],
+             "revision_hash": index.compute_content_revision(trace(content))}
+    check = lambda: originals.checked_bytes(conn, share_id, SETTINGS,
+        approved_digest=originals.digest(document), redacted=[final])
+    if shared:
+        assert json.loads(check())["sessions"][0]["messages"][0]["content"] == content
+    else:
+        with pytest.raises(ValueError, match="Possible credentials"):
+            check()
 
 
 def test_combined_size_matches_the_hosted_limit(conn, monkeypatch):

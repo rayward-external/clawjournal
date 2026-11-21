@@ -111,13 +111,16 @@ def grant(store, capture_id):
 def _scan_original(original):
     from . import betterleaks
     from .secrets import scan_text
+    from ..parsing.widened import _walk_strings
     # Originals never enter online credential verification or an AI backend.
-    raw = contract.canonical(original)
-    report = betterleaks.scan_text(raw)
+    report = betterleaks.scan_text(contract.canonical(original))
     if report.bypassed or report.binary_missing or report.scan_error or report.findings:
         raise ValueError("Original contains possible secrets or local scanner is unavailable")
-    if any(m["type"] not in {"email", "ip_address", "private_url"} for m in scan_text(raw)):
-        raise ValueError("Possible credentials in original; this conversation cannot be shared")
+    # The regex scanner reads text as written, as on the export path. On JSON,
+    # escaping joins a placeholder to the next line (`[REDACTED]\nprint(`).
+    for text, _field in _walk_strings(original, ""):
+        if any(m["type"] not in {"email", "ip_address", "private_url"} for m in scan_text(text)):
+            raise ValueError("Possible credentials in original; this conversation cannot be shared")
 
 
 def _scan(original, redacted, pair_id, directory):
