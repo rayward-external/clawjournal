@@ -335,8 +335,8 @@ describe('Share selection defaults', () => {
     });
   });
 
-  it('caps bulk selection at 50 traces', async () => {
-    mockInitialLoad(readyStats(75));
+  it('caps bulk selection at 75 traces', async () => {
+    mockInitialLoad(readyStats(100));
 
     render(
       <MemoryRouter initialEntries={['/share?ids=']}>
@@ -346,10 +346,10 @@ describe('Share selection defaults', () => {
     );
 
     expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Select first 50 (50 max)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Select first 75 (75 max)' }));
 
-    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
-    expect(screen.queryByText(/Added 50 traces/)).not.toBeInTheDocument();
+    expect(await screen.findByText('75 traces selected')).toBeInTheDocument();
+    expect(screen.queryByText(/Added 75 traces/)).not.toBeInTheDocument();
     await waitFor(() => {
       const params = new URLSearchParams(screen.getByTestId('location-search').textContent || '');
       expect(params.get('selection')).toBe('all');
@@ -357,7 +357,7 @@ describe('Share selection defaults', () => {
     });
   });
 
-  it('caps a large eligible history at 50 selected traces while keeping the rest browsable', async () => {
+  it('caps a large eligible history at 75 selected traces while keeping the rest browsable', async () => {
     mockInitialLoad(readyStats(125));
 
     render(
@@ -366,33 +366,34 @@ describe('Share selection defaults', () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(await screen.findByText('75 traces selected')).toBeInTheDocument();
     expect(screen.getAllByRole('checkbox', { name: /Include trace:/ })).toHaveLength(50);
     expect(screen.getByText(/Showing 50 of 125 matching traces/)).toBeInTheDocument();
-    expect(screen.getByText(/Only selected traces are in this bundle \(50 maximum\)/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '50 trace limit reached' })).toBeDisabled();
+    expect(screen.getByText(/Only selected traces are in this bundle \(75 maximum\)/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '75 trace limit reached' })).toBeDisabled();
 
     fireEvent.click(screen.getByRole('button', { name: /Show 50 more/ }));
     expect(screen.getAllByRole('checkbox', { name: /Include trace:/ })).toHaveLength(100);
-    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s75' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s76' })).toBeDisabled();
 
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s1' }));
     await waitFor(() => {
-      expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeEnabled();
+      expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s76' })).toBeEnabled();
     });
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' }));
-    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
-    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s51' })).toBeChecked();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include trace: Trace s76' }));
+    expect(await screen.findByText('75 traces selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Include trace: Trace s76' })).toBeChecked();
   }, 10_000);
 
   it('prunes stale queue ids when eligibility refreshes after a completed bundle', async () => {
-    const initialStats = readyStats(50);
-    const refreshedSessions = ['s51', 's52', 's53'].map(readySession);
+    const initialStats = readyStats(75);
+    const refreshedSessions = ['s76', 's77', 's78'].map(readySession);
     const refreshedStats: ShareReadyStats = {
       ...readyStats(0),
       count: refreshedSessions.length,
       total_approved: refreshedSessions.length,
-      recommended_session_ids: ['s51'],
+      recommended_session_ids: ['s76'],
       sessions: refreshedSessions,
     };
     mockInitialLoad(initialStats);
@@ -411,7 +412,7 @@ describe('Share selection defaults', () => {
 
     await waitFor(() => expect(api.shareReady).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/Nothing is preselected/)).toBeInTheDocument();
-    const replacement = screen.getByRole('checkbox', { name: 'Include trace: Trace s51' });
+    const replacement = screen.getByRole('checkbox', { name: 'Include trace: Trace s76' });
     expect(replacement).toBeEnabled();
 
     fireEvent.click(replacement);
@@ -475,7 +476,7 @@ describe('Share selection defaults', () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(await screen.findByText('75 traces selected')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'What would you like to share?' })).toBeInTheDocument();
     expect(redactionSpy).not.toHaveBeenCalled();
   });
@@ -554,8 +555,8 @@ describe('Share selection defaults', () => {
     expect(redactionSpy.mock.calls.every(([, options]) => options?.aiPii === true)).toBe(true);
   });
 
-  it('locks only the capped 50-trace snapshot without adding a newly eligible trace', async () => {
-    const ids = Array.from({ length: 80 }, (_, index) => `session-${index.toString().padStart(4, '0')}`);
+  it('locks only the capped 75-trace snapshot without adding a newly eligible trace', async () => {
+    const ids = Array.from({ length: 100 }, (_, index) => `session-${index.toString().padStart(4, '0')}`);
     const stats: ShareReadyStats = {
       ...readyStats(0),
       count: ids.length,
@@ -575,7 +576,7 @@ describe('Share selection defaults', () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText('50 traces selected')).toBeInTheDocument();
+    expect(await screen.findByText('75 traces selected')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Redact & review' }));
 
     let lockedSearch = '';
@@ -584,7 +585,7 @@ describe('Share selection defaults', () => {
       const params = new URLSearchParams(lockedSearch);
       expect(params.get('step')).toBe('redact');
       expect(params.get('selection')).toBe('locked');
-      expect((params.get('ids') || '').split(',')).toEqual(ids.slice(0, 50));
+      expect((params.get('ids') || '').split(',')).toEqual(ids.slice(0, 75));
       expect(params.has('queue_ref')).toBe(false);
     });
     await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
@@ -608,6 +609,8 @@ describe('Share selection defaults', () => {
     expect(await screen.findByRole('heading', { name: 'Redacting your traces' })).toBeInTheDocument();
     await waitFor(() => expect(redactionSpy).toHaveBeenCalledTimes(2));
     expect(redactionSpy).not.toHaveBeenCalledWith(newlyEligible, expect.anything());
+    // The step lists 50 traces at a time; the rest of the share is one click away.
+    expect(screen.getByRole('button', { name: /Show 25 more/ })).toBeInTheDocument();
   });
 
   it('rejects a locked downstream URL when its queue reference is missing', async () => {

@@ -66,9 +66,9 @@ export function readyStats(count = 12): ShareReadyStats {
 }
 
 describe('Share queue selection encoding', () => {
-  it('defaults to the first 50 ranked eligible traces', () => {
-    const stats = readyStats(75);
-    const expected = stats.sessions.slice(0, 50).map((session) => session.session_id);
+  it('defaults to the first 75 ranked eligible traces', () => {
+    const stats = readyStats(100);
+    const expected = stats.sessions.slice(0, 75).map((session) => session.session_id);
     expect(queueFromStats(stats)).toEqual(expected);
     expect(queueFromSelectionParams(stats, new URLSearchParams())).toEqual(expected);
   });
@@ -134,13 +134,13 @@ describe('Share queue selection encoding', () => {
     expect(queueFromSelectionParams(stats, params)).toEqual(['s2', 's1']);
   });
 
-  it('caps explicit selections at 50 while retaining eligible traces outside the default queue', () => {
-    const stats = readyStats(75);
+  it('caps explicit selections at 75 while retaining eligible traces outside the default queue', () => {
+    const stats = readyStats(100);
     const reversed = stats.sessions.map((session) => session.session_id).reverse();
     const params = new URLSearchParams({ ids: reversed.join(',') });
 
-    expect(queueFromSelectionParams(stats, params)).toEqual(reversed.slice(0, 50));
-    expect(queueFromSelectionParams(stats, params)[0]).toBe('s75');
+    expect(queueFromSelectionParams(stats, params)).toEqual(reversed.slice(0, 75));
+    expect(queueFromSelectionParams(stats, params)[0]).toBe('s100');
   });
 
   it('materializes and marks an exact downstream snapshot', () => {
@@ -203,8 +203,8 @@ describe('logical conversation queue projection', () => {
     ]);
   });
 
-  it('does not split a checkpoint family at the 50-checkpoint default cap', () => {
-    const standalone = Array.from({ length: 49 }, (_, index) => readySession(`s${index + 1}`));
+  it('does not split a checkpoint family at the 75-checkpoint default cap', () => {
+    const standalone = Array.from({ length: 74 }, (_, index) => readySession(`s${index + 1}`));
     const sessions = [
       ...standalone,
       checkpoint('conversation-1', 0),
@@ -213,7 +213,7 @@ describe('logical conversation queue projection', () => {
     ];
     const stats: ShareReadyStats = { ...readyStats(0), count: sessions.length, sessions };
 
-    expect(queueFromStats(stats)).toHaveLength(50);
+    expect(queueFromStats(stats)).toHaveLength(75);
     expect(queueFromStats(stats)).not.toContain('conversation-1');
     expect(queueFromStats(stats)).not.toContain('conversation-1_seg-0001');
     expect(queueFromStats(stats)).toContain('fits-after-group');
