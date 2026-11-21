@@ -141,7 +141,7 @@ Sharing is always a separate decision. An assistant permission prompt is not the
 
 1. **Choose projects.** ClawJournal finds your coding-agent sessions. Review the project list and exclude anything you do not want included.
 2. **Review locally.** Use the browser workbench to search, approve, block, hold, or embargo sessions. No account or upload is required.
-3. **Choose a share.** Select up to 50 reviewed sessions. Anything you do not select stays out of that package.
+3. **Choose a share.** Select up to 75 reviewed sessions. Anything you do not select stays out of that package.
 4. **Redact and check.** Inspect the redacted preview, remove sessions if needed, and run the required secret scans.
 5. **Confirm.** Review the destination and consent details. Nothing is uploaded until you approve the final submission.
 

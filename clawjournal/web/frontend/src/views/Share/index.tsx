@@ -167,7 +167,7 @@ export function Share({ onSubmittedShareChange }: ShareProps = {}) {
   const queueSet = useMemo(() => new Set(eligibleQueueOrder), [eligibleQueueOrder]);
 
   // Eligibility can shrink after a successful share or a hold/config refresh.
-  // Keep the stored queue canonical so stale IDs never consume the 50 slots.
+  // Keep the stored queue canonical so stale IDs never consume its slots.
   useEffect(() => {
     const unchanged = queueOrder.length === eligibleQueueOrder.length
       && queueOrder.every((id, index) => id === eligibleQueueOrder[index]);
